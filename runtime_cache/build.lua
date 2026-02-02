@@ -1,2 +1,2 @@
-project("runtime_cache")
+setup_project("runtime_cache")
 	kind "StaticLib"

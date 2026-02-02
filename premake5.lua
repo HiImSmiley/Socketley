@@ -5,15 +5,15 @@ function setup_project(project_name)
         cdialect "C17"
         characterset "MBCS"
 
-        targetdir ("%{wks.location}/bin/%{prj.name}-%{cfg.architecture}-%{cfg.buildcfg}")
-        location("%{wks.location}/%{prj.name}")
-
+	targetdir ("../bin/%{cfg.buildcfg}")
+        location("%{wks.location}")
+	
         files {
-            "%{prj.location}/**.c",
-            "%{prj.location}/**.h",
-            "%{prj.location}/**.cpp",
-            "%{wks.location}/shared/**.h",
-            "%{wks.location}/shared/**.cpp"
+            "../%{prj.name}/**.c",
+            "../%{prj.name}/**.h",
+            "../%{prj.name}/**.cpp",
+            "../shared/**.h",
+            "../shared/**.cpp"
         }
 
         filter "system:linux"
@@ -39,7 +39,7 @@ workspace "Socketley"
     configurations { "Debug", "Release" }
     platforms { "x64" }
 
-    location "./"
+    location "make"
 
     include "socketley/build.lua"
     include "runtime_server/build.lua"

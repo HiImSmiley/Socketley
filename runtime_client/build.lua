@@ -1,2 +1,2 @@
-project("runtime_client")
+setup_project("runtime_client")
 	kind "StaticLib"

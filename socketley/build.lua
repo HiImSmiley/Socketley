@@ -1,4 +1,4 @@
-project("socketley")
+setup_project("socketley")
 	kind "ConsoleApp"
 	
 	links {

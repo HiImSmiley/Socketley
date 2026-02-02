@@ -1,2 +1,2 @@
-project("runtime_proxy")
+setup_project("runtime_proxy")
 	kind "StaticLib"
