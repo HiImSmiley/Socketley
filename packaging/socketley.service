@@ -1,0 +1,28 @@
+[Unit]
+Description=Socketley Runtime Daemon
+Documentation=man:socketley(1)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socketley daemon
+Restart=on-failure
+RestartSec=5
+
+# Directories
+RuntimeDirectory=socketley
+StateDirectory=socketley
+ConfigurationDirectory=socketley
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/socketley /run/socketley
+
+# User
+User=socketley
+Group=socketley
+
+[Install]
+WantedBy=multi-user.target

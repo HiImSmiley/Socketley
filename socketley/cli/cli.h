@@ -1,0 +1,11 @@
+#pragma once
+
+int cli_dispatch(int argc, char** argv);
+int cli_forward(int argc, char** argv);
+int cli_send(int argc, char** argv);
+int cli_stdin_send(int argc, char** argv);
+int cli_edit(int argc, char** argv);
+int cli_runtime_action(int argc, char** argv);
+int cli_interactive(int argc, char** argv);
+int cli_daemon();
+int cli_config(int argc, char** argv);
