@@ -1,0 +1,1044 @@
+.\" Socketley Manual Page
+.\" Copyright (c) 2025
+.\"
+.TH SOCKETLEY 1 "2026" "socketley" "User Commands"
+.SH NAME
+socketley \- manage long-living network runtimes in Docker-like style
+.SH SYNOPSIS
+.B socketley
+.I command
+.RI [ options ]
+.br
+.B socketley
+.B daemon
+.RI [ \-\-log\-level
+.IR level ]
+.br
+.B socketley
+.B create
+.I type name
+.RI [ flags ]
+.br
+.B socketley
+.B start
+.IR name | pattern ...
+.RB [ \-i ]
+.br
+.B socketley
+.B stop
+.IR name | pattern ...
+.br
+.B socketley
+.B remove
+.IR name | pattern ...
+.br
+.B socketley
+.B stats
+.IR name | pattern ...
+.br
+.B socketley
+.B reload
+.IR name | pattern ...
+.br
+.B socketley
+.B reload-lua
+.IR name | pattern ...
+.br
+.B socketley
+.B show
+.IR name | pattern ...
+.br
+.B socketley
+.B edit
+.I name
+.RI [ flags ]
+.br
+.B socketley
+.B edit
+.I name
+.RB [ \-r | \-\-reload ]
+.br
+.B socketley
+.B ls
+.br
+.B socketley
+.B ps
+.br
+.B socketley
+.B \-\-config
+.I lua_file
+.SH DESCRIPTION
+.B socketley
+is a Linux-only central daemon and CLI tool for managing persistent network
+runtimes (server, client, proxy, cache). It provides Docker-like management
+with persistent configurations, simple CLI, and Lua scripting support.
+All runtimes are managed centrally through a single daemon process, using
+io_uring for high-performance async I/O.
+.SH COMMANDS
+.TP
+.B daemon
+Start the socketley daemon. Must be running before any other commands.
+When installed system-wide, creates IPC socket at /run/socketley/socketley.sock.
+In development mode, uses /tmp/socketley.sock.
+On startup, restores persisted runtime configurations. Runtimes that were
+running when the daemon last stopped are auto-started.
+.TP
+.BI "create " "type name " "[flags]"
+Create a new runtime instance.
+.I type
+can be: server, client, proxy, cache.
+.I name
+is a unique identifier for the runtime.
+.TP
+.BI "start " "name|pattern" "... [\-i]"
+Start one or more runtimes. Accepts multiple names, glob patterns
+.RB ( * ", " ? ", " [] ),
+or a mix. With
+.BR * ,
+starts all non-running runtimes.
+.RS
+.TP
+.B \-i
+Interactive mode. Starts the runtime and opens an interactive session.
+For server: stdin is broadcast to clients, received messages appear on stdout.
+For client: stdin is sent to server, received messages appear on stdout.
+For cache: stdin accepts cache commands, responses appear on stdout (like redis-cli).
+Not supported for proxy. Press Ctrl+C to detach (runtime continues running).
+If the runtime is already running, attaches without restarting.
+.RE
+.TP
+.BI "stop " "name|pattern" "..."
+Stop one or more running runtimes. Accepts multiple names, glob patterns
+.RB ( * ", " ? ", " [] ),
+or a mix. With
+.BR * ,
+stops all running runtimes.
+.TP
+.BI "remove " "name|pattern" "..."
+Remove one or more runtimes from the registry. Cannot be undone.
+Accepts multiple names, glob patterns, or a mix. Running runtimes
+are stopped first. With
+.BR * ,
+stops and removes all.
+.TP
+.BI "send " "name" " [message]"
+Send a message to a running server or client runtime.
+For servers, the message is broadcast to all connected clients.
+For clients, the message is sent to the connected server.
+Respects the runtime's mode setting (fails if mode is receive-only).
+.PP
+If no message is given, reads from stdin:
+.nf
+echo "hello" | socketley send myserver
+cat data.txt | socketley send myclient
+.fi
+.TP
+.BI "stats " "name|pattern" "..."
+Display runtime statistics including total connections, messages processed,
+bytes in/out, and type-specific counters. Accepts multiple names, glob
+patterns, or a mix. With
+.BR * ,
+shows stats for all runtimes.
+.TP
+.BI "reload " "name|pattern" "..."
+Restart one or more running runtimes (stop + start). Accepts multiple
+names, glob patterns, or a mix. Non-running runtimes are skipped.
+With
+.BR * ,
+restarts all running runtimes.
+.TP
+.BI "reload-lua " "name|pattern" "..."
+Hot-reload the Lua script attached to one or more runtimes. The Lua
+context is destroyed and re-created from the original script path.
+Accepts multiple names, glob patterns, or a mix. Runtimes without
+Lua scripts are skipped. With
+.BR * ,
+reloads Lua on all runtimes that have scripts loaded.
+.TP
+.BI "show " "name|pattern" "..."
+Print runtime JSON configuration to stdout. Accepts multiple names,
+glob patterns, or a mix. With
+.BR * ,
+prints all runtimes.
+.TP
+.BI "edit " "name " "[flags]"
+Edit a runtime's configuration. When called with flags (e.g. \-p 9001),
+applies changes directly like
+.BR create .
+When called without flags (or with only \-r/\-\-reload),
+opens the runtime's JSON configuration in
+.BR $VISUAL ,
+.BR $EDITOR ,
+or
+.BR vim .
+After saving, changes are validated and applied.
+.TP
+.BI "edit " "name " "\-r"
+Interactive editor mode with auto-reload. After saving changes, the
+runtime's Lua script is automatically hot-reloaded. Alias:
+.BR \-\-reload .
+.SS Edit: JSON Configuration Fields
+The interactive editor opens a JSON file with the following fields.
+Fields marked
+.B (read-only)
+are ignored on import. Fields marked
+.B (requires restart)
+cannot be changed while the runtime is running \(em stop the runtime first.
+.PP
+.B Identity fields:
+.TS
+l l.
+name	Runtime name \fB(requires restart)\fR
+id	6-char hex identifier (read-only, ignored on import)
+type	Runtime type: server, client, proxy, cache (read-only, ignored on import)
+was_running	Internal daemon state (ignored on import)
+.TE
+.PP
+.B Common fields (all types):
+.TS
+l l l.
+Field	Type	Description
+_
+port	number	Listener/connection port \fB(requires restart)\fR
+log_file	string	State transition log file path
+write_file	string	Message write file path
+lua_script	string	Lua script path (absolute)
+bash_output	bool	Output messages to stdout
+bash_prefix	bool	Prefix messages with [name]
+bash_timestamp	bool	Prefix messages with [HH:MM:SS]
+max_connections	number	Max concurrent connections (0 = unlimited)
+rate_limit	number	Messages/sec per connection (0 = unlimited)
+drain	bool	Graceful shutdown (flush writes before close)
+tls	bool	Enable TLS \fB(requires restart)\fR
+cert_path	string	TLS certificate file (PEM)
+key_path	string	TLS private key file (PEM)
+ca_path	string	TLS CA certificate file
+target	string	Client target host:port \fB(requires restart)\fR
+cache_name	string	Connected cache runtime name
+.TE
+.PP
+.B Server fields:
+.TS
+l l l.
+Field	Type	Description
+_
+mode	string	"inout", "in", "out", or "master"
+udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
+master_pw	string	Static password for master mode
+master_forward	bool	Forward non-master messages to master
+.TE
+.PP
+.B Client fields:
+.TS
+l l l.
+Field	Type	Description
+_
+mode	string	"inout", "in", or "out"
+udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
+.TE
+.PP
+.B Proxy fields:
+.TS
+l l l.
+Field	Type	Description
+_
+protocol	string	"http" or "tcp" \fB(requires restart)\fR
+strategy	string	"round-robin", "random", or "lua"
+backends	array	List of backend addresses ["ip:port", ...]
+.TE
+.PP
+.B Cache fields:
+.TS
+l l l.
+Field	Type	Description
+_
+persistent_path	string	Persistence file path
+cache_mode	string	"readonly", "readwrite", or "admin"
+resp_forced	bool	Force RESP2 protocol \fB(requires restart)\fR
+replicate_target	string	Leader host:port \fB(requires restart)\fR
+max_memory	number	Max memory in bytes (0 = unlimited)
+eviction	string	"noeviction", "allkeys-lru", "allkeys-random"
+.TE
+.PP
+.B Example JSON (server):
+.nf
+{
+    "name": "api",
+    "id": "a1b2c3",
+    "type": "server",
+    "port": 9000,
+    "was_running": true,
+    "lua_script": "/home/user/handler.lua",
+    "max_connections": 100,
+    "rate_limit": 1000,
+    "mode": "inout"
+}
+.fi
+.TP
+.B ls
+List all runtimes (all states). Docker-style output with columns:
+ID, NAME, TYPE, PORT, CONN (connections), STATUS, CREATED.
+.TP
+.B ps
+List only running runtimes. Same format as
+.BR ls .
+.TP
+.BI "\-\-config " "lua_file"
+Load Lua orchestration configuration. Creates multiple runtimes from
+a single config file.
+.SH DAEMON FLAGS
+.TP
+.BI "\-\-log\-level " "level"
+Set daemon log verbosity:
+.B debug
+,
+.B info
+(default),
+.B warn
+, or
+.BR error .
+.SH COMMON FLAGS
+These flags work with all runtime types:
+.TP
+.BI "\-p " "port"
+Set listener port (server, proxy, cache) or target port (client).
+.TP
+.B \-s
+Start immediately after creation.
+.TP
+.B \-\-test
+Dry run. Validate configuration without starting.
+.TP
+.BI "\-\-log " "file"
+Log state transitions (created, running, stopped, failed) to file.
+.TP
+.BI "\-w " "file"
+Write every received message to file.
+.TP
+.BI "\-\-config " "script"
+Attach Lua configuration script with callbacks (alias:
+.BR \-\-lua ).
+.TP
+.B \-b
+Output received messages to stdout (bash mode).
+.TP
+.B \-bp
+Output messages with runtime name prefix: [name] message
+.TP
+.B \-bt
+Output messages with timestamp: [HH:MM:SS] message
+.TP
+.B \-bpt
+Output messages with both timestamp and prefix: [HH:MM:SS] [name] message
+.TP
+.BI "\-\-max\-connections " "n"
+Limit maximum concurrent connections. New connections beyond this limit
+are immediately closed. 0 means unlimited (default). Alias:
+.BR \-\-max\-conn .
+.TP
+.BI "\-\-rate\-limit " "n"
+Limit messages per second per connection using a token bucket algorithm.
+Excess messages are silently dropped. 0 means unlimited (default).
+.TP
+.B \-\-drain
+Enable graceful shutdown. When stopping, the runtime closes its listener
+but flushes all pending write queues before closing connections.
+.TP
+.B \-\-tls
+Enable TLS encryption for all connections. Requires
+.B \-\-cert
+and
+.B \-\-key
+for accepting runtimes (server, cache, proxy) or
+.B \-\-ca
+for connecting runtimes (client).
+.TP
+.BI "\-\-cert " "file"
+Path to TLS certificate file (PEM format).
+.TP
+.BI "\-\-key " "file"
+Path to TLS private key file (PEM format).
+.TP
+.BI "\-\-ca " "file"
+Path to TLS CA certificate file for client verification.
+.SH SERVER FLAGS
+.TP
+.BI "\-\-mode " "mode"
+Message flow direction:
+.B inout
+(bidirectional, default),
+.B in
+(receive only),
+.B out
+(send only),
+.B master
+(one client claims master, only master's messages are broadcast).
+.TP
+.B \-\-udp
+Use UDP instead of TCP. The server binds a single SOCK_DGRAM socket.
+Peers are auto-registered on first datagram. Each datagram is one message
+(no line-parsing). Broadcast sends to all known peers via sendto().
+Not available for cache or proxy. Incompatible with master mode.
+.TP
+.BI "\-\-master\-pw " "password"
+Static password for master mode authentication. A client sends "master <password>"
+to claim master role. Only one master at a time; master is released on disconnect.
+Alternatively, use the
+.B on_master_auth(client_id, password)
+Lua callback for dynamic authentication.
+.TP
+.B \-\-master\-forward
+When set in master mode, non-master client messages are forwarded to the master
+as "[<fd>] <message>\\n" instead of being silently dropped.
+.SS WebSocket Support
+Servers automatically detect WebSocket upgrade requests on each connection.
+When a client sends an HTTP GET with "Upgrade: websocket", the server completes
+the handshake and transparently frames/deframes messages. Raw TCP and WebSocket
+clients coexist on the same port. No flag is needed.
+.PP
+Browser example:
+.nf
+const ws = new WebSocket("ws://localhost:9000");
+ws.onmessage = e => console.log(e.data);
+ws.send("hello");
+.fi
+.SS Cache Access via Server
+When a server is linked to a cache with
+.BR \-\-cache ,
+clients can send "cache <command>" messages to execute commands directly against
+the linked cache. The response is sent back to the sender only (never broadcast).
+Normal messages are still processed according to the server's mode.
+.PP
+.nf
+socketley create cache store -p 9001 -s
+socketley create server api -p 9000 --cache store -s
+# Client sends: "cache set foo bar" → receives "ok"
+# Client sends: "cache get foo" → receives "bar"
+.fi
+.PP
+Default port: 8000
+.SH CLIENT FLAGS
+.TP
+.BI "\-t " "host:port"
+Target server to connect to. Default: 127.0.0.1:8000
+.TP
+.BI "\-\-mode " "mode"
+Message flow direction:
+.B inout
+(bidirectional, default),
+.B in
+(receive only),
+.B out
+(send only).
+.TP
+.B \-\-udp
+Use UDP instead of TCP. Creates a connected SOCK_DGRAM socket.
+Each datagram is one message (no line-parsing).
+Not available for cache or proxy.
+.SH PROXY FLAGS
+.TP
+.BI "\-\-backend " "addr"
+Add backend server. Can be ip:port or runtime name. Repeatable or comma-separated.
+.TP
+.BI "\-\-strategy " "strategy"
+Load balancing strategy:
+.B round-robin
+(default),
+.B random
+,
+.B lua
+(custom via on_route callback).
+.TP
+.BI "\-\-protocol " "protocol"
+.B http
+(default, path-based routing) or
+.B tcp
+(raw byte forwarding).
+.PP
+Default port: 8080
+.PP
+HTTP mode: Requests to /<proxy-name>/* are forwarded with prefix stripped.
+.SH CACHE FLAGS
+.TP
+.BI "\-\-persistent " "file"
+Persistent storage file. Cache is saved on stop and loaded on start.
+.TP
+.BI "\-\-mode " "mode"
+Access control mode:
+.B readonly
+(GET, SIZE only),
+.B readwrite
+(GET, SET, DEL, SIZE \- default),
+.B admin
+(all commands including FLUSH, LOAD).
+.TP
+.BI "\-\-maxmemory " "size"
+Maximum memory for cache data. Supports K, M, G suffixes (e.g., 100M, 1G).
+When exceeded, behavior depends on eviction policy. 0 means unlimited (default).
+.TP
+.BI "\-\-eviction " "policy"
+Eviction policy when maxmemory is reached:
+.B noeviction
+(reject writes, default),
+.B allkeys\-lru
+(evict least recently used),
+.B allkeys\-random
+(evict random keys).
+.TP
+.B \-\-resp
+Force RESP2 protocol mode for all connections (Redis wire protocol).
+By default, the cache auto-detects RESP mode when a connection's first
+byte is '*'. With this flag, all connections use RESP regardless.
+.TP
+.BI "\-\-replicate " "host:port"
+Connect as a follower to the specified leader cache. The follower receives
+a full data dump on connect, then receives ongoing write command replication.
+The follower operates in read-only mode.
+.PP
+Default port: 9000
+.SS Cache Protocol
+Connect via TCP and send commands (newline-terminated, all lowercase).
+.PP
+.B Strings:
+.TP
+.BI "set " "key value"
+Store a key-value pair. Returns "ok" or "error: type conflict".
+.TP
+.BI "get " "key"
+Retrieve value. Returns value or "nil".
+.TP
+.BI "del " "key"
+Delete key (any type). Returns "ok" or "nil".
+.TP
+.BI "exists " "key"
+Check if key exists. Returns "1" or "0".
+.TP
+.B size
+Return number of stored keys (all types).
+.PP
+.B Lists (ordered, deque-backed):
+.TP
+.BI "lpush " "key value"
+Insert at front. Returns "ok" or "error: type conflict".
+.TP
+.BI "rpush " "key value"
+Insert at back.
+.TP
+.BI "lpop " "key"
+Remove and return front element. Returns value or "nil".
+.TP
+.BI "rpop " "key"
+Remove and return back element.
+.TP
+.BI "llen " "key"
+Return list length.
+.TP
+.BI "lindex " "key index"
+Return element at index (negative = from end).
+.TP
+.BI "lrange " "key start stop"
+Return range of elements (multi-line, "end" terminator). Negative indices supported.
+.PP
+.B Sets (unique unordered members):
+.TP
+.BI "sadd " "key member"
+Add member. Returns "ok", "exists", or "error: type conflict".
+.TP
+.BI "srem " "key member"
+Remove member. Returns "ok" or "nil".
+.TP
+.BI "sismember " "key member"
+Check membership. Returns "1" or "0".
+.TP
+.BI "scard " "key"
+Return set cardinality.
+.TP
+.BI "smembers " "key"
+Return all members (multi-line, "end" terminator).
+.PP
+.B Hashes (nested key-value maps):
+.TP
+.BI "hset " "key field value"
+Set hash field. Returns "ok" or "error: type conflict".
+.TP
+.BI "hget " "key field"
+Get hash field value. Returns value or "nil".
+.TP
+.BI "hdel " "key field"
+Delete hash field. Returns "ok" or "nil".
+.TP
+.BI "hlen " "key"
+Return number of hash fields.
+.TP
+.BI "hgetall " "key"
+Return all fields and values (multi-line "field value\n", "end" terminator).
+.PP
+.B TTL / Expiry:
+.TP
+.BI "expire " "key seconds"
+Set time-to-live. Returns "ok" or "nil" (key not found).
+.TP
+.BI "ttl " "key"
+Return remaining seconds, -1 (no ttl), or -2 (not found).
+.TP
+.BI "persist " "key"
+Remove expiry. Returns "ok" or "nil".
+.PP
+.B Pub/Sub:
+.TP
+.BI "subscribe " "channel"
+Subscribe to a channel. Returns "ok". Messages are delivered as
+"message <channel> <payload>\\n".
+.TP
+.BI "unsubscribe " "channel"
+Unsubscribe from a channel. Returns "ok".
+.TP
+.BI "publish " "channel message"
+Publish a message to all subscribers. Returns number of subscribers reached.
+.PP
+.B Memory Management:
+.TP
+.BI "maxmemory " ""
+Query current maxmemory setting. Returns bytes or "0" (unlimited).
+.TP
+.BI "memory " ""
+Query current memory usage in bytes.
+.PP
+.B Admin (requires --mode admin):
+.TP
+.BI "flush " "[path]"
+Save cache to file (uses --persistent path if omitted).
+.TP
+.BI "load " "[path]"
+Load cache from file.
+.PP
+Type enforcement: a key can only hold one data type. Writing to a key of a different type returns "error: type conflict".
+Multi-line responses (lrange, smembers, hgetall) terminate with "end\n".
+.SS RESP Protocol (Redis Compatibility)
+The cache supports the RESP2 wire protocol for compatibility with Redis clients
+(redis-cli, Redis client libraries). RESP mode is auto-detected when a
+connection's first byte is '*', or can be forced with
+.BR \-\-resp .
+.PP
+Supported Redis commands (case-insensitive): SET (with EX option), GET, DEL,
+EXISTS, PING, DBSIZE, LPUSH, RPUSH, LPOP, RPOP, LLEN, SADD, SREM, SISMEMBER,
+SCARD, SMEMBERS, HSET, HGET, HDEL, HLEN, HGETALL, EXPIRE, TTL, PERSIST,
+SUBSCRIBE, UNSUBSCRIBE, PUBLISH.
+.PP
+Example with redis-cli:
+.nf
+redis-cli -p 9000 SET mykey myval
+redis-cli -p 9000 GET mykey
+redis-cli -p 9000 SUBSCRIBE news
+.fi
+.SS Replication
+Cache runtimes support leader-follower replication.
+.PP
+The follower connects to the leader and receives a full data dump, then
+ongoing write commands are forwarded in real-time. Followers are read-only.
+.PP
+.nf
+# Start leader cache
+socketley create cache leader -p 9000 -s
+
+# Start follower
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
+
+# Writes on leader are replicated to follower
+echo "set key val" | nc localhost 9000
+echo "get key" | nc localhost 9001    # Returns "val"
+.fi
+.PP
+Example with netcat:
+.nf
+echo "set user:1 alice" | nc localhost 9000
+echo "get user:1" | nc localhost 9000
+echo "lpush queue task1" | nc localhost 9000
+echo "hset user:1 name alice" | nc localhost 9000
+echo "expire user:1 300" | nc localhost 9000
+echo "subscribe news" | nc localhost 9000
+.fi
+.SH LUA CONFIGURATION
+Lua scripts can define multiple runtimes and attach callbacks.
+.SS Configuration File Format
+.nf
+runtimes = {
+    { type = "server", name = "api", port = 9000, autostart = true },
+    { type = "client", name = "cli", port = 9000, target = "127.0.0.1:9000" },
+    { type = "proxy",  name = "gw", port = 8080,
+      backends = {"127.0.0.1:9000"}, strategy = "round-robin" },
+    { type = "cache",  name = "store", port = 9001,
+      persistent = "/data/store.bin" }
+}
+.fi
+.SS Available Callbacks
+.TP
+.B on_start()
+Called when runtime starts.
+.TP
+.B on_stop()
+Called when runtime stops.
+.TP
+.B on_message(msg)
+Called when message received (server/client).
+.TP
+.B on_connect(client_id)
+Called when a client connects (server/client). The client_id is the file descriptor.
+.TP
+.B on_disconnect(client_id)
+Called when a client disconnects (server/client).
+.TP
+.B on_send(msg)
+Called when message sent.
+.TP
+.B on_route(method, path)
+Proxy only. Custom backend selection. Returns backend index (0-based).
+.TP
+.B on_master_auth(client_id, password)
+Server only (master mode). Custom authentication. Return true to grant
+master role, false to deny. If defined, overrides
+.BR \-\-master\-pw .
+.SS Runtime Methods (in Lua)
+.nf
+self.name      -- Runtime name (read-only)
+self.port      -- Port number (read-only)
+self.state     -- Current state (read-only)
+self.type      -- Runtime type (read-only)
+self.protocol  -- "tcp" or "udp" (server/client only)
+self.send(msg)             -- Send message (client)
+self.send(client_id, msg)  -- Send to specific client (server)
+self.broadcast(msg)        -- Broadcast to all clients (server)
+
+-- Cache: strings
+self.get(key)       -- Get string value
+self.set(key, val)  -- Set string value
+self.del(key)       -- Delete key (any type)
+
+-- Cache: lists
+self.lpush(key, val)        -- Push to front
+self.rpush(key, val)        -- Push to back
+self.lpop(key)              -- Pop from front
+self.rpop(key)              -- Pop from back
+self.llen(key)              -- List length
+
+-- Cache: sets
+self.sadd(key, member)      -- Add member
+self.srem(key, member)      -- Remove member
+self.sismember(key, member) -- Check membership
+self.scard(key)             -- Set cardinality
+
+-- Cache: hashes
+self.hset(key, field, val)  -- Set hash field
+self.hget(key, field)       -- Get hash field
+self.hdel(key, field)       -- Delete hash field
+self.hlen(key)              -- Hash field count
+
+-- Cache: TTL
+self.expire(key, seconds)   -- Set expiry
+self.ttl(key)               -- Get remaining TTL
+self.persist(key)           -- Remove expiry
+
+-- Cache: pub/sub
+self.publish(channel, msg)  -- Publish to channel
+.fi
+.SS Global Functions
+.TP
+.B socketley.log(msg)
+Output log message with [lua] prefix.
+.SH RUNTIME STATES
+.TP
+.B created
+Initial state after creation.
+.TP
+.B running
+Active and processing I/O.
+.TP
+.B stopped
+Stopped but can be restarted.
+.TP
+.B failed
+Setup failed, cannot recover.
+.SH EXAMPLES
+Start daemon and create a simple server:
+.PP
+.nf
+socketley daemon &
+socketley create server myserver -p 9000 -s
+.fi
+.PP
+Create client connecting to server:
+.PP
+.nf
+socketley create client myclient -t 127.0.0.1:9000 -s
+.fi
+.PP
+Create HTTP proxy with load balancing:
+.PP
+.nf
+socketley create proxy gateway -p 8080 \\
+    --backend 127.0.0.1:9001,127.0.0.1:9002 \\
+    --strategy round-robin -s
+.fi
+.PP
+Server with bash output (messages to stdout):
+.PP
+.nf
+socketley create server echo -p 9000 -b -s
+# With timestamp and prefix:
+socketley create server echo -p 9000 -bpt -s
+.fi
+.PP
+Send message to runtime:
+.PP
+.nf
+socketley send myserver "Hello from CLI"
+socketley send myclient "Message to server"
+.fi
+.PP
+Create persistent cache with maxmemory:
+.PP
+.nf
+socketley create cache store -p 9000 \\
+    --persistent /data/cache.bin \\
+    --maxmemory 256M --eviction allkeys-lru -s
+.fi
+.PP
+Create cache with RESP mode (Redis-compatible):
+.PP
+.nf
+socketley create cache redis-compat -p 6379 --resp -s
+redis-cli -p 6379 SET mykey myval
+redis-cli -p 6379 GET mykey
+.fi
+.PP
+Server with connection limits and rate limiting:
+.PP
+.nf
+socketley create server api -p 9000 \\
+    --max-connections 100 --rate-limit 1000 -s
+.fi
+.PP
+View runtime statistics:
+.PP
+.nf
+socketley stats myserver
+# Output: name, type, port, connections, total_messages, bytes_in/out, ...
+.fi
+.PP
+Restart a running runtime:
+.PP
+.nf
+socketley reload myserver
+# Stops and restarts the runtime
+socketley reload *
+# Restarts all running runtimes
+.fi
+.PP
+Hot-reload Lua script:
+.PP
+.nf
+socketley reload-lua myserver
+# Re-loads the Lua script without stopping the runtime
+socketley reload-lua *
+# Hot-reloads Lua on all runtimes with scripts
+.fi
+.PP
+Start/stop all runtimes:
+.PP
+.nf
+socketley start *
+# Starts all non-running runtimes
+socketley stop *
+# Stops all running runtimes
+socketley remove *
+# Stops all and removes everything
+.fi
+.PP
+Multiple names and glob patterns:
+.PP
+.nf
+socketley stop myserver myclient
+# Stops both runtimes
+socketley stop my*
+# Stops all runtimes starting with "my"
+socketley stats cache?
+# Shows stats for cache1, cache2, etc.
+socketley start myserver cache*
+# Starts myserver and all cache-prefixed runtimes
+socketley remove api-* test-*
+# Removes all api- and test- prefixed runtimes
+.fi
+.PP
+Interactive mode (live terminal session):
+.PP
+.nf
+# Start server and enter interactive session
+socketley create server echo -p 9000
+socketley start echo -i
+# Type messages to broadcast, see received messages
+# Press Ctrl+C to detach (server keeps running)
+
+# Attach to already-running cache
+socketley start mycache -i
+# Type cache commands: set foo bar, get foo, etc.
+.fi
+.PP
+Interactive edit (opens JSON config in $EDITOR):
+.PP
+.nf
+socketley edit myserver           # Opens config in editor
+socketley edit myserver -r        # Opens editor, auto-reloads Lua after save
+socketley edit myserver -p 9001   # Flag-based edit (direct)
+.fi
+.PP
+Cache replication (leader-follower):
+.PP
+.nf
+socketley create cache leader -p 9000 -s
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
+.fi
+.PP
+TLS-encrypted server:
+.PP
+.nf
+socketley create server secure -p 9000 \\
+    --tls --cert server.pem --key server-key.pem -s
+.fi
+.PP
+Graceful shutdown (drain pending writes):
+.PP
+.nf
+socketley create server api -p 9000 --drain -s
+socketley stop api   # Flushes write queues before closing
+.fi
+.PP
+UDP server (fire-and-forget messaging):
+.PP
+.nf
+socketley create server metrics -p 9000 --udp -b -s
+echo "cpu.load 0.42" | socat - UDP:localhost:9000
+.fi
+.PP
+UDP client:
+.PP
+.nf
+socketley create client udpcli -t 127.0.0.1:9000 --udp -s
+.fi
+.PP
+Create read-only cache (for shared lookups):
+.PP
+.nf
+socketley create cache lookup -p 9000 --mode readonly -s
+.fi
+.PP
+Master mode server (one controller, many viewers):
+.PP
+.nf
+socketley create server broadcast -p 9000 \\
+    --mode master --master-pw secret -s
+# Client A: sends "master secret" → "master: ok"
+# Client A: sends "hello" → broadcast to all others
+# Client B: sends "hello" → silently dropped
+.fi
+.PP
+Master mode with forwarding:
+.PP
+.nf
+socketley create server ctrl -p 9000 \\
+    --mode master --master-pw admin123 --master-forward -s
+# Non-master messages forwarded to master as "[<fd>] msg"
+.fi
+.PP
+WebSocket server (auto-detected, no flags needed):
+.PP
+.nf
+socketley create server ws -p 9000 -s
+# Browser: new WebSocket("ws://localhost:9000")
+# Raw TCP clients also work on the same port
+.fi
+.PP
+Cache access through server:
+.PP
+.nf
+socketley create cache db -p 9001 -s
+socketley create server api -p 9000 --cache db -s
+# Client sends: "cache set user:1 alice" → "ok"
+# Client sends: "cache get user:1" → "alice"
+# Client sends: "hello" → broadcast as usual
+.fi
+.PP
+Load complex configuration:
+.PP
+.nf
+socketley --config /etc/socketley/setup.lua
+.fi
+.SH INSTALLATION
+.SS Quick Install
+.nf
+sudo bash packaging/install.sh
+sudo systemctl start socketley
+.fi
+.SS Debian Package
+.nf
+bash packaging/build-deb.sh 1.0.0
+sudo dpkg -i socketley_1.0.0_amd64.deb
+sudo systemctl start socketley
+.fi
+.SS Uninstall
+.nf
+sudo bash packaging/uninstall.sh
+.fi
+.SH STATE PERSISTENCE
+Runtime configurations are persisted as JSON files. When a runtime is created,
+its configuration is saved. When the daemon starts, all persisted runtimes are
+restored. Runtimes that were running when the daemon stopped are auto-started.
+.PP
+This means runtimes survive daemon restarts and system reboots (like Docker
+with restart-always policy).
+.PP
+State is saved after create, start, stop, remove, and edit commands.
+The
+.B was_running
+field tracks whether a runtime should be auto-started on daemon startup.
+.SH FILES
+.SS System Mode (installed via package)
+.TP
+.I /usr/bin/socketley
+Binary.
+.TP
+.I /usr/lib/systemd/system/socketley.service
+systemd unit file.
+.TP
+.I /run/socketley/socketley.sock
+Unix domain socket for daemon IPC.
+.TP
+.I /var/lib/socketley/runtimes/
+Per-runtime JSON configuration files.
+.TP
+.I /etc/socketley/config.lua
+Daemon configuration.
+.SS Development Mode (no system install)
+.TP
+.I /tmp/socketley.sock
+Unix domain socket for daemon IPC.
+.TP
+.I ~/.local/share/socketley/runtimes/
+Per-runtime JSON configuration files.
+.TP
+.I ~/.config/socketley/config.lua
+Daemon configuration (or set SOCKETLEY_CONFIG env var).
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (invalid command, runtime not found, etc.).
+.SH SEE ALSO
+.BR docker (1),
+.BR nginx (1),
+.BR redis-server (1)
+.SH BUGS
+Report bugs at: https://github.com/socketley/socketley/issues
+.SH AUTHORS
+socketley was created for high-performance network runtime management.

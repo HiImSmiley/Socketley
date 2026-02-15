@@ -1,4 +1,6 @@
-int main()
+#include "cli/cli.h"
+
+int main(int argc, char** argv)
 {
-    return 0;
+    return cli_dispatch(argc, argv);
 }
