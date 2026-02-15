@@ -1,0 +1,12 @@
+[
+{
+  "test": "proxy_http_single_backend",
+  "timestamp": "2026-02-06T15:11:10+01:00",
+  "requests": 1000,
+  "success": 0,
+  "total_time_ms": 9556,
+  "requests_per_sec": 0,
+  "avg_latency_ms": 0,
+  "p99_latency_ms": 0
+}
+]

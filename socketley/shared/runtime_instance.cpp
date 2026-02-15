@@ -1,0 +1,398 @@
+#include "runtime_instance.h"
+#include "event_loop.h"
+#include "lua_context.h"
+#include "id_generator.h"
+#include <iostream>
+#include <iomanip>
+#include <ctime>
+#include <unistd.h>
+#include <cerrno>
+
+runtime_instance::runtime_instance(runtime_type type, std::string_view name)
+    : m_name(name), m_id(generate_runtime_id()), m_type(type), m_state(runtime_created),
+      m_created_time(std::chrono::system_clock::now())
+{
+}
+
+runtime_instance::~runtime_instance() = default;
+
+bool runtime_instance::start(event_loop& loop)
+{
+    runtime_state current = m_state.load(std::memory_order_acquire);
+
+    if (current != runtime_created && current != runtime_stopped)
+        return false;
+
+    if (!setup(loop))
+    {
+        m_state.store(runtime_failed, std::memory_order_release);
+        return false;
+    }
+
+    m_state.store(runtime_running, std::memory_order_release);
+    m_start_time = std::chrono::system_clock::now();
+    invoke_on_start();
+    return true;
+}
+
+bool runtime_instance::stop(event_loop& loop)
+{
+    if (m_state.load(std::memory_order_acquire) != runtime_running)
+        return false;
+
+    invoke_on_stop();
+    teardown(loop);
+    m_state.store(runtime_stopped, std::memory_order_release);
+
+    // Signal all interactive sessions that runtime has stopped
+    for (int ifd : m_interactive_fds)
+        (void)::write(ifd, "\0", 1);
+    m_interactive_fds.clear();
+
+    return true;
+}
+
+runtime_state runtime_instance::get_state() const
+{
+    return m_state.load(std::memory_order_relaxed);
+}
+
+runtime_type runtime_instance::get_type() const
+{
+    return m_type;
+}
+
+std::string_view runtime_instance::get_name() const
+{
+    return m_name;
+}
+
+void runtime_instance::set_name(std::string_view name)
+{
+    m_name = std::string(name);
+}
+
+std::string_view runtime_instance::get_id() const
+{
+    return m_id;
+}
+
+void runtime_instance::set_id(std::string_view id)
+{
+    m_id = id;
+}
+
+std::chrono::system_clock::time_point runtime_instance::get_created_time() const
+{
+    return m_created_time;
+}
+
+std::chrono::system_clock::time_point runtime_instance::get_start_time() const
+{
+    return m_start_time;
+}
+
+void runtime_instance::set_port(uint16_t port)
+{
+    m_port = port;
+}
+
+uint16_t runtime_instance::get_port() const
+{
+    return m_port;
+}
+
+void runtime_instance::set_log_file(std::string_view path)
+{
+    m_log_file = path;
+}
+
+std::string_view runtime_instance::get_log_file() const
+{
+    return m_log_file;
+}
+
+void runtime_instance::set_write_file(std::string_view path)
+{
+    m_write_file = path;
+}
+
+std::string_view runtime_instance::get_write_file() const
+{
+    return m_write_file;
+}
+
+void runtime_instance::set_test_mode(bool enabled)
+{
+    m_test_mode = enabled;
+}
+
+bool runtime_instance::get_test_mode() const
+{
+    return m_test_mode;
+}
+
+void runtime_instance::set_target(std::string_view target)
+{
+    m_target = target;
+}
+
+std::string_view runtime_instance::get_target() const
+{
+    return m_target;
+}
+
+void runtime_instance::set_cache_name(std::string_view name)
+{
+    m_cache_name = name;
+}
+
+std::string_view runtime_instance::get_cache_name() const
+{
+    return m_cache_name;
+}
+
+void runtime_instance::set_bash_output(bool enabled)
+{
+    m_bash_output = enabled;
+}
+
+void runtime_instance::set_bash_prefix(bool enabled)
+{
+    m_bash_prefix = enabled;
+}
+
+void runtime_instance::set_bash_timestamp(bool enabled)
+{
+    m_bash_timestamp = enabled;
+}
+
+bool runtime_instance::get_bash_output() const
+{
+    return m_bash_output;
+}
+
+bool runtime_instance::get_bash_prefix() const
+{
+    return m_bash_prefix;
+}
+
+bool runtime_instance::get_bash_timestamp() const
+{
+    return m_bash_timestamp;
+}
+
+void runtime_instance::print_bash_message(std::string_view msg) const
+{
+    if (!m_bash_output)
+        return;
+
+    if (m_bash_timestamp)
+    {
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::localtime(&time);
+        std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] ";
+    }
+
+    if (m_bash_prefix)
+        std::cout << "[" << m_name << "] ";
+
+    std::cout << msg << std::endl;
+}
+
+bool runtime_instance::load_lua_script(std::string_view path)
+{
+    m_lua = std::make_unique<lua_context>();
+
+    if (!m_lua->load_script(path, this))
+    {
+        m_lua.reset();
+        return false;
+    }
+
+    m_lua_script_path = path;
+    return true;
+}
+
+bool runtime_instance::reload_lua_script()
+{
+    if (m_lua_script_path.empty())
+        return false;
+
+    if (m_state.load(std::memory_order_acquire) != runtime_running)
+        return false;
+
+    m_lua.reset();
+    m_lua = std::make_unique<lua_context>();
+
+    if (!m_lua->load_script(m_lua_script_path, this))
+    {
+        m_lua.reset();
+        return false;
+    }
+
+    m_lua->update_self_state("running");
+    return true;
+}
+
+std::string_view runtime_instance::get_lua_script_path() const
+{
+    return m_lua_script_path;
+}
+
+void runtime_instance::invoke_on_start()
+{
+    if (!m_lua || !m_lua->has_on_start())
+        return;
+
+    m_lua->update_self_state("running");
+
+    try {
+        m_lua->on_start()();
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_start error: " << e.what() << std::endl;
+    }
+}
+
+void runtime_instance::invoke_on_stop()
+{
+    if (!m_lua || !m_lua->has_on_stop())
+        return;
+
+    m_lua->update_self_state("stopped");
+
+    try {
+        m_lua->on_stop()();
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_stop error: " << e.what() << std::endl;
+    }
+}
+
+void runtime_instance::invoke_on_message(std::string_view msg)
+{
+    if (!m_lua || !m_lua->has_on_message())
+        return;
+
+    try {
+        m_lua->on_message()(std::string(msg));
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_message error: " << e.what() << std::endl;
+    }
+}
+
+void runtime_instance::invoke_on_connect(int client_id)
+{
+    if (!m_lua || !m_lua->has_on_connect())
+        return;
+
+    try {
+        m_lua->on_connect()(client_id);
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_connect error: " << e.what() << std::endl;
+    }
+}
+
+void runtime_instance::invoke_on_disconnect(int client_id)
+{
+    if (!m_lua || !m_lua->has_on_disconnect())
+        return;
+
+    try {
+        m_lua->on_disconnect()(client_id);
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_disconnect error: " << e.what() << std::endl;
+    }
+}
+
+void runtime_instance::invoke_on_send(std::string_view msg)
+{
+    if (!m_lua || !m_lua->has_on_send())
+        return;
+
+    try {
+        m_lua->on_send()(std::string(msg));
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_send error: " << e.what() << std::endl;
+    }
+}
+
+// ─── Resource limits ───
+
+void runtime_instance::set_max_connections(uint32_t max) { m_max_connections = max; }
+uint32_t runtime_instance::get_max_connections() const { return m_max_connections; }
+
+void runtime_instance::set_rate_limit(double rate) { m_rate_limit = rate; }
+double runtime_instance::get_rate_limit() const { return m_rate_limit; }
+
+void runtime_instance::set_drain(bool enabled) { m_drain = enabled; }
+bool runtime_instance::get_drain() const { return m_drain; }
+
+// ─── TLS ───
+
+void runtime_instance::set_tls(bool enabled) { m_tls = enabled; }
+bool runtime_instance::get_tls() const { return m_tls; }
+void runtime_instance::set_cert_path(std::string_view path) { m_cert_path = path; }
+std::string_view runtime_instance::get_cert_path() const { return m_cert_path; }
+void runtime_instance::set_key_path(std::string_view path) { m_key_path = path; }
+std::string_view runtime_instance::get_key_path() const { return m_key_path; }
+void runtime_instance::set_ca_path(std::string_view path) { m_ca_path = path; }
+std::string_view runtime_instance::get_ca_path() const { return m_ca_path; }
+
+// ─── Stats ───
+
+std::string runtime_instance::get_stats() const
+{
+    std::ostringstream out;
+    out << "name:" << m_name << "\n"
+        << "type:" << (m_type == runtime_server ? "server" :
+                      m_type == runtime_client ? "client" :
+                      m_type == runtime_proxy  ? "proxy"  :
+                      m_type == runtime_cache  ? "cache"  : "unknown") << "\n"
+        << "port:" << m_port << "\n"
+        << "connections:" << get_connection_count() << "\n"
+        << "total_connections:" << m_stat_total_connections.load(std::memory_order_relaxed) << "\n"
+        << "total_messages:" << m_stat_total_messages.load(std::memory_order_relaxed) << "\n"
+        << "bytes_in:" << m_stat_bytes_in.load(std::memory_order_relaxed) << "\n"
+        << "bytes_out:" << m_stat_bytes_out.load(std::memory_order_relaxed) << "\n";
+    return out.str();
+}
+
+// ─── Interactive mode ───
+
+void runtime_instance::add_interactive_fd(int fd)
+{
+    m_interactive_fds.push_back(fd);
+}
+
+void runtime_instance::remove_interactive_fd(int fd)
+{
+    m_interactive_fds.erase(
+        std::remove(m_interactive_fds.begin(), m_interactive_fds.end(), fd),
+        m_interactive_fds.end());
+}
+
+void runtime_instance::notify_interactive(std::string_view msg) const
+{
+    if (m_interactive_fds.empty())
+        return;
+
+    std::string line;
+    line.reserve(msg.size() + 1);
+    line.append(msg.data(), msg.size());
+    if (line.empty() || line.back() != '\n')
+        line += '\n';
+
+    for (size_t i = 0; i < m_interactive_fds.size(); )
+    {
+        ssize_t n = ::write(m_interactive_fds[i], line.data(), line.size());
+        if (n < 0 && errno == EPIPE)
+        {
+            // Remove dead fd (const_cast is safe since we own the vector)
+            auto& fds = const_cast<std::vector<int>&>(m_interactive_fds);
+            fds.erase(fds.begin() + i);
+        }
+        else
+            ++i;
+    }
+}

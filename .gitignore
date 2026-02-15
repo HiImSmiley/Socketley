@@ -39,3 +39,12 @@
 
 # debug information files
 *.dwo
+
+# Build output
+bin/Debug/
+bin/Release/
+make/
+
+# Packages
+*.deb
+*.rpm

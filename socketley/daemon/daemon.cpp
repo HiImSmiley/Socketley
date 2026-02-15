@@ -1,0 +1,253 @@
+#include "daemon.h"
+#include "daemon_handler.h"
+#include "../shared/event_loop.h"
+#include "../shared/runtime_manager.h"
+#include "../shared/logging.h"
+#include "../shared/paths.h"
+#include "../shared/state_persistence.h"
+#include "../runtime/server/server_instance.h"
+#include "../runtime/client/client_instance.h"
+#include "../runtime/proxy/proxy_instance.h"
+#include "../runtime/cache/cache_instance.h"
+
+#include <csignal>
+#include <cstdlib>
+#include <unistd.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <sol/sol.hpp>
+
+static int g_signal_write_fd = -1;
+
+static void signal_handler(int)
+{
+    if (g_signal_write_fd >= 0)
+    {
+        char c = 1;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+        write(g_signal_write_fd, &c, 1);
+#pragma GCC diagnostic pop
+    }
+}
+
+static bool parse_log_level(std::string_view str, log_level& level)
+{
+    if (str == "debug") { level = log_debug; return true; }
+    if (str == "info")  { level = log_info;  return true; }
+    if (str == "warn")  { level = log_warn;  return true; }
+    if (str == "error") { level = log_error; return true; }
+    return false;
+}
+
+static void load_daemon_config(const std::string& config_path)
+{
+    std::string path = config_path;
+
+    // Check SOCKETLEY_CONFIG env var first
+    const char* env = std::getenv("SOCKETLEY_CONFIG");
+    if (env && env[0])
+        path = env;
+
+    if (path.empty())
+        return;
+
+    // Check if file exists
+    std::ifstream check(path);
+    if (!check.good())
+        return;
+    check.close();
+
+    sol::state lua;
+    lua.open_libraries(sol::lib::base, sol::lib::string);
+
+    auto result = lua.safe_script_file(path, sol::script_pass_on_error);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        std::cerr << "[config] error loading " << path << ": " << err.what() << "\n";
+        return;
+    }
+
+    // Parse config table
+    sol::optional<sol::table> config = lua["config"];
+    if (!config)
+        return;
+
+    // log_level
+    sol::optional<std::string> ll = (*config)["log_level"];
+    if (ll)
+    {
+        log_level level;
+        if (parse_log_level(*ll, level))
+            logger::g_level = level;
+    }
+}
+
+static void restore_runtimes(state_persistence& persistence,
+                              runtime_manager& manager, event_loop& loop)
+{
+    auto configs = persistence.load_all();
+    if (configs.empty())
+        return;
+
+    LOG_INFO("restoring runtimes from state");
+
+    // Pass 1: Create all runtimes and apply configs
+    for (const auto& cfg : configs)
+    {
+        if (!manager.create(cfg.type, cfg.name))
+        {
+            LOG_WARN("restore: could not create runtime (already exists?)");
+            continue;
+        }
+
+        auto* instance = manager.get(cfg.name);
+        if (!instance)
+            continue;
+
+        // Restore persisted ID
+        instance->set_id(cfg.id);
+
+        // Common fields
+        if (cfg.port > 0) instance->set_port(cfg.port);
+        if (!cfg.log_file.empty()) instance->set_log_file(cfg.log_file);
+        if (!cfg.write_file.empty()) instance->set_write_file(cfg.write_file);
+        if (cfg.bash_output) instance->set_bash_output(true);
+        if (cfg.bash_prefix) instance->set_bash_prefix(true);
+        if (cfg.bash_timestamp) instance->set_bash_timestamp(true);
+        if (cfg.max_connections > 0) instance->set_max_connections(cfg.max_connections);
+        if (cfg.rate_limit > 0.0) instance->set_rate_limit(cfg.rate_limit);
+        if (cfg.drain) instance->set_drain(true);
+        if (cfg.tls) instance->set_tls(true);
+        if (!cfg.cert_path.empty()) instance->set_cert_path(cfg.cert_path);
+        if (!cfg.key_path.empty()) instance->set_key_path(cfg.key_path);
+        if (!cfg.ca_path.empty()) instance->set_ca_path(cfg.ca_path);
+        if (!cfg.target.empty()) instance->set_target(cfg.target);
+        if (!cfg.cache_name.empty()) instance->set_cache_name(cfg.cache_name);
+
+        if (!cfg.lua_script.empty())
+        {
+            if (!instance->load_lua_script(cfg.lua_script))
+                LOG_WARN("restore: could not load lua script");
+        }
+
+        // Type-specific
+        switch (cfg.type)
+        {
+            case runtime_server:
+            {
+                auto* srv = static_cast<server_instance*>(instance);
+                srv->set_mode(static_cast<server_mode>(cfg.mode));
+                if (cfg.udp) srv->set_udp(true);
+                if (!cfg.cache_name.empty())
+                    srv->set_runtime_manager(&manager);
+                if (!cfg.master_pw.empty())
+                    srv->set_master_pw(cfg.master_pw);
+                if (cfg.master_forward)
+                    srv->set_master_forward(true);
+                break;
+            }
+            case runtime_client:
+            {
+                auto* cli = static_cast<client_instance*>(instance);
+                cli->set_mode(static_cast<client_mode>(cfg.mode));
+                if (cfg.udp) cli->set_udp(true);
+                break;
+            }
+            case runtime_proxy:
+            {
+                auto* prx = static_cast<proxy_instance*>(instance);
+                prx->set_runtime_manager(&manager);
+                prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
+                prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
+                for (const auto& b : cfg.backends)
+                    prx->add_backend(b);
+                break;
+            }
+            case runtime_cache:
+            {
+                auto* cache = static_cast<cache_instance*>(instance);
+                if (!cfg.persistent_path.empty()) cache->set_persistent(cfg.persistent_path);
+                cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
+                if (cfg.resp_forced) cache->set_resp_forced(true);
+                if (!cfg.replicate_target.empty()) cache->set_replicate_target(cfg.replicate_target);
+                if (cfg.max_memory > 0) cache->set_max_memory(cfg.max_memory);
+                cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
+                break;
+            }
+        }
+    }
+
+    // Pass 2: Start runtimes that were running
+    for (const auto& cfg : configs)
+    {
+        if (!cfg.was_running)
+            continue;
+
+        if (!manager.run(cfg.name, loop))
+            LOG_WARN("restore: could not start runtime");
+        else
+            LOG_DEBUG("restored runtime");
+    }
+}
+
+int daemon_start(runtime_manager& manager, event_loop& loop)
+{
+    // Resolve paths (system vs dev mode)
+    auto paths = socketley_paths::resolve();
+
+    // Set socket path for daemon_handler and ipc_client
+    daemon_handler::socket_path = paths.socket_path.string();
+
+    // Load config file (sets log level etc.) before anything else
+    load_daemon_config(paths.config_path.string());
+
+    if (!loop.init())
+    {
+        LOG_ERROR("failed to init event loop");
+        return 1;
+    }
+
+    // Create state persistence
+    state_persistence persistence(paths.state_dir.string());
+
+    daemon_handler handler(manager, loop);
+    handler.set_state_persistence(&persistence);
+
+    if (!handler.setup())
+    {
+        LOG_ERROR("failed to setup ipc socket");
+        return 1;
+    }
+
+    // Restore persisted runtimes before entering the event loop
+    restore_runtimes(persistence, manager, loop);
+
+    g_signal_write_fd = loop.get_signal_write_fd();
+
+    // Ignore SIGPIPE — broken pipe errors are handled via io_uring CQE results (-EPIPE)
+    signal(SIGPIPE, SIG_IGN);
+
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+
+    LOG_INFO("daemon started");
+
+    loop.run();
+
+    manager.stop_all(loop);
+    handler.teardown();
+
+    g_signal_write_fd = -1;
+
+    LOG_INFO("daemon stopped");
+
+    return 0;
+}
