@@ -1,0 +1,105 @@
+[
+{
+  "test": "cache_set_throughput",
+  "timestamp": "2026-02-06T15:09:56+01:00",
+  "operations": 3000,
+  "value_size_bytes": 64,
+  "total_time_ms": 22363,
+  "ops_per_sec": 134.15,
+  "throughput_mb_sec": 0,
+  "avg_latency_ms": 0,
+  "p99_latency_ms": 0
+}
+,
+{
+  "test": "cache_get_throughput",
+  "timestamp": "2026-02-06T15:10:27+01:00",
+  "operations": 3000,
+  "hits": 3000,
+  "misses": 0,
+  "total_time_ms": 24032,
+  "ops_per_sec": 124.83,
+  "avg_latency_ms": 5.48,
+  "p99_latency_ms": 10.00
+}
+,
+{
+  "test": "cache_mixed_workload",
+  "timestamp": "2026-02-06T15:10:36+01:00",
+  "total_operations": 3000,
+  "get_operations": 2410,
+  "set_operations": 590,
+  "total_time_ms": 6687,
+  "ops_per_sec": 448.63
+}
+,
+{
+  "test": "cache_concurrent_access",
+  "timestamp": "2026-02-06T15:10:38+01:00",
+  "num_clients": 10,
+  "ops_per_client": 200,
+  "total_ops": 0,
+  "total_time_ms": 1605,
+  "ops_per_sec": 0
+}
+,
+{
+  "test": "cache_persistence",
+  "timestamp": "2026-02-06T15:10:47+01:00",
+  "num_keys": 2000,
+  "flush_time_ms": 1009,
+  "load_time_ms": 1010,
+  "file_size_bytes": 0,
+  "keys_restored": 2000
+}
+,
+{
+  "test": "cache_large_values_64B",
+  "timestamp": "2026-02-06T15:10:49+01:00",
+  "value_size_bytes": 64,
+  "operations": 1000,
+  "total_time_ms": 2095,
+  "ops_per_sec": 477.32,
+  "throughput_mb_sec": ".02"
+}
+,
+{
+  "test": "cache_large_values_256B",
+  "timestamp": "2026-02-06T15:10:52+01:00",
+  "value_size_bytes": 256,
+  "operations": 1000,
+  "total_time_ms": 2224,
+  "ops_per_sec": 449.64,
+  "throughput_mb_sec": ".10"
+}
+,
+{
+  "test": "cache_large_values_1024B",
+  "timestamp": "2026-02-06T15:10:54+01:00",
+  "value_size_bytes": 1024,
+  "operations": 1000,
+  "total_time_ms": 2114,
+  "ops_per_sec": 473.03,
+  "throughput_mb_sec": ".45"
+}
+,
+{
+  "test": "cache_large_values_4096B",
+  "timestamp": "2026-02-06T15:10:56+01:00",
+  "value_size_bytes": 4096,
+  "operations": 1000,
+  "total_time_ms": 2115,
+  "ops_per_sec": 472.81,
+  "throughput_mb_sec": 1.84
+}
+,
+{
+  "test": "cache_large_values_16384B",
+  "timestamp": "2026-02-06T15:10:58+01:00",
+  "value_size_bytes": 16384,
+  "operations": 1000,
+  "total_time_ms": 2056,
+  "ops_per_sec": 486.38,
+  "throughput_mb_sec": 7.59
+}
+]

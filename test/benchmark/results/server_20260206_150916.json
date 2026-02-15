@@ -1,0 +1,43 @@
+[
+{
+  "test": "server_connection_rate",
+  "timestamp": "2026-02-06T15:09:21+01:00",
+  "connections_attempted": 500,
+  "connections_success": 500,
+  "connections_failed": 0,
+  "total_time_ms": 4129,
+  "connections_per_sec": 121.09,
+  "avg_latency_ms": 5.79,
+  "p99_latency_ms": 10.00
+}
+,
+{
+  "test": "server_single_client_throughput",
+  "timestamp": "2026-02-06T15:09:21+01:00",
+  "messages_sent": 5000,
+  "message_size_bytes": 64,
+  "total_time_ms": 96,
+  "messages_per_sec": 52083.33,
+  "throughput_mb_sec": 3.12
+}
+,
+{
+  "test": "server_single_client_throughput",
+  "timestamp": "2026-02-06T15:09:21+01:00",
+  "messages_sent": 5000,
+  "message_size_bytes": 1024,
+  "total_time_ms": 210,
+  "messages_per_sec": 23809.52,
+  "throughput_mb_sec": 23.23
+}
+,
+{
+  "test": "server_concurrent_clients",
+  "timestamp": "2026-02-06T15:09:21+01:00",
+  "num_clients": 20,
+  "msgs_per_client": 100,
+  "total_messages": 300,
+  "total_time_ms": 17,
+  "messages_per_sec": 17647.05
+}
+]
