@@ -12,6 +12,9 @@ constexpr uint8_t WS_OP_CLOSE = 0x8;
 constexpr uint8_t WS_OP_PING  = 0x9;
 constexpr uint8_t WS_OP_PONG  = 0xA;
 
+// Max payload size (16 MB) to prevent memory exhaustion
+constexpr uint64_t WS_MAX_PAYLOAD = 16 * 1024 * 1024;
+
 static constexpr const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 struct ws_frame
@@ -140,6 +143,9 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
             payload_len = (payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
         header_size = 10;
     }
+
+    if (payload_len > WS_MAX_PAYLOAD)
+        return false;
 
     size_t mask_size = masked ? 4 : 0;
     size_t total = header_size + mask_size + payload_len;

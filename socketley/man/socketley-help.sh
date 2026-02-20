@@ -194,6 +194,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley edit myserver -p 9001${NC}   # Direct flag-based edit"
     echo ""
 
+    echo -e "${BOLD}owner <name>${NC}"
+    echo "  Show ownership info: parent, children, on_parent_stop policy"
+    echo -e "  ${CYAN}socketley owner chess-rapid${NC}"
+    echo ""
+
     echo -e "${BOLD}--config <file.lua>${NC}"
     echo "  Load Lua configuration"
     echo -e "  ${CYAN}socketley --config setup.lua${NC}"
@@ -325,9 +330,10 @@ flags_options() {
     echo ""
 
     echo -e "${BOLD}Client-only Flags:${NC}"
-    echo "┌──────────────────┬─────────────────────────────────────────┐"
-    echo "│ -t <host:port>   │ Target server                           │"
-    echo "└──────────────────┴─────────────────────────────────────────┘"
+    echo "┌──────────────────────┬─────────────────────────────────────────┐"
+    echo "│ -t <host:port>       │ Target server                           │"
+    echo "│ --reconnect [max]    │ Auto-reconnect with exponential backoff │"
+    echo "└──────────────────────┴─────────────────────────────────────────┘"
     echo ""
 
     echo -e "${BOLD}Proxy Flags:${NC}"
@@ -949,6 +955,14 @@ installation_help() {
     echo -e "${BOLD}Build Debian Package:${NC}"
     echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.0${NC}"
     echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.0_amd64.deb${NC}"
+    echo ""
+
+    echo -e "${BOLD}Daemon Configuration (config.lua):${NC}"
+    echo -e "  ${CYAN}config = {"
+    echo -e "    log_level = \"info\",       -- debug, info, warn, error"
+    echo -e "    metrics_port = 9100        -- Prometheus metrics endpoint"
+    echo -e "  }${NC}"
+    echo -e "  When metrics_port is set, GET /metrics returns Prometheus format."
     echo ""
 
     echo -e "${BOLD}State Persistence:${NC}"

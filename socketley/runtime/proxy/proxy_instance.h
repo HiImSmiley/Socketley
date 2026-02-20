@@ -126,7 +126,6 @@ private:
     socklen_t m_accept_addrlen = sizeof(sockaddr_in);
     io_request m_accept_req{};
     event_loop* m_loop = nullptr;
-    runtime_manager* m_manager = nullptr;
     bool m_multishot_active = false;
 
     std::unordered_map<int, std::unique_ptr<proxy_client_connection>> m_clients;

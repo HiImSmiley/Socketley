@@ -25,12 +25,17 @@ struct runtime_config
     uint32_t max_connections = 0;
     double rate_limit = 0.0;
     bool drain = false;
+    int reconnect = -1;
     bool tls = false;
     std::string cert_path;
     std::string key_path;
     std::string ca_path;
     std::string target;
     std::string cache_name;
+
+    // Ownership
+    std::string owner;
+    int child_policy = 0; // 0 = stop, 1 = remove
 
     // Server/Client
     uint8_t mode = 0;       // server_mode or client_mode

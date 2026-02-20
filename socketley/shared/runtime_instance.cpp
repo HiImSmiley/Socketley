@@ -317,6 +317,32 @@ void runtime_instance::invoke_on_send(std::string_view msg)
     }
 }
 
+// ─── Ownership ───
+
+void runtime_instance::set_owner(std::string_view owner_name) { m_owner = std::string(owner_name); }
+std::string_view runtime_instance::get_owner() const { return m_owner; }
+void runtime_instance::set_lua_created(bool v) { m_lua_created = v; }
+bool runtime_instance::is_lua_created() const { return m_lua_created; }
+void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
+runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
+
+void runtime_instance::set_runtime_manager(runtime_manager* mgr) { m_runtime_manager = mgr; }
+void runtime_instance::set_event_loop(event_loop* loop) { m_event_loop = loop; }
+runtime_manager* runtime_instance::get_runtime_manager() const { return m_runtime_manager; }
+event_loop* runtime_instance::get_event_loop() const { return m_event_loop; }
+
+void runtime_instance::invoke_on_client_message(int client_id, std::string_view msg)
+{
+    if (!m_lua || !m_lua->has_on_client_message())
+        return;
+
+    try {
+        m_lua->on_client_message()(client_id, std::string(msg));
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_client_message error: " << e.what() << std::endl;
+    }
+}
+
 // ─── Resource limits ───
 
 void runtime_instance::set_max_connections(uint32_t max) { m_max_connections = max; }
@@ -327,6 +353,9 @@ double runtime_instance::get_rate_limit() const { return m_rate_limit; }
 
 void runtime_instance::set_drain(bool enabled) { m_drain = enabled; }
 bool runtime_instance::get_drain() const { return m_drain; }
+
+void runtime_instance::set_reconnect(int max_attempts) { m_reconnect = max_attempts; }
+int runtime_instance::get_reconnect() const { return m_reconnect; }
 
 // ─── TLS ───
 

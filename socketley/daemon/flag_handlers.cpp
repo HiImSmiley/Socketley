@@ -1,6 +1,7 @@
 #include "flag_handlers.h"
 #include "../shared/runtime_instance.h"
 #include <iostream>
+#include <charconv>
 #include "../shared/runtime_manager.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
@@ -128,6 +129,24 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--drain"):
             instance->set_drain(true);
             return 0;
+
+        case fnv1a("--reconnect"):
+        {
+            int max_attempts = 0; // default: infinite
+            if (i + 1 < pa.count)
+            {
+                int val = 0;
+                auto sv = std::string_view(pa.args[i + 1]);
+                auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+                if (e == std::errc{} && p == sv.data() + sv.size())
+                {
+                    max_attempts = val;
+                    i++;
+                }
+            }
+            instance->set_reconnect(max_attempts);
+            return 0;
+        }
 
         case fnv1a("--tls"):
             instance->set_tls(true);

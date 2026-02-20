@@ -17,7 +17,8 @@ enum op_type : uint8_t
     op_multishot_accept = 4,
     op_read_provided    = 5,
     op_writev           = 6,
-    op_recvmsg          = 7
+    op_recvmsg          = 7,
+    op_timeout          = 8
 };
 
 struct io_request

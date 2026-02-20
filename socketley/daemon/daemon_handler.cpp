@@ -293,6 +293,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("stats"):     return cmd_stats(conn, pa);
         case fnv1a("reload"):    return cmd_reload(conn, pa);
         case fnv1a("reload-lua"):return cmd_reload_lua(conn, pa);
+        case fnv1a("owner"):     return cmd_owner(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -328,6 +329,9 @@ int daemon_handler::cmd_create(const parsed_args& pa)
         std::cout << "internal error\n";
         return 2;
     }
+
+    instance->set_runtime_manager(&m_manager);
+    instance->set_event_loop(&m_loop);
 
     if (type == runtime_proxy)
         static_cast<proxy_instance*>(instance)->set_runtime_manager(&m_manager);
@@ -384,7 +388,7 @@ int daemon_handler::cmd_create(const parsed_args& pa)
         }
     }
 
-    if (m_persistence && !instance->get_test_mode())
+    if (m_persistence && !instance->get_test_mode() && !instance->is_lua_created())
         m_persistence->save_runtime(instance);
 
     return 0;
@@ -517,6 +521,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         << std::setw(8) << "TYPE"
         << std::setw(8) << "PORT"
         << std::setw(6) << "CONN"
+        << std::setw(9) << "OWNER"
         << std::setw(20) << "STATUS"
         << "CREATED\n";
 
@@ -539,11 +544,13 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         }
 
         uint16_t port = instance->get_port();
+        auto owner = instance->get_owner();
         out << std::setw(10) << instance->get_id()
             << std::setw(16) << name
             << std::setw(8) << type_to_string(instance->get_type())
             << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
             << std::setw(6) << instance->get_connection_count()
+            << std::setw(9) << (owner.empty() ? "-" : std::string(owner))
             << std::setw(20) << status_str
             << format_time_ago(instance->get_created_time()) << "\n";
     }
@@ -571,6 +578,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         << std::setw(8) << "TYPE"
         << std::setw(8) << "PORT"
         << std::setw(6) << "CONN"
+        << std::setw(9) << "OWNER"
         << std::setw(20) << "STATUS"
         << "CREATED\n";
 
@@ -580,14 +588,46 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             continue;
 
         uint16_t port = instance->get_port();
+        auto owner = instance->get_owner();
         out << std::setw(10) << instance->get_id()
             << std::setw(16) << name
             << std::setw(8) << type_to_string(instance->get_type())
             << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
             << std::setw(6) << instance->get_connection_count()
+            << std::setw(9) << (owner.empty() ? "-" : std::string(owner))
             << std::setw(20) << format_uptime(instance->get_start_time())
             << format_time_ago(instance->get_created_time()) << "\n";
     }
+
+    conn->write_buf = out.str();
+    return 0;
+}
+
+int daemon_handler::cmd_owner(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2)
+    {
+        conn->write_buf = "usage: owner <name>\n";
+        return 1;
+    }
+
+    auto* inst = m_manager.get(pa.args[1]);
+    if (!inst)
+    {
+        conn->write_buf = "runtime not found\n";
+        return 1;
+    }
+
+    std::ostringstream out;
+    auto owner = inst->get_owner();
+    out << "name:" << inst->get_name() << "\n";
+    out << "owner:" << (owner.empty() ? "-" : std::string(owner)) << "\n";
+    out << "on_parent_stop:" << (inst->get_child_policy() == runtime_instance::child_policy::remove ? "remove" : "stop") << "\n";
+
+    auto children = m_manager.get_children(inst->get_name());
+    out << "children:" << children.size() << "\n";
+    for (auto& c : children)
+        out << "  " << c << "\n";
 
     conn->write_buf = out.str();
     return 0;
@@ -1407,6 +1447,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     instance->set_max_connections(cfg.max_connections);
     instance->set_rate_limit(cfg.rate_limit);
     instance->set_drain(cfg.drain);
+    instance->set_reconnect(cfg.reconnect);
     instance->set_tls(cfg.tls);
     instance->set_cert_path(cfg.cert_path);
     instance->set_key_path(cfg.key_path);

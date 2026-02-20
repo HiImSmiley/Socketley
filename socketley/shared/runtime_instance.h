@@ -15,6 +15,7 @@
 
 class event_loop;
 class lua_context;
+class runtime_manager;
 
 class runtime_instance : public io_handler
 {
@@ -80,6 +81,10 @@ public:
     void set_drain(bool enabled);
     bool get_drain() const;
 
+    // Reconnect (client only)
+    void set_reconnect(int max_attempts);
+    int get_reconnect() const;
+
     // TLS
     void set_tls(bool enabled);
     bool get_tls() const;
@@ -108,6 +113,22 @@ public:
 
     // UDP mode (virtual, implemented by server/client)
     virtual bool is_udp() const { return false; }
+
+    // Ownership system
+    void set_owner(std::string_view owner_name);
+    std::string_view get_owner() const;
+    void set_lua_created(bool v);
+    bool is_lua_created() const;
+
+    enum class child_policy { stop, remove };
+    void set_child_policy(child_policy p);
+    child_policy get_child_policy() const;
+
+    // Runtime manager / event loop (base class — used by Lua management API)
+    void set_runtime_manager(runtime_manager* mgr);
+    void set_event_loop(event_loop* loop);
+    runtime_manager* get_runtime_manager() const;
+    event_loop* get_event_loop() const;
 
     // Lua integration
     bool load_lua_script(std::string_view path);
@@ -158,6 +179,7 @@ protected:
     void invoke_on_connect(int client_id);
     void invoke_on_disconnect(int client_id);
     void invoke_on_send(std::string_view msg);
+    void invoke_on_client_message(int client_id, std::string_view msg);
 
     // Bash output helper
     void print_bash_message(std::string_view msg) const;
@@ -190,6 +212,9 @@ private:
     // Graceful shutdown
     bool m_drain = false;
 
+    // Reconnect
+    int m_reconnect = -1; // -1 = disabled, 0 = infinite, >0 = max attempts
+
     // TLS
     bool m_tls = false;
     std::string m_cert_path;
@@ -201,4 +226,13 @@ private:
 
     // Interactive mode observer fds (IPC sockets)
     std::vector<int> m_interactive_fds;
+
+    // Ownership
+    std::string m_owner;
+    bool m_lua_created = false;
+    child_policy m_child_policy = child_policy::stop;
+
+    // Runtime manager / event loop (base class)
+    runtime_manager* m_runtime_manager = nullptr;
+    event_loop* m_event_loop = nullptr;
 };

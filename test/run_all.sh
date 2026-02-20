@@ -40,6 +40,7 @@ run_test "command_hashing" "$BIN_DIR/test_command_hashing"
 run_test "cache_store" "$BIN_DIR/test_cache_store"
 run_test "resp_parser" "$BIN_DIR/test_resp_parser"
 run_test "name_resolver" "$BIN_DIR/test_name_resolver"
+run_test "ws_parser" "$BIN_DIR/test_ws_parser"
 
 # Integration tests — start shared daemon
 echo "--- Integration Tests ---"

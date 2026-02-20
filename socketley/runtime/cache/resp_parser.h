@@ -10,6 +10,10 @@
 
 namespace resp {
 
+// Safety limits to prevent resource exhaustion
+constexpr int RESP_MAX_ARRAY_SIZE = 1024;
+constexpr int RESP_MAX_BULK_LEN = 512 * 1024; // 512 KB
+
 // ─── Encoding ───
 
 inline std::string encode_ok()
@@ -91,7 +95,7 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 
     int count = 0;
     auto [ptr, ec] = std::from_chars(buf.data() + 1, buf.data() + pos, count);
-    if (ec != std::errc{} || count < 0)
+    if (ec != std::errc{} || count < 0 || count > RESP_MAX_ARRAY_SIZE)
         return parse_result::error;
 
     size_t offset = pos + 2;
@@ -110,7 +114,7 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 
         int len = 0;
         auto [p2, e2] = std::from_chars(buf.data() + offset + 1, buf.data() + end, len);
-        if (e2 != std::errc{} || len < 0)
+        if (e2 != std::errc{} || len < 0 || len > RESP_MAX_BULK_LEN)
             return parse_result::error;
 
         offset = end + 2;

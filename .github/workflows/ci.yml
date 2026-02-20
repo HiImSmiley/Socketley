@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential liburing-dev libssl-dev netcat-openbsd bc
+
+      - name: Generate Makefiles
+        run: ./bin/premake5 gmake2
+
+      - name: Build (Release)
+        run: cd make && make config=release_x64 -j$(nproc)
+
+      - name: Unit tests
+        run: |
+          ./bin/Release/test_command_hashing
+          ./bin/Release/test_cache_store
+          ./bin/Release/test_resp_parser
+          ./bin/Release/test_name_resolver
+          ./bin/Release/test_ws_parser
+
+      - name: Integration tests
+        run: bash test/run_all.sh
+        timeout-minutes: 5

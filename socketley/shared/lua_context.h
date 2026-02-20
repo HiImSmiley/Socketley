@@ -31,6 +31,7 @@ public:
     bool has_on_disconnect() const;
     bool has_on_route() const;
     bool has_on_master_auth() const;
+    bool has_on_client_message() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -41,6 +42,7 @@ public:
     sol::function& on_disconnect() { return m_on_disconnect; }
     sol::function& on_route() { return m_on_route; }
     sol::function& on_master_auth() { return m_on_master_auth; }
+    sol::function& on_client_message() { return m_on_client_message; }
 
 private:
     void register_bindings(runtime_instance* owner);
@@ -58,4 +60,5 @@ private:
     sol::function m_on_disconnect;
     sol::function m_on_route;
     sol::function m_on_master_auth;
+    sol::function m_on_client_message;
 };
