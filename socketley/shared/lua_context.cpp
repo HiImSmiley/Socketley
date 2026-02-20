@@ -1,6 +1,9 @@
 #include "lua_context.h"
 #include "runtime_instance.h"
 #include "runtime_definitions.h"
+#include "runtime_manager.h"
+#include "event_loop.h"
+#include "../runtime/server/server_instance.h"
 #include <iostream>
 
 lua_context::lua_context()
@@ -52,6 +55,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_disconnect = m_lua["on_disconnect"];
     m_on_route = m_lua["on_route"];
     m_on_master_auth = m_lua["on_master_auth"];
+    m_on_client_message = m_lua["on_client_message"];
 
     return true;
 }
@@ -64,6 +68,7 @@ bool lua_context::has_on_connect() const { return m_on_connect.valid(); }
 bool lua_context::has_on_disconnect() const { return m_on_disconnect.valid(); }
 bool lua_context::has_on_route() const { return m_on_route.valid(); }
 bool lua_context::has_on_master_auth() const { return m_on_master_auth.valid(); }
+bool lua_context::has_on_client_message() const { return m_on_client_message.valid(); }
 
 void lua_context::update_self_state(const char* state_str)
 {
@@ -72,13 +77,144 @@ void lua_context::update_self_state(const char* state_str)
         (*self)["state"] = state_str;
 }
 
+static bool parse_type_string(const std::string& s, runtime_type& t)
+{
+    if (s == "server") { t = runtime_server; return true; }
+    if (s == "client") { t = runtime_client; return true; }
+    if (s == "proxy")  { t = runtime_proxy;  return true; }
+    if (s == "cache")  { t = runtime_cache;  return true; }
+    return false;
+}
+
 void lua_context::register_bindings(runtime_instance* owner)
 {
-    // Register socketley.log()
+    // Register socketley.log() and management API
     sol::table sk = m_lua.create_table();
     sk["log"] = [](std::string msg) {
         std::cerr << "[lua] " << msg << std::endl;
     };
+
+    // socketley.create(type, name, config_table) → bool
+    sk["create"] = [owner, this](std::string type_str, std::string name, sol::optional<sol::table> config) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop) return false;
+
+        runtime_type type;
+        if (!parse_type_string(type_str, type)) return false;
+
+        if (!mgr->create(type, name)) return false;
+
+        auto* inst = mgr->get(name);
+        if (!inst) return false;
+
+        inst->set_runtime_manager(mgr);
+        inst->set_event_loop(loop);
+        inst->set_owner(owner->get_name());
+        inst->set_lua_created(true);
+
+        if (config) {
+            sol::optional<int> port = (*config)["port"];
+            if (port) inst->set_port(static_cast<uint16_t>(*port));
+
+            sol::optional<std::string> lua_script = (*config)["config"];
+            if (!lua_script) lua_script = (*config)["lua"];
+            if (lua_script && !lua_script->empty())
+                inst->load_lua_script(*lua_script);
+
+            sol::optional<std::string> target = (*config)["target"];
+            if (target) inst->set_target(*target);
+
+            sol::optional<std::string> mode_str = (*config)["mode"];
+            if (mode_str && type == runtime_server) {
+                auto* srv = static_cast<server_instance*>(inst);
+                if (*mode_str == "in") srv->set_mode(mode_in);
+                else if (*mode_str == "out") srv->set_mode(mode_out);
+                else if (*mode_str == "master") srv->set_mode(mode_master);
+                else srv->set_mode(mode_inout);
+            }
+
+            sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"];
+            if (on_stop_str && *on_stop_str == "remove")
+                inst->set_child_policy(runtime_instance::child_policy::remove);
+
+            sol::optional<bool> autostart = (*config)["autostart"];
+            if (autostart && *autostart)
+                mgr->run(name, *loop);
+        }
+
+        return true;
+    };
+
+    // socketley.start(name) → bool
+    sk["start"] = [owner](std::string name) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop) return false;
+        return mgr->run(name, *loop);
+    };
+
+    // socketley.stop(name) → bool
+    sk["stop"] = [owner](std::string name) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop) return false;
+        return mgr->stop(name, *loop);
+    };
+
+    // socketley.remove(name) → bool
+    sk["remove"] = [owner](std::string name) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop) return false;
+        auto* inst = mgr->get(name);
+        if (inst && inst->get_state() == runtime_running)
+            mgr->stop(name, *loop);
+        return mgr->remove(name);
+    };
+
+    // socketley.send(name, msg) → bool
+    sk["send"] = [owner](std::string name, std::string msg) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return false;
+        auto* inst = mgr->get(name);
+        if (!inst || inst->get_state() != runtime_running) return false;
+        if (inst->get_type() == runtime_server)
+            inst->lua_broadcast(msg);
+        else
+            inst->lua_send(msg);
+        return true;
+    };
+
+    // socketley.list() → table of names
+    sk["list"] = [owner, this]() -> sol::table {
+        sol::table result = m_lua.create_table();
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return result;
+        std::shared_lock lock(mgr->mutex);
+        int i = 1;
+        for (const auto& [name, _] : mgr->list())
+            result[i++] = name;
+        return result;
+    };
+
+    // socketley.get(name) → table {name, type, state, port, connections, owner} or nil
+    sk["get"] = [owner, this](std::string name) -> sol::object {
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return sol::nil;
+        auto* inst = mgr->get(name);
+        if (!inst) return sol::nil;
+        sol::table info = m_lua.create_table();
+        info["name"] = std::string(inst->get_name());
+        info["type"] = type_to_string(inst->get_type());
+        info["state"] = state_to_string(inst->get_state());
+        info["port"] = inst->get_port();
+        info["connections"] = inst->get_connection_count();
+        auto ow = inst->get_owner();
+        info["owner"] = ow.empty() ? sol::object(sol::nil) : sol::make_object(m_lua, std::string(ow));
+        return info;
+    };
+
     m_lua["socketley"] = sk;
 
     // Register "self" table with runtime properties and actions
@@ -123,6 +259,27 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         return owner->get_connection_count();
     };
     self["protocol"] = owner->is_udp() ? "udp" : "tcp";
+
+    // Client routing
+    self["route"] = [owner](int client_id, std::string target) -> bool {
+        return static_cast<server_instance*>(owner)->route_client(client_id, target);
+    };
+    self["unroute"] = [owner](int client_id) -> bool {
+        return static_cast<server_instance*>(owner)->unroute_client(client_id);
+    };
+    self["get_route"] = [owner, this](int client_id) -> sol::object {
+        auto route = static_cast<server_instance*>(owner)->get_client_route(client_id);
+        if (route.empty()) return sol::nil;
+        return sol::make_object(m_lua, std::string(route));
+    };
+
+    // Owner-targeted sending (sub-server → owner's clients)
+    self["owner_send"] = [owner](int client_id, std::string msg) -> bool {
+        return static_cast<server_instance*>(owner)->owner_send(client_id, msg);
+    };
+    self["owner_broadcast"] = [owner](std::string msg) -> bool {
+        return static_cast<server_instance*>(owner)->owner_broadcast(msg);
+    };
 }
 
 void lua_context::register_client_table(runtime_instance* owner, sol::table& self)

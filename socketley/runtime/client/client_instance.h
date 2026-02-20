@@ -2,6 +2,7 @@
 #include <string>
 #include <string_view>
 #include <netinet/in.h>
+#include <linux/time_types.h>
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
@@ -51,15 +52,24 @@ public:
 private:
     void handle_read(struct io_uring_cqe* cqe);
     void handle_write(struct io_uring_cqe* cqe);
+    void handle_timeout(struct io_uring_cqe* cqe);
 
     void process_message(std::string_view msg);
     void send_to_server(std::string_view msg);
+    void schedule_reconnect();
+    bool try_connect();
 
     client_mode m_mode;
     bool m_udp{false};
     client_tcp_connection m_conn;
     event_loop* m_loop;
     bool m_connected;
+
+    // Reconnect state
+    int m_reconnect_attempt{0};
+    bool m_reconnect_pending{false};
+    io_request m_timeout_req{};
+    struct __kernel_timespec m_timeout_ts{};
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 4;

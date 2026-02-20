@@ -32,13 +32,45 @@ bool runtime_manager::run(std::string_view name, event_loop& loop)
 
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
 {
-    std::shared_lock lock(mutex);
+    {
+        std::shared_lock lock(mutex);
+        auto it = runtimes.find(name);
+        if (it == runtimes.end())
+            return false;
+        if (!it->second->stop(loop))
+            return false;
+    }
 
-    auto it = runtimes.find(name);
-    if (it == runtimes.end())
-        return false;
+    // Cascade to children based on child_policy
+    auto* inst = get(name);
+    if (inst)
+    {
+        auto children = get_children(name);
+        for (const auto& child : children)
+        {
+            auto* child_inst = get(child);
+            if (!child_inst) continue;
 
-    return it->second->stop(loop);
+            if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
+                remove_children(child, loop);
+            else
+                stop_children(child, loop);
+
+            if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
+            {
+                if (child_inst->get_state() == runtime_running)
+                    stop(child, loop);
+                remove(child);
+            }
+            else
+            {
+                if (child_inst->get_state() == runtime_running)
+                    stop(child, loop);
+            }
+        }
+    }
+
+    return true;
 }
 
 bool runtime_manager::remove(std::string_view name)
@@ -69,6 +101,43 @@ bool runtime_manager::rename(std::string_view old_name, std::string_view new_nam
     instance->set_name(new_name);
     runtimes.emplace(std::string(new_name), std::move(instance));
     return true;
+}
+
+std::vector<std::string> runtime_manager::get_children(std::string_view parent_name) const
+{
+    std::shared_lock lock(mutex);
+    std::vector<std::string> children;
+    for (const auto& [name, instance] : runtimes)
+    {
+        if (instance->get_owner() == parent_name)
+            children.push_back(name);
+    }
+    return children;
+}
+
+void runtime_manager::stop_children(std::string_view parent_name, event_loop& loop)
+{
+    auto children = get_children(parent_name);
+    for (const auto& child : children)
+    {
+        // Recurse: stop grandchildren first
+        stop_children(child, loop);
+        stop(child, loop);
+    }
+}
+
+void runtime_manager::remove_children(std::string_view parent_name, event_loop& loop)
+{
+    auto children = get_children(parent_name);
+    for (const auto& child : children)
+    {
+        // Recurse: remove grandchildren first
+        remove_children(child, loop);
+        auto* inst = get(child);
+        if (inst && inst->get_state() == runtime_running)
+            stop(child, loop);
+        remove(child);
+    }
 }
 
 void runtime_manager::stop_all(event_loop& loop)

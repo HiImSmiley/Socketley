@@ -42,6 +42,9 @@ struct server_connection
     double rl_tokens{0.0};
     double rl_max{0.0};
     std::chrono::steady_clock::time_point rl_last{};
+
+    // Master auth attempt tracking
+    uint8_t auth_failures{0};
 };
 
 enum server_mode : uint8_t
@@ -77,8 +80,17 @@ public:
     // Stats
     std::string get_stats() const override;
 
-    // Cache integration
-    void set_runtime_manager(runtime_manager* mgr);
+    // Client routing
+    bool route_client(int client_fd, std::string_view target_name);
+    bool unroute_client(int client_fd);
+    std::string_view get_client_route(int client_fd) const;
+    void process_forwarded_message(int client_fd, std::string_view msg, std::string_view parent_name);
+    void remove_forwarded_client(int client_fd);
+    void send_to_client(int client_fd, std::string_view msg);
+
+    // Owner-targeted sending (sub-server → owner's clients)
+    bool owner_send(int client_fd, std::string_view msg);
+    bool owner_broadcast(std::string_view msg);
 
     // Master mode
     void set_master_pw(std::string_view pw);
@@ -120,9 +132,12 @@ private:
     server_connection* m_conn_idx[MAX_FDS]{};
     bool m_multishot_active{false};
 
-    // Cache integration
-    runtime_manager* m_runtime_manager = nullptr;
     uint64_t m_message_counter = 0;
+
+    // Client routing: fd → target runtime name
+    std::unordered_map<int, std::string> m_routes;
+    // Forwarded clients: fd → source (parent) runtime name
+    std::unordered_map<int, std::string> m_forwarded_clients;
 
     // Stats
     uint32_t m_stat_peak_connections{0};

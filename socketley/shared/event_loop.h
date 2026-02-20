@@ -33,6 +33,7 @@ public:
     void submit_write(int fd, const char* buf, uint32_t len, io_request* req);
     void submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req);
     void submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
+    void submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
     // Provided buffer ring API
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);

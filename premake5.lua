@@ -1,6 +1,6 @@
 workspace "Socketley"
     system "linux"
-    configurations { "Debug", "Release" }
+    configurations { "Debug", "Release", "Sanitize" }
     platforms { "x64" }
     location "make"
 
@@ -47,6 +47,15 @@ project "socketley"
         staticruntime "Off"
     filter {}
 
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        staticruntime "Off"
+        optimize "Off"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: command hashing ───
 
 project "test_command_hashing"
@@ -71,6 +80,13 @@ project "test_command_hashing"
     filter "configurations:Release"
         defines { "NDEBUG" }
         optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
 -- ─── Test: cache store ───
@@ -105,6 +121,13 @@ project "test_cache_store"
         optimize "On"
     filter {}
 
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: RESP parser ───
 
 project "test_resp_parser"
@@ -131,6 +154,13 @@ project "test_resp_parser"
         optimize "On"
     filter {}
 
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: name resolver ───
 
 project "test_name_resolver"
@@ -155,4 +185,46 @@ project "test_name_resolver"
     filter "configurations:Release"
         defines { "NDEBUG" }
         optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: WebSocket parser ───
+
+project "test_ws_parser"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    links { "ssl", "crypto" }
+
+    files { "test/unit/test_ws_parser.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
     filter {}

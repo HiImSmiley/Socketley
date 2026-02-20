@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 #include <liburing.h>
 #include <sstream>
+#include <sys/stat.h>
 
 cache_instance::cache_instance(std::string_view name)
     : runtime_instance(runtime_cache, name), m_listen_fd(-1), m_loop(nullptr)
@@ -29,6 +30,16 @@ cache_instance::~cache_instance()
 
 void cache_instance::set_persistent(std::string_view path)
 {
+    // Validate parent directory exists
+    std::string p(path);
+    auto slash = p.rfind('/');
+    if (slash != std::string::npos && slash > 0)
+    {
+        std::string parent = p.substr(0, slash);
+        struct stat st;
+        if (stat(parent.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+            return; // Silent reject — parent dir doesn't exist
+    }
     m_persistent_path = path;
 }
 
@@ -1832,7 +1843,11 @@ bool cache_instance::connect_to_master()
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
+    {
+        close(fd);
+        return false;
+    }
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {

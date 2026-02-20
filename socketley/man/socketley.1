@@ -65,6 +65,10 @@ socketley \- manage long-living network runtimes in Docker-like style
 .B ps
 .br
 .B socketley
+.B owner
+.I name
+.br
+.B socketley
 .B \-\-config
 .I lua_file
 .SH DESCRIPTION
@@ -235,6 +239,7 @@ Field	Type	Description
 _
 mode	string	"inout", "in", or "out"
 udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
+reconnect	number	Auto-reconnect max attempts (-1=off, 0=infinite)
 .TE
 .PP
 .B Proxy fields:
@@ -277,11 +282,15 @@ eviction	string	"noeviction", "allkeys-lru", "allkeys-random"
 .TP
 .B ls
 List all runtimes (all states). Docker-style output with columns:
-ID, NAME, TYPE, PORT, CONN (connections), STATUS, CREATED.
+ID, NAME, TYPE, PORT, CONN (connections), OWNER, STATUS, CREATED.
 .TP
 .B ps
 List only running runtimes. Same format as
 .BR ls .
+.TP
+.BI "owner " "name"
+Show ownership info for a runtime: parent name, children list, and
+on_parent_stop policy (stop or remove).
 .TP
 .BI "\-\-config " "lua_file"
 Load Lua orchestration configuration. Creates multiple runtimes from
@@ -435,6 +444,12 @@ Message flow direction:
 Use UDP instead of TCP. Creates a connected SOCK_DGRAM socket.
 Each datagram is one message (no line-parsing).
 Not available for cache or proxy.
+.TP
+.BI "\-\-reconnect " "[max\-attempts]"
+Enable automatic reconnection with exponential backoff when the connection
+is lost. Backoff starts at 1 second and doubles each attempt up to 30 seconds,
+with random jitter. Set to 0 for infinite attempts (default when flag is given
+without a value). Set to a positive number to limit reconnection attempts.
 .SH PROXY FLAGS
 .TP
 .BI "\-\-backend " "addr"
@@ -682,6 +697,10 @@ Called when runtime stops.
 .B on_message(msg)
 Called when message received (server/client).
 .TP
+.B on_client_message(client_id, msg)
+Called when message received with sender identification (server only).
+Fires alongside on_message for backward compatibility.
+.TP
 .B on_connect(client_id)
 Called when a client connects (server/client). The client_id is the file descriptor.
 .TP
@@ -740,11 +759,34 @@ self.persist(key)           -- Remove expiry
 
 -- Cache: pub/sub
 self.publish(channel, msg)  -- Publish to channel
+
+-- Server: client routing
+self.route(client_id, target)      -- Forward client to sub-server
+self.unroute(client_id)            -- Stop forwarding
+self.get_route(client_id)          -- Get current route (string or nil)
+
+-- Server: owner-targeted sending (sub-server only)
+self.owner_send(client_id, msg)    -- Send to owner's client by fd
+self.owner_broadcast(msg)          -- Broadcast to all owner's clients
 .fi
 .SS Global Functions
 .TP
 .B socketley.log(msg)
 Output log message with [lua] prefix.
+.SS Runtime Management API
+Create, start, stop, and remove runtimes from Lua scripts:
+.nf
+socketley.create(type, name, config)  -- Create runtime
+socketley.start(name)                 -- Start runtime
+socketley.stop(name)                  -- Stop runtime
+socketley.remove(name)                -- Stop + remove runtime
+socketley.send(name, msg)             -- Send/broadcast to runtime
+socketley.list()                      -- List all runtime names (table)
+socketley.get(name)                   -- Get info table or nil
+.fi
+.P
+Config table keys: port, config (lua script path), target, mode, on_parent_stop ("remove"/"stop"), autostart (bool).
+Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
 .SH RUNTIME STATES
 .TP
 .B created
@@ -1016,7 +1058,7 @@ Unix domain socket for daemon IPC.
 Per-runtime JSON configuration files.
 .TP
 .I /etc/socketley/config.lua
-Daemon configuration.
+Daemon configuration (log_level, metrics_port).
 .SS Development Mode (no system install)
 .TP
 .I /tmp/socketley.sock
@@ -1027,6 +1069,24 @@ Per-runtime JSON configuration files.
 .TP
 .I ~/.config/socketley/config.lua
 Daemon configuration (or set SOCKETLEY_CONFIG env var).
+.SS Daemon Configuration
+The daemon config file is a Lua script that sets a
+.B config
+table:
+.nf
+config = {
+    log_level = "info",      -- debug, info, warn, error
+    metrics_port = 9100      -- Prometheus metrics HTTP endpoint
+}
+.fi
+.PP
+When
+.B metrics_port
+is set, the daemon starts an HTTP endpoint that serves Prometheus exposition
+format metrics at
+.BR "GET /metrics" .
+Metrics include: runtimes total/running, connections total/active,
+messages total, bytes in/out, and per-runtime breakdowns.
 .SH EXIT STATUS
 .TP
 .B 0

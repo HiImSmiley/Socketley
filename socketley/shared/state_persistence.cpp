@@ -346,12 +346,15 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.max_connections = instance->get_max_connections();
     cfg.rate_limit = instance->get_rate_limit();
     cfg.drain = instance->get_drain();
+    cfg.reconnect = instance->get_reconnect();
     cfg.tls = instance->get_tls();
     cfg.cert_path = instance->get_cert_path();
     cfg.key_path = instance->get_key_path();
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
     cfg.cache_name = instance->get_cache_name();
+    cfg.owner = instance->get_owner();
+    cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
 
     // Type-specific
     switch (cfg.type)
@@ -426,6 +429,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"rate_limit\": " << cfg.rate_limit << ",\n";
     if (cfg.drain)
         out << "    \"drain\": true,\n";
+    if (cfg.reconnect >= 0)
+        out << "    \"reconnect\": " << cfg.reconnect << ",\n";
     if (cfg.tls)
         out << "    \"tls\": true,\n";
     if (!cfg.cert_path.empty())
@@ -438,6 +443,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"target\": \"" << json_escape(cfg.target) << "\",\n";
     if (!cfg.cache_name.empty())
         out << "    \"cache_name\": \"" << json_escape(cfg.cache_name) << "\",\n";
+    if (!cfg.owner.empty())
+        out << "    \"owner\": \"" << json_escape(cfg.owner) << "\",\n";
+    if (cfg.child_policy != 0)
+        out << "    \"child_policy\": " << cfg.child_policy << ",\n";
 
     // Type-specific
     switch (cfg.type)
@@ -514,12 +523,15 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.max_connections = json_get_uint32(json, "max_connections");
     cfg.rate_limit = json_get_double(json, "rate_limit");
     cfg.drain = json_get_bool(json, "drain");
+    cfg.reconnect = json_get_int(json, "reconnect", -1);
     cfg.tls = json_get_bool(json, "tls");
     cfg.cert_path = json_get_string(json, "cert_path");
     cfg.key_path = json_get_string(json, "key_path");
     cfg.ca_path = json_get_string(json, "ca_path");
     cfg.target = json_get_string(json, "target");
     cfg.cache_name = json_get_string(json, "cache_name");
+    cfg.owner = json_get_string(json, "owner");
+    cfg.child_policy = json_get_int(json, "child_policy");
 
     // Type-specific
     switch (cfg.type)
@@ -592,6 +604,8 @@ bool state_persistence::read_json(const fs::path& path, runtime_config& cfg) con
 
 void state_persistence::save_runtime(const runtime_instance* instance)
 {
+    if (instance->is_lua_created())
+        return;
     runtime_config cfg = read_from_instance(instance);
     write_json(cfg);
 }
