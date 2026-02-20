@@ -50,6 +50,11 @@ public:
     bool rename(std::string_view old_name, std::string_view new_name);
     void stop_all(event_loop& loop);
 
+    // Ownership cascading
+    std::vector<std::string> get_children(std::string_view parent_name) const;
+    void stop_children(std::string_view parent_name, event_loop& loop);
+    void remove_children(std::string_view parent_name, event_loop& loop);
+
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);
 

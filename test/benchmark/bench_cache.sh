@@ -408,6 +408,222 @@ test_large_values() {
     socketley_cmd remove bench_cache
 }
 
+# Test 7: LIST operations throughput
+test_list_throughput() {
+    local num_ops=${1:-3000}
+    local test_name="cache_list_throughput"
+
+    log_section "Test: LIST Throughput ($num_ops ops each for LPUSH/LPOP)"
+
+    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
+    sleep 0.5
+
+    # LPUSH
+    local start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "lpush benchlist item$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    local end_time=$(get_time_ms)
+    local lpush_time=$((end_time - start_time))
+    local lpush_ops=$(echo "scale=2; $num_ops * 1000 / $lpush_time" | bc)
+    log_success "  LPUSH: $lpush_ops ops/sec"
+
+    # LPOP
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "lpop benchlist" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local lpop_time=$((end_time - start_time))
+    local lpop_ops=$(echo "scale=2; $num_ops * 1000 / $lpop_time" | bc)
+    log_success "  LPOP: $lpop_ops ops/sec"
+
+    # LRANGE
+    for i in $(seq 1 100); do
+        echo "rpush rangelist val$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $((num_ops / 10))); do
+        echo "lrange rangelist 0 99" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local lrange_time=$((end_time - start_time))
+    local lrange_ops=$(echo "scale=2; $num_ops / 10 * 1000 / $lrange_time" | bc)
+    log_success "  LRANGE 0-99: $lrange_ops ops/sec"
+
+    append_result
+    write_json_result "$test_name" "$RESULTS_FILE" \
+        "operations" "$num_ops" \
+        "lpush_ops_sec" "$lpush_ops" \
+        "lpop_ops_sec" "$lpop_ops" \
+        "lrange_ops_sec" "$lrange_ops"
+
+    socketley_cmd stop bench_cache
+    socketley_cmd remove bench_cache
+}
+
+# Test 8: SET (data structure) operations throughput
+test_set_ds_throughput() {
+    local num_ops=${1:-3000}
+    local test_name="cache_set_ds_throughput"
+
+    log_section "Test: SET (data structure) Throughput ($num_ops ops)"
+
+    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
+    sleep 0.5
+
+    # SADD
+    local start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "sadd benchset member$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    local end_time=$(get_time_ms)
+    local sadd_time=$((end_time - start_time))
+    local sadd_ops=$(echo "scale=2; $num_ops * 1000 / $sadd_time" | bc)
+    log_success "  SADD: $sadd_ops ops/sec"
+
+    # SISMEMBER
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "sismember benchset member$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local sismember_time=$((end_time - start_time))
+    local sismember_ops=$(echo "scale=2; $num_ops * 1000 / $sismember_time" | bc)
+    log_success "  SISMEMBER: $sismember_ops ops/sec"
+
+    # SCARD
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $((num_ops / 10))); do
+        echo "scard benchset" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local scard_time=$((end_time - start_time))
+    local scard_ops=$(echo "scale=2; $num_ops / 10 * 1000 / $scard_time" | bc)
+    log_success "  SCARD: $scard_ops ops/sec"
+
+    append_result
+    write_json_result "$test_name" "$RESULTS_FILE" \
+        "operations" "$num_ops" \
+        "sadd_ops_sec" "$sadd_ops" \
+        "sismember_ops_sec" "$sismember_ops" \
+        "scard_ops_sec" "$scard_ops"
+
+    socketley_cmd stop bench_cache
+    socketley_cmd remove bench_cache
+}
+
+# Test 9: HASH operations throughput
+test_hash_throughput() {
+    local num_ops=${1:-3000}
+    local test_name="cache_hash_throughput"
+
+    log_section "Test: HASH Throughput ($num_ops ops)"
+
+    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
+    sleep 0.5
+
+    # HSET
+    local start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "hset benchhash field$i value$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    local end_time=$(get_time_ms)
+    local hset_time=$((end_time - start_time))
+    local hset_ops=$(echo "scale=2; $num_ops * 1000 / $hset_time" | bc)
+    log_success "  HSET: $hset_ops ops/sec"
+
+    # HGET
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "hget benchhash field$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local hget_time=$((end_time - start_time))
+    local hget_ops=$(echo "scale=2; $num_ops * 1000 / $hget_time" | bc)
+    log_success "  HGET: $hget_ops ops/sec"
+
+    # HGETALL
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $((num_ops / 30))); do
+        echo "hgetall benchhash" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local hgetall_time=$((end_time - start_time))
+    local hgetall_ops=$(echo "scale=2; $num_ops / 30 * 1000 / $hgetall_time" | bc)
+    log_success "  HGETALL: $hgetall_ops ops/sec"
+
+    append_result
+    write_json_result "$test_name" "$RESULTS_FILE" \
+        "operations" "$num_ops" \
+        "hset_ops_sec" "$hset_ops" \
+        "hget_ops_sec" "$hget_ops" \
+        "hgetall_ops_sec" "$hgetall_ops"
+
+    socketley_cmd stop bench_cache
+    socketley_cmd remove bench_cache
+}
+
+# Test 10: TTL/Expiry operations throughput
+test_ttl_throughput() {
+    local num_ops=${1:-3000}
+    local test_name="cache_ttl_throughput"
+
+    log_section "Test: TTL/Expiry Throughput ($num_ops ops)"
+
+    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
+    sleep 0.5
+
+    # Pre-populate keys
+    for i in $(seq 1 $num_ops); do
+        echo "set ttlkey$i val$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+
+    # EXPIRE
+    local start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "expire ttlkey$i 3600" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    local end_time=$(get_time_ms)
+    local expire_time=$((end_time - start_time))
+    local expire_ops=$(echo "scale=2; $num_ops * 1000 / $expire_time" | bc)
+    log_success "  EXPIRE: $expire_ops ops/sec"
+
+    # TTL
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "ttl ttlkey$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local ttl_time=$((end_time - start_time))
+    local ttl_ops=$(echo "scale=2; $num_ops * 1000 / $ttl_time" | bc)
+    log_success "  TTL: $ttl_ops ops/sec"
+
+    # PERSIST
+    start_time=$(get_time_ms)
+    for i in $(seq 1 $num_ops); do
+        echo "persist ttlkey$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    done
+    end_time=$(get_time_ms)
+    local persist_time=$((end_time - start_time))
+    local persist_ops=$(echo "scale=2; $num_ops * 1000 / $persist_time" | bc)
+    log_success "  PERSIST: $persist_ops ops/sec"
+
+    append_result
+    write_json_result "$test_name" "$RESULTS_FILE" \
+        "operations" "$num_ops" \
+        "expire_ops_sec" "$expire_ops" \
+        "ttl_ops_sec" "$ttl_ops" \
+        "persist_ops_sec" "$persist_ops"
+
+    socketley_cmd stop bench_cache
+    socketley_cmd remove bench_cache
+}
+
 # Main execution
 run_cache_benchmarks() {
     log_section "CACHE RUNTIME BENCHMARKS"
@@ -418,6 +634,10 @@ run_cache_benchmarks() {
     test_concurrent_access 10 200
     test_persistence 2000
     test_large_values
+    test_list_throughput 3000
+    test_set_ds_throughput 3000
+    test_hash_throughput 3000
+    test_ttl_throughput 3000
 
     echo "]" >> "$RESULTS_FILE"
 

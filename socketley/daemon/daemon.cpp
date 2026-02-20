@@ -1,5 +1,6 @@
 #include "daemon.h"
 #include "daemon_handler.h"
+#include "metrics_endpoint.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/logging.h"
@@ -41,8 +42,9 @@ static bool parse_log_level(std::string_view str, log_level& level)
     return false;
 }
 
-static void load_daemon_config(const std::string& config_path)
+static uint16_t load_daemon_config(const std::string& config_path)
 {
+    uint16_t metrics_port = 0;
     std::string path = config_path;
 
     // Check SOCKETLEY_CONFIG env var first
@@ -51,12 +53,12 @@ static void load_daemon_config(const std::string& config_path)
         path = env;
 
     if (path.empty())
-        return;
+        return 0;
 
     // Check if file exists
     std::ifstream check(path);
     if (!check.good())
-        return;
+        return 0;
     check.close();
 
     sol::state lua;
@@ -67,13 +69,13 @@ static void load_daemon_config(const std::string& config_path)
     {
         sol::error err = result;
         std::cerr << "[config] error loading " << path << ": " << err.what() << "\n";
-        return;
+        return 0;
     }
 
     // Parse config table
     sol::optional<sol::table> config = lua["config"];
     if (!config)
-        return;
+        return 0;
 
     // log_level
     sol::optional<std::string> ll = (*config)["log_level"];
@@ -83,6 +85,13 @@ static void load_daemon_config(const std::string& config_path)
         if (parse_log_level(*ll, level))
             logger::g_level = level;
     }
+
+    // metrics_port
+    sol::optional<int> mp = (*config)["metrics_port"];
+    if (mp && *mp > 0 && *mp <= 65535)
+        metrics_port = static_cast<uint16_t>(*mp);
+
+    return metrics_port;
 }
 
 static void restore_runtimes(state_persistence& persistence,
@@ -110,6 +119,17 @@ static void restore_runtimes(state_persistence& persistence,
         // Restore persisted ID
         instance->set_id(cfg.id);
 
+        // Always set runtime manager and event loop
+        instance->set_runtime_manager(&manager);
+        instance->set_event_loop(&loop);
+
+        // Restore ownership
+        if (!cfg.owner.empty())
+            instance->set_owner(cfg.owner);
+        instance->set_child_policy(
+            cfg.child_policy == 1 ? runtime_instance::child_policy::remove
+                                  : runtime_instance::child_policy::stop);
+
         // Common fields
         if (cfg.port > 0) instance->set_port(cfg.port);
         if (!cfg.log_file.empty()) instance->set_log_file(cfg.log_file);
@@ -120,6 +140,7 @@ static void restore_runtimes(state_persistence& persistence,
         if (cfg.max_connections > 0) instance->set_max_connections(cfg.max_connections);
         if (cfg.rate_limit > 0.0) instance->set_rate_limit(cfg.rate_limit);
         if (cfg.drain) instance->set_drain(true);
+        if (cfg.reconnect >= 0) instance->set_reconnect(cfg.reconnect);
         if (cfg.tls) instance->set_tls(true);
         if (!cfg.cert_path.empty()) instance->set_cert_path(cfg.cert_path);
         if (!cfg.key_path.empty()) instance->set_key_path(cfg.key_path);
@@ -201,8 +222,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop)
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
 
-    // Load config file (sets log level etc.) before anything else
-    load_daemon_config(paths.config_path.string());
+    // Load config file (sets log level, metrics port, etc.) before anything else
+    uint16_t metrics_port = load_daemon_config(paths.config_path.string());
 
     if (!loop.init())
     {
@@ -220,6 +241,16 @@ int daemon_start(runtime_manager& manager, event_loop& loop)
     {
         LOG_ERROR("failed to setup ipc socket");
         return 1;
+    }
+
+    // Start metrics endpoint if configured
+    metrics_endpoint metrics(manager);
+    if (metrics_port > 0)
+    {
+        if (metrics.start(metrics_port))
+            LOG_INFO("metrics endpoint started");
+        else
+            LOG_WARN("failed to start metrics endpoint");
     }
 
     // Restore persisted runtimes before entering the event loop

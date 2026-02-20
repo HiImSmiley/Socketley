@@ -278,6 +278,21 @@ void event_loop::submit_recvmsg(int fd, struct msghdr* msg, io_request* req)
     m_pending_submissions++;
 }
 
+void event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
+{
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    if (!sqe)
+    {
+        flush();
+        sqe = io_uring_get_sqe(&m_ring);
+        if (!sqe) return;
+    }
+
+    io_uring_prep_timeout(sqe, ts, 0, 0);
+    io_uring_sqe_set_data(sqe, req);
+    m_pending_submissions++;
+}
+
 bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size)
 {
     // Already registered — reuse

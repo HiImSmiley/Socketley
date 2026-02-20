@@ -86,6 +86,13 @@ run_benchmarks() {
     bash "$script_dir/bench_proxy.sh"
 
     cleanup_runtimes
+    sleep 2
+
+    # WebSocket benchmarks
+    log_section "Running WebSocket Benchmarks"
+    bash "$script_dir/bench_websocket.sh"
+
+    cleanup_runtimes
 }
 
 # Generate summary from JSON results
@@ -277,6 +284,13 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         bash "$(dirname "$0")/bench_proxy.sh"
+        ;;
+    --websocket-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        setup_cleanup_trap
+        start_daemon || exit 1
+        bash "$(dirname "$0")/bench_websocket.sh"
         ;;
     --help|-h)
         echo "Usage: $0 [options]"
