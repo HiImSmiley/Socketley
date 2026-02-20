@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <algorithm>
 
 client_instance::client_instance(std::string_view name)
     : runtime_instance(runtime_client, name), m_mode(client_mode_inout), m_loop(nullptr), m_connected(false)
@@ -47,10 +48,8 @@ size_t client_instance::get_connection_count() const
     return m_connected ? 1 : 0;
 }
 
-bool client_instance::setup(event_loop& loop)
+bool client_instance::try_connect()
 {
-    m_loop = &loop;
-
     std::string host = "127.0.0.1";
     uint16_t port = get_port();
     if (port == 0)
@@ -97,22 +96,68 @@ bool client_instance::setup(event_loop& loop)
     }
 
     m_connected = true;
+    m_reconnect_attempt = 0;
     m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
     invoke_on_connect(m_conn.fd);
+    m_conn.partial.clear();
     m_conn.partial.reserve(8192);
+    m_conn.closing = false;
+    m_conn.read_pending = false;
+    m_conn.write_pending = false;
 
     m_conn.read_req = { op_read, m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), this };
     m_conn.write_req = { op_write, m_conn.fd, nullptr, 0, this };
-
-    m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
 
     if (m_mode != client_mode_out)
     {
         m_conn.read_pending = true;
         if (m_use_provided_bufs)
-            loop.submit_read_provided(m_conn.fd, BUF_GROUP_ID, &m_conn.read_req);
+            m_loop->submit_read_provided(m_conn.fd, BUF_GROUP_ID, &m_conn.read_req);
         else
-            loop.submit_read(m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), &m_conn.read_req);
+            m_loop->submit_read(m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), &m_conn.read_req);
+    }
+
+    return true;
+}
+
+void client_instance::schedule_reconnect()
+{
+    int max = get_reconnect();
+    if (max < 0 || !m_loop)
+        return; // Reconnect disabled
+
+    if (max > 0 && m_reconnect_attempt >= max)
+        return; // Max attempts reached
+
+    // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
+    int base_sec = 1 << std::min(m_reconnect_attempt, 4); // 1,2,4,8,16
+    int delay_sec = std::min(base_sec, 30);
+    // Simple jitter: add 0-500ms
+    int jitter_ms = (m_reconnect_attempt * 137) % 500;
+
+    m_timeout_ts.tv_sec = delay_sec;
+    m_timeout_ts.tv_nsec = jitter_ms * 1000000LL;
+
+    m_timeout_req = { op_timeout, -1, nullptr, 0, this };
+    m_reconnect_pending = true;
+    m_loop->submit_timeout(&m_timeout_ts, &m_timeout_req);
+}
+
+bool client_instance::setup(event_loop& loop)
+{
+    m_loop = &loop;
+
+    m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+
+    if (!try_connect())
+    {
+        // If reconnect enabled, schedule first attempt
+        if (get_reconnect() >= 0)
+        {
+            schedule_reconnect();
+            return true; // Setup "succeeds" — we'll connect later
+        }
+        return false;
     }
 
     return true;
@@ -145,6 +190,9 @@ void client_instance::on_cqe(struct io_uring_cqe* cqe)
             break;
         case op_write:
             handle_write(cqe);
+            break;
+        case op_timeout:
+            handle_timeout(cqe);
             break;
         default:
             break;
@@ -185,6 +233,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
             close(m_conn.fd);
             m_conn.fd = -1;
             m_connected = false;
+            schedule_reconnect();
         }
         return;
     }
@@ -295,6 +344,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
             close(m_conn.fd);
             m_conn.fd = -1;
             m_connected = false;
+            schedule_reconnect();
         }
         return;
     }
@@ -308,6 +358,23 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
         m_conn.fd = -1;
         m_connected = false;
     }
+}
+
+void client_instance::handle_timeout(struct io_uring_cqe* cqe)
+{
+    m_reconnect_pending = false;
+
+    // io_uring timeout fires with -ETIME on expiration
+    if (cqe->res != -ETIME && cqe->res != 0)
+        return;
+
+    m_reconnect_attempt++;
+
+    if (try_connect())
+        return; // Reconnected successfully
+
+    // Failed — schedule another attempt
+    schedule_reconnect();
 }
 
 void client_instance::process_message(std::string_view msg)

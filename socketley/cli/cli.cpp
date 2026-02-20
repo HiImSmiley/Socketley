@@ -131,6 +131,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("reload"):
         case fnv1a("reload-lua"):
         case fnv1a("show"):
+        case fnv1a("owner"):
             return cli_forward(argc, argv);
 
         case fnv1a("send"):

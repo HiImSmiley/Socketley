@@ -37,7 +37,7 @@ void proxy_instance::add_backend(std::string_view addr)
 void proxy_instance::clear_backends() { m_backends.clear(); }
 void proxy_instance::set_protocol(proxy_protocol p) { m_protocol = p; }
 void proxy_instance::set_strategy(proxy_strategy s) { m_strategy = s; }
-void proxy_instance::set_runtime_manager(runtime_manager* mgr) { m_manager = mgr; }
+void proxy_instance::set_runtime_manager(runtime_manager* mgr) { runtime_instance::set_runtime_manager(mgr); }
 proxy_protocol proxy_instance::get_protocol() const { return m_protocol; }
 proxy_strategy proxy_instance::get_strategy() const { return m_strategy; }
 const std::vector<backend_info>& proxy_instance::get_backends() const { return m_backends; }
@@ -59,10 +59,10 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return true;
     }
 
-    if (!m_manager)
+    if (!get_runtime_manager())
         return false;
 
-    auto* inst = m_manager->get(b.address);
+    auto* inst = get_runtime_manager()->get(b.address);
     if (!inst)
         return false;
 

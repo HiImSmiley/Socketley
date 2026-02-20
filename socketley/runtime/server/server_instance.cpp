@@ -13,6 +13,7 @@
 #include <netinet/tcp.h>
 #include <liburing.h>
 #include <sstream>
+#include <algorithm>
 
 server_instance::server_instance(std::string_view name)
     : runtime_instance(runtime_server, name), m_mode(mode_inout), m_listen_fd(-1), m_loop(nullptr)
@@ -50,10 +51,7 @@ bool server_instance::is_udp() const
     return m_udp;
 }
 
-void server_instance::set_runtime_manager(runtime_manager* mgr)
-{
-    m_runtime_manager = mgr;
-}
+// Routing: get_runtime_manager() from base class replaces per-type get_runtime_manager()
 
 void server_instance::set_master_pw(std::string_view pw)
 {
@@ -84,12 +82,16 @@ size_t server_instance::get_connection_count() const
 {
     if (m_udp)
         return m_udp_peers.size();
-    return m_clients.size();
+    return m_clients.size() + m_forwarded_clients.size();
 }
 
 bool server_instance::setup(event_loop& loop)
 {
     m_loop = &loop;
+
+    // Internal-only server (port=0, used for Lua-managed sub-servers)
+    if (get_port() == 0 && !get_owner().empty())
+        return true;
 
     uint16_t port = get_port();
     if (port == 0)
@@ -228,6 +230,31 @@ void server_instance::teardown(event_loop& loop)
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
+
+    // Clean up forwarded client entries on parent servers
+    for (auto& [fwd_fd, parent_name] : m_forwarded_clients)
+    {
+        auto* mgr = get_runtime_manager();
+        if (mgr)
+        {
+            auto* parent = mgr->get(parent_name);
+            if (parent && parent->get_type() == runtime_server)
+            {
+                auto* psrv = static_cast<server_instance*>(parent);
+                psrv->m_routes.erase(fwd_fd);
+            }
+        }
+    }
+    m_forwarded_clients.clear();
+    m_routes.clear();
+
+    // Zeroize password memory
+    if (!m_master_pw.empty())
+    {
+        volatile char* p = m_master_pw.data();
+        for (size_t i = 0; i < m_master_pw.size(); i++)
+            p[i] = 0;
+    }
 }
 
 void server_instance::on_cqe(struct io_uring_cqe* cqe)
@@ -369,6 +396,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         }
         else
         {
+            unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
             close(fd);
@@ -562,6 +590,26 @@ submit_next_read:
     }
 }
 
+// Constant-time string compare to prevent timing attacks on password
+static bool constant_time_eq(std::string_view a, std::string_view b)
+{
+    if (a.size() != b.size())
+    {
+        // Still do work proportional to max size to avoid length leak
+        volatile uint8_t dummy = 0;
+        for (size_t i = 0; i < std::max(a.size(), b.size()); i++)
+            dummy |= 0;
+        (void)dummy;
+        return false;
+    }
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < a.size(); i++)
+        diff |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
+    return diff == 0;
+}
+
+static constexpr uint8_t MAX_AUTH_FAILURES = 5;
+
 static bool check_rate_limit(server_connection* conn)
 {
     if (conn->rl_max <= 0)
@@ -587,17 +635,42 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     if (sender && !check_rate_limit(sender))
         return;
 
+    // Check if this client is routed to a sub-server
+    if (sender)
+    {
+        auto rit = m_routes.find(sender->fd);
+        if (rit != m_routes.end())
+        {
+            auto* mgr = get_runtime_manager();
+            if (mgr)
+            {
+                auto* target = mgr->get(rit->second);
+                if (target && target->get_type() == runtime_server &&
+                    target->get_state() == runtime_running)
+                {
+                    auto* sub = static_cast<server_instance*>(target);
+                    sub->process_forwarded_message(sender->fd, msg, get_name());
+                }
+            }
+            return;
+        }
+    }
+
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
     print_bash_message(msg);
     notify_interactive(msg);
+
+    // Fire on_client_message callback (sender-aware)
+    if (sender)
+        invoke_on_client_message(sender->fd, msg);
 
     // Cache command interception: "cache <cmd>" → execute against linked cache, respond to sender only
     if (sender && msg.size() > 6 && msg.starts_with("cache "))
     {
         auto cname = get_cache_name();
-        if (!cname.empty() && m_runtime_manager)
+        if (!cname.empty() && get_runtime_manager())
         {
-            auto* cache_rt = m_runtime_manager->get(cname);
+            auto* cache_rt = get_runtime_manager()->get(cname);
             if (cache_rt && cache_rt->get_type() == runtime_cache &&
                 cache_rt->get_state() == runtime_running)
             {
@@ -617,9 +690,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
     // Store in cache if configured
     auto cache_name = get_cache_name();
-    if (!cache_name.empty() && m_runtime_manager)
+    if (!cache_name.empty() && get_runtime_manager())
     {
-        auto* cache_rt = m_runtime_manager->get(cache_name);
+        auto* cache_rt = get_runtime_manager()->get(cache_name);
         if (cache_rt && cache_rt->get_type() == runtime_cache &&
             cache_rt->get_state() == runtime_running)
         {
@@ -663,6 +736,13 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             // Master authentication: "master <password>"
             if (msg.size() > 7 && msg.starts_with("master "))
             {
+                // Auth attempt limit — disconnect after too many failures
+                if (sender->auth_failures >= MAX_AUTH_FAILURES)
+                {
+                    sender->closing = true;
+                    break;
+                }
+
                 std::string_view pw = msg.substr(7);
                 bool auth_ok = false;
 
@@ -679,18 +759,19 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 }
                 else if (!m_master_pw.empty())
                 {
-                    // Static password check
-                    auth_ok = (pw == m_master_pw);
+                    auth_ok = constant_time_eq(pw, m_master_pw);
                 }
 
                 if (auth_ok)
                 {
                     m_master_fd = sender->fd;
+                    sender->auth_failures = 0;
                     auto ok_msg = std::make_shared<const std::string>("master: ok\n");
                     send_to(sender, ok_msg);
                 }
                 else
                 {
+                    sender->auth_failures++;
                     auto deny_msg = std::make_shared<const std::string>("master: denied\n");
                     send_to(sender, deny_msg);
                 }
@@ -754,6 +835,21 @@ void server_instance::lua_broadcast(std::string_view msg)
 
     auto full_msg = std::make_shared<const std::string>(std::move(full_str));
     broadcast(full_msg, -1);  // -1 = don't exclude anyone
+
+    // Also send to forwarded clients through their parent servers
+    for (auto& [fwd_fd, parent_name] : m_forwarded_clients)
+    {
+        auto* mgr = get_runtime_manager();
+        if (mgr)
+        {
+            auto* parent = mgr->get(parent_name);
+            if (parent && parent->get_type() == runtime_server &&
+                parent->get_state() == runtime_running)
+            {
+                static_cast<server_instance*>(parent)->send_to_client(fwd_fd, msg);
+            }
+        }
+    }
 }
 
 void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd)
@@ -869,6 +965,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->closing = true;
         if (!conn->read_pending)
         {
+            unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
             close(fd);
@@ -890,6 +987,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         {
             if (fd == m_master_fd)
                 m_master_fd = -1;
+            unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
             close(fd);
@@ -953,21 +1051,39 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
     if (!m_loop || m_udp)
         return;
 
-    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+    // Check direct connection first
+    if (client_id >= 0 && client_id < MAX_FDS && m_conn_idx[client_id])
+    {
+        auto* conn = m_conn_idx[client_id];
+        if (conn->closing)
+            return;
+
+        std::string full_str;
+        full_str.reserve(msg.size() + 1);
+        full_str.append(msg.data(), msg.size());
+        if (full_str.empty() || full_str.back() != '\n')
+            full_str += '\n';
+
+        auto full_msg = std::make_shared<const std::string>(std::move(full_str));
+        send_to(conn, full_msg);
         return;
+    }
 
-    auto* conn = m_conn_idx[client_id];
-    if (conn->closing)
-        return;
-
-    std::string full_str;
-    full_str.reserve(msg.size() + 1);
-    full_str.append(msg.data(), msg.size());
-    if (full_str.empty() || full_str.back() != '\n')
-        full_str += '\n';
-
-    auto full_msg = std::make_shared<const std::string>(std::move(full_str));
-    send_to(conn, full_msg);
+    // Check forwarded clients (send through parent server)
+    auto fit = m_forwarded_clients.find(client_id);
+    if (fit != m_forwarded_clients.end())
+    {
+        auto* mgr = get_runtime_manager();
+        if (mgr)
+        {
+            auto* parent = mgr->get(fit->second);
+            if (parent && parent->get_type() == runtime_server &&
+                parent->get_state() == runtime_running)
+            {
+                static_cast<server_instance*>(parent)->send_to_client(client_id, msg);
+            }
+        }
+    }
 }
 
 std::string server_instance::get_stats() const
@@ -981,6 +1097,107 @@ std::string server_instance::get_stats() const
     if (m_mode == mode_master)
         out << "master_fd:" << m_master_fd << "\n";
     return out.str();
+}
+
+// ─── Client Routing ───
+
+bool server_instance::route_client(int client_fd, std::string_view target_name)
+{
+    auto* mgr = get_runtime_manager();
+    if (!mgr) return false;
+
+    auto* target = mgr->get(target_name);
+    if (!target || target->get_type() != runtime_server) return false;
+
+    auto* sub = static_cast<server_instance*>(target);
+    m_routes[client_fd] = std::string(target_name);
+    sub->m_forwarded_clients[client_fd] = std::string(get_name());
+    sub->invoke_on_connect(client_fd);
+    return true;
+}
+
+bool server_instance::unroute_client(int client_fd)
+{
+    auto it = m_routes.find(client_fd);
+    if (it == m_routes.end()) return false;
+
+    auto* mgr = get_runtime_manager();
+    if (mgr)
+    {
+        auto* target = mgr->get(it->second);
+        if (target && target->get_type() == runtime_server)
+        {
+            auto* sub = static_cast<server_instance*>(target);
+            sub->invoke_on_disconnect(client_fd);
+            sub->m_forwarded_clients.erase(client_fd);
+        }
+    }
+    m_routes.erase(it);
+    return true;
+}
+
+std::string_view server_instance::get_client_route(int client_fd) const
+{
+    auto it = m_routes.find(client_fd);
+    if (it == m_routes.end()) return {};
+    return it->second;
+}
+
+void server_instance::process_forwarded_message(int client_fd, std::string_view msg,
+                                                  std::string_view parent_name)
+{
+    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    invoke_on_client_message(client_fd, msg);
+    invoke_on_message(msg);
+}
+
+void server_instance::remove_forwarded_client(int client_fd)
+{
+    m_forwarded_clients.erase(client_fd);
+}
+
+void server_instance::send_to_client(int client_fd, std::string_view msg)
+{
+    if (client_fd < 0 || client_fd >= MAX_FDS || !m_conn_idx[client_fd]) return;
+    auto* conn = m_conn_idx[client_fd];
+    if (conn->closing) return;
+
+    std::string full(msg);
+    if (full.empty() || full.back() != '\n') full += '\n';
+    auto shared = std::make_shared<const std::string>(std::move(full));
+    send_to(conn, shared);
+}
+
+bool server_instance::owner_send(int client_fd, std::string_view msg)
+{
+    auto owner_name = get_owner();
+    if (owner_name.empty()) return false;
+
+    auto* mgr = get_runtime_manager();
+    if (!mgr) return false;
+
+    auto* parent = mgr->get(owner_name);
+    if (!parent || parent->get_type() != runtime_server ||
+        parent->get_state() != runtime_running) return false;
+
+    static_cast<server_instance*>(parent)->send_to_client(client_fd, msg);
+    return true;
+}
+
+bool server_instance::owner_broadcast(std::string_view msg)
+{
+    auto owner_name = get_owner();
+    if (owner_name.empty()) return false;
+
+    auto* mgr = get_runtime_manager();
+    if (!mgr) return false;
+
+    auto* parent = mgr->get(owner_name);
+    if (!parent || parent->get_type() != runtime_server ||
+        parent->get_state() != runtime_running) return false;
+
+    static_cast<server_instance*>(parent)->lua_broadcast(msg);
+    return true;
 }
 
 int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
