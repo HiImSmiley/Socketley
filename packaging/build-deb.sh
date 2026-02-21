@@ -64,9 +64,13 @@ fi
 chown -R socketley:socketley /var/lib/socketley
 install -dm755 -o socketley -g socketley /run/socketley
 
-# Enable service
+# Kill any stale dev-mode daemon (user-space, socket at /tmp/socketley.sock)
+pkill -x socketley 2>/dev/null || true
+
+# Enable and restart system service
 systemctl daemon-reload
 systemctl enable socketley.service
+systemctl try-restart socketley.service 2>/dev/null || true
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postinst"
 
