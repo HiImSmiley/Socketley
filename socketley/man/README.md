@@ -32,7 +32,7 @@ man ./socketley.1
 | `socketley remove <name>` | Remove runtime |
 | `socketley ls` | List all runtimes |
 | `socketley ps` | List running runtimes |
-| `socketley --config <file>` | Load Lua config |
+| `socketley --lua <file>` | Load Lua config |
 
 ## Runtime Types
 
