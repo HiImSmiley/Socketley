@@ -53,7 +53,7 @@ TEST_CASE("FNV-1a CLI commands unique")
         fnv1a("daemon"), fnv1a("ls"), fnv1a("ps"),
         fnv1a("create"), fnv1a("run"), fnv1a("stop"), fnv1a("remove"),
         fnv1a("send"), fnv1a("edit"), fnv1a("stats"), fnv1a("reload"),
-        fnv1a("--config")
+        fnv1a("--lua")
     };
 
     size_t count = sizeof(hashes) / sizeof(hashes[0]);
