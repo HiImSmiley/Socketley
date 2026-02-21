@@ -4,7 +4,7 @@
 -- Demonstrates client connection tracking with Lua callbacks.
 --
 -- USAGE:
---   socketley create server tracker -p 9000 --config callbacks-connect.lua -s
+--   socketley create server tracker -p 9000 --lua callbacks-connect.lua -s
 --   # Connect clients to see callbacks fire:
 --   nc localhost 9000
 -- =============================================================================

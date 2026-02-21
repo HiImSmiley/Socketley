@@ -8,7 +8,7 @@
 -- - Real-time log streaming
 --
 -- USAGE:
---   socketley --config logging-pipeline.lua
+--   socketley --lua logging-pipeline.lua
 --
 -- =============================================================================
 

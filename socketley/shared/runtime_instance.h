@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include <sol/sol.hpp>
+#include <liburing.h>
 #include "runtime_definitions.h"
 #include "event_loop_definitions.h"
 
@@ -235,4 +236,16 @@ private:
     // Runtime manager / event loop (base class)
     runtime_manager* m_runtime_manager = nullptr;
     event_loop* m_event_loop = nullptr;
+
+    // Tick timer
+    struct tick_handler : io_handler {
+        runtime_instance* rt{nullptr};
+        io_request req{};
+        struct __kernel_timespec ts{};
+        std::chrono::steady_clock::time_point last{};
+        void on_cqe(struct io_uring_cqe* cqe) override;
+    };
+    tick_handler* m_tick{nullptr};
+    void start_tick_timer();
+    void fire_tick(int res);
 };

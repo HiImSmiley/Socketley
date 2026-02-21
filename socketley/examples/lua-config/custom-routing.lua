@@ -6,7 +6,7 @@
 -- This allows dynamic backend selection based on HTTP method and path.
 --
 -- USAGE:
---   socketley --config custom-routing.lua
+--   socketley --lua custom-routing.lua
 --
 -- =============================================================================
 

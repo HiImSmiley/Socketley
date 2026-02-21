@@ -11,7 +11,7 @@ int cli_config(int argc, char** argv)
 {
     if (argc < 3)
     {
-        std::cerr << "usage: socketley --config <lua path>\n";
+        std::cerr << "usage: socketley --lua <lua path>\n";
         return 1;
     }
 
@@ -106,7 +106,7 @@ int cli_config(int argc, char** argv)
         if (!lua_script || lua_script->empty())
             lua_script = t["lua"];
         if (lua_script && !lua_script->empty())
-            command += " --config " + *lua_script;
+            command += " --lua " + *lua_script;
 
         sol::optional<std::string> bash = t["bash"];
         if (bash)

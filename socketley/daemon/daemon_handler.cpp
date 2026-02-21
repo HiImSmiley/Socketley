@@ -521,7 +521,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         << std::setw(8) << "TYPE"
         << std::setw(8) << "PORT"
         << std::setw(6) << "CONN"
-        << std::setw(9) << "OWNER"
+        << std::setw(12) << "OWNED BY"
         << std::setw(20) << "STATUS"
         << "CREATED\n";
 
@@ -550,7 +550,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             << std::setw(8) << type_to_string(instance->get_type())
             << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
             << std::setw(6) << instance->get_connection_count()
-            << std::setw(9) << (owner.empty() ? "-" : std::string(owner))
+            << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
             << std::setw(20) << status_str
             << format_time_ago(instance->get_created_time()) << "\n";
     }
@@ -578,7 +578,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         << std::setw(8) << "TYPE"
         << std::setw(8) << "PORT"
         << std::setw(6) << "CONN"
-        << std::setw(9) << "OWNER"
+        << std::setw(12) << "OWNED BY"
         << std::setw(20) << "STATUS"
         << "CREATED\n";
 
@@ -594,7 +594,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             << std::setw(8) << type_to_string(instance->get_type())
             << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
             << std::setw(6) << instance->get_connection_count()
-            << std::setw(9) << (owner.empty() ? "-" : std::string(owner))
+            << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
             << std::setw(20) << format_uptime(instance->get_start_time())
             << format_time_ago(instance->get_created_time()) << "\n";
     }

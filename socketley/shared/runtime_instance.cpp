@@ -16,6 +16,43 @@ runtime_instance::runtime_instance(runtime_type type, std::string_view name)
 
 runtime_instance::~runtime_instance() = default;
 
+void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
+{
+    if (!rt) { delete this; return; }
+    rt->fire_tick(cqe->res);
+}
+
+void runtime_instance::start_tick_timer()
+{
+    uint32_t ms = m_lua->get_tick_ms();
+    if (ms < 10) ms = 10;
+    m_tick = new tick_handler();
+    m_tick->rt = this;
+    m_tick->req = { op_timeout, -1, nullptr, 0, m_tick };
+    m_tick->ts = { static_cast<long long>(ms / 1000),
+                   static_cast<long long>((ms % 1000) * 1000000LL) };
+    m_tick->last = std::chrono::steady_clock::now();
+    m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req);
+}
+
+void runtime_instance::fire_tick(int res)
+{
+    if (res == -ECANCELED || !m_tick) return;
+    auto now = std::chrono::steady_clock::now();
+    double dt = std::chrono::duration<double, std::milli>(now - m_tick->last).count();
+    m_tick->last = now;
+    if (m_lua && m_lua->has_on_tick()) {
+        try { m_lua->on_tick()(dt); }
+        catch (const sol::error& e) { std::cerr << "[lua] on_tick error: " << e.what() << "\n"; }
+    }
+    if (!m_tick || !m_event_loop) return;
+    uint32_t ms = m_lua ? m_lua->get_tick_ms() : 100;
+    if (ms < 10) ms = 10;
+    m_tick->ts = { static_cast<long long>(ms / 1000),
+                   static_cast<long long>((ms % 1000) * 1000000LL) };
+    m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req);
+}
+
 bool runtime_instance::start(event_loop& loop)
 {
     runtime_state current = m_state.load(std::memory_order_acquire);
@@ -32,6 +69,8 @@ bool runtime_instance::start(event_loop& loop)
     m_state.store(runtime_running, std::memory_order_release);
     m_start_time = std::chrono::system_clock::now();
     invoke_on_start();
+    if (m_lua && m_lua->has_on_tick() && m_event_loop)
+        start_tick_timer();
     return true;
 }
 
@@ -40,6 +79,7 @@ bool runtime_instance::stop(event_loop& loop)
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
 
+    if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
     invoke_on_stop();
     teardown(loop);
     m_state.store(runtime_stopped, std::memory_order_release);
@@ -233,6 +273,15 @@ bool runtime_instance::reload_lua_script()
     }
 
     m_lua->update_self_state("running");
+
+    bool should_tick = m_lua->has_on_tick();
+    if (!m_tick && should_tick)
+        start_tick_timer();
+    else if (m_tick && !should_tick) {
+        m_tick->rt = nullptr;
+        m_tick = nullptr;
+    }
+
     return true;
 }
 

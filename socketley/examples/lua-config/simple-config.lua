@@ -5,7 +5,7 @@
 -- Shows the basic structure of a Lua configuration file.
 --
 -- USAGE:
---   socketley --config simple-config.lua
+--   socketley --lua simple-config.lua
 --
 -- =============================================================================
 
