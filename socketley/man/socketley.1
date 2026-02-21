@@ -69,7 +69,7 @@ socketley \- manage long-living network runtimes in Docker-like style
 .I name
 .br
 .B socketley
-.B \-\-config
+.B \-\-lua
 .I lua_file
 .SH DESCRIPTION
 .B socketley
@@ -282,7 +282,7 @@ eviction	string	"noeviction", "allkeys-lru", "allkeys-random"
 .TP
 .B ls
 List all runtimes (all states). Docker-style output with columns:
-ID, NAME, TYPE, PORT, CONN (connections), OWNER, STATUS, CREATED.
+ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED.
 .TP
 .B ps
 List only running runtimes. Same format as
@@ -292,7 +292,7 @@ List only running runtimes. Same format as
 Show ownership info for a runtime: parent name, children list, and
 on_parent_stop policy (stop or remove).
 .TP
-.BI "\-\-config " "lua_file"
+.BI "\-\-lua " "lua_file"
 Load Lua orchestration configuration. Creates multiple runtimes from
 a single config file.
 .SH DAEMON FLAGS
@@ -324,9 +324,8 @@ Log state transitions (created, running, stopped, failed) to file.
 .BI "\-w " "file"
 Write every received message to file.
 .TP
-.BI "\-\-config " "script"
-Attach Lua configuration script with callbacks (alias:
-.BR \-\-lua ).
+.BI "\-\-lua " "script"
+Attach Lua configuration script with callbacks.
 .TP
 .B \-b
 Output received messages to stdout (bash mode).
@@ -717,6 +716,21 @@ Proxy only. Custom backend selection. Returns backend index (0-based).
 Server only (master mode). Custom authentication. Return true to grant
 master role, false to deny. If defined, overrides
 .BR \-\-master\-pw .
+.TP
+.B on_tick(dt)
+Called at a configurable interval while the runtime is running.
+.I dt
+is the actual elapsed time in milliseconds since the last tick (double).
+Requires a top-level
+.B tick_ms
+global (integer, minimum 10, default 100 if omitted) to be set in the Lua script.
+Example:
+.nf
+tick_ms = 50
+function on_tick(dt)
+    self.broadcast("ping")
+end
+.fi
 .SS Runtime Methods (in Lua)
 .nf
 self.name      -- Runtime name (read-only)
@@ -1012,7 +1026,7 @@ socketley create server api -p 9000 --cache db -s
 Load complex configuration:
 .PP
 .nf
-socketley --config /etc/socketley/setup.lua
+socketley --lua /etc/socketley/setup.lua
 .fi
 .SH INSTALLATION
 .SS Quick Install

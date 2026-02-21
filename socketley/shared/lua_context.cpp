@@ -56,6 +56,11 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_route = m_lua["on_route"];
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
+    m_on_tick = m_lua["on_tick"];
+    if (m_on_tick.valid()) {
+        sol::optional<int> tms = m_lua["tick_ms"];
+        m_tick_ms = (tms && *tms >= 10) ? static_cast<uint32_t>(*tms) : 100;
+    }
 
     return true;
 }
@@ -69,6 +74,7 @@ bool lua_context::has_on_disconnect() const { return m_on_disconnect.valid(); }
 bool lua_context::has_on_route() const { return m_on_route.valid(); }
 bool lua_context::has_on_master_auth() const { return m_on_master_auth.valid(); }
 bool lua_context::has_on_client_message() const { return m_on_client_message.valid(); }
+bool lua_context::has_on_tick() const { return m_on_tick.valid(); }
 
 void lua_context::update_self_state(const char* state_str)
 {

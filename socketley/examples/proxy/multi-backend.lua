@@ -6,7 +6,7 @@
 -- The on_route() function determines which backend handles each request.
 --
 -- USAGE:
---   socketley --config multi-backend.lua
+--   socketley --lua multi-backend.lua
 --
 -- =============================================================================
 

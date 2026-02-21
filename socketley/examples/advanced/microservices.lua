@@ -9,7 +9,7 @@
 -- - Shared state via cache
 --
 -- USAGE:
---   socketley --config microservices.lua
+--   socketley --lua microservices.lua
 --
 -- =============================================================================
 
