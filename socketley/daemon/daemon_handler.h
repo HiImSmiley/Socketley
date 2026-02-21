@@ -52,8 +52,8 @@ private:
     int process_command(ipc_connection* conn, std::string_view line);
     int cmd_create(const parsed_args& pa);
     int cmd_start(ipc_connection* conn, const parsed_args& pa);
-    int cmd_stop(const parsed_args& pa);
-    int cmd_remove(const parsed_args& pa);
+    int cmd_stop(ipc_connection* conn, const parsed_args& pa);
+    int cmd_remove(ipc_connection* conn, const parsed_args& pa);
     int cmd_ls(ipc_connection* conn, const parsed_args& pa);
     int cmd_ps(ipc_connection* conn, const parsed_args& pa);
     int cmd_send(const parsed_args& pa);
