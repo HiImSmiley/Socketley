@@ -55,7 +55,7 @@ LUAEOF
 # If the daemon was started by run_all.sh, we can't capture its stderr
 # This test verifies it doesn't crash; full callback verification needs daemon stderr
 
-"$BIN" create server luasvr -p "$PORT" --config "$LUA_SCRIPT" -s 2>"$LOG_FILE" || true
+"$BIN" create server luasvr -p "$PORT" --lua "$LUA_SCRIPT" -s 2>"$LOG_FILE" || true
 sleep 0.3
 
 # Connect and send a message, then disconnect
