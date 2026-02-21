@@ -6,7 +6,7 @@
 -- server and client runtimes via Lua.
 --
 -- USAGE:
---   socketley --config cache-integration.lua
+--   socketley --lua cache-integration.lua
 --
 -- =============================================================================
 

@@ -9,7 +9,7 @@
 -- - Hot reload simulation via callbacks
 --
 -- USAGE:
---   socketley --config development-env.lua
+--   socketley --lua development-env.lua
 --
 -- =============================================================================
 

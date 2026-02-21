@@ -199,9 +199,9 @@ cli_commands() {
     echo -e "  ${CYAN}socketley owner chess-rapid${NC}"
     echo ""
 
-    echo -e "${BOLD}--config <file.lua>${NC}"
+    echo -e "${BOLD}--lua <file.lua>${NC}"
     echo "  Load Lua configuration"
-    echo -e "  ${CYAN}socketley --config setup.lua${NC}"
+    echo -e "  ${CYAN}socketley --lua setup.lua${NC}"
     echo ""
 
     read -p "Press Enter to continue..."
@@ -298,7 +298,7 @@ flags_options() {
     echo "│ --test           │ Dry run (validate only)                 │"
     echo "│ --log <file>     │ Log state transitions                   │"
     echo "│ -w <file>        │ Write messages to file                  │"
-    echo "│ --config <script>│ Attach Lua configuration (alias: --lua) │"
+    echo "│ --lua <script>   │ Attach Lua configuration script         │"
     echo "│ -b               │ Output messages to stdout               │"
     echo "│ -bp              │ Output with [name] prefix               │"
     echo "│ -bt              │ Output with [HH:MM:SS] timestamp        │"
@@ -389,6 +389,7 @@ lua_config() {
     echo "│ on_send(msg)                 │ Called on message sent           │"
     echo "│ on_route(method, path)       │ Proxy: custom backend selection  │"
     echo "│ on_master_auth(id, pw)       │ Server: master mode auth         │"
+    echo "│ on_tick(dt)                  │ Periodic timer (tick_ms global)  │"
     echo "└──────────────────────────────┴──────────────────────────────────┘"
     echo ""
 
@@ -587,7 +588,7 @@ example_lua_config() {
     echo "end"
     echo ""
     echo "# Run:"
-    echo -e "socketley --config config.lua${NC}"
+    echo -e "socketley --lua config.lua${NC}"
     echo ""
     read -p "Press Enter to continue..."
     examples_menu
@@ -696,7 +697,7 @@ example_stats_reload() {
     show_header
     echo -e "${BOLD}${YELLOW}=== Stats & Reload Example ===${NC}\n"
     echo -e "${CYAN}# Create server with Lua script"
-    echo "socketley create server api -p 9000 --config handler.lua -s"
+    echo "socketley create server api -p 9000 --lua handler.lua -s"
     echo ""
     echo "# View statistics"
     echo "socketley stats api"

@@ -5,7 +5,7 @@
 -- Demonstrates all available Lua callbacks and when they fire.
 --
 -- USAGE:
---   socketley --config callbacks.lua
+--   socketley --lua callbacks.lua
 --
 -- =============================================================================
 
@@ -75,7 +75,7 @@ end
 
 --[[
 Test:
-  1. Run: socketley --config callbacks.lua
+  1. Run: socketley --lua callbacks.lua
   2. Connect: nc localhost 9000
   3. Type messages and observe callback logs
   4. Stop: socketley stop callback-demo

@@ -56,11 +56,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             instance->set_write_file(pa.args[++i]);
             return 0;
 
-        case fnv1a("--config"):
         case fnv1a("--lua"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "--config requires a Lua script path\n";
+                std::cout << "--lua requires a Lua script path\n";
                 return 1;
             }
             if (!instance->load_lua_script(pa.args[++i]))

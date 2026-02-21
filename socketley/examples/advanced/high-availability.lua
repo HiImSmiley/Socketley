@@ -8,7 +8,7 @@
 -- - Health tracking in cache
 --
 -- USAGE:
---   socketley --config high-availability.lua
+--   socketley --lua high-availability.lua
 --
 -- =============================================================================
 
