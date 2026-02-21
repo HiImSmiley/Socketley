@@ -280,8 +280,8 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
     {
         case fnv1a("create"):     return cmd_create(pa);
         case fnv1a("start"):     return cmd_start(conn, pa);
-        case fnv1a("stop"):      return cmd_stop(pa);
-        case fnv1a("remove"):    return cmd_remove(pa);
+        case fnv1a("stop"):      return cmd_stop(conn, pa);
+        case fnv1a("remove"):    return cmd_remove(conn, pa);
         case fnv1a("ls"):        return cmd_ls(conn, pa);
         case fnv1a("ps"):        return cmd_ps(conn, pa);
         case fnv1a("send"):      return cmd_send(pa);
@@ -419,7 +419,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     }
 
     auto names = resolve_names(pa);
-    int rc = check_empty_names(names, pa, "could not run runtime: ", nullptr);
+    int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
     if (want_interactive && names.size() > 1)
@@ -459,16 +459,16 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-int daemon_handler::cmd_stop(const parsed_args& pa)
+int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        std::cout << "usage: stop <name|pattern>...\n";
+        conn->write_buf = "usage: stop <name|pattern>...\n";
         return 1;
     }
 
     auto names = resolve_names(pa);
-    int rc = check_empty_names(names, pa, "could not stop runtime: ", nullptr);
+    int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
     for (const auto& n : names)
@@ -479,16 +479,16 @@ int daemon_handler::cmd_stop(const parsed_args& pa)
     return 0;
 }
 
-int daemon_handler::cmd_remove(const parsed_args& pa)
+int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        std::cout << "usage: remove <name|pattern>...\n";
+        conn->write_buf = "usage: remove <name|pattern>...\n";
         return 1;
     }
 
     auto names = resolve_names(pa);
-    int rc = check_empty_names(names, pa, "could not remove runtime: ", nullptr);
+    int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
     for (const auto& n : names)
