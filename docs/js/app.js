@@ -70,7 +70,7 @@ function updateActiveNav() {
       li.querySelectorAll('ul a').forEach(cl => {
         if (cl.getAttribute('href') && cl.getAttribute('href').slice(1) === current) match = true;
       });
-      if (match) { a.classList.add('active'); li.classList.add('open'); }
+      if (match) { a.classList.add('active'); }
     }
   });
   subItems.forEach(a => {
@@ -78,16 +78,6 @@ function updateActiveNav() {
     if (a.getAttribute('href') && a.getAttribute('href').slice(1) === current) a.classList.add('active');
   });
 }
-
-// Accordion toggle for nav top-level items
-document.querySelectorAll('#navList-socketley > li > a, #navList-lua > li > a').forEach(a => {
-  a.addEventListener('click', function(e) {
-    if (this.parentElement.querySelector(':scope > ul')) {
-      e.preventDefault();
-      this.parentElement.classList.toggle('open');
-    }
-  });
-});
 
 window.addEventListener('scroll', updateActiveNav);
 
@@ -117,7 +107,6 @@ searchInput.addEventListener('input', function() {
       if (m) any = true;
     });
     li.style.display = any ? '' : 'none';
-    if (any) li.classList.add('open');
   });
 });
 
