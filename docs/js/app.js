@@ -82,8 +82,10 @@ function updateActiveNav() {
 // Accordion toggle for nav top-level items
 document.querySelectorAll('#navList-socketley > li > a, #navList-lua > li > a').forEach(a => {
   a.addEventListener('click', function(e) {
-    // Only toggle accordion; actual hash navigation is handled by the href
-    this.parentElement.classList.toggle('open');
+    if (this.parentElement.querySelector(':scope > ul')) {
+      e.preventDefault();
+      this.parentElement.classList.toggle('open');
+    }
   });
 });
 
