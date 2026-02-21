@@ -99,7 +99,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("daemon"):
             return cli_daemon();
 
-        case fnv1a("--config"):
+        case fnv1a("--lua"):
             return cli_config(argc, argv);
 
         default:

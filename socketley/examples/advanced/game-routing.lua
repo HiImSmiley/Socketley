@@ -2,7 +2,7 @@
 -- Main server (lobby) routes players to mode-specific sub-servers
 --
 -- Usage:
---   socketley create server lobby -p 9000 --config examples/advanced/game-routing.lua -s
+--   socketley create server lobby -p 9000 --lua examples/advanced/game-routing.lua -s
 --   # Then connect: nc localhost 9000
 --   # Send "join rapid" to route to rapid mode
 --   # Send "join blitz" to route to blitz mode

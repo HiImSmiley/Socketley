@@ -10,7 +10,7 @@
 -- - Comprehensive logging and callbacks
 --
 -- USAGE:
---   socketley --config full-setup.lua
+--   socketley --lua full-setup.lua
 --
 -- =============================================================================
 

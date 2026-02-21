@@ -32,6 +32,7 @@ public:
     bool has_on_route() const;
     bool has_on_master_auth() const;
     bool has_on_client_message() const;
+    bool has_on_tick() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -43,6 +44,8 @@ public:
     sol::function& on_route() { return m_on_route; }
     sol::function& on_master_auth() { return m_on_master_auth; }
     sol::function& on_client_message() { return m_on_client_message; }
+    sol::function& on_tick() { return m_on_tick; }
+    uint32_t get_tick_ms() const { return m_tick_ms; }
 
 private:
     void register_bindings(runtime_instance* owner);
@@ -61,4 +64,6 @@ private:
     sol::function m_on_route;
     sol::function m_on_master_auth;
     sol::function m_on_client_message;
+    sol::function m_on_tick;
+    uint32_t m_tick_ms{0};
 };
