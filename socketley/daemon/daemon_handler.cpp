@@ -514,45 +514,116 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     if (runtimes.empty())
         return 0;
 
-    std::ostringstream out;
-    out << std::left
-        << std::setw(10) << "ID"
-        << std::setw(16) << "NAME"
-        << std::setw(8) << "TYPE"
-        << std::setw(8) << "PORT"
-        << std::setw(6) << "CONN"
-        << std::setw(12) << "OWNED BY"
-        << std::setw(20) << "STATUS"
-        << "CREATED\n";
+    bool silent = false;
+    bool col_id = false, col_name = false, col_type = false, col_port = false;
+    bool col_status = false, col_conn = false, col_owner = false, col_created = false;
 
-    for (const auto& [name, instance] : runtimes)
+    for (size_t i = 1; i < pa.count; ++i)
     {
-        runtime_state state = instance->get_state();
-        const char* status_str;
-        std::string uptime_buf;
-
-        switch (state)
+        switch (pa.hashes[i])
         {
-            case runtime_created: status_str = "Created"; break;
-            case runtime_running:
-                uptime_buf = format_uptime(instance->get_start_time());
-                status_str = uptime_buf.c_str();
-                break;
-            case runtime_stopped: status_str = "Stopped"; break;
-            case runtime_failed:  status_str = "Failed";  break;
-            default: status_str = "Unknown"; break;
+            case fnv1a("-s"):
+            case fnv1a("--silent"):  silent     = true; break;
+            case fnv1a("--id"):      col_id      = true; break;
+            case fnv1a("--name"):    col_name    = true; break;
+            case fnv1a("--type"):    col_type    = true; break;
+            case fnv1a("--port"):    col_port    = true; break;
+            case fnv1a("--status"):  col_status  = true; break;
+            case fnv1a("--conn"):    col_conn    = true; break;
+            case fnv1a("--owner"):   col_owner   = true; break;
+            case fnv1a("--created"): col_created = true; break;
+        }
+    }
+
+    bool any_col = col_id || col_name || col_type || col_port ||
+                   col_status || col_conn || col_owner || col_created;
+
+    std::ostringstream out;
+    out << std::left;
+
+    if (!any_col)
+    {
+        if (!silent)
+            out << std::setw(10) << "ID"
+                << std::setw(16) << "NAME"
+                << std::setw(8)  << "TYPE"
+                << std::setw(8)  << "PORT"
+                << std::setw(6)  << "CONN"
+                << std::setw(12) << "OWNED BY"
+                << std::setw(20) << "STATUS"
+                << "CREATED\n";
+
+        for (const auto& [name, instance] : runtimes)
+        {
+            runtime_state state = instance->get_state();
+            const char* status_str;
+            std::string uptime_buf;
+            switch (state)
+            {
+                case runtime_created: status_str = "Created"; break;
+                case runtime_running:
+                    uptime_buf = format_uptime(instance->get_start_time());
+                    status_str = uptime_buf.c_str();
+                    break;
+                case runtime_stopped: status_str = "Stopped"; break;
+                case runtime_failed:  status_str = "Failed";  break;
+                default:              status_str = "Unknown"; break;
+            }
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            out << std::setw(10) << instance->get_id()
+                << std::setw(16) << name
+                << std::setw(8)  << type_to_string(instance->get_type())
+                << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
+                << std::setw(6)  << instance->get_connection_count()
+                << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
+                << std::setw(20) << status_str
+                << format_time_ago(instance->get_created_time()) << "\n";
+        }
+    }
+    else
+    {
+        if (!silent)
+        {
+            bool first = true;
+            auto hdr = [&](const char* h) { if (!first) out << '\t'; out << h; first = false; };
+            if (col_id)      hdr("ID");
+            if (col_name)    hdr("NAME");
+            if (col_type)    hdr("TYPE");
+            if (col_port)    hdr("PORT");
+            if (col_conn)    hdr("CONN");
+            if (col_owner)   hdr("OWNER");
+            if (col_status)  hdr("STATUS");
+            if (col_created) hdr("CREATED");
+            out << '\n';
         }
 
-        uint16_t port = instance->get_port();
-        auto owner = instance->get_owner();
-        out << std::setw(10) << instance->get_id()
-            << std::setw(16) << name
-            << std::setw(8) << type_to_string(instance->get_type())
-            << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
-            << std::setw(6) << instance->get_connection_count()
-            << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
-            << std::setw(20) << status_str
-            << format_time_ago(instance->get_created_time()) << "\n";
+        for (const auto& [name, instance] : runtimes)
+        {
+            runtime_state state = instance->get_state();
+            std::string status;
+            switch (state)
+            {
+                case runtime_created: status = "Created"; break;
+                case runtime_running: status = format_uptime(instance->get_start_time()); break;
+                case runtime_stopped: status = "Stopped"; break;
+                case runtime_failed:  status = "Failed";  break;
+                default:              status = "Unknown"; break;
+            }
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            bool first = true;
+            auto col = [&](const std::string& v) { if (!first) out << '\t'; out << v; first = false; };
+            if (col_id)      col(std::string(instance->get_id()));
+            if (col_name)    col(std::string(name));
+            if (col_type)    col(std::string(type_to_string(instance->get_type())));
+            if (col_port)    col(port > 0 ? std::to_string(port) : "-");
+            if (col_conn)    col(std::to_string(instance->get_connection_count()));
+            if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
+            if (col_status)  col(status);
+            if (col_created) col(format_time_ago(instance->get_created_time()));
+            out << '\n';
+        }
     }
 
     conn->write_buf = out.str();
@@ -571,32 +642,97 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
     if (!has_running)
         return 0;
 
-    std::ostringstream out;
-    out << std::left
-        << std::setw(10) << "ID"
-        << std::setw(16) << "NAME"
-        << std::setw(8) << "TYPE"
-        << std::setw(8) << "PORT"
-        << std::setw(6) << "CONN"
-        << std::setw(12) << "OWNED BY"
-        << std::setw(20) << "STATUS"
-        << "CREATED\n";
+    bool silent = false;
+    bool col_id = false, col_name = false, col_type = false, col_port = false;
+    bool col_uptime = false, col_conn = false, col_owner = false, col_created = false;
 
-    for (const auto& [name, instance] : runtimes)
+    for (size_t i = 1; i < pa.count; ++i)
     {
-        if (instance->get_state() != runtime_running)
-            continue;
+        switch (pa.hashes[i])
+        {
+            case fnv1a("-s"):
+            case fnv1a("--silent"):  silent     = true; break;
+            case fnv1a("--id"):      col_id      = true; break;
+            case fnv1a("--name"):    col_name    = true; break;
+            case fnv1a("--type"):    col_type    = true; break;
+            case fnv1a("--port"):    col_port    = true; break;
+            case fnv1a("--uptime"):  col_uptime  = true; break;
+            case fnv1a("--status"):  col_uptime  = true; break;
+            case fnv1a("--conn"):    col_conn    = true; break;
+            case fnv1a("--owner"):   col_owner   = true; break;
+            case fnv1a("--created"): col_created = true; break;
+        }
+    }
 
-        uint16_t port = instance->get_port();
-        auto owner = instance->get_owner();
-        out << std::setw(10) << instance->get_id()
-            << std::setw(16) << name
-            << std::setw(8) << type_to_string(instance->get_type())
-            << std::setw(8) << (port > 0 ? std::to_string(port) : "-")
-            << std::setw(6) << instance->get_connection_count()
-            << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
-            << std::setw(20) << format_uptime(instance->get_start_time())
-            << format_time_ago(instance->get_created_time()) << "\n";
+    bool any_col = col_id || col_name || col_type || col_port ||
+                   col_uptime || col_conn || col_owner || col_created;
+
+    std::ostringstream out;
+    out << std::left;
+
+    if (!any_col)
+    {
+        if (!silent)
+            out << std::setw(10) << "ID"
+                << std::setw(16) << "NAME"
+                << std::setw(8)  << "TYPE"
+                << std::setw(8)  << "PORT"
+                << std::setw(6)  << "CONN"
+                << std::setw(12) << "OWNED BY"
+                << std::setw(20) << "STATUS"
+                << "CREATED\n";
+
+        for (const auto& [name, instance] : runtimes)
+        {
+            if (instance->get_state() != runtime_running)
+                continue;
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            out << std::setw(10) << instance->get_id()
+                << std::setw(16) << name
+                << std::setw(8)  << type_to_string(instance->get_type())
+                << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
+                << std::setw(6)  << instance->get_connection_count()
+                << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
+                << std::setw(20) << format_uptime(instance->get_start_time())
+                << format_time_ago(instance->get_created_time()) << "\n";
+        }
+    }
+    else
+    {
+        if (!silent)
+        {
+            bool first = true;
+            auto hdr = [&](const char* h) { if (!first) out << '\t'; out << h; first = false; };
+            if (col_id)      hdr("ID");
+            if (col_name)    hdr("NAME");
+            if (col_type)    hdr("TYPE");
+            if (col_port)    hdr("PORT");
+            if (col_conn)    hdr("CONN");
+            if (col_owner)   hdr("OWNER");
+            if (col_uptime)  hdr("UPTIME");
+            if (col_created) hdr("CREATED");
+            out << '\n';
+        }
+
+        for (const auto& [name, instance] : runtimes)
+        {
+            if (instance->get_state() != runtime_running)
+                continue;
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            bool first = true;
+            auto col = [&](const std::string& v) { if (!first) out << '\t'; out << v; first = false; };
+            if (col_id)      col(std::string(instance->get_id()));
+            if (col_name)    col(std::string(name));
+            if (col_type)    col(std::string(type_to_string(instance->get_type())));
+            if (col_port)    col(port > 0 ? std::to_string(port) : "-");
+            if (col_conn)    col(std::to_string(instance->get_connection_count()));
+            if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
+            if (col_uptime)  col(format_uptime(instance->get_start_time()));
+            if (col_created) col(format_time_ago(instance->get_created_time()));
+            out << '\n';
+        }
     }
 
     conn->write_buf = out.str();
