@@ -16,7 +16,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential liburing-dev libssl-dev netcat-openbsd bc
+          sudo apt-get install -y build-essential liburing-dev libssl-dev netcat-openbsd bc libluajit-5.1-dev
+          cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" thirdparty/luajit/libluajit.a
 
       - name: Generate Makefiles
         run: ./bin/premake5 gmake2
