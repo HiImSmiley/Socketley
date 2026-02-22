@@ -434,6 +434,11 @@ void runtime_instance::set_on_message(std::function<void(std::string_view)> cb) 
 void runtime_instance::set_on_tick(std::function<void(double)> cb)                       { m_cb_on_tick = std::move(cb); }
 void runtime_instance::set_tick_interval(uint32_t ms)                                    { m_cb_tick_ms = ms; }
 
+// ─── Group ───
+
+void runtime_instance::set_group(std::string_view group) { m_group = std::string(group); }
+std::string_view runtime_instance::get_group() const { return m_group; }
+
 // ─── Ownership ───
 
 void runtime_instance::set_owner(std::string_view owner_name) { m_owner = std::string(owner_name); }

@@ -353,6 +353,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
     cfg.cache_name = instance->get_cache_name();
+    cfg.group = instance->get_group();
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
     cfg.external_runtime = instance->is_external();
@@ -451,6 +452,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"target\": \"" << json_escape(cfg.target) << "\",\n";
     if (!cfg.cache_name.empty())
         out << "    \"cache_name\": \"" << json_escape(cfg.cache_name) << "\",\n";
+    if (!cfg.group.empty())
+        out << "    \"group\": \"" << json_escape(cfg.group) << "\",\n";
     if (!cfg.owner.empty())
         out << "    \"owner\": \"" << json_escape(cfg.owner) << "\",\n";
     if (cfg.child_policy != 0)
@@ -548,6 +551,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.ca_path = json_get_string(json, "ca_path");
     cfg.target = json_get_string(json, "target");
     cfg.cache_name = json_get_string(json, "cache_name");
+    cfg.group = json_get_string(json, "group");
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
     cfg.external_runtime = json_get_bool(json, "external_runtime");

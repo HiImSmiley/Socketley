@@ -180,6 +180,18 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
         inst->on_publish_dispatch(cache_name, channel, message);
 }
 
+std::vector<runtime_instance*> runtime_manager::get_by_group(std::string_view group) const
+{
+    std::shared_lock lock(mutex);
+    std::vector<runtime_instance*> result;
+    for (const auto& [_, inst] : runtimes)
+    {
+        if (inst->get_group() == group && inst->get_state() == runtime_running)
+            result.push_back(inst.get());
+    }
+    return result;
+}
+
 const runtime_manager::runtime_map& runtime_manager::list() const
 {
     return runtimes;

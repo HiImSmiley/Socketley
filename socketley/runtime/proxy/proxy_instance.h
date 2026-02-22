@@ -22,6 +22,13 @@ struct backend_info
     std::string address;
     std::string resolved_host;
     uint16_t resolved_port = 0;
+    bool is_group = false;
+};
+
+struct resolved_backend
+{
+    std::string host;
+    uint16_t port = 0;
 };
 
 struct proxy_client_connection
@@ -107,8 +114,8 @@ private:
                                      std::string_view new_path);
 
     bool resolve_backend(backend_info& b);
-    size_t select_backend(proxy_client_connection* conn);
-    bool connect_to_backend(proxy_client_connection* conn, size_t idx);
+    resolved_backend select_and_resolve_backend(proxy_client_connection* conn);
+    bool connect_to_backend(proxy_client_connection* conn, const resolved_backend& target);
     void close_pair(int client_fd, int backend_fd);
 
     void forward_to_backend(proxy_client_connection* conn, std::string_view data);
