@@ -119,6 +119,10 @@ public:
     // UDP mode (virtual, implemented by server/client)
     virtual bool is_udp() const { return false; }
 
+    // Group tagging (for dynamic proxy backend discovery)
+    void set_group(std::string_view group);
+    std::string_view get_group() const;
+
     // Ownership system
     void set_owner(std::string_view owner_name);
     std::string_view get_owner() const;
@@ -263,6 +267,9 @@ private:
 
     // Interactive mode observer fds (IPC sockets)
     std::vector<int> m_interactive_fds;
+
+    // Group tag
+    std::string m_group;
 
     // Ownership
     std::string m_owner;
