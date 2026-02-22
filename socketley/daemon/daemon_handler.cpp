@@ -132,6 +132,13 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             break;
         case op_write:
             break;
+        case op_timeout:
+            // Deferred-delete cleanup: all in-flight CQEs for the removed runtimes have
+            // now been processed (event loop completed at least one full iteration), so
+            // it is safe to destroy the runtime objects.
+            m_deferred_delete.clear();
+            m_cleanup_pending = false;
+            break;
         default:
             break;
     }
@@ -294,6 +301,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("reload"):    return cmd_reload(conn, pa);
         case fnv1a("reload-lua"):return cmd_reload_lua(conn, pa);
         case fnv1a("owner"):     return cmd_owner(conn, pa);
+        case fnv1a("attach"):    return cmd_attach(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -500,9 +508,30 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
 
     for (const auto& n : names)
     {
-        if (m_manager.remove(n) && m_persistence)
-            m_persistence->remove_runtime(n);
+        // Use extract() instead of remove() so we hold the runtime alive for one
+        // event loop tick.  Any io_uring CQEs that are still in-flight reference
+        // io_request members embedded in the runtime object; freeing the object
+        // immediately would make those pointers dangling and crash the daemon.
+        auto ptr = m_manager.extract(n);
+        if (ptr)
+        {
+            m_deferred_delete.push_back(std::move(ptr));
+            if (m_persistence)
+                m_persistence->remove_runtime(n);
+        }
     }
+
+    // Schedule a 0-ms timeout so we get a CQE in the very next event loop
+    // iteration.  By the time that CQE fires, all pending CQEs for the removed
+    // runtimes will have been processed and it is safe to destroy the objects.
+    if (!m_deferred_delete.empty() && !m_cleanup_pending)
+    {
+        m_cleanup_pending = true;
+        m_cleanup_ts = {};   // {0, 0} — fires immediately
+        m_cleanup_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop.submit_timeout(&m_cleanup_ts, &m_cleanup_req);
+    }
+
     return 0;
 }
 
@@ -1724,6 +1753,92 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         if (inst && !inst->get_lua_script_path().empty())
             inst->reload_lua_script();
     }
+    return 0;
+}
+
+int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 4)
+    {
+        conn->write_buf = "usage: attach <type> <name> <port> [--owner <name>]\n";
+        return 1;
+    }
+
+    runtime_type type;
+    if (!parse_runtime_type(pa.args[1], type))
+    {
+        conn->write_buf = std::string("unknown runtime type: ") + std::string(pa.args[1]) + "\n";
+        return 1;
+    }
+
+    std::string_view name = pa.args[2];
+
+    // Parse port
+    uint16_t port = 0;
+    {
+        auto sv = pa.args[3];
+        auto result = std::from_chars(sv.data(), sv.data() + sv.size(), port);
+        if (result.ec != std::errc{} || port == 0)
+        {
+            conn->write_buf = "invalid port: " + std::string(sv) + "\n";
+            return 1;
+        }
+    }
+
+    // Check for name collision
+    if (m_manager.get(name))
+    {
+        conn->write_buf = std::string("runtime already exists: ") + std::string(name) + "\n";
+        return 1;
+    }
+
+    if (!m_manager.create(type, name))
+    {
+        conn->write_buf = "internal error: could not create runtime\n";
+        return 2;
+    }
+
+    auto* inst = m_manager.get(name);
+    if (!inst)
+    {
+        conn->write_buf = "internal error\n";
+        return 2;
+    }
+
+    inst->set_port(port);
+    inst->set_runtime_manager(&m_manager);
+    inst->set_event_loop(&m_loop);
+
+    // Parse optional flags
+    for (size_t i = 4; i < pa.count; ++i)
+    {
+        if ((pa.args[i] == "--owner" || pa.args[i] == "-o") && i + 1 < pa.count)
+        {
+            inst->set_owner(pa.args[++i]);
+        }
+        else if (pa.args[i] == "--pid" && i + 1 < pa.count)
+        {
+            pid_t pid = 0;
+            auto sv = pa.args[++i];
+            std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+            if (pid > 0)
+                inst->set_pid(pid);
+        }
+    }
+
+    // Mark as external — must come before run() so start() skips io_uring setup
+    inst->mark_external();
+
+    if (!m_manager.run(name, m_loop))
+    {
+        conn->write_buf = "could not register external runtime\n";
+        m_manager.remove(name);
+        return 2;
+    }
+
+    if (m_persistence)
+        m_persistence->save_runtime(inst);
+
     return 0;
 }
 

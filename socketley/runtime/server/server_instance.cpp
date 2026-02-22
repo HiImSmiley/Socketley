@@ -8,6 +8,7 @@
 
 #include <unistd.h>
 #include <cstring>
+#include <charconv>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
@@ -87,6 +88,12 @@ size_t server_instance::get_connection_count() const
 
 bool server_instance::setup(event_loop& loop)
 {
+    // Clear any connections left over from a previous stop() — their fds are
+    // already closed, but we deferred freeing them so that in-flight io_uring
+    // CQEs could reference their io_request members safely.  Now that setup()
+    // is starting a fresh run it is safe to destroy them.
+    m_clients.clear();
+
     m_loop = &loop;
 
     // Internal-only server (port=0, used for Lua-managed sub-servers)
@@ -198,7 +205,17 @@ void server_instance::teardown(event_loop& loop)
         return;
     }
 
-    // Close listener first to stop new connections
+    // Shutdown the listen socket before closing it.  This causes the kernel to
+    // complete any pending io_uring accept ops immediately (via the socket wait
+    // queue), placing their CQEs in the ring synchronously within the syscall.
+    // Using shutdown() instead of a cancel SQE avoids the race where close(fd)
+    // is called before the SQPOLL thread processes the cancel SQE: after close,
+    // fget(fd) returns NULL so the cancel fails with ENOENT, leaving the accept
+    // in-flight and its CQE arriving after server_instance is freed → SIGSEGV.
+    if (m_listen_fd >= 0)
+        shutdown(m_listen_fd, SHUT_RDWR);
+
+    // Close listener to stop new connections
     if (m_listen_fd >= 0)
     {
         close(m_listen_fd);
@@ -223,10 +240,29 @@ void server_instance::teardown(event_loop& loop)
     {
         if (fd >= 0 && fd < MAX_FDS)
             m_conn_idx[fd] = nullptr;
+
+        // Shutdown the connection before closing it.  Like for the listen fd,
+        // shutdown() completes any pending io_uring read/write ops synchronously
+        // (the kernel wakes up the socket wait queue, completing the ops and
+        // placing their CQEs in the ring before we return from shutdown()).
+        // This avoids the cancel-SQE fd-closed race described above.
+        shutdown(fd, SHUT_RDWR);
         close(fd);
+
+        // Release shared_ptr message refs now so memory is freed promptly, but
+        // keep the server_connection structs alive — their embedded io_request
+        // members are still referenced by in-flight CQEs until the cancellations
+        // complete and the deferred-delete timeout fires.
+        while (!conn->write_queue.empty())
+            conn->write_queue.pop();
+        for (size_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].reset();
+        conn->write_batch_count = 0;
     }
 
-    m_clients.clear();
+    // Do NOT call m_clients.clear() here.  The server_connection objects must
+    // stay alive until the server_instance itself is destroyed (see setup() for
+    // when they are freed on a restart, or the destructor for the remove case).
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
@@ -574,7 +610,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (scan_from >= conn->partial.size())
                 conn->partial.clear();
             else
-                conn->partial = conn->partial.substr(scan_from);
+                conn->partial.erase(0, scan_from);
         }
     }
 
@@ -697,8 +733,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             cache_rt->get_state() == runtime_running)
         {
             auto* cache = static_cast<cache_instance*>(cache_rt);
-            std::string key = std::to_string(++m_message_counter);
-            cache->store_direct(key, msg);
+            char key_buf[24];
+            auto [key_end, key_ec] = std::to_chars(key_buf, key_buf + sizeof(key_buf), ++m_message_counter);
+            cache->store_direct(std::string_view(key_buf, key_end - key_buf), msg);
         }
     }
 
@@ -750,12 +787,14 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 auto* lctx = lua();
                 if (lctx && lctx->has_on_master_auth())
                 {
+#ifndef SOCKETLEY_NO_LUA
                     try {
                         sol::protected_function_result result =
                             lctx->on_master_auth()(sender->fd, std::string(pw));
                         if (result.valid())
                             auth_ok = result.get<bool>();
                     } catch (...) {}
+#endif
                 }
                 else if (!m_master_pw.empty())
                 {
@@ -796,14 +835,15 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             if (sender && m_master_forward && m_master_fd >= 0 &&
                 m_master_fd < MAX_FDS && m_conn_idx[m_master_fd])
             {
-                std::string fwd_str;
-                fwd_str.reserve(msg.size() + 16);
-                fwd_str += '[';
-                fwd_str += std::to_string(sender->fd);
-                fwd_str += "] ";
-                fwd_str.append(msg.data(), msg.size());
-                fwd_str += '\n';
-                auto fwd_msg = std::make_shared<const std::string>(std::move(fwd_str));
+                char fd_buf[16];
+                auto [fd_end, fd_ec] = std::to_chars(fd_buf, fd_buf + sizeof(fd_buf), sender->fd);
+                auto fwd_msg = std::make_shared<std::string>();
+                fwd_msg->reserve(msg.size() + 16);
+                fwd_msg->push_back('[');
+                fwd_msg->append(fd_buf, fd_end - fd_buf);
+                fwd_msg->append("] ", 2);
+                fwd_msg->append(msg.data(), msg.size());
+                fwd_msg->push_back('\n');
                 send_to(m_conn_idx[m_master_fd], fwd_msg);
             }
             // Non-master messages are silently dropped (not broadcast)

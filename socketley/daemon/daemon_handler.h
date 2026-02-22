@@ -7,6 +7,7 @@
 #include <sys/un.h>
 
 #include "../shared/event_loop_definitions.h"
+#include "../shared/runtime_instance.h"
 #include "../cli/arg_parser.h"
 
 class event_loop;
@@ -65,6 +66,7 @@ private:
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
     int cmd_owner(ipc_connection* conn, const parsed_args& pa);
+    int cmd_attach(ipc_connection* conn, const parsed_args& pa);
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 
@@ -81,4 +83,12 @@ private:
     std::unordered_map<int, std::unique_ptr<ipc_connection>> m_clients;
 
     state_persistence* m_persistence = nullptr;
+
+    // Deferred deletion: runtimes are held here for one event loop tick after cmd_remove so
+    // that any in-flight io_uring CQEs referencing their io_request members can be processed
+    // safely before the objects are destroyed.
+    std::vector<std::unique_ptr<runtime_instance>> m_deferred_delete;
+    struct __kernel_timespec m_cleanup_ts{};
+    io_request m_cleanup_req{};
+    bool m_cleanup_pending{false};
 };

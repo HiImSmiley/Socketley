@@ -355,6 +355,12 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.cache_name = instance->get_cache_name();
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
+    cfg.external_runtime = instance->is_external();
+    if (cfg.external_runtime)
+    {
+        cfg.was_running = false;  // prevent daemon from trying to re-bind on restart
+        cfg.pid = static_cast<int32_t>(instance->get_pid());
+    }
 
     // Type-specific
     switch (cfg.type)
@@ -447,6 +453,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"owner\": \"" << json_escape(cfg.owner) << "\",\n";
     if (cfg.child_policy != 0)
         out << "    \"child_policy\": " << cfg.child_policy << ",\n";
+    if (cfg.external_runtime)
+    {
+        out << "    \"external_runtime\": true,\n";
+        if (cfg.pid > 0)
+            out << "    \"pid\": " << cfg.pid << ",\n";
+    }
 
     // Type-specific
     switch (cfg.type)
@@ -532,6 +544,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.cache_name = json_get_string(json, "cache_name");
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
+    cfg.external_runtime = json_get_bool(json, "external_runtime");
+    cfg.pid = static_cast<int32_t>(json_get_int(json, "pid"));
 
     // Type-specific
     switch (cfg.type)

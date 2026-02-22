@@ -65,6 +65,9 @@ size_t cache_instance::get_connection_count() const
 
 bool cache_instance::setup(event_loop& loop)
 {
+    // Clear connections from a previous stop() — safe to free now.
+    m_clients.clear();
+
     m_loop = &loop;
 
     uint16_t port = get_port();
@@ -129,9 +132,11 @@ void cache_instance::teardown(event_loop& loop)
     if (!m_persistent_path.empty())
         m_store.save(m_persistent_path);
 
-    // Close listener first to stop new connections
+    // Shutdown the listen socket before closing — forces the pending multishot
+    // accept CQE to complete synchronously, before the deferred-delete timeout.
     if (m_listen_fd >= 0)
     {
+        shutdown(m_listen_fd, SHUT_RDWR);
         close(m_listen_fd);
         m_listen_fd = -1;
     }
@@ -147,25 +152,32 @@ void cache_instance::teardown(event_loop& loop)
             while (!conn->write_queue.empty())
             {
                 auto& msg = conn->write_queue.front();
-                if (::write(fd, msg->data(), msg->size()) < 0) break;
+                if (::write(fd, msg.data(), msg.size()) < 0) break;
                 conn->write_queue.pop();
             }
         }
     }
 
     for (auto& [fd, conn] : m_clients)
+    {
+        shutdown(fd, SHUT_RDWR);
         close(fd);
-
-    m_clients.clear();
+    }
+    // Do NOT clear m_clients here — connection objects must stay alive until the
+    // deferred-delete timeout fires and all pending CQEs have been processed.
 
     // Close replication connections
     if (m_master_fd >= 0)
     {
+        shutdown(m_master_fd, SHUT_RDWR);
         close(m_master_fd);
         m_master_fd = -1;
     }
     for (int fd : m_follower_fds)
+    {
+        shutdown(fd, SHUT_RDWR);
         close(fd);
+    }
     m_follower_fds.clear();
 
     m_loop = nullptr;
@@ -231,6 +243,8 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
+        if (client_fd < MAX_FDS)
+            m_conn_idx[client_fd] = ptr;
 
         // Initialize rate limiting
         double rl = get_rate_limit();
@@ -270,11 +284,9 @@ cache_resubmit_accept:
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_clients.find(fd);
-    if (it == m_clients.end())
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
         return;
-
-    auto* conn = it->second.get();
+    auto* conn = m_conn_idx[fd];
     conn->read_pending = false;
 
     bool is_provided = (req->type == op_read_provided);
@@ -305,7 +317,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         else
         {
             close(fd);
-            m_clients.erase(it);
+            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            m_clients.erase(fd);
         }
         return;
     }
@@ -358,7 +371,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (scan_from >= conn->partial.size())
                 conn->partial.clear();
             else
-                conn->partial = conn->partial.substr(scan_from);
+                conn->partial.erase(0, scan_from);
         }
     }
 
@@ -378,16 +391,14 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_clients.find(fd);
-    if (it == m_clients.end())
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
         return;
-
-    auto* conn = it->second.get();
+    auto* conn = m_conn_idx[fd];
     conn->write_pending = false;
 
-    // Release batch references
+    // Release batch buffers
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].reset();
+        conn->write_batch[i] = {};
     conn->write_batch_count = 0;
 
     if (cqe->res <= 0)
@@ -396,7 +407,8 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->read_pending)
         {
             close(fd);
-            m_clients.erase(it);
+            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            m_clients.erase(fd);
         }
         return;
     }
@@ -411,6 +423,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (conn->closing && !conn->read_pending)
         {
             close(fd);
+            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             m_clients.erase(fd);
         }
     }
@@ -431,6 +444,15 @@ std::string cache_instance::execute(std::string_view line)
     dummy.rl_max = 0;
     process_command(&dummy, line);
     return std::move(dummy.response_buf);
+}
+
+// Zero-allocation integer append for text-mode responses
+static inline void append_int_nl(std::string& buf, int64_t v)
+{
+    char tmp[24];
+    auto [end, ec] = std::to_chars(tmp, tmp + sizeof(tmp), v);
+    buf.append(tmp, static_cast<size_t>(end - tmp));
+    buf.push_back('\n');
 }
 
 void cache_instance::process_command(client_connection* conn, std::string_view line)
@@ -631,8 +653,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         case fnv1a("llen"):
         {
             m_store.check_expiry(args);
-            rb.append(std::to_string(m_store.llen(args)));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.llen(args));
             break;
         }
         case fnv1a("lindex"):
@@ -761,8 +782,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         case fnv1a("scard"):
         {
             m_store.check_expiry(args);
-            rb.append(std::to_string(m_store.scard(args)));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.scard(args));
             break;
         }
         case fnv1a("smembers"):
@@ -853,8 +873,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         case fnv1a("hlen"):
         {
             m_store.check_expiry(args);
-            rb.append(std::to_string(m_store.hlen(args)));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.hlen(args));
             break;
         }
         case fnv1a("hgetall"):
@@ -905,8 +924,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         {
             m_store.check_expiry(args);
             int ttl = m_store.get_ttl(args);
-            rb.append(std::to_string(ttl));
-            rb.push_back('\n');
+            append_int_nl(rb, ttl);
             break;
         }
         case fnv1a("persist"):
@@ -956,8 +974,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("size"):
         {
-            rb.append(std::to_string(m_store.size()));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.size());
             break;
         }
 
@@ -999,8 +1016,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 return;
             }
             int count = publish(channel, message);
-            rb.append(std::to_string(count));
-            rb.push_back('\n');
+            append_int_nl(rb, count);
             break;
         }
 
@@ -1008,14 +1024,12 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case fnv1a("maxmemory"):
         {
-            rb.append(std::to_string(m_store.get_max_memory()));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.get_max_memory());
             break;
         }
         case fnv1a("memory"):
         {
-            rb.append(std::to_string(m_store.get_memory_used()));
-            rb.push_back('\n');
+            append_int_nl(rb, m_store.get_memory_used());
             break;
         }
         case fnv1a("replicate"):
@@ -1034,7 +1048,7 @@ void cache_instance::flush_responses(client_connection* conn)
     if (conn->response_buf.empty() || !m_loop || conn->closing)
         return;
 
-    conn->write_queue.push(std::make_shared<const std::string>(std::move(conn->response_buf)));
+    conn->write_queue.push(std::move(conn->response_buf));
     conn->response_buf.reserve(4096);
 
     if (!conn->write_pending)
@@ -1052,8 +1066,8 @@ void cache_instance::flush_write_queue(client_connection* conn)
         conn->write_batch[count] = std::move(conn->write_queue.front());
         conn->write_queue.pop();
 
-        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
-        conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
+        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+        conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
         count++;
     }
 
@@ -1063,8 +1077,8 @@ void cache_instance::flush_write_queue(client_connection* conn)
     if (count == 1)
     {
         conn->write_req.type = op_write;
-        m_loop->submit_write(conn->fd, conn->write_batch[0]->data(),
-            static_cast<uint32_t>(conn->write_batch[0]->size()), &conn->write_req);
+        m_loop->submit_write(conn->fd, conn->write_batch[0].data(),
+            static_cast<uint32_t>(conn->write_batch[0].size()), &conn->write_req);
     }
     else
     {
@@ -1143,6 +1157,7 @@ int cache_instance::lua_llen(std::string_view key)
     return m_store.llen(key);
 }
 
+#ifndef SOCKETLEY_NO_LUA
 sol::table cache_instance::lua_lrange(std::string_view key, int start, int stop)
 {
     m_store.check_expiry(key);
@@ -1167,6 +1182,7 @@ sol::table cache_instance::lua_lrange(std::string_view key, int start, int stop)
 
     return result;
 }
+#endif
 
 int cache_instance::lua_sadd(std::string_view key, std::string_view member)
 {
@@ -1196,6 +1212,7 @@ int cache_instance::lua_scard(std::string_view key)
     return m_store.scard(key);
 }
 
+#ifndef SOCKETLEY_NO_LUA
 sol::table cache_instance::lua_smembers(std::string_view key)
 {
     m_store.check_expiry(key);
@@ -1214,6 +1231,7 @@ sol::table cache_instance::lua_smembers(std::string_view key)
 
     return result;
 }
+#endif
 
 bool cache_instance::lua_hset(std::string_view key, std::string_view field, std::string_view val)
 {
@@ -1244,6 +1262,7 @@ int cache_instance::lua_hlen(std::string_view key)
     return m_store.hlen(key);
 }
 
+#ifndef SOCKETLEY_NO_LUA
 sol::table cache_instance::lua_hgetall(std::string_view key)
 {
     m_store.check_expiry(key);
@@ -1261,6 +1280,7 @@ sol::table cache_instance::lua_hgetall(std::string_view key)
 
     return result;
 }
+#endif
 
 bool cache_instance::lua_expire(std::string_view key, int seconds)
 {
@@ -1315,13 +1335,17 @@ bool cache_instance::load_from(std::string_view path)
 
 void cache_instance::process_resp(client_connection* conn)
 {
-    std::vector<std::string> args;
+    // Fixed-size string_view array — zero heap allocations per command
+    static constexpr int MAX_RESP_ARGS = 64;
+    std::string_view args[MAX_RESP_ARGS];
+    int argc = 0;
     size_t consumed = 0;
+    size_t offset = 0;
 
-    while (true)
+    while (offset < conn->partial.size())
     {
-        std::string_view buf(conn->partial);
-        auto result = resp::parse_message(buf, args, consumed);
+        std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
+        auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
 
         if (result == resp::parse_result::incomplete)
             break;
@@ -1330,20 +1354,29 @@ void cache_instance::process_resp(client_connection* conn)
         {
             conn->response_buf.append("-ERR protocol error\r\n");
             conn->partial.clear();
-            break;
+            return;
         }
 
-        // Parse OK — dispatch
-        conn->partial.erase(0, consumed);
+        // Advance offset; args[] point into conn->partial which stays valid
+        offset += consumed;
 
-        if (!args.empty())
-            process_resp_command(conn, args);
+        if (argc > 0)
+            process_resp_command(conn, args, argc);
+    }
+
+    // Single erase for entire batch — O(remaining) not O(n * commands)
+    if (offset > 0)
+    {
+        if (offset >= conn->partial.size())
+            conn->partial.clear();
+        else
+            conn->partial.erase(0, offset);
     }
 }
 
-void cache_instance::process_resp_command(client_connection* conn, const std::vector<std::string>& args)
+void cache_instance::process_resp_command(client_connection* conn, std::string_view* args, int argc)
 {
-    if (args.empty())
+    if (argc == 0)
         return;
 
     // Rate limit check
@@ -1357,7 +1390,7 @@ void cache_instance::process_resp_command(client_connection* conn, const std::ve
             conn->rl_tokens = conn->rl_max;
         if (conn->rl_tokens < 1.0)
         {
-            conn->response_buf.append(resp::encode_error("rate limited"));
+            resp::encode_error_into(conn->response_buf, "rate limited");
             return;
         }
         conn->rl_tokens -= 1.0;
@@ -1366,29 +1399,25 @@ void cache_instance::process_resp_command(client_connection* conn, const std::ve
     m_stat_commands++;
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
 
-    std::string cmd_lower = args[0];
-    resp::to_lower(cmd_lower);
-
+    // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
-    switch (fnv1a(cmd_lower.c_str()))
+    switch (fnv1a_lower(args[0]))
     {
         case fnv1a("set"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             // Handle optional EX argument
             if (!m_store.set(args[1], args[2]))
-                rb.append(resp::encode_error("type conflict"));
+                resp::encode_error_into(rb, "type conflict");
             else
             {
                 // Check for EX/PX options
-                for (size_t i = 3; i + 1 < args.size(); i++)
+                for (int i = 3; i + 1 < argc; i++)
                 {
-                    std::string opt = args[i];
-                    resp::to_lower(opt);
-                    if (opt == "ex")
+                    if (fnv1a_lower(args[i]) == fnv1a("ex"))
                     {
                         int sec = 0;
                         auto [p, e] = std::from_chars(args[i+1].data(), args[i+1].data() + args[i+1].size(), sec);
@@ -1397,275 +1426,279 @@ void cache_instance::process_resp_command(client_connection* conn, const std::ve
                         i++;
                     }
                 }
-                rb.append(resp::encode_ok());
+                resp::encode_ok_into(rb);
             }
             break;
         }
         case fnv1a("get"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             const std::string* val = m_store.get_ptr(args[1]);
-            if (val) { m_stat_get_hits++; rb.append(resp::encode_bulk(*val)); }
-            else { m_stat_get_misses++; rb.append(resp::encode_null()); }
+            if (val) { m_stat_get_hits++; resp::encode_bulk_into(rb, *val); }
+            else { m_stat_get_misses++; resp::encode_null_into(rb); }
             break;
         }
         case fnv1a("del"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int deleted = 0;
-            for (size_t i = 1; i < args.size(); i++)
+            for (int i = 1; i < argc; i++)
             {
                 m_store.check_expiry(args[i]);
                 if (m_store.del(args[i])) deleted++;
             }
-            rb.append(resp::encode_integer(deleted));
+            resp::encode_integer_into(rb, deleted);
             break;
         }
         case fnv1a("exists"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.exists(args[1]) ? 1 : 0));
+            resp::encode_integer_into(rb, m_store.exists(args[1]) ? 1 : 0);
             break;
         }
         case fnv1a("ping"):
         {
-            if (args.size() > 1)
-                rb.append(resp::encode_bulk(args[1]));
+            if (argc > 1)
+                resp::encode_bulk_into(rb, args[1]);
             else
-                rb.append(resp::encode_simple("PONG"));
+                resp::encode_simple_into(rb, "PONG");
             break;
         }
         case fnv1a("dbsize"):
         {
-            rb.append(resp::encode_integer(m_store.size()));
+            resp::encode_integer_into(rb, m_store.size());
             break;
         }
         case fnv1a("lpush"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
-            for (size_t i = 2; i < args.size(); i++)
+            for (int i = 2; i < argc; i++)
             {
                 if (!m_store.lpush(args[1], args[i]))
                 {
-                    rb.append(resp::encode_error("type conflict"));
+                    resp::encode_error_into(rb, "type conflict");
                     return;
                 }
             }
-            rb.append(resp::encode_integer(m_store.llen(args[1])));
+            resp::encode_integer_into(rb, m_store.llen(args[1]));
             break;
         }
         case fnv1a("rpush"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
-            for (size_t i = 2; i < args.size(); i++)
+            for (int i = 2; i < argc; i++)
             {
                 if (!m_store.rpush(args[1], args[i]))
                 {
-                    rb.append(resp::encode_error("type conflict"));
+                    resp::encode_error_into(rb, "type conflict");
                     return;
                 }
             }
-            rb.append(resp::encode_integer(m_store.llen(args[1])));
+            resp::encode_integer_into(rb, m_store.llen(args[1]));
             break;
         }
         case fnv1a("lpop"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             std::string val;
-            if (m_store.lpop(args[1], val)) rb.append(resp::encode_bulk(val));
-            else rb.append(resp::encode_null());
+            if (m_store.lpop(args[1], val)) resp::encode_bulk_into(rb, val);
+            else resp::encode_null_into(rb);
             break;
         }
         case fnv1a("rpop"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             std::string val;
-            if (m_store.rpop(args[1], val)) rb.append(resp::encode_bulk(val));
-            else rb.append(resp::encode_null());
+            if (m_store.rpop(args[1], val)) resp::encode_bulk_into(rb, val);
+            else resp::encode_null_into(rb);
             break;
         }
         case fnv1a("llen"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.llen(args[1])));
+            resp::encode_integer_into(rb, m_store.llen(args[1]));
             break;
         }
         case fnv1a("sadd"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             int added = 0;
-            for (size_t i = 2; i < args.size(); i++)
+            for (int i = 2; i < argc; i++)
             {
                 int r = m_store.sadd(args[1], args[i]);
-                if (r < 0) { rb.append(resp::encode_error("type conflict")); return; }
+                if (r < 0) { resp::encode_error_into(rb, "type conflict"); return; }
                 added += r;
             }
-            rb.append(resp::encode_integer(added));
+            resp::encode_integer_into(rb, added);
             break;
         }
         case fnv1a("srem"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             int removed = 0;
-            for (size_t i = 2; i < args.size(); i++)
+            for (int i = 2; i < argc; i++)
                 if (m_store.srem(args[1], args[i])) removed++;
-            rb.append(resp::encode_integer(removed));
+            resp::encode_integer_into(rb, removed);
             break;
         }
         case fnv1a("sismember"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.sismember(args[1], args[2]) ? 1 : 0));
+            resp::encode_integer_into(rb, m_store.sismember(args[1], args[2]) ? 1 : 0);
             break;
         }
         case fnv1a("scard"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.scard(args[1])));
+            resp::encode_integer_into(rb, m_store.scard(args[1]));
             break;
         }
         case fnv1a("smembers"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             const auto* s = m_store.set_ptr(args[1]);
-            if (!s) { rb.append(resp::encode_array_header(0)); break; }
-            rb.append(resp::encode_array_header(static_cast<int>(s->size())));
+            if (!s) { resp::encode_array_header_into(rb, 0); break; }
+            resp::encode_array_header_into(rb, static_cast<int>(s->size()));
             for (const auto& member : *s)
-                rb.append(resp::encode_bulk(member));
+                resp::encode_bulk_into(rb, member);
             break;
         }
         case fnv1a("hset"):
         {
-            if (args.size() < 4 || (args.size() - 2) % 2 != 0)
+            if (argc < 4 || (argc - 2) % 2 != 0)
             {
-                rb.append(resp::encode_error("wrong number of arguments"));
+                resp::encode_error_into(rb, "wrong number of arguments");
                 return;
             }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             int added = 0;
-            for (size_t i = 2; i + 1 < args.size(); i += 2)
+            for (int i = 2; i + 1 < argc; i += 2)
             {
                 if (!m_store.hset(args[1], args[i], args[i+1]))
                 {
-                    rb.append(resp::encode_error("type conflict"));
+                    resp::encode_error_into(rb, "type conflict");
                     return;
                 }
                 added++;
             }
-            rb.append(resp::encode_integer(added));
+            resp::encode_integer_into(rb, added);
             break;
         }
         case fnv1a("hget"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             const std::string* val = m_store.hget(args[1], args[2]);
-            if (val) rb.append(resp::encode_bulk(*val));
-            else rb.append(resp::encode_null());
+            if (val) resp::encode_bulk_into(rb, *val);
+            else resp::encode_null_into(rb);
             break;
         }
         case fnv1a("hdel"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             int removed = 0;
-            for (size_t i = 2; i < args.size(); i++)
+            for (int i = 2; i < argc; i++)
                 if (m_store.hdel(args[1], args[i])) removed++;
-            rb.append(resp::encode_integer(removed));
+            resp::encode_integer_into(rb, removed);
             break;
         }
         case fnv1a("hlen"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.hlen(args[1])));
+            resp::encode_integer_into(rb, m_store.hlen(args[1]));
             break;
         }
         case fnv1a("hgetall"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             const auto* h = m_store.hash_ptr(args[1]);
-            if (!h) { rb.append(resp::encode_array_header(0)); break; }
-            rb.append(resp::encode_array_header(static_cast<int>(h->size() * 2)));
+            if (!h) { resp::encode_array_header_into(rb, 0); break; }
+            resp::encode_array_header_into(rb, static_cast<int>(h->size() * 2));
             for (const auto& [field, val] : *h)
             {
-                rb.append(resp::encode_bulk(field));
-                rb.append(resp::encode_bulk(val));
+                resp::encode_bulk_into(rb, field);
+                resp::encode_bulk_into(rb, val);
             }
             break;
         }
         case fnv1a("expire"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int sec = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), sec);
-            if (e != std::errc{} || sec <= 0) { rb.append(resp::encode_error("invalid seconds")); return; }
-            rb.append(resp::encode_integer(m_store.set_expiry(args[1], sec) ? 1 : 0));
+            if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
+            resp::encode_integer_into(rb, m_store.set_expiry(args[1], sec) ? 1 : 0);
             break;
         }
         case fnv1a("ttl"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            rb.append(resp::encode_integer(m_store.get_ttl(args[1])));
+            resp::encode_integer_into(rb, m_store.get_ttl(args[1]));
             break;
         }
         case fnv1a("persist"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            if (m_mode == cache_mode_readonly) { rb.append(resp::encode_error("readonly mode")); return; }
-            rb.append(resp::encode_integer(m_store.persist(args[1]) ? 1 : 0));
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            resp::encode_integer_into(rb, m_store.persist(args[1]) ? 1 : 0);
             break;
         }
         case fnv1a("subscribe"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            for (size_t i = 1; i < args.size(); i++)
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            for (int i = 1; i < argc; i++)
                 m_store.subscribe(conn->fd, args[i]);
-            rb.append(resp::encode_ok());
+            resp::encode_ok_into(rb);
             break;
         }
         case fnv1a("unsubscribe"):
         {
-            if (args.size() < 2) { rb.append(resp::encode_error("wrong number of arguments")); return; }
-            for (size_t i = 1; i < args.size(); i++)
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            for (int i = 1; i < argc; i++)
                 m_store.unsubscribe(conn->fd, args[i]);
-            rb.append(resp::encode_ok());
+            resp::encode_ok_into(rb);
             break;
         }
         case fnv1a("publish"):
         {
-            if (args.size() < 3) { rb.append(resp::encode_error("wrong number of arguments")); return; }
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             int count = publish(args[1], args[2]);
-            rb.append(resp::encode_integer(count));
+            resp::encode_integer_into(rb, count);
             break;
         }
         default:
-            rb.append(resp::encode_error("unknown command '" + cmd_lower + "'"));
+        {
+            rb.append("-ERR unknown command '", 22);
+            rb.append(args[0].data(), args[0].size());
+            rb.append("'\r\n", 3);
             break;
+        }
     }
 }
 
@@ -1691,15 +1724,14 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
     int count = 0;
     for (int fd : *subs)
     {
-        auto it = m_clients.find(fd);
-        if (it == m_clients.end())
+        if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
             continue;
 
-        auto* sub_conn = it->second.get();
+        auto* sub_conn = m_conn_idx[fd];
         if (sub_conn->closing)
             continue;
 
-        sub_conn->write_queue.push(shared_msg);
+        sub_conn->write_queue.push(*shared_msg);
         if (!sub_conn->write_pending)
             flush_write_queue(sub_conn);
         count++;

@@ -18,9 +18,17 @@ append_result() {
     fi
 }
 
-# WS handshake helper — returns HTTP response
+# WS handshake helper — sends upgrade request via bash /dev/tcp, reads the
+# HTTP status line (arrives in <1ms on localhost), then closes. This avoids
+# the nc -q1 behaviour which waits a full second after stdin closes while the
+# server holds the WS connection open.
 ws_handshake() {
-    printf 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' | nc -q1 localhost $WS_PORT 2>/dev/null
+    local resp
+    exec 99<>/dev/tcp/localhost/$WS_PORT 2>/dev/null || return 1
+    printf 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' >&99
+    IFS= read -r -t 1 resp <&99
+    exec 99<&-
+    printf '%s' "$resp"
 }
 
 # Test 1: WebSocket handshake throughput
@@ -34,20 +42,26 @@ test_ws_handshake() {
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
 
-    local success=0
+    local results_dir=$(mktemp -d)
+    local batch=20
+
     local start_time=$(get_time_ms)
 
     for i in $(seq 1 $num_ops); do
-        local resp=$(ws_handshake)
-        if echo "$resp" | grep -q "101 Switching"; then
-            ((success++))
-        fi
-
-        if [[ $((i % 100)) -eq 0 ]]; then
-            echo -ne "\r  Progress: $i / $num_ops (success: $success)"
+        (
+            local resp=$(ws_handshake)
+            echo "$resp" | grep -q "101 Switching" && touch "$results_dir/ok_$i"
+        ) &
+        if [[ $((i % batch)) -eq 0 ]]; then
+            wait
+            echo -ne "\r  Progress: $i / $num_ops"
         fi
     done
+    wait
     echo ""
+
+    local success=$(ls "$results_dir" | wc -l)
+    rm -rf "$results_dir"
 
     local end_time=$(get_time_ms)
     local total_time=$((end_time - start_time))
@@ -79,23 +93,27 @@ test_ws_tcp_coexistence() {
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
 
-    local ws_success=0
-    local tcp_success=0
+    local results_dir=$(mktemp -d)
+    local batch=20
     local start_time=$(get_time_ms)
 
     for i in $(seq 1 $num_ops); do
-        if [[ $((i % 2)) -eq 0 ]]; then
-            # WS handshake
-            local resp=$(ws_handshake)
-            if echo "$resp" | grep -q "101"; then
-                ((ws_success++))
+        (
+            if [[ $((i % 2)) -eq 0 ]]; then
+                local resp=$(ws_handshake)
+                echo "$resp" | grep -q "101" && echo "ws" > "$results_dir/r_$i"
+            else
+                echo "hello tcp $i" | nc -q0 localhost $WS_PORT >/dev/null 2>&1
+                echo "tcp" > "$results_dir/r_$i"
             fi
-        else
-            # Plain TCP message
-            local resp=$(echo "hello tcp $i" | nc -q1 localhost $WS_PORT 2>/dev/null)
-            ((tcp_success++))
-        fi
+        ) &
+        [[ $((i % batch)) -eq 0 ]] && wait
     done
+    wait
+
+    local ws_success=$(grep -rl "^ws$" "$results_dir" 2>/dev/null | wc -l)
+    local tcp_success=$(grep -rl "^tcp$" "$results_dir" 2>/dev/null | wc -l)
+    rm -rf "$results_dir"
 
     local end_time=$(get_time_ms)
     local total_time=$((end_time - start_time))
@@ -182,9 +200,9 @@ test_ws_concurrent() {
 run_ws_benchmarks() {
     log_section "WEBSOCKET BENCHMARKS"
 
-    test_ws_handshake 300
-    test_ws_tcp_coexistence 300
-    test_ws_concurrent 10 20
+    test_ws_handshake 200
+    test_ws_tcp_coexistence 200
+    test_ws_concurrent 20 25
 
     echo "]" >> "$RESULTS_FILE"
 

@@ -7,6 +7,7 @@
 #include <ctime>
 #include <unistd.h>
 #include <cerrno>
+#include <csignal>
 
 runtime_instance::runtime_instance(runtime_type type, std::string_view name)
     : m_name(name), m_id(generate_runtime_id()), m_type(type), m_state(runtime_created),
@@ -24,7 +25,8 @@ void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 
 void runtime_instance::start_tick_timer()
 {
-    uint32_t ms = m_lua->get_tick_ms();
+    uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
+                : (m_lua ? m_lua->get_tick_ms() : 100);
     if (ms < 10) ms = 10;
     m_tick = new tick_handler();
     m_tick->rt = this;
@@ -41,12 +43,17 @@ void runtime_instance::fire_tick(int res)
     auto now = std::chrono::steady_clock::now();
     double dt = std::chrono::duration<double, std::milli>(now - m_tick->last).count();
     m_tick->last = now;
-    if (m_lua && m_lua->has_on_tick()) {
+    if (m_cb_on_tick) {
+        m_cb_on_tick(dt);
+    } else if (m_lua && m_lua->has_on_tick()) {
+#ifndef SOCKETLEY_NO_LUA
         try { m_lua->on_tick()(dt); }
         catch (const sol::error& e) { std::cerr << "[lua] on_tick error: " << e.what() << "\n"; }
+#endif
     }
     if (!m_tick || !m_event_loop) return;
-    uint32_t ms = m_lua ? m_lua->get_tick_ms() : 100;
+    uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
+                : (m_lua ? m_lua->get_tick_ms() : 100);
     if (ms < 10) ms = 10;
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
@@ -60,6 +67,13 @@ bool runtime_instance::start(event_loop& loop)
     if (current != runtime_created && current != runtime_stopped)
         return false;
 
+    if (m_external)
+    {
+        m_state.store(runtime_running, std::memory_order_release);
+        m_start_time = std::chrono::system_clock::now();
+        return true;  // skip setup(), on_start, tick timer
+    }
+
     if (!setup(loop))
     {
         m_state.store(runtime_failed, std::memory_order_release);
@@ -69,7 +83,7 @@ bool runtime_instance::start(event_loop& loop)
     m_state.store(runtime_running, std::memory_order_release);
     m_start_time = std::chrono::system_clock::now();
     invoke_on_start();
-    if (m_lua && m_lua->has_on_tick() && m_event_loop)
+    if ((m_cb_on_tick || (m_lua && m_lua->has_on_tick())) && m_event_loop)
         start_tick_timer();
     return true;
 }
@@ -78,6 +92,14 @@ bool runtime_instance::stop(event_loop& loop)
 {
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
+
+    if (m_external)
+    {
+        if (m_pid > 0)
+            kill(m_pid, SIGTERM);   // ask the external process to shut down
+        m_state.store(runtime_stopped, std::memory_order_release);
+        return true;  // skip teardown(), on_stop
+    }
 
     if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
     invoke_on_stop();
@@ -272,7 +294,9 @@ bool runtime_instance::reload_lua_script()
         return false;
     }
 
+#ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("running");
+#endif
 
     bool should_tick = m_lua->has_on_tick();
     if (!m_tick && should_tick)
@@ -292,9 +316,11 @@ std::string_view runtime_instance::get_lua_script_path() const
 
 void runtime_instance::invoke_on_start()
 {
+    if (m_cb_on_start) { m_cb_on_start(); return; }
     if (!m_lua || !m_lua->has_on_start())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("running");
 
     try {
@@ -302,13 +328,16 @@ void runtime_instance::invoke_on_start()
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_start error: " << e.what() << std::endl;
     }
+#endif
 }
 
 void runtime_instance::invoke_on_stop()
 {
+    if (m_cb_on_stop) { m_cb_on_stop(); return; }
     if (!m_lua || !m_lua->has_on_stop())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("stopped");
 
     try {
@@ -316,42 +345,52 @@ void runtime_instance::invoke_on_stop()
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_stop error: " << e.what() << std::endl;
     }
+#endif
 }
 
 void runtime_instance::invoke_on_message(std::string_view msg)
 {
+    if (m_cb_on_message) { m_cb_on_message(msg); return; }
     if (!m_lua || !m_lua->has_on_message())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     try {
         m_lua->on_message()(std::string(msg));
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_message error: " << e.what() << std::endl;
     }
+#endif
 }
 
 void runtime_instance::invoke_on_connect(int client_id)
 {
+    if (m_cb_on_connect) { m_cb_on_connect(client_id); return; }
     if (!m_lua || !m_lua->has_on_connect())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     try {
         m_lua->on_connect()(client_id);
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_connect error: " << e.what() << std::endl;
     }
+#endif
 }
 
 void runtime_instance::invoke_on_disconnect(int client_id)
 {
+    if (m_cb_on_disconnect) { m_cb_on_disconnect(client_id); return; }
     if (!m_lua || !m_lua->has_on_disconnect())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     try {
         m_lua->on_disconnect()(client_id);
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_disconnect error: " << e.what() << std::endl;
     }
+#endif
 }
 
 void runtime_instance::invoke_on_send(std::string_view msg)
@@ -359,12 +398,25 @@ void runtime_instance::invoke_on_send(std::string_view msg)
     if (!m_lua || !m_lua->has_on_send())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     try {
         m_lua->on_send()(std::string(msg));
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_send error: " << e.what() << std::endl;
     }
+#endif
 }
+
+// ─── C++ callbacks ───
+
+void runtime_instance::set_on_start(std::function<void()> cb)                            { m_cb_on_start = std::move(cb); }
+void runtime_instance::set_on_stop(std::function<void()> cb)                             { m_cb_on_stop = std::move(cb); }
+void runtime_instance::set_on_connect(std::function<void(int)> cb)                       { m_cb_on_connect = std::move(cb); }
+void runtime_instance::set_on_disconnect(std::function<void(int)> cb)                    { m_cb_on_disconnect = std::move(cb); }
+void runtime_instance::set_on_client_message(std::function<void(int, std::string_view)> cb) { m_cb_on_client_message = std::move(cb); }
+void runtime_instance::set_on_message(std::function<void(std::string_view)> cb)          { m_cb_on_message = std::move(cb); }
+void runtime_instance::set_on_tick(std::function<void(double)> cb)                       { m_cb_on_tick = std::move(cb); }
+void runtime_instance::set_tick_interval(uint32_t ms)                                    { m_cb_tick_ms = ms; }
 
 // ─── Ownership ───
 
@@ -372,6 +424,10 @@ void runtime_instance::set_owner(std::string_view owner_name) { m_owner = std::s
 std::string_view runtime_instance::get_owner() const { return m_owner; }
 void runtime_instance::set_lua_created(bool v) { m_lua_created = v; }
 bool runtime_instance::is_lua_created() const { return m_lua_created; }
+void runtime_instance::mark_external() { m_external = true; }
+bool runtime_instance::is_external() const { return m_external; }
+void runtime_instance::set_pid(pid_t pid) { m_pid = pid; }
+pid_t runtime_instance::get_pid() const { return m_pid; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
 
@@ -382,14 +438,17 @@ event_loop* runtime_instance::get_event_loop() const { return m_event_loop; }
 
 void runtime_instance::invoke_on_client_message(int client_id, std::string_view msg)
 {
+    if (m_cb_on_client_message) { m_cb_on_client_message(client_id, msg); return; }
     if (!m_lua || !m_lua->has_on_client_message())
         return;
 
+#ifndef SOCKETLEY_NO_LUA
     try {
         m_lua->on_client_message()(client_id, std::string(msg));
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_client_message error: " << e.what() << std::endl;
     }
+#endif
 }
 
 // ─── Resource limits ───

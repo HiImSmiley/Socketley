@@ -105,23 +105,26 @@ void event_loop::run()
 {
     m_running.store(true, std::memory_order_release);
 
+    struct io_uring_cqe* cqe;
+
     while (m_running.load(std::memory_order_acquire))
     {
-        struct io_uring_cqe* cqe;
-
-        // Flush any pending submissions, then wait
+        // Flush any pending submissions, then ensure at least one CQE is ready.
+        // Peek first — if CQEs from the previous iteration's submitted SQEs already
+        // landed (common at high throughput), skip the blocking wait entirely.
         if (m_pending_submissions > 0)
         {
             io_uring_submit_and_wait(&m_ring, 1);
             m_pending_submissions = 0;
         }
-        else
+        else if (io_uring_peek_cqe(&m_ring, &cqe) != 0)
         {
+            // Ring is empty: block until at least one CQE arrives
             if (io_uring_wait_cqe(&m_ring, &cqe) < 0)
                 break;
         }
 
-        // Batch CQE processing — single io_uring_cq_advance instead of per-CQE atomic
+        // Batch-drain all available CQEs in one pass — single io_uring_cq_advance
         unsigned head;
         unsigned count = 0;
         bool got_signal = false;
@@ -290,6 +293,26 @@ void event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
 
     io_uring_prep_timeout(sqe, ts, 0, 0);
     io_uring_sqe_set_data(sqe, req);
+    m_pending_submissions++;
+}
+
+void event_loop::submit_cancel_fd(int fd)
+{
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    if (!sqe)
+    {
+        flush();
+        sqe = io_uring_get_sqe(&m_ring);
+        if (!sqe) return;
+    }
+
+    // IORING_ASYNC_CANCEL_ALL cancels ALL pending ops for this fd in one shot.
+    // Without it, only one op is cancelled per SQE — leaving the second CQE
+    // (e.g. a write when read is also pending) to arrive after the deferred-
+    // delete timeout fires and the owning object is freed.
+    io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_ALL);
+    // Null user_data so the cancel-result CQE is silently discarded by event_loop::run()
+    io_uring_sqe_set_data(sqe, nullptr);
     m_pending_submissions++;
 }
 
