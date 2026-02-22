@@ -92,6 +92,17 @@ check_dependencies() {
     return 0
 }
 
+# Check if k6 is available
+check_k6() {
+    if command -v k6 &> /dev/null; then
+        log_success "k6 found: $(k6 version 2>/dev/null || echo 'unknown version')"
+        return 0
+    else
+        log_warn "k6 not found — install from https://grafana.com/docs/k6/latest/set-up/install-k6/"
+        return 1
+    fi
+}
+
 # Start daemon
 start_daemon() {
     # Kill any existing daemon
