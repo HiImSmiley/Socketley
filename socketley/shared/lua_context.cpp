@@ -64,6 +64,10 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         sol::optional<int> tms = m_lua["tick_ms"];
         m_tick_ms = (tms && *tms >= 10) ? static_cast<uint32_t>(*tms) : 100;
     }
+    m_on_miss   = m_lua["on_miss"];
+    m_on_write  = m_lua["on_write"];
+    m_on_delete = m_lua["on_delete"];
+    m_on_expire = m_lua["on_expire"];
 
     return true;
 }
@@ -78,6 +82,10 @@ bool lua_context::has_on_route() const { return m_on_route.valid(); }
 bool lua_context::has_on_master_auth() const { return m_on_master_auth.valid(); }
 bool lua_context::has_on_client_message() const { return m_on_client_message.valid(); }
 bool lua_context::has_on_tick() const { return m_on_tick.valid(); }
+bool lua_context::has_on_miss()   const { return m_on_miss.valid(); }
+bool lua_context::has_on_write()  const { return m_on_write.valid(); }
+bool lua_context::has_on_delete() const { return m_on_delete.valid(); }
+bool lua_context::has_on_expire() const { return m_on_expire.valid(); }
 
 void lua_context::update_self_state(const char* state_str)
 {
