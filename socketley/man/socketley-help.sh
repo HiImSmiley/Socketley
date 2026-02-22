@@ -212,6 +212,15 @@ cli_commands() {
     echo -e "  ${CYAN}socketley --lua setup.lua${NC}"
     echo ""
 
+    echo -e "${BOLD}cluster --cluster-dir <dir> [subcommand]${NC}"
+    echo "  Multi-daemon cluster inspection (reads shared directory directly)"
+    echo -e "  ${CYAN}socketley cluster --cluster-dir /cluster ls${NC}        # list daemons"
+    echo -e "  ${CYAN}socketley cluster --cluster-dir /cluster ps${NC}        # list all runtimes"
+    echo -e "  ${CYAN}socketley cluster --cluster-dir /cluster group api${NC}  # group members"
+    echo -e "  ${CYAN}socketley cluster --cluster-dir /cluster stats${NC}     # cluster summary"
+    echo -e "  ${CYAN}socketley cluster --cluster-dir /cluster watch${NC}     # live refresh"
+    echo ""
+
     read -p "Press Enter to continue..."
     main_menu
 }
@@ -361,6 +370,14 @@ flags_options() {
     echo "│ --backend <addr>       │ Backend (ip:port, name, or @group)  │"
     echo "│ --strategy <strategy>  │ round-robin, random, lua            │"
     echo "│ --protocol <protocol>  │ http (default), tcp                 │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}Daemon Flags (cluster mode):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --name <name> | -n     │ Name this daemon instance           │"
+    echo "│ --cluster <dir>        │ Enable cluster mode (shared dir)    │"
+    echo "│ --cluster-addr <addr>  │ Override advertised address          │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
 

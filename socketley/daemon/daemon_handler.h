@@ -13,6 +13,7 @@
 class event_loop;
 class runtime_manager;
 class state_persistence;
+class cluster_discovery;
 
 struct ipc_connection
 {
@@ -38,6 +39,7 @@ public:
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     void set_state_persistence(state_persistence* sp);
+    void set_cluster_discovery(cluster_discovery* cd);
 
     static std::string socket_path;
 
@@ -83,6 +85,7 @@ private:
     std::unordered_map<int, std::unique_ptr<ipc_connection>> m_clients;
 
     state_persistence* m_persistence = nullptr;
+    cluster_discovery* m_cluster = nullptr;
 
     // Deferred deletion: runtimes are held here for one event loop tick after cmd_remove so
     // that any in-flight io_uring CQEs referencing their io_request members can be processed

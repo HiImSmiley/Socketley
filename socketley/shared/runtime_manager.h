@@ -10,6 +10,7 @@
 #include "runtime_instance.h"
 
 class event_loop;
+class cluster_discovery;
 
 // Transparent hash for heterogeneous lookup (avoids string copies on find)
 struct runtime_string_hash
@@ -66,8 +67,13 @@ public:
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);
 
+    // Cluster discovery integration
+    void set_cluster_discovery(cluster_discovery* cd);
+    cluster_discovery* get_cluster_discovery() const;
+
     mutable std::shared_mutex mutex;
 
 private:
     runtime_map runtimes;
+    cluster_discovery* m_cluster = nullptr;
 };

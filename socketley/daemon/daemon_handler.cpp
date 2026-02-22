@@ -56,6 +56,11 @@ void daemon_handler::set_state_persistence(state_persistence* sp)
     m_persistence = sp;
 }
 
+void daemon_handler::set_cluster_discovery(cluster_discovery* cd)
+{
+    m_cluster = cd;
+}
+
 bool daemon_handler::setup()
 {
     unlink(socket_path.c_str());
