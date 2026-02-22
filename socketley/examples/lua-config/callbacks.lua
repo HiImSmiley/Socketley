@@ -51,6 +51,8 @@ end
 -- CALLBACK: on_message
 -- Triggered when a message is received
 -- Parameter: msg - the received message string
+-- NOTE: Defining on_message claims message handling — the default broadcast
+--       (inout/master modes) is suppressed. Use self.broadcast() to relay.
 -- =============================================================================
 function on_message(msg)
     socketley.log("=== on_message() called ===")
@@ -58,6 +60,7 @@ function on_message(msg)
     socketley.log("Length: " .. #msg .. " bytes")
 
     -- Example: Echo back with modification
+    -- Since on_message claims handling, we must broadcast explicitly
     local response = "[ECHO] " .. msg
     self.broadcast(response)
     socketley.log("Broadcasted: '" .. response .. "'")

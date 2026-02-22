@@ -46,7 +46,7 @@ runtimes = {
 |----------|---------|------------|
 | `on_start()` | Runtime started | none |
 | `on_stop()` | Runtime stopped | none |
-| `on_message(msg)` | Message received | message string |
+| `on_message(msg)` | Message received (claims handling; no default broadcast) | message string |
 | `on_send(msg)` | Message sent | message string |
 | `on_route(method, path)` | HTTP request (proxy) | method, path |
 
