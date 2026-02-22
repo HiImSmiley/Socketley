@@ -30,7 +30,7 @@ runtimes = {
         name = "service-cache",
         port = services.cache.port,
         persistent = "/tmp/microservices-cache.bin",
-        autostart = true
+        start = true
     },
 
     -- User Service (group: users)
@@ -40,7 +40,7 @@ runtimes = {
         port = services.users.port,
         mode = "inout",
         group = "users",
-        autostart = true
+        start = true
     },
 
     -- Product Service (group: products)
@@ -50,7 +50,7 @@ runtimes = {
         port = services.products.port,
         mode = "inout",
         group = "products",
-        autostart = true
+        start = true
     },
 
     -- Order Service (group: orders)
@@ -60,7 +60,7 @@ runtimes = {
         port = services.orders.port,
         mode = "inout",
         group = "orders",
-        autostart = true
+        start = true
     },
 
     -- Inventory Service (group: inventory)
@@ -70,7 +70,7 @@ runtimes = {
         port = services.inventory.port,
         mode = "inout",
         group = "inventory",
-        autostart = true
+        start = true
     },
 
     -- API Gateway — uses runtime names for Lua-routed backends,
@@ -89,7 +89,7 @@ runtimes = {
             "order-service",      -- 2
             "inventory-service"   -- 3
         },
-        autostart = true
+        start = true
     }
 }
 

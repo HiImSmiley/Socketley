@@ -382,8 +382,8 @@ void lua_context::register_bindings(runtime_instance* owner)
             if (on_stop_str && fnv1a(*on_stop_str) == fnv1a("remove"))
                 inst->set_child_policy(runtime_instance::child_policy::remove);
 
-            sol::optional<bool> autostart = (*config)["autostart"];
-            if (autostart && *autostart)
+            sol::optional<bool> start = (*config)["start"];
+            if (start && *start)
                 mgr->run(name, *loop);
         }
 

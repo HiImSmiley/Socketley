@@ -17,7 +17,7 @@ runtimes = {
         name = "my-server",     -- Unique name (required)
         port = 9000,            -- Listening port
         mode = "inout",         -- Message mode: inout|in|out
-        autostart = true,       -- Start immediately
+        start = true,       -- Start immediately
         log = "/tmp/server.log" -- Log file
     },
 
@@ -27,7 +27,7 @@ runtimes = {
         name = "my-client",
         target = "127.0.0.1:9000",  -- Target server
         mode = "inout",
-        autostart = true,
+        start = true,
         log = "/tmp/client.log"
     }
 }
