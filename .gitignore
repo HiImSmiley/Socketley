@@ -43,7 +43,11 @@
 # Build output
 bin/Debug/
 bin/Release/
+bin/Sanitize/
 make/
+
+# Benchmark results
+test/benchmark/results/
 
 # Packages
 *.deb
