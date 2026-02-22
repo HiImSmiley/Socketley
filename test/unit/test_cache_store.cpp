@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
+#include <thread>
 
 TEST_CASE("cache_store string operations")
 {
@@ -314,5 +315,201 @@ TEST_CASE("cache_store pub/sub")
         store.subscribe(10, "ch1");
         store.subscribe(20, "ch2");
         CHECK(store.channel_count() == 2);
+    }
+}
+
+TEST_CASE("cache_store new methods")
+{
+    cache_store store;
+
+    SUBCASE("incr creates key")
+    {
+        int64_t result = 0;
+        CHECK(store.incr("counter", 1, result));
+        CHECK(result == 1);
+        std::string out;
+        CHECK(store.get("counter", out));
+        CHECK(out == "1");
+    }
+
+    SUBCASE("incr existing integer")
+    {
+        store.set("counter", "10");
+        int64_t result = 0;
+        CHECK(store.incr("counter", 5, result));
+        CHECK(result == 15);
+    }
+
+    SUBCASE("incr non-integer fails")
+    {
+        store.set("k", "abc");
+        int64_t result = 0;
+        CHECK_FALSE(store.incr("k", 1, result));
+    }
+
+    SUBCASE("decr")
+    {
+        store.set("k", "10");
+        int64_t result = 0;
+        CHECK(store.incr("k", -1, result));
+        CHECK(result == 9);
+    }
+
+    SUBCASE("append creates key")
+    {
+        size_t len = store.append("k", "hello");
+        CHECK(len == 5);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "hello");
+    }
+
+    SUBCASE("append existing")
+    {
+        store.set("k", "hello");
+        size_t len = store.append("k", " world");
+        CHECK(len == 11);
+        std::string out;
+        store.get("k", out);
+        CHECK(out == "hello world");
+    }
+
+    SUBCASE("strlen")
+    {
+        store.set("k", "hello");
+        CHECK(store.strlen_key("k") == 5);
+        CHECK(store.strlen_key("missing") == 0);
+    }
+
+    SUBCASE("getset returns old value")
+    {
+        store.set("k", "old");
+        std::string oldval;
+        CHECK(store.getset("k", "new", oldval));
+        CHECK(oldval == "old");
+        std::string cur;
+        store.get("k", cur);
+        CHECK(cur == "new");
+    }
+
+    SUBCASE("getset on missing key")
+    {
+        std::string oldval = "nonempty";
+        CHECK(store.getset("missing", "new", oldval));
+        CHECK(oldval == "");
+        CHECK(store.exists("missing"));
+    }
+
+    SUBCASE("type")
+    {
+        store.set("s", "val");
+        CHECK(store.type("s") == "string");
+        store.lpush("l", "a");
+        CHECK(store.type("l") == "list");
+        store.sadd("st", "m");
+        CHECK(store.type("st") == "set");
+        store.hset("h", "f", "v");
+        CHECK(store.type("h") == "hash");
+        CHECK(store.type("none") == "none");
+    }
+
+    SUBCASE("keys wildcard")
+    {
+        store.set("foo:1", "a");
+        store.set("foo:2", "b");
+        store.set("bar:1", "c");
+        std::vector<std::string_view> out;
+        store.keys("foo:*", out);
+        CHECK(out.size() == 2);
+        out.clear();
+        store.keys("*", out);
+        CHECK(out.size() == 3);
+    }
+
+    SUBCASE("setnx new key")
+    {
+        CHECK(store.setnx("k", "val"));
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "val");
+    }
+
+    SUBCASE("setnx existing key")
+    {
+        store.set("k", "original");
+        CHECK_FALSE(store.setnx("k", "new"));
+        std::string out;
+        store.get("k", out);
+        CHECK(out == "original");
+    }
+
+    SUBCASE("set_expiry_ms and get_pttl")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", 5000));
+        int64_t pttl = store.get_pttl("k");
+        CHECK(pttl > 4000);
+        CHECK(pttl <= 5000);
+    }
+
+    SUBCASE("pttl nonexistent")
+    {
+        CHECK(store.get_pttl("missing") == -2);
+    }
+
+    SUBCASE("pttl no expiry")
+    {
+        store.set("k", "v");
+        CHECK(store.get_pttl("k") == -1);
+    }
+
+    SUBCASE("sweep_expired ms")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        store.sweep_expired();
+        CHECK_FALSE(store.exists("k"));
+    }
+
+    SUBCASE("scan all keys")
+    {
+        store.set("a", "1");
+        store.set("b", "2");
+        store.set("c", "3");
+        std::vector<std::string_view> out;
+        uint64_t next = store.scan(0, "*", 10, out);
+        CHECK(next == 0);
+        CHECK(out.size() == 3);
+    }
+
+    SUBCASE("scan pagination")
+    {
+        store.set("k1", "v");
+        store.set("k2", "v");
+        store.set("k3", "v");
+        store.set("k4", "v");
+        store.set("k5", "v");
+        std::vector<std::string_view> all;
+        uint64_t cursor = 0;
+        do {
+            std::vector<std::string_view> batch;
+            cursor = store.scan(cursor, "*", 2, batch);
+            all.insert(all.end(), batch.begin(), batch.end());
+        } while (cursor != 0);
+        CHECK(all.size() == 5);
+    }
+
+    SUBCASE("scan pattern")
+    {
+        store.set("foo:1", "v");
+        store.set("foo:2", "v");
+        store.set("bar:1", "v");
+        std::vector<std::string_view> out;
+        uint64_t next = store.scan(0, "foo:*", 10, out);
+        CHECK(next == 0);
+        CHECK(out.size() == 2);
+        for (auto& k : out)
+            CHECK(k.substr(0, 4) == "foo:");
     }
 }

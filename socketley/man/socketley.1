@@ -548,6 +548,52 @@ Delete key (any type). Returns "ok" or "nil".
 .BI "exists " "key"
 Check if key exists. Returns "1" or "0".
 .TP
+.BI "incr " "key"
+Increment integer value by 1. Returns new integer.
+.TP
+.BI "decr " "key"
+Decrement integer value by 1. Returns new integer.
+.TP
+.BI "incrby " "key delta"
+Increment integer value by delta. Returns new integer.
+.TP
+.BI "decrby " "key delta"
+Decrement integer value by delta. Returns new integer.
+.TP
+.BI "append " "key value"
+Append to string value. Returns new length.
+.TP
+.BI "strlen " "key"
+Return string length. Returns 0 if missing.
+.TP
+.BI "getset " "key newvalue"
+Set new value and return old value. Returns old value or "nil".
+.TP
+.BI "mget " "key [key ...]"
+Get multiple keys. Returns one value per line (nil if missing), then "end".
+.TP
+.BI "mset " "key value [key value ...]"
+Set multiple key-value pairs atomically. Returns "ok".
+.TP
+.BI "type " "key"
+Return type of key: "string", "list", "set", "hash", or "none".
+.TP
+.BI "keys " "pattern"
+List all matching keys (glob patterns, "*" for all). Returns keys then "end".
+.TP
+.BI "setnx " "key value"
+Set key only if it does not exist. Returns "1" (set) or "0" (not set).
+.TP
+.BI "setex " "key seconds value"
+Set key with expiry. Equivalent to SET + EXPIRE. Returns "ok".
+.TP
+.BI "psetex " "key milliseconds value"
+Set key with millisecond-precision expiry. Returns "ok".
+.TP
+.BI "scan " "cursor [match pattern] [count n]"
+Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
+Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.TP
 .B size
 Return number of stored keys (all types).
 .PP
@@ -618,6 +664,18 @@ Return remaining seconds, -1 (no ttl), or -2 (not found).
 .TP
 .BI "persist " "key"
 Remove expiry. Returns "ok" or "nil".
+.TP
+.BI "pexpire " "key milliseconds"
+Set millisecond-precision TTL. Returns "1" (set) or "0" (key not found).
+.TP
+.BI "pttl " "key"
+Return remaining TTL in milliseconds, -1 (no ttl), or -2 (not found).
+.TP
+.BI "expireat " "key unix_seconds"
+Set expiry to an absolute Unix timestamp (seconds). Returns "1" or "0".
+.TP
+.BI "pexpireat " "key unix_ms"
+Set expiry to an absolute Unix timestamp in milliseconds. Returns "1" or "0".
 .PP
 .B Pub/Sub:
 .TP
@@ -655,9 +713,13 @@ The cache supports the RESP2 wire protocol for compatibility with Redis clients
 connection's first byte is '*', or can be forced with
 .BR \-\-resp .
 .PP
-Supported Redis commands (case-insensitive): SET (with EX option), GET, DEL,
-EXISTS, PING, DBSIZE, LPUSH, RPUSH, LPOP, RPOP, LLEN, SADD, SREM, SISMEMBER,
-SCARD, SMEMBERS, HSET, HGET, HDEL, HLEN, HGETALL, EXPIRE, TTL, PERSIST,
+Supported Redis commands (case-insensitive): SET (with EX, PX, NX, XX options),
+GET, DEL, EXISTS, PING, DBSIZE, INCR, DECR, INCRBY, DECRBY, APPEND, STRLEN,
+GETSET, MGET, MSET, TYPE, KEYS, SETNX, SETEX, PSETEX, SCAN,
+LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX,
+SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
+HSET, HGET, HDEL, HLEN, HGETALL,
+EXPIRE, TTL, PERSIST, PEXPIRE, PTTL, EXPIREAT, PEXPIREAT,
 SUBSCRIBE, UNSUBSCRIBE, PUBLISH.
 .PP
 Example with redis-cli:
