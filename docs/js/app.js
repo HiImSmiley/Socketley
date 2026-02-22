@@ -19,22 +19,23 @@ themeToggle.addEventListener('click', () => {
 });
 
 // ─── Tab Switching ───
-const tabBtns       = document.querySelectorAll('.tab-btn');
-const navSocketley  = document.getElementById('navList-socketley');
-const navLua        = document.getElementById('navList-lua');
-const contentSK     = document.getElementById('content-socketley');
-const contentLua    = document.getElementById('content-lua');
+const tabBtns = document.querySelectorAll('.tab-btn');
+const tabs    = ['socketley', 'lua', 'addons'];
 
-function getActiveNav()     { return navSocketley.style.display === 'none' ? navLua : navSocketley; }
-function getActiveContent() { return contentSK.style.display    === 'none' ? contentLua : contentSK; }
+function navEl(t)     { return document.getElementById('navList-' + t); }
+function contentEl(t) { return document.getElementById('content-' + t); }
+
+function getActiveNav()     { return tabs.map(navEl).find(el => el && el.style.display !== 'none') || navEl('socketley'); }
+function getActiveContent() { return tabs.map(contentEl).find(el => el && el.style.display !== 'none') || contentEl('socketley'); }
 
 function activateTab(tab) {
-  const isLua = tab === 'lua';
   tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  navSocketley.style.display  = isLua ? 'none' : '';
-  navLua.style.display        = isLua ? '' : 'none';
-  contentSK.style.display     = isLua ? 'none' : '';
-  contentLua.style.display    = isLua ? '' : 'none';
+  tabs.forEach(t => {
+    const n = navEl(t), c = contentEl(t);
+    const show = t === tab ? '' : 'none';
+    if (n) n.style.display = show;
+    if (c) c.style.display = show;
+  });
   localStorage.setItem('sk-tab', tab);
   window.scrollTo(0, 0);
   // reset search
@@ -83,7 +84,9 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  [navSocketley, navLua].forEach(nav => {
+  tabs.forEach(t => {
+    const nav = navEl(t);
+    if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
       li.style.display = '';
       li.querySelectorAll('ul > li').forEach(s => s.style.display = '');
