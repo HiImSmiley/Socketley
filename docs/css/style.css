@@ -30,6 +30,7 @@ html { scroll-behavior: smooth; scroll-padding-top: 24px; }
   --badge-cache-bg: #3a2a10;  --badge-cache-fg: #e8c060;
   --badge-proxy-bg: #2a1a3a;  --badge-proxy-fg: #b888e8;
   --badge-all-bg: #2a2a3a;    --badge-all-fg: #a0a0b8;
+  --badge-cluster-bg: #1a3030; --badge-cluster-fg: #50c8c8;
   --td-first-color: #6d8df8;
   --td-border: #2a2a4e;
 }
@@ -60,6 +61,7 @@ html { scroll-behavior: smooth; scroll-padding-top: 24px; }
   --badge-cache-bg: #fff3cd;  --badge-cache-fg: #856404;
   --badge-proxy-bg: #e8d5f5;  --badge-proxy-fg: #5b2d8e;
   --badge-all-bg: #e2e3e5;    --badge-all-fg: #383d41;
+  --badge-cluster-bg: #d1f0f0; --badge-cluster-fg: #1a6060;
   --td-first-color: #4361ee;
   --td-border: #eeeeee;
 }
@@ -192,6 +194,8 @@ body {
 .badge-cache  { background: var(--badge-cache-bg);  color: var(--badge-cache-fg);  }
 .badge-proxy  { background: var(--badge-proxy-bg);  color: var(--badge-proxy-fg);  }
 .badge-all    { background: var(--badge-all-bg);    color: var(--badge-all-fg);    }
+.badge-cluster{ background: var(--badge-cluster-bg);color: var(--badge-cluster-fg);}
+
 
 /* ===== Cards ===== */
 .method-card {
