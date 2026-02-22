@@ -20,7 +20,7 @@ socketley \- manage long-living network runtimes in Docker-like style
 .br
 .B socketley
 .B cluster
-.BI \-\-cluster\-dir " dir"
+.I dir
 .RI [ ls | ps | group | show | stats | watch ]
 .br
 .B socketley
@@ -329,11 +329,10 @@ List only running runtimes. Same format as
 Show ownership info for a runtime: parent name, children list, and
 on_parent_stop policy (stop or remove).
 .TP
-.BI "cluster " "[subcommand]"
+.BI "cluster " "dir " "[subcommand]"
 Inspect the shared cluster directory. Does not require a running daemon.
-Requires
-.BI \-\-cluster\-dir " dir"
-to specify the path.
+.I dir
+is the path to the shared cluster directory.
 .RS
 .TP
 .B ls
@@ -1570,11 +1569,11 @@ services:
 .B Inspecting the cluster:
 .PP
 .nf
-socketley cluster --cluster-dir /cluster ls
-socketley cluster --cluster-dir /cluster ps
-socketley cluster --cluster-dir /cluster group api
-socketley cluster --cluster-dir /cluster stats
-socketley cluster --cluster-dir /cluster watch
+socketley cluster /cluster ls
+socketley cluster /cluster ps
+socketley cluster /cluster group api
+socketley cluster /cluster stats
+socketley cluster /cluster watch
 .fi
 .PP
 .B Stale detection:
