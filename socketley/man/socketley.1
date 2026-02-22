@@ -906,7 +906,7 @@ Lua scripts can define multiple runtimes and attach callbacks.
 .SS Configuration File Format
 .nf
 runtimes = {
-    { type = "server", name = "api", port = 9000, group = "api", autostart = true },
+    { type = "server", name = "api", port = 9000, group = "api", start = true },
     { type = "client", name = "cli", port = 9000, target = "127.0.0.1:9000" },
     { type = "proxy",  name = "gw", port = 8080,
       backends = {"@api", "127.0.0.1:9000"}, strategy = "round-robin" },
@@ -1149,7 +1149,7 @@ socketley.list()                      -- List all runtime names (table)
 socketley.get(name)                   -- Get info table or nil
 .fi
 .P
-Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), autostart (bool).
+Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), start (bool).
 Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
 .SS Cluster Introspection API
 When the daemon runs in cluster mode (\fB\-\-cluster\fR), the

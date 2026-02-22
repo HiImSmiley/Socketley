@@ -23,7 +23,7 @@ runtimes = {
         name = "dev-db",
         port = 5432,  -- Familiar port
         persistent = DEV_DIR .. "/dev-db.bin",
-        autostart = true
+        start = true
     },
 
     -- Backend API server
@@ -33,7 +33,7 @@ runtimes = {
         port = 3001,
         mode = "inout",
         log = DEV_DIR .. "/api.log",
-        autostart = true
+        start = true
     },
 
     -- WebSocket server (for real-time updates)
@@ -43,7 +43,7 @@ runtimes = {
         port = 3002,
         mode = "inout",
         log = DEV_DIR .. "/ws.log",
-        autostart = true
+        start = true
     },
 
     -- Development proxy (combines all services)
@@ -58,7 +58,7 @@ runtimes = {
             "dev-ws"    -- 1: WebSocket
         },
         log = DEV_DIR .. "/proxy.log",
-        autostart = true
+        start = true
     }
 }
 

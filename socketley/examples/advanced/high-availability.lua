@@ -18,7 +18,7 @@ runtimes = {
         type = "cache",
         name = "health-store",
         port = 9000,
-        autostart = true
+        start = true
     },
 
     -- API Service - 3 replicas (group: api)
@@ -28,7 +28,7 @@ runtimes = {
         port = 9001,
         mode = "inout",
         group = "api",
-        autostart = true
+        start = true
     },
     {
         type = "server",
@@ -36,7 +36,7 @@ runtimes = {
         port = 9002,
         mode = "inout",
         group = "api",
-        autostart = true
+        start = true
     },
     {
         type = "server",
@@ -44,7 +44,7 @@ runtimes = {
         port = 9003,
         mode = "inout",
         group = "api",
-        autostart = true
+        start = true
     },
 
     -- Load Balancer — discovers API replicas via @api group
@@ -55,7 +55,7 @@ runtimes = {
         protocol = "http",
         strategy = "round-robin",
         backends = { "@api" },
-        autostart = true
+        start = true
     },
 
     -- Worker Service - 2 replicas (group: workers)
@@ -65,7 +65,7 @@ runtimes = {
         port = 9011,
         mode = "inout",
         group = "workers",
-        autostart = true
+        start = true
     },
     {
         type = "server",
@@ -73,7 +73,7 @@ runtimes = {
         port = 9012,
         mode = "inout",
         group = "workers",
-        autostart = true
+        start = true
     },
 
     -- Worker Load Balancer — discovers workers via @workers group
@@ -84,7 +84,7 @@ runtimes = {
         protocol = "tcp",
         strategy = "random",
         backends = { "@workers" },
-        autostart = true
+        start = true
     }
 }
 

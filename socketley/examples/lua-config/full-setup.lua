@@ -37,7 +37,7 @@ runtimes = {
         port = CONFIG.base_port,
         persistent = CONFIG.cache_file,
         log = CONFIG.log_dir .. "/state-store.log",
-        autostart = true
+        start = true
     },
 
     -- =========================================================================
@@ -50,7 +50,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/auth-service.log",
         write = CONFIG.log_dir .. "/auth-messages.log",
-        autostart = true
+        start = true
     },
     {
         type = "server",
@@ -59,7 +59,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/user-service.log",
         write = CONFIG.log_dir .. "/user-messages.log",
-        autostart = true
+        start = true
     },
     {
         type = "server",
@@ -68,7 +68,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/order-service.log",
         write = CONFIG.log_dir .. "/order-messages.log",
-        autostart = true
+        start = true
     },
 
     -- =========================================================================
@@ -86,7 +86,7 @@ runtimes = {
             "order-service"   -- 2
         },
         log = CONFIG.log_dir .. "/api-gateway.log",
-        autostart = true
+        start = true
     },
 
     -- =========================================================================
@@ -97,14 +97,14 @@ runtimes = {
         name = "service-mesh-auth",
         target = "127.0.0.1:" .. (CONFIG.base_port + 1),
         mode = "inout",
-        autostart = true
+        start = true
     },
     {
         type = "client",
         name = "service-mesh-user",
         target = "127.0.0.1:" .. (CONFIG.base_port + 2),
         mode = "inout",
-        autostart = true
+        start = true
     }
 }
 
