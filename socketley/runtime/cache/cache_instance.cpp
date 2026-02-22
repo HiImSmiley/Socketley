@@ -344,7 +344,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         else
         {
             close(fd);
-            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             m_clients.erase(fd);
         }
         return;
@@ -434,7 +434,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->read_pending)
         {
             close(fd);
-            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             m_clients.erase(fd);
         }
         return;
@@ -450,7 +450,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (conn->closing && !conn->read_pending)
         {
             close(fd);
-            if (fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             m_clients.erase(fd);
         }
     }
