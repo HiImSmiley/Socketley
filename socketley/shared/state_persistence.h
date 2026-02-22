@@ -33,6 +33,9 @@ struct runtime_config
     std::string target;
     std::string cache_name;
 
+    // Group
+    std::string group;
+
     // Ownership
     std::string owner;
     int child_policy = 0; // 0 = stop, 1 = remove

@@ -184,6 +184,18 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        case fnv1a("--group"):
+        case fnv1a("-g"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--group requires a value\n";
+                return 1;
+            }
+            instance->set_group(pa.args[++i]);
+            return 0;
+        }
+
         default:
             return -1;
     }
@@ -595,6 +607,18 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             instance->set_rate_limit(rate);
+            return 0;
+        }
+
+        case fnv1a("--group"):
+        case fnv1a("-g"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--group requires a value\n";
+                return 1;
+            }
+            instance->set_group(pa.args[++i]);
             return 0;
         }
 

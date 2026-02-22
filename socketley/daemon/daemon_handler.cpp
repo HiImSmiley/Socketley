@@ -546,6 +546,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     bool silent = false;
     bool col_id = false, col_name = false, col_type = false, col_port = false;
     bool col_status = false, col_conn = false, col_owner = false, col_created = false;
+    bool col_group = false;
 
     for (size_t i = 1; i < pa.count; ++i)
     {
@@ -561,11 +562,12 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--conn"):    col_conn    = true; break;
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
+            case fnv1a("--group"):   col_group   = true; break;
         }
     }
 
     bool any_col = col_id || col_name || col_type || col_port ||
-                   col_status || col_conn || col_owner || col_created;
+                   col_status || col_conn || col_owner || col_created || col_group;
 
     std::ostringstream out;
     out << std::left;
@@ -622,6 +624,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             if (col_port)    hdr("PORT");
             if (col_conn)    hdr("CONN");
             if (col_owner)   hdr("OWNER");
+            if (col_group)   hdr("GROUP");
             if (col_status)  hdr("STATUS");
             if (col_created) hdr("CREATED");
             out << '\n';
@@ -641,6 +644,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             }
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
+            auto group = instance->get_group();
             bool first = true;
             auto col = [&](const std::string& v) { if (!first) out << '\t'; out << v; first = false; };
             if (col_id)      col(std::string(instance->get_id()));
@@ -649,6 +653,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             if (col_port)    col(port > 0 ? std::to_string(port) : "-");
             if (col_conn)    col(std::to_string(instance->get_connection_count()));
             if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
+            if (col_group)   col(group.empty() ? "-" : std::string(group));
             if (col_status)  col(status);
             if (col_created) col(format_time_ago(instance->get_created_time()));
             out << '\n';
@@ -1619,6 +1624,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     instance->set_ca_path(cfg.ca_path);
     instance->set_target(cfg.target);
     instance->set_cache_name(cfg.cache_name);
+    instance->set_group(cfg.group);
 
     // Lua script: reload if changed
     std::string cur_lua(instance->get_lua_script_path());

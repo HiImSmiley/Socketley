@@ -367,6 +367,10 @@ void lua_context::register_bindings(runtime_instance* owner)
                     srv->set_http_cache(true);
             }
 
+            sol::optional<std::string> group = (*config)["group"];
+            if (group && !group->empty())
+                inst->set_group(*group);
+
             sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"];
             if (on_stop_str && fnv1a(*on_stop_str) == fnv1a("remove"))
                 inst->set_child_policy(runtime_instance::child_policy::remove);
