@@ -29,19 +29,19 @@ export SOCKETLEY_DEV=1
 
 echo "Starting daemon node1..."
 SOCKETLEY_SOCKET=/tmp/socketley-node1.sock \
-socketley daemon --name node1 --cluster "$CLUSTER_DIR" &
+socketley daemon --name node1 --cluster &
 DAEMON1_PID=$!
 sleep 0.5
 
 echo "Starting daemon node2..."
 SOCKETLEY_SOCKET=/tmp/socketley-node2.sock \
-socketley daemon --name node2 --cluster "$CLUSTER_DIR" &
+socketley daemon --name node2 --cluster &
 DAEMON2_PID=$!
 sleep 0.5
 
 echo "Starting daemon gateway..."
 SOCKETLEY_SOCKET=/tmp/socketley-gateway.sock \
-socketley daemon --name gateway --cluster "$CLUSTER_DIR" &
+socketley daemon --name gateway --cluster &
 DAEMON3_PID=$!
 sleep 0.5
 
@@ -64,15 +64,15 @@ socketley create proxy gw -p 8080 --backend @api --protocol tcp -s
 
 echo ""
 echo "=== Cluster State ==="
-socketley cluster "$CLUSTER_DIR" ps
+socketley cluster ps
 
 echo ""
 echo "=== Cluster Stats ==="
-socketley cluster "$CLUSTER_DIR" stats
+socketley cluster stats
 
 echo ""
 echo "=== Group 'api' Members ==="
-socketley cluster "$CLUSTER_DIR" group api
+socketley cluster group api
 
 echo ""
 echo "Proxy is running on port 8080, routing to api1:9001 and api2:9002"

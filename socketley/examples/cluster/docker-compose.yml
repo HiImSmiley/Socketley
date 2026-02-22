@@ -2,7 +2,7 @@
 #
 # Build:   docker compose build    (uses Dockerfile at repo root)
 # Start:   docker compose up -d
-# Inspect: socketley cluster /tmp/cluster ls
+# Inspect: socketley cluster ls
 #
 # The shared "cluster" volume lets all daemons discover each other.
 # The gateway proxy uses @api to route to all api instances.

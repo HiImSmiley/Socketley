@@ -49,7 +49,7 @@ sleep 6
 
 echo "  Test 1: cluster ls"
 OUT=$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" \
-    exec -T gateway socketley cluster /cluster ls 2>&1)
+    exec -T gateway socketley cluster ls 2>&1)
 assert_contains "$OUT" "api1"
 assert_contains "$OUT" "api2"
 assert_contains "$OUT" "gateway"
@@ -58,7 +58,7 @@ assert_contains "$OUT" "gateway"
 
 echo "  Test 2: cluster group api"
 OUT=$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" \
-    exec -T gateway socketley cluster /cluster group api 2>&1)
+    exec -T gateway socketley cluster group api 2>&1)
 assert_contains "$OUT" "api1"
 assert_contains "$OUT" "api2"
 
