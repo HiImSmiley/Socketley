@@ -1752,6 +1752,13 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         auto* inst = m_manager.get(n);
         if (inst && !inst->get_lua_script_path().empty())
             inst->reload_lua_script();
+        // Rebuild HTTP file cache on reload-lua (picks up new/changed files)
+        if (inst && inst->get_type() == runtime_server)
+        {
+            auto* srv = static_cast<server_instance*>(inst);
+            if (srv->get_http_cache() && !srv->get_http_dir().empty())
+                srv->rebuild_http_cache();
+        }
     }
     return 0;
 }

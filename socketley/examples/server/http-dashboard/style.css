@@ -1,0 +1,47 @@
+body {
+    font-family: monospace;
+    background: #111;
+    color: #0f0;
+    margin: 2em;
+}
+
+h1 {
+    font-size: 1.2em;
+    border-bottom: 1px solid #333;
+    padding-bottom: 0.5em;
+}
+
+#messages {
+    height: 60vh;
+    overflow-y: auto;
+    border: 1px solid #333;
+    padding: 0.5em;
+    margin-bottom: 1em;
+}
+
+#messages div {
+    padding: 2px 0;
+}
+
+#form {
+    display: flex;
+    gap: 0.5em;
+}
+
+#form input {
+    flex: 1;
+    background: #222;
+    color: #0f0;
+    border: 1px solid #333;
+    padding: 0.5em;
+    font-family: monospace;
+}
+
+#form button {
+    background: #0f0;
+    color: #111;
+    border: none;
+    padding: 0.5em 1em;
+    cursor: pointer;
+    font-family: monospace;
+}

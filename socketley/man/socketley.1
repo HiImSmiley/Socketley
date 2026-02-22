@@ -419,6 +419,23 @@ Lua callback for dynamic authentication.
 .B \-\-master\-forward
 When set in master mode, non-master client messages are forwarded to the master
 as "[<fd>] <message>\\n" instead of being silently dropped.
+.TP
+.BI "\-\-http " "directory"
+Serve static files from the given directory over HTTP. When a browser makes a
+plain HTTP GET request (without a WebSocket upgrade header), the server responds
+with the requested file. GET / serves index.html. HTML files (.html, .htm)
+automatically get a WebSocket connection script injected before </head>.
+Content-Type is detected from the file extension. WebSocket upgrades continue
+to work as before on the same port. Only GET requests are served; other HTTP
+methods fall through to raw TCP handling.
+.TP
+.B \-\-http\-cache
+When used with \-\-http, reads all files into memory at startup instead of
+reading from disk on each request. Faster for production. The cache is rebuilt
+on
+.BR reload\-lua .
+Without this flag, files are read from disk on each request (suitable for
+development).
 .SS WebSocket Support
 Servers automatically detect WebSocket upgrade requests on each connection.
 When a client sends an HTTP GET with "Upgrade: websocket", the server completes
