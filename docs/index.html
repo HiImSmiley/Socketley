@@ -67,8 +67,11 @@
         <li><a href="#cmd-reload">reload / reload-lua</a></li>
         <li><a href="#cmd-show-edit">show / edit</a></li>
         <li><a href="#cmd-ls-ps">ls / ps / owner</a></li>
+        <li><a href="#cmd-daemon">daemon</a></li>
+        <li><a href="#cmd-cluster">cluster</a></li>
       </ul></li>
       <li><a href="#cli-flags">CLI Flags</a><ul>
+        <li><a href="#flags-daemon">Daemon</a></li>
         <li><a href="#flags-common">Common</a></li>
         <li><a href="#flags-server">Server</a></li>
         <li><a href="#flags-client">Client</a></li>
@@ -597,8 +600,45 @@ socketley create proxy gw -p 8080 --backend @api -s</code></pre>
 a1b2c3    api-server      server  9000    3     -           Up 2 hours          3 hours ago
 d4e5f6    my-client       client  -       1     -           Up 45 minutes       1 hour ago</code></pre>
 
+<div class="cli-card" id="cmd-daemon">
+  <div class="cli-name">socketley daemon [flags]</div>
+  <div class="cli-desc">Start the background daemon. Usually auto-started on first CLI use, but run explicitly when you need cluster mode or custom logging. Add <code>--name</code> and <code>--cluster</code> for multi-daemon discovery.</div>
+</div>
+<pre><code><span class="cm"># Standalone (auto-started, rarely needed)</span>
+socketley daemon &amp;
+
+<span class="cm"># Cluster mode with two named daemons sharing a directory</span>
+socketley daemon --name api1 --cluster /shared/cluster --cluster-addr 10.0.1.1 &amp;
+socketley daemon --name api2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &amp;</code></pre>
+
+<div class="cli-card" id="cmd-cluster">
+  <div class="cli-name">socketley cluster --cluster-dir &lt;dir&gt; &lt;subcommand&gt;</div>
+  <div class="cli-desc">Inspect the shared cluster directory. Does not require a running daemon &mdash; reads the heartbeat JSON files directly. Subcommands:</div>
+</div>
+<table><thead><tr><th>Subcommand</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>ls</code></td><td>List all daemons with runtime counts and heartbeat status</td></tr>
+<tr><td><code>ps</code></td><td>List all runtimes across every daemon in the cluster</td></tr>
+<tr><td><code>group &lt;name&gt;</code></td><td>Show all members of a specific group</td></tr>
+<tr><td><code>show &lt;daemon&gt;</code></td><td>Print a daemon's raw cluster JSON file</td></tr>
+<tr><td><code>stats</code></td><td>Aggregate summary: daemon counts, runtime totals, group membership</td></tr>
+<tr><td><code>watch</code></td><td>Live-refresh the cluster view every 2&nbsp;seconds (Ctrl+C to stop)</td></tr>
+</tbody></table>
+<pre><code>socketley cluster --cluster-dir /shared/cluster ls
+socketley cluster --cluster-dir /shared/cluster ps
+socketley cluster --cluster-dir /shared/cluster group api
+socketley cluster --cluster-dir /shared/cluster stats
+socketley cluster --cluster-dir /shared/cluster watch</code></pre>
+
 <!-- ── CLI FLAGS ── -->
 <h2 id="cli-flags">CLI Flags</h2>
+
+<h3 id="flags-daemon">Daemon Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>--name &lt;name&gt; / -n</td><td>Name this daemon instance. Required for cluster mode. In Docker Compose, match the service name for DNS resolution</td></tr>
+<tr><td>--cluster &lt;dir&gt;</td><td>Enable cluster mode. Publishes runtime state every 2&nbsp;seconds and scans for peers. Mount a shared volume at this path in Docker</td></tr>
+<tr><td>--cluster-addr &lt;addr&gt;</td><td>Override advertised address. Defaults to <code>--name</code> value. Use when the hostname doesn't resolve (bare metal, custom networks)</td></tr>
+<tr><td>--log-level &lt;level&gt;</td><td>Daemon log verbosity: <code>debug</code>, <code>info</code> (default), <code>warn</code>, <code>error</code></td></tr>
+</tbody></table>
 
 <h3 id="flags-common">Common Flags (all types)</h3>
 <table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
