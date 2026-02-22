@@ -49,6 +49,10 @@ struct runtime_config
     std::string master_pw;
     bool master_forward = false;
 
+    // Server HTTP static file serving
+    std::string http_dir;
+    bool http_cache = false;
+
     // Proxy
     uint8_t protocol = 0;   // proxy_protocol
     uint8_t strategy = 0;   // proxy_strategy
