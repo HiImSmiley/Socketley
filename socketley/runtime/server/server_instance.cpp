@@ -932,6 +932,12 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
     if (!m_loop || conn->closing)
         return;
 
+    if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+    {
+        conn->closing = true;
+        return;
+    }
+
     if (conn->ws == ws_active)
     {
         // Strip trailing newline for WS frame
