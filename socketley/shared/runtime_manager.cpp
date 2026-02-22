@@ -1,6 +1,7 @@
 #include "runtime_manager.h"
 #include "runtime_factory.h"
 #include "event_loop.h"
+#include "cluster_discovery.h"
 #include <mutex>
 #include <shared_mutex>
 
@@ -205,4 +206,14 @@ runtime_instance* runtime_manager::get(std::string_view name)
     if (it != runtimes.end())
         return it->second.get();
     return nullptr;
+}
+
+void runtime_manager::set_cluster_discovery(cluster_discovery* cd)
+{
+    m_cluster = cd;
+}
+
+cluster_discovery* runtime_manager::get_cluster_discovery() const
+{
+    return m_cluster;
 }

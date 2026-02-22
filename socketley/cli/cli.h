@@ -7,5 +7,6 @@ int cli_stdin_send(int argc, char** argv);
 int cli_edit(int argc, char** argv);
 int cli_runtime_action(int argc, char** argv);
 int cli_interactive(int argc, char** argv);
-int cli_daemon();
+int cli_daemon(int argc, char** argv);
 int cli_config(int argc, char** argv);
+int cli_cluster(int argc, char** argv);

@@ -6,7 +6,7 @@
 extern runtime_manager g_runtime_manager;
 extern event_loop g_event_loop;
 
-int cli_daemon()
+int cli_daemon(int argc, char** argv)
 {
-    return daemon_start(g_runtime_manager, g_event_loop);
+    return daemon_start(g_runtime_manager, g_event_loop, argc, argv);
 }
