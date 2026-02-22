@@ -272,6 +272,19 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
         case fnv1a("--master-forward"):
             srv->set_master_forward(true);
             return 0;
+        case fnv1a("--http"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--http requires a directory path\n";
+                return 1;
+            }
+            srv->set_http_dir(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--http-cache"):
+            srv->set_http_cache(true);
+            return 0;
         default:
             return -1;
     }
@@ -645,6 +658,19 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
         }
         case fnv1a("--master-forward"):
             srv->set_master_forward(true);
+            return 0;
+        case fnv1a("--http"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--http requires a directory path\n";
+                return 1;
+            }
+            srv->set_http_dir(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--http-cache"):
+            srv->set_http_cache(true);
             return 0;
         default:
             return -1;

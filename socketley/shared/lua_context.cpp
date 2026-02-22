@@ -362,6 +362,16 @@ void lua_context::register_bindings(runtime_instance* owner)
                 else srv->set_mode(mode_inout);
             }
 
+            if (type == runtime_server) {
+                auto* srv = static_cast<server_instance*>(inst);
+                sol::optional<std::string> http_dir = (*config)["http"];
+                if (http_dir && !http_dir->empty())
+                    srv->set_http_dir(*http_dir);
+                sol::optional<bool> http_cache = (*config)["http_cache"];
+                if (http_cache && *http_cache)
+                    srv->set_http_cache(true);
+            }
+
             sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"];
             if (on_stop_str && *on_stop_str == "remove")
                 inst->set_child_policy(runtime_instance::child_policy::remove);

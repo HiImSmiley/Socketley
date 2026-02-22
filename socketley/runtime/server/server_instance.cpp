@@ -15,6 +15,8 @@
 #include <liburing.h>
 #include <sstream>
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
 
 server_instance::server_instance(std::string_view name)
     : runtime_instance(runtime_server, name), m_mode(mode_inout), m_listen_fd(-1), m_loop(nullptr)
@@ -77,6 +79,252 @@ bool server_instance::get_master_forward() const
 int server_instance::get_master_fd() const
 {
     return m_master_fd;
+}
+
+void server_instance::set_http_dir(std::string_view path)
+{
+    m_http_dir = std::filesystem::path(path);
+}
+
+const std::filesystem::path& server_instance::get_http_dir() const
+{
+    return m_http_dir;
+}
+
+void server_instance::set_http_cache(bool enabled)
+{
+    m_http_cache_enabled = enabled;
+}
+
+bool server_instance::get_http_cache() const
+{
+    return m_http_cache_enabled;
+}
+
+static std::string_view http_content_type(std::string_view ext)
+{
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css")  return "text/css; charset=utf-8";
+    if (ext == ".js")   return "application/javascript; charset=utf-8";
+    if (ext == ".json") return "application/json; charset=utf-8";
+    if (ext == ".png")  return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".gif")  return "image/gif";
+    if (ext == ".svg")  return "image/svg+xml";
+    if (ext == ".ico")  return "image/x-icon";
+    if (ext == ".woff2") return "font/woff2";
+    if (ext == ".woff") return "font/woff";
+    if (ext == ".ttf")  return "font/ttf";
+    if (ext == ".txt")  return "text/plain; charset=utf-8";
+    if (ext == ".xml")  return "application/xml";
+    if (ext == ".wasm") return "application/wasm";
+    if (ext == ".webp") return "image/webp";
+    if (ext == ".mp4")  return "video/mp4";
+    if (ext == ".webm") return "video/webm";
+    if (ext == ".mp3")  return "audio/mpeg";
+    if (ext == ".ogg")  return "audio/ogg";
+    if (ext == ".pdf")  return "application/pdf";
+    return "application/octet-stream";
+}
+
+static constexpr std::string_view WS_INJECT_SCRIPT =
+    "<script>const socketley=new WebSocket("
+    "`ws${location.protocol==='https:'?'s':''}://${location.host}`);</script>";
+
+static std::string inject_ws_script(std::string_view content)
+{
+    std::string result(content);
+
+    // Try </head> first
+    auto pos = result.find("</head>");
+    if (pos == std::string::npos)
+        pos = result.find("</HEAD>");
+    if (pos != std::string::npos)
+    {
+        result.insert(pos, WS_INJECT_SCRIPT);
+        return result;
+    }
+
+    // Try </body>
+    pos = result.find("</body>");
+    if (pos == std::string::npos)
+        pos = result.find("</BODY>");
+    if (pos != std::string::npos)
+    {
+        result.insert(pos, WS_INJECT_SCRIPT);
+        return result;
+    }
+
+    // Append at end
+    result.append(WS_INJECT_SCRIPT);
+    return result;
+}
+
+static std::string build_http_response(std::string_view content_type, std::string_view body)
+{
+    std::string resp;
+    resp.reserve(128 + body.size());
+    resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
+    resp.append(content_type);
+    resp.append("\r\nContent-Length: ");
+    char len_buf[24];
+    auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
+    resp.append(len_buf, len_end - len_buf);
+    resp.append("\r\nConnection: close\r\n\r\n");
+    resp.append(body);
+    return resp;
+}
+
+static const std::shared_ptr<const std::string>& http_404_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 13\r\n"
+        "Connection: close\r\n\r\n"
+        "404 Not Found");
+    return resp;
+}
+
+void server_instance::rebuild_http_cache()
+{
+    m_http_cache.clear();
+    if (m_http_dir.empty())
+        return;
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // Resolve canonical base path (also cached for disk-mode serve_http)
+    m_http_base = fs::canonical(m_http_dir, ec);
+    if (ec)
+        return;
+
+    for (const auto& entry : fs::recursive_directory_iterator(m_http_base, ec))
+    {
+        if (!entry.is_regular_file())
+            continue;
+
+        // Compute URL path relative to base dir
+        auto rel = fs::relative(entry.path(), m_http_base, ec);
+        if (ec)
+            continue;
+        std::string url_path = "/" + rel.string();
+
+        // Read file content
+        std::ifstream f(entry.path(), std::ios::binary);
+        if (!f.is_open())
+            continue;
+        std::string content((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+
+        // Detect content type
+        std::string ext = entry.path().extension().string();
+        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        auto ct = http_content_type(ext);
+
+        // Inject WebSocket script into HTML files
+        if (ext == ".html" || ext == ".htm")
+            content = inject_ws_script(content);
+
+        // Store pre-built response as shared_ptr (zero-copy on cache hit)
+        m_http_cache[url_path] = {
+            std::make_shared<const std::string>(build_http_response(ct, content))
+        };
+    }
+}
+
+void server_instance::serve_http(server_connection* conn, std::string_view path)
+{
+    // Normalize: "/" → "/index.html"
+    std::string url_path(path);
+    if (url_path == "/")
+        url_path = "/index.html";
+
+    // Security: reject path traversal and null bytes
+    if (url_path.find("..") != std::string::npos ||
+        url_path.find('\0') != std::string::npos)
+    {
+        conn->write_queue.push(http_404_response());
+        if (!conn->write_pending)
+            flush_write_queue(conn);
+        conn->closing = true;
+        return;
+    }
+
+    // Strip query string
+    auto qpos = url_path.find('?');
+    if (qpos != std::string::npos)
+        url_path.erase(qpos);
+
+    if (m_http_cache_enabled && !m_http_cache.empty())
+    {
+        // Cached mode: zero-copy lookup — just bump shared_ptr refcount
+        auto it = m_http_cache.find(url_path);
+        conn->write_queue.push(it != m_http_cache.end()
+            ? it->second.response : http_404_response());
+    }
+    else
+    {
+        // Disk mode: read file on each request
+        namespace fs = std::filesystem;
+        std::error_code ec;
+
+        // Resolve base once if not yet done (dev mode, no rebuild_http_cache call)
+        if (m_http_base.empty())
+        {
+            m_http_base = fs::canonical(m_http_dir, ec);
+            if (ec)
+            {
+                conn->write_queue.push(http_404_response());
+                if (!conn->write_pending)
+                    flush_write_queue(conn);
+                conn->closing = true;
+                return;
+            }
+        }
+
+        fs::path file_path = m_http_base / url_path.substr(1); // strip leading /
+        fs::path resolved = fs::canonical(file_path, ec);
+
+        // Verify the resolved path is within the base directory (symlink escape check)
+        auto base_str = m_http_base.native();
+        auto resolved_str = resolved.native();
+        if (ec || resolved_str.size() < base_str.size() ||
+            resolved_str.compare(0, base_str.size(), base_str) != 0)
+        {
+            conn->write_queue.push(http_404_response());
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+            conn->closing = true;
+            return;
+        }
+
+        std::ifstream f(resolved, std::ios::binary);
+        if (!f.is_open())
+        {
+            conn->write_queue.push(http_404_response());
+        }
+        else
+        {
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            std::string ext = resolved.extension().string();
+            for (auto& c : ext)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto ct = http_content_type(ext);
+
+            if (ext == ".html" || ext == ".htm")
+                content = inject_ws_script(content);
+
+            conn->write_queue.push(
+                std::make_shared<const std::string>(build_http_response(ct, content)));
+        }
+    }
+
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+    conn->closing = true;
 }
 
 size_t server_instance::get_connection_count() const
@@ -187,6 +435,10 @@ bool server_instance::setup(event_loop& loop)
         loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
         m_multishot_active = false;
     }
+
+    // Build HTTP file cache if enabled
+    if (m_http_cache_enabled && !m_http_dir.empty())
+        rebuild_http_cache();
 
     return true;
 }
@@ -558,6 +810,22 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
             if (!has_upgrade || ws_key_pos == std::string_view::npos)
             {
+                if (!m_http_dir.empty())
+                {
+                    // Extract request path from "GET /path HTTP/1.1"
+                    std::string_view req_line(conn->partial.data(),
+                        std::min(conn->partial.find("\r\n"), conn->partial.size()));
+                    auto sp1 = req_line.find(' ');
+                    auto sp2 = (sp1 != std::string_view::npos)
+                                ? req_line.find(' ', sp1 + 1) : std::string_view::npos;
+                    if (sp1 != std::string_view::npos && sp2 != std::string_view::npos)
+                    {
+                        std::string_view path = req_line.substr(sp1 + 1, sp2 - sp1 - 1);
+                        conn->partial.clear();
+                        serve_http(conn, path);
+                        goto submit_next_read;
+                    }
+                }
                 conn->ws = ws_tcp;
                 conn->partial.clear();
                 goto submit_next_read;

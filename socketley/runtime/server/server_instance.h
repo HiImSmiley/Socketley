@@ -7,6 +7,7 @@
 #include <vector>
 #include <netinet/in.h>
 #include <sys/uio.h>
+#include <filesystem>
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
@@ -126,11 +127,19 @@ public:
     bool get_master_forward() const;
     int get_master_fd() const;
 
+    // HTTP static file serving
+    void set_http_dir(std::string_view path);
+    const std::filesystem::path& get_http_dir() const;
+    void set_http_cache(bool enabled);
+    bool get_http_cache() const;
+    void rebuild_http_cache();
+
 private:
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void invoke_on_websocket(int fd);
+    void serve_http(server_connection* conn, std::string_view path);
 
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
@@ -185,4 +194,11 @@ private:
     struct msghdr m_udp_recv_msg{};
     io_request m_udp_recv_req{};
     std::vector<udp_peer> m_udp_peers;
+
+    // HTTP static file serving
+    std::filesystem::path m_http_dir;
+    std::filesystem::path m_http_base;  // canonical resolved path (set at setup/rebuild time)
+    bool m_http_cache_enabled{false};
+    struct cached_file { std::shared_ptr<const std::string> response; };
+    std::unordered_map<std::string, cached_file> m_http_cache;
 };

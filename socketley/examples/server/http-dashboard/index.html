@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Socketley Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Socketley Dashboard</h1>
+    <div id="messages"></div>
+    <form id="form">
+        <input id="input" autocomplete="off" placeholder="Type a message...">
+        <button type="submit">Send</button>
+    </form>
+    <script>
+        // `socketley` is auto-injected by --http as a WebSocket connection.
+        const msgs = document.getElementById('messages');
+        const form = document.getElementById('form');
+        const input = document.getElementById('input');
+
+        socketley.onmessage = e => {
+            const div = document.createElement('div');
+            div.textContent = e.data;
+            msgs.appendChild(div);
+            msgs.scrollTop = msgs.scrollHeight;
+        };
+
+        socketley.onclose = () => {
+            const div = document.createElement('div');
+            div.textContent = '-- disconnected --';
+            div.style.color = '#f44';
+            msgs.appendChild(div);
+        };
+
+        form.onsubmit = e => {
+            e.preventDefault();
+            if (input.value) {
+                socketley.send(input.value);
+                input.value = '';
+            }
+        };
+    </script>
+</body>
+</html>

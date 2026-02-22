@@ -372,6 +372,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.udp = srv->is_udp();
             cfg.master_pw = std::string(srv->get_master_pw());
             cfg.master_forward = srv->get_master_forward();
+            cfg.http_dir = srv->get_http_dir().string();
+            cfg.http_cache = srv->get_http_cache();
             break;
         }
         case runtime_client:
@@ -471,6 +473,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 out << "    \"master_pw\": \"" << json_escape(cfg.master_pw) << "\",\n";
             if (cfg.master_forward)
                 out << "    \"master_forward\": true,\n";
+            if (!cfg.http_dir.empty())
+                out << "    \"http_dir\": \"" << json_escape(cfg.http_dir) << "\",\n";
+            if (cfg.http_cache)
+                out << "    \"http_cache\": true,\n";
             break;
         case runtime_client:
             out << "    \"mode\": \"" << server_mode_str(cfg.mode) << "\",\n";
@@ -555,6 +561,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.udp = json_get_bool(json, "udp");
             cfg.master_pw = json_get_string(json, "master_pw");
             cfg.master_forward = json_get_bool(json, "master_forward");
+            cfg.http_dir = json_get_string(json, "http_dir");
+            cfg.http_cache = json_get_bool(json, "http_cache");
             break;
         case runtime_client:
             cfg.mode = str_to_server_mode(json_get_string(json, "mode"));
