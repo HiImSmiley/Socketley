@@ -534,6 +534,22 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                             ws_key_end = line_end;
                             break;
                         }
+                        case fnv1a("cookie"):
+                        case fnv1a("origin"):
+                        case fnv1a("sec-websocket-protocol"):
+                        case fnv1a("authorization"):
+                        {
+                            size_t vs = colon + 1;
+                            while (vs < line.size() && line[vs] == ' ') ++vs;
+                            std::string val(line.substr(vs));
+                            switch (h) {
+                                case fnv1a("cookie"):                 conn->ws_cookie   = std::move(val); break;
+                                case fnv1a("origin"):                 conn->ws_origin   = std::move(val); break;
+                                case fnv1a("sec-websocket-protocol"): conn->ws_protocol = std::move(val); break;
+                                case fnv1a("authorization"):          conn->ws_auth     = std::move(val); break;
+                            }
+                            break;
+                        }
                     }
                 }
 
@@ -557,6 +573,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 flush_write_queue(conn);
 
             conn->ws = ws_active;
+            invoke_on_websocket(conn->fd);
             conn->partial.erase(0, hdr_end + 4);
         }
     }
@@ -1140,6 +1157,34 @@ std::string server_instance::lua_peer_ip(int client_fd)
         inet_ntop(AF_INET6,
             &reinterpret_cast<struct sockaddr_in6*>(&addr)->sin6_addr, ip, sizeof(ip));
     return ip;
+}
+
+void server_instance::invoke_on_websocket(int fd)
+{
+#ifndef SOCKETLEY_NO_LUA
+    auto* lctx = lua();
+    if (!lctx || !lctx->has_on_websocket()) return;
+    auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+    if (!conn) return;
+    try {
+        sol::table h = lctx->state().create_table();
+        if (!conn->ws_cookie.empty())   h["cookie"]        = conn->ws_cookie;
+        if (!conn->ws_origin.empty())   h["origin"]        = conn->ws_origin;
+        if (!conn->ws_protocol.empty()) h["protocol"]      = conn->ws_protocol;
+        if (!conn->ws_auth.empty())     h["authorization"] = conn->ws_auth;
+        lctx->on_websocket()(fd, h);
+    } catch (const sol::error& e) {
+        fprintf(stderr, "[lua] on_websocket error: %s\n", e.what());
+    }
+#endif
+}
+
+server_instance::ws_headers_result server_instance::lua_ws_headers(int client_fd) const
+{
+    if (client_fd < 0 || client_fd >= MAX_FDS) return {};
+    const auto* conn = m_conn_idx[client_fd];
+    if (!conn || conn->ws != ws_active) return {};
+    return {true, conn->ws_cookie, conn->ws_origin, conn->ws_protocol, conn->ws_auth};
 }
 
 void server_instance::lua_send_to(int client_id, std::string_view msg)

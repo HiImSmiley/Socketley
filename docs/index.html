@@ -802,7 +802,7 @@ socketley reload-lua myserver</code></pre>
 <h2 id="addons-overview">Addons</h2>
 <p>Socketley's Lua scripting layer enables pure-Lua addon patterns that extend servers with auth middleware, rate limiting, service discovery, metrics push, and more — without touching C++ code. This page documents the primitives that make these patterns possible and shows working examples for each use case.</p>
 
-<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code></div>
+<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code></div>
 
 <h2 id="addons-auth">Auth Middleware</h2>
 <p>Two complementary auth patterns cover the most common cases: IP-based admission (via <code>on_auth</code>) and first-message token auth (via <code>self.disconnect</code>).</p>
@@ -868,6 +868,53 @@ nc 127.0.0.1 19100   <span class="cm"># connection is closed before any data exc
     <span class="kw">end</span>
     self.broadcast(<span class="st">"["</span> .. tostring(client_id) .. <span class="st">"] "</span> .. msg)
 <span class="kw">end</span></code></pre>
+
+<h2 id="addons-websocket-session">WebSocket Session Identity</h2>
+<p>When a browser connects via WebSocket, the HTTP upgrade request automatically carries rich identity information: <code>Cookie</code>, <code>Origin</code>, <code>Sec-WebSocket-Protocol</code>, and <code>Authorization</code>. The <code>on_websocket</code> callback fires after the handshake completes and exposes these headers as a Lua table.</p>
+<p>This is the preferred mechanism for cross-session identity: the session cookie set by your web app's login flow is forwarded automatically by the browser on every WebSocket reconnect, giving you a durable identifier that survives fd recycling and IP changes.</p>
+
+<div class="method-card" id="cb-on-websocket">
+<div class="method-header"><span class="method-name">on_websocket</span><span class="method-sig">(client_id, headers)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Called immediately after a WebSocket upgrade handshake completes, after <code>on_connect</code> has already fired. <code>headers</code> is a Lua table with any subset of: <code>cookie</code>, <code>origin</code>, <code>protocol</code> (Sec-WebSocket-Protocol), <code>authorization</code>. Absent headers are nil. Never fires for plain TCP clients.</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.ws_headers</span><span class="method-sig">(client_id) &rarr; table | nil</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns the stored WebSocket upgrade headers table for a connected client, or <code>nil</code> if the client is a plain TCP connection. Same keys as the <code>on_websocket</code> <code>headers</code> argument. Can be called from any server callback after the handshake.</div>
+</div>
+
+<pre><code><span class="cm">-- websocket-session.lua</span>
+<span class="kw">local</span> cjson    = require <span class="st">"cjson"</span>
+<span class="kw">local</span> sessions = {}   <span class="cm">-- client_id → { sid, ip, origin }</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    sessions[client_id] = { sid = tostring(client_id), ip = self.peer_ip(client_id) }
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_websocket</span>(client_id, headers)
+    <span class="kw">local</span> sid = sessions[client_id] <span class="kw">and</span> sessions[client_id].sid <span class="kw">or</span> tostring(client_id)
+    <span class="kw">if</span> headers.cookie <span class="kw">then</span>
+        sid = headers.cookie:match(<span class="st">"session_id=([^;%s]+)"</span>) <span class="kw">or</span> sid
+    <span class="kw">end</span>
+    sessions[client_id] = { sid = sid, ip = self.peer_ip(client_id), origin = headers.origin <span class="kw">or</span> <span class="st">"unknown"</span> }
+    socketley.log(<span class="st">"ws connect sid="</span> .. sid .. <span class="st">" origin="</span> .. (headers.origin <span class="kw">or</span> <span class="st">"?"</span>))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
+    <span class="kw">local</span> s = sessions[client_id]
+    <span class="kw">if</span> s <span class="kw">then</span> socketley.log(<span class="st">"disconnect sid="</span> .. s.sid) sessions[client_id] = <span class="kw">nil</span> <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">local</span> s = sessions[client_id] <span class="kw">or</span> {}
+    self.broadcast(cjson.encode({ sid = s.sid, data = msg }))
+<span class="kw">end</span></code></pre>
+
+<pre><code><span class="cm"># Start server and connect with a cookie header</span>
+socketley start ws-test --lua websocket-session.lua --port 9000
+wscat --header <span class="st">"Cookie: session_id=abc123"</span> --connect ws://localhost:9000
+<span class="cm"># Logs: ws connect sid=abc123 origin=?</span>
+<span class="cm"># Reconnect with same cookie → same sid=abc123</span></code></pre>
 
 <h2 id="addons-rate-limit">Rate Limiting</h2>
 <p>Combine <code>self.disconnect</code> with <code>on_tick</code> to enforce a per-client message budget. No external deps required — pure Lua.</p>
