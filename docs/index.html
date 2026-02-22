@@ -169,6 +169,8 @@
         <li><a href="#db-patterns">Write-Behind vs Write-Through</a></li>
       </ul></li>
       <li><a href="#addons-mq">Message Queue Bridge</a></li>
+      <li><a href="#addons-redis-session">Distributed State</a></li>
+      <li><a href="#addons-session-ids">Session IDs</a></li>
     </ul>
   </nav>
 </aside>
@@ -1244,6 +1246,80 @@ tick_ms = <span class="nb">2000</span>
     },
 })</code></pre>
 </div>
+
+
+<h2 id="addons-redis-session">Distributed Session / Shared State</h2>
+<p>A single Socketley instance keeps state in plain Lua tables. For multi-instance deployments (load-balanced), shared state is needed: rate-limit counters, presence tracking, session data. <code>redis-lua</code> connects to an external Redis from within any Lua callback.</p>
+
+<pre><code><span class="cm">-- luarocks install redis-lua</span>
+<span class="kw">local</span> redis = require <span class="st">"redis"</span>
+<span class="kw">local</span> r     = redis.connect(<span class="st">"127.0.0.1"</span>, <span class="nb">6379</span>)
+
+<span class="kw">local</span> RATE_LIMIT = <span class="nb">20</span>  <span class="cm">-- max messages per second per IP</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    r:sadd(<span class="st">"socketley:online"</span>, tostring(client_id))
+    <span class="kw">local</span> key = <span class="st">"session:"</span> .. tostring(client_id)
+    r:hset(key, <span class="st">"ip"</span>, self.peer_ip(client_id))
+    r:expire(key, <span class="nb">3600</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
+    r:srem(<span class="st">"socketley:online"</span>, tostring(client_id))
+    r:del(<span class="st">"session:"</span> .. tostring(client_id))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="cm">-- Distributed rate limiting — shared across all server instances</span>
+    <span class="kw">local</span> key = <span class="st">"rl:"</span> .. self.peer_ip(client_id)
+    <span class="kw">local</span> n   = r:incr(key)
+    <span class="kw">if</span> n == <span class="nb">1</span> <span class="kw">then</span> r:expire(key, <span class="nb">1</span>) <span class="kw">end</span>   <span class="cm">-- 1-second window</span>
+    <span class="kw">if</span> n > RATE_LIMIT <span class="kw">then</span>
+        self.send(client_id, <span class="st">"ERROR rate limit exceeded"</span>)
+        self.disconnect(client_id)
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(msg)
+<span class="kw">end</span></code></pre>
+
+<div class="warn-box"><strong>Blocking calls.</strong> <code>redis-lua</code> uses synchronous sockets and blocks the io_uring event loop for the duration of each Redis round-trip. Keep calls in <code>on_start</code>/<code>on_stop</code> or rate-limit how often they fire in <code>on_client_message</code>. For high-frequency paths, batch writes in a local table and flush in <code>on_tick</code>.</div>
+
+<p>Full example: <code>socketley/examples/server/redis-session.lua</code></p>
+
+
+<h2 id="addons-session-ids">Session IDs &amp; Tracing</h2>
+<p>Assign a UUID to each connection for end-to-end tracing across logs, metrics, and external systems. Pairs naturally with <code>cjson</code> (embed in outbound JSON envelopes) and <code>redis-lua</code> (use as the session store key).</p>
+
+<pre><code><span class="cm">-- luarocks install uuid</span>
+<span class="kw">local</span> uuid  = require <span class="st">"uuid"</span>
+<span class="kw">local</span> cjson = require <span class="st">"cjson"</span>
+uuid.seed()
+
+<span class="kw">local</span> session_ids = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    session_ids[client_id] = uuid()
+    socketley.log(<span class="st">"connect sid="</span> .. session_ids[client_id]
+                  .. <span class="st">" ip="</span> .. self.peer_ip(client_id))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
+    socketley.log(<span class="st">"disconnect sid="</span> .. (session_ids[client_id] <span class="kw">or</span> <span class="st">"?"</span>))
+    session_ids[client_id] = <span class="kw">nil</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="cm">-- Embed the session ID in every outbound message for distributed tracing</span>
+    self.broadcast(cjson.encode({
+        sid  = session_ids[client_id],
+        from = client_id,
+        data = msg,
+    }))
+<span class="kw">end</span></code></pre>
+
+<div class="info-box"><strong>Tip — combine with redis-lua.</strong> Use the UUID as the Redis session store key (<code>r:hset("session:" .. session_ids[client_id], ...)</code>) so the same correlation ID flows from the TCP layer through your Redis session store and into your logs.</div>
+
+<p>Full example: <code>socketley/examples/server/session-ids.lua</code></p>
 
 </div><!-- #content-addons -->
 
