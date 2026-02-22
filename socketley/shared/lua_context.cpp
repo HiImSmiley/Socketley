@@ -499,7 +499,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // ─── socketley.cluster.* — cluster introspection API ───
     sol::table cluster_tbl = m_lua.create_table();
 
-    // socketley.cluster.daemons() → array of {name, host, healthy, runtimes}
+    // socketley.cluster.daemons() → array of {name, host, runtimes}
     cluster_tbl["daemons"] = [owner, this]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
@@ -513,7 +513,6 @@ void lua_context::register_bindings(runtime_instance* owner)
             sol::table d = m_lua.create_table();
             d["name"] = std::string(cd->get_daemon_name());
             d["host"] = std::string(cd->get_cluster_addr());
-            d["healthy"] = true;
             size_t count = 0;
             {
                 std::shared_lock lock(mgr->mutex);
@@ -529,7 +528,6 @@ void lua_context::register_bindings(runtime_instance* owner)
             sol::table d = m_lua.create_table();
             d["name"] = rd.name;
             d["host"] = rd.host;
-            d["healthy"] = true;
             d["runtimes"] = static_cast<int>(rd.runtimes.size());
             result[i++] = d;
         }
@@ -628,7 +626,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         return result;
     };
 
-    // socketley.cluster.stats() → {daemons, healthy, stale, runtimes, running, groups={name=count}}
+    // socketley.cluster.stats() → {daemons, runtimes, running, groups={name=count}}
     cluster_tbl["stats"] = [owner, this]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
@@ -637,8 +635,6 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!cd) return result;
 
         int daemon_count = 1;  // include local
-        int healthy = 1;
-        int stale = 0;
         int rt_total = 0;
         int rt_running = 0;
         std::unordered_map<std::string, int> groups;
@@ -660,7 +656,6 @@ void lua_context::register_bindings(runtime_instance* owner)
         for (const auto& rd : daemons)
         {
             ++daemon_count;
-            ++healthy;  // get_all_daemons already filters stale
             for (const auto& rt : rd.runtimes)
             {
                 ++rt_total;
@@ -670,8 +665,6 @@ void lua_context::register_bindings(runtime_instance* owner)
         }
 
         result["daemons"] = daemon_count;
-        result["healthy"] = healthy;
-        result["stale"] = stale;
         result["runtimes"] = rt_total;
         result["running"] = rt_running;
 

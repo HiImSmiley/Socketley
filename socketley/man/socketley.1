@@ -1173,7 +1173,6 @@ Returns an array of daemon info tables. Each entry has:
 .nf
 name      string   Daemon name (from \-\-name)
 host      string   Advertised address (from \-\-cluster\-addr)
-healthy   bool     Always true (stale daemons are pruned before this call)
 runtimes  number   Count of runtimes on this daemon
 .fi
 .IP
@@ -1207,8 +1206,6 @@ Useful for building custom routing, health checks, or failover logic from Lua.
 Aggregate cluster statistics:
 .nf
 daemons   number   Total daemon count (local + remote)
-healthy   number   Healthy daemon count
-stale     number   Stale daemon count (always 0 since stale entries are pruned)
 runtimes  number   Total runtime count across all daemons
 running   number   Count of runtimes in "running" state
 groups    table    Maps group name (string) \(-> member count (number)
