@@ -64,15 +64,15 @@ socketley create proxy gw -p 8080 --backend @api --protocol tcp -s
 
 echo ""
 echo "=== Cluster State ==="
-socketley cluster --cluster-dir "$CLUSTER_DIR" ps
+socketley cluster "$CLUSTER_DIR" ps
 
 echo ""
 echo "=== Cluster Stats ==="
-socketley cluster --cluster-dir "$CLUSTER_DIR" stats
+socketley cluster "$CLUSTER_DIR" stats
 
 echo ""
 echo "=== Group 'api' Members ==="
-socketley cluster --cluster-dir "$CLUSTER_DIR" group api
+socketley cluster "$CLUSTER_DIR" group api
 
 echo ""
 echo "Proxy is running on port 8080, routing to api1:9001 and api2:9002"

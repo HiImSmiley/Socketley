@@ -382,34 +382,19 @@ static int cluster_watch(const std::string& dir)
 
 int cli_cluster(int argc, char** argv)
 {
-    // Find --cluster-dir flag, or auto-detect from running daemon
-    std::string dir;
-    std::string subcmd;
-
-    // Parse: socketley cluster [--cluster-dir <dir>] <subcommand> [args]
-    int i = 2;
-    while (i < argc)
+    // Parse: socketley cluster <dir> [subcommand] [args]
+    if (argc < 3)
     {
-        std::string_view arg = argv[i];
-        if (arg == "--cluster-dir" && i + 1 < argc)
-        {
-            dir = argv[++i];
-            ++i;
-        }
-        else
-        {
-            break;
-        }
+        std::cerr << "usage: cluster <dir> <ls|ps|group|show|stats|watch>\n";
+        return 1;
     }
+
+    std::string dir = argv[2];
+    std::string subcmd;
+    int i = 3;
 
     if (i < argc)
         subcmd = argv[i];
-
-    if (dir.empty())
-    {
-        std::cerr << "usage: cluster --cluster-dir <dir> <ls|ps|group|show|stats|watch>\n";
-        return 1;
-    }
 
     if (subcmd.empty())
     {
