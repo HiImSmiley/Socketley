@@ -42,21 +42,18 @@ EOF
 echo "Creating chat server..."
 socketley create server chat-server \
     -p 9000 \
-    --mode inout \
     --lua /tmp/chat-server.lua \
     -s
 
 echo "Creating chat clients..."
 socketley create client alice \
     -t 127.0.0.1:9000 \
-    --mode inout \
     --lua /tmp/chat-client.lua \
     -w /tmp/alice-chat.txt \
     -s
 
 socketley create client bob \
     -t 127.0.0.1:9000 \
-    --mode inout \
     --lua /tmp/chat-client.lua \
     -w /tmp/bob-chat.txt \
     -s

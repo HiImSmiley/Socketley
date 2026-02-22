@@ -2125,7 +2125,7 @@ socketley create server full-echo -p 9004 -bpt -s
 </div>
 <p class="method-desc">One server, multiple clients. Any message sent to the server is broadcast to all connected clients. Each client logs received messages to a file via <code>-w</code>.</p>
 <pre><code><span class="cm"># Create server</span>
-socketley create server broadcast-hub -p 9000 --mode inout -s
+socketley create server broadcast-hub -p 9000 -s
 
 <span class="cm"># Connect 3 clients, each logging to a file</span>
 socketley create client client-1 -t 127.0.0.1:9000 -w /tmp/client-1.txt -s
@@ -2147,9 +2147,9 @@ echo <span class="st">"hello everyone"</span> | nc localhost 9000</code></pre>
 <span class="kw">function</span> <span class="fn">on_message</span>(msg)
     self.broadcast(<span class="st">"["</span> .. os.date(<span class="st">"%H:%M:%S"</span>) .. <span class="st">"] "</span> .. msg)
 <span class="kw">end</span></code></pre>
-<pre><code>socketley create server chat -p 9000 --mode inout --lua chat-server.lua -s
-socketley create client alice -t 127.0.0.1:9000 --mode inout -w /tmp/alice.txt -s
-socketley create client bob -t 127.0.0.1:9000 --mode inout -w /tmp/bob.txt -s</code></pre>
+<pre><code>socketley create server chat -p 9000 --lua chat-server.lua -s
+socketley create client alice -t 127.0.0.1:9000 -w /tmp/alice.txt -s
+socketley create client bob -t 127.0.0.1:9000 -w /tmp/bob.txt -s</code></pre>
 </div>
 
 <div class="method-card" id="ex-modes">
