@@ -137,6 +137,10 @@ int cli_config(int argc, char** argv)
         if (cache_name)
             command += " --cache " + *cache_name;
 
+        sol::optional<std::string> group = t["group"];
+        if (group && !group->empty())
+            command += " -g " + *group;
+
         sol::optional<std::string> master_pw = t["master_pw"];
         if (master_pw && !master_pw->empty())
             command += " --master-pw " + *master_pw;

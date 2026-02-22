@@ -49,6 +49,13 @@ size_t proxy_instance::get_connection_count() const
 
 bool proxy_instance::resolve_backend(backend_info& b)
 {
+    // Group references (@groupname) are resolved dynamically at connection time
+    if (b.address.size() > 1 && b.address[0] == '@')
+    {
+        b.is_group = true;
+        return true;
+    }
+
     auto colon = b.address.find(':');
     if (colon != std::string::npos)
     {
@@ -84,14 +91,14 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_loop = &loop;
 
+    if (m_backends.empty())
+        return false;
+
     for (auto& b : m_backends)
     {
         if (!resolve_backend(b))
             return false;
     }
-
-    if (m_backends.empty())
-        return false;
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
 
@@ -352,8 +359,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // TCP mode: connect on first read, then forward raw bytes
         if (conn->backend_fd < 0)
         {
-            size_t idx = select_backend(conn);
-            if (!connect_to_backend(conn, idx))
+            auto target = select_and_resolve_backend(conn);
+            if (!connect_to_backend(conn, target))
             {
                 if (is_provided)
                     m_loop->return_buf(BUF_GROUP_ID, buf_id);
@@ -419,8 +426,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             new_path = conn->path.substr(m_prefix.size() - 1); // Keep leading /
 
         // Select and connect to backend
-        size_t idx = select_backend(conn);
-        if (!connect_to_backend(conn, idx))
+        auto target = select_and_resolve_backend(conn);
+        if (!connect_to_backend(conn, target))
         {
             send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
             return;
@@ -559,10 +566,40 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     return result;
 }
 
-size_t proxy_instance::select_backend(proxy_client_connection* conn)
+resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
 {
-    if (m_backends.size() == 1)
-        return 0;
+    // Build expanded pool of all available backends
+    std::vector<resolved_backend> pool;
+    pool.reserve(m_backends.size());
+
+    for (const auto& b : m_backends)
+    {
+        if (b.is_group)
+        {
+            auto* mgr = get_runtime_manager();
+            if (mgr)
+            {
+                std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+                auto members = mgr->get_by_group(group_name);
+                for (auto* inst : members)
+                {
+                    uint16_t port = inst->get_port();
+                    if (port > 0)
+                        pool.push_back({"127.0.0.1", port});
+                }
+            }
+        }
+        else
+        {
+            pool.push_back({b.resolved_host, b.resolved_port});
+        }
+    }
+
+    if (pool.empty())
+        return {};
+
+    if (pool.size() == 1)
+        return pool[0];
 
     if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
     {
@@ -576,8 +613,8 @@ size_t proxy_instance::select_backend(proxy_client_connection* conn)
         if (result.is<int>())
         {
             int idx = result.as<int>();
-            if (idx >= 0 && static_cast<size_t>(idx) < m_backends.size())
-                return static_cast<size_t>(idx);
+            if (idx >= 0 && static_cast<size_t>(idx) < pool.size())
+                return pool[static_cast<size_t>(idx)];
         }
 #endif
         // Fallback to round-robin
@@ -585,22 +622,20 @@ size_t proxy_instance::select_backend(proxy_client_connection* conn)
 
     if (m_strategy == strategy_random)
     {
-        std::uniform_int_distribution<size_t> dist(0, m_backends.size() - 1);
-        return dist(m_rng);
+        std::uniform_int_distribution<size_t> dist(0, pool.size() - 1);
+        return pool[dist(m_rng)];
     }
 
     // round-robin (default, also fallback for lua)
-    size_t idx = m_rr_index % m_backends.size();
+    size_t idx = m_rr_index % pool.size();
     ++m_rr_index;
-    return idx;
+    return pool[idx];
 }
 
-bool proxy_instance::connect_to_backend(proxy_client_connection* conn, size_t idx)
+bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const resolved_backend& target)
 {
-    if (idx >= m_backends.size())
+    if (target.port == 0)
         return false;
-
-    auto& backend = m_backends[idx];
 
     int bfd = socket(AF_INET, SOCK_STREAM, 0);
     if (bfd < 0)
@@ -611,9 +646,9 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, size_t id
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(backend.resolved_port);
+    addr.sin_port = htons(target.port);
 
-    if (inet_pton(AF_INET, backend.resolved_host.c_str(), &addr.sin_addr) <= 0)
+    if (inet_pton(AF_INET, target.host.c_str(), &addr.sin_addr) <= 0)
     {
         close(bfd);
         return false;

@@ -127,6 +127,10 @@ static void restore_runtimes(state_persistence& persistence,
         instance->set_runtime_manager(&manager);
         instance->set_event_loop(&loop);
 
+        // Restore group
+        if (!cfg.group.empty())
+            instance->set_group(cfg.group);
+
         // Restore ownership
         if (!cfg.owner.empty())
             instance->set_owner(cfg.owner);

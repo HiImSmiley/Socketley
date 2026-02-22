@@ -240,6 +240,7 @@ key_path	string	TLS private key file (PEM)
 ca_path	string	TLS CA certificate file
 target	string	Client target host:port \fB(requires restart)\fR
 cache_name	string	Connected cache runtime name
+group	string	Group tag for dynamic proxy discovery
 .TE
 .PP
 .B Server fields:
@@ -270,7 +271,7 @@ Field	Type	Description
 _
 protocol	string	"http" or "tcp" \fB(requires restart)\fR
 strategy	string	"round-robin", "random", or "lua"
-backends	array	List of backend addresses ["ip:port", ...]
+backends	array	List of backend addresses ["ip:port", "@group", ...]
 .TE
 .PP
 .B Cache fields:
@@ -390,6 +391,16 @@ Path to TLS private key file (PEM format).
 .TP
 .BI "\-\-ca " "file"
 Path to TLS CA certificate file for client verification.
+.TP
+.BI "\-g " "name"
+.TQ
+.BI "\-\-group " "name"
+Assign the runtime to a named group. Groups enable dynamic proxy backend
+discovery: a proxy using
+.B @groupname
+as a backend will route to all running members of that group at connection
+time. New group members are discovered automatically without restarting
+the proxy.
 .SH SERVER FLAGS
 .TP
 .BI "\-\-mode " "mode"
@@ -490,7 +501,11 @@ without a value). Set to a positive number to limit reconnection attempts.
 .SH PROXY FLAGS
 .TP
 .BI "\-\-backend " "addr"
-Add backend server. Can be ip:port or runtime name. Repeatable or comma-separated.
+Add backend server. Can be ip:port, runtime name, or
+.BI @ groupname
+to dynamically target all running members of that group. Repeatable or comma-separated.
+Group backends are resolved at connection time, so new group members are picked up
+automatically without restarting the proxy.
 .TP
 .BI "\-\-strategy " "strategy"
 Load balancing strategy:
@@ -842,10 +857,10 @@ Lua scripts can define multiple runtimes and attach callbacks.
 .SS Configuration File Format
 .nf
 runtimes = {
-    { type = "server", name = "api", port = 9000, autostart = true },
+    { type = "server", name = "api", port = 9000, group = "api", autostart = true },
     { type = "client", name = "cli", port = 9000, target = "127.0.0.1:9000" },
     { type = "proxy",  name = "gw", port = 8080,
-      backends = {"127.0.0.1:9000"}, strategy = "round-robin" },
+      backends = {"@api", "127.0.0.1:9000"}, strategy = "round-robin" },
     { type = "cache",  name = "store", port = 9001,
       persistent = "/data/store.bin" }
 }
@@ -1075,7 +1090,7 @@ socketley.list()                      -- List all runtime names (table)
 socketley.get(name)                   -- Get info table or nil
 .fi
 .P
-Config table keys: port, config (lua script path), target, mode, on_parent_stop ("remove"/"stop"), autostart (bool).
+Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), autostart (bool).
 Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
 .SH RUNTIME STATES
 .TP
@@ -1297,6 +1312,22 @@ socketley create server api -p 9000 --cache db -s
 # Client sends: "cache set user:1 alice" → "ok"
 # Client sends: "cache get user:1" → "alice"
 # Client sends: "hello" → broadcast as usual
+.fi
+.PP
+Dynamic proxy with group-based backend discovery:
+.PP
+.nf
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s
+# Proxy routes to all running members of group "api"
+
+# Add a new member dynamically (no proxy restart needed)
+socketley create server api3 -p 9003 -g api -s
+
+# Mix group and direct backends
+socketley create proxy gw2 -p 8081 \\
+    --backend @api,10.0.0.5:9000 -s
 .fi
 .PP
 Load complex configuration:

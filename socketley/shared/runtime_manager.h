@@ -60,6 +60,9 @@ public:
     void stop_children(std::string_view parent_name, event_loop& loop);
     void remove_children(std::string_view parent_name, event_loop& loop);
 
+    // Group query: return all running instances with the given group tag
+    std::vector<runtime_instance*> get_by_group(std::string_view group) const;
+
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);
 

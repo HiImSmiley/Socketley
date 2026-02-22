@@ -327,6 +327,7 @@ flags_options() {
     echo "│ --cert <file>    │ TLS certificate (PEM)                   │"
     echo "│ --key <file>     │ TLS private key (PEM)                   │"
     echo "│ --ca <file>      │ TLS CA certificate                      │"
+    echo "│ -g <name>        │ Assign to group (proxy @group discovery)│"
     echo "└──────────────────┴─────────────────────────────────────────┘"
     echo ""
 
@@ -357,7 +358,7 @@ flags_options() {
 
     echo -e "${BOLD}Proxy Flags:${NC}"
     echo "┌────────────────────────┬─────────────────────────────────────┐"
-    echo "│ --backend <addr>       │ Backend (ip:port or runtime name)   │"
+    echo "│ --backend <addr>       │ Backend (ip:port, name, or @group)  │"
     echo "│ --strategy <strategy>  │ round-robin, random, lua            │"
     echo "│ --protocol <protocol>  │ http (default), tcp                 │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
@@ -392,6 +393,7 @@ lua_config() {
     echo "        name = \"api\","
     echo "        port = 9000,"
     echo "        mode = \"inout\","
+    echo "        group = \"api\","
     echo "        autostart = true"
     echo "    },"
     echo "    -- more runtimes..."
