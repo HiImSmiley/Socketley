@@ -124,6 +124,15 @@
         <li><a href="#cache-ttl">TTL / Expiry</a></li>
         <li><a href="#cache-pubsub">Pub/Sub</a></li>
       </ul></li>
+      <li><a href="#db-backend">DB Backend Hooks</a><ul>
+        <li><a href="#cb-on-miss">on_miss</a></li>
+        <li><a href="#cb-on-write">on_write</a></li>
+        <li><a href="#cb-on-delete-expire">on_delete / on_expire</a></li>
+        <li><a href="#db-sqlite">SQLite</a></li>
+        <li><a href="#db-mysql">MySQL / MariaDB</a></li>
+        <li><a href="#db-postgres">PostgreSQL</a></li>
+        <li><a href="#db-patterns">Write-Behind vs Write-Through</a></li>
+      </ul></li>
       <li><a href="#proxy-api">Proxy API</a><ul>
         <li><a href="#proxy-connections">connections</a></li>
         <li><a href="#proxy-routing">Lua Routing</a></li>
@@ -322,7 +331,7 @@ d4e5f6    my-client       client  -       1     -           Up 45 minutes       
 <pre><code>socketley create proxy gw -p 8080 --backend api1,api2 --strategy lua --lua router.lua -s</code></pre>
 
 <h3 id="rt-cache">Cache</h3>
-<p>In-memory store: strings, lists, sets, hashes, TTL, pub/sub, RESP2, LRU eviction, persistence, and replication.</p>
+<p>In-memory store: strings, lists, sets, hashes, TTL, pub/sub, RESP2, LRU eviction, persistence, and replication. Attach a Lua script to connect any database via <a href="#db-backend">DB Backend Hooks</a>.</p>
 <pre><code>socketley create cache store -p 9000 --persistent /tmp/data.bin --maxmemory 256M --eviction allkeys-lru --resp -s</code></pre>
 
 <h2 id="cache-protocol">Cache Protocol</h2>
@@ -692,6 +701,227 @@ socketley reload-lua myserver</code></pre>
 <h3 id="cache-pubsub">Pub/Sub</h3>
 <div class="method-card"><div class="method-header"><span class="method-name">self.publish</span><span class="method-sig">(channel, message) &rarr; number</span><span class="badge badge-cache">cache</span></div>
 <div class="method-desc">Publish to a channel. Returns the subscriber count.</div></div>
+
+<h2 id="db-backend">Database Backend Hooks</h2>
+<p>Four Lua callbacks wire the cache to any database — no built-in drivers, no C++ changes required. Install a Lua DB library with <code>luarocks</code>, implement the callbacks you need, and the cache handles read-through population and write propagation automatically.</p>
+<table><thead><tr><th>Callback</th><th>Signature</th><th>Fires when</th></tr></thead><tbody>
+<tr><td><code>on_miss(key)</code></td><td><code>&rarr; value [, ttl_seconds]</code></td><td>GET returns nil — fetch from DB</td></tr>
+<tr><td><code>on_write(key, value, ttl)</code></td><td>&rarr; nothing</td><td>After SET / SETEX / SETNX / MSET</td></tr>
+<tr><td><code>on_delete(key)</code></td><td>&rarr; nothing</td><td>After DEL</td></tr>
+<tr><td><code>on_expire(key)</code></td><td>&rarr; nothing</td><td>After TTL sweep removes key</td></tr>
+</tbody></table>
+<div class="info-box"><strong>Zero overhead when unused.</strong> Each hook is a single boolean check on the event loop thread — if the callback is not defined in your script, execution falls straight through with no extra work.</div>
+
+<div class="callback-card" id="cb-on-miss">
+<div class="method-header"><span class="method-name">on_miss(key)</span><span class="method-sig"> &rarr; value [, ttl_seconds]</span><span class="badge badge-cache">cache</span></div>
+<div class="fires">Fires when a GET misses the in-memory store. Return a value (and optional TTL in seconds) to populate the cache transparently and return it to the client. Return nil to pass the miss through to the client normally.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_miss</span>(key)
+    <span class="kw">local</span> value = db_fetch(key)
+    <span class="kw">if</span> value <span class="kw">then</span>
+        <span class="kw">return</span> value, <span class="nb">300</span>  <span class="cm">-- populate cache, expire after 300 s</span>
+    <span class="kw">end</span>
+    <span class="cm">-- return nil → client receives nil, nothing cached</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-write">
+<div class="method-header"><span class="method-name">on_write(key, value, ttl)</span><span class="badge badge-cache">cache</span></div>
+<div class="fires">Fires after every successful SET, SETEX, PSETEX, SETNX, or MSET. <code>ttl</code> is the expiry in seconds (0 = no TTL). Runs synchronously on the event loop thread — for write-heavy workloads use the <strong>write-behind</strong> pattern: buffer in this callback, flush to the DB in <code>on_tick</code>.</div>
+<pre><code><span class="kw">local</span> pending = {}
+
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)
+    pending[key] = value  <span class="cm">-- buffer — instant return to client</span>
+<span class="kw">end</span>
+
+tick_ms = <span class="nb">2000</span>
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">if</span> <span class="kw">not</span> next(pending) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">end</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db_upsert(k, v)
+    <span class="kw">end</span>
+    pending = {}
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-delete-expire">
+<div class="method-header"><span class="method-name">on_delete(key)</span>&ensp;<span class="method-name">on_expire(key)</span><span class="badge badge-cache">cache</span></div>
+<div class="fires"><code>on_delete</code> fires after DEL. <code>on_expire</code> fires when the 100 ms background TTL sweep removes a key. <code>on_expire</code> does <em>not</em> delete from the DB by default — uncomment <code>on_delete(key)</code> below if you want expiry to propagate.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_delete</span>(key)
+    db:exec(<span class="st">"DELETE FROM kv WHERE key="</span> .. db:quote(key))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_expire</span>(key)
+    socketley.log(<span class="st">"expired: "</span> .. key)
+    <span class="cm">-- on_delete(key)  -- un-comment to propagate expiry to DB</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<h3 id="db-sqlite">SQLite — lsqlite3</h3>
+<p>Embedded, zero-config, no server required. Ideal for single-host deployments and local development.</p>
+<pre><code>luarocks install lsqlite3</code></pre>
+<pre><code><span class="cm">-- Attach: socketley create cache mydb -p 9000 --lua sqlite.lua -s</span>
+<span class="kw">local</span> db, pending = <span class="kw">nil</span>, {}
+tick_ms = <span class="nb">2000</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    db = require(<span class="st">"lsqlite3"</span>).open(<span class="st">"/tmp/cache.db"</span>)
+    db:exec(<span class="st">"CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)"</span>)
+    socketley.log(<span class="st">"SQLite backend ready"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_miss</span>(key)
+    <span class="kw">for</span> row <span class="kw">in</span> db:nrows(<span class="st">"SELECT value FROM kv WHERE key="</span> .. db:quote(key)) <span class="kw">do</span>
+        <span class="kw">return</span> row.value, <span class="nb">300</span>  <span class="cm">-- value + TTL</span>
+    <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)
+    pending[key] = value
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">if</span> <span class="kw">not</span> next(pending) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">end</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:exec(<span class="st">"INSERT OR REPLACE INTO kv(key,value) VALUES("</span>
+                ..db:quote(k)..<span class="st">","</span>..db:quote(v)..<span class="st">")"</span>)
+    <span class="kw">end</span>
+    pending = {}
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_delete</span>(key)
+    pending[key] = <span class="kw">nil</span>
+    db:exec(<span class="st">"DELETE FROM kv WHERE key="</span> .. db:quote(key))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_expire</span>(key)
+    socketley.log(<span class="st">"expired: "</span> .. key)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>  <span class="cm">-- flush before shutdown</span>
+        db:exec(<span class="st">"INSERT OR REPLACE INTO kv(key,value) VALUES("</span>
+                ..db:quote(k)..<span class="st">","</span>..db:quote(v)..<span class="st">")"</span>)
+    <span class="kw">end</span>
+    <span class="kw">if</span> db <span class="kw">then</span> db:close() <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<h3 id="db-mysql">MySQL / MariaDB — luasql-mysql</h3>
+<pre><code>luarocks install luasql-mysql</code></pre>
+<pre><code><span class="cm">-- Attach: socketley create cache mydb -p 9000 --lua mysql.lua -s</span>
+<span class="cm">-- Schema: CREATE TABLE kv (k VARCHAR(512) PRIMARY KEY, v TEXT,</span>
+<span class="cm">--                          updated_at TIMESTAMP DEFAULT NOW() ON UPDATE NOW());</span>
+<span class="kw">local</span> env, db, pending = <span class="kw">nil</span>, <span class="kw">nil</span>, {}
+tick_ms = <span class="nb">2000</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> luasql = require(<span class="st">"luasql.mysql"</span>)
+    env = luasql.mysql()
+    db  = env:connect(<span class="st">"mydb"</span>, <span class="st">"user"</span>, <span class="st">"password"</span>, <span class="st">"127.0.0.1"</span>, <span class="nb">3306</span>)
+    db:execute(<span class="st">"CREATE TABLE IF NOT EXISTS kv ("</span>
+               ..<span class="st">"k VARCHAR(512) PRIMARY KEY, v TEXT)"</span>)
+    socketley.log(<span class="st">"MySQL backend ready"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_miss</span>(key)
+    <span class="kw">local</span> cur = db:execute(<span class="st">"SELECT v FROM kv WHERE k='"</span>
+                           ..db:escape(key)..<span class="st">"'"</span>)
+    <span class="kw">local</span> row = cur:fetch({}, <span class="st">"a"</span>)
+    cur:close()
+    <span class="kw">if</span> row <span class="kw">then</span> <span class="kw">return</span> row.v, <span class="nb">300</span> <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)
+    pending[key] = value
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">if</span> <span class="kw">not</span> next(pending) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">end</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:execute(<span class="st">"INSERT INTO kv(k,v) VALUES('"</span>..db:escape(k)..<span class="st">"','"</span>
+                   ..db:escape(v)..<span class="st">"') ON DUPLICATE KEY UPDATE v=VALUES(v)"</span>)
+    <span class="kw">end</span>
+    pending = {}
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_delete</span>(key)
+    pending[key] = <span class="kw">nil</span>
+    db:execute(<span class="st">"DELETE FROM kv WHERE k='"</span> .. db:escape(key) .. <span class="st">"'"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_expire</span>(key)
+    socketley.log(<span class="st">"expired: "</span> .. key)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:execute(<span class="st">"INSERT INTO kv(k,v) VALUES('"</span>..db:escape(k)..<span class="st">"','"</span>
+                   ..db:escape(v)..<span class="st">"') ON DUPLICATE KEY UPDATE v=VALUES(v)"</span>)
+    <span class="kw">end</span>
+    <span class="kw">if</span> db  <span class="kw">then</span> db:close()  <span class="kw">end</span>
+    <span class="kw">if</span> env <span class="kw">then</span> env:close() <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<h3 id="db-postgres">PostgreSQL — luasql-postgres</h3>
+<pre><code>luarocks install luasql-postgres</code></pre>
+<pre><code><span class="cm">-- Attach: socketley create cache mydb -p 9000 --lua postgres.lua -s</span>
+<span class="cm">-- Schema: CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);</span>
+<span class="kw">local</span> env, db, pending = <span class="kw">nil</span>, <span class="kw">nil</span>, {}
+tick_ms = <span class="nb">2000</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> luasql = require(<span class="st">"luasql.postgres"</span>)
+    env = luasql.postgres()
+    db  = env:connect(<span class="st">"host=127.0.0.1 dbname=mydb user=app password=secret"</span>)
+    db:execute(<span class="st">"CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"</span>)
+    socketley.log(<span class="st">"PostgreSQL backend ready"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_miss</span>(key)
+    <span class="kw">local</span> cur = db:execute(<span class="st">"SELECT v FROM kv WHERE k='"</span>
+                           ..db:escape(key)..<span class="st">"'"</span>)
+    <span class="kw">local</span> row = cur:fetch({}, <span class="st">"a"</span>)
+    cur:close()
+    <span class="kw">if</span> row <span class="kw">then</span> <span class="kw">return</span> row.v, <span class="nb">300</span> <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)
+    pending[key] = value
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">if</span> <span class="kw">not</span> next(pending) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">end</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:execute(<span class="st">"INSERT INTO kv(k,v) VALUES('"</span>..db:escape(k)..<span class="st">"','"</span>
+                   ..db:escape(v)..<span class="st">"') ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v"</span>)
+    <span class="kw">end</span>
+    pending = {}
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_delete</span>(key)
+    pending[key] = <span class="kw">nil</span>
+    db:execute(<span class="st">"DELETE FROM kv WHERE k='"</span> .. db:escape(key) .. <span class="st">"'"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_expire</span>(key)
+    socketley.log(<span class="st">"expired: "</span> .. key)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:execute(<span class="st">"INSERT INTO kv(k,v) VALUES('"</span>..db:escape(k)..<span class="st">"','"</span>
+                   ..db:escape(v)..<span class="st">"') ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v"</span>)
+    <span class="kw">end</span>
+    <span class="kw">if</span> db  <span class="kw">then</span> db:close()  <span class="kw">end</span>
+    <span class="kw">if</span> env <span class="kw">then</span> env:close() <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<h3 id="db-patterns">Write-Behind vs Write-Through</h3>
+<table><thead><tr><th>Pattern</th><th>How</th><th>SET latency</th><th>Durability</th><th>Best for</th></tr></thead><tbody>
+<tr><td><strong>Write-behind</strong></td><td>Buffer in <code>on_write</code>, flush in <code>on_tick</code></td><td>Cache only — instant</td><td>Up to <code>tick_ms</code> lag on crash</td><td>High write rate, latency-sensitive</td></tr>
+<tr><td><strong>Write-through</strong></td><td>Call DB directly in <code>on_write</code></td><td>Cache + DB latency</td><td>Always in sync</td><td>Low write rate, strict durability</td></tr>
+</tbody></table>
+<div class="warn-box"><strong>Write-through saturation:</strong> At 1 ms/DB write, write-through saturates around 1 000 writes/s on a single-threaded event loop. Use write-behind for anything above that.</div>
+<div class="info-box"><strong>Flush on shutdown:</strong> Always flush <code>pending</code> in <code>on_stop()</code> to avoid losing the last batch of writes when the cache is stopped cleanly.</div>
 
 <h2 id="proxy-api">Lua Proxy API</h2>
 
