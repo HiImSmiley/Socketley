@@ -2,6 +2,10 @@
 #include <fstream>
 #include <cstring>
 #include <random>
+#include <charconv>
+#include <fnmatch.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // ─── Type conflict checks (fast-path: empty() avoids hash lookups) ───
 
@@ -433,6 +437,196 @@ void cache_store::check_expiry(std::string_view key)
     if (auto hit = m_hashes.find(key); hit != m_hashes.end()) { m_hashes.erase(hit); return; }
 }
 
+void cache_store::sweep_expired()
+{
+    if (m_expiry.empty())
+        return;
+
+    auto now = std::chrono::steady_clock::now();
+    std::vector<std::string> expired;
+    for (const auto& [key, tp] : m_expiry)
+    {
+        if (now >= tp)
+            expired.push_back(key);
+    }
+    for (const auto& key : expired)
+        del(key);
+}
+
+bool cache_store::set_expiry_ms(std::string_view key, int64_t ms)
+{
+    if (!exists(key))
+        return false;
+
+    auto tp = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    auto it = m_expiry.find(key);
+    if (it != m_expiry.end())
+        it->second = tp;
+    else
+        m_expiry.emplace(std::string(key), tp);
+    return true;
+}
+
+int64_t cache_store::get_pttl(std::string_view key) const
+{
+    if (!exists(key))
+        return -2;
+
+    auto it = m_expiry.find(key);
+    if (it == m_expiry.end())
+        return -1;
+
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        it->second - std::chrono::steady_clock::now());
+    return remaining.count();
+}
+
+bool cache_store::setnx(std::string_view key, std::string_view value)
+{
+    check_expiry(key);
+    if (exists(key))
+        return false;
+    return set(key, value);
+}
+
+uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
+                            size_t count, std::vector<std::string_view>& out) const
+{
+    bool match_all = (pattern.empty() || pattern == "*");
+    auto match = [&](std::string_view k) -> bool {
+        if (match_all) return true;
+        return fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
+    };
+
+    uint64_t pos = 0;
+    auto try_add = [&](std::string_view k) -> bool {
+        if (pos++ < cursor) return true;  // skip already-seen
+        if (match(k)) out.push_back(k);
+        return out.size() < count;        // stop when count reached
+    };
+
+    for (const auto& [k, _] : m_data)   if (!try_add(k)) return pos;
+    for (const auto& [k, _] : m_lists)  if (!try_add(k)) return pos;
+    for (const auto& [k, _] : m_sets)   if (!try_add(k)) return pos;
+    for (const auto& [k, _] : m_hashes) if (!try_add(k)) return pos;
+    return 0;  // exhausted all keys
+}
+
+bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
+{
+    check_expiry(key);
+    if (has_type_conflict_for_string(key))
+        return false;
+
+    int64_t val = 0;
+    auto it = m_data.find(key);
+    if (it != m_data.end())
+    {
+        auto [ptr, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), val);
+        if (ec != std::errc{} || ptr != it->second.data() + it->second.size())
+            return false;  // not an integer
+    }
+
+    val += delta;
+    result = val;
+
+    char buf[24];
+    auto [end, ec2] = std::to_chars(buf, buf + sizeof(buf), val);
+    std::string_view sv(buf, static_cast<size_t>(end - buf));
+
+    if (it != m_data.end())
+    {
+        track_sub(it->second.size());
+        it->second.assign(sv.data(), sv.size());
+        track_add(it->second.size());
+    }
+    else
+    {
+        if (!check_memory(key.size() + sv.size()))
+            return false;
+        m_data.emplace(std::string(key), std::string(sv));
+        track_add(key.size() + sv.size());
+    }
+    touch_lru(key);
+    return true;
+}
+
+size_t cache_store::append(std::string_view key, std::string_view suffix)
+{
+    check_expiry(key);
+    if (has_type_conflict_for_string(key))
+        return std::string::npos;  // type conflict
+
+    auto it = m_data.find(key);
+    if (it != m_data.end())
+    {
+        if (m_max_memory > 0 && !check_memory(suffix.size()))
+            return it->second.size();
+        it->second.append(suffix.data(), suffix.size());
+        track_add(suffix.size());
+        touch_lru(key);
+        return it->second.size();
+    }
+    else
+    {
+        if (!check_memory(key.size() + suffix.size()))
+            return 0;
+        auto& str = m_data.emplace(std::string(key), std::string(suffix)).first->second;
+        track_add(key.size() + suffix.size());
+        touch_lru(key);
+        return str.size();
+    }
+}
+
+size_t cache_store::strlen_key(std::string_view key) const
+{
+    auto it = m_data.find(key);
+    if (it == m_data.end())
+        return 0;
+    return it->second.size();
+}
+
+bool cache_store::getset(std::string_view key, std::string_view newval, std::string& oldval)
+{
+    check_expiry(key);
+    if (has_type_conflict_for_string(key))
+        return false;
+
+    auto it = m_data.find(key);
+    oldval = (it != m_data.end()) ? it->second : std::string{};
+    return set(key, newval);
+}
+
+std::string_view cache_store::type(std::string_view key) const
+{
+    if (m_data.count(key)) return "string";
+    if (!m_lists.empty() && m_lists.count(key)) return "list";
+    if (!m_sets.empty() && m_sets.count(key)) return "set";
+    if (!m_hashes.empty() && m_hashes.count(key)) return "hash";
+    return "none";
+}
+
+void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& out) const
+{
+    bool match_all = (pattern == "*");
+    auto match = [&](std::string_view key) -> bool {
+        if (match_all) return true;
+        // fnmatch requires null-terminated strings
+        std::string key_str(key);
+        std::string pat_str(pattern);
+        return fnmatch(pat_str.c_str(), key_str.c_str(), 0) == 0;
+    };
+
+    for (const auto& [key, _] : m_data)
+        if (match(key)) out.push_back(key);
+    for (const auto& [key, _] : m_lists)
+        if (match(key)) out.push_back(key);
+    for (const auto& [key, _] : m_sets)
+        if (match(key)) out.push_back(key);
+    for (const auto& [key, _] : m_hashes)
+        if (match(key)) out.push_back(key);
+}
+
 // ─── General ───
 
 bool cache_store::del(std::string_view key)
@@ -506,7 +700,8 @@ bool cache_store::save(std::string_view path) const
 
 bool cache_store::save_v2(std::string_view path) const
 {
-    std::ofstream file(std::string(path), std::ios::binary | std::ios::trunc);
+    std::string tmp_path = std::string(path) + ".tmp";
+    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
     if (!file)
         return false;
 
@@ -589,7 +784,21 @@ bool cache_store::save_v2(std::string_view path) const
         write_expiry(key);
     }
 
-    return file.good();
+    if (!file.good())
+        return false;
+
+    file.flush();
+    file.close();
+
+    // fsync then atomic rename
+    int fd_raw = open(tmp_path.c_str(), O_RDONLY);
+    if (fd_raw >= 0)
+    {
+        fsync(fd_raw);
+        close(fd_raw);
+    }
+
+    return rename(tmp_path.c_str(), std::string(path).c_str()) == 0;
 }
 
 bool cache_store::load(std::string_view path)

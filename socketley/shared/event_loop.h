@@ -56,7 +56,6 @@ public:
 
 private:
     void setup_signal_pipe();
-    void process_cqes();
 
     struct io_uring m_ring{};
     std::atomic<bool> m_running;

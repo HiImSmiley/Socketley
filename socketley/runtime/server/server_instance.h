@@ -18,6 +18,7 @@ enum ws_state : uint8_t { ws_unknown = 0, ws_tcp = 1, ws_upgrading = 2, ws_activ
 struct server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
 
     int fd;
     io_request read_req;

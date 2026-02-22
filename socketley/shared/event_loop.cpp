@@ -96,11 +96,6 @@ void event_loop::flush()
     }
 }
 
-void event_loop::process_cqes()
-{
-    // unused
-}
-
 void event_loop::run()
 {
     m_running.store(true, std::memory_order_release);
