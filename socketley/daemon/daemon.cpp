@@ -320,6 +320,10 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // publish includes all restored runtimes
     if (cluster)
     {
+        cluster->set_event_callback([&manager](const std::vector<cluster_event>& events) {
+            manager.dispatch_cluster_events(events);
+        });
+
         if (!cluster->start(loop))
         {
             handler.teardown();

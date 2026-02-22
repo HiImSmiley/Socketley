@@ -46,6 +46,9 @@ public:
     bool has_on_websocket() const;
     bool has_on_proxy_request()  const;
     bool has_on_proxy_response() const;
+    bool has_on_cluster_join()   const;
+    bool has_on_cluster_leave()  const;
+    bool has_on_group_change()   const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -66,6 +69,9 @@ public:
     sol::function& on_websocket()   { return m_on_websocket; }
     sol::function& on_proxy_request()  { return m_on_proxy_request; }
     sol::function& on_proxy_response() { return m_on_proxy_response; }
+    sol::function& on_cluster_join()   { return m_on_cluster_join; }
+    sol::function& on_cluster_leave()  { return m_on_cluster_leave; }
+    sol::function& on_group_change()   { return m_on_group_change; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
@@ -97,6 +103,9 @@ private:
     sol::function m_on_websocket;
     sol::function m_on_proxy_request;
     sol::function m_on_proxy_response;
+    sol::function m_on_cluster_join;
+    sol::function m_on_cluster_leave;
+    sol::function m_on_group_change;
     uint32_t m_tick_ms{0};
 
     // Timer lifetime guard — set to false in destructor; timers check before firing
@@ -142,6 +151,9 @@ public:
     bool has_on_websocket()      const { return false; }
     bool has_on_proxy_request()  const { return false; }
     bool has_on_proxy_response() const { return false; }
+    bool has_on_cluster_join()   const { return false; }
+    bool has_on_cluster_leave()  const { return false; }
+    bool has_on_group_change()   const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,

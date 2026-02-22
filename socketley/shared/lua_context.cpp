@@ -5,6 +5,7 @@
 #include "runtime_instance.h"
 #include "runtime_definitions.h"
 #include "runtime_manager.h"
+#include "cluster_discovery.h"
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
 #include "../cli/command_hashing.h"
@@ -111,6 +112,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_websocket  = m_lua["on_websocket"];
     m_on_proxy_request  = m_lua["on_proxy_request"];
     m_on_proxy_response = m_lua["on_proxy_response"];
+    m_on_cluster_join   = m_lua["on_cluster_join"];
+    m_on_cluster_leave  = m_lua["on_cluster_leave"];
+    m_on_group_change   = m_lua["on_group_change"];
 
     return true;
 }
@@ -133,6 +137,9 @@ bool lua_context::has_on_auth()            const { return m_on_auth.valid(); }
 bool lua_context::has_on_websocket()       const { return m_on_websocket.valid(); }
 bool lua_context::has_on_proxy_request()   const { return m_on_proxy_request.valid(); }
 bool lua_context::has_on_proxy_response()  const { return m_on_proxy_response.valid(); }
+bool lua_context::has_on_cluster_join()    const { return m_on_cluster_join.valid(); }
+bool lua_context::has_on_cluster_leave()   const { return m_on_cluster_leave.valid(); }
+bool lua_context::has_on_group_change()    const { return m_on_group_change.valid(); }
 
 void lua_context::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
@@ -488,6 +495,195 @@ void lua_context::register_bindings(runtime_instance* owner)
     sk["subscribe"] = [this](std::string cache_name, std::string channel, sol::function fn) {
         m_subscriptions[cache_name + '\0' + channel].push_back(std::move(fn));
     };
+
+    // ─── socketley.cluster.* — cluster introspection API ───
+    sol::table cluster_tbl = m_lua.create_table();
+
+    // socketley.cluster.daemons() → array of {name, host, healthy, runtimes}
+    cluster_tbl["daemons"] = [owner, this]() -> sol::table {
+        sol::table result = m_lua.create_table();
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return result;
+        auto* cd = mgr->get_cluster_discovery();
+        if (!cd) return result;
+
+        int i = 1;
+        // Local daemon entry
+        {
+            sol::table d = m_lua.create_table();
+            d["name"] = std::string(cd->get_daemon_name());
+            d["host"] = std::string(cd->get_cluster_addr());
+            d["healthy"] = true;
+            size_t count = 0;
+            {
+                std::shared_lock lock(mgr->mutex);
+                count = mgr->list().size();
+            }
+            d["runtimes"] = static_cast<int>(count);
+            result[i++] = d;
+        }
+        // Remote daemons
+        auto daemons = cd->get_all_daemons();
+        for (const auto& rd : daemons)
+        {
+            sol::table d = m_lua.create_table();
+            d["name"] = rd.name;
+            d["host"] = rd.host;
+            d["healthy"] = true;
+            d["runtimes"] = static_cast<int>(rd.runtimes.size());
+            result[i++] = d;
+        }
+        return result;
+    };
+
+    // socketley.cluster.runtimes() → array of {daemon, name, type, port, group, state, connections}
+    cluster_tbl["runtimes"] = [owner, this]() -> sol::table {
+        sol::table result = m_lua.create_table();
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return result;
+        auto* cd = mgr->get_cluster_discovery();
+        if (!cd) return result;
+
+        int i = 1;
+        // Local runtimes
+        {
+            std::shared_lock lock(mgr->mutex);
+            for (const auto& [name, inst] : mgr->list())
+            {
+                sol::table r = m_lua.create_table();
+                r["daemon"] = std::string(cd->get_daemon_name());
+                r["name"] = std::string(name);
+                r["type"] = type_to_string(inst->get_type());
+                r["port"] = inst->get_port();
+                r["group"] = std::string(inst->get_group());
+                r["state"] = state_to_string(inst->get_state());
+                r["connections"] = static_cast<int>(inst->get_connection_count());
+                result[i++] = r;
+            }
+        }
+        // Remote runtimes
+        auto daemons = cd->get_all_daemons();
+        for (const auto& rd : daemons)
+        {
+            for (const auto& rt : rd.runtimes)
+            {
+                sol::table r = m_lua.create_table();
+                r["daemon"] = rt.daemon_name;
+                r["name"] = rt.name;
+                r["type"] = rt.type;
+                r["port"] = rt.port;
+                r["group"] = rt.group;
+                r["state"] = rt.state;
+                r["connections"] = static_cast<int>(rt.connections);
+                result[i++] = r;
+            }
+        }
+        return result;
+    };
+
+    // socketley.cluster.group(name) → array of {daemon, host, port, connections}
+    cluster_tbl["group"] = [owner, this](std::string group_name) -> sol::table {
+        sol::table result = m_lua.create_table();
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return result;
+        auto* cd = mgr->get_cluster_discovery();
+        if (!cd) return result;
+
+        int i = 1;
+        // Local group members
+        {
+            std::shared_lock lock(mgr->mutex);
+            for (const auto& [_, inst] : mgr->list())
+            {
+                if (inst->get_group() == group_name &&
+                    inst->get_state() == runtime_running &&
+                    inst->get_port() > 0)
+                {
+                    sol::table m = m_lua.create_table();
+                    m["daemon"] = std::string(cd->get_daemon_name());
+                    m["host"] = std::string(cd->get_cluster_addr());
+                    m["port"] = inst->get_port();
+                    m["connections"] = static_cast<int>(inst->get_connection_count());
+                    result[i++] = m;
+                }
+            }
+        }
+        // Remote group members
+        auto daemons = cd->get_all_daemons();
+        for (const auto& rd : daemons)
+        {
+            for (const auto& rt : rd.runtimes)
+            {
+                if (rt.group == group_name && rt.state == "running" && rt.port > 0)
+                {
+                    sol::table m = m_lua.create_table();
+                    m["daemon"] = rt.daemon_name;
+                    m["host"] = rt.host;
+                    m["port"] = rt.port;
+                    m["connections"] = static_cast<int>(rt.connections);
+                    result[i++] = m;
+                }
+            }
+        }
+        return result;
+    };
+
+    // socketley.cluster.stats() → {daemons, healthy, stale, runtimes, running, groups={name=count}}
+    cluster_tbl["stats"] = [owner, this]() -> sol::table {
+        sol::table result = m_lua.create_table();
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return result;
+        auto* cd = mgr->get_cluster_discovery();
+        if (!cd) return result;
+
+        int daemon_count = 1;  // include local
+        int healthy = 1;
+        int stale = 0;
+        int rt_total = 0;
+        int rt_running = 0;
+        std::unordered_map<std::string, int> groups;
+
+        // Local runtimes
+        {
+            std::shared_lock lock(mgr->mutex);
+            for (const auto& [_, inst] : mgr->list())
+            {
+                ++rt_total;
+                if (inst->get_state() == runtime_running) ++rt_running;
+                auto g = inst->get_group();
+                if (!g.empty()) ++groups[std::string(g)];
+            }
+        }
+
+        // Remote daemons
+        auto daemons = cd->get_all_daemons();
+        for (const auto& rd : daemons)
+        {
+            ++daemon_count;
+            ++healthy;  // get_all_daemons already filters stale
+            for (const auto& rt : rd.runtimes)
+            {
+                ++rt_total;
+                if (rt.state == "running") ++rt_running;
+                if (!rt.group.empty()) ++groups[rt.group];
+            }
+        }
+
+        result["daemons"] = daemon_count;
+        result["healthy"] = healthy;
+        result["stale"] = stale;
+        result["runtimes"] = rt_total;
+        result["running"] = rt_running;
+
+        sol::table grp_tbl = m_lua.create_table();
+        for (const auto& [name, count] : groups)
+            grp_tbl[name] = count;
+        result["groups"] = grp_tbl;
+
+        return result;
+    };
+
+    sk["cluster"] = cluster_tbl;
 
     m_lua["socketley"] = sk;
 

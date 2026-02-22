@@ -2,6 +2,7 @@
 #include "runtime_factory.h"
 #include "event_loop.h"
 #include "cluster_discovery.h"
+#include "lua_context.h"
 #include <mutex>
 #include <shared_mutex>
 
@@ -179,6 +180,114 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     }
     for (auto* inst : targets)
         inst->on_publish_dispatch(cache_name, channel, message);
+}
+
+void runtime_manager::dispatch_cluster_events(const std::vector<cluster_event>& events)
+{
+    // Snapshot under read lock — same pattern as dispatch_publish()
+    std::vector<runtime_instance*> targets;
+    {
+        std::shared_lock lock(mutex);
+        targets.reserve(runtimes.size());
+        for (auto& [_, inst] : runtimes)
+            targets.push_back(inst.get());
+    }
+
+#ifndef SOCKETLEY_NO_LUA
+    for (auto* inst : targets)
+    {
+        auto* lua = inst->lua();
+        if (!lua) continue;
+
+        for (const auto& ev : events)
+        {
+            try {
+                switch (ev.kind)
+                {
+                    case cluster_event::daemon_join:
+                        if (lua->has_on_cluster_join())
+                        {
+                            sol::table dt = lua->state().create_table();
+                            dt["name"] = ev.daemon_name;
+                            // Look up host from remote daemons
+                            if (m_cluster)
+                            {
+                                auto daemons = m_cluster->get_all_daemons();
+                                for (const auto& rd : daemons)
+                                {
+                                    if (rd.name == ev.daemon_name)
+                                    {
+                                        dt["host"] = rd.host;
+                                        break;
+                                    }
+                                }
+                            }
+                            lua->on_cluster_join()(dt);
+                        }
+                        break;
+
+                    case cluster_event::daemon_leave:
+                        if (lua->has_on_cluster_leave())
+                        {
+                            sol::table dt = lua->state().create_table();
+                            dt["name"] = ev.daemon_name;
+                            lua->on_cluster_leave()(dt);
+                        }
+                        break;
+
+                    case cluster_event::group_change:
+                        if (lua->has_on_group_change())
+                        {
+                            // Build members table
+                            sol::table members = lua->state().create_table();
+                            int mi = 1;
+                            if (m_cluster)
+                            {
+                                // Local group members
+                                {
+                                    std::shared_lock lock(mutex);
+                                    for (const auto& [_, rinst] : runtimes)
+                                    {
+                                        if (rinst->get_group() == ev.group_name &&
+                                            rinst->get_state() == runtime_running &&
+                                            rinst->get_port() > 0)
+                                        {
+                                            sol::table m = lua->state().create_table();
+                                            m["daemon"] = std::string(m_cluster->get_daemon_name());
+                                            m["host"] = std::string(m_cluster->get_cluster_addr());
+                                            m["port"] = rinst->get_port();
+                                            members[mi++] = m;
+                                        }
+                                    }
+                                }
+                                // Remote group members
+                                auto daemons = m_cluster->get_all_daemons();
+                                for (const auto& rd : daemons)
+                                {
+                                    for (const auto& rt : rd.runtimes)
+                                    {
+                                        if (rt.group == ev.group_name &&
+                                            rt.state == "running" && rt.port > 0)
+                                        {
+                                            sol::table m = lua->state().create_table();
+                                            m["daemon"] = rt.daemon_name;
+                                            m["host"] = rt.host;
+                                            m["port"] = rt.port;
+                                            members[mi++] = m;
+                                        }
+                                    }
+                                }
+                            }
+                            lua->on_group_change()(ev.group_name, members);
+                        }
+                        break;
+                }
+            } catch (const sol::error& e) {
+                fprintf(stderr, "[lua] cluster event callback error: %s\n", e.what());
+            }
+        }
+    }
+#endif
 }
 
 std::vector<runtime_instance*> runtime_manager::get_by_group(std::string_view group) const
