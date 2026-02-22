@@ -97,10 +97,13 @@ int cli_dispatch(int argc, char** argv)
     switch (fnv1a(cmd.data()))
     {
         case fnv1a("daemon"):
-            return cli_daemon();
+            return cli_daemon(argc, argv);
 
         case fnv1a("--lua"):
             return cli_config(argc, argv);
+
+        case fnv1a("cluster"):
+            return cli_cluster(argc, argv);
 
         default:
             break;

@@ -11,8 +11,17 @@ socketley \- manage long-living network runtimes in Docker-like style
 .br
 .B socketley
 .B daemon
-.RI [ \-\-log\-level
-.IR level ]
+.RI [ \-\-name
+.IR name ]
+.RI [ \-\-cluster
+.IR dir ]
+.RI [ \-\-cluster\-addr
+.IR addr ]
+.br
+.B socketley
+.B cluster
+.BI \-\-cluster\-dir " dir"
+.RI [ ls | ps | group | show | stats | watch ]
 .br
 .B socketley
 .B create
@@ -86,6 +95,12 @@ When installed system-wide, creates IPC socket at /run/socketley/socketley.sock.
 In development mode, uses /tmp/socketley.sock.
 On startup, restores persisted runtime configurations. Runtimes that were
 running when the daemon last stopped are auto-started.
+Use
+.B \-\-name
+and
+.B \-\-cluster
+to enable multi-daemon cluster discovery (see
+.BR "CLUSTER MODE" ).
 .TP
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
@@ -314,6 +329,32 @@ List only running runtimes. Same format as
 Show ownership info for a runtime: parent name, children list, and
 on_parent_stop policy (stop or remove).
 .TP
+.BI "cluster " "[subcommand]"
+Inspect the shared cluster directory. Does not require a running daemon.
+Requires
+.BI \-\-cluster\-dir " dir"
+to specify the path.
+.RS
+.TP
+.B ls
+List all daemons in the cluster with runtime counts and heartbeat status.
+.TP
+.B ps
+List all runtimes across the entire cluster.
+.TP
+.BI "group " "name"
+Show all members of a specific group across the cluster.
+.TP
+.BI "show " "daemon\-name"
+Print a daemon's raw cluster JSON file.
+.TP
+.B stats
+Show cluster summary: daemon counts, runtime totals, group membership.
+.TP
+.B watch
+Continuously refresh the cluster view every 2 seconds (Ctrl+C to stop).
+.RE
+.TP
 .BI "\-\-lua " "lua_file"
 Load Lua orchestration configuration. Creates multiple runtimes from
 a single config file.
@@ -328,6 +369,25 @@ Set daemon log verbosity:
 .B warn
 , or
 .BR error .
+.TP
+.BI "\-\-name " "name" " | \-n " "name"
+Name this daemon instance (required for cluster mode).
+In Docker Compose, this should match the service name so other containers
+can resolve it via DNS.
+.TP
+.BI "\-\-cluster " "dir"
+Enable cluster mode. Each daemon publishes its runtime state to this shared
+directory every 2 seconds and scans for peer daemons. Proxy
+.B @group
+backends automatically discover runtimes on remote daemons.
+In Docker Compose, mount a shared volume at this path.
+.TP
+.BI "\-\-cluster\-addr " "addr"
+Override the advertised address for this daemon. Other daemons use this to
+connect to runtimes on this node. Defaults to the
+.B \-\-name
+value (which Docker Compose resolves via DNS). Use this when the hostname
+doesn't resolve (e.g., bare metal or custom networks).
 .SH COMMON FLAGS
 These flags work with all runtime types:
 .TP
@@ -1335,6 +1395,77 @@ Load complex configuration:
 .nf
 socketley --lua /etc/socketley/setup.lua
 .fi
+.SH CLUSTER MODE
+Multi-daemon cluster discovery allows proxies to route to runtimes on remote
+daemons. Each daemon publishes its state to a shared directory (typically a
+Docker volume) every 2 seconds. Stale entries (heartbeat older than 10s) are
+automatically excluded.
+.PP
+.B How it works:
+.RS
+.IP 1. 3
+Each daemon writes its state to
+.IR dir / name .json
+.IP 2. 3
+Every 2 seconds, each daemon scans the directory for peer files
+.IP 3. 3
+Proxy
+.B @group
+resolution includes both local and remote group members
+.IP 4. 3
+On graceful shutdown, the daemon deletes its file
+.RE
+.PP
+.B Docker Compose example:
+.PP
+.nf
+version: "3.8"
+volumes:
+  cluster:
+
+services:
+  api1:
+    image: socketley
+    command: >
+      sh -c "socketley daemon --name api1 --cluster /cluster &
+             sleep 1 && socketley create server web -p 9001 -g api -s && wait"
+    volumes: [cluster:/cluster]
+
+  api2:
+    image: socketley
+    command: >
+      sh -c "socketley daemon --name api2 --cluster /cluster &
+             sleep 1 && socketley create server web -p 9001 -g api -s && wait"
+    volumes: [cluster:/cluster]
+
+  gateway:
+    image: socketley
+    command: >
+      sh -c "socketley daemon --name gateway --cluster /cluster &
+             sleep 2 && socketley create proxy gw -p 8080 --backend @api -s && wait"
+    volumes: [cluster:/cluster]
+    ports: ["8080:8080"]
+.fi
+.PP
+.B Inspecting the cluster:
+.PP
+.nf
+socketley cluster --cluster-dir /cluster ls
+socketley cluster --cluster-dir /cluster ps
+socketley cluster --cluster-dir /cluster group api
+socketley cluster --cluster-dir /cluster stats
+socketley cluster --cluster-dir /cluster watch
+.fi
+.PP
+.B Stale detection:
+.TS
+l l l.
+Scenario	Behavior	Recovery
+_
+Graceful shutdown	File deleted	Immediate
+Container killed	Stale heartbeat	~10 seconds
+Container restart	File overwritten	Immediate
+.TE
 .SH INSTALLATION
 .SS Quick Install
 .nf

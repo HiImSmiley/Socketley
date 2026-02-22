@@ -1,12 +1,14 @@
 #include "proxy_instance.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
+#include "../../shared/cluster_discovery.h"
 #include "../../shared/lua_context.h"
 
 #include <unistd.h>
 #include <cstring>
 #include <charconv>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <algorithm>
@@ -580,12 +582,23 @@ resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connect
             if (mgr)
             {
                 std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+
+                // Local group members
                 auto members = mgr->get_by_group(group_name);
                 for (auto* inst : members)
                 {
                     uint16_t port = inst->get_port();
                     if (port > 0)
                         pool.push_back({"127.0.0.1", port});
+                }
+
+                // Remote group members (from cluster discovery)
+                auto* cd = mgr->get_cluster_discovery();
+                if (cd)
+                {
+                    auto remotes = cd->get_remote_group(group_name);
+                    for (auto& ep : remotes)
+                        pool.push_back({std::move(ep.host), ep.port});
                 }
             }
         }
@@ -637,28 +650,37 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const res
     if (target.port == 0)
         return false;
 
-    int bfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (bfd < 0)
+    // Use getaddrinfo for hostname resolution (supports Docker DNS, IPv4/IPv6)
+    char port_str[8];
+    auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), target.port);
+    *pend = '\0';
+
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = nullptr;
+    if (getaddrinfo(target.host.c_str(), port_str, &hints, &result) != 0 || !result)
         return false;
+
+    int bfd = socket(result->ai_family, SOCK_STREAM, 0);
+    if (bfd < 0)
+    {
+        freeaddrinfo(result);
+        return false;
+    }
 
     int opt = 1;
     setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(target.port);
-
-    if (inet_pton(AF_INET, target.host.c_str(), &addr.sin_addr) <= 0)
+    if (::connect(bfd, result->ai_addr, result->ai_addrlen) < 0)
     {
         close(bfd);
+        freeaddrinfo(result);
         return false;
     }
 
-    if (::connect(bfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
-    {
-        close(bfd);
-        return false;
-    }
+    freeaddrinfo(result);
 
     conn->backend_fd = bfd;
 
