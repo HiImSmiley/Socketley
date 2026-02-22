@@ -1,0 +1,7 @@
+bin/Debug
+bin/Sanitize
+make
+test/benchmark/results
+.git
+.github
+docs

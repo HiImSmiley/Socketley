@@ -1,0 +1,46 @@
+# Docker cluster test: 2 API backends + 1 gateway proxy
+#
+# Usage: docker compose -f test/docker/docker-compose.cluster.yml up -d
+# Test:  bash test/docker/test_cluster_docker.sh
+
+volumes:
+  cluster:
+
+services:
+  api1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: >
+      sh -c "socketley daemon --name api1 --cluster /cluster &
+             sleep 1 &&
+             socketley create server web -p 9001 -g api -s &&
+             wait"
+    volumes:
+      - cluster:/cluster
+
+  api2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: >
+      sh -c "socketley daemon --name api2 --cluster /cluster &
+             sleep 1 &&
+             socketley create server web -p 9001 -g api -s &&
+             wait"
+    volumes:
+      - cluster:/cluster
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: >
+      sh -c "socketley daemon --name gateway --cluster /cluster &
+             sleep 2 &&
+             socketley create proxy gw -p 8080 --backend @api --protocol tcp -s &&
+             wait"
+    volumes:
+      - cluster:/cluster
+    ports:
+      - "18080:8080"
