@@ -7,7 +7,7 @@ A high-performance Linux daemon and CLI tool that manages long-living network ru
 - **Server** -- TCP/UDP listener with broadcast, WebSocket auto-detection, master mode
 - **Client** -- TCP/UDP connector with auto-reconnect
 - **Proxy** -- HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
-- **Cache** -- In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, and leader-follower replication
+- **Cache** -- In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
 - **Lua scripting** -- Per-runtime callbacks (`on_message`, `on_connect`, `on_route`, etc.) with hot-reload
 - **TLS/SSL** -- Optional encryption for all runtime types
 - **WebSocket** -- Auto-detected per connection, coexists with raw TCP on the same port
@@ -184,6 +184,56 @@ end
 ```bash
 socketley create server echo -p 9000 --lua example.lua -s
 ```
+
+## Cache — DB Backend
+
+Four Lua callbacks connect the cache to any database — no built-in drivers, no rebuild required. Install whichever Lua DB library you prefer and implement the hooks you need.
+
+| Callback | Signature | When |
+|---|---|---|
+| `on_miss(key)` | → `value [, ttl_seconds]` | GET miss — fetch from DB and populate cache |
+| `on_write(key, value, ttl)` | → nothing | After SET / SETEX / SETNX / MSET |
+| `on_delete(key)` | → nothing | After DEL |
+| `on_expire(key)` | → nothing | After TTL sweep removes key |
+
+```lua
+-- sqlite-backend.lua  (luarocks install lsqlite3)
+local db, pending = nil, {}
+tick_ms = 2000  -- flush writes every 2 s
+
+function on_start()
+    db = require("lsqlite3").open("/tmp/cache.db")
+    db:exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+end
+
+function on_miss(key)   -- transparent fetch on GET miss
+    for row in db:nrows("SELECT value FROM kv WHERE key=" .. db:quote(key)) do
+        return row.value, 300   -- value + 300 s TTL
+    end
+end
+
+function on_write(key, value, ttl)  -- write-behind: buffer, flush in on_tick
+    pending[key] = value
+end
+
+function on_tick(dt)
+    for k, v in pairs(pending) do
+        db:exec("INSERT OR REPLACE INTO kv(key,value) VALUES("
+                ..db:quote(k)..","..db:quote(v)..")")
+    end
+    pending = {}
+end
+
+function on_delete(key)
+    db:exec("DELETE FROM kv WHERE key=" .. db:quote(key))
+end
+```
+
+```bash
+socketley create cache mydb -p 9000 --lua sqlite-backend.lua -s
+```
+
+See [`socketley/examples/cache/db-backend.lua`](socketley/examples/cache/db-backend.lua) for MySQL and PostgreSQL examples.
 
 ## Testing
 
