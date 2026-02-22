@@ -201,6 +201,7 @@ protected:
     void invoke_on_message(std::string_view msg);
     void invoke_on_connect(int client_id);
     void invoke_on_disconnect(int client_id);
+    bool invoke_on_auth(int client_id);
     void invoke_on_send(std::string_view msg);
     void invoke_on_client_message(int client_id, std::string_view msg);
 

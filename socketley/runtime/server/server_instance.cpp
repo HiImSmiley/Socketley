@@ -364,6 +364,16 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_last = std::chrono::steady_clock::now();
         }
 
+        // on_auth fires before on_connect; a rejected client never triggers on_connect
+        if (!invoke_on_auth(client_fd))
+        {
+            if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
+            m_clients.erase(client_fd);
+            shutdown(client_fd, SHUT_RDWR);
+            close(client_fd);
+            goto resubmit_accept;
+        }
+
         invoke_on_connect(client_fd);
 
         ptr->read_pending = true;
@@ -623,6 +633,16 @@ submit_next_read:
             m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
         else
             m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    }
+    else if (conn->closing && !conn->write_pending)
+    {
+        // No write in flight and closing — clean up now.
+        // (If write_pending, handle_write will clean up when write completes.)
+        unroute_client(fd);
+        invoke_on_disconnect(fd);
+        if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+        close(fd);
+        m_clients.erase(fd);
     }
 }
 
@@ -1090,6 +1110,36 @@ void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_
         sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
                reinterpret_cast<const struct sockaddr*>(&peer.addr), sizeof(peer.addr));
     }
+}
+
+void server_instance::lua_disconnect(int client_fd)
+{
+    auto* conn = (client_fd >= 0 && client_fd < MAX_FDS)
+                 ? m_conn_idx[client_fd] : nullptr;
+    if (!conn || conn->closing) return;
+    conn->closing = true;
+    // SHUT_RD only: keeps the write side open so any queued message
+    // (e.g. "AUTH FAIL" sent just before disconnect) still reaches the client.
+    // If a pending read CQE exists, SHUT_RD triggers its EOF so handle_read
+    // can clean up. If no ops are pending, handle_read's submit_next_read
+    // branch handles the cleanup when it sees closing=true, write_pending=false.
+    shutdown(client_fd, SHUT_RD);
+}
+
+std::string server_instance::lua_peer_ip(int client_fd)
+{
+    struct sockaddr_storage addr{};
+    socklen_t len = sizeof(addr);
+    if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0)
+        return "";
+    char ip[INET6_ADDRSTRLEN]{};
+    if (addr.ss_family == AF_INET)
+        inet_ntop(AF_INET,
+            &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr, ip, sizeof(ip));
+    else if (addr.ss_family == AF_INET6)
+        inet_ntop(AF_INET6,
+            &reinterpret_cast<struct sockaddr_in6*>(&addr)->sin6_addr, ip, sizeof(ip));
+    return ip;
 }
 
 void server_instance::lua_send_to(int client_id, std::string_view msg)

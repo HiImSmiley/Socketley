@@ -8,10 +8,19 @@
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
 #include <iostream>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#ifndef SOCKETLEY_NO_HTTPS
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 
 lua_context::lua_context()
 {
-    m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table, sol::lib::math, sol::lib::os);
+    m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
+                         sol::lib::math, sol::lib::os, sol::lib::io);
 }
 
 static const char* type_to_string(runtime_type t)
@@ -68,6 +77,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_write  = m_lua["on_write"];
     m_on_delete = m_lua["on_delete"];
     m_on_expire = m_lua["on_expire"];
+    m_on_auth   = m_lua["on_auth"];
 
     return true;
 }
@@ -86,6 +96,7 @@ bool lua_context::has_on_miss()   const { return m_on_miss.valid(); }
 bool lua_context::has_on_write()  const { return m_on_write.valid(); }
 bool lua_context::has_on_delete() const { return m_on_delete.valid(); }
 bool lua_context::has_on_expire() const { return m_on_expire.valid(); }
+bool lua_context::has_on_auth()   const { return m_on_auth.valid(); }
 
 void lua_context::update_self_state(const char* state_str)
 {
@@ -101,6 +112,157 @@ static bool parse_type_string(const std::string& s, runtime_type& t)
     if (s == "proxy")  { t = runtime_proxy;  return true; }
     if (s == "cache")  { t = runtime_cache;  return true; }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// socketley.http(opts) — synchronous HTTP/HTTPS client for Lua scripts
+// opts = { url, method="GET", body="", headers={}, timeout_ms=5000 }
+// Returns { ok=bool, status=int, body=string, error=string }
+// WARNING: Blocks the event loop thread. Use only in on_start/on_stop or
+// low-frequency on_tick callbacks. For HTTPS, cert verification is skipped
+// (SSL_VERIFY_NONE) — suitable for trusted internal services.
+// ---------------------------------------------------------------------------
+static sol::table socketley_http_call(sol::state& lua, sol::table opts)
+{
+    sol::table result = lua.create_table();
+    result["ok"]     = false;
+    result["status"] = 0;
+    result["body"]   = std::string{};
+    result["error"]  = std::string{};
+
+    sol::optional<std::string> url_opt = opts["url"];
+    if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
+
+    std::string method  = sol::optional<std::string>(opts["method"]).value_or("GET");
+    std::string url     = *url_opt;
+    std::string body    = sol::optional<std::string>(opts["body"]).value_or("");
+    int timeout_ms      = sol::optional<int>(opts["timeout_ms"]).value_or(5000);
+
+    // Parse scheme
+    bool is_https = false;
+    if (url.rfind("https://", 0) == 0)      { is_https = true;  url = url.substr(8); }
+    else if (url.rfind("http://", 0) == 0)  {                   url = url.substr(7); }
+    else { result["error"] = "unsupported scheme (use http:// or https://)"; return result; }
+
+#ifdef SOCKETLEY_NO_HTTPS
+    if (is_https) {
+        result["error"] = "HTTPS not supported in this build; use io.popen(\"curl -s https://...\")";
+        return result;
+    }
+#endif
+
+    // Parse host:port/path
+    int port = is_https ? 443 : 80;
+    std::string host, path;
+    auto slash = url.find('/');
+    std::string host_port = (slash != std::string::npos) ? url.substr(0, slash) : url;
+    path = (slash != std::string::npos) ? url.substr(slash) : "/";
+    auto colon = host_port.rfind(':');
+    if (colon != std::string::npos) {
+        host = host_port.substr(0, colon);
+        try { port = std::stoi(host_port.substr(colon + 1)); } catch (...) {}
+    } else {
+        host = host_port;
+    }
+
+    // DNS resolve
+    struct addrinfo hints{}, *addrs = nullptr;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &addrs) != 0 || !addrs) {
+        result["error"] = "DNS resolution failed for: " + host;
+        return result;
+    }
+
+    // Connect
+    int sock = ::socket(addrs->ai_family, SOCK_STREAM, 0);
+    if (sock < 0) { freeaddrinfo(addrs); result["error"] = "socket() failed"; return result; }
+
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0) {
+        freeaddrinfo(addrs); ::close(sock);
+        result["error"] = "connect() failed";
+        return result;
+    }
+    freeaddrinfo(addrs);
+
+    // Build HTTP/1.0 request
+    std::string req;
+    req.reserve(256 + body.size());
+    req += method + " " + path + " HTTP/1.0\r\n";
+    req += "Host: " + host + "\r\n";
+    if (!body.empty())
+        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    sol::optional<sol::table> hdrs = opts["headers"];
+    if (hdrs) {
+        (*hdrs).for_each([&](sol::object k, sol::object v) {
+            if (k.is<std::string>() && v.is<std::string>())
+                req += k.as<std::string>() + ": " + v.as<std::string>() + "\r\n";
+        });
+    }
+    req += "Connection: close\r\n\r\n";
+    req += body;
+
+    // Send + receive
+    std::string response;
+    std::string send_err;
+
+#ifndef SOCKETLEY_NO_HTTPS
+    if (is_https) {
+        SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+        SSL* ssl = SSL_new(ctx);
+        if (!ssl) { SSL_CTX_free(ctx); ::close(sock); result["error"] = "SSL_new failed"; return result; }
+        SSL_set_fd(ssl, sock);
+        SSL_set_tlsext_host_name(ssl, host.c_str());
+        if (SSL_connect(ssl) != 1) {
+            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
+            result["error"] = "TLS handshake failed"; return result;
+        }
+        if (SSL_write(ssl, req.c_str(), static_cast<int>(req.size())) <= 0) {
+            send_err = "SSL_write failed";
+        } else {
+            char buf[4096]; int n;
+            while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0)
+                response.append(buf, n);
+        }
+        SSL_shutdown(ssl);
+        SSL_free(ssl); SSL_CTX_free(ctx);
+        ::close(sock);
+    } else
+#endif
+    {
+        if (::send(sock, req.c_str(), req.size(), 0) < 0) {
+            send_err = "send() failed";
+        } else {
+            char buf[4096]; ssize_t n;
+            while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0)
+                response.append(buf, n);
+        }
+        ::close(sock);
+    }
+
+    if (!send_err.empty()) { result["error"] = send_err; return result; }
+
+    // Parse HTTP status line: "HTTP/1.x NNN Reason"
+    int status = 0;
+    auto sp1 = response.find(' ');
+    if (sp1 != std::string::npos) {
+        auto sp2 = response.find(' ', sp1 + 1);
+        try { status = std::stoi(response.substr(sp1 + 1, sp2 - sp1 - 1)); } catch (...) {}
+    }
+    auto body_start = response.find("\r\n\r\n");
+    result["status"] = status;
+    result["body"]   = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
+    result["ok"]     = (status >= 200 && status < 300);
+    return result;
 }
 
 void lua_context::register_bindings(runtime_instance* owner)
@@ -232,6 +394,10 @@ void lua_context::register_bindings(runtime_instance* owner)
         return info;
     };
 
+    sk["http"] = [this](sol::table opts) -> sol::table {
+        return socketley_http_call(m_lua, opts);
+    };
+
     m_lua["socketley"] = sk;
 
     // Register "self" table with runtime properties and actions
@@ -296,6 +462,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
     self["owner_broadcast"] = [owner](std::string msg) -> bool {
         return static_cast<server_instance*>(owner)->owner_broadcast(msg);
+    };
+
+    // Connection control
+    self["disconnect"] = [owner](int client_id) {
+        static_cast<server_instance*>(owner)->lua_disconnect(client_id);
+    };
+    self["peer_ip"] = [owner](int client_id) -> std::string {
+        return static_cast<server_instance*>(owner)->lua_peer_ip(client_id);
     };
 }
 

@@ -77,6 +77,8 @@ public:
     // Lua actions
     void lua_broadcast(std::string_view msg) override;
     void lua_send_to(int client_id, std::string_view msg) override;
+    void        lua_disconnect(int client_fd);
+    std::string lua_peer_ip(int client_fd);
 
     // Stats
     std::string get_stats() const override;
