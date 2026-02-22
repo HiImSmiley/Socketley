@@ -14,7 +14,62 @@ namespace resp {
 constexpr int RESP_MAX_ARRAY_SIZE = 1024;
 constexpr int RESP_MAX_BULK_LEN = 512 * 1024; // 512 KB
 
-// ─── Encoding ───
+// ─── Zero-allocation encoding (appends directly to caller's buffer) ───
+
+inline void encode_ok_into(std::string& buf)
+{
+    buf.append("+OK\r\n", 5);
+}
+
+inline void encode_null_into(std::string& buf)
+{
+    buf.append("$-1\r\n", 5);
+}
+
+inline void encode_error_into(std::string& buf, std::string_view msg)
+{
+    buf.append("-ERR ", 5);
+    buf.append(msg.data(), msg.size());
+    buf.append("\r\n", 2);
+}
+
+inline void encode_simple_into(std::string& buf, std::string_view msg)
+{
+    buf += '+';
+    buf.append(msg.data(), msg.size());
+    buf.append("\r\n", 2);
+}
+
+inline void encode_integer_into(std::string& buf, int64_t n)
+{
+    char tmp[24];
+    auto [end, ec] = std::to_chars(tmp, tmp + sizeof(tmp), n);
+    buf += ':';
+    buf.append(tmp, static_cast<size_t>(end - tmp));
+    buf.append("\r\n", 2);
+}
+
+inline void encode_bulk_into(std::string& buf, std::string_view str)
+{
+    char tmp[24];
+    auto [end, ec] = std::to_chars(tmp, tmp + sizeof(tmp), str.size());
+    buf += '$';
+    buf.append(tmp, static_cast<size_t>(end - tmp));
+    buf.append("\r\n", 2);
+    buf.append(str.data(), str.size());
+    buf.append("\r\n", 2);
+}
+
+inline void encode_array_header_into(std::string& buf, int n)
+{
+    char tmp[16];
+    auto [end, ec] = std::to_chars(tmp, tmp + sizeof(tmp), n);
+    buf += '*';
+    buf.append(tmp, static_cast<size_t>(end - tmp));
+    buf.append("\r\n", 2);
+}
+
+// ─── Allocating encoding (kept for use in execute() / tests) ───
 
 inline std::string encode_ok()
 {
@@ -126,6 +181,63 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
         offset += static_cast<size_t>(len) + 2; // skip \r\n
     }
 
+    consumed = offset;
+    return parse_result::ok;
+}
+
+// Zero-allocation RESP parser: fills string_view array pointing into buf.
+// args[] must have room for at least max_args entries.
+// Safe to call in a tight loop — no heap allocations.
+inline parse_result parse_message_views(std::string_view buf,
+    std::string_view* args, int max_args, int& argc, size_t& consumed)
+{
+    argc = 0;
+    consumed = 0;
+
+    if (buf.empty())
+        return parse_result::incomplete;
+
+    if (buf[0] != '*')
+        return parse_result::error;
+
+    size_t pos = buf.find("\r\n");
+    if (pos == std::string_view::npos)
+        return parse_result::incomplete;
+
+    int count = 0;
+    auto [ptr, ec] = std::from_chars(buf.data() + 1, buf.data() + pos, count);
+    if (ec != std::errc{} || count < 0 || count > RESP_MAX_ARRAY_SIZE || count > max_args)
+        return parse_result::error;
+
+    size_t offset = pos + 2;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (offset >= buf.size())
+            return parse_result::incomplete;
+
+        if (buf[offset] != '$')
+            return parse_result::error;
+
+        size_t end = buf.find("\r\n", offset);
+        if (end == std::string_view::npos)
+            return parse_result::incomplete;
+
+        int len = 0;
+        auto [p2, e2] = std::from_chars(buf.data() + offset + 1, buf.data() + end, len);
+        if (e2 != std::errc{} || len < 0 || len > RESP_MAX_BULK_LEN)
+            return parse_result::error;
+
+        offset = end + 2;
+
+        if (offset + static_cast<size_t>(len) + 2 > buf.size())
+            return parse_result::incomplete;
+
+        args[i] = std::string_view(buf.data() + offset, static_cast<size_t>(len));
+        offset += static_cast<size_t>(len) + 2;
+    }
+
+    argc = count;
     consumed = offset;
     return parse_result::ok;
 }

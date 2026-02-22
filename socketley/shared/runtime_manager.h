@@ -47,6 +47,8 @@ public:
     bool run(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
     bool remove(std::string_view name);
+    // Like remove(), but returns ownership so the caller controls when destruction happens.
+    std::unique_ptr<runtime_instance> extract(std::string_view name);
     bool rename(std::string_view old_name, std::string_view new_name);
     void stop_all(event_loop& loop);
 

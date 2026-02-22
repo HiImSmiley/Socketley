@@ -85,6 +85,19 @@ bool runtime_manager::remove(std::string_view name)
     return true;
 }
 
+std::unique_ptr<runtime_instance> runtime_manager::extract(std::string_view name)
+{
+    std::unique_lock lock(mutex);
+
+    auto it = runtimes.find(name);
+    if (it == runtimes.end())
+        return nullptr;
+
+    auto ptr = std::move(it->second);
+    runtimes.erase(it);
+    return ptr;
+}
+
 bool runtime_manager::rename(std::string_view old_name, std::string_view new_name)
 {
     std::unique_lock lock(mutex);

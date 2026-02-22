@@ -1,4 +1,7 @@
 #include "lua_context.h"
+
+#ifndef SOCKETLEY_NO_LUA
+
 #include "runtime_instance.h"
 #include "runtime_definitions.h"
 #include "runtime_manager.h"
@@ -384,3 +387,5 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
         return owner->get_connection_count();
     };
 }
+
+#endif // SOCKETLEY_NO_LUA

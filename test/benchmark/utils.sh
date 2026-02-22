@@ -15,7 +15,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SOCKETLEY_BIN="${PROJECT_ROOT}/bin/Release/socketley"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
-IPC_SOCKET="/tmp/socketley.sock"
+
+# Mirror socketley_paths::resolve(): root + installed binary → system socket
+if [[ -x "/usr/bin/socketley" ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    IPC_SOCKET="/run/socketley/socketley.sock"
+else
+    IPC_SOCKET="/tmp/socketley.sock"
+fi
 
 # Ensure results directory exists
 mkdir -p "$RESULTS_DIR"
@@ -145,6 +151,7 @@ cleanup_runtimes() {
     local runtimes=$(socketley_cmd ls 2>/dev/null | tail -n +2 | awk '{print $2}')
     for name in $runtimes; do
         socketley_cmd stop "$name" 2>/dev/null
+        sleep 0.5
         socketley_cmd remove "$name" 2>/dev/null
     done
 }

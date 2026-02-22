@@ -77,6 +77,11 @@ bool proxy_instance::resolve_backend(backend_info& b)
 
 bool proxy_instance::setup(event_loop& loop)
 {
+    // Clear any connections left from a previous stop() — safe to free now that
+    // all in-flight CQEs have been processed (we're starting a fresh run).
+    m_clients.clear();
+    m_backend_conns.clear();
+
     m_loop = &loop;
 
     for (auto& b : m_backends)
@@ -140,9 +145,29 @@ bool proxy_instance::setup(event_loop& loop)
 
 void proxy_instance::teardown(event_loop& loop)
 {
-    // Close listener first
+    // Null out all req->owner pointers FIRST so any stale CQEs that arrive after
+    // teardown (e.g. from SQPOLL processing a write SQE that was queued late) are
+    // safely skipped by the event loop's `if (req && req->owner)` guard.  Without
+    // this, a CQE processed in the same batch as the "remove" command could read
+    // req->owner from already-freed connection memory → SEGFAULT.
+    m_accept_req.owner = nullptr;
+    for (auto& [fd, conn] : m_clients)
+    {
+        conn->read_req.owner  = nullptr;
+        conn->write_req.owner = nullptr;
+    }
+    for (auto& [fd, conn] : m_backend_conns)
+    {
+        conn->read_req.owner  = nullptr;
+        conn->write_req.owner = nullptr;
+    }
+
+    // Shutdown the listen socket before closing — same reasoning as server_instance:
+    // shutdown() forces the pending io_uring accept op to complete synchronously,
+    // placing its CQE in the ring before the deferred-delete timeout SQE is submitted.
     if (m_listen_fd >= 0)
     {
+        shutdown(m_listen_fd, SHUT_RDWR);
         close(m_listen_fd);
         m_listen_fd = -1;
     }
@@ -162,16 +187,20 @@ void proxy_instance::teardown(event_loop& loop)
     }
 
     for (auto& [fd, conn] : m_backend_conns)
+    {
+        shutdown(fd, SHUT_RDWR);
         close(fd);
-    m_backend_conns.clear();
+    }
+    // Do NOT clear m_backend_conns here — connection objects must stay alive until
+    // all their pending io_uring CQEs are processed (deferred-delete timeout).
 
     for (auto& [fd, conn] : m_clients)
     {
-        if (conn->backend_fd >= 0)
-            close(conn->backend_fd);
+        // backend_fd is already closed above via m_backend_conns loop; skip it.
+        shutdown(fd, SHUT_RDWR);
         close(fd);
     }
-    m_clients.clear();
+    // Do NOT clear m_clients here for the same reason.
 
     m_loop = nullptr;
     m_multishot_active = false;
@@ -343,6 +372,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             else
                 m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
         }
+        else if (!conn->write_pending)
+        {
+            // Closing and no more pending ops — clean up now.
+            close_pair(fd, conn->backend_fd);
+        }
         return;
     }
 
@@ -408,6 +442,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         else
             m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
+    else if (!conn->write_pending)
+    {
+        // Closing and no more pending ops — clean up now.
+        close_pair(fd, conn->backend_fd);
+    }
 }
 
 void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* req)
@@ -468,6 +507,11 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         else
             m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
+    else if (!conn->write_pending)
+    {
+        // Closing and no more pending ops — clean up now.
+        close_pair(conn->client_fd, fd);
+    }
 }
 
 bool proxy_instance::parse_http_request_line(proxy_client_connection* conn)
@@ -519,6 +563,7 @@ size_t proxy_instance::select_backend(proxy_client_connection* conn)
 
     if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
     {
+#ifndef SOCKETLEY_NO_LUA
         sol::object result;
         if (m_protocol == protocol_http)
             result = lua()->on_route()(conn->method, conn->path);
@@ -531,6 +576,7 @@ size_t proxy_instance::select_backend(proxy_client_connection* conn)
             if (idx >= 0 && static_cast<size_t>(idx) < m_backends.size())
                 return static_cast<size_t>(idx);
         }
+#endif
         // Fallback to round-robin
     }
 
@@ -610,14 +656,19 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             }
             else
             {
+                // Clear the stale reference on the client side so a later
+                // close_pair call does not re-close this (now-freed) fd.
+                auto cit = m_clients.find(bconn->client_fd);
+                if (cit != m_clients.end())
+                    cit->second->backend_fd = -1;
                 close(backend_fd);
                 m_backend_conns.erase(bit);
             }
         }
-        else
-        {
-            close(backend_fd);
-        }
+        // else: backend was already closed and erased from the map.
+        // Do NOT call close() here — the fd integer may have been reused by
+        // the kernel for a new connection, and closing it would corrupt that
+        // connection (or even close the proxy's own listen socket).
     }
 
     if (client_fd >= 0)
@@ -644,10 +695,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                         m_backend_conns.erase(bit2);
                     }
                 }
-                else
-                {
-                    close(conn->backend_fd);
-                }
+                // else: already closed and erased — do not close again.
+                conn->backend_fd = -1;
             }
 
             if (conn->read_pending || conn->write_pending)
@@ -660,10 +709,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 m_clients.erase(it);
             }
         }
-        else
-        {
-            close(client_fd);
-        }
+        // else: client was already closed and erased from the map.
+        // Do NOT call close() here for the same fd-reuse reason as above.
     }
 }
 

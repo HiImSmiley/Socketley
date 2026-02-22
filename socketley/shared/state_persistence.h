@@ -37,6 +37,10 @@ struct runtime_config
     std::string owner;
     int child_policy = 0; // 0 = stop, 1 = remove
 
+    // External (attach) mode
+    bool external_runtime = false;
+    int32_t pid = 0;  // PID of external process (0 = unknown)
+
     // Server/Client
     uint8_t mode = 0;       // server_mode or client_mode
     bool udp = false;
