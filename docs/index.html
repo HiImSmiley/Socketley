@@ -1135,7 +1135,6 @@ socketley reload-lua myserver</code></pre>
 <table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
 <tr><td>name</td><td>string</td><td>Daemon name (from <code>--name</code>)</td></tr>
 <tr><td>host</td><td>string</td><td>Advertised address (from <code>--cluster-addr</code>)</td></tr>
-<tr><td>healthy</td><td>bool</td><td>Always <code>true</code> (stale daemons are pruned before this call)</td></tr>
 <tr><td>runtimes</td><td>number</td><td>Count of runtimes on this daemon</td></tr>
 </tbody></table>
 <pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
@@ -1182,8 +1181,6 @@ socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span cla
 <div class="method-desc">Returns aggregate cluster statistics in a single call.</div>
 <table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
 <tr><td>daemons</td><td>number</td><td>Total daemon count (local + remote)</td></tr>
-<tr><td>healthy</td><td>number</td><td>Healthy daemon count</td></tr>
-<tr><td>stale</td><td>number</td><td>Stale daemon count (always 0 since stale entries are pruned)</td></tr>
 <tr><td>runtimes</td><td>number</td><td>Total runtime count across all daemons</td></tr>
 <tr><td>running</td><td>number</td><td>Runtimes currently in <code>"running"</code> state</td></tr>
 <tr><td>groups</td><td>table</td><td>Maps group name &rarr; member count</td></tr>
