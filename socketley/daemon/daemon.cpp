@@ -245,10 +245,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
 
-    // Parse daemon-specific flags: --name, --cluster, --cluster-addr
+    // Parse daemon-specific flags: --name, --cluster
     std::string daemon_name;
     std::string cluster_dir;
-    std::string cluster_addr;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -257,8 +256,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
             daemon_name = argv[++i];
         else if (arg == "--cluster" && i + 1 < argc)
             cluster_dir = argv[++i];
-        else if (arg == "--cluster-addr" && i + 1 < argc)
-            cluster_addr = argv[++i];
     }
 
     // Load config file (sets log level, metrics port, etc.) before anything else
@@ -298,7 +295,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         }
 
         cluster = std::make_unique<cluster_discovery>(
-            daemon_name, cluster_dir, cluster_addr, manager);
+            daemon_name, cluster_dir, manager);
         manager.set_cluster_discovery(cluster.get());
         handler.set_cluster_discovery(cluster.get());
     }

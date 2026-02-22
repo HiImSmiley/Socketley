@@ -15,8 +15,6 @@ socketley \- manage long-living network runtimes in Docker-like style
 .IR name ]
 .RI [ \-\-cluster
 .IR dir ]
-.RI [ \-\-cluster\-addr
-.IR addr ]
 .br
 .B socketley
 .B cluster
@@ -370,8 +368,6 @@ Set daemon log verbosity:
 .TP
 .BI "\-\-name " "name" " | \-n " "name"
 Name this daemon instance (required for cluster mode).
-In Docker Compose, this should match the service name so other containers
-can resolve it via DNS.
 .TP
 .BI "\-\-cluster " "dir"
 Enable cluster mode. Each daemon publishes its runtime state to this shared
@@ -379,13 +375,8 @@ directory every 2 seconds and scans for peer daemons. Proxy
 .B @group
 backends automatically discover runtimes on remote daemons.
 In Docker Compose, mount a shared volume at this path.
-.TP
-.BI "\-\-cluster\-addr " "addr"
-Override the advertised address for this daemon. Other daemons use this to
-connect to runtimes on this node. Defaults to the
-.B \-\-name
-value (which Docker Compose resolves via DNS). Use this when the hostname
-doesn't resolve (e.g., bare metal or custom networks).
+The advertised host address is set automatically via
+.BR gethostname (3).
 .SH COMMON FLAGS
 These flags work with all runtime types:
 .TP
