@@ -8,6 +8,7 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop master_test 2>/dev/null || true
+    sleep 0.5
     "$BIN" remove master_test 2>/dev/null || true
 }
 trap cleanup EXIT

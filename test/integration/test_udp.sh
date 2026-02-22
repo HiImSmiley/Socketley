@@ -8,8 +8,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop udp_client 2>/dev/null || true
-    "$BIN" remove udp_client 2>/dev/null || true
     "$BIN" stop udp_test 2>/dev/null || true
+    sleep 0.5
+    "$BIN" remove udp_client 2>/dev/null || true
     "$BIN" remove udp_test 2>/dev/null || true
 }
 trap cleanup EXIT
