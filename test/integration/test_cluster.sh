@@ -81,17 +81,17 @@ echo "=== Integration: cluster discovery ==="
 # ─── Start 3 daemons ──────────────────────────────────────────────────────────
 
 SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon \
-    --name node1 --cluster "$CLUSTER_DIR" --cluster-addr 127.0.0.1 2>/dev/null &
+    --name node1 --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.3
 
 SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon \
-    --name node2 --cluster "$CLUSTER_DIR" --cluster-addr 127.0.0.1 2>/dev/null &
+    --name node2 --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.3
 
 SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon \
-    --name gateway --cluster "$CLUSTER_DIR" --cluster-addr 127.0.0.1 2>/dev/null &
+    --name gateway --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.5
 

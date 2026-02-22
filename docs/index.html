@@ -608,8 +608,8 @@ d4e5f6    my-client       client  -       1     -           Up 45 minutes       
 socketley daemon &amp;
 
 <span class="cm"># Cluster mode with two named daemons sharing a directory</span>
-socketley daemon --name api1 --cluster /shared/cluster --cluster-addr 10.0.1.1 &amp;
-socketley daemon --name api2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &amp;</code></pre>
+socketley daemon --name api1 --cluster /shared/cluster &amp;
+socketley daemon --name api2 --cluster /shared/cluster &amp;</code></pre>
 
 <div class="cli-card" id="cmd-cluster">
   <div class="cli-name">socketley cluster &lt;subcommand&gt;</div>
@@ -634,9 +634,8 @@ socketley cluster watch</code></pre>
 
 <h3 id="flags-daemon">Daemon Flags</h3>
 <table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
-<tr><td>--name &lt;name&gt; / -n</td><td>Name this daemon instance. Required for cluster mode. In Docker Compose, match the service name for DNS resolution</td></tr>
-<tr><td>--cluster &lt;dir&gt;</td><td>Enable cluster mode. Publishes runtime state every 2&nbsp;seconds and scans for peers. Mount a shared volume at this path in Docker</td></tr>
-<tr><td>--cluster-addr &lt;addr&gt;</td><td>Override advertised address. Defaults to <code>--name</code> value. Use when the hostname doesn't resolve (bare metal, custom networks)</td></tr>
+<tr><td>--name &lt;name&gt; / -n</td><td>Name this daemon instance. Required for cluster mode</td></tr>
+<tr><td>--cluster &lt;dir&gt;</td><td>Enable cluster mode. Publishes runtime state every 2&nbsp;seconds and scans for peers. Host address is set automatically via <code>gethostname()</code></td></tr>
 <tr><td>--log-level &lt;level&gt;</td><td>Daemon log verbosity: <code>debug</code>, <code>info</code> (default), <code>warn</code>, <code>error</code></td></tr>
 </tbody></table>
 
@@ -1167,14 +1166,14 @@ socketley reload-lua myserver</code></pre>
 <h2 id="cluster-api">Cluster Introspection API</h2>
 <p>When the daemon runs in cluster mode (<code>--cluster</code>), the <code>socketley.cluster</code> table provides read-only access to the full cluster topology. All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.</p>
 
-<div class="info-box"><strong>Requires cluster mode.</strong> The daemon must be started with <code>--name</code>, <code>--cluster &lt;dir&gt;</code>, and optionally <code>--cluster-addr &lt;host&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
+<div class="info-box"><strong>Requires cluster mode.</strong> The daemon must be started with <code>--name</code> and <code>--cluster &lt;dir&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
 
 <div class="method-card" id="cluster-daemons">
 <div class="method-header"><span class="method-name">socketley.cluster.daemons</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
 <div class="method-desc">Returns an array of all daemons in the cluster. The local daemon is always the first entry.</div>
 <table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
 <tr><td>name</td><td>string</td><td>Daemon name (from <code>--name</code>)</td></tr>
-<tr><td>host</td><td>string</td><td>Advertised address (from <code>--cluster-addr</code>)</td></tr>
+<tr><td>host</td><td>string</td><td>Hostname (from <code>gethostname()</code>)</td></tr>
 <tr><td>runtimes</td><td>number</td><td>Count of runtimes on this daemon</td></tr>
 </tbody></table>
 <pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
@@ -1584,8 +1583,8 @@ socketley start api</code></pre>
 <span class="kw">end</span></code></pre>
 
 <pre><code><span class="cm"># Start two clustered daemons with api servers + a monitoring server:</span>
-socketley daemon --name node1 --cluster /shared/cluster --cluster-addr 10.0.1.1 &amp;
-socketley daemon --name node2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &amp;
+socketley daemon --name node1 --cluster /shared/cluster &amp;
+socketley daemon --name node2 --cluster /shared/cluster &amp;
 
 <span class="cm"># On node1: api server + monitoring server with cluster callbacks</span>
 SOCKETLEY_SOCKET=/tmp/node1.sock socketley create server api1 -p 9001 -g api -s
