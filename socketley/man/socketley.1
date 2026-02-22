@@ -860,6 +860,18 @@ Called when message sent.
 .B on_route(method, path)
 Proxy only. Custom backend selection. Returns backend index (0-based).
 .TP
+.B on_proxy_request(client_id, data) \(-> string | nil
+Proxy only. Called for every chunk forwarded from a client to a backend.
+Return a modified string to replace the data, or
+.B nil
+to drop the chunk entirely (the backend never receives it).
+.TP
+.B on_proxy_response(client_id, data) \(-> string | nil
+Proxy only. Called for every chunk forwarded from a backend to a client.
+Same semantics as
+.BR on_proxy_request :
+return a replacement string or nil to drop.
+.TP
 .B on_master_auth(client_id, password)
 Server only (master mode). Custom authentication. Return true to grant
 master role, false to deny. If defined, overrides
@@ -954,6 +966,14 @@ self.disconnect(client_id)         -- Terminate a connection from Lua
 self.peer_ip(client_id)            -- Get client IP (IPv4 or IPv6 string)
 self.ws_headers(client_id)         -- Get WS upgrade headers table (nil for TCP)
 
+-- Server: client enumeration and multicast
+self.clients()                     -- Return table of all connected client_ids
+self.multicast(ids, msg)           -- Send msg to a subset of clients (ids = table of client_ids)
+
+-- Server: per-connection metadata
+self.set_data(id, key, val)        -- Set string metadata on a connection (nil val deletes key)
+self.get_data(id, key)             -- Get metadata string or nil
+
 -- Server: client routing
 self.route(client_id, target)      -- Forward client to sub-server
 self.unroute(client_id)            -- Stop forwarding
@@ -967,6 +987,32 @@ self.owner_broadcast(msg)          -- Broadcast to all owner's clients
 .TP
 .B socketley.log(msg)
 Output log message with [lua] prefix.
+.TP
+.B socketley.set_timeout(ms, fn)
+Fire
+.I fn
+once after
+.I ms
+milliseconds using an io_uring timeout SQE.
+Shares the event loop with the runtime — no extra threads.
+.TP
+.B socketley.set_interval(ms, fn)
+Fire
+.I fn
+every
+.I ms
+milliseconds.
+Cancel by calling from within
+.BR on_stop ,
+where the context will be destroyed and the timer freed safely.
+.TP
+.B socketley.subscribe(cache_name, channel, fn)
+Register
+.I fn(channel, message)
+to be called whenever the named cache runtime publishes to
+.IR channel .
+The function is called on the subscribing runtime's event loop turn (not from the cache itself).
+Multiple subscriptions to the same channel are all fired in registration order.
 .TP
 .B socketley.http(opts) \(-> table
 Synchronous HTTP/HTTPS client.

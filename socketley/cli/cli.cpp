@@ -566,10 +566,10 @@ int cli_interactive(int argc, char** argv)
             if (end)
             {
                 if (end > buf)
-                    (void)::write(STDOUT_FILENO, buf, end - buf);
+                    if (::write(STDOUT_FILENO, buf, end - buf) < 0) {}
                 break;
             }
-            (void)::write(STDOUT_FILENO, buf, n);
+            if (::write(STDOUT_FILENO, buf, n) < 0) {}
         }
 
         if (fds[1].revents & (POLLERR | POLLHUP))
@@ -581,7 +581,7 @@ int cli_interactive(int argc, char** argv)
             n = read(STDIN_FILENO, buf, sizeof(buf));
             if (n <= 0)
                 break;
-            (void)::write(ipc_fd, buf, n);
+            if (::write(ipc_fd, buf, n) < 0) {}
         }
     }
 

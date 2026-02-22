@@ -221,7 +221,7 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 {
                     std::string resp = static_cast<cache_instance*>(inst)->execute(line);
                     if (!resp.empty())
-                        (void)::write(conn->fd, resp.data(), resp.size());
+                        if (::write(conn->fd, resp.data(), resp.size()) < 0) {}
                     break;
                 }
                 default:

@@ -153,6 +153,11 @@
         <li><a href="#addons-auth-token">Token Auth</a></li>
       </ul></li>
       <li><a href="#addons-rate-limit">Rate Limiting</a></li>
+      <li><a href="#addons-clients-multicast">Client Enumeration &amp; Multicast</a></li>
+      <li><a href="#addons-metadata">Per-Connection Metadata</a></li>
+      <li><a href="#addons-timers">Timers</a></li>
+      <li><a href="#addons-proxy-hooks">Proxy Data Hooks</a></li>
+      <li><a href="#addons-pubsub">Cross-Runtime Pub/Sub</a></li>
       <li><a href="#addons-http">HTTP Calls</a><ul>
         <li><a href="#addons-http-api">socketley.http API</a></li>
         <li><a href="#addons-http-https">HTTPS</a></li>
@@ -802,7 +807,7 @@ socketley reload-lua myserver</code></pre>
 <h2 id="addons-overview">Addons</h2>
 <p>Socketley's Lua scripting layer enables pure-Lua addon patterns that extend servers with auth middleware, rate limiting, service discovery, metrics push, and more — without touching C++ code. This page documents the primitives that make these patterns possible and shows working examples for each use case.</p>
 
-<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code></div>
+<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code><br><strong>Primitives added in v1.4:</strong> <code>self.clients()</code>, <code>self.multicast()</code>, <code>self.set_data()</code>, <code>self.get_data()</code>, <code>socketley.set_timeout()</code>, <code>socketley.set_interval()</code>, <code>socketley.subscribe()</code>, <code>on_proxy_request</code>, <code>on_proxy_response</code></div>
 
 <h2 id="addons-auth">Auth Middleware</h2>
 <p>Two complementary auth patterns cover the most common cases: IP-based admission (via <code>on_auth</code>) and first-message token auth (via <code>self.disconnect</code>).</p>
@@ -940,6 +945,145 @@ tick_ms = <span class="nb">1000</span>
 <span class="kw">function</span> <span class="fn">on_tick</span>(dt)
     <span class="kw">for</span> id <span class="kw">in</span> pairs(counts) <span class="kw">do</span> counts[id] = <span class="nb">0</span> <span class="kw">end</span>
 <span class="kw">end</span></code></pre>
+
+<h2 id="addons-clients-multicast">Client Enumeration &amp; Multicast</h2>
+<p>Two primitives fill the gap between single-target <code>self.send</code> and full-fanout <code>self.broadcast</code>: <code>self.clients()</code> enumerates connected client IDs and <code>self.multicast(ids, msg)</code> sends to an arbitrary subset in one call.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.clients</span><span class="method-sig">() &rarr; table</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns a Lua table (1-based array) of all currently connected client fd integers. The list is a snapshot — clients that disconnect before you iterate it are safe to ignore (send to them simply does nothing).</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.multicast</span><span class="method-sig">(ids, msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Send <code>msg</code> to every client_id in the <code>ids</code> table. Silently skips invalid or already-disconnected fds. Uses the same zero-copy shared-string path as <code>broadcast</code>.</div>
+</div>
+
+<pre><code><span class="cm">-- multicast.lua: send to clients tagged as "subscriber"</span>
+<span class="kw">local</span> subs = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(id) subs[id] = <span class="kw">false</span> <span class="kw">end</span>
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(id) subs[id] = <span class="kw">nil</span> <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    <span class="kw">if</span> msg == <span class="st">"SUBSCRIBE"</span> <span class="kw">then</span>
+        subs[id] = <span class="kw">true</span>
+        self.send(id, <span class="st">"OK subscribed"</span>)
+    <span class="kw">elseif</span> msg:sub(<span class="nb">1</span>,<span class="nb">9</span>) == <span class="st">"PUBLISH: "</span> <span class="kw">then</span>
+        <span class="kw">local</span> targets = {}
+        <span class="kw">for</span> cid, is_sub <span class="kw">in</span> pairs(subs) <span class="kw">do</span>
+            <span class="kw">if</span> is_sub <span class="kw">then</span> targets[#targets+<span class="nb">1</span>] = cid <span class="kw">end</span>
+        <span class="kw">end</span>
+        self.multicast(targets, msg:sub(<span class="nb">10</span>))
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-metadata">Per-Connection Metadata</h2>
+<p>Store arbitrary string key/value pairs on a connection without a separate Lua table. Metadata is freed automatically when the client disconnects — no <code>on_disconnect</code> cleanup needed.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.set_data</span><span class="method-sig">(id, key, val)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Attach a string value to client <code>id</code> under <code>key</code>. Pass <code>nil</code> as <code>val</code> to delete the key.</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.get_data</span><span class="method-sig">(id, key) &rarr; string | nil</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Retrieve the value stored under <code>key</code> for client <code>id</code>, or <code>nil</code> if not set.</div>
+</div>
+
+<pre><code><span class="cm">-- metadata.lua: store username on auth, access in message handler</span>
+<span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    <span class="kw">if</span> <span class="kw">not</span> self.get_data(id, <span class="st">"user"</span>) <span class="kw">then</span>
+        <span class="cm">-- First message: treat as login</span>
+        self.set_data(id, <span class="st">"user"</span>, msg:match(<span class="st">"^LOGIN (%S+)"</span>))
+        self.send(id, <span class="st">"OK"</span>)
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    <span class="kw">local</span> user = self.get_data(id, <span class="st">"user"</span>)
+    self.broadcast(<span class="st">"["</span> .. user .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span>
+
+<span class="cm">-- No on_disconnect needed — metadata freed with connection</span></code></pre>
+
+<h2 id="addons-timers">Timers</h2>
+<p>One-shot and repeating timers backed by io_uring <code>IORING_OP_TIMEOUT</code> — no extra threads, no polling. Each timer fires on the runtime's event loop turn.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.set_timeout</span><span class="method-sig">(ms, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Fire <code>fn()</code> once after <code>ms</code> milliseconds. The timer is automatically freed after firing.</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.set_interval</span><span class="method-sig">(ms, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Fire <code>fn()</code> every <code>ms</code> milliseconds. The interval continues until the runtime's Lua context is destroyed (i.e. on stop). No explicit cancel API — intervals are bounded to the runtime lifetime.</div>
+</div>
+
+<pre><code><span class="cm">-- timers.lua: one-shot warmup delay + repeating heartbeat</span>
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="cm">-- Fire once after 2 seconds</span>
+    socketley.set_timeout(<span class="nb">2000</span>, <span class="kw">function</span>()
+        socketley.log(<span class="st">"warmup complete"</span>)
+        self.broadcast(<span class="st">"SERVER READY"</span>)
+    <span class="kw">end</span>)
+
+    <span class="cm">-- Fire every 5 seconds</span>
+    socketley.set_interval(<span class="nb">5000</span>, <span class="kw">function</span>()
+        self.broadcast(<span class="st">"heartbeat conns="</span> .. tostring(self.connections()))
+    <span class="kw">end</span>)
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-proxy-hooks">Proxy Data Hooks</h2>
+<p>Intercept, modify, or drop data at the proxy layer without touching backend or client code. Both hooks follow the same contract: return a modified string to replace the chunk, or <code>nil</code> to drop it entirely.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">on_proxy_request</span><span class="method-sig">(client_id, data) &rarr; string | nil</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">Called for every chunk forwarded from a client to a backend. Return a replacement string or <code>nil</code> to drop. Fires before the data is queued for the backend write.</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">on_proxy_response</span><span class="method-sig">(client_id, data) &rarr; string | nil</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">Called for every chunk forwarded from a backend to a client. Same semantics as <code>on_proxy_request</code>.</div>
+</div>
+
+<pre><code><span class="cm">-- proxy-hooks.lua: uppercase requests, add header to responses</span>
+<span class="kw">function</span> <span class="fn">on_proxy_request</span>(client_id, data)
+    <span class="kw">return</span> data:upper()   <span class="cm">-- modify</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_proxy_response</span>(client_id, data)
+    <span class="cm">-- Drop responses containing "SECRET"</span>
+    <span class="kw">if</span> data:find(<span class="st">"SECRET"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">nil</span> <span class="kw">end</span>
+    <span class="kw">return</span> data
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-pubsub">Cross-Runtime Pub/Sub</h2>
+<p>A runtime's Lua script can now subscribe to any named cache runtime's publish channel — no RESP client socket required. <code>socketley.subscribe</code> registers a callback that fires on the subscribing runtime's event loop turn whenever the cache publishes to that channel.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.subscribe</span><span class="method-sig">(cache_name, channel, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Register <code>fn(channel, message)</code> to fire whenever the named cache runtime publishes to <code>channel</code>. Multiple subscriptions to the same channel stack and all fire in registration order. The callback is bound to the subscribing runtime's Lua context and freed when the runtime stops.</div>
+</div>
+
+<pre><code><span class="cm">-- pubsub-server.lua: server reacts to cache publish events</span>
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.subscribe(<span class="st">"events"</span>, <span class="st">"alerts"</span>, <span class="kw">function</span>(ch, msg)
+        socketley.log(<span class="st">"alert: "</span> .. msg)
+        self.broadcast(<span class="st">"ALERT: "</span> .. msg)
+    <span class="kw">end</span>)
+<span class="kw">end</span>
+
+<span class="cm">-- pubsub-cache.lua: cache script that publishes alerts</span>
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)
+    <span class="kw">if</span> key:sub(<span class="nb">1</span>,<span class="nb">6</span>) == <span class="st">"alert:"</span> <span class="kw">then</span>
+        self.publish(<span class="st">"alerts"</span>, value)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<pre><code><span class="cm"># Wire it up:</span>
+socketley create cache events --port 9100 --lua pubsub-cache.lua
+socketley create server api   --port 9000 --lua pubsub-server.lua
+socketley start events
+socketley start api</code></pre>
 
 <h2 id="addons-http">HTTP Calls</h2>
 

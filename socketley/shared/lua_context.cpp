@@ -23,6 +23,34 @@ lua_context::lua_context()
                          sol::lib::math, sol::lib::os, sol::lib::io);
 }
 
+lua_context::~lua_context()
+{
+    *m_alive = false;
+}
+
+// ─── lua_timer: heap-allocated one-shot / repeating timer via op_timeout ───
+struct lua_timer : io_handler
+{
+    std::shared_ptr<bool> alive;
+    sol::function         fn;
+    event_loop*           loop{};
+    struct __kernel_timespec ts{};
+    io_request            req{};
+    bool                  repeat{false};
+
+    void on_cqe(struct io_uring_cqe* cqe) override
+    {
+        if (!*alive || cqe->res == -ECANCELED) { delete this; return; }
+        try { fn(); } catch (const sol::error& e) {
+            fprintf(stderr, "[lua] timer error: %s\n", e.what());
+        }
+        if (repeat && *alive)
+            loop->submit_timeout(&ts, &req);
+        else
+            delete this;
+    }
+};
+
 static const char* type_to_string(runtime_type t)
 {
     switch (t)
@@ -79,6 +107,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_expire = m_lua["on_expire"];
     m_on_auth       = m_lua["on_auth"];
     m_on_websocket  = m_lua["on_websocket"];
+    m_on_proxy_request  = m_lua["on_proxy_request"];
+    m_on_proxy_response = m_lua["on_proxy_response"];
 
     return true;
 }
@@ -97,8 +127,25 @@ bool lua_context::has_on_miss()   const { return m_on_miss.valid(); }
 bool lua_context::has_on_write()  const { return m_on_write.valid(); }
 bool lua_context::has_on_delete() const { return m_on_delete.valid(); }
 bool lua_context::has_on_expire() const { return m_on_expire.valid(); }
-bool lua_context::has_on_auth()       const { return m_on_auth.valid(); }
-bool lua_context::has_on_websocket()  const { return m_on_websocket.valid(); }
+bool lua_context::has_on_auth()            const { return m_on_auth.valid(); }
+bool lua_context::has_on_websocket()       const { return m_on_websocket.valid(); }
+bool lua_context::has_on_proxy_request()   const { return m_on_proxy_request.valid(); }
+bool lua_context::has_on_proxy_response()  const { return m_on_proxy_response.valid(); }
+
+void lua_context::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
+{
+    auto key = std::string(cache_name) + '\0' + std::string(channel);
+    auto it = m_subscriptions.find(key);
+    if (it == m_subscriptions.end()) return;
+    for (auto& fn : it->second)
+    {
+        try { fn(std::string(channel), std::string(message)); }
+        catch (const sol::error& e)
+        {
+            fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
+        }
+    }
+}
 
 void lua_context::update_self_state(const char* state_str)
 {
@@ -400,6 +447,39 @@ void lua_context::register_bindings(runtime_instance* owner)
         return socketley_http_call(m_lua, opts);
     };
 
+    // socketley.set_timeout(ms, fn) — fires fn once after ms milliseconds
+    sk["set_timeout"] = [this, owner](int ms, sol::function fn) {
+        auto* loop = owner->get_event_loop();
+        if (!loop || ms <= 0) return;
+        auto* t  = new lua_timer{};
+        t->alive  = m_alive;
+        t->fn     = std::move(fn);
+        t->loop   = loop;
+        t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
+        t->req    = { op_timeout, -1, nullptr, 0, t };
+        t->repeat = false;
+        loop->submit_timeout(&t->ts, &t->req);
+    };
+
+    // socketley.set_interval(ms, fn) — fires fn every ms milliseconds
+    sk["set_interval"] = [this, owner](int ms, sol::function fn) {
+        auto* loop = owner->get_event_loop();
+        if (!loop || ms <= 0) return;
+        auto* t  = new lua_timer{};
+        t->alive  = m_alive;
+        t->fn     = std::move(fn);
+        t->loop   = loop;
+        t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
+        t->req    = { op_timeout, -1, nullptr, 0, t };
+        t->repeat = true;
+        loop->submit_timeout(&t->ts, &t->req);
+    };
+
+    // socketley.subscribe(cache_name, channel, fn) — receive published messages
+    sk["subscribe"] = [this](std::string cache_name, std::string channel, sol::function fn) {
+        m_subscriptions[cache_name + '\0' + channel].push_back(std::move(fn));
+    };
+
     m_lua["socketley"] = sk;
 
     // Register "self" table with runtime properties and actions
@@ -482,6 +562,36 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         if (!h.protocol.empty()) t["protocol"]      = h.protocol;
         if (!h.auth.empty())     t["authorization"] = h.auth;
         return t;
+    };
+
+    // Client enumeration
+    self["clients"] = [owner, this]() -> sol::table {
+        sol::table t = m_lua.create_table();
+        auto ids = static_cast<server_instance*>(owner)->lua_clients();
+        for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
+        return t;
+    };
+
+    // Targeted multicast to a subset of clients
+    self["multicast"] = [owner](sol::table ids, std::string msg) {
+        std::vector<int> fds;
+        ids.for_each([&](sol::object, sol::object v) {
+            if (v.is<int>()) fds.push_back(v.as<int>());
+        });
+        static_cast<server_instance*>(owner)->lua_multicast(fds, msg);
+    };
+
+    // Per-connection metadata: nil value deletes the key
+    self["set_data"] = [owner](int id, std::string key, sol::optional<std::string> val) {
+        if (val)
+            static_cast<server_instance*>(owner)->lua_set_data(id, key, *val);
+        else
+            static_cast<server_instance*>(owner)->lua_del_data(id, key);
+    };
+    self["get_data"] = [owner, this](int id, std::string key) -> sol::object {
+        auto v = static_cast<server_instance*>(owner)->lua_get_data(id, key);
+        if (v.empty()) return sol::nil;
+        return sol::make_object(m_lua, v);
     };
 }
 

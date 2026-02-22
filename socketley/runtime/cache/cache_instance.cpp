@@ -1,6 +1,7 @@
 #include "cache_instance.h"
 #include "resp_parser.h"
 #include "../../shared/event_loop.h"
+#include "../../shared/runtime_manager.h"
 #include "../../shared/lua_context.h"
 #include "../../cli/command_hashing.h"
 
@@ -2490,35 +2491,40 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 int cache_instance::publish(std::string_view channel, std::string_view message)
 {
     const auto* subs = m_store.get_subscribers(channel);
-    if (!subs || subs->empty())
-        return 0;
-
-    // Build the message for subscribers
-    std::string msg_line;
-    msg_line.reserve(8 + channel.size() + 1 + message.size() + 1);
-    msg_line.append("message ");
-    msg_line.append(channel.data(), channel.size());
-    msg_line.push_back(' ');
-    msg_line.append(message.data(), message.size());
-    msg_line.push_back('\n');
-
-    auto shared_msg = std::make_shared<const std::string>(std::move(msg_line));
-
     int count = 0;
-    for (int fd : *subs)
+
+    if (subs && !subs->empty())
     {
-        if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
-            continue;
+        // Build the message for RESP subscribers
+        std::string msg_line;
+        msg_line.reserve(8 + channel.size() + 1 + message.size() + 1);
+        msg_line.append("message ");
+        msg_line.append(channel.data(), channel.size());
+        msg_line.push_back(' ');
+        msg_line.append(message.data(), message.size());
+        msg_line.push_back('\n');
 
-        auto* sub_conn = m_conn_idx[fd];
-        if (sub_conn->closing)
-            continue;
+        auto shared_msg = std::make_shared<const std::string>(std::move(msg_line));
 
-        sub_conn->write_queue.push(*shared_msg);
-        if (!sub_conn->write_pending)
-            flush_write_queue(sub_conn);
-        count++;
+        for (int fd : *subs)
+        {
+            if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
+                continue;
+
+            auto* sub_conn = m_conn_idx[fd];
+            if (sub_conn->closing)
+                continue;
+
+            sub_conn->write_queue.push(*shared_msg);
+            if (!sub_conn->write_pending)
+                flush_write_queue(sub_conn);
+            count++;
+        }
     }
+
+    // Dispatch to Lua subscribers in other runtimes
+    if (auto* mgr = get_runtime_manager())
+        mgr->dispatch_publish(get_name(), channel, message);
 
     return count;
 }

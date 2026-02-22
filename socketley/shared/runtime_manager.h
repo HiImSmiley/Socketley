@@ -52,6 +52,9 @@ public:
     bool rename(std::string_view old_name, std::string_view new_name);
     void stop_all(event_loop& loop);
 
+    // Cross-runtime pub/sub: dispatch a published message to all runtimes
+    void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
+
     // Ownership cascading
     std::vector<std::string> get_children(std::string_view parent_name) const;
     void stop_children(std::string_view parent_name, event_loop& loop);
