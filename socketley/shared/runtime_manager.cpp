@@ -164,6 +164,22 @@ void runtime_manager::stop_all(event_loop& loop)
     }
 }
 
+void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
+{
+    // Snapshot under read lock — do NOT hold the lock during callbacks.
+    // A Lua subscribe callback may call socketley.stop/remove which needs a write lock,
+    // which would deadlock if we held the read lock here.
+    std::vector<runtime_instance*> targets;
+    {
+        std::shared_lock lock(mutex);
+        targets.reserve(runtimes.size());
+        for (auto& [_, inst] : runtimes)
+            targets.push_back(inst.get());
+    }
+    for (auto* inst : targets)
+        inst->on_publish_dispatch(cache_name, channel, message);
+}
+
 const runtime_manager::runtime_map& runtime_manager::list() const
 {
     return runtimes;

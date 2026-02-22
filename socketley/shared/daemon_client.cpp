@@ -31,7 +31,11 @@ static int daemon_ipc(const char* cmd)
     }
 
     std::string msg = std::string(cmd) + "\n";
-    (void)write(fd, msg.data(), msg.size());
+    if (write(fd, msg.data(), msg.size()) < 0)
+    {
+        close(fd);
+        return -1;
+    }
 
     char buf[512];
     int  ec = -1;

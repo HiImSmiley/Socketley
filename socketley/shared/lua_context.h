@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 class runtime_instance;
 
@@ -14,7 +16,7 @@ class lua_context
 {
 public:
     lua_context();
-    ~lua_context() = default;
+    ~lua_context();
 
     // Load and execute a Lua script, registering callbacks
     bool load_script(std::string_view path, runtime_instance* owner);
@@ -42,6 +44,8 @@ public:
     bool has_on_expire() const;
     bool has_on_auth() const;
     bool has_on_websocket() const;
+    bool has_on_proxy_request()  const;
+    bool has_on_proxy_response() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -60,7 +64,12 @@ public:
     sol::function& on_expire()    { return m_on_expire; }
     sol::function& on_auth()        { return m_on_auth; }
     sol::function& on_websocket()   { return m_on_websocket; }
+    sol::function& on_proxy_request()  { return m_on_proxy_request; }
+    sol::function& on_proxy_response() { return m_on_proxy_response; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
+
+    // Cross-runtime pub/sub dispatch (called from runtime_instance)
+    void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
 
 private:
     void register_bindings(runtime_instance* owner);
@@ -86,7 +95,15 @@ private:
     sol::function m_on_expire;
     sol::function m_on_auth;
     sol::function m_on_websocket;
+    sol::function m_on_proxy_request;
+    sol::function m_on_proxy_response;
     uint32_t m_tick_ms{0};
+
+    // Timer lifetime guard — set to false in destructor; timers check before firing
+    std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
+
+    // Cross-runtime pub/sub: key = cache_name + '\0' + channel
+    std::unordered_map<std::string, std::vector<sol::function>> m_subscriptions;
 };
 
 #else // SOCKETLEY_NO_LUA
@@ -123,7 +140,10 @@ public:
     bool has_on_expire()         const { return false; }
     bool has_on_auth()           const { return false; }
     bool has_on_websocket()      const { return false; }
+    bool has_on_proxy_request()  const { return false; }
+    bool has_on_proxy_response() const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
+    void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,
     // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.
 };

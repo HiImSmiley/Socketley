@@ -108,7 +108,7 @@ bool runtime_instance::stop(event_loop& loop)
 
     // Signal all interactive sessions that runtime has stopped
     for (int ifd : m_interactive_fds)
-        (void)::write(ifd, "\0", 1);
+        if (::write(ifd, "\0", 1) < 0) {}
     m_interactive_fds.clear();
 
     return true;
@@ -548,4 +548,11 @@ void runtime_instance::notify_interactive(std::string_view msg) const
         else
             ++i;
     }
+}
+
+void runtime_instance::on_publish_dispatch(std::string_view cache_name, std::string_view channel, std::string_view message)
+{
+#ifndef SOCKETLEY_NO_LUA
+    if (m_lua) m_lua->dispatch_publish(cache_name, channel, message);
+#endif
 }
