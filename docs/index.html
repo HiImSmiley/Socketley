@@ -1244,8 +1244,6 @@ socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span cla
 <h2 id="addons-overview">Addons</h2>
 <p>Socketley's Lua scripting layer enables pure-Lua addon patterns that extend servers with auth middleware, rate limiting, service discovery, metrics push, and more — without touching C++ code. This page documents the primitives that make these patterns possible and shows working examples for each use case.</p>
 
-<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code><br><strong>Primitives added in v1.4:</strong> <code>self.clients()</code>, <code>self.multicast()</code>, <code>self.set_data()</code>, <code>self.get_data()</code>, <code>socketley.set_timeout()</code>, <code>socketley.set_interval()</code>, <code>socketley.subscribe()</code>, <code>on_proxy_request</code>, <code>on_proxy_response</code><br><strong>Primitives added in v1.5:</strong> <code>socketley.cluster.daemons()</code>, <code>socketley.cluster.runtimes()</code>, <code>socketley.cluster.group()</code>, <code>socketley.cluster.stats()</code>, <code>on_cluster_join</code>, <code>on_cluster_leave</code>, <code>on_group_change</code></div>
-
 <h2 id="addons-auth">Auth Middleware</h2>
 <p>Two complementary auth patterns cover the most common cases: IP-based admission (via <code>on_auth</code>) and first-message token auth (via <code>self.disconnect</code>).</p>
 
