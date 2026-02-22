@@ -23,7 +23,7 @@ runtimes = {
         port = 9999,
         mode = "in",  -- Only receives, no broadcasts
         write = LOG_DIR .. "/all-logs.log",
-        autostart = true
+        start = true
     },
 
     -- Log aggregation cache (for metrics/counts)
@@ -32,7 +32,7 @@ runtimes = {
         name = "log-metrics",
         port = 9998,
         persistent = LOG_DIR .. "/metrics.bin",
-        autostart = true
+        start = true
     },
 
     -- Application services with log forwarding
@@ -41,21 +41,21 @@ runtimes = {
         name = "web-app",
         port = 9001,
         log = LOG_DIR .. "/web-app.log",
-        autostart = true
+        start = true
     },
     {
         type = "server",
         name = "api-app",
         port = 9002,
         log = LOG_DIR .. "/api-app.log",
-        autostart = true
+        start = true
     },
     {
         type = "server",
         name = "worker-app",
         port = 9003,
         log = LOG_DIR .. "/worker-app.log",
-        autostart = true
+        start = true
     },
 
     -- Log forwarders (clients that send to collector)
@@ -64,21 +64,21 @@ runtimes = {
         name = "web-log-forwarder",
         target = "127.0.0.1:9999",
         mode = "out",  -- Only sends
-        autostart = true
+        start = true
     },
     {
         type = "client",
         name = "api-log-forwarder",
         target = "127.0.0.1:9999",
         mode = "out",
-        autostart = true
+        start = true
     },
     {
         type = "client",
         name = "worker-log-forwarder",
         target = "127.0.0.1:9999",
         mode = "out",
-        autostart = true
+        start = true
     }
 }
 

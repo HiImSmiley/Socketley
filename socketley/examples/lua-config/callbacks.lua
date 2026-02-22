@@ -14,7 +14,7 @@ runtimes = {
         type = "server",
         name = "callback-demo",
         port = 9000,
-        autostart = true
+        start = true
     }
 }
 

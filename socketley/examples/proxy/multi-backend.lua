@@ -17,21 +17,21 @@ runtimes = {
         type = "server",
         name = "read-backend",
         port = 9001,
-        autostart = true
+        start = true
     },
     -- Backend for write operations
     {
         type = "server",
         name = "write-backend",
         port = 9002,
-        autostart = true
+        start = true
     },
     -- Backend for admin operations
     {
         type = "server",
         name = "admin-backend",
         port = 9003,
-        autostart = true
+        start = true
     },
     -- Proxy with Lua-based routing
     {
@@ -45,7 +45,7 @@ runtimes = {
             "127.0.0.1:9002",  -- Index 1: write-backend
             "127.0.0.1:9003"   -- Index 2: admin-backend
         },
-        autostart = true
+        start = true
     }
 }
 
