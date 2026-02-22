@@ -1,0 +1,32 @@
+{
+  "benchmark": {
+    "name": "socketley-k6-http",
+    "version": "1.0.0",
+    "description": "Test JSON payload for HTTP static serving benchmarks"
+  },
+  "server": {
+    "runtime": "server",
+    "features": ["io_uring", "sqpoll", "http-static", "http-cache", "websocket", "tls"],
+    "protocols": ["tcp", "http/1.1", "websocket"],
+    "max_connections": 65535
+  },
+  "test_data": {
+    "items": [
+      {"id": 1, "name": "alpha", "value": 100, "tags": ["benchmark", "test"]},
+      {"id": 2, "name": "beta", "value": 200, "tags": ["load", "throughput"]},
+      {"id": 3, "name": "gamma", "value": 300, "tags": ["latency", "p99"]},
+      {"id": 4, "name": "delta", "value": 400, "tags": ["concurrent", "spike"]},
+      {"id": 5, "name": "epsilon", "value": 500, "tags": ["ramp", "cooldown"]},
+      {"id": 6, "name": "zeta", "value": 600, "tags": ["sustained", "steady"]},
+      {"id": 7, "name": "eta", "value": 700, "tags": ["burst", "recovery"]},
+      {"id": 8, "name": "theta", "value": 800, "tags": ["warmup", "baseline"]}
+    ],
+    "metadata": {
+      "created": "2026-02-22T00:00:00Z",
+      "purpose": "HTTP benchmark payload",
+      "encoding": "utf-8",
+      "content_type": "application/json"
+    },
+    "padding": "This additional text brings the JSON payload closer to the target size of approximately 2 KB for realistic HTTP response benchmarking. Real-world API responses commonly fall in the 1-4 KB range, making this a representative test case for measuring serialization overhead, transfer time, and connection reuse efficiency under load."
+  }
+}

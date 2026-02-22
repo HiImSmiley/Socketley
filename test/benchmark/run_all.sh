@@ -93,6 +93,23 @@ run_benchmarks() {
     bash "$script_dir/bench_websocket.sh"
 
     cleanup_runtimes
+    sleep 2
+
+    # k6 benchmarks (optional — skip if k6 not installed)
+    if check_k6 2>/dev/null; then
+        log_section "Running k6 HTTP Benchmarks"
+        bash "$script_dir/bench_k6_http.sh"
+
+        cleanup_runtimes
+        sleep 2
+
+        log_section "Running k6 WebSocket Benchmarks"
+        bash "$script_dir/bench_k6_ws.sh"
+
+        cleanup_runtimes
+    else
+        log_warn "Skipping k6 benchmarks (k6 not installed)"
+    fi
 }
 
 # Generate summary from JSON results
@@ -292,6 +309,33 @@ case "${1:-}" in
         start_daemon || exit 1
         bash "$(dirname "$0")/bench_websocket.sh"
         ;;
+    --k6-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        check_k6 || exit 1
+        setup_cleanup_trap
+        start_daemon || exit 1
+        bash "$(dirname "$0")/bench_k6_http.sh"
+        cleanup_runtimes
+        sleep 2
+        bash "$(dirname "$0")/bench_k6_ws.sh"
+        ;;
+    --k6-http-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        check_k6 || exit 1
+        setup_cleanup_trap
+        start_daemon || exit 1
+        bash "$(dirname "$0")/bench_k6_http.sh"
+        ;;
+    --k6-ws-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        check_k6 || exit 1
+        setup_cleanup_trap
+        start_daemon || exit 1
+        bash "$(dirname "$0")/bench_k6_ws.sh"
+        ;;
     --help|-h)
         echo "Usage: $0 [options]"
         echo ""
@@ -299,9 +343,14 @@ case "${1:-}" in
         echo "  --server-only    Run only server benchmarks"
         echo "  --cache-only     Run only cache benchmarks"
         echo "  --proxy-only     Run only proxy benchmarks"
+        echo "  --websocket-only Run only WebSocket benchmarks"
+        echo "  --k6-only        Run only k6 benchmarks (HTTP + WebSocket)"
+        echo "  --k6-http-only   Run only k6 HTTP benchmarks"
+        echo "  --k6-ws-only     Run only k6 WebSocket benchmarks"
         echo "  --help           Show this help"
         echo ""
         echo "Without options, runs the complete benchmark suite."
+        echo "k6 benchmarks require k6 to be installed (https://grafana.com/docs/k6/latest/set-up/install-k6/)."
         ;;
     *)
         main
