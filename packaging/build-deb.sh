@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_ROOT/bin/Release/socketley"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.1.0}"
 ARCH="amd64"
 PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 

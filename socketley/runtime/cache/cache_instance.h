@@ -15,6 +15,7 @@
 struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
 
     int fd;
     io_request read_req;
@@ -215,4 +216,8 @@ private:
     static constexpr uint32_t BUF_COUNT = 512;
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
+
+    // Periodic TTL sweep timer
+    io_request m_ttl_req{};
+    struct __kernel_timespec m_ttl_ts{};
 };

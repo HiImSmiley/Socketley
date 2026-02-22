@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <deque>
 #include <list>
+#include <vector>
 #include <cstdint>
 #include <functional>
 #include <chrono>
@@ -88,6 +89,31 @@ public:
     int get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);
+    void sweep_expired();  // removes all keys whose expiry has passed
+
+    // --- Millisecond-precision TTL ---
+    bool set_expiry_ms(std::string_view key, int64_t ms);
+    int64_t get_pttl(std::string_view key) const;  // ms; -1=no ttl, -2=not found
+
+    // --- Set if not exists ---
+    bool setnx(std::string_view key, std::string_view value);
+
+    // --- Cursor scan (stateless offset cursor; returns next cursor, 0=done) ---
+    uint64_t scan(uint64_t cursor, std::string_view pattern,
+                  size_t count, std::vector<std::string_view>& out) const;
+
+    // --- Atomic increment ---
+    bool incr(std::string_view key, int64_t delta, int64_t& result);
+
+    // --- String extras ---
+    size_t append(std::string_view key, std::string_view suffix);  // returns new length
+    size_t strlen_key(std::string_view key) const;                  // 0 if missing
+    bool getset(std::string_view key, std::string_view newval, std::string& oldval);
+
+    // --- Type / Keys ---
+    std::string_view type(std::string_view key) const;
+    // returns "string", "list", "set", "hash", or "none"
+    void keys(std::string_view pattern, std::vector<std::string_view>& out) const;
 
     // --- General ---
     bool del(std::string_view key);

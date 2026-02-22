@@ -120,6 +120,7 @@ private:
     proxy_protocol m_protocol = protocol_http;
     proxy_strategy m_strategy = strategy_round_robin;
     std::vector<backend_info> m_backends;
+    std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     int m_listen_fd = -1;
     sockaddr_in m_accept_addr{};

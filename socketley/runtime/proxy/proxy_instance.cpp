@@ -95,6 +95,9 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
 
+    // Pre-build prefix once to avoid per-request allocation
+    m_prefix = "/" + std::string(get_name()) + "/";
+
     uint16_t port = get_port();
     if (port == 0)
         port = 8080;
@@ -400,9 +403,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
         conn->header_parsed = true;
 
-        // Check path prefix
-        std::string prefix = "/" + std::string(get_name()) + "/";
-        if (!conn->path.starts_with(prefix) && conn->path != "/" + std::string(get_name()))
+        // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
+        std::string_view bare = std::string_view(m_prefix).substr(0, m_prefix.size() - 1);
+        if (!conn->path.starts_with(m_prefix) && conn->path != bare)
         {
             send_error(conn, "404 Not Found", "Not Found\n");
             return;
@@ -410,10 +413,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
         // Strip prefix
         std::string new_path;
-        if (conn->path == "/" + std::string(get_name()))
+        if (conn->path == bare)
             new_path = "/";
         else
-            new_path = conn->path.substr(prefix.size() - 1); // Keep leading /
+            new_path = conn->path.substr(m_prefix.size() - 1); // Keep leading /
 
         // Select and connect to backend
         size_t idx = select_backend(conn);
@@ -772,10 +775,12 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
 
     std::string response;
     response.reserve(9 + status.size() + 18 + 8 + 23 + body.size());
+    char clen_buf[24];
+    auto [clen_end, clen_ec] = std::to_chars(clen_buf, clen_buf + sizeof(clen_buf), body.size());
     response += "HTTP/1.1 ";
     response += status;
     response += "\r\nContent-Length: ";
-    response += std::to_string(body.size());
+    response.append(clen_buf, static_cast<size_t>(clen_end - clen_buf));
     response += "\r\nConnection: close\r\n\r\n";
     response += body;
 
