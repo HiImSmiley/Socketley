@@ -102,9 +102,6 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("--lua"):
             return cli_config(argc, argv);
 
-        case fnv1a("cluster"):
-            return cli_cluster(argc, argv);
-
         default:
             break;
     }
@@ -137,6 +134,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("show"):
         case fnv1a("owner"):
             return cli_forward(argc, argv);
+
+        case fnv1a("cluster"):
+            return cli_cluster(argc, argv);
 
         case fnv1a("send"):
             return cli_send(argc, argv);

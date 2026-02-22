@@ -70,6 +70,7 @@ private:
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
     int cmd_owner(ipc_connection* conn, const parsed_args& pa);
     int cmd_attach(ipc_connection* conn, const parsed_args& pa);
+    int cmd_cluster_dir(ipc_connection* conn);
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 

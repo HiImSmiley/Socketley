@@ -11,6 +11,7 @@
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
+#include "../shared/cluster_discovery.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -321,6 +322,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("reload-lua"):return cmd_reload_lua(conn, pa);
         case fnv1a("owner"):     return cmd_owner(conn, pa);
         case fnv1a("attach"):    return cmd_attach(conn, pa);
+        case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -1876,6 +1878,18 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     if (m_persistence)
         m_persistence->save_runtime(inst);
 
+    return 0;
+}
+
+int daemon_handler::cmd_cluster_dir(ipc_connection* conn)
+{
+    if (!m_cluster)
+    {
+        conn->write_buf = "daemon is not in cluster mode (start with --name and --cluster)\n";
+        return 1;
+    }
+
+    conn->write_buf = std::string(m_cluster->get_cluster_dir()) + "\n";
     return 0;
 }
 
