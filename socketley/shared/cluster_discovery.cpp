@@ -419,6 +419,75 @@ void cluster_discovery::scan()
             }
         }
     }
+
+    // ─── Change detection for event callbacks ───
+    if (!m_event_callback)
+        return;
+
+    // Build current daemon name set and group counts under lock
+    std::unordered_set<std::string> current_names;
+    std::unordered_map<std::string, int> current_groups;
+    {
+        std::lock_guard lock(m_remote_mutex);
+        for (const auto& [name, daemon] : m_remote_daemons)
+        {
+            current_names.insert(name);
+            for (const auto& rt : daemon.runtimes)
+            {
+                if (!rt.group.empty() && rt.state == "running" && rt.port > 0)
+                    ++current_groups[rt.group];
+            }
+        }
+    }
+
+    // Also count local group members
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [_, inst] : m_manager.list())
+        {
+            auto g = inst->get_group();
+            if (!g.empty() && inst->get_state() == runtime_running && inst->get_port() > 0)
+                ++current_groups[std::string(g)];
+        }
+    }
+
+    // Diff against previous state
+    std::vector<cluster_event> events;
+
+    // New daemons = join events
+    for (const auto& name : current_names)
+    {
+        if (m_previous_daemon_names.find(name) == m_previous_daemon_names.end())
+            events.push_back({cluster_event::daemon_join, name, {}, 0});
+    }
+
+    // Missing daemons = leave events
+    for (const auto& name : m_previous_daemon_names)
+    {
+        if (current_names.find(name) == current_names.end())
+            events.push_back({cluster_event::daemon_leave, name, {}, 0});
+    }
+
+    // Changed group counts = group_change events
+    for (const auto& [group, count] : current_groups)
+    {
+        auto it = m_previous_group_counts.find(group);
+        if (it == m_previous_group_counts.end() || it->second != count)
+            events.push_back({cluster_event::group_change, {}, group, count});
+    }
+    for (const auto& [group, _] : m_previous_group_counts)
+    {
+        if (current_groups.find(group) == current_groups.end())
+            events.push_back({cluster_event::group_change, {}, group, 0});
+    }
+
+    // Update previous state
+    m_previous_daemon_names = std::move(current_names);
+    m_previous_group_counts = std::move(current_groups);
+
+    // Fire callback
+    if (!events.empty())
+        m_event_callback(events);
 }
 
 void cluster_discovery::unpublish()
@@ -470,6 +539,11 @@ cluster_discovery::get_remote_group(std::string_view group) const
     }
 
     return result;
+}
+
+void cluster_discovery::set_event_callback(event_callback_t cb)
+{
+    m_event_callback = std::move(cb);
 }
 
 std::vector<remote_daemon> cluster_discovery::get_all_daemons() const

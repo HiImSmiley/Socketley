@@ -1010,6 +1010,16 @@ function on_tick(dt)
     self.broadcast("ping")
 end
 .fi
+.TP
+.B on_cluster_join(daemon)
+Cluster only. Called when a new remote daemon is discovered. See
+.BR "Cluster Event Callbacks" .
+.TP
+.B on_cluster_leave(daemon)
+Cluster only. Called when a remote daemon becomes stale or disappears.
+.TP
+.B on_group_change(group, members)
+Cluster only. Called when the member count of a group changes.
 .SS Runtime Methods (in Lua)
 .nf
 self.name      -- Runtime name (read-only)
@@ -1152,6 +1162,119 @@ socketley.get(name)                   -- Get info table or nil
 .P
 Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), autostart (bool).
 Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
+.SS Cluster Introspection API
+When the daemon runs in cluster mode (\fB\-\-cluster\fR), the
+.B socketley.cluster
+table provides read-only introspection into the full cluster topology.
+All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.
+.TP
+.B socketley.cluster.daemons() \(-> table
+Returns an array of daemon info tables. Each entry has:
+.nf
+name      string   Daemon name (from \-\-name)
+host      string   Advertised address (from \-\-cluster\-addr)
+healthy   bool     Always true (stale daemons are pruned before this call)
+runtimes  number   Count of runtimes on this daemon
+.fi
+.IP
+The local daemon is always the first entry. Remote daemons follow in discovery order.
+.TP
+.B socketley.cluster.runtimes() \(-> table
+Returns a flat array of all runtimes across every daemon in the cluster:
+.nf
+daemon       string   Name of the daemon hosting this runtime
+name         string   Runtime name
+type         string   "server", "client", "proxy", or "cache"
+port         number   Listen port (0 = internal-only)
+group        string   Group tag (empty string if unset)
+state        string   "created", "running", "stopped", or "failed"
+connections  number   Current connection count
+.fi
+.TP
+.B socketley.cluster.group(name) \(-> table
+Returns running members of the named group that have a valid port.
+Each entry has:
+.nf
+daemon       string   Daemon name
+host         string   Advertised address
+port         number   Listen port
+connections  number   Current connection count
+.fi
+.IP
+Useful for building custom routing, health checks, or failover logic from Lua.
+.TP
+.B socketley.cluster.stats() \(-> table
+Aggregate cluster statistics:
+.nf
+daemons   number   Total daemon count (local + remote)
+healthy   number   Healthy daemon count
+stale     number   Stale daemon count (always 0 since stale entries are pruned)
+runtimes  number   Total runtime count across all daemons
+running   number   Count of runtimes in "running" state
+groups    table    Maps group name (string) \(-> member count (number)
+.fi
+.SS Cluster Event Callbacks
+These optional callbacks fire when the cluster topology changes.
+Events are detected during the 2-second scan/publish cycle, so callbacks
+may fire up to 2 seconds after the actual change.
+A daemon is considered stale and triggers
+.B on_cluster_leave
+after 10 seconds without a heartbeat update.
+.TP
+.B on_cluster_join(daemon)
+Fired when a new remote daemon is discovered in the cluster directory.
+.I daemon
+is a table with
+.B name
+(string) and
+.B host
+(string) fields.
+.TP
+.B on_cluster_leave(daemon)
+Fired when a remote daemon's heartbeat file becomes stale (>10s old) or is
+removed from the cluster directory.
+.I daemon
+is a table with a
+.B name
+(string) field.
+.TP
+.B on_group_change(group, members)
+Fired when the total member count of a group changes (a runtime joins or
+leaves the group, or a daemon with group members appears/disappears).
+Only fires on actual count changes, not on every scan cycle.
+.I group
+is the group name (string).
+.I members
+is an array of tables, each with
+.BR daemon ", " host ", and " port
+fields representing the current group membership.
+.PP
+Example \(em log topology changes and maintain a local routing table:
+.nf
+local backends = {}
+
+function on_cluster_join(daemon)
+    socketley.log("daemon joined: " .. daemon.name .. " at " .. daemon.host)
+end
+
+function on_cluster_leave(daemon)
+    socketley.log("daemon left: " .. daemon.name)
+end
+
+function on_group_change(group, members)
+    if group == "api" then
+        backends = members   \-\- update routing table
+        socketley.log("api group now has " .. #members .. " members")
+    end
+end
+
+function on_start()
+    \-\- Initial snapshot
+    local stats = socketley.cluster.stats()
+    socketley.log("cluster: " .. stats.daemons .. " daemons, "
+                  .. stats.running .. " running runtimes")
+end
+.fi
 .SH RUNTIME STATES
 .TP
 .B created

@@ -11,6 +11,7 @@
 
 class event_loop;
 class cluster_discovery;
+struct cluster_event;
 
 // Transparent hash for heterogeneous lookup (avoids string copies on find)
 struct runtime_string_hash
@@ -55,6 +56,9 @@ public:
 
     // Cross-runtime pub/sub: dispatch a published message to all runtimes
     void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
+
+    // Cluster event dispatch: forward topology changes to all runtimes with Lua callbacks
+    void dispatch_cluster_events(const std::vector<cluster_event>& events);
 
     // Ownership cascading
     std::vector<std::string> get_children(std::string_view parent_name) const;

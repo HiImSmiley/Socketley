@@ -153,6 +153,10 @@
         <li><a href="#route-route">route / unroute</a></li>
         <li><a href="#route-owner-send">owner_send / owner_broadcast</a></li>
       </ul></li>
+      <li><a href="#cluster-api">Cluster API</a><ul>
+        <li><a href="#cluster-daemons">daemons / runtimes</a></li>
+        <li><a href="#cluster-group">group / stats</a></li>
+      </ul></li>
     </ul>
 
     <!-- ── Addons Nav ── -->
@@ -168,6 +172,10 @@
       <li><a href="#addons-timers">Timers</a></li>
       <li><a href="#addons-proxy-hooks">Proxy Data Hooks</a></li>
       <li><a href="#addons-pubsub">Cross-Runtime Pub/Sub</a></li>
+      <li><a href="#addons-cluster-events">Cluster Events</a><ul>
+        <li><a href="#addons-cluster-join">on_cluster_join / leave</a></li>
+        <li><a href="#addons-group-change">on_group_change</a></li>
+      </ul></li>
       <li><a href="#addons-http">HTTP Calls</a><ul>
         <li><a href="#addons-http-api">socketley.http API</a></li>
         <li><a href="#addons-http-https">HTTPS</a></li>
@@ -1203,6 +1211,80 @@ socketley reload-lua myserver</code></pre>
 
 <p>Port-0 sub-servers have no listener — they only receive messages via client routing from the parent.</p>
 
+<h2 id="cluster-api">Cluster Introspection API</h2>
+<p>When the daemon runs in cluster mode (<code>--cluster</code>), the <code>socketley.cluster</code> table provides read-only access to the full cluster topology. All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.</p>
+
+<div class="info-box"><strong>Requires cluster mode.</strong> The daemon must be started with <code>--name</code>, <code>--cluster &lt;dir&gt;</code>, and optionally <code>--cluster-addr &lt;host&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
+
+<div class="method-card" id="cluster-daemons">
+<div class="method-header"><span class="method-name">socketley.cluster.daemons</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns an array of all daemons in the cluster. The local daemon is always the first entry.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>name</td><td>string</td><td>Daemon name (from <code>--name</code>)</td></tr>
+<tr><td>host</td><td>string</td><td>Advertised address (from <code>--cluster-addr</code>)</td></tr>
+<tr><td>healthy</td><td>bool</td><td>Always <code>true</code> (stale daemons are pruned before this call)</td></tr>
+<tr><td>runtimes</td><td>number</td><td>Count of runtimes on this daemon</td></tr>
+</tbody></table>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">for</span> _, d <span class="kw">in</span> <span class="fn">ipairs</span>(socketley.cluster.daemons()) <span class="kw">do</span>
+        socketley.log(d.name .. <span class="st">" @ "</span> .. d.host .. <span class="st">" ("</span> .. d.runtimes .. <span class="st">" runtimes)"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="method-card" id="cluster-runtimes">
+<div class="method-header"><span class="method-name">socketley.cluster.runtimes</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns a flat array of every runtime across all daemons in the cluster (local + remote).</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon</td><td>string</td><td>Hosting daemon name</td></tr>
+<tr><td>name</td><td>string</td><td>Runtime name</td></tr>
+<tr><td>type</td><td>string</td><td><code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
+<tr><td>port</td><td>number</td><td>Listen port (0 = internal-only)</td></tr>
+<tr><td>group</td><td>string</td><td>Group tag (empty string if unset)</td></tr>
+<tr><td>state</td><td>string</td><td><code>"created"</code>, <code>"running"</code>, <code>"stopped"</code>, or <code>"failed"</code></td></tr>
+<tr><td>connections</td><td>number</td><td>Current connection count</td></tr>
+</tbody></table>
+</div>
+
+<div class="method-card" id="cluster-group">
+<div class="method-header"><span class="method-name">socketley.cluster.group</span><span class="method-sig">(name) &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns running members of the named group that have a valid port. Useful for building custom routing, health checks, or failover logic.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon</td><td>string</td><td>Daemon name</td></tr>
+<tr><td>host</td><td>string</td><td>Advertised address</td></tr>
+<tr><td>port</td><td>number</td><td>Listen port</td></tr>
+<tr><td>connections</td><td>number</td><td>Current connection count</td></tr>
+</tbody></table>
+<pre><code><span class="cm">-- Pick the least-loaded backend from the "api" group</span>
+<span class="kw">local</span> members = socketley.cluster.group(<span class="st">"api"</span>)
+<span class="kw">local</span> best = members[<span class="nb">1</span>]
+<span class="kw">for</span> _, m <span class="kw">in</span> <span class="fn">ipairs</span>(members) <span class="kw">do</span>
+    <span class="kw">if</span> m.connections &lt; best.connections <span class="kw">then</span> best = m <span class="kw">end</span>
+<span class="kw">end</span>
+socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span class="st">":"</span> .. best.port)</code></pre>
+</div>
+
+<div class="method-card" id="cluster-stats">
+<div class="method-header"><span class="method-name">socketley.cluster.stats</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns aggregate cluster statistics in a single call.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemons</td><td>number</td><td>Total daemon count (local + remote)</td></tr>
+<tr><td>healthy</td><td>number</td><td>Healthy daemon count</td></tr>
+<tr><td>stale</td><td>number</td><td>Stale daemon count (always 0 since stale entries are pruned)</td></tr>
+<tr><td>runtimes</td><td>number</td><td>Total runtime count across all daemons</td></tr>
+<tr><td>running</td><td>number</td><td>Runtimes currently in <code>"running"</code> state</td></tr>
+<tr><td>groups</td><td>table</td><td>Maps group name &rarr; member count</td></tr>
+</tbody></table>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> s = socketley.cluster.stats()
+    socketley.log(<span class="st">"cluster: "</span> .. s.daemons .. <span class="st">" daemons, "</span>
+                  .. s.running .. <span class="st">"/"</span> .. s.runtimes .. <span class="st">" running"</span>)
+    <span class="kw">for</span> name, count <span class="kw">in</span> <span class="fn">pairs</span>(s.groups) <span class="kw">do</span>
+        socketley.log(<span class="st">"  group "</span> .. name .. <span class="st">": "</span> .. count .. <span class="st">" members"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
 </div><!-- #content-lua -->
 
 <!-- ═══════════════════════════════════════════
@@ -1213,7 +1295,7 @@ socketley reload-lua myserver</code></pre>
 <h2 id="addons-overview">Addons</h2>
 <p>Socketley's Lua scripting layer enables pure-Lua addon patterns that extend servers with auth middleware, rate limiting, service discovery, metrics push, and more — without touching C++ code. This page documents the primitives that make these patterns possible and shows working examples for each use case.</p>
 
-<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code><br><strong>Primitives added in v1.4:</strong> <code>self.clients()</code>, <code>self.multicast()</code>, <code>self.set_data()</code>, <code>self.get_data()</code>, <code>socketley.set_timeout()</code>, <code>socketley.set_interval()</code>, <code>socketley.subscribe()</code>, <code>on_proxy_request</code>, <code>on_proxy_response</code></div>
+<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code><br><strong>Primitives added in v1.3:</strong> <code>on_websocket(client_id, headers)</code>, <code>self.ws_headers(client_id)</code><br><strong>Primitives added in v1.4:</strong> <code>self.clients()</code>, <code>self.multicast()</code>, <code>self.set_data()</code>, <code>self.get_data()</code>, <code>socketley.set_timeout()</code>, <code>socketley.set_interval()</code>, <code>socketley.subscribe()</code>, <code>on_proxy_request</code>, <code>on_proxy_response</code><br><strong>Primitives added in v1.5:</strong> <code>socketley.cluster.daemons()</code>, <code>socketley.cluster.runtimes()</code>, <code>socketley.cluster.group()</code>, <code>socketley.cluster.stats()</code>, <code>on_cluster_join</code>, <code>on_cluster_leave</code>, <code>on_group_change</code></div>
 
 <h2 id="addons-auth">Auth Middleware</h2>
 <p>Two complementary auth patterns cover the most common cases: IP-based admission (via <code>on_auth</code>) and first-message token auth (via <code>self.disconnect</code>).</p>
@@ -1490,6 +1572,79 @@ socketley create cache events --port 9100 --lua pubsub-cache.lua
 socketley create server api   --port 9000 --lua pubsub-server.lua
 socketley start events
 socketley start api</code></pre>
+
+<h2 id="addons-cluster-events">Cluster Event Callbacks</h2>
+<p>React to cluster topology changes from Lua. These optional callbacks fire when daemons join or leave the cluster, or when a group's membership count changes. Events are detected during the 2-second scan/publish cycle, so callbacks may fire up to 2&nbsp;seconds after the actual change.</p>
+
+<div class="info-box"><strong>Requires cluster mode.</strong> These callbacks only fire when the daemon is started with <code>--cluster</code>. A daemon is considered stale and triggers <code>on_cluster_leave</code> after 10&nbsp;seconds without a heartbeat update.</div>
+
+<div class="callback-card" id="addons-cluster-join">
+<div class="method-header"><span class="method-name">on_cluster_join(daemon)</span><span class="badge badge-cluster">cluster</span></div>
+<div class="fires">Fires when a new remote daemon is discovered in the cluster directory.</div>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon.name</td><td>string</td><td>The new daemon's name</td></tr>
+<tr><td>daemon.host</td><td>string</td><td>The new daemon's advertised address</td></tr>
+</tbody></table>
+</div>
+
+<div class="callback-card" id="addons-cluster-leave">
+<div class="method-header"><span class="method-name">on_cluster_leave(daemon)</span><span class="badge badge-cluster">cluster</span></div>
+<div class="fires">Fires when a remote daemon's heartbeat becomes stale (&gt;10s) or its file is removed.</div>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon.name</td><td>string</td><td>The departed daemon's name</td></tr>
+</tbody></table>
+</div>
+
+<div class="callback-card" id="addons-group-change">
+<div class="method-header"><span class="method-name">on_group_change(group, members)</span><span class="badge badge-cluster">cluster</span></div>
+<div class="fires">Fires when the total member count of a group changes &mdash; a runtime joins or leaves the group, or a daemon with group members appears or disappears. Only fires on actual count changes, not on every scan cycle.</div>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>group</td><td>string</td><td>The group name</td></tr>
+<tr><td>members</td><td>table</td><td>Array of <code>{daemon, host, port}</code> for current group members</td></tr>
+</tbody></table>
+</div>
+
+<pre><code><span class="cm">-- cluster-failover.lua: maintain a live routing table for the "api" group</span>
+<span class="kw">local</span> backends = {}
+
+<span class="kw">function</span> <span class="fn">on_cluster_join</span>(daemon)
+    socketley.log(<span class="st">"daemon joined: "</span> .. daemon.name .. <span class="st">" @ "</span> .. daemon.host)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_cluster_leave</span>(daemon)
+    socketley.log(<span class="st">"daemon left: "</span> .. daemon.name)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_group_change</span>(group, members)
+    <span class="kw">if</span> group == <span class="st">"api"</span> <span class="kw">then</span>
+        backends = members
+        socketley.log(<span class="st">"api group now has "</span> .. #members .. <span class="st">" members"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="cm">-- Initial cluster snapshot</span>
+    <span class="kw">local</span> stats = socketley.cluster.stats()
+    socketley.log(<span class="st">"cluster: "</span> .. stats.daemons .. <span class="st">" daemons, "</span>
+                  .. stats.running .. <span class="st">"/"</span> .. stats.runtimes .. <span class="st">" running"</span>)
+
+    <span class="cm">-- Seed the routing table</span>
+    backends = socketley.cluster.group(<span class="st">"api"</span>)
+    socketley.log(<span class="st">"api group: "</span> .. #backends .. <span class="st">" members"</span>)
+<span class="kw">end</span></code></pre>
+
+<pre><code><span class="cm"># Start two clustered daemons with api servers + a monitoring server:</span>
+socketley daemon --name node1 --cluster /shared/cluster --cluster-addr 10.0.1.1 &amp;
+socketley daemon --name node2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &amp;
+
+<span class="cm"># On node1: api server + monitoring server with cluster callbacks</span>
+SOCKETLEY_SOCKET=/tmp/node1.sock socketley create server api1 -p 9001 -g api -s
+SOCKETLEY_SOCKET=/tmp/node1.sock socketley create server monitor -p 9100 --lua cluster-failover.lua -s
+
+<span class="cm"># On node2: api server (triggers on_cluster_join + on_group_change on node1)</span>
+SOCKETLEY_SOCKET=/tmp/node2.sock socketley create server api2 -p 9002 -g api -s</code></pre>
+
+<div class="info-box"><strong>Combining introspection + events.</strong> Use <code>socketley.cluster.group()</code> in <code>on_start</code> for the initial snapshot, then keep it up-to-date via <code>on_group_change</code>. This avoids polling and gives you a near-real-time routing table with ~2s convergence.</div>
 
 <h2 id="addons-http">HTTP Calls</h2>
 
