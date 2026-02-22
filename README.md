@@ -284,4 +284,4 @@ bash test/benchmark/run_all.sh
 
 ## License
 
-MIT
+Apache 2.0
