@@ -89,7 +89,7 @@ public:
     int get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);
-    void sweep_expired();  // removes all keys whose expiry has passed
+    std::vector<std::string> sweep_expired();  // removes expired keys, returns their names
 
     // --- Millisecond-precision TTL ---
     bool set_expiry_ms(std::string_view key, int64_t ms);

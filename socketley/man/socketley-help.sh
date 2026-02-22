@@ -407,6 +407,10 @@ lua_config() {
     echo "│ on_route(method, path)       │ Proxy: custom backend selection  │"
     echo "│ on_master_auth(id, pw)       │ Server: master mode auth         │"
     echo "│ on_tick(dt)                  │ Periodic timer (tick_ms global)  │"
+    echo "│ on_miss(key)→val,ttl         │ Cache: GET miss — fetch from DB  │"
+    echo "│ on_write(key,val,ttl)        │ Cache: after SET — write to DB   │"
+    echo "│ on_delete(key)               │ Cache: after DEL — delete in DB  │"
+    echo "│ on_expire(key)               │ Cache: after TTL expiry          │"
     echo "└──────────────────────────────┴──────────────────────────────────┘"
     echo ""
 
