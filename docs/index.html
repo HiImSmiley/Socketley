@@ -412,8 +412,8 @@ Hello everyone!              <span class="cm"># → broadcast normally (no "cach
 
 <p>In Lua orchestration files, use the <code>cache_name</code> key:</p>
 <pre><code>runtimes = {
-    { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, cache_name = <span class="st">"store"</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, cache_name = <span class="st">"store"</span>, start = <span class="kw">true</span> },
 }</code></pre>
 
 <h3 id="concept-http">HTTP Serving</h3>
@@ -865,17 +865,17 @@ socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pr
 <p>Orchestration files define runtimes in a Lua table. All CLI flags have table equivalents:</p>
 <pre><code>runtimes = {
     { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, group = <span class="st">"web"</span>,
-      cache_name = <span class="st">"store"</span>, http = <span class="st">"./public"</span>, http_cache = <span class="kw">true</span>, autostart = <span class="kw">true</span> },
+      cache_name = <span class="st">"store"</span>, http = <span class="st">"./public"</span>, http_cache = <span class="kw">true</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, persistent = <span class="st">"/tmp/data.bin"</span>,
-      maxmemory = <span class="st">"256M"</span>, eviction = <span class="st">"allkeys-lru"</span>, resp = <span class="kw">true</span>, autostart = <span class="kw">true</span> },
+      maxmemory = <span class="st">"256M"</span>, eviction = <span class="st">"allkeys-lru"</span>, resp = <span class="kw">true</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,    port = <span class="nb">8080</span>,
-      backends = { <span class="st">"@web"</span> }, strategy = <span class="st">"round-robin"</span>, autostart = <span class="kw">true</span> },
+      backends = { <span class="st">"@web"</span> }, strategy = <span class="st">"round-robin"</span>, start = <span class="kw">true</span> },
 }</code></pre>
 <table><thead><tr><th>Key</th><th>Type</th><th>Description</th></tr></thead><tbody>
 <tr><td>type</td><td>string</td><td>Required. <code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
 <tr><td>name</td><td>string</td><td>Required. Unique runtime name</td></tr>
 <tr><td>port</td><td>number</td><td>Port number. 0 = internal only (no network bind)</td></tr>
-<tr><td>autostart</td><td>boolean</td><td>Start immediately after creation</td></tr>
+<tr><td>start</td><td>boolean</td><td>Start immediately after creation</td></tr>
 <tr><td>mode</td><td>string</td><td><code>"inout"</code> / <code>"in"</code> / <code>"out"</code> / <code>"master"</code></td></tr>
 <tr><td>target</td><td>string</td><td>Client target address (<code>"host:port"</code>)</td></tr>
 <tr><td>lua / config</td><td>string</td><td>Lua script path for this runtime</td></tr>
@@ -1113,7 +1113,7 @@ socketley reload-lua myserver</code></pre>
 
 <div class="method-card" id="mgmt-create">
 <div class="method-header"><span class="method-name">socketley.create</span><span class="method-sig">(type, name, config?) &rarr; boolean</span><span class="badge badge-all">all</span></div>
-<div class="method-desc">Config keys: <code>port</code>, <code>lua</code>/<code>config</code>, <code>target</code>, <code>mode</code>, <code>on_parent_stop</code> (<code>"stop"</code>|<code>"remove"</code>), <code>autostart</code>.</div>
+<div class="method-desc">Config keys: <code>port</code>, <code>lua</code>/<code>config</code>, <code>target</code>, <code>mode</code>, <code>on_parent_stop</code> (<code>"stop"</code>|<code>"remove"</code>), <code>start</code>.</div>
 </div>
 <div class="method-card"><div class="method-header"><span class="method-name">socketley.start</span><span class="method-sig">(name) &rarr; boolean</span><span class="badge badge-all">all</span></div></div>
 <div class="method-card"><div class="method-header"><span class="method-name">socketley.stop</span><span class="method-sig">(name) &rarr; boolean</span><span class="badge badge-all">all</span></div></div>
@@ -1135,7 +1135,7 @@ socketley reload-lua myserver</code></pre>
 <p>Runtimes created via <code>socketley.create()</code> are owned by the calling runtime. Use <code>on_parent_stop = "remove"</code> to auto-remove children when the parent stops.</p>
 <pre><code>socketley.create(<span class="st">"server"</span>, <span class="st">"worker"</span>, {
     port = <span class="nb">0</span>, lua = <span class="st">"worker.lua"</span>,
-    on_parent_stop = <span class="st">"remove"</span>, autostart = <span class="kw">true</span>
+    on_parent_stop = <span class="st">"remove"</span>, start = <span class="kw">true</span>
 })</code></pre>
 
 <h2 id="client-routing">Client Routing</h2>
@@ -2263,13 +2263,13 @@ socketley create proxy gateway -p 8080 \
 <p class="method-desc">Custom routing logic via the <code>on_route(method, path)</code> callback. Route requests to different backends based on HTTP method, URL path, or any combination. Return a 0-based backend index.</p>
 <pre><code><span class="cm">-- multi-backend.lua</span>
 runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"read-backend"</span>,  port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"write-backend"</span>, port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"admin-backend"</span>, port = <span class="nb">9003</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"read-backend"</span>,  port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"write-backend"</span>, port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"admin-backend"</span>, port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"smart-proxy"</span>,   port = <span class="nb">8080</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
       backends = { <span class="st">"127.0.0.1:9001"</span>, <span class="st">"127.0.0.1:9002"</span>, <span class="st">"127.0.0.1:9003"</span> },
-      autostart = <span class="kw">true</span> }
+      start = <span class="kw">true</span> }
 }
 
 <span class="kw">function</span> <span class="fn">on_route</span>(method, path)
@@ -2444,8 +2444,8 @@ tick_ms = <span class="nb">2000</span>
 <pre><code><span class="cm">-- cache-integration.lua</span>
 runtimes = {
     { type = <span class="st">"cache"</span>,  name = <span class="st">"shared-state"</span>, port = <span class="nb">9000</span>,
-      persistent = <span class="st">"/tmp/shared-state.bin"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-server"</span>,   port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
+      persistent = <span class="st">"/tmp/shared-state.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-server"</span>,   port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
 }
 
 <span class="kw">function</span> <span class="fn">on_message</span>(msg)
@@ -2709,9 +2709,9 @@ wscat --header <span class="st">"Cookie: session_id=abc123"</span> --connect ws:
 <pre><code><span class="cm">-- simple-config.lua</span>
 runtimes = {
     { type = <span class="st">"server"</span>, name = <span class="st">"my-server"</span>, port = <span class="nb">9000</span>,
-      mode = <span class="st">"inout"</span>, autostart = <span class="kw">true</span> },
+      mode = <span class="st">"inout"</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"client"</span>, name = <span class="st">"my-client"</span>,
-      target = <span class="st">"127.0.0.1:9000"</span>, autostart = <span class="kw">true</span> },
+      target = <span class="st">"127.0.0.1:9000"</span>, start = <span class="kw">true</span> },
 }
 
 <span class="kw">function</span> <span class="fn">on_start</span>()
@@ -2728,7 +2728,7 @@ runtimes = {
 <p class="method-desc">All available callbacks demonstrated: <code>on_start</code>, <code>on_stop</code>, <code>on_message</code>, and <code>on_send</code>. Each fires at a specific lifecycle event. All are optional &mdash; define only the ones you need.</p>
 <pre><code><span class="cm">-- callbacks.lua</span>
 runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"callback-demo"</span>, port = <span class="nb">9000</span>, autostart = <span class="kw">true</span> }
+    { type = <span class="st">"server"</span>, name = <span class="st">"callback-demo"</span>, port = <span class="nb">9000</span>, start = <span class="kw">true</span> }
 }
 
 <span class="kw">function</span> <span class="fn">on_start</span>()
@@ -2780,13 +2780,13 @@ runtimes = {
 <p class="method-desc">A Lua-strategy proxy that routes by content type: static assets go to a static backend, API calls go to an API backend, and compute-heavy requests go to a compute backend. Demonstrates pattern matching in <code>on_route</code>.</p>
 <pre><code><span class="cm">-- custom-routing.lua</span>
 runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"static-backend"</span>,  port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-backend"</span>,     port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"compute-backend"</span>, port = <span class="nb">9003</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"static-backend"</span>,  port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-backend"</span>,     port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"compute-backend"</span>, port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"smart-router"</span>,    port = <span class="nb">8080</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
       backends = { <span class="st">"127.0.0.1:9001"</span>, <span class="st">"127.0.0.1:9002"</span>, <span class="st">"127.0.0.1:9003"</span> },
-      autostart = <span class="kw">true</span> }
+      start = <span class="kw">true</span> }
 }
 
 <span class="kw">function</span> <span class="fn">on_route</span>(method, path)
@@ -2813,16 +2813,16 @@ runtimes = {
 runtimes = {
     <span class="cm">-- Layer 1: Data</span>
     { type = <span class="st">"cache"</span>,  name = <span class="st">"state-store"</span>,   port = CONFIG.base_port,
-      persistent = CONFIG.cache_file, autostart = <span class="kw">true</span> },
+      persistent = CONFIG.cache_file, start = <span class="kw">true</span> },
     <span class="cm">-- Layer 2: Services</span>
-    { type = <span class="st">"server"</span>, name = <span class="st">"auth-service"</span>,  port = CONFIG.base_port + <span class="nb">1</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,  port = CONFIG.base_port + <span class="nb">2</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>, port = CONFIG.base_port + <span class="nb">3</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"auth-service"</span>,  port = CONFIG.base_port + <span class="nb">1</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,  port = CONFIG.base_port + <span class="nb">2</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>, port = CONFIG.base_port + <span class="nb">3</span>, start = <span class="kw">true</span> },
     <span class="cm">-- Layer 3: Gateway</span>
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-gateway"</span>,   port = <span class="nb">8080</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
       backends = { <span class="st">"auth-service"</span>, <span class="st">"user-service"</span>, <span class="st">"order-service"</span> },
-      autostart = <span class="kw">true</span> },
+      start = <span class="kw">true</span> },
 }
 
 <span class="kw">function</span> <span class="fn">on_route</span>(method, path)
@@ -2848,15 +2848,15 @@ runtimes = {
 <pre><code><span class="cm">-- microservices.lua (essential excerpt)</span>
 runtimes = {
     { type = <span class="st">"cache"</span>,  name = <span class="st">"service-cache"</span>,     port = <span class="nb">9005</span>,
-      persistent = <span class="st">"/tmp/micro-cache.bin"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,      port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"product-service"</span>,   port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>,     port = <span class="nb">9003</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"inventory-service"</span>, port = <span class="nb">9004</span>, autostart = <span class="kw">true</span> },
+      persistent = <span class="st">"/tmp/micro-cache.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,      port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"product-service"</span>,   port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>,     port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"inventory-service"</span>, port = <span class="nb">9004</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-gateway"</span>,       port = <span class="nb">8080</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
       backends = { <span class="st">"user-service"</span>, <span class="st">"product-service"</span>, <span class="st">"order-service"</span>, <span class="st">"inventory-service"</span> },
-      autostart = <span class="kw">true</span> },
+      start = <span class="kw">true</span> },
 }
 
 <span class="kw">function</span> <span class="fn">on_route</span>(method, path)
@@ -2879,14 +2879,14 @@ runtimes = {
 <p class="method-desc">3 API replicas behind a round-robin load balancer, plus 2 worker replicas with random distribution. Stop any replica and traffic automatically redistributes. Health tracking via cache.</p>
 <pre><code><span class="cm">-- high-availability.lua (essential excerpt)</span>
 runtimes = {
-    { type = <span class="st">"cache"</span>,  name = <span class="st">"health-store"</span>,    port = <span class="nb">9000</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-1"</span>,   port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-2"</span>,   port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-3"</span>,   port = <span class="nb">9003</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"health-store"</span>,    port = <span class="nb">9000</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-1"</span>,   port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-2"</span>,   port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-3"</span>,   port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-lb"</span>,          port = <span class="nb">8080</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"round-robin"</span>,
       backends = { <span class="st">"api-replica-1"</span>, <span class="st">"api-replica-2"</span>, <span class="st">"api-replica-3"</span> },
-      autostart = <span class="kw">true</span> },
+      start = <span class="kw">true</span> },
 }
 <span class="cm">-- (see full example in examples/advanced/high-availability.lua)</span></code></pre>
 <pre><code>socketley --lua high-availability.lua
@@ -2905,14 +2905,14 @@ socketley stop api-replica-2</code></pre>
 <pre><code><span class="cm">-- logging-pipeline.lua (essential excerpt)</span>
 runtimes = {
     { type = <span class="st">"server"</span>, name = <span class="st">"log-collector"</span>, port = <span class="nb">9999</span>, mode = <span class="st">"in"</span>,
-      write = <span class="st">"/tmp/all-logs.log"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"cache"</span>,  name = <span class="st">"log-metrics"</span>,   port = <span class="nb">9998</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"web-app"</span>,        port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api-app"</span>,        port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
+      write = <span class="st">"/tmp/all-logs.log"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"log-metrics"</span>,   port = <span class="nb">9998</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"web-app"</span>,        port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-app"</span>,        port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"client"</span>, name = <span class="st">"web-log-fwd"</span>,   target = <span class="st">"127.0.0.1:9999"</span>,
-      mode = <span class="st">"out"</span>, autostart = <span class="kw">true</span> },
+      mode = <span class="st">"out"</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"client"</span>, name = <span class="st">"api-log-fwd"</span>,   target = <span class="st">"127.0.0.1:9999"</span>,
-      mode = <span class="st">"out"</span>, autostart = <span class="kw">true</span> },
+      mode = <span class="st">"out"</span>, start = <span class="kw">true</span> },
 }
 <span class="cm">-- (see full example in examples/advanced/logging-pipeline.lua)</span></code></pre>
 <pre><code>socketley --lua logging-pipeline.lua
@@ -2928,12 +2928,12 @@ tail -f /tmp/all-logs.log</code></pre>
 <pre><code><span class="cm">-- development-env.lua (essential excerpt)</span>
 runtimes = {
     { type = <span class="st">"cache"</span>,  name = <span class="st">"dev-db"</span>,    port = <span class="nb">5432</span>,
-      persistent = <span class="st">"/tmp/dev-db.bin"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"dev-api"</span>,   port = <span class="nb">3001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"dev-ws"</span>,    port = <span class="nb">3002</span>, autostart = <span class="kw">true</span> },
+      persistent = <span class="st">"/tmp/dev-db.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"dev-api"</span>,   port = <span class="nb">3001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"dev-ws"</span>,    port = <span class="nb">3002</span>, start = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"dev-proxy"</span>, port = <span class="nb">3000</span>,
       protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
-      backends = { <span class="st">"dev-api"</span>, <span class="st">"dev-ws"</span> }, autostart = <span class="kw">true</span> },
+      backends = { <span class="st">"dev-api"</span>, <span class="st">"dev-ws"</span> }, start = <span class="kw">true</span> },
 }
 
 <span class="kw">function</span> <span class="fn">on_route</span>(method, path)

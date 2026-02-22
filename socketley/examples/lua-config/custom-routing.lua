@@ -16,21 +16,21 @@ runtimes = {
         type = "server",
         name = "static-backend",
         port = 9001,
-        autostart = true
+        start = true
     },
     -- Backend: API server for dynamic content
     {
         type = "server",
         name = "api-backend",
         port = 9002,
-        autostart = true
+        start = true
     },
     -- Backend: Heavy compute tasks
     {
         type = "server",
         name = "compute-backend",
         port = 9003,
-        autostart = true
+        start = true
     },
     -- Smart proxy with Lua routing
     {
@@ -44,7 +44,7 @@ runtimes = {
             "127.0.0.1:9002",  -- 1: api
             "127.0.0.1:9003"   -- 2: compute
         },
-        autostart = true
+        start = true
     }
 }
 

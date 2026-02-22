@@ -17,14 +17,14 @@ runtimes = {
         name = "shared-state",
         port = 9000,
         persistent = "/tmp/shared-state.bin",
-        autostart = true
+        start = true
     },
     -- Server that reads/writes to cache
     {
         type = "server",
         name = "api-server",
         port = 9001,
-        autostart = true
+        start = true
     },
     -- Client that interacts with server
     {
@@ -32,7 +32,7 @@ runtimes = {
         name = "api-client",
         port = 9001,
         target = "127.0.0.1:9001",
-        autostart = true
+        start = true
     }
 }
 

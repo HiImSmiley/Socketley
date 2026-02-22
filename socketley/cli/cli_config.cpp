@@ -165,8 +165,8 @@ int cli_config(int argc, char** argv)
         if (test)
             command += " --test";
 
-        bool autostart = t["autostart"].get_or(false);
-        if (autostart)
+        bool start = t["start"].get_or(false);
+        if (start)
             command += " -s";
 
         std::string response;
