@@ -157,6 +157,9 @@ public:
     void set_on_tick           (std::function<void(double dt_ms)>             cb);
     void set_tick_interval     (uint32_t ms);   // tick period in ms; 0 = use Lua value (default)
 
+    // Cross-runtime pub/sub dispatch (called by runtime_manager on publish)
+    virtual void on_publish_dispatch(std::string_view cache_name, std::string_view channel, std::string_view message);
+
     // Virtual methods for Lua actions (overridden by specific runtimes)
     virtual void lua_send(std::string_view msg) {}
     virtual void lua_broadcast(std::string_view msg) {}

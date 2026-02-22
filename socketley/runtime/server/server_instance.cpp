@@ -1353,3 +1353,49 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
     m_udp_peers.push_back({addr});
     return static_cast<int>(m_udp_peers.size() - 1);
 }
+
+// ─── Lua client enumeration ───
+
+std::vector<int> server_instance::lua_clients() const
+{
+    std::vector<int> result;
+    result.reserve(m_clients.size());
+    for (const auto& [fd, _] : m_clients)
+        result.push_back(fd);
+    return result;
+}
+
+void server_instance::lua_multicast(const std::vector<int>& fds, std::string_view msg)
+{
+    if (!m_loop || m_udp) return;
+    auto shared = std::make_shared<const std::string>(msg);
+    for (int fd : fds)
+    {
+        if (fd < 0 || fd >= MAX_FDS) continue;
+        auto* conn = m_conn_idx[fd];
+        if (!conn || conn->closing) continue;
+        send_to(conn, shared);
+    }
+}
+
+// ─── Lua per-connection metadata ───
+
+void server_instance::lua_set_data(int fd, std::string_view key, std::string_view val)
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    m_conn_idx[fd]->meta[std::string(key)] = std::string(val);
+}
+
+void server_instance::lua_del_data(int fd, std::string_view key)
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    m_conn_idx[fd]->meta.erase(std::string(key));
+}
+
+std::string server_instance::lua_get_data(int fd, std::string_view key) const
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return "";
+    const auto& m = m_conn_idx[fd]->meta;
+    auto it = m.find(std::string(key));
+    return (it != m.end()) ? it->second : "";
+}
