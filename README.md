@@ -125,20 +125,10 @@ socketley stats myapp
 
 ## Installation
 
-### Quick install (latest release)
+### Quick install
 
 ```bash
-curl -s https://api.github.com/repos/HiImSmiley/socketley/releases/latest \
-  | grep -oP '"browser_download_url": "\K[^"]*\.deb' \
-  | xargs curl -fsSLO && sudo dpkg -i socketley_*.deb
-```
-
-Or install a specific version:
-
-```bash
-VERSION=1.0.0
-curl -fsSLO "https://github.com/HiImSmiley/socketley/releases/download/v${VERSION}/socketley_${VERSION}_amd64.deb"
-sudo dpkg -i "socketley_${VERSION}_amd64.deb"
+curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
 ```
 
 ### From source
