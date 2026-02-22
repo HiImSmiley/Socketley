@@ -10,6 +10,7 @@ LOG_FILE="/tmp/test-callbacks-$$.log"
 
 cleanup() {
     "$BIN" stop luasvr 2>/dev/null || true
+    sleep 0.5
     "$BIN" remove luasvr 2>/dev/null || true
     rm -f "$LUA_SCRIPT" "$LOG_FILE"
 }

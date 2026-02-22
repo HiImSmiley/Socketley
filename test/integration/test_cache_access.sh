@@ -9,8 +9,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop ca_server 2>/dev/null || true
-    "$BIN" remove ca_server 2>/dev/null || true
     "$BIN" stop ca_cache 2>/dev/null || true
+    sleep 0.5
+    "$BIN" remove ca_server 2>/dev/null || true
     "$BIN" remove ca_cache 2>/dev/null || true
 }
 trap cleanup EXIT

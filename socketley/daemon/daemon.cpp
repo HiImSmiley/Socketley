@@ -264,6 +264,10 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Load config file (sets log level, metrics port, etc.) before anything else
     uint16_t metrics_port = load_daemon_config(paths.config_path.string());
 
+    // If another daemon is already running on this socket, exit gracefully
+    if (daemon_handler::is_running())
+        return 0;
+
     if (!loop.init())
     {
         LOG_ERROR("failed to init event loop");

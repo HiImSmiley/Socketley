@@ -7,8 +7,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop testsvr 2>/dev/null || true
-    "$BIN" remove testsvr 2>/dev/null || true
     "$BIN" stop autosvr 2>/dev/null || true
+    sleep 0.5
+    "$BIN" remove testsvr 2>/dev/null || true
     "$BIN" remove autosvr 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -47,9 +48,9 @@ assert_ok "create server"
 OUT=$("$BIN" ls 2>&1)
 assert_contains "$OUT" "testsvr"
 
-# Test: run
-OUT=$("$BIN" run testsvr 2>&1) || true
-assert_ok "run server"
+# Test: start
+OUT=$("$BIN" start testsvr 2>&1) || true
+assert_ok "start server"
 sleep 0.2
 
 # Test: ps shows running
@@ -84,6 +85,7 @@ assert_contains "$OUT" "autosvr"
 
 # Cleanup
 "$BIN" stop autosvr 2>/dev/null || true
+sleep 0.5
 "$BIN" remove autosvr 2>/dev/null || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
