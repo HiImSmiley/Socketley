@@ -1057,6 +1057,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         {
             invoke_on_message(msg);
 
+            if (lua() && lua()->has_on_message())
+                break;
+
             if (m_udp)
             {
                 // UDP: broadcast to all peers (exclude handled by caller via addr)
@@ -1134,12 +1137,15 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             {
                 invoke_on_message(msg);
 
-                std::string relay_str;
-                relay_str.reserve(msg.size() + 1);
-                relay_str.append(msg.data(), msg.size());
-                relay_str += '\n';
-                auto relay_msg = std::make_shared<const std::string>(std::move(relay_str));
-                broadcast(relay_msg, sender->fd);
+                if (!(lua() && lua()->has_on_message()))
+                {
+                    std::string relay_str;
+                    relay_str.reserve(msg.size() + 1);
+                    relay_str.append(msg.data(), msg.size());
+                    relay_str += '\n';
+                    auto relay_msg = std::make_shared<const std::string>(std::move(relay_str));
+                    broadcast(relay_msg, sender->fd);
+                }
                 break;
             }
 
