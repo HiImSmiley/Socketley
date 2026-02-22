@@ -40,6 +40,7 @@ public:
     bool has_on_write() const;
     bool has_on_delete() const;
     bool has_on_expire() const;
+    bool has_on_auth() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -56,6 +57,7 @@ public:
     sol::function& on_write()     { return m_on_write; }
     sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
     sol::function& on_expire()    { return m_on_expire; }
+    sol::function& on_auth()      { return m_on_auth; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
 private:
@@ -80,6 +82,7 @@ private:
     sol::function m_on_write;
     sol::function m_on_delete;
     sol::function m_on_expire;
+    sol::function m_on_auth;
     uint32_t m_tick_ms{0};
 };
 
@@ -115,6 +118,7 @@ public:
     bool has_on_write()          const { return false; }
     bool has_on_delete()         const { return false; }
     bool has_on_expire()         const { return false; }
+    bool has_on_auth()           const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     // on_*() callbacks omitted — only called when has_*() returns true,
     // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.

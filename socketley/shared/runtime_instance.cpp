@@ -393,6 +393,22 @@ void runtime_instance::invoke_on_disconnect(int client_id)
 #endif
 }
 
+bool runtime_instance::invoke_on_auth(int client_id)
+{
+#ifndef SOCKETLEY_NO_LUA
+    if (!m_lua || !m_lua->has_on_auth()) return true;  // no hook = allow
+    try {
+        sol::optional<bool> res = m_lua->on_auth()(client_id);
+        return res.value_or(false);  // nil/non-bool → reject (fail-closed)
+    } catch (const sol::error& e) {
+        std::cerr << "[lua] on_auth error: " << e.what() << "\n";
+        return false;  // Lua error → reject (fail-closed)
+    }
+#else
+    return true;
+#endif
+}
+
 void runtime_instance::invoke_on_send(std::string_view msg)
 {
     if (!m_lua || !m_lua->has_on_send())
