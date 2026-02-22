@@ -377,8 +377,8 @@ flags_options() {
     echo "┌────────────────────────┬─────────────────────────────────────┐"
     echo "│ --name <name> | -n     │ Name this daemon instance           │"
     echo "│ --cluster <dir>        │ Enable cluster mode (shared dir)    │"
-    echo "│ --cluster-addr <addr>  │ Override advertised address          │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo "  Host address is set automatically via gethostname()."
     echo ""
 
     echo -e "${BOLD}Cache Flags:${NC}"
