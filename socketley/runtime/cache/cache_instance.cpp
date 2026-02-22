@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <charconv>
+#include <iostream>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
@@ -199,7 +200,18 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     // Periodic TTL sweep timer
     if (req == &m_ttl_req)
     {
-        m_store.sweep_expired();
+        auto expired_keys = m_store.sweep_expired();
+#ifndef SOCKETLEY_NO_LUA
+        if (lua() && lua()->has_on_expire() && !expired_keys.empty())
+        {
+            for (const auto& key : expired_keys)
+            {
+                try { lua()->on_expire()(key); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_expire error: " << e.what() << "\n"; }
+            }
+        }
+#endif
         m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
         return;
     }
@@ -529,13 +541,22 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 return;
             }
             auto key = args.substr(0, space);
+            auto value = args.substr(space + 1);
             m_store.check_expiry(key);
-            if (!m_store.set(key, args.substr(space + 1)))
+            if (!m_store.set(key, value))
                 rb.append("error: type conflict\n", 21);
             else
             {
                 rb.append("ok\n", 3);
                 replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_write())
+                {
+                    try { lua()->on_write()(std::string(key), std::string(value), 0); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                }
+#endif
             }
             break;
         }
@@ -551,6 +572,30 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             }
             else
             {
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_miss())
+                {
+                    try
+                    {
+                        auto res = lua()->on_miss()(std::string(args));
+                        sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
+                        if (fetched && !fetched->empty())
+                        {
+                            int ttl = 0;
+                            sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
+                            if (ttl_opt) ttl = *ttl_opt;
+                            m_store.set(args, *fetched);
+                            if (ttl > 0) m_store.set_expiry(args, ttl);
+                            m_stat_get_hits++;
+                            rb.append(*fetched);
+                            rb.push_back('\n');
+                            break;
+                        }
+                    }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_miss error: " << e.what() << "\n"; }
+                }
+#endif
                 m_stat_get_misses++;
                 rb.append("nil\n", 4);
             }
@@ -568,6 +613,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 rb.append("ok\n", 3);
                 replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_delete())
+                {
+                    try { lua()->on_delete_cb()(std::string(args)); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
+                }
+#endif
             }
             else
                 rb.append("nil\n", 4);
@@ -715,6 +768,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 std::string_view val = (sp2 == std::string_view::npos) ? rest : rest.substr(0, sp2);
                 m_store.check_expiry(key);
                 m_store.set(key, val);
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_write())
+                {
+                    try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                }
+#endif
                 if (sp2 == std::string_view::npos) break;
                 rest = rest.substr(sp2 + 1);
             }
@@ -1117,7 +1178,18 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             if (key.empty() || val.empty()) { rb.append("usage: setnx key value\n", 23); return; }
             bool did_set = m_store.setnx(key, val);
             rb.append(did_set ? "1\n" : "0\n");
-            if (did_set) replicate_command(line);
+            if (did_set)
+            {
+                replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_write())
+                {
+                    try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                }
+#endif
+            }
             break;
         }
         case fnv1a("setex"):
@@ -1133,6 +1205,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             m_store.set_expiry(key, sec);
             rb.append("ok\n", 3);
             replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(key), std::string(val), sec); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("psetex"):
@@ -1151,6 +1231,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             m_store.set_expiry_ms(key, ms);
             rb.append("ok\n", 3);
             replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("pexpire"):
@@ -1766,6 +1854,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (ex_sec > 0) m_store.set_expiry(args[1], ex_sec);
             else if (px_ms > 0) m_store.set_expiry_ms(args[1], px_ms);
             resp::encode_ok_into(rb);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(args[1]), std::string(args[2]), ex_sec); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("get"):
@@ -1773,8 +1869,39 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             const std::string* val = m_store.get_ptr(args[1]);
-            if (val) { m_stat_get_hits++; resp::encode_bulk_into(rb, *val); }
-            else { m_stat_get_misses++; resp::encode_null_into(rb); }
+            if (val)
+            {
+                m_stat_get_hits++;
+                resp::encode_bulk_into(rb, *val);
+            }
+            else
+            {
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_miss())
+                {
+                    try
+                    {
+                        auto res = lua()->on_miss()(std::string(args[1]));
+                        sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
+                        if (fetched && !fetched->empty())
+                        {
+                            int ttl = 0;
+                            sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
+                            if (ttl_opt) ttl = *ttl_opt;
+                            m_store.set(args[1], *fetched);
+                            if (ttl > 0) m_store.set_expiry(args[1], ttl);
+                            m_stat_get_hits++;
+                            resp::encode_bulk_into(rb, *fetched);
+                            break;
+                        }
+                    }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_miss error: " << e.what() << "\n"; }
+                }
+#endif
+                m_stat_get_misses++;
+                resp::encode_null_into(rb);
+            }
             break;
         }
         case fnv1a("del"):
@@ -1785,7 +1912,18 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             for (int i = 1; i < argc; i++)
             {
                 m_store.check_expiry(args[i]);
-                if (m_store.del(args[i])) deleted++;
+                if (m_store.del(args[i]))
+                {
+                    deleted++;
+#ifndef SOCKETLEY_NO_LUA
+                    if (lua() && lua()->has_on_delete())
+                    {
+                        try { lua()->on_delete_cb()(std::string(args[i])); }
+                        catch (const sol::error& e)
+                        { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
+                    }
+#endif
+                }
             }
             resp::encode_integer_into(rb, deleted);
             break;
@@ -1901,6 +2039,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             {
                 m_store.check_expiry(args[i]);
                 m_store.set(args[i], args[i+1]);
+#ifndef SOCKETLEY_NO_LUA
+                if (lua() && lua()->has_on_write())
+                {
+                    try { lua()->on_write()(std::string(args[i]), std::string(args[i+1]), 0); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                }
+#endif
             }
             resp::encode_ok_into(rb);
             break;
@@ -2171,6 +2317,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             bool did_set = m_store.setnx(args[1], args[2]);
             resp::encode_integer_into(rb, did_set ? 1 : 0);
+#ifndef SOCKETLEY_NO_LUA
+            if (did_set && lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(args[1]), std::string(args[2]), 0); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("setex"):
@@ -2184,6 +2338,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             m_store.set_expiry(args[1], sec);
             resp::encode_ok_into(rb);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(args[1]), std::string(args[3]), sec); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("psetex"):
@@ -2197,6 +2359,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             m_store.set_expiry_ms(args[1], ms);
             resp::encode_ok_into(rb);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(std::string(args[1]), std::string(args[3]), 0); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("pexpire"):

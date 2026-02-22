@@ -36,6 +36,10 @@ public:
     bool has_on_master_auth() const;
     bool has_on_client_message() const;
     bool has_on_tick() const;
+    bool has_on_miss() const;
+    bool has_on_write() const;
+    bool has_on_delete() const;
+    bool has_on_expire() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -48,6 +52,10 @@ public:
     sol::function& on_master_auth() { return m_on_master_auth; }
     sol::function& on_client_message() { return m_on_client_message; }
     sol::function& on_tick() { return m_on_tick; }
+    sol::function& on_miss()      { return m_on_miss; }
+    sol::function& on_write()     { return m_on_write; }
+    sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
+    sol::function& on_expire()    { return m_on_expire; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
 private:
@@ -68,6 +76,10 @@ private:
     sol::function m_on_master_auth;
     sol::function m_on_client_message;
     sol::function m_on_tick;
+    sol::function m_on_miss;
+    sol::function m_on_write;
+    sol::function m_on_delete;
+    sol::function m_on_expire;
     uint32_t m_tick_ms{0};
 };
 
@@ -99,6 +111,10 @@ public:
     bool has_on_master_auth()    const { return false; }
     bool has_on_client_message() const { return false; }
     bool has_on_tick()           const { return false; }
+    bool has_on_miss()           const { return false; }
+    bool has_on_write()          const { return false; }
+    bool has_on_delete()         const { return false; }
+    bool has_on_expire()         const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     // on_*() callbacks omitted — only called when has_*() returns true,
     // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.

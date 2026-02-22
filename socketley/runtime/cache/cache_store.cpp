@@ -437,10 +437,11 @@ void cache_store::check_expiry(std::string_view key)
     if (auto hit = m_hashes.find(key); hit != m_hashes.end()) { m_hashes.erase(hit); return; }
 }
 
-void cache_store::sweep_expired()
+std::vector<std::string> cache_store::sweep_expired()
 {
+    std::vector<std::string> expired_names;
     if (m_expiry.empty())
-        return;
+        return expired_names;
 
     auto now = std::chrono::steady_clock::now();
     std::vector<std::string> expired;
@@ -450,7 +451,11 @@ void cache_store::sweep_expired()
             expired.push_back(key);
     }
     for (const auto& key : expired)
+    {
+        expired_names.push_back(key);
         del(key);
+    }
+    return expired_names;
 }
 
 bool cache_store::set_expiry_ms(std::string_view key, int64_t ms)

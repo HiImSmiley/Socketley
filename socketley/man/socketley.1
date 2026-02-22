@@ -728,6 +728,71 @@ redis-cli -p 9000 SET mykey myval
 redis-cli -p 9000 GET mykey
 redis-cli -p 9000 SUBSCRIBE news
 .fi
+.SS Database Backend
+Cache runtimes support four Lua callbacks for DB-backed operation.
+Attach a Lua script with
+.BR \-\-lua
+and implement whichever callbacks you need using any Lua DB library
+(luasql-mysql, luasql-postgres, lsqlite3, etc.).
+.PP
+.TS
+tab(|);
+l l l.
+Callback|Signature|When called
+_
+on_miss(key)|→ value [, ttl_seconds]|GET returns nil — fetch from DB
+on_write(key, value, ttl)|→ nothing|After successful SET/SETEX/SETNX/MSET
+on_delete(key)|→ nothing|After DEL — delete from DB
+on_expire(key)|→ nothing|After TTL sweep removes key
+.TE
+.PP
+\fBon_miss\fR may return two values (Lua multi-return): the fetched string and an
+optional TTL in seconds.
+If the value is nil or empty, the GET returns nil to the client normally.
+If a value is returned, it is inserted into the cache and returned to
+the client transparently (read-through / lazy population).
+.PP
+\fBon_write\fR is called synchronously on the event loop thread.
+For write-heavy loads, use the write-behind pattern: buffer writes in Lua
+inside \fBon_write\fR and flush to the DB in \fBon_tick\fR every few seconds.
+This decouples SET latency from DB latency entirely.
+.PP
+Example (SQLite write-behind):
+.nf
+tick_ms = 2000
+local db, pending = nil, {}
+
+function on_start()
+    local sq = require("lsqlite3")
+    db = sq.open("/tmp/cache.db")
+    db:exec("CREATE TABLE IF NOT EXISTS cache_kv (key TEXT PRIMARY KEY, value TEXT)")
+end
+
+function on_miss(key)
+    for row in db:nrows("SELECT value FROM cache_kv WHERE key=" .. db:quote(key)) do
+        return row.value, 300  -- value + 300 s TTL
+    end
+end
+
+function on_write(key, value, ttl)
+    pending[key] = value  -- buffer
+end
+
+function on_tick(dt)
+    for k, v in pairs(pending) do
+        db:exec("INSERT OR REPLACE INTO cache_kv(key,value) VALUES("..db:quote(k)..","..db:quote(v)..")")
+    end
+    pending = {}
+end
+
+function on_delete(key)
+    db:exec("DELETE FROM cache_kv WHERE key="..db:quote(key))
+end
+.fi
+.PP
+See
+.B socketley/examples/cache/db-backend.lua
+for a full example with MySQL, Postgres, and SQLite backends.
 .SS Replication
 Cache runtimes support leader-follower replication.
 .PP
