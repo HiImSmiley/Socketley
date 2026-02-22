@@ -19,6 +19,9 @@ Round-robin and random load balancing across backends.
 ### TCP Proxy
 Raw TCP byte forwarding without HTTP parsing.
 
+### Group Discovery
+Dynamic backend discovery using runtime groups (`-g` and `@group`).
+
 ### Multi-Backend Lua
 Custom routing logic with Lua scripts.
 
@@ -37,6 +40,10 @@ Backend Request: GET /api/users HTTP/1.1
 Backends can be specified as:
 - IP:Port: `127.0.0.1:9001`
 - Runtime name: `api-server` (resolved via runtime_manager)
+- Group reference: `@api` (dynamically discovers all running members of group `api`)
+
+Group backends are resolved at connection time, so new members are picked up
+automatically without restarting the proxy.
 
 ### Load Balancing Strategies
 

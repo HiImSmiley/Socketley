@@ -56,6 +56,7 @@
         <li><a href="#concept-cache">Cache Attachment</a></li>
         <li><a href="#concept-http">HTTP Serving</a></li>
         <li><a href="#concept-names">Runtime Name Networking</a></li>
+        <li><a href="#concept-groups">Group-Based Discovery</a></li>
         <li><a href="#concept-lua">Writing Lua Scripts</a></li>
       </ul></li>
       <li><a href="#cli-commands">CLI Commands</a><ul>
@@ -204,6 +205,7 @@
       <li><a href="#ex-proxy-cat">Proxy</a><ul>
         <li><a href="#ex-http-proxy">HTTP Proxy</a></li>
         <li><a href="#ex-load-balancer">Load Balancer</a></li>
+        <li><a href="#ex-group-discovery">Group Discovery</a></li>
         <li><a href="#ex-tcp-proxy">TCP Proxy</a></li>
         <li><a href="#ex-name-backend">Named Backends</a></li>
         <li><a href="#ex-lua-routing">Lua Routing</a></li>
@@ -321,7 +323,7 @@ d4e5f6    chat    server  9001  0     -         Up 30 sec    30 sec ago</code></
 <li><strong>Want Lua scripting?</strong> &rarr; <a href="#concept-lua">Writing Lua Scripts</a></li>
 <li><strong>Building a web app?</strong> &rarr; <a href="#concept-http">HTTP Serving</a> (serve HTML + auto WebSocket)</li>
 <li><strong>Need a cache?</strong> &rarr; <a href="#concept-cache">Cache Attachment</a></li>
-<li><strong>Load balancing?</strong> &rarr; <a href="#concept-names">Runtime Name Networking</a></li>
+<li><strong>Load balancing?</strong> &rarr; <a href="#concept-names">Runtime Name Networking</a> and <a href="#concept-groups">Group Discovery</a></li>
 <li><strong>See all examples</strong> &rarr; <a href="#ex-getting-started">Examples tab</a></li>
 <li><strong>Full Lua API reference</strong> &rarr; <a href="#lua-scripting">Lua tab</a></li>
 </ul>
@@ -463,6 +465,29 @@ socketley create proxy gateway -p 8080 --backend api1,api2,api3 -s</code></pre>
 
 <p><strong>Why this matters:</strong> You can build entire architectures without a single hardcoded address. Names are stable identifiers; ports are implementation details.</p>
 
+<h3 id="concept-groups">Group-Based Discovery</h3>
+<p>Groups take runtime name networking one step further: tag runtimes with <code>-g &lt;name&gt;</code>, then use <code>@groupname</code> as a proxy backend. The proxy discovers all running members of that group <strong>at connection time</strong> &mdash; no restarts, no config changes.</p>
+
+<pre><code><span class="cm"># Tag servers with a group</span>
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+
+<span class="cm"># Proxy targets the group &mdash; discovers members dynamically</span>
+socketley create proxy gw -p 8080 --backend @api -s
+
+<span class="cm"># Add a new member while the proxy is running &mdash; no restart needed</span>
+socketley create server api3 -p 9003 -g api -s
+<span class="cm"># Next connection is automatically routed to api1, api2, or api3</span></code></pre>
+
+<p><strong>How it works:</strong> When a new connection arrives at the proxy, <code>@api</code> is expanded into the list of all <em>running</em> runtimes tagged with group <code>api</code>. The configured strategy (round-robin, random, lua) then picks from that pool. Stopped members are excluded automatically.</p>
+
+<p><strong>Mix and match:</strong> You can combine group backends with static addresses and runtime names in the same proxy:</p>
+<pre><code>socketley create proxy gw -p 8080 --backend @api,10.0.0.5:9000,legacy-server -s</code></pre>
+
+<p><strong>Use cases:</strong> Auto-scaling (Lua scripts creating new servers join the group automatically), blue-green deploys (swap group tags with <code>socketley edit</code>), microservice pools, game lobby routing.</p>
+
+<div class="info-box"><strong>Naming:</strong> The <code>@</code> prefix distinguishes group references from runtime names and IP:port addresses. Group names can be any non-empty string.</div>
+
 <h3 id="concept-lua">Writing Lua Scripts</h3>
 <p>Lua scripts give you full control over how your runtimes behave. There are two ways to use them:</p>
 
@@ -520,7 +545,8 @@ socketley create proxy gateway -p 8080 --backend api1,api2,api3 -s</code></pre>
 <pre><code>socketley create server myapp -p 9000 -s
 socketley create cache store -p 9001 --persistent /tmp/data.bin --maxmemory 256M -s
 socketley create client bot -t 127.0.0.1:9000 --reconnect -s
-socketley create proxy gw -p 8080 --backend api1,api2 -s</code></pre>
+socketley create server api1 -p 9001 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s</code></pre>
 
 <div class="cli-card" id="cmd-start-stop">
   <div class="cli-name">socketley start &lt;name|pattern&gt;... [-i]</div>
@@ -588,6 +614,7 @@ d4e5f6    my-client       client  -       1     -           Up 45 minutes       
 <tr><td>--drain</td><td>Graceful shutdown &mdash; flush pending writes before closing connections</td></tr>
 <tr><td>--tls</td><td>Enable TLS encryption (requires <code>--cert</code> + <code>--key</code>, or <code>--ca</code>)</td></tr>
 <tr><td>--cert / --key / --ca</td><td>TLS certificate, key, CA paths (PEM format)</td></tr>
+<tr><td>-g / --group &lt;name&gt;</td><td>Assign to a <a href="#concept-groups">group</a> for dynamic proxy backend discovery via <code>@groupname</code></td></tr>
 </tbody></table>
 
 <h3 id="flags-server">Server Flags</h3>
@@ -622,7 +649,7 @@ d4e5f6    my-client       client  -       1     -           Up 45 minutes       
 
 <h3 id="flags-proxy">Proxy Flags</h3>
 <table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
-<tr><td>--backend &lt;addr&gt;</td><td>Comma-separated backends: IP:port or runtime names</td></tr>
+<tr><td>--backend &lt;addr&gt;</td><td>Comma-separated backends: IP:port, runtime names, or <code>@group</code> for <a href="#concept-groups">dynamic group discovery</a></td></tr>
 <tr><td>--strategy &lt;s&gt;</td><td><code>round-robin</code> (default), <code>random</code>, or <code>lua</code></td></tr>
 <tr><td>--protocol &lt;p&gt;</td><td><code>http</code> (default, per-request routing) or <code>tcp</code> (raw byte forwarding, connection-sticky)</td></tr>
 </tbody></table>
@@ -669,20 +696,26 @@ socketley create client bot -t 127.0.0.1:9000 --reconnect --lua bot.lua -s
 socketley create client listener -t 127.0.0.1:9000 --mode in -b -s</code></pre>
 
 <h3 id="rt-proxy">Proxy</h3>
-<p>An HTTP or TCP reverse proxy that distributes traffic across backend servers. Backends can be IP:port addresses or runtime names &mdash; no hardcoded ports needed.</p>
+<p>An HTTP or TCP reverse proxy that distributes traffic across backend servers. Backends can be IP:port addresses, runtime names, or <code>@group</code> references for dynamic discovery.</p>
 
 <ul>
 <li><strong>Runtime name backends:</strong> <code>--backend api1,api2</code> instead of <code>--backend 127.0.0.1:9001,127.0.0.1:9002</code>.</li>
+<li><strong>Group discovery:</strong> <code>--backend @api</code> dynamically routes to all running members of group <code>api</code>. New members are picked up at connection time &mdash; no proxy restart needed. See <a href="#concept-groups">Group-Based Discovery</a>.</li>
 <li><strong>Load balancing:</strong> Round-robin, random, or Lua-based custom routing via <code>on_route(method, path)</code>.</li>
 <li><strong>Protocol modes:</strong> <code>http</code> for per-request routing, <code>tcp</code> for raw byte forwarding (connection-sticky).</li>
 <li><strong>Data hooks:</strong> <code>on_proxy_request</code> and <code>on_proxy_response</code> Lua callbacks let you inspect/modify/drop traffic in flight.</li>
 </ul>
 
-<pre><code><span class="cm"># Load balancer with runtime name backends</span>
+<pre><code><span class="cm"># Dynamic group discovery &mdash; proxy auto-discovers backends</span>
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s
+
+<span class="cm"># Load balancer with runtime name backends</span>
 socketley create proxy lb -p 8080 --backend api1,api2,api3 -s
 
 <span class="cm"># Lua-routed HTTP proxy</span>
-socketley create proxy gw -p 8080 --backend api1,api2 --strategy lua --lua router.lua -s
+socketley create proxy gw2 -p 8081 --backend api1,api2 --strategy lua --lua router.lua -s
 
 <span class="cm"># Raw TCP proxy</span>
 socketley create proxy tcp-gw -p 8080 --backend 10.0.0.1:9000 --protocol tcp -s</code></pre>
@@ -792,12 +825,12 @@ socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pr
 <h3 id="config-runtimes">The runtimes Table</h3>
 <p>Orchestration files define runtimes in a Lua table. All CLI flags have table equivalents:</p>
 <pre><code>runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, cache_name = <span class="st">"store"</span>,
-      http = <span class="st">"./public"</span>, http_cache = <span class="kw">true</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, group = <span class="st">"web"</span>,
+      cache_name = <span class="st">"store"</span>, http = <span class="st">"./public"</span>, http_cache = <span class="kw">true</span>, autostart = <span class="kw">true</span> },
     { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, persistent = <span class="st">"/tmp/data.bin"</span>,
       maxmemory = <span class="st">"256M"</span>, eviction = <span class="st">"allkeys-lru"</span>, resp = <span class="kw">true</span>, autostart = <span class="kw">true</span> },
     { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,    port = <span class="nb">8080</span>,
-      backends = { <span class="st">"api"</span> }, strategy = <span class="st">"round-robin"</span>, autostart = <span class="kw">true</span> },
+      backends = { <span class="st">"@web"</span> }, strategy = <span class="st">"round-robin"</span>, autostart = <span class="kw">true</span> },
 }</code></pre>
 <table><thead><tr><th>Key</th><th>Type</th><th>Description</th></tr></thead><tbody>
 <tr><td>type</td><td>string</td><td>Required. <code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
@@ -815,7 +848,8 @@ socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pr
 <tr><td>eviction</td><td>string</td><td>Eviction policy: <code>"noeviction"</code>, <code>"allkeys-lru"</code>, <code>"allkeys-random"</code></td></tr>
 <tr><td>resp</td><td>boolean</td><td>Force RESP2 protocol mode (cache)</td></tr>
 <tr><td>replicate</td><td>string</td><td>Leader address for cache replication (<code>"host:port"</code>)</td></tr>
-<tr><td>backends</td><td>table</td><td>Proxy backends array (IP:port or runtime names)</td></tr>
+<tr><td>group</td><td>string</td><td>Group tag for <a href="#concept-groups">dynamic proxy discovery</a> (<code>-g</code>)</td></tr>
+<tr><td>backends</td><td>table</td><td>Proxy backends array (IP:port, runtime names, or <code>"@group"</code>)</td></tr>
 <tr><td>strategy</td><td>string</td><td>Proxy strategy: <code>"round-robin"</code>, <code>"random"</code>, <code>"lua"</code></td></tr>
 <tr><td>protocol</td><td>string</td><td>Proxy protocol: <code>"http"</code> or <code>"tcp"</code></td></tr>
 <tr><td>udp</td><td>boolean</td><td>UDP mode (server/client)</td></tr>
@@ -899,19 +933,22 @@ socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pr
 <span class="kw">end</span></code></pre>
 <pre><code>socketley create server ctrl -p 9000 --mode master --master-forward --lua master.lua -s</code></pre>
 
-<h3 id="ex-proxy">Proxy with Lua Routing</h3>
+<h3 id="ex-proxy">Proxy with Group Discovery</h3>
 <pre><code>runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"static"</span>, port = <span class="nb">9001</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,    port = <span class="nb">9002</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,     port = <span class="nb">8080</span>,
-      strategy = <span class="st">"lua"</span>, backends = { <span class="st">"static"</span>, <span class="st">"api"</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api1"</span>, port = <span class="nb">9001</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api2"</span>, port = <span class="nb">9002</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,   port = <span class="nb">8080</span>,
+      backends = { <span class="st">"@api"</span> }, strategy = <span class="st">"round-robin"</span>,
       autostart = <span class="kw">true</span> }
 }
-<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
-    <span class="kw">if</span> path:match(<span class="st">"^/static/"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">0</span> <span class="kw">end</span>
-    <span class="kw">return</span> <span class="nb">1</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="cm">-- Scale up dynamically: new members join the group automatically</span>
+    socketley.create(<span class="st">"server"</span>, <span class="st">"api3"</span>, {
+        port = <span class="nb">9003</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span>
+    })
 <span class="kw">end</span></code></pre>
-<pre><code>socketley --lua smart-router.lua</code></pre>
+<pre><code>socketley --lua group-setup.lua</code></pre>
 
 </main>
 
@@ -2029,7 +2066,7 @@ socketley create server srv-out -p 9003 --mode out -s</code></pre>
 
 <!-- ── Proxy ── -->
 <h2 id="ex-proxy-cat">Proxy</h2>
-<p>Reverse proxying, load balancing, and custom Lua routing. Backends can be IP:port addresses or runtime names.</p>
+<p>Reverse proxying, load balancing, group-based discovery, and custom Lua routing. Backends can be IP:port addresses, runtime names, or <code>@group</code> references.</p>
 
 <div class="method-card" id="ex-http-proxy">
 <div class="method-header">
@@ -2059,6 +2096,31 @@ socketley create proxy lb -p 8080 \
     --strategy round-robin --protocol http -s
 
 <span class="cm"># Requests cycle: api-1 → api-2 → api-3 → api-1 → ...</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-group-discovery">
+<div class="method-header">
+  <span class="method-name">Group Discovery</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Tag runtimes with <code>-g &lt;group&gt;</code> and use <code>@group</code> as a proxy backend. The proxy discovers all running group members <strong>at connection time</strong> &mdash; add or remove members dynamically without touching the proxy.</p>
+<pre><code><span class="cm"># Tag servers with a group</span>
+socketley create server api-1 -p 9001 -g api -s
+socketley create server api-2 -p 9002 -g api -s
+
+<span class="cm"># Proxy discovers group members dynamically</span>
+socketley create proxy gw -p 8080 --backend @api --strategy round-robin -s
+
+<span class="cm"># Scale up: add a new member without restarting the proxy</span>
+socketley create server api-3 -p 9003 -g api -s
+<span class="cm"># Next connection automatically includes api-3 in the pool</span>
+
+<span class="cm"># Scale down: stop a member and it's excluded automatically</span>
+socketley stop api-2
+<span class="cm"># Proxy routes only to api-1 and api-3</span>
+
+<span class="cm"># Mix groups with static backends</span>
+socketley create proxy gw2 -p 8081 --backend @api,10.0.0.5:9000 -s</code></pre>
 </div>
 
 <div class="method-card" id="ex-tcp-proxy">
