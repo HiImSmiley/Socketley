@@ -21,12 +21,13 @@ runtimes = {
         autostart = true
     },
 
-    -- API Service - 3 replicas
+    -- API Service - 3 replicas (group: api)
     {
         type = "server",
         name = "api-replica-1",
         port = 9001,
         mode = "inout",
+        group = "api",
         autostart = true
     },
     {
@@ -34,6 +35,7 @@ runtimes = {
         name = "api-replica-2",
         port = 9002,
         mode = "inout",
+        group = "api",
         autostart = true
     },
     {
@@ -41,30 +43,28 @@ runtimes = {
         name = "api-replica-3",
         port = 9003,
         mode = "inout",
+        group = "api",
         autostart = true
     },
 
-    -- Load Balancer
+    -- Load Balancer — discovers API replicas via @api group
     {
         type = "proxy",
         name = "api-lb",
         port = 8080,
         protocol = "http",
         strategy = "round-robin",
-        backends = {
-            "api-replica-1",
-            "api-replica-2",
-            "api-replica-3"
-        },
+        backends = { "@api" },
         autostart = true
     },
 
-    -- Worker Service - 2 replicas
+    -- Worker Service - 2 replicas (group: workers)
     {
         type = "server",
         name = "worker-replica-1",
         port = 9011,
         mode = "inout",
+        group = "workers",
         autostart = true
     },
     {
@@ -72,20 +72,18 @@ runtimes = {
         name = "worker-replica-2",
         port = 9012,
         mode = "inout",
+        group = "workers",
         autostart = true
     },
 
-    -- Worker Load Balancer (random for stateless work)
+    -- Worker Load Balancer — discovers workers via @workers group
     {
         type = "proxy",
         name = "worker-lb",
         port = 8081,
         protocol = "tcp",
         strategy = "random",
-        backends = {
-            "worker-replica-1",
-            "worker-replica-2"
-        },
+        backends = { "@workers" },
         autostart = true
     }
 }
@@ -103,11 +101,12 @@ function on_start()
         socketley.log("╔════════════════════════════════════════════╗")
         socketley.log("║        High Availability Setup             ║")
         socketley.log("╠════════════════════════════════════════════╣")
-        socketley.log("║  API LB:    http://localhost:8080          ║")
-        socketley.log("║  Worker LB: tcp://localhost:8081           ║")
+        socketley.log("║  API LB:    http://localhost:8080 (@api)   ║")
+        socketley.log("║  Worker LB: tcp://localhost:8081 (@workers)║")
         socketley.log("╠════════════════════════════════════════════╣")
-        socketley.log("║  API Replicas: 3 (round-robin)             ║")
-        socketley.log("║  Worker Replicas: 2 (random)               ║")
+        socketley.log("║  API Replicas: 3 (round-robin, @api)       ║")
+        socketley.log("║  Worker Replicas: 2 (random, @workers)     ║")
+        socketley.log("║  Groups enable dynamic scaling!             ║")
         socketley.log("╚════════════════════════════════════════════╝")
     end
 
@@ -154,14 +153,18 @@ Test Load Balancing:
   for i in {1..10}; do curl -s localhost:8080/api-lb/test; done
 
 Simulate Failover:
-  # Stop one replica
+  # Stop one replica — proxy excludes it automatically via @api group
   socketley stop api-replica-2
 
   # Traffic redistributes to remaining replicas
   for i in {1..6}; do curl -s localhost:8080/api-lb/test; done
 
-  # Restore replica
+  # Restore replica — proxy picks it up on next connection
   socketley start api-replica-2
+
+Scale Up (no proxy restart needed):
+  socketley create server api-replica-4 -p 9004 -g api -s
+  # api-lb automatically includes api-replica-4 via @api group
 
 Cleanup:
   socketley stop api-lb worker-lb api-replica-1 api-replica-2 api-replica-3 worker-replica-1 worker-replica-2 health-store

@@ -33,43 +33,50 @@ runtimes = {
         autostart = true
     },
 
-    -- User Service
+    -- User Service (group: users)
     {
         type = "server",
         name = "user-service",
         port = services.users.port,
         mode = "inout",
+        group = "users",
         autostart = true
     },
 
-    -- Product Service
+    -- Product Service (group: products)
     {
         type = "server",
         name = "product-service",
         port = services.products.port,
         mode = "inout",
+        group = "products",
         autostart = true
     },
 
-    -- Order Service
+    -- Order Service (group: orders)
     {
         type = "server",
         name = "order-service",
         port = services.orders.port,
         mode = "inout",
+        group = "orders",
         autostart = true
     },
 
-    -- Inventory Service
+    -- Inventory Service (group: inventory)
     {
         type = "server",
         name = "inventory-service",
         port = services.inventory.port,
         mode = "inout",
+        group = "inventory",
         autostart = true
     },
 
-    -- API Gateway
+    -- API Gateway — uses runtime names for Lua-routed backends,
+    -- but each service is also grouped for horizontal scaling.
+    -- To scale a service, just add more servers to its group:
+    --   socketley create server user-service-2 -p 9006 -g users -s
     {
         type = "proxy",
         name = "api-gateway",
