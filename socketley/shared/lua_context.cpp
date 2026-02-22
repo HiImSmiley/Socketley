@@ -77,7 +77,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_write  = m_lua["on_write"];
     m_on_delete = m_lua["on_delete"];
     m_on_expire = m_lua["on_expire"];
-    m_on_auth   = m_lua["on_auth"];
+    m_on_auth       = m_lua["on_auth"];
+    m_on_websocket  = m_lua["on_websocket"];
 
     return true;
 }
@@ -96,7 +97,8 @@ bool lua_context::has_on_miss()   const { return m_on_miss.valid(); }
 bool lua_context::has_on_write()  const { return m_on_write.valid(); }
 bool lua_context::has_on_delete() const { return m_on_delete.valid(); }
 bool lua_context::has_on_expire() const { return m_on_expire.valid(); }
-bool lua_context::has_on_auth()   const { return m_on_auth.valid(); }
+bool lua_context::has_on_auth()       const { return m_on_auth.valid(); }
+bool lua_context::has_on_websocket()  const { return m_on_websocket.valid(); }
 
 void lua_context::update_self_state(const char* state_str)
 {
@@ -470,6 +472,16 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
     self["peer_ip"] = [owner](int client_id) -> std::string {
         return static_cast<server_instance*>(owner)->lua_peer_ip(client_id);
+    };
+    self["ws_headers"] = [owner, this](int client_id) -> sol::object {
+        auto h = static_cast<server_instance*>(owner)->lua_ws_headers(client_id);
+        if (!h.is_websocket) return sol::nil;
+        sol::table t = m_lua.create_table();
+        if (!h.cookie.empty())   t["cookie"]        = h.cookie;
+        if (!h.origin.empty())   t["origin"]        = h.origin;
+        if (!h.protocol.empty()) t["protocol"]      = h.protocol;
+        if (!h.auth.empty())     t["authorization"] = h.auth;
+        return t;
     };
 }
 

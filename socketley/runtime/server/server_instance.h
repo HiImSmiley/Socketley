@@ -39,6 +39,12 @@ struct server_connection
     // WebSocket auto-detect state
     ws_state ws{ws_unknown};
 
+    // WebSocket handshake headers (non-empty only for ws_active connections)
+    std::string ws_cookie;
+    std::string ws_origin;
+    std::string ws_protocol;  // Sec-WebSocket-Protocol
+    std::string ws_auth;      // Authorization
+
     // Rate limiting (token bucket)
     double rl_tokens{0.0};
     double rl_max{0.0};
@@ -80,6 +86,12 @@ public:
     void        lua_disconnect(int client_fd);
     std::string lua_peer_ip(int client_fd);
 
+    struct ws_headers_result {
+        bool is_websocket{false};
+        std::string cookie, origin, protocol, auth;
+    };
+    ws_headers_result lua_ws_headers(int client_fd) const;
+
     // Stats
     std::string get_stats() const override;
 
@@ -106,6 +118,7 @@ private:
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
+    void invoke_on_websocket(int fd);
 
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
