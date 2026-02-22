@@ -115,6 +115,23 @@ body {
 [data-theme="light"] .tab-btn:hover { color: #333; }
 [data-theme="light"] .tab-btn.active { background: #4361ee; color: #fff; }
 
+/* ===== Lua Sub-tab Switcher (API | Addons) ===== */
+.sub-tab-switcher {
+  display: flex; margin: 0 16px 10px; background: #0d0d1e;
+  border: 1px solid #1e1e3e; border-radius: 6px; padding: 2px; gap: 2px;
+}
+.sub-tab-btn {
+  flex: 1; padding: 5px 8px; border: none; background: transparent;
+  color: #6666aa; font-size: 12px; font-weight: 600; border-radius: 5px;
+  cursor: pointer; transition: background .15s, color .15s; letter-spacing: .2px;
+}
+.sub-tab-btn:hover { color: #aaa; }
+.sub-tab-btn.active { background: #2a2a5e; color: #b0b0ff; }
+[data-theme="light"] .sub-tab-switcher { background: #e8e8f5; border-color: #c8c8e0; }
+[data-theme="light"] .sub-tab-btn { color: #888; }
+[data-theme="light"] .sub-tab-btn:hover { color: #444; }
+[data-theme="light"] .sub-tab-btn.active { background: #d0d0f0; color: #4361ee; }
+
 /* ===== Nav ===== */
 .sidebar nav ul { list-style: none; }
 .sidebar nav > ul > li > a {

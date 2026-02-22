@@ -18,34 +18,70 @@ themeToggle.addEventListener('click', () => {
   }
 });
 
-// ─── Tab Switching ───
-const tabBtns = document.querySelectorAll('.tab-btn');
-const tabs    = ['socketley', 'lua', 'addons'];
+// ─── Tab / Sub-tab Switching ───
+const tabBtns    = document.querySelectorAll('.tab-btn');
+const subTabBtns = document.querySelectorAll('.sub-tab-btn');
+const luaSubTabs = document.getElementById('luaSubTabs');
 
-function navEl(t)     { return document.getElementById('navList-' + t); }
-function contentEl(t) { return document.getElementById('content-' + t); }
+let currentTab    = 'socketley';
+let currentSubTab = 'api';   // 'api' | 'addons'
 
-function getActiveNav()     { return tabs.map(navEl).find(el => el && el.style.display !== 'none') || navEl('socketley'); }
-function getActiveContent() { return tabs.map(contentEl).find(el => el && el.style.display !== 'none') || contentEl('socketley'); }
+function navEl(id)     { return document.getElementById('navList-' + id); }
+function contentEl(id) { return document.getElementById('content-' + id); }
 
-function activateTab(tab) {
-  tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  tabs.forEach(t => {
-    const n = navEl(t), c = contentEl(t);
-    const show = t === tab ? '' : 'none';
+function getActiveNav() {
+  if (currentTab === 'lua') return navEl(currentSubTab === 'addons' ? 'addons' : 'lua');
+  return navEl('socketley');
+}
+function getActiveContent() {
+  if (currentTab === 'lua') return contentEl(currentSubTab === 'addons' ? 'addons' : 'lua');
+  return contentEl('socketley');
+}
+
+function _applyVisibility() {
+  const panes = ['socketley', 'lua', 'addons'];
+  let activeNav, activeContent;
+  if (currentTab === 'socketley') {
+    activeNav = 'socketley'; activeContent = 'socketley';
+  } else {
+    activeNav = currentSubTab === 'addons' ? 'addons' : 'lua';
+    activeContent = activeNav;
+  }
+  panes.forEach(id => {
+    const n = navEl(id), c = contentEl(id);
+    const show = id === activeNav ? '' : 'none';
     if (n) n.style.display = show;
     if (c) c.style.display = show;
   });
+  luaSubTabs.style.display = currentTab === 'lua' ? '' : 'none';
+}
+
+function activateTab(tab) {
+  currentTab = tab;
+  tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  _applyVisibility();
   localStorage.setItem('sk-tab', tab);
   window.scrollTo(0, 0);
-  // reset search
   const si = document.getElementById('search');
-  if (si) { si.value = ''; }
+  if (si) si.value = '';
   resetSearch();
   updateActiveNav();
 }
 
-tabBtns.forEach(b => b.addEventListener('click', () => activateTab(b.dataset.tab)));
+function activateSubTab(subtab) {
+  currentSubTab = subtab;
+  subTabBtns.forEach(b => b.classList.toggle('active', b.dataset.subtab === subtab));
+  _applyVisibility();
+  localStorage.setItem('sk-lua-subtab', subtab);
+  window.scrollTo(0, 0);
+  const si = document.getElementById('search');
+  if (si) si.value = '';
+  resetSearch();
+  updateActiveNav();
+}
+
+tabBtns.forEach(b    => b.addEventListener('click', () => activateTab(b.dataset.tab)));
+subTabBtns.forEach(b => b.addEventListener('click', () => activateSubTab(b.dataset.subtab)));
 
 // ─── Sidebar Nav (active state on scroll) ───
 function updateActiveNav() {
@@ -84,8 +120,8 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  tabs.forEach(t => {
-    const nav = navEl(t);
+  ['socketley', 'lua', 'addons'].forEach(id => {
+    const nav = navEl(id);
     if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
       li.style.display = '';
@@ -140,5 +176,9 @@ document.querySelectorAll('pre').forEach(pre => {
 });
 
 // ─── Init ───
-const savedTab = localStorage.getItem('sk-tab') || 'socketley';
-activateTab(savedTab);
+const savedTab    = localStorage.getItem('sk-tab') || 'socketley';
+const savedSubTab = localStorage.getItem('sk-lua-subtab') || 'api';
+currentTab    = savedTab === 'addons' ? 'lua' : savedTab;   // migrate old top-level addons tab
+currentSubTab = savedTab === 'addons' ? 'addons' : savedSubTab;
+subTabBtns.forEach(b => b.classList.toggle('active', b.dataset.subtab === currentSubTab));
+activateTab(currentTab);
