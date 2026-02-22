@@ -8,8 +8,12 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <functional>
+#include <sys/types.h>
 
+#ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
+#endif
 #include <liburing.h>
 #include "runtime_definitions.h"
 #include "event_loop_definitions.h"
@@ -121,6 +125,12 @@ public:
     void set_lua_created(bool v);
     bool is_lua_created() const;
 
+    // External (attach) mode — runtime is managed by another process
+    void mark_external();
+    bool is_external() const;
+    void set_pid(pid_t pid);
+    pid_t get_pid() const;
+
     enum class child_policy { stop, remove };
     void set_child_policy(child_policy p);
     child_policy get_child_policy() const;
@@ -134,6 +144,18 @@ public:
     // Lua integration
     bool load_lua_script(std::string_view path);
     lua_context* lua() const { return m_lua.get(); }
+
+    // ── C++ event callbacks (alternative to Lua) ─────────────────────────────
+    // If set, the C++ callback is invoked *instead of* the Lua callback for that event.
+    // Use set_tick_interval() to control the tick period when not using Lua.
+    void set_on_start          (std::function<void()>                         cb);
+    void set_on_stop           (std::function<void()>                         cb);
+    void set_on_connect        (std::function<void(int fd)>                   cb);
+    void set_on_disconnect     (std::function<void(int fd)>                   cb);
+    void set_on_client_message (std::function<void(int fd, std::string_view)> cb);
+    void set_on_message        (std::function<void(std::string_view)>         cb);
+    void set_on_tick           (std::function<void(double dt_ms)>             cb);
+    void set_tick_interval     (uint32_t ms);   // tick period in ms; 0 = use Lua value (default)
 
     // Virtual methods for Lua actions (overridden by specific runtimes)
     virtual void lua_send(std::string_view msg) {}
@@ -225,12 +247,24 @@ private:
     // Lua script path for hot-reload
     std::string m_lua_script_path;
 
+    // C++ event callbacks
+    std::function<void()>                        m_cb_on_start;
+    std::function<void()>                        m_cb_on_stop;
+    std::function<void(int)>                     m_cb_on_connect;
+    std::function<void(int)>                     m_cb_on_disconnect;
+    std::function<void(int, std::string_view)>   m_cb_on_client_message;
+    std::function<void(std::string_view)>        m_cb_on_message;
+    std::function<void(double)>                  m_cb_on_tick;
+    uint32_t                                     m_cb_tick_ms = 0;
+
     // Interactive mode observer fds (IPC sockets)
     std::vector<int> m_interactive_fds;
 
     // Ownership
     std::string m_owner;
     bool m_lua_created = false;
+    bool m_external = false;
+    pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;
 
     // Runtime manager / event loop (base class)

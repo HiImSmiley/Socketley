@@ -1,4 +1,7 @@
 #pragma once
+
+#ifndef SOCKETLEY_NO_LUA
+
 #include <sol/sol.hpp>
 #include <memory>
 #include <string>
@@ -67,3 +70,38 @@ private:
     sol::function m_on_tick;
     uint32_t m_tick_ms{0};
 };
+
+#else // SOCKETLEY_NO_LUA
+
+#include <string>
+#include <string_view>
+#include <cstdint>
+
+class runtime_instance;
+
+// No-op stub — same public interface, no LuaJIT required
+class lua_context
+{
+public:
+    lua_context() = default;
+    ~lua_context() = default;
+
+    bool load_script(std::string_view, runtime_instance*) { return true; }
+    void update_self_state(const char*) {}
+
+    bool has_on_start()          const { return false; }
+    bool has_on_stop()           const { return false; }
+    bool has_on_message()        const { return false; }
+    bool has_on_send()           const { return false; }
+    bool has_on_connect()        const { return false; }
+    bool has_on_disconnect()     const { return false; }
+    bool has_on_route()          const { return false; }
+    bool has_on_master_auth()    const { return false; }
+    bool has_on_client_message() const { return false; }
+    bool has_on_tick()           const { return false; }
+    uint32_t get_tick_ms()       const { return 0; }
+    // on_*() callbacks omitted — only called when has_*() returns true,
+    // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.
+};
+
+#endif // SOCKETLEY_NO_LUA

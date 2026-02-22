@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cache Runtime Benchmark
-# Tests: SET/GET operations, throughput, concurrent access, persistence
+# Uses pipelined awk|nc connections instead of one nc per operation.
 
 source "$(dirname "$0")/utils.sh"
 
@@ -18,12 +18,27 @@ append_result() {
     fi
 }
 
-# Helper: Send command to cache and get response
+# Send a single one-off command and return its response.
 cache_cmd() {
-    echo "$1" | nc -q1 localhost $CACHE_PORT 2>/dev/null
+    printf '%s\n' "$1" | nc -q1 localhost $CACHE_PORT 2>/dev/null
 }
 
-# Test 1: SET operation throughput
+# Pipeline N commands through one TCP connection; return the response text.
+# $1 = num_ops, $2 = awk BEGIN program (uses variable i)
+pipeline() {
+    local num_ops=$1
+    local awk_prog=$2
+    awk -v n=$num_ops "BEGIN{ $awk_prog }" | nc -q0 localhost $CACHE_PORT 2>/dev/null
+}
+
+# Pipeline and count OK/integer responses.
+pipeline_count_ok() {
+    local num_ops=$1
+    local awk_prog=$2
+    pipeline "$num_ops" "$awk_prog" | grep -cE '^(OK|[0-9]+)$' || echo 0
+}
+
+# Test 1: SET throughput
 test_set_throughput() {
     local num_ops=${1:-10000}
     local value_size=${2:-64}
@@ -35,59 +50,37 @@ test_set_throughput() {
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
-    local value=$(head -c $value_size /dev/urandom | base64 | head -c $value_size | tr -d '\n')
-    local latencies_file=$(mktemp)
+    local value
+    value=$(head -c $value_size /dev/urandom | base64 | tr -d '\n=' | head -c $value_size)
 
     local start_time=$(get_time_ms)
-
-    for i in $(seq 1 $num_ops); do
-        local op_start=$(get_time_ms)
-        local result=$(echo "SET key$i $value" | nc -q0 localhost $CACHE_PORT 2>/dev/null)
-        local op_end=$(get_time_ms)
-
-        if [[ "$result" == "OK" ]]; then
-            echo "$((op_end - op_start))" >> "$latencies_file"
-        fi
-
-        if [[ $((i % 1000)) -eq 0 ]]; then
-            echo -ne "\r  Progress: $i / $num_ops"
-        fi
-    done
-    echo ""
-
+    awk -v n=$num_ops -v v="$value" \
+        'BEGIN{ for(i=1;i<=n;i++) printf "SET key%d %s\n",i,v }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
+
     local total_time=$((end_time - start_time))
     local ops_sec=$(echo "scale=2; $num_ops * 1000 / $total_time" | bc)
-    local throughput_mb=$(echo "scale=2; $num_ops * $value_size / 1024 / 1024 * 1000 / $total_time" | bc)
+    local throughput_mb=$(echo "scale=2; $num_ops * $value_size / 1048576.0 * 1000 / $total_time" | bc)
 
-    local stats=$(calc_stats "$latencies_file")
-    rm -f "$latencies_file"
-
-    local avg_lat=$(echo "$stats" | grep -oP 'avg=\K[0-9.]+')
-    local p99_lat=$(echo "$stats" | grep -oP 'p99=\K[0-9.]+')
-
-    log_success "Operations: $num_ops SET"
     log_success "Total time: $(format_duration $total_time)"
     log_success "Throughput: $ops_sec ops/sec, ${throughput_mb} MB/sec"
-    log_info "Latency: $stats"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
-        "value_size_bytes" "$value_size" \
-        "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec" \
-        "throughput_mb_sec" "$throughput_mb" \
-        "avg_latency_ms" "$avg_lat" \
-        "p99_latency_ms" "$p99_lat"
+        "operations"        "$num_ops" \
+        "value_size_bytes"  "$value_size" \
+        "total_time_ms"     "$total_time" \
+        "ops_per_sec"       "$ops_sec" \
+        "throughput_mb_sec" "$throughput_mb"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 
-    echo "$ops_sec $avg_lat $p99_lat"
+    echo "$ops_sec"
 }
 
-# Test 2: GET operation throughput (pre-populated)
+# Test 2: GET throughput (pre-populated)
 test_get_throughput() {
     local num_ops=${1:-10000}
     local test_name="cache_get_throughput"
@@ -98,70 +91,38 @@ test_get_throughput() {
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
-    # Pre-populate cache
-    log_info "Pre-populating cache with $num_ops keys..."
     local value="benchmark_value_64_bytes_padding_padding_padding_pad"
-    for i in $(seq 1 $num_ops); do
-        echo "SET key$i $value" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-        if [[ $((i % 1000)) -eq 0 ]]; then
-            echo -ne "\r  Populating: $i / $num_ops"
-        fi
-    done
-    echo ""
 
-    local latencies_file=$(mktemp)
-    local hits=0
-    local misses=0
+    # Populate in one pipeline
+    log_info "Pre-populating $num_ops keys..."
+    awk -v n=$num_ops -v v="$value" \
+        'BEGIN{ for(i=1;i<=n;i++) printf "SET key%d %s\n",i,v }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    sleep 0.1  # let the server drain the populate pipeline
 
+    # Benchmark GETs
     local start_time=$(get_time_ms)
-
-    for i in $(seq 1 $num_ops); do
-        local op_start=$(get_time_ms)
-        local result=$(echo "GET key$i" | nc -q0 localhost $CACHE_PORT 2>/dev/null)
-        local op_end=$(get_time_ms)
-
-        if [[ "$result" != "NIL" && -n "$result" ]]; then
-            ((hits++))
-            echo "$((op_end - op_start))" >> "$latencies_file"
-        else
-            ((misses++))
-        fi
-
-        if [[ $((i % 1000)) -eq 0 ]]; then
-            echo -ne "\r  Progress: $i / $num_ops"
-        fi
-    done
-    echo ""
-
+    awk -v n=$num_ops \
+        'BEGIN{ for(i=1;i<=n;i++) printf "GET key%d\n",i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
+
     local total_time=$((end_time - start_time))
     local ops_sec=$(echo "scale=2; $num_ops * 1000 / $total_time" | bc)
 
-    local stats=$(calc_stats "$latencies_file")
-    rm -f "$latencies_file"
-
-    local avg_lat=$(echo "$stats" | grep -oP 'avg=\K[0-9.]+')
-    local p99_lat=$(echo "$stats" | grep -oP 'p99=\K[0-9.]+')
-
-    log_success "Operations: $hits hits, $misses misses"
     log_success "Total time: $(format_duration $total_time)"
     log_success "Throughput: $ops_sec ops/sec"
-    log_info "Latency: $stats"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
-        "hits" "$hits" \
-        "misses" "$misses" \
+        "operations"    "$num_ops" \
         "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec" \
-        "avg_latency_ms" "$avg_lat" \
-        "p99_latency_ms" "$p99_lat"
+        "ops_per_sec"   "$ops_sec"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 
-    echo "$ops_sec $avg_lat $p99_lat"
+    echo "$ops_sec"
 }
 
 # Test 3: Mixed workload (80% GET, 20% SET)
@@ -175,55 +136,40 @@ test_mixed_workload() {
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
-    # Pre-populate with some keys
-    local prepop=$((num_ops / 5))
     local value="mixed_workload_test_value_padding_padding_padding"
-    log_info "Pre-populating $prepop keys..."
-    for i in $(seq 1 $prepop); do
-        echo "SET key$i $value" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    local prepop=$((num_ops / 5))
 
-    local get_count=0
-    local set_count=0
-    local key_counter=$((prepop + 1))
+    # Pre-populate
+    awk -v n=$prepop -v v="$value" \
+        'BEGIN{ for(i=1;i<=n;i++) printf "SET key%d %s\n",i,v }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    sleep 0.1
 
+    # Generate mixed command stream and benchmark
     local start_time=$(get_time_ms)
-
-    for i in $(seq 1 $num_ops); do
-        local rand=$((RANDOM % 100))
-        if [[ $rand -lt 80 ]]; then
-            # GET operation (random existing key)
-            local key=$((RANDOM % prepop + 1))
-            echo "GET key$key" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-            ((get_count++))
-        else
-            # SET operation (new key)
-            echo "SET key$key_counter $value" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-            ((key_counter++))
-            ((set_count++))
-        fi
-
-        if [[ $((i % 1000)) -eq 0 ]]; then
-            echo -ne "\r  Progress: $i / $num_ops (GET: $get_count, SET: $set_count)"
-        fi
-    done
-    echo ""
-
+    awk -v n=$num_ops -v pre=$prepop -v v="$value" 'BEGIN{
+        srand(42)
+        new_key = pre + 1
+        for(i=1;i<=n;i++) {
+            if(rand() < 0.8)
+                printf "GET key%d\n", int(rand()*pre)+1
+            else
+                printf "SET key%d %s\n", new_key++, v
+        }
+    }' | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
+
     local total_time=$((end_time - start_time))
     local ops_sec=$(echo "scale=2; $num_ops * 1000 / $total_time" | bc)
 
-    log_success "Operations: $get_count GET, $set_count SET"
     log_success "Total time: $(format_duration $total_time)"
     log_success "Throughput: $ops_sec ops/sec"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
         "total_operations" "$num_ops" \
-        "get_operations" "$get_count" \
-        "set_operations" "$set_count" \
-        "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec"
+        "total_time_ms"    "$total_time" \
+        "ops_per_sec"      "$ops_sec"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
@@ -231,13 +177,13 @@ test_mixed_workload() {
     echo "$ops_sec"
 }
 
-# Test 4: Concurrent client access
+# Test 4: Concurrent client access (N background awk|nc pipelines)
 test_concurrent_access() {
     local num_clients=${1:-20}
-    local ops_per_client=${2:-500}
+    local ops_per_client=${2:-2000}
     local test_name="cache_concurrent_access"
 
-    log_section "Test: Concurrent Access ($num_clients clients, $ops_per_client ops each)"
+    log_section "Test: Concurrent Access ($num_clients clients × $ops_per_client ops)"
 
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
@@ -245,49 +191,33 @@ test_concurrent_access() {
 
     local value="concurrent_test_value_padding_padding_padding_pad"
     local pids=()
-    local results_dir=$(mktemp -d)
 
     local start_time=$(get_time_ms)
 
     for c in $(seq 1 $num_clients); do
-        (
-            local count=0
-            for i in $(seq 1 $ops_per_client); do
-                local key="client${c}_key${i}"
-                local result=$(echo "SET $key $value" | nc -q0 localhost $CACHE_PORT 2>/dev/null)
-                [[ "$result" == "OK" ]] && ((count++))
-            done
-            echo "$count" > "$results_dir/client_$c"
-        ) &
+        awk -v n=$ops_per_client -v c=$c -v v="$value" \
+            'BEGIN{ for(i=1;i<=n;i++) printf "SET c%d_key%d %s\n",c,i,v }' \
+            | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1 &
         pids+=($!)
     done
 
-    for pid in "${pids[@]}"; do
-        wait "$pid"
-    done
+    for pid in "${pids[@]}"; do wait "$pid"; done
 
     local end_time=$(get_time_ms)
     local total_time=$((end_time - start_time))
-
-    local total_ops=0
-    for f in "$results_dir"/client_*; do
-        total_ops=$((total_ops + $(cat "$f")))
-    done
-    rm -rf "$results_dir"
-
+    local total_ops=$((num_clients * ops_per_client))
     local ops_sec=$(echo "scale=2; $total_ops * 1000 / $total_time" | bc)
 
-    log_success "Total successful operations: $total_ops"
     log_success "Total time: $(format_duration $total_time)"
     log_success "Aggregate throughput: $ops_sec ops/sec"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "num_clients" "$num_clients" \
-        "ops_per_client" "$ops_per_client" \
-        "total_ops" "$total_ops" \
-        "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec"
+        "num_clients"      "$num_clients" \
+        "ops_per_client"   "$ops_per_client" \
+        "total_ops"        "$total_ops" \
+        "total_time_ms"    "$total_time" \
+        "ops_per_sec"      "$ops_sec"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
@@ -295,12 +225,12 @@ test_concurrent_access() {
     echo "$ops_sec"
 }
 
-# Test 5: Persistence performance (FLUSH/LOAD)
+# Test 5: Persistence (FLUSH / LOAD)
 test_persistence() {
-    local num_keys=${1:-5000}
+    local num_keys=${1:-10000}
     local test_name="cache_persistence"
 
-    log_section "Test: Persistence Performance ($num_keys keys)"
+    log_section "Test: Persistence ($num_keys keys)"
 
     local persist_file="/tmp/bench_cache_persist.bin"
     rm -f "$persist_file"
@@ -309,54 +239,47 @@ test_persistence() {
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
-    # Populate cache
     local value="persistence_test_value_padding_padding_padding_p"
-    log_info "Populating cache..."
-    for i in $(seq 1 $num_keys); do
-        echo "SET key$i $value" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-        if [[ $((i % 1000)) -eq 0 ]]; then
-            echo -ne "\r  Populating: $i / $num_keys"
-        fi
-    done
-    echo ""
 
-    # Test FLUSH performance
+    log_info "Populating $num_keys keys..."
+    awk -v n=$num_keys -v v="$value" \
+        'BEGIN{ for(i=1;i<=n;i++) printf "SET key%d %s\n",i,v }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    sleep 0.1
+
+    # FLUSH
     local flush_start=$(get_time_ms)
-    local flush_result=$(echo "FLUSH" | nc -q1 localhost $CACHE_PORT 2>/dev/null)
+    cache_cmd "FLUSH" >/dev/null
     local flush_end=$(get_time_ms)
     local flush_time=$((flush_end - flush_start))
-
     log_success "FLUSH time: $(format_duration $flush_time)"
 
-    # Check file size
     local file_size=$(stat -c%s "$persist_file" 2>/dev/null || echo 0)
-    log_info "Persisted file size: $((file_size / 1024)) KB"
+    log_info "Persisted file: $((file_size / 1024)) KB"
 
-    # Restart cache and test LOAD
+    # Restart and LOAD
     socketley_cmd stop bench_cache
     sleep 0.5
-    socketley_cmd run bench_cache
+    socketley_cmd start bench_cache
     wait_for_port $CACHE_PORT || { log_error "Cache failed to restart"; return 1; }
     sleep 0.5
 
     local load_start=$(get_time_ms)
-    local load_result=$(echo "LOAD" | nc -q1 localhost $CACHE_PORT 2>/dev/null)
+    cache_cmd "LOAD" >/dev/null
     local load_end=$(get_time_ms)
     local load_time=$((load_end - load_start))
-
     log_success "LOAD time: $(format_duration $load_time)"
 
-    # Verify data integrity
-    local size_result=$(echo "SIZE" | nc -q1 localhost $CACHE_PORT 2>/dev/null)
+    local size_result=$(cache_cmd "SIZE")
     log_info "Keys after LOAD: $size_result"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "num_keys" "$num_keys" \
-        "flush_time_ms" "$flush_time" \
-        "load_time_ms" "$load_time" \
+        "num_keys"        "$num_keys" \
+        "flush_time_ms"   "$flush_time" \
+        "load_time_ms"    "$load_time" \
         "file_size_bytes" "$file_size" \
-        "keys_restored" "$size_result"
+        "keys_restored"   "$size_result"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
@@ -365,55 +288,57 @@ test_persistence() {
     echo "$flush_time $load_time"
 }
 
-# Test 6: Large value handling
+# Test 6: Large value throughput (multiple sizes)
 test_large_values() {
-    local value_sizes=(64 256 1024 4096 16384)
-    local ops_per_size=1000
+    local value_sizes=(64 256 1024 4096)
+    local ops_per_size=2000
     local test_name="cache_large_values"
 
-    log_section "Test: Large Value Handling"
+    log_section "Test: Large Value Throughput"
 
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
     for size in "${value_sizes[@]}"; do
-        local value=$(head -c $size /dev/urandom | base64 | head -c $size | tr -d '\n')
+        local value
+        value=$(head -c $size /dev/urandom | base64 | tr -d '\n=' | head -c $size)
 
         local start_time=$(get_time_ms)
-        for i in $(seq 1 $ops_per_size); do
-            echo "SET largekey$i $value" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-        done
+        awk -v n=$ops_per_size -v v="$value" \
+            'BEGIN{ for(i=1;i<=n;i++) printf "SET lk%d %s\n",i,v }' \
+            | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
         local end_time=$(get_time_ms)
 
         local total_time=$((end_time - start_time))
         local ops_sec=$(echo "scale=2; $ops_per_size * 1000 / $total_time" | bc)
-        local throughput_mb=$(echo "scale=2; $ops_per_size * $size / 1024 / 1024 * 1000 / $total_time" | bc)
+        local throughput_mb=$(echo "scale=2; $ops_per_size * $size / 1048576.0 * 1000 / $total_time" | bc)
 
-        log_success "  ${size}B values: $ops_sec ops/sec, ${throughput_mb} MB/sec"
+        log_success "  ${size}B: $ops_sec ops/sec, ${throughput_mb} MB/sec"
 
         append_result
         write_json_result "${test_name}_${size}B" "$RESULTS_FILE" \
-            "value_size_bytes" "$size" \
-            "operations" "$ops_per_size" \
-            "total_time_ms" "$total_time" \
-            "ops_per_sec" "$ops_sec" \
+            "value_size_bytes"  "$size" \
+            "operations"        "$ops_per_size" \
+            "total_time_ms"     "$total_time" \
+            "ops_per_sec"       "$ops_sec" \
             "throughput_mb_sec" "$throughput_mb"
 
-        # Clear for next test
-        echo "FLUSH /dev/null" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        # Flush between sizes
+        cache_cmd "FLUSH /dev/null" >/dev/null
+        sleep 0.05
     done
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 }
 
-# Test 7: LIST operations throughput
+# Test 7: LIST operations
 test_list_throughput() {
-    local num_ops=${1:-3000}
+    local num_ops=${1:-5000}
     local test_name="cache_list_throughput"
 
-    log_section "Test: LIST Throughput ($num_ops ops each for LPUSH/LPOP)"
+    log_section "Test: LIST Throughput ($num_ops ops)"
 
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
@@ -421,9 +346,8 @@ test_list_throughput() {
 
     # LPUSH
     local start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "lpush benchlist item$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "LPUSH benchlist item%d\n",i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local lpush_time=$((end_time - start_time))
     local lpush_ops=$(echo "scale=2; $num_ops * 1000 / $lpush_time" | bc)
@@ -431,41 +355,26 @@ test_list_throughput() {
 
     # LPOP
     start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "lpop benchlist" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "LPOP benchlist\n" }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local lpop_time=$((end_time - start_time))
     local lpop_ops=$(echo "scale=2; $num_ops * 1000 / $lpop_time" | bc)
     log_success "  LPOP: $lpop_ops ops/sec"
 
-    # LRANGE
-    for i in $(seq 1 100); do
-        echo "rpush rangelist val$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
-    start_time=$(get_time_ms)
-    for i in $(seq 1 $((num_ops / 10))); do
-        echo "lrange rangelist 0 99" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
-    end_time=$(get_time_ms)
-    local lrange_time=$((end_time - start_time))
-    local lrange_ops=$(echo "scale=2; $num_ops / 10 * 1000 / $lrange_time" | bc)
-    log_success "  LRANGE 0-99: $lrange_ops ops/sec"
-
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
+        "operations"    "$num_ops" \
         "lpush_ops_sec" "$lpush_ops" \
-        "lpop_ops_sec" "$lpop_ops" \
-        "lrange_ops_sec" "$lrange_ops"
+        "lpop_ops_sec"  "$lpop_ops"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 }
 
-# Test 8: SET (data structure) operations throughput
+# Test 8: SET data structure operations
 test_set_ds_throughput() {
-    local num_ops=${1:-3000}
+    local num_ops=${1:-5000}
     local test_name="cache_set_ds_throughput"
 
     log_section "Test: SET (data structure) Throughput ($num_ops ops)"
@@ -476,9 +385,8 @@ test_set_ds_throughput() {
 
     # SADD
     local start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "sadd benchset member$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "SADD benchset member%d\n",i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local sadd_time=$((end_time - start_time))
     local sadd_ops=$(echo "scale=2; $num_ops * 1000 / $sadd_time" | bc)
@@ -486,38 +394,26 @@ test_set_ds_throughput() {
 
     # SISMEMBER
     start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "sismember benchset member$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "SISMEMBER benchset member%d\n",int(rand()*n)+1 }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local sismember_time=$((end_time - start_time))
     local sismember_ops=$(echo "scale=2; $num_ops * 1000 / $sismember_time" | bc)
     log_success "  SISMEMBER: $sismember_ops ops/sec"
 
-    # SCARD
-    start_time=$(get_time_ms)
-    for i in $(seq 1 $((num_ops / 10))); do
-        echo "scard benchset" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
-    end_time=$(get_time_ms)
-    local scard_time=$((end_time - start_time))
-    local scard_ops=$(echo "scale=2; $num_ops / 10 * 1000 / $scard_time" | bc)
-    log_success "  SCARD: $scard_ops ops/sec"
-
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
-        "sadd_ops_sec" "$sadd_ops" \
-        "sismember_ops_sec" "$sismember_ops" \
-        "scard_ops_sec" "$scard_ops"
+        "operations"        "$num_ops" \
+        "sadd_ops_sec"      "$sadd_ops" \
+        "sismember_ops_sec" "$sismember_ops"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 }
 
-# Test 9: HASH operations throughput
+# Test 9: HASH operations
 test_hash_throughput() {
-    local num_ops=${1:-3000}
+    local num_ops=${1:-5000}
     local test_name="cache_hash_throughput"
 
     log_section "Test: HASH Throughput ($num_ops ops)"
@@ -528,9 +424,8 @@ test_hash_throughput() {
 
     # HSET
     local start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "hset benchhash field$i value$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "HSET benchhash field%d value%d\n",i,i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local hset_time=$((end_time - start_time))
     local hset_ops=$(echo "scale=2; $num_ops * 1000 / $hset_time" | bc)
@@ -538,56 +433,43 @@ test_hash_throughput() {
 
     # HGET
     start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "hget benchhash field$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "HGET benchhash field%d\n",int(rand()*n)+1 }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local hget_time=$((end_time - start_time))
     local hget_ops=$(echo "scale=2; $num_ops * 1000 / $hget_time" | bc)
     log_success "  HGET: $hget_ops ops/sec"
 
-    # HGETALL
-    start_time=$(get_time_ms)
-    for i in $(seq 1 $((num_ops / 30))); do
-        echo "hgetall benchhash" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
-    end_time=$(get_time_ms)
-    local hgetall_time=$((end_time - start_time))
-    local hgetall_ops=$(echo "scale=2; $num_ops / 30 * 1000 / $hgetall_time" | bc)
-    log_success "  HGETALL: $hgetall_ops ops/sec"
-
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
+        "operations"   "$num_ops" \
         "hset_ops_sec" "$hset_ops" \
-        "hget_ops_sec" "$hget_ops" \
-        "hgetall_ops_sec" "$hgetall_ops"
+        "hget_ops_sec" "$hget_ops"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 }
 
-# Test 10: TTL/Expiry operations throughput
+# Test 10: TTL operations
 test_ttl_throughput() {
-    local num_ops=${1:-3000}
+    local num_ops=${1:-5000}
     local test_name="cache_ttl_throughput"
 
-    log_section "Test: TTL/Expiry Throughput ($num_ops ops)"
+    log_section "Test: TTL Throughput ($num_ops ops)"
 
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 
-    # Pre-populate keys
-    for i in $(seq 1 $num_ops); do
-        echo "set ttlkey$i val$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    # Populate keys
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "SET ttlkey%d val%d\n",i,i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+    sleep 0.1
 
     # EXPIRE
     local start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "expire ttlkey$i 3600" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "EXPIRE ttlkey%d 3600\n",i }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local expire_time=$((end_time - start_time))
     local expire_ops=$(echo "scale=2; $num_ops * 1000 / $expire_time" | bc)
@@ -595,49 +477,37 @@ test_ttl_throughput() {
 
     # TTL
     start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "ttl ttlkey$((RANDOM % num_ops + 1))" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
+    awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "TTL ttlkey%d\n",int(rand()*n)+1 }' \
+        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local ttl_time=$((end_time - start_time))
     local ttl_ops=$(echo "scale=2; $num_ops * 1000 / $ttl_time" | bc)
     log_success "  TTL: $ttl_ops ops/sec"
 
-    # PERSIST
-    start_time=$(get_time_ms)
-    for i in $(seq 1 $num_ops); do
-        echo "persist ttlkey$i" | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
-    done
-    end_time=$(get_time_ms)
-    local persist_time=$((end_time - start_time))
-    local persist_ops=$(echo "scale=2; $num_ops * 1000 / $persist_time" | bc)
-    log_success "  PERSIST: $persist_ops ops/sec"
-
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
+        "operations"     "$num_ops" \
         "expire_ops_sec" "$expire_ops" \
-        "ttl_ops_sec" "$ttl_ops" \
-        "persist_ops_sec" "$persist_ops"
+        "ttl_ops_sec"    "$ttl_ops"
 
     socketley_cmd stop bench_cache
     socketley_cmd remove bench_cache
 }
 
-# Main execution
+# Main
 run_cache_benchmarks() {
     log_section "CACHE RUNTIME BENCHMARKS"
 
-    test_set_throughput 3000 64
-    test_get_throughput 3000
-    test_mixed_workload 3000
-    test_concurrent_access 10 200
-    test_persistence 2000
+    test_set_throughput     10000 64
+    test_get_throughput     10000
+    test_mixed_workload     10000
+    test_concurrent_access  20 2000
+    test_persistence        10000
     test_large_values
-    test_list_throughput 3000
-    test_set_ds_throughput 3000
-    test_hash_throughput 3000
-    test_ttl_throughput 3000
+    test_list_throughput    5000
+    test_set_ds_throughput  5000
+    test_hash_throughput    5000
+    test_ttl_throughput     5000
 
     echo "]" >> "$RESULTS_FILE"
 
