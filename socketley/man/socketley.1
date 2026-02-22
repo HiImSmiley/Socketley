@@ -931,6 +931,9 @@ Called when runtime stops.
 .TP
 .B on_message(msg)
 Called when message received (server/client).
+When defined on a server, this callback claims message handling: the default broadcast
+(in \fBinout\fR and \fBmaster\fR modes) is suppressed. Use \fBself.broadcast(msg)\fR
+to relay messages manually.
 .TP
 .B on_client_message(client_id, msg)
 Called when message received with sender identification (server only).
