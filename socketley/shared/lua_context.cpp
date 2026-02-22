@@ -7,6 +7,8 @@
 #include "runtime_manager.h"
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
+#include "../cli/command_hashing.h"
+#include "../cli/runtime_type_parser.h"
 #include <iostream>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -152,15 +154,6 @@ void lua_context::update_self_state(const char* state_str)
     sol::optional<sol::table> self = m_lua["self"];
     if (self)
         (*self)["state"] = state_str;
-}
-
-static bool parse_type_string(const std::string& s, runtime_type& t)
-{
-    if (s == "server") { t = runtime_server; return true; }
-    if (s == "client") { t = runtime_client; return true; }
-    if (s == "proxy")  { t = runtime_proxy;  return true; }
-    if (s == "cache")  { t = runtime_cache;  return true; }
-    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +322,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!mgr || !loop) return false;
 
         runtime_type type;
-        if (!parse_type_string(type_str, type)) return false;
+        if (!parse_runtime_type(type_str, type)) return false;
 
         if (!mgr->create(type, name)) return false;
 
@@ -356,10 +349,12 @@ void lua_context::register_bindings(runtime_instance* owner)
             sol::optional<std::string> mode_str = (*config)["mode"];
             if (mode_str && type == runtime_server) {
                 auto* srv = static_cast<server_instance*>(inst);
-                if (*mode_str == "in") srv->set_mode(mode_in);
-                else if (*mode_str == "out") srv->set_mode(mode_out);
-                else if (*mode_str == "master") srv->set_mode(mode_master);
-                else srv->set_mode(mode_inout);
+                switch (fnv1a(*mode_str)) {
+                    case fnv1a("in"):     srv->set_mode(mode_in);     break;
+                    case fnv1a("out"):    srv->set_mode(mode_out);    break;
+                    case fnv1a("master"): srv->set_mode(mode_master); break;
+                    default:              srv->set_mode(mode_inout);  break;
+                }
             }
 
             if (type == runtime_server) {
@@ -373,7 +368,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
 
             sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"];
-            if (on_stop_str && *on_stop_str == "remove")
+            if (on_stop_str && fnv1a(*on_stop_str) == fnv1a("remove"))
                 inst->set_child_policy(runtime_instance::child_policy::remove);
 
             sol::optional<bool> autostart = (*config)["autostart"];
