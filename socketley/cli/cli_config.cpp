@@ -145,6 +145,14 @@ int cli_config(int argc, char** argv)
         if (master_forward)
             command += " --master-forward";
 
+        sol::optional<std::string> http_dir = t["http"];
+        if (http_dir && !http_dir->empty())
+            command += " --http " + *http_dir;
+
+        bool http_cache = t["http_cache"].get_or(false);
+        if (http_cache)
+            command += " --http-cache";
+
         bool udp = t["udp"].get_or(false);
         if (udp)
             command += " --udp";

@@ -176,6 +176,10 @@ static void restore_runtimes(state_persistence& persistence,
                     srv->set_master_pw(cfg.master_pw);
                 if (cfg.master_forward)
                     srv->set_master_forward(true);
+                if (!cfg.http_dir.empty())
+                    srv->set_http_dir(cfg.http_dir);
+                if (cfg.http_cache)
+                    srv->set_http_cache(true);
                 break;
             }
             case runtime_client:
