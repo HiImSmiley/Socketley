@@ -30,19 +30,23 @@ function navEl(id)     { return document.getElementById('navList-' + id); }
 function contentEl(id) { return document.getElementById('content-' + id); }
 
 function getActiveNav() {
+  if (currentTab === 'examples') return navEl('examples');
   if (currentTab === 'lua') return navEl(currentSubTab === 'addons' ? 'addons' : 'lua');
   return navEl('socketley');
 }
 function getActiveContent() {
+  if (currentTab === 'examples') return contentEl('examples');
   if (currentTab === 'lua') return contentEl(currentSubTab === 'addons' ? 'addons' : 'lua');
   return contentEl('socketley');
 }
 
 function _applyVisibility() {
-  const panes = ['socketley', 'lua', 'addons'];
+  const panes = ['socketley', 'lua', 'addons', 'examples'];
   let activeNav, activeContent;
   if (currentTab === 'socketley') {
     activeNav = 'socketley'; activeContent = 'socketley';
+  } else if (currentTab === 'examples') {
+    activeNav = 'examples'; activeContent = 'examples';
   } else {
     activeNav = currentSubTab === 'addons' ? 'addons' : 'lua';
     activeContent = activeNav;
@@ -120,7 +124,7 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  ['socketley', 'lua', 'addons'].forEach(id => {
+  ['socketley', 'lua', 'addons', 'examples'].forEach(id => {
     const nav = navEl(id);
     if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
@@ -178,7 +182,8 @@ document.querySelectorAll('pre').forEach(pre => {
 // ─── Init ───
 const savedTab    = localStorage.getItem('sk-tab') || 'socketley';
 const savedSubTab = localStorage.getItem('sk-lua-subtab') || 'api';
-currentTab    = savedTab === 'addons' ? 'lua' : savedTab;   // migrate old top-level addons tab
+// migrate old top-level addons tab; 'examples' is valid as-is
+currentTab    = savedTab === 'addons' ? 'lua' : savedTab;
 currentSubTab = savedTab === 'addons' ? 'addons' : savedSubTab;
 subTabBtns.forEach(b => b.classList.toggle('active', b.dataset.subtab === currentSubTab));
 activateTab(currentTab);
