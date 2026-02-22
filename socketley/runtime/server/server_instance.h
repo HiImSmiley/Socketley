@@ -52,6 +52,9 @@ struct server_connection
 
     // Master auth attempt tracking
     uint8_t auth_failures{0};
+
+    // Per-connection metadata (freed automatically on disconnect)
+    std::unordered_map<std::string, std::string> meta;
 };
 
 enum server_mode : uint8_t
@@ -85,6 +88,15 @@ public:
     void lua_send_to(int client_id, std::string_view msg) override;
     void        lua_disconnect(int client_fd);
     std::string lua_peer_ip(int client_fd);
+
+    // Lua client enumeration + multicast
+    std::vector<int> lua_clients() const;
+    void lua_multicast(const std::vector<int>& fds, std::string_view msg);
+
+    // Lua per-connection metadata
+    void        lua_set_data(int fd, std::string_view key, std::string_view val);
+    void        lua_del_data(int fd, std::string_view key);
+    std::string lua_get_data(int fd, std::string_view key) const;
 
     struct ws_headers_result {
         bool is_websocket{false};

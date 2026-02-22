@@ -70,6 +70,7 @@ bash test/run_all.sh
 - **NEVER read files from `thirdparty/`**
 - **Silence is golden** — success = no output, only errors to stdout
 - **Exit codes:** 0 = success, 1 = bad input, 2 = fatal error
+- **Zero warnings, zero errors** — every build must be completely clean. After any code change, verify with `make config=release_x64 -j$(nproc) 2>&1 | grep -E "warning:|error:"` and fix all output before finishing. The `(void)` cast does not suppress `warn_unused_result` on this toolchain — use `if (expr < 0) {}` for intentionally-ignored return values instead.
 
 ## Documentation Maintenance
 
