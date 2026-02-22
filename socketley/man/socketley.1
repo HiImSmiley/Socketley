@@ -876,6 +876,22 @@ to reject and close the connection. If the callback throws a Lua error, the clie
 .B on_auth
 callback is defined, all clients are admitted.
 .TP
+.B on_websocket(client_id, headers)
+Server only. Called immediately after a WebSocket upgrade handshake completes,
+after
+.B on_connect
+has already fired. The
+.I headers
+argument is a Lua table containing any subset of the following keys from the
+HTTP upgrade request:
+.BR cookie ,
+.BR origin ,
+.BR protocol
+(Sec-WebSocket-Protocol), and
+.BR authorization .
+Only keys present in the request are set; absent headers are nil.
+This callback never fires for plain TCP clients.
+.TP
 .B on_tick(dt)
 Called at a configurable interval while the runtime is running.
 .I dt
@@ -936,6 +952,7 @@ self.publish(channel, msg)  -- Publish to channel
 -- Server: connection control
 self.disconnect(client_id)         -- Terminate a connection from Lua
 self.peer_ip(client_id)            -- Get client IP (IPv4 or IPv6 string)
+self.ws_headers(client_id)         -- Get WS upgrade headers table (nil for TCP)
 
 -- Server: client routing
 self.route(client_id, target)      -- Forward client to sub-server
