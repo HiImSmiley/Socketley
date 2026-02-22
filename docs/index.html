@@ -28,6 +28,7 @@
   <div class="tab-switcher">
     <button class="tab-btn" data-tab="socketley">Socketley</button>
     <button class="tab-btn" data-tab="lua">Lua</button>
+    <button class="tab-btn" data-tab="addons">Addons</button>
   </div>
 
   <!-- Search -->
@@ -146,6 +147,24 @@
         <li><a href="#route-route">route / unroute</a></li>
         <li><a href="#route-owner-send">owner_send / owner_broadcast</a></li>
       </ul></li>
+    </ul>
+
+    <!-- ── Addons Nav ── -->
+    <ul id="navList-addons" style="display:none">
+      <li class="open"><a href="#addons-overview">Overview</a></li>
+      <li><a href="#addons-auth">Auth Middleware</a><ul>
+        <li><a href="#addons-auth-ip">IP Allowlist</a></li>
+        <li><a href="#addons-auth-token">Token Auth</a></li>
+      </ul></li>
+      <li><a href="#addons-rate-limit">Rate Limiting</a></li>
+      <li><a href="#addons-http">HTTP Calls</a><ul>
+        <li><a href="#addons-http-api">socketley.http API</a></li>
+        <li><a href="#addons-http-https">HTTPS</a></li>
+      </ul></li>
+      <li><a href="#addons-service-discovery">Service Discovery</a></li>
+      <li><a href="#addons-metrics">Metrics Push</a></li>
+      <li><a href="#addons-db-backend">Database Backend</a></li>
+      <li><a href="#addons-mq">Message Queue Bridge</a></li>
     </ul>
   </nav>
 </aside>
@@ -989,6 +1008,242 @@ tick_ms = <span class="nb">2000</span>
 <p>Port-0 sub-servers have no listener — they only receive messages via client routing from the parent.</p>
 
 </div><!-- #content-lua -->
+
+<!-- ═══════════════════════════════════════════
+     ADDONS TAB CONTENT
+═══════════════════════════════════════════ -->
+<div id="content-addons" class="content" style="display:none">
+
+<h2 id="addons-overview">Addons</h2>
+<p>Socketley's Lua scripting layer enables pure-Lua addon patterns that extend servers with auth middleware, rate limiting, service discovery, metrics push, and more — without touching C++ code. This page documents the primitives that make these patterns possible and shows working examples for each use case.</p>
+
+<div class="info-box"><strong>Primitives added in v1.2:</strong> <code>on_auth(client_id)</code>, <code>self.disconnect(client_id)</code>, <code>self.peer_ip(client_id)</code>, <code>socketley.http(opts)</code></div>
+
+<h2 id="addons-auth">Auth Middleware</h2>
+<p>Two complementary auth patterns cover the most common cases: IP-based admission (via <code>on_auth</code>) and first-message token auth (via <code>self.disconnect</code>).</p>
+
+<h3 id="addons-auth-ip">IP Allowlist</h3>
+<p><code>on_auth(client_id)</code> fires immediately after a TCP accept, before <code>on_connect</code>. Return <code>true</code> to admit the client or <code>false</code> to reject and close the connection. Rejected clients never trigger <code>on_connect</code>.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">on_auth</span><span class="method-sig">(client_id) &rarr; bool</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Called before <code>on_connect</code>. Return <code>false</code> (or raise an error) to reject. Fail-closed: if the callback throws, the client is rejected.</div>
+</div>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.peer_ip</span><span class="method-sig">(client_id) &rarr; string</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns the client's IP address (IPv4 or IPv6 string). Calls <code>getpeername()</code> at call time; works in any callback including <code>on_auth</code>.</div>
+</div>
+
+<pre><code><span class="cm">-- auth-ip-allowlist.lua</span>
+<span class="kw">local</span> allowed_prefix = <span class="st">"192.168."</span>
+
+<span class="kw">function</span> <span class="fn">on_auth</span>(client_id)
+    <span class="kw">local</span> ip = self.peer_ip(client_id)
+    <span class="kw">local</span> ok = ip:sub(<span class="nb">1</span>, #allowed_prefix) == allowed_prefix
+    <span class="kw">if not</span> ok <span class="kw">then</span>
+        socketley.log(<span class="st">"rejected: "</span> .. ip)
+    <span class="kw">end</span>
+    <span class="kw">return</span> ok
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    self.broadcast(<span class="st">"["</span> .. tostring(client_id) .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+
+<pre><code><span class="cm"># Test: 127.0.0.1 is not in 192.168. → rejected immediately</span>
+socketley create server authtest -p 19100 --lua auth-ip-allowlist.lua -s
+nc 127.0.0.1 19100   <span class="cm"># connection is closed before any data exchange</span></code></pre>
+
+<h3 id="addons-auth-token">Token Auth</h3>
+<p>For protocol-level auth (e.g., an API token as the first message), use <code>self.disconnect(client_id)</code> to close the connection from inside a callback.</p>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.disconnect</span><span class="method-sig">(client_id)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Gracefully terminates a client connection. Calls <code>shutdown(SHUT_RDWR)</code> on the fd — the pending read CQE completes with EOF, which triggers <code>on_disconnect</code> and cleans up the slot normally. Safe to call at any time from any server callback.</div>
+</div>
+
+<pre><code><span class="cm">-- auth-token.lua</span>
+<span class="kw">local</span> SECRET = <span class="st">"my-secret-token"</span>
+<span class="kw">local</span> authenticated = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)    authenticated[client_id] = <span class="kw">false</span> <span class="kw">end</span>
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id) authenticated[client_id] = <span class="kw">nil</span>   <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">if not</span> authenticated[client_id] <span class="kw">then</span>
+        <span class="kw">if</span> msg == SECRET <span class="kw">then</span>
+            authenticated[client_id] = <span class="kw">true</span>
+            self.send(client_id, <span class="st">"AUTH OK"</span>)
+        <span class="kw">else</span>
+            self.send(client_id, <span class="st">"AUTH FAIL"</span>)
+            self.disconnect(client_id)
+        <span class="kw">end</span>
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(<span class="st">"["</span> .. tostring(client_id) .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-rate-limit">Rate Limiting</h2>
+<p>Combine <code>self.disconnect</code> with <code>on_tick</code> to enforce a per-client message budget. No external deps required — pure Lua.</p>
+
+<pre><code><span class="cm">-- rate-limit.lua: 10 messages per second per client</span>
+<span class="kw">local</span> MAX_MSGS = <span class="nb">10</span>
+<span class="kw">local</span> counts   = {}
+tick_ms = <span class="nb">1000</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)    counts[client_id] = <span class="nb">0</span>   <span class="kw">end</span>
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id) counts[client_id] = <span class="kw">nil</span> <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    counts[client_id] = (counts[client_id] <span class="kw">or</span> <span class="nb">0</span>) + <span class="nb">1</span>
+    <span class="kw">if</span> counts[client_id] > MAX_MSGS <span class="kw">then</span>
+        self.send(client_id, <span class="st">"ERROR rate limit exceeded"</span>)
+        self.disconnect(client_id)
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(msg)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">for</span> id <span class="kw">in</span> pairs(counts) <span class="kw">do</span> counts[id] = <span class="nb">0</span> <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-http">HTTP Calls</h2>
+
+<h3 id="addons-http-api">socketley.http API</h3>
+<p>Make synchronous HTTP or HTTPS requests from Lua scripts using <code>socketley.http(opts)</code>.</p>
+
+<div class="warn-box"><strong>Blocks the event loop.</strong> <code>socketley.http</code> is a synchronous call that blocks the single-threaded event loop for the duration of the request. Use it only in <code>on_start</code>, <code>on_stop</code>, or low-frequency <code>on_tick</code> callbacks (e.g., <code>tick_ms = 30000</code>). Never call it from <code>on_client_message</code> or <code>on_connect</code> under load.</div>
+
+<div class="method-card" id="addons-http-api">
+<div class="method-header"><span class="method-name">socketley.http</span><span class="method-sig">(opts) &rarr; table</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">
+  Sends a synchronous HTTP/1.0 request. Returns <code>{ok, status, body, error}</code>.
+  <br><br>
+  <strong>opts keys:</strong> <code>url</code> (required), <code>method</code> (default <code>"GET"</code>), <code>body</code>, <code>headers</code> (table), <code>timeout_ms</code> (default 5000).
+</div>
+</div>
+
+<pre><code><span class="cm">-- Simple GET</span>
+<span class="kw">local</span> res = socketley.http({ url = <span class="st">"http://127.0.0.1:8500/v1/status/leader"</span> })
+<span class="kw">if</span> res.ok <span class="kw">then</span>
+    socketley.log(<span class="st">"leader: "</span> .. res.body)
+<span class="kw">else</span>
+    socketley.log(<span class="st">"error: "</span> .. res.error)
+<span class="kw">end</span>
+
+<span class="cm">-- POST with JSON body</span>
+<span class="kw">local</span> res = socketley.http({
+    method  = <span class="st">"POST"</span>,
+    url     = <span class="st">"http://127.0.0.1:9091/metrics/job/myapp"</span>,
+    body    = <span class="st">"connections "</span> .. tostring(self.connections()) .. <span class="st">"\n"</span>,
+    headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"text/plain"</span> },
+})</code></pre>
+
+<h3 id="addons-http-https">HTTPS</h3>
+<p>HTTPS is supported via OpenSSL. Certificate validation is skipped (<code>SSL_VERIFY_NONE</code>) — suitable for trusted internal services (Consul, etcd, Prometheus Pushgateway on localhost).</p>
+<p>For external HTTPS with certificate validation, use <code>io.popen</code> (available in Lua scripts since <code>sol::lib::io</code> is opened):</p>
+<pre><code><span class="cm">-- Fallback via curl for full cert validation</span>
+<span class="kw">local</span> f = io.popen(<span class="st">"curl -s https://api.example.com/health"</span>)
+<span class="kw">local</span> body = f:read(<span class="st">"*a"</span>)
+f:close()</code></pre>
+
+<h2 id="addons-service-discovery">Service Discovery</h2>
+<p>Register and deregister this runtime with Consul (or any HTTP-based registry) using <code>socketley.http</code> in <code>on_start</code>/<code>on_stop</code>.</p>
+
+<pre><code><span class="cm">-- service-discovery.lua — Consul registration</span>
+<span class="kw">local</span> CONSUL = <span class="st">"http://127.0.0.1:8500"</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> payload = string.format(
+        <span class="st">'{"ID":"%s","Name":"%s","Port":%d}'</span>,
+        self.name, self.name, self.port)
+    socketley.http({
+        method  = <span class="st">"PUT"</span>,
+        url     = CONSUL .. <span class="st">"/v1/agent/service/register"</span>,
+        body    = payload,
+        headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"application/json"</span> },
+    })
+    socketley.log(<span class="st">"registered with Consul: "</span> .. self.name)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    socketley.http({
+        method = <span class="st">"PUT"</span>,
+        url    = CONSUL .. <span class="st">"/v1/agent/service/deregister/"</span> .. self.name,
+    })
+<span class="kw">end</span></code></pre>
+
+<p>The same pattern works with etcd (PUT to <code>/v3/kv/put</code>), Eureka (POST to <code>/eureka/apps/&lt;name&gt;</code>), or any REST-based registry.</p>
+
+<h2 id="addons-metrics">Metrics Push</h2>
+<p>Push runtime metrics to Prometheus Pushgateway every N seconds using <code>on_tick</code> + <code>socketley.http</code>.</p>
+
+<pre><code><span class="cm">-- metrics-push.lua — Prometheus Pushgateway</span>
+<span class="kw">local</span> PUSHGW = <span class="st">"http://127.0.0.1:9091"</span>
+tick_ms = <span class="nb">30000</span>   <span class="cm">-- push every 30 s</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">local</span> conns = self.connections()
+    <span class="kw">local</span> body  = string.format(
+        <span class="st">"# HELP socketley_connections Active TCP connections\n"</span> ..
+        <span class="st">"# TYPE socketley_connections gauge\n"</span> ..
+        <span class="st">"socketley_connections{runtime=\"%s\"} %d\n"</span>,
+        self.name, conns)
+    socketley.http({
+        method  = <span class="st">"POST"</span>,
+        url     = PUSHGW .. <span class="st">"/metrics/job/socketley/instance/"</span> .. self.name,
+        body    = body,
+        headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"text/plain; version=0.0.4"</span> },
+    })
+<span class="kw">end</span></code></pre>
+
+<h2 id="addons-db-backend">Database Backend</h2>
+<p>Cache runtimes support DB-backed operation via <code>on_miss</code>, <code>on_write</code>, <code>on_delete</code>, and <code>on_expire</code> callbacks. See the <a href="#db-backend">DB Backend Hooks</a> section in the Lua tab for full documentation and SQLite / MySQL / PostgreSQL examples.</p>
+
+<h2 id="addons-mq">Message Queue Bridge</h2>
+<p>Bridge connected clients to RabbitMQ, NATS, or Redis Streams using luarocks libraries inside server callbacks.</p>
+
+<pre><code><span class="cm">-- nats-bridge.lua — forward all client messages to a NATS subject</span>
+<span class="cm">-- Requires: luarocks install lua-nats (or similar binding)</span>
+<span class="kw">local</span> nats
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> ok, mod = pcall(require, <span class="st">"nats"</span>)
+    <span class="kw">if</span> ok <span class="kw">then</span>
+        nats = mod.connect({ host = <span class="st">"127.0.0.1"</span>, port = <span class="nb">4222</span> })
+        socketley.log(<span class="st">"NATS bridge connected"</span>)
+    <span class="kw">else</span>
+        socketley.log(<span class="st">"NATS not available: "</span> .. tostring(mod))
+    <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">if</span> nats <span class="kw">then</span>
+        nats:publish(<span class="st">"socketley."</span> .. self.name, msg)
+    <span class="kw">end</span>
+    self.broadcast(msg)   <span class="cm">-- also relay to TCP clients</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    <span class="kw">if</span> nats <span class="kw">then</span> nats:close() <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+
+<div class="info-box">
+<strong>Tip — HTTP-based MQ:</strong> If your broker has an HTTP API (RabbitMQ Management, NATS JetStream), you can publish messages directly via <code>socketley.http</code> without any extra library:
+<pre style="margin-top:0.5em;margin-bottom:0"><code>socketley.http({
+    method = <span class="st">"POST"</span>,
+    url    = <span class="st">"http://127.0.0.1:15672/api/exchanges/%2F/amq.default/publish"</span>,
+    body   = <span class="st">'{"properties":{},"routing_key":"myqueue","payload":"'</span> .. msg .. <span class="st">'","payload_encoding":"string"}'</span>,
+    headers = {
+        [<span class="st">"Content-Type"</span>] = <span class="st">"application/json"</span>,
+        [<span class="st">"Authorization"</span>] = <span class="st">"Basic Z3Vlc3Q6Z3Vlc3Q="</span>,  <span class="cm">-- guest:guest</span>
+    },
+})</code></pre>
+</div>
+
+</div><!-- #content-addons -->
 
 <script src="js/app.js"></script>
 </body>

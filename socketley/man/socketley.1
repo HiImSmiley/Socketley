@@ -865,6 +865,17 @@ Server only (master mode). Custom authentication. Return true to grant
 master role, false to deny. If defined, overrides
 .BR \-\-master\-pw .
 .TP
+.B on_auth(client_id) \(-> bool
+Server only. Called immediately after a client is accepted, before
+.B on_connect
+fires. Return
+.B true
+to admit the client or
+.B false
+to reject and close the connection. If the callback throws a Lua error, the client is also rejected (fail-closed). When no
+.B on_auth
+callback is defined, all clients are admitted.
+.TP
 .B on_tick(dt)
 Called at a configurable interval while the runtime is running.
 .I dt
@@ -922,6 +933,10 @@ self.persist(key)           -- Remove expiry
 -- Cache: pub/sub
 self.publish(channel, msg)  -- Publish to channel
 
+-- Server: connection control
+self.disconnect(client_id)         -- Terminate a connection from Lua
+self.peer_ip(client_id)            -- Get client IP (IPv4 or IPv6 string)
+
 -- Server: client routing
 self.route(client_id, target)      -- Forward client to sub-server
 self.unroute(client_id)            -- Stop forwarding
@@ -935,6 +950,39 @@ self.owner_broadcast(msg)          -- Broadcast to all owner's clients
 .TP
 .B socketley.log(msg)
 Output log message with [lua] prefix.
+.TP
+.B socketley.http(opts) \(-> table
+Synchronous HTTP/HTTPS client.
+.B WARNING:
+Blocks the event loop thread. Use only in
+.BR on_start / on_stop
+or low-frequency
+.B on_tick
+callbacks.
+.PP
+.I opts
+table keys:
+.nf
+url         string   Request URL (http:// or https://)
+method      string   HTTP method (default "GET")
+body        string   Request body (optional)
+headers     table    Extra headers e.g. {["Content-Type"]="application/json"}
+timeout_ms  number   Timeout in milliseconds (default 5000)
+.fi
+.PP
+Returns a table:
+.nf
+ok      bool    true if HTTP status 2xx
+status  number  HTTP status code (e.g. 200, 404)
+body    string  Response body
+error   string  Error message on failure
+.fi
+.PP
+HTTPS uses OpenSSL with
+.B SSL_VERIFY_NONE
+(no certificate validation) — suitable for trusted internal services.
+For external HTTPS with cert validation, use
+.BR "io.popen(\"curl -s ...\")" .
 .SS Runtime Management API
 Create, start, stop, and remove runtimes from Lua scripts:
 .nf
