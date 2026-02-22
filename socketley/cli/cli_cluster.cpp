@@ -1,4 +1,5 @@
 #include "cli.h"
+#include "ipc_client.h"
 #include "command_hashing.h"
 #include "../shared/cluster_discovery.h"
 
@@ -382,16 +383,28 @@ static int cluster_watch(const std::string& dir)
 
 int cli_cluster(int argc, char** argv)
 {
-    // Parse: socketley cluster <dir> [subcommand] [args]
-    if (argc < 3)
+    // Query daemon for cluster directory
+    std::string dir;
+    int rc = ipc_send("cluster-dir", dir);
+    if (rc < 0)
     {
-        std::cerr << "usage: cluster <dir> <ls|ps|group|show|stats|watch>\n";
-        return 1;
+        std::cerr << "failed to connect to daemon\n";
+        return 2;
+    }
+    if (rc != 0)
+    {
+        // daemon returned error (e.g. not in cluster mode)
+        if (!dir.empty())
+            std::cerr << dir;
+        return rc;
     }
 
-    std::string dir = argv[2];
+    // Trim trailing newline
+    while (!dir.empty() && (dir.back() == '\n' || dir.back() == '\r'))
+        dir.pop_back();
+
     std::string subcmd;
-    int i = 3;
+    int i = 2;
 
     if (i < argc)
         subcmd = argv[i];

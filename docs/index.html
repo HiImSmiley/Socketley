@@ -612,8 +612,8 @@ socketley daemon --name api1 --cluster /shared/cluster --cluster-addr 10.0.1.1 &
 socketley daemon --name api2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &amp;</code></pre>
 
 <div class="cli-card" id="cmd-cluster">
-  <div class="cli-name">socketley cluster &lt;dir&gt; &lt;subcommand&gt;</div>
-  <div class="cli-desc">Inspect the shared cluster directory. Does not require a running daemon &mdash; reads the heartbeat JSON files directly. Subcommands:</div>
+  <div class="cli-name">socketley cluster &lt;subcommand&gt;</div>
+  <div class="cli-desc">Inspect the cluster. Requires a running daemon in cluster mode (<code>--name</code> + <code>--cluster</code>). The cluster directory is read from the daemon automatically. Subcommands:</div>
 </div>
 <table><thead><tr><th>Subcommand</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>ls</code></td><td>List all daemons with runtime counts and heartbeat status</td></tr>
@@ -623,11 +623,11 @@ socketley daemon --name api2 --cluster /shared/cluster --cluster-addr 10.0.1.2 &
 <tr><td><code>stats</code></td><td>Aggregate summary: daemon counts, runtime totals, group membership</td></tr>
 <tr><td><code>watch</code></td><td>Live-refresh the cluster view every 2&nbsp;seconds (Ctrl+C to stop)</td></tr>
 </tbody></table>
-<pre><code>socketley cluster /shared/cluster ls
-socketley cluster /shared/cluster ps
-socketley cluster /shared/cluster group api
-socketley cluster /shared/cluster stats
-socketley cluster /shared/cluster watch</code></pre>
+<pre><code>socketley cluster ls
+socketley cluster ps
+socketley cluster group api
+socketley cluster stats
+socketley cluster watch</code></pre>
 
 <!-- ── CLI FLAGS ── -->
 <h2 id="cli-flags">CLI Flags</h2>

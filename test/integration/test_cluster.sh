@@ -114,7 +114,7 @@ sleep 3
 # ─── Test 1: Daemon discovery (cluster ls) ─────────────────────────────────────
 
 echo "  Test 1: daemon discovery"
-OUT=$("$BIN" cluster "$CLUSTER_DIR" ls 2>&1)
+OUT=$(node1 cluster ls 2>&1)
 assert_contains "$OUT" "node1"
 assert_contains "$OUT" "node2"
 assert_contains "$OUT" "gateway"
@@ -122,14 +122,14 @@ assert_contains "$OUT" "gateway"
 # ─── Test 2: Runtime visibility (cluster ps) ───────────────────────────────────
 
 echo "  Test 2: runtime visibility"
-OUT=$("$BIN" cluster "$CLUSTER_DIR" ps 2>&1)
+OUT=$(node1 cluster ps 2>&1)
 assert_contains "$OUT" "$RT_API1"
 assert_contains "$OUT" "$RT_API2"
 
 # ─── Test 3: Group resolution (cluster group api) ─────────────────────────────
 
 echo "  Test 3: group resolution"
-OUT=$("$BIN" cluster "$CLUSTER_DIR" group api 2>&1)
+OUT=$(node1 cluster group api 2>&1)
 assert_contains "$OUT" "node1"
 assert_contains "$OUT" "node2"
 assert_contains "$OUT" "$NODE1_PORT"
@@ -138,7 +138,7 @@ assert_contains "$OUT" "$NODE2_PORT"
 # ─── Test 4: Cluster stats ────────────────────────────────────────────────────
 
 echo "  Test 4: cluster stats"
-OUT=$("$BIN" cluster "$CLUSTER_DIR" stats 2>&1)
+OUT=$(node1 cluster stats 2>&1)
 assert_contains "$OUT" "3 healthy"
 assert_contains "$OUT" "api"
 assert_contains "$OUT" "2 members"
@@ -175,7 +175,7 @@ DAEMON_PIDS[1]=0
 # Stale threshold is 10s; wait for it to expire
 sleep 12
 
-OUT=$("$BIN" cluster "$CLUSTER_DIR" ls 2>&1)
+OUT=$(node1 cluster ls 2>&1)
 # node2 should be stale or its heartbeat should be old
 TOTAL=$((TOTAL+1))
 if echo "$OUT" | grep "node2" | grep -q "stale"; then
