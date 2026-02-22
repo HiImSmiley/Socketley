@@ -128,7 +128,7 @@ LUAEOF
 
 # ─── Start daemon A ──────────────────────────────────────────────────────────
 SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon \
-    --name nodeA --cluster "$CLUSTER_DIR" --cluster-addr 127.0.0.1 2>/dev/null &
+    --name nodeA --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.5
 
@@ -152,7 +152,7 @@ assert_contains "$OUT" "stats_daemons=1"
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon \
-    --name nodeB --cluster "$CLUSTER_DIR" --cluster-addr 127.0.0.1 2>/dev/null &
+    --name nodeB --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.5
 

@@ -49,7 +49,6 @@ class cluster_discovery : public io_handler
 public:
     cluster_discovery(std::string_view daemon_name,
                       std::string_view cluster_dir,
-                      std::string_view cluster_addr,
                       runtime_manager& manager);
     ~cluster_discovery() override;
 

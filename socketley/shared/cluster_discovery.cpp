@@ -150,13 +150,16 @@ const char* state_str(runtime_state s)
 
 cluster_discovery::cluster_discovery(std::string_view daemon_name,
                                      std::string_view cluster_dir,
-                                     std::string_view cluster_addr,
                                      runtime_manager& manager)
     : m_daemon_name(daemon_name)
     , m_cluster_dir(cluster_dir)
-    , m_cluster_addr(cluster_addr.empty() ? std::string(daemon_name) : std::string(cluster_addr))
     , m_manager(manager)
 {
+    char buf[256];
+    if (gethostname(buf, sizeof(buf)) == 0)
+        m_cluster_addr = buf;
+    else
+        m_cluster_addr = daemon_name;
 }
 
 cluster_discovery::~cluster_discovery()
