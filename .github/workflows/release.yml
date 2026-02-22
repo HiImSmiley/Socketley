@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential liburing-dev libssl-dev \
+            netcat-openbsd bc libluajit-5.1-dev
+          cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" \
+            thirdparty/luajit/libluajit.a
+
+      - name: Build release binary
+        run: |
+          ./bin/premake5 gmake2
+          cd make && make config=release_x64 -j$(nproc)
+
+      - name: Run tests
+        run: |
+          ./bin/Release/test_command_hashing
+          ./bin/Release/test_cache_store
+          ./bin/Release/test_resp_parser
+          ./bin/Release/test_name_resolver
+          ./bin/Release/test_ws_parser
+          bash test/run_all.sh
+        timeout-minutes: 5
+
+      - name: Build .deb package
+        run: bash packaging/build-deb.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Socketley $VERSION" \
+            --generate-notes \
+            "socketley_${VERSION}_amd64.deb"
