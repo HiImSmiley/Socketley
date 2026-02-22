@@ -8,11 +8,15 @@ A high-performance Linux daemon and CLI tool that manages long-living network ru
 - **Client** -- TCP/UDP connector with auto-reconnect
 - **Proxy** -- HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
 - **Cache** -- In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
-- **Lua scripting** -- Per-runtime callbacks (`on_message`, `on_connect`, `on_route`, etc.) with hot-reload
+- **Lua scripting** -- Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
+- **Cluster mode** -- Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
+- **Master mode** -- One client claims master, broadcasts to all; optional forwarding
+- **HTTP static serving** -- `--http <dir>` with auto-injected WebSocket, optional in-memory caching
 - **TLS/SSL** -- Optional encryption for all runtime types
 - **WebSocket** -- Auto-detected per connection, coexists with raw TCP on the same port
 - **io_uring** -- Multishot accept, SQPOLL, provided buffers, writev coalescing
 - **State persistence** -- Runtime configs saved as JSON, auto-restored on daemon restart
+- **Ownership** -- Parent-child runtime relationships with configurable `on_parent_stop` policies
 - **Monitoring** -- `socketley stats` for live metrics, `--rate-limit` and `--max-connections` for resource control
 
 ## Performance
@@ -145,7 +149,9 @@ sudo dpkg -i socketley_*.deb
 ## CLI Reference
 
 ```
+socketley daemon [--name <n>] [--cluster <dir>]  # start the daemon
 socketley create <type> <name> [flags]    # types: server, client, proxy, cache
+socketley attach <type> <name> <port>     # register an external process as a runtime
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive
 socketley stop <name|pattern>...          # stop runtime(s)
 socketley remove <name|pattern>...        # remove runtime(s)
@@ -155,8 +161,11 @@ socketley reload <name|pattern>...        # restart runtime
 socketley reload-lua <name|pattern>...    # hot-reload Lua script
 socketley show <name|pattern>...          # print JSON config
 socketley edit <name> [flags]             # modify runtime config
+socketley owner <name>                    # show parent/children/policy
 socketley ls                              # list all runtimes
 socketley ps                              # list running runtimes
+socketley --lua <file.lua>                # run Lua orchestration script
+socketley cluster ls|ps|group|show|stats|watch  # multi-daemon cluster inspection
 ```
 
 Glob patterns supported: `socketley stop "api-*"` stops all runtimes matching `api-*`.
