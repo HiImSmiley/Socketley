@@ -61,6 +61,20 @@ void daemon_handler::set_cluster_discovery(cluster_discovery* cd)
     m_cluster = cd;
 }
 
+bool daemon_handler::is_running()
+{
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe < 0)
+        return false;
+
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+    bool alive = connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    close(probe);
+    return alive;
+}
+
 bool daemon_handler::setup()
 {
     unlink(socket_path.c_str());
@@ -441,6 +455,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
+    int failed = 0;
     for (const auto& n : names)
     {
         // Allow -i on already-running runtimes (attach without start)
@@ -450,7 +465,11 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         if (!already_running)
         {
             if (!m_manager.run(n, m_loop))
+            {
+                conn->write_buf += "failed to start: " + std::string(n) + "\n";
+                ++failed;
                 continue;
+            }
             if (m_persistence)
                 m_persistence->set_was_running(n, true);
             inst = m_manager.get(n);
@@ -469,7 +488,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    return 0;
+    return failed > 0 ? 1 : 0;
 }
 
 int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)

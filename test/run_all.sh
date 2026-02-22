@@ -8,12 +8,15 @@ BIN_DIR="$ROOT/bin/Release"
 PASS=0; FAIL=0
 DAEMON_PID=""
 
+# Use a fixed test socket path (avoids system-mode path resolution issues)
+export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
+
 cleanup() {
     if [ -n "$DAEMON_PID" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
-    rm -f /tmp/socketley.sock
+    rm -f "$SOCKETLEY_SOCKET"
 }
 trap cleanup EXIT
 
@@ -49,14 +52,14 @@ echo ""
 # Kill any existing daemon
 pkill -f "socketley daemon" 2>/dev/null || true
 sleep 0.2
-rm -f /tmp/socketley.sock
+rm -f "$SOCKETLEY_SOCKET"
 
 export BIN="$BIN_DIR/socketley"
 "$BIN" daemon 2>/dev/null &
 DAEMON_PID=$!
 sleep 0.5
 
-if [ ! -S /tmp/socketley.sock ]; then
+if [ ! -S "$SOCKETLEY_SOCKET" ]; then
     echo "ERROR: daemon failed to start"
     exit 1
 fi

@@ -8,6 +8,7 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop resp_test 2>/dev/null || true
+    sleep 0.5
     "$BIN" remove resp_test 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -34,7 +35,7 @@ assert_contains() {
 }
 
 send_resp() {
-    printf '%s' "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
+    printf '%b' "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
 }
 
 echo "=== Integration: RESP2 protocol ==="
@@ -58,9 +59,15 @@ assert_contains "$RESULT" "myval" "RESP GET"
 RESULT=$(send_resp '*2\r\n$3\r\nDEL\r\n$5\r\nmykey\r\n')
 assert_contains "$RESULT" ":1" "RESP DEL"
 
-# Test: GET after DEL returns nil
+# Test: GET after DEL returns null bulk string ($-1)
 RESULT=$(send_resp '*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n')
-assert_contains "$RESULT" "nil" "RESP GET after DEL"
+TOTAL=$((TOTAL+1))
+if echo "$RESULT" | grep -qF '$-1'; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [RESP GET after DEL]: expected '\$-1' in output, got '$RESULT'"
+fi
 
 # Test: PING
 RESULT=$(send_resp '*1\r\n$4\r\nPING\r\n')

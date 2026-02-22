@@ -10,6 +10,7 @@ cleanup() {
     # Kill any lingering nc processes from this test
     kill $NC_PID1 $NC_PID2 $NC_PID3 $NC_PID4 2>/dev/null || true
     "$BIN" stop rl_test 2>/dev/null || true
+    sleep 0.5
     "$BIN" remove rl_test 2>/dev/null || true
 }
 NC_PID1=""; NC_PID2=""; NC_PID3=""; NC_PID4=""
