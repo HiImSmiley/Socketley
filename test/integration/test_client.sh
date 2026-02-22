@@ -8,8 +8,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop cli_client 2>/dev/null || true
-    "$BIN" remove cli_client 2>/dev/null || true
     "$BIN" stop cli_svr 2>/dev/null || true
+    sleep 0.5
+    "$BIN" remove cli_client 2>/dev/null || true
     "$BIN" remove cli_svr 2>/dev/null || true
 }
 trap cleanup EXIT

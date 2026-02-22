@@ -34,6 +34,7 @@ public:
     daemon_handler(runtime_manager& manager, event_loop& loop);
     ~daemon_handler() override;
 
+    static bool is_running();
     bool setup();
     void teardown();
     void on_cqe(struct io_uring_cqe* cqe) override;

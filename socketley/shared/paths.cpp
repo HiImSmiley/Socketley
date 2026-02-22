@@ -22,6 +22,9 @@ socketley_paths socketley_paths::resolve()
 {
     socketley_paths p;
 
+    // SOCKETLEY_SOCKET env var overrides socket path (used by cluster multi-daemon setups)
+    const char* env_socket = std::getenv("SOCKETLEY_SOCKET");
+
     bool installed = access("/usr/bin/socketley", X_OK) == 0;
     uid_t uid = getuid();
 
@@ -72,6 +75,10 @@ socketley_paths socketley_paths::resolve()
             p.system_mode = true;
         }
     }
+
+    // Override socket path if SOCKETLEY_SOCKET is set
+    if (env_socket && env_socket[0])
+        p.socket_path = env_socket;
 
     return p;
 }

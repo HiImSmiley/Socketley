@@ -3,11 +3,12 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
-PORT=19100
+PORT=19150
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop testcache 2>/dev/null || true
+    sleep 0.5
     "$BIN" remove testcache 2>/dev/null || true
     rm -f /tmp/test-cache-$$.bin
 }
