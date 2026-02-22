@@ -96,14 +96,6 @@
         <li><a href="#config-runtimes">runtimes Table</a></li>
         <li><a href="#config-daemon">Daemon Config</a></li>
       </ul></li>
-      <li><a href="#examples">Quick Examples</a><ul>
-        <li><a href="#ex-echo">Echo Server</a></li>
-        <li><a href="#ex-chat">Chat Server</a></li>
-        <li><a href="#ex-game">Game Lobby</a></li>
-        <li><a href="#ex-cache-api">Cache-Backed API</a></li>
-        <li><a href="#ex-master">Master Broadcast</a></li>
-        <li><a href="#ex-proxy">Proxy Routing</a></li>
-      </ul></li>
     </ul>
 
     <!-- ── Lua Nav ── -->
@@ -878,85 +870,6 @@ socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pr
     metrics_port = <span class="nb">9100</span>   <span class="cm">-- GET /metrics exposes Prometheus counters</span>
 }</code></pre>
 <p>The <code>metrics_port</code> enables a Prometheus-compatible endpoint at <code>http://localhost:9100/metrics</code> with per-runtime connection counts, message rates, and byte counters.</p>
-
-<!-- ── QUICK EXAMPLES ── -->
-<h2 id="examples">Quick Examples</h2>
-
-<h3 id="ex-echo">Echo Server</h3>
-<pre><code><span class="kw">function</span> <span class="fn">on_message</span>(msg)
-    self.broadcast(msg)
-<span class="kw">end</span></code></pre>
-<pre><code>socketley create server echo -p 9000 --lua echo.lua -s</code></pre>
-
-<h3 id="ex-chat">Chat Server</h3>
-<pre><code><span class="kw">local</span> clients = {}
-
-<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
-    clients[client_id] = <span class="st">"user"</span> .. client_id
-    self.send(client_id, <span class="st">"Welcome! You are "</span> .. clients[client_id])
-    self.broadcast(clients[client_id] .. <span class="st">" joined"</span>)
-<span class="kw">end</span>
-
-<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
-    <span class="kw">local</span> name = clients[client_id] <span class="kw">or</span> <span class="st">"unknown"</span>
-    clients[client_id] = <span class="kw">nil</span>
-    self.broadcast(name .. <span class="st">" left"</span>)
-<span class="kw">end</span>
-
-<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
-    <span class="kw">if</span> msg:match(<span class="st">"^/nick "</span>) <span class="kw">then</span>
-        <span class="kw">local</span> old = clients[client_id]
-        clients[client_id] = msg:match(<span class="st">"^/nick (%S+)"</span>)
-        self.broadcast(old .. <span class="st">" is now "</span> .. clients[client_id])
-        <span class="kw">return</span>
-    <span class="kw">end</span>
-    self.broadcast(<span class="st">"["</span> .. clients[client_id] .. <span class="st">"] "</span> .. msg)
-<span class="kw">end</span></code></pre>
-
-<h3 id="ex-game">Game Lobby</h3>
-<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
-    socketley.create(<span class="st">"server"</span>, <span class="st">"chess-rapid"</span>, {
-        port = <span class="nb">0</span>, lua = <span class="st">"rapid-handler.lua"</span>,
-        on_parent_stop = <span class="st">"remove"</span>, autostart = <span class="kw">true</span>
-    })
-<span class="kw">end</span>
-
-<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
-    <span class="kw">if</span> msg:match(<span class="st">"^join "</span>) <span class="kw">then</span>
-        self.route(client_id, <span class="st">"chess-"</span> .. msg:match(<span class="st">"^join (%S+)"</span>))
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-
-<h3 id="ex-cache-api">Cache-Backed API</h3>
-<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
-    self.set(<span class="st">"config:version"</span>, <span class="st">"1.0.0"</span>)
-    self.hset(<span class="st">"user:1"</span>, <span class="st">"name"</span>, <span class="st">"Alice"</span>)
-    socketley.log(<span class="st">"Cache seeded"</span>)
-<span class="kw">end</span></code></pre>
-
-<h3 id="ex-master">Master Broadcast</h3>
-<pre><code><span class="kw">local</span> tokens = { [<span class="st">"admin-secret"</span>] = <span class="kw">true</span> }
-<span class="kw">function</span> <span class="fn">on_master_auth</span>(client_id, password)
-    <span class="kw">return</span> tokens[password] == <span class="kw">true</span>
-<span class="kw">end</span></code></pre>
-<pre><code>socketley create server ctrl -p 9000 --mode master --master-forward --lua master.lua -s</code></pre>
-
-<h3 id="ex-proxy">Proxy with Group Discovery</h3>
-<pre><code>runtimes = {
-    { type = <span class="st">"server"</span>, name = <span class="st">"api1"</span>, port = <span class="nb">9001</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"server"</span>, name = <span class="st">"api2"</span>, port = <span class="nb">9002</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span> },
-    { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,   port = <span class="nb">8080</span>,
-      backends = { <span class="st">"@api"</span> }, strategy = <span class="st">"round-robin"</span>,
-      autostart = <span class="kw">true</span> }
-}
-
-<span class="kw">function</span> <span class="fn">on_start</span>()
-    <span class="cm">-- Scale up dynamically: new members join the group automatically</span>
-    socketley.create(<span class="st">"server"</span>, <span class="st">"api3"</span>, {
-        port = <span class="nb">9003</span>, group = <span class="st">"api"</span>, autostart = <span class="kw">true</span>
-    })
-<span class="kw">end</span></code></pre>
-<pre><code>socketley --lua group-setup.lua</code></pre>
 
 </main>
 
