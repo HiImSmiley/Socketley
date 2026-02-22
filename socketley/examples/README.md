@@ -47,6 +47,7 @@ examples/
 ### Proxy
 - `http-proxy.sh` - Basic HTTP reverse proxy
 - `load-balancer.sh` - Round-robin load balancing
+- `group-discovery.sh` - Dynamic backends with `@group` discovery
 - `tcp-proxy.sh` - Raw TCP byte forwarding
 - `multi-backend.lua` - Multiple backends with Lua
 
