@@ -103,28 +103,33 @@ bool server_instance::get_http_cache() const
 
 static std::string_view http_content_type(std::string_view ext)
 {
-    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
-    if (ext == ".css")  return "text/css; charset=utf-8";
-    if (ext == ".js")   return "application/javascript; charset=utf-8";
-    if (ext == ".json") return "application/json; charset=utf-8";
-    if (ext == ".png")  return "image/png";
-    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
-    if (ext == ".gif")  return "image/gif";
-    if (ext == ".svg")  return "image/svg+xml";
-    if (ext == ".ico")  return "image/x-icon";
-    if (ext == ".woff2") return "font/woff2";
-    if (ext == ".woff") return "font/woff";
-    if (ext == ".ttf")  return "font/ttf";
-    if (ext == ".txt")  return "text/plain; charset=utf-8";
-    if (ext == ".xml")  return "application/xml";
-    if (ext == ".wasm") return "application/wasm";
-    if (ext == ".webp") return "image/webp";
-    if (ext == ".mp4")  return "video/mp4";
-    if (ext == ".webm") return "video/webm";
-    if (ext == ".mp3")  return "audio/mpeg";
-    if (ext == ".ogg")  return "audio/ogg";
-    if (ext == ".pdf")  return "application/pdf";
-    return "application/octet-stream";
+    switch (fnv1a(ext))
+    {
+        case fnv1a(".html"): case fnv1a(".htm"):
+            return "text/html; charset=utf-8";
+        case fnv1a(".css"):  return "text/css; charset=utf-8";
+        case fnv1a(".js"):   return "application/javascript; charset=utf-8";
+        case fnv1a(".json"): return "application/json; charset=utf-8";
+        case fnv1a(".png"):  return "image/png";
+        case fnv1a(".jpg"):  case fnv1a(".jpeg"):
+            return "image/jpeg";
+        case fnv1a(".gif"):  return "image/gif";
+        case fnv1a(".svg"):  return "image/svg+xml";
+        case fnv1a(".ico"):  return "image/x-icon";
+        case fnv1a(".woff2"): return "font/woff2";
+        case fnv1a(".woff"): return "font/woff";
+        case fnv1a(".ttf"):  return "font/ttf";
+        case fnv1a(".txt"):  return "text/plain; charset=utf-8";
+        case fnv1a(".xml"):  return "application/xml";
+        case fnv1a(".wasm"): return "application/wasm";
+        case fnv1a(".webp"): return "image/webp";
+        case fnv1a(".mp4"):  return "video/mp4";
+        case fnv1a(".webm"): return "video/webm";
+        case fnv1a(".mp3"):  return "audio/mpeg";
+        case fnv1a(".ogg"):  return "audio/ogg";
+        case fnv1a(".pdf"):  return "application/pdf";
+        default:             return "application/octet-stream";
+    }
 }
 
 static constexpr std::string_view WS_INJECT_SCRIPT =
@@ -221,10 +226,11 @@ void server_instance::rebuild_http_cache()
         // Detect content type
         std::string ext = entry.path().extension().string();
         for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        uint32_t ext_hash = fnv1a(ext);
         auto ct = http_content_type(ext);
 
         // Inject WebSocket script into HTML files
-        if (ext == ".html" || ext == ".htm")
+        if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
             content = inject_ws_script(content);
 
         // Store pre-built response as shared_ptr (zero-copy on cache hit)
@@ -312,9 +318,10 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             std::string ext = resolved.extension().string();
             for (auto& c : ext)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            uint32_t ext_hash = fnv1a(ext);
             auto ct = http_content_type(ext);
 
-            if (ext == ".html" || ext == ".htm")
+            if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
                 content = inject_ws_script(content);
 
             conn->write_queue.push(

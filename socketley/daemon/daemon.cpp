@@ -10,6 +10,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../cli/command_hashing.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -35,11 +36,14 @@ static void signal_handler(int)
 
 static bool parse_log_level(std::string_view str, log_level& level)
 {
-    if (str == "debug") { level = log_debug; return true; }
-    if (str == "info")  { level = log_info;  return true; }
-    if (str == "warn")  { level = log_warn;  return true; }
-    if (str == "error") { level = log_error; return true; }
-    return false;
+    switch (fnv1a(str))
+    {
+        case fnv1a("debug"): level = log_debug; return true;
+        case fnv1a("info"):  level = log_info;  return true;
+        case fnv1a("warn"):  level = log_warn;  return true;
+        case fnv1a("error"): level = log_error; return true;
+        default: return false;
+    }
 }
 
 static uint16_t load_daemon_config(const std::string& config_path)
