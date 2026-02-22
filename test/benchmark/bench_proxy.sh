@@ -20,11 +20,39 @@ append_result() {
     fi
 }
 
-# Simple HTTP request
+# Simple HTTP request via bash /dev/tcp — avoids nc -q1 1-second delay.
+# Sends request, reads the HTTP status line (arrives in <1ms on localhost),
+# then closes. Returns the status line so callers can check non-empty / code.
 http_request() {
     local port=$1
     local path=${2:-/}
-    echo -e "GET $path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | nc -q1 localhost "$port" 2>/dev/null
+    local resp
+    exec 99<>/dev/tcp/localhost/$port 2>/dev/null || return 1
+    printf 'GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' "$path" >&99
+    IFS= read -r -t 2 resp <&99
+    exec 99<&-
+    printf '%s' "$resp"
+}
+
+# Start a raw-socket HTTP backend that responds 200 OK to every request.
+# Uses listen(1000) so the proxy's sequential blocking connect() calls never
+# hit a full accept queue (Python HTTPServer defaults to backlog=5, which
+# causes Linux to drop SYNs beyond the limit → 1-second retransmit stall
+# per connection → nearly all benchmark requests time out at 2s).
+start_python_http_backend() {
+    local port=$1
+    python3 -c "
+import socket, threading
+resp = b'HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', $port))
+s.listen(1000)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=lambda c=c: [c.recv(65536), c.sendall(resp), c.close()], daemon=True).start()
+" >/dev/null 2>&1 &
+    echo $!
 }
 
 # Test 1: HTTP proxy throughput (single backend)
@@ -34,35 +62,45 @@ test_http_single_backend() {
 
     log_section "Test: HTTP Proxy Single Backend ($num_requests requests)"
 
-    # Create backend server
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed to start"; return 1; }
+    # Create backend HTTP server (Python3 — responds 200 OK to every GET)
+    local backend_pid
+    backend_pid=$(start_python_http_backend $BACKEND_PORT_1)
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed to start"; kill "$backend_pid" 2>/dev/null; return 1; }
 
     # Create proxy
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT --backend 127.0.0.1:$BACKEND_PORT_1 --protocol http -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid" 2>/dev/null; return 1; }
     sleep 0.5
 
     local latencies_file=$(mktemp)
+    local results_dir=$(mktemp -d)
     local success=0
+    local batch=40
 
     local start_time=$(get_time_ms)
 
     for i in $(seq 1 $num_requests); do
-        local req_start=$(get_time_ms)
-        local response=$(http_request $PROXY_PORT "/bench_proxy/test")
-        local req_end=$(get_time_ms)
-
-        if [[ -n "$response" ]]; then
-            echo "$((req_end - req_start))" >> "$latencies_file"
-            ((success++))
-        fi
-
-        if [[ $((i % 200)) -eq 0 ]]; then
-            echo -ne "\r  Progress: $i / $num_requests (success: $success)"
+        (
+            local t0=$(get_time_ms)
+            local response=$(http_request $PROXY_PORT "/bench_proxy/test")
+            local t1=$(get_time_ms)
+            if [[ -n "$response" ]]; then
+                echo "$((t1 - t0))" > "$results_dir/r_$i"
+            fi
+        ) &
+        # Limit concurrency
+        if [[ $((i % batch)) -eq 0 ]]; then
+            wait
+            echo -ne "\r  Progress: $i / $num_requests"
         fi
     done
+    wait
     echo ""
+
+    for f in "$results_dir"/r_*; do
+        [[ -f "$f" ]] && { cat "$f" >> "$latencies_file"; ((success++)); }
+    done
+    rm -rf "$results_dir"
 
     local end_time=$(get_time_ms)
     local total_time=$((end_time - start_time))
@@ -89,9 +127,10 @@ test_http_single_backend() {
         "p99_latency_ms" "$p99_lat"
 
     socketley_cmd stop bench_proxy
-    socketley_cmd stop backend1
+    sleep 0.5
     socketley_cmd remove bench_proxy
-    socketley_cmd remove backend1
+    kill "$backend_pid" 2>/dev/null
+    wait "$backend_pid" 2>/dev/null
 
     echo "$rps $avg_lat $p99_lat"
 }
@@ -103,31 +142,41 @@ test_http_load_balancing() {
 
     log_section "Test: HTTP Proxy Load Balancing ($num_requests requests, 2 backends)"
 
-    # Create backend servers
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 -s
-    socketley_cmd create server backend2 -p $BACKEND_PORT_2 -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend1 failed"; return 1; }
-    wait_for_port $BACKEND_PORT_2 || { log_error "Backend2 failed"; return 1; }
+    # Create backend HTTP servers (Python3)
+    local backend_pid1 backend_pid2
+    backend_pid1=$(start_python_http_backend $BACKEND_PORT_1)
+    backend_pid2=$(start_python_http_backend $BACKEND_PORT_2)
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend1 failed"; kill "$backend_pid1" "$backend_pid2" 2>/dev/null; return 1; }
+    wait_for_port $BACKEND_PORT_2 || { log_error "Backend2 failed"; kill "$backend_pid1" "$backend_pid2" 2>/dev/null; return 1; }
 
     # Create proxy with round-robin
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend 127.0.0.1:$BACKEND_PORT_1,127.0.0.1:$BACKEND_PORT_2 \
         --strategy round-robin --protocol http -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid1" "$backend_pid2" 2>/dev/null; return 1; }
     sleep 0.5
 
     local success=0
+    local results_dir=$(mktemp -d)
+    local batch=40
+
     local start_time=$(get_time_ms)
 
     for i in $(seq 1 $num_requests); do
-        local response=$(http_request $PROXY_PORT "/bench_proxy/test")
-        [[ -n "$response" ]] && ((success++))
-
-        if [[ $((i % 200)) -eq 0 ]]; then
+        (
+            local response=$(http_request $PROXY_PORT "/bench_proxy/test")
+            [[ -n "$response" ]] && touch "$results_dir/ok_$i"
+        ) &
+        if [[ $((i % batch)) -eq 0 ]]; then
+            wait
             echo -ne "\r  Progress: $i / $num_requests"
         fi
     done
+    wait
     echo ""
+
+    success=$(ls "$results_dir" | wc -l)
+    rm -rf "$results_dir"
 
     local end_time=$(get_time_ms)
     local total_time=$((end_time - start_time))
@@ -146,11 +195,10 @@ test_http_load_balancing() {
         "requests_per_sec" "$rps"
 
     socketley_cmd stop bench_proxy
-    socketley_cmd stop backend1
-    socketley_cmd stop backend2
+    sleep 0.5
     socketley_cmd remove bench_proxy
-    socketley_cmd remove backend1
-    socketley_cmd remove backend2
+    kill "$backend_pid1" "$backend_pid2" 2>/dev/null
+    wait "$backend_pid1" "$backend_pid2" 2>/dev/null
 
     echo "$rps"
 }
@@ -216,6 +264,7 @@ test_tcp_throughput() {
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
+    sleep 0.5
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 
@@ -290,6 +339,7 @@ test_concurrent_proxy_connections() {
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
+    sleep 0.5
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 
@@ -317,23 +367,33 @@ test_proxy_overhead() {
     local direct_latencies=$(mktemp)
     local proxied_latencies=$(mktemp)
 
-    # Test direct connections
+    local batch=40
+
+    # Test direct connections (parallel)
     log_info "Testing direct connections..."
     for i in $(seq 1 $num_requests); do
-        local start=$(get_time_ms)
-        echo "$message" | nc -q0 localhost $BACKEND_PORT_1 >/dev/null 2>&1
-        local end=$(get_time_ms)
-        echo "$((end - start))" >> "$direct_latencies"
+        (
+            local t0=$(get_time_ms)
+            echo "$message" | nc -q0 localhost $BACKEND_PORT_1 >/dev/null 2>&1
+            local t1=$(get_time_ms)
+            echo "$((t1 - t0))" >> "$direct_latencies"
+        ) &
+        [[ $((i % batch)) -eq 0 ]] && wait
     done
+    wait
 
-    # Test proxied connections
+    # Test proxied connections (parallel)
     log_info "Testing proxied connections..."
     for i in $(seq 1 $num_requests); do
-        local start=$(get_time_ms)
-        echo "$message" | nc -q0 localhost $PROXY_PORT >/dev/null 2>&1
-        local end=$(get_time_ms)
-        echo "$((end - start))" >> "$proxied_latencies"
+        (
+            local t0=$(get_time_ms)
+            echo "$message" | nc -q0 localhost $PROXY_PORT >/dev/null 2>&1
+            local t1=$(get_time_ms)
+            echo "$((t1 - t0))" >> "$proxied_latencies"
+        ) &
+        [[ $((i % batch)) -eq 0 ]] && wait
     done
+    wait
 
     local direct_stats=$(calc_stats "$direct_latencies")
     local proxied_stats=$(calc_stats "$proxied_latencies")
@@ -358,6 +418,7 @@ test_proxy_overhead() {
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
+    sleep 0.5
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 
@@ -408,6 +469,7 @@ test_runtime_name_backend() {
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop named_backend
+    sleep 0.5
     socketley_cmd remove bench_proxy
     socketley_cmd remove named_backend
 
@@ -418,8 +480,8 @@ test_runtime_name_backend() {
 run_proxy_benchmarks() {
     log_section "PROXY RUNTIME BENCHMARKS"
 
-    test_http_single_backend 1000
-    test_http_load_balancing 1000
+    test_http_single_backend 2000
+    test_http_load_balancing 2000
     test_tcp_throughput 3000 128
     test_concurrent_proxy_connections 20 100
     test_proxy_overhead 500

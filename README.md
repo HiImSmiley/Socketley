@@ -17,19 +17,76 @@ A high-performance Linux daemon and CLI tool that manages long-living network ru
 
 ## Performance
 
-Benchmarked against Redis 7.x on the same hardware (single-threaded, TCP):
+All benchmarks: single-threaded, loopback TCP, Intel Core Ultra 5 125H, Linux 6.8, Release build.
 
-| Operation | Socketley | Redis | Speedup |
-|-----------|-----------|-------|---------|
-| STRING SET 64B | 1.93M ops/s | 641K ops/s | **3.0x** |
-| STRING GET | 11.0M ops/s | 2.08M ops/s | **5.3x** |
-| LIST LPUSH | 8.77M ops/s | 1.38M ops/s | **6.4x** |
-| LIST LPOP | 15.2M ops/s | 1.75M ops/s | **8.7x** |
-| SET SADD | 4.06M ops/s | 1.28M ops/s | **3.2x** |
-| HASH HSET | 3.76M ops/s | 957K ops/s | **3.9x** |
-| Pipeline depth=5000 | 0.81 us/op | 1.78 us/op | **2.2x** |
+### Cache — vs Redis 7.0 (RESP2, `redis-benchmark`)
 
-Server: ~87K connections/sec burst, ~4.3M messages/sec concurrent (100 clients).
+> Both servers use the same Redis wire protocol (RESP2) and the same benchmark tool.
+> Socketley is **single-threaded**. Redis 7.x is also single-threaded (event loop).
+
+**Pipeline depth = 1** (one outstanding request per client, 50 clients, 200K ops each):
+
+| Operation    | Socketley     | Redis 7.0     | Ratio  |
+|-------------|---------------|---------------|--------|
+| SET         | 182K ops/s    | 179K ops/s    | 1.0x   |
+| GET         | 186K ops/s    | 184K ops/s    | 1.0x   |
+| LPUSH       | 185K ops/s    | 189K ops/s    | 1.0x   |
+| LPOP        | 188K ops/s    | 189K ops/s    | 1.0x   |
+| SADD        | 190K ops/s    | 184K ops/s    | 1.0x   |
+| HSET        | 200K ops/s    | 180K ops/s    | **1.1x** |
+
+At P=1, throughput is dominated by loopback round-trip latency (~0.14 ms) — both servers are essentially equivalent.
+
+**Pipeline depth = 100** (100 pipelined requests, 50 clients, 2M ops each):
+
+| Operation    | Socketley      | Redis 7.0     | Speedup   |
+|-------------|----------------|---------------|-----------|
+| SET         | **8.93M ops/s** | 3.14M ops/s  | **2.8x**  |
+| GET         | **10.2M ops/s** | 4.01M ops/s  | **2.5x**  |
+| LPUSH       | **8.20M ops/s** | 2.98M ops/s  | **2.8x**  |
+| LPOP        | **10.4M ops/s** | 2.68M ops/s  | **3.9x**  |
+| SADD        | **7.17M ops/s** | 3.67M ops/s  | **2.0x**  |
+| HSET        | **8.30M ops/s** | 3.00M ops/s  | **2.8x**  |
+
+Socketley is **2–4x faster than Redis 7** at sustained pipelined throughput.
+
+The advantage comes from:
+- **io_uring SQPOLL** eliminates all `epoll_wait`/`sendmsg` syscalls — zero syscalls per op in the hot path
+- **Zero-allocation RESP2 codec** — parse and encode directly into/from the connection buffer using `to_chars` and `string_view`; no heap allocations per command
+- **Batch CQE drain** — all completions from a submit round are processed in one pass; single `io_uring_cq_advance`
+- **writev coalescing** — up to 16 responses batched into a single `writev` SQE
+
+**Latency comparison** (P=100):
+
+| Metric   | Socketley | Redis 7.0 |
+|----------|-----------|-----------|
+| p50 SET  | 0.30 ms   | 1.48 ms   |
+| p50 GET  | 0.25 ms   | 1.14 ms   |
+| p99 SET  | 0.82 ms   | 1.78 ms   |
+| p99 GET  | 0.38 ms   | 1.40 ms   |
+
+### Server — Connection Rate & Message Throughput
+
+| Test                               | Result             |
+|------------------------------------|--------------------|
+| Connection rate (2000 conns)       | **72.9K conn/s**   |
+| Burst (5000 simultaneous)          | **117.6K conn/s**  |
+| Single client 64B msg throughput   | **719K msg/s** (44.6 MB/s) |
+| Single client 1KB msg throughput   | **792K msg/s** (775 MB/s)  |
+| 100 clients × 500 msgs (aggregate) | **3.12M msg/s**    |
+
+All on a single-threaded io_uring event loop. `IORING_SETUP_SQPOLL` keeps the submission thread hot — no syscalls during sustained traffic.
+
+### Proxy — Overhead vs Direct
+
+| Test                              | Result             |
+|-----------------------------------|--------------------|
+| TCP message throughput            | **49.2K msg/s** (5.9 MB/s) |
+| 20 concurrent clients             | **62.5K msg/s**    |
+| Latency overhead vs direct        | **+5.5%**          |
+| Named-runtime backend resolution  | **50.0K req/s**    |
+
+The proxy adds roughly 2 ms median latency on top of the direct path — mostly loopback TCP overhead, not protocol processing.
 
 ## Quick Start
 

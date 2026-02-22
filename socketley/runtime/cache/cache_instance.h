@@ -22,9 +22,10 @@ struct client_connection
     char read_buf[4096];
     std::string partial;
     std::string response_buf;
-    std::queue<std::shared_ptr<const std::string>> write_queue;
+    // write_queue holds owned strings — no shared_ptr overhead per flush
+    std::queue<std::string> write_queue;
 
-    std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
+    std::string write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
     uint32_t write_batch_count{0};
 
@@ -78,21 +79,27 @@ public:
     std::string lua_lpop(std::string_view key);
     std::string lua_rpop(std::string_view key);
     int lua_llen(std::string_view key);
+#ifndef SOCKETLEY_NO_LUA
     sol::table lua_lrange(std::string_view key, int start, int stop);
+#endif
 
     // Lua cache access — sets
     int lua_sadd(std::string_view key, std::string_view member);
     bool lua_srem(std::string_view key, std::string_view member);
     bool lua_sismember(std::string_view key, std::string_view member);
     int lua_scard(std::string_view key);
+#ifndef SOCKETLEY_NO_LUA
     sol::table lua_smembers(std::string_view key);
+#endif
 
     // Lua cache access — hashes
     bool lua_hset(std::string_view key, std::string_view field, std::string_view val);
     std::string lua_hget(std::string_view key, std::string_view field);
     bool lua_hdel(std::string_view key, std::string_view field);
     int lua_hlen(std::string_view key);
+#ifndef SOCKETLEY_NO_LUA
     sol::table lua_hgetall(std::string_view key);
+#endif
 
     // Lua cache access — TTL
     bool lua_expire(std::string_view key, int seconds);
@@ -166,7 +173,7 @@ private:
 
     void process_command(client_connection* conn, std::string_view line);
     void process_resp(client_connection* conn);
-    void process_resp_command(client_connection* conn, const std::vector<std::string>& args);
+    void process_resp_command(client_connection* conn, std::string_view* args, int argc);
     void flush_responses(client_connection* conn);
     void flush_write_queue(client_connection* conn);
 
@@ -178,6 +185,10 @@ private:
 
     cache_store m_store;
     std::unordered_map<int, std::unique_ptr<client_connection>> m_clients;
+
+    // O(1) fd→connection lookup (avoids hash map on every CQE)
+    static constexpr int MAX_FDS = 8192;
+    client_connection* m_conn_idx[MAX_FDS]{};
 
     event_loop* m_loop;
     std::string m_persistent_path;
@@ -201,7 +212,7 @@ private:
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 3;
-    static constexpr uint32_t BUF_COUNT = 128;
+    static constexpr uint32_t BUF_COUNT = 512;
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
 };

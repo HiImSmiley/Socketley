@@ -122,6 +122,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley create server api -p 9000 -s${NC}"
     echo ""
 
+    echo -e "${BOLD}attach <type> <name> <port> [--owner <name>]${NC}"
+    echo "  Register an external process as a runtime visible in ls/ps."
+    echo "  The daemon does NOT bind the port or manage I/O — the external"
+    echo "  process owns its connections. Useful for SDK-embedded runtimes."
+    echo -e "  ${CYAN}socketley attach server my-app 8080${NC}"
+    echo -e "  ${CYAN}socketley attach server my-app 8080 --owner api${NC}"
+    echo ""
+
     echo -e "${BOLD}start <name|pattern>... [-i]${NC}"
     echo "  Start runtimes. Accepts multiple names, glob patterns (*,?,[])"
     echo "  -i: Interactive mode (stdin/stdout live session, single name only)"

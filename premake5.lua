@@ -56,6 +56,108 @@ project "socketley"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── SDK: socketley_sdk static library ───
+
+project "socketley_sdk"
+    kind "StaticLib"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+
+    files {
+        "socketley/shared/**.h",
+        "socketley/shared/**.cpp",
+        "socketley/runtime/**.h",
+        "socketley/runtime/**.cpp",
+        "include/linux/**.h"
+    }
+
+    filter "system:linux"
+        systemversion "latest"
+        defines { "SOCKETLEY_LINUX" }
+    filter {}
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+        staticruntime "Off"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG", "RELEASE" }
+        optimize "On"
+        staticruntime "Off"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        staticruntime "Off"
+        optimize "Off"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── SDK: socketley_sdk_nolua static library (SOCKETLEY_NO_LUA) ───
+
+project "socketley_sdk_nolua"
+    kind "StaticLib"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    defines { "SOCKETLEY_NO_LUA" }
+
+    files {
+        "socketley/shared/**.h", "socketley/shared/**.cpp",
+        "socketley/runtime/**.h", "socketley/runtime/**.cpp",
+        "include/linux/**.h"
+    }
+
+    filter "system:linux"
+        systemversion "latest"
+        defines { "SOCKETLEY_LINUX" }
+    filter {}
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+        staticruntime "Off"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG", "RELEASE" }
+        optimize "On"
+        staticruntime "Off"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        staticruntime "Off"
+        optimize "Off"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: command hashing ───
 
 project "test_command_hashing"

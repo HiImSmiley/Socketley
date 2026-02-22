@@ -38,6 +38,10 @@ public:
     // Provided buffer ring API
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
     void submit_read_provided(int fd, uint16_t group_id, io_request* req);
+    // Cancel all pending io_uring ops for a fd (user_data=null, CQE is ignored).
+    // Submit this BEFORE close(fd) to guarantee the kernel generates cancellation
+    // CQEs before any subsequently-submitted timeout/cleanup SQE fires.
+    void submit_cancel_fd(int fd);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
     bool has_buf_ring(uint16_t group_id) const;

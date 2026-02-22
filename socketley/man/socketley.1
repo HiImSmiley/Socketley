@@ -94,6 +94,27 @@ can be: server, client, proxy, cache.
 .I name
 is a unique identifier for the runtime.
 .TP
+.BI "attach " "type name port " "[\-\-owner " "name" "]"
+Register an external process as a runtime visible in
+.BR ls / ps .
+The daemon does NOT bind the port or forward any I/O — the external process
+manages its own network connections. The runtime appears as running and can
+be inspected or removed like any other runtime.
+.RS
+.TP
+.I type
+Runtime type: server, client, proxy, or cache.
+.TP
+.I name
+Unique name for this external runtime.
+.TP
+.I port
+Port number the external process is listening on (informational only).
+.TP
+.B \-\-owner \fIname\fR
+Optional owner runtime name.
+.RE
+.TP
 .BI "start " "name|pattern" "... [\-i]"
 Start one or more runtimes. Accepts multiple names, glob patterns
 .RB ( * ", " ? ", " [] ),

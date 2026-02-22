@@ -130,6 +130,14 @@ static void restore_runtimes(state_persistence& persistence,
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
                                   : runtime_instance::child_policy::stop);
 
+        // External (attached) runtimes: mark as external so start() skips io_uring setup
+        if (cfg.external_runtime)
+        {
+            instance->mark_external();
+            if (cfg.pid > 0)
+                instance->set_pid(static_cast<pid_t>(cfg.pid));
+        }
+
         // Common fields
         if (cfg.port > 0) instance->set_port(cfg.port);
         if (!cfg.log_file.empty()) instance->set_log_file(cfg.log_file);
