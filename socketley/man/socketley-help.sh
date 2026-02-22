@@ -349,6 +349,7 @@ flags_options() {
     echo "│ --master-pw <pw> │ Static password for master auth         │"
     echo "│ --master-forward │ Forward non-master msgs to master       │"
     echo "│ --udp            │ Use UDP instead of TCP                  │"
+    echo "│ --cache <name>   │ Link to cache (\"cache <cmd>\") [server]  │"
     echo "│ --http <dir>     │ Serve static files from dir [server]    │"
     echo "│ --http-cache     │ Cache files in memory at startup        │"
     echo "└──────────────────┴─────────────────────────────────────────┘"

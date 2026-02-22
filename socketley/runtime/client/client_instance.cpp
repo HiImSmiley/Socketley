@@ -316,7 +316,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         if (scan_from >= m_conn.partial.size())
             m_conn.partial.clear();
         else
-            m_conn.partial = m_conn.partial.substr(scan_from);
+            m_conn.partial.erase(0, scan_from);
     }
     }
 

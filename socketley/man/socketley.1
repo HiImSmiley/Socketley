@@ -496,6 +496,13 @@ on
 .BR reload\-lua .
 Without this flag, files are read from disk on each request (suitable for
 development).
+.TP
+.BI "\-\-cache " "name"
+Link this server to an existing cache runtime. Clients can then send
+"cache <command>" messages (e.g. "cache set foo bar", "cache get foo")
+which are executed against the linked cache and the response returned to
+the sender only. Normal messages are still processed according to the
+server's mode.
 .SS WebSocket Support
 Servers automatically detect WebSocket upgrade requests on each connection.
 When a client sends an HTTP GET with "Upgrade: websocket", the server completes
