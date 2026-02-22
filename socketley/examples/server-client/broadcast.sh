@@ -20,7 +20,6 @@ echo ""
 echo "[1/4] Creating broadcast server..."
 socketley create server broadcast-hub \
     -p 9000 \
-    --mode inout \
     -s
 
 # Create multiple clients
