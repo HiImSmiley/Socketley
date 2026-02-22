@@ -25,20 +25,6 @@
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 
-namespace {
-    constexpr const char* type_to_string(runtime_type type)
-    {
-        switch (type)
-        {
-            case runtime_server: return "server";
-            case runtime_client: return "client";
-            case runtime_proxy:  return "proxy";
-            case runtime_cache:  return "cache";
-            default:             return "unknown";
-        }
-    }
-}
-
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     : m_manager(manager), m_loop(loop), m_listen_fd(-1)
 {

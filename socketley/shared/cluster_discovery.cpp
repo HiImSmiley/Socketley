@@ -10,6 +10,7 @@
 #include <cstring>
 #include <charconv>
 #include <shared_mutex>
+#include <unordered_set>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -325,7 +326,7 @@ void cluster_discovery::scan()
     time_t now = std::time(nullptr);
 
     // Track which daemons we see in this scan (for removing stale entries)
-    std::vector<std::string> seen;
+    std::unordered_set<std::string> seen;
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr)
@@ -347,7 +348,7 @@ void cluster_discovery::scan()
         if (daemon_name == m_daemon_name)
             continue;
 
-        seen.push_back(daemon_name);
+        seen.insert(daemon_name);
 
         // Check mtime — only re-read if file changed
         std::string full_path = m_cluster_dir + "/" + std::string(fname);
@@ -406,12 +407,7 @@ void cluster_discovery::scan()
         std::lock_guard lock(m_remote_mutex);
         for (auto it = m_remote_daemons.begin(); it != m_remote_daemons.end(); )
         {
-            bool found = false;
-            for (const auto& s : seen)
-            {
-                if (s == it->first) { found = true; break; }
-            }
-            if (!found)
+            if (seen.find(it->first) == seen.end())
             {
                 m_mtime_cache.erase(it->first);
                 it = m_remote_daemons.erase(it);
@@ -546,6 +542,7 @@ cluster_discovery::get_remote_group(std::string_view group) const
 
 void cluster_discovery::set_event_callback(event_callback_t cb)
 {
+    std::lock_guard lock(m_remote_mutex);
     m_event_callback = std::move(cb);
 }
 
