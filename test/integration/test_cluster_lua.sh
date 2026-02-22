@@ -127,7 +127,7 @@ end
 LUAEOF
 
 # ─── Start daemon A ──────────────────────────────────────────────────────────
-SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon \
+CLUA_OUT_FILE="$LUA_OUT" SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon \
     --name nodeA --cluster "$CLUSTER_DIR" 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.5
@@ -139,7 +139,7 @@ if [ ! -S "$SOCK_A" ]; then
 fi
 
 # ─── Create server on A with Lua script ─────────────────────────────────────
-CLUA_OUT_FILE="$LUA_OUT" nodeA create server "$RT_A" -p "$PORT_A" -g api \
+nodeA create server "$RT_A" -p "$PORT_A" -g api \
     --lua "$LUA_SCRIPT" -s 2>&1 || true
 sleep 1
 
