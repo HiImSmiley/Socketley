@@ -1248,7 +1248,9 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 </div>
 
 <h3 id="sdk-t1-cache">Cache Operations</h3>
-<p>Direct IPC access to cache data &mdash; no TCP connection needed.</p>
+<p>Direct IPC access to cache data &mdash; no TCP connection needed. Every operation has a typed convenience function in <code>socketley::ctl</code>.</p>
+
+<h4>Strings</h4>
 
 <div class="method-card" id="sdk-ctl-cache-get">
 <div class="method-header">
@@ -1277,7 +1279,201 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
   <span class="badge badge-cache">Cache</span>
 </div>
 <p class="method-sig">result cache_del(const std::string&amp; cache_name, const std::string&amp; key)</p>
-<p class="method-desc">Delete a key from a cache runtime.</p>
+<p class="method-desc">Delete a key of any type from a cache runtime.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-exists">
+<div class="method-header">
+  <span class="method-name">cache_exists</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_exists(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Check if a key exists. Returns <code>"1"</code> or <code>"0"</code> in data.</p>
+</div>
+
+<h4>Lists</h4>
+
+<div class="method-card" id="sdk-ctl-cache-lpush">
+<div class="method-header">
+  <span class="method-name">cache_lpush / cache_rpush</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_lpush(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">result cache_rpush(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-desc">Push a value to the head (<code>lpush</code>) or tail (<code>rpush</code>) of a list. Creates the list if it doesn't exist.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-lpop">
+<div class="method-header">
+  <span class="method-name">cache_lpop / cache_rpop</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_lpop(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-sig">result cache_rpop(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Pop and return the first (<code>lpop</code>) or last (<code>rpop</code>) element. Returns <code>"nil"</code> if empty.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-llen">
+<div class="method-header">
+  <span class="method-name">cache_llen</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_llen(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get the length of a list. Returns count in data.</p>
+</div>
+
+<h4>Sets</h4>
+
+<div class="method-card" id="sdk-ctl-cache-sadd">
+<div class="method-header">
+  <span class="method-name">cache_sadd</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_sadd(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-desc">Add a member to a set. Returns <code>"ok"</code> if added, <code>"exists"</code> if already present.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-srem">
+<div class="method-header">
+  <span class="method-name">cache_srem</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_srem(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-desc">Remove a member from a set. Returns <code>"1"</code> if removed, <code>"0"</code> if not found.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-sismember">
+<div class="method-header">
+  <span class="method-name">cache_sismember</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_sismember(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-desc">Check if a member exists in a set. Returns <code>"1"</code> or <code>"0"</code>.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-scard">
+<div class="method-header">
+  <span class="method-name">cache_scard</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_scard(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get the number of members in a set.</p>
+</div>
+
+<h4>Hashes</h4>
+
+<div class="method-card" id="sdk-ctl-cache-hset">
+<div class="method-header">
+  <span class="method-name">cache_hset</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_hset(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; field, const std::string&amp; value)</p>
+<p class="method-desc">Set a field in a hash. Creates the hash if it doesn't exist.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-hget">
+<div class="method-header">
+  <span class="method-name">cache_hget</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_hget(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; field)</p>
+<p class="method-desc">Get a hash field value. Returns <code>"nil"</code> if field or key doesn't exist.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-hdel">
+<div class="method-header">
+  <span class="method-name">cache_hdel</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_hdel(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; field)</p>
+<p class="method-desc">Delete a field from a hash. Returns <code>"1"</code> if removed, <code>"0"</code> if not found.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-hlen">
+<div class="method-header">
+  <span class="method-name">cache_hlen</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_hlen(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get the number of fields in a hash.</p>
+</div>
+
+<h4>TTL</h4>
+
+<div class="method-card" id="sdk-ctl-cache-expire">
+<div class="method-header">
+  <span class="method-name">cache_expire</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_expire(const std::string&amp; cache_name, const std::string&amp; key, int seconds)</p>
+<p class="method-desc">Set a TTL on a key. Returns <code>"ok"</code> if set, <code>"nil"</code> if key doesn't exist.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-ttl">
+<div class="method-header">
+  <span class="method-name">cache_ttl</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_ttl(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get remaining TTL in seconds. Returns <code>-1</code> (no TTL), <code>-2</code> (key missing), or seconds remaining.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-persist">
+<div class="method-header">
+  <span class="method-name">cache_persist</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_persist(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Remove TTL from a key. Returns <code>"ok"</code> if removed, <code>"nil"</code> if key has no TTL or doesn't exist.</p>
+</div>
+
+<h4>Pub/Sub</h4>
+
+<div class="method-card" id="sdk-ctl-cache-publish">
+<div class="method-header">
+  <span class="method-name">cache_publish</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_publish(const std::string&amp; cache_name, const std::string&amp; channel, const std::string&amp; message)</p>
+<p class="method-desc">Publish a message to a channel. Returns subscriber count in data.</p>
+</div>
+
+<h4>Admin</h4>
+
+<div class="method-card" id="sdk-ctl-cache-size">
+<div class="method-header">
+  <span class="method-name">cache_size</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_size(const std::string&amp; cache_name)</p>
+<p class="method-desc">Get total key count in the cache.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-memory">
+<div class="method-header">
+  <span class="method-name">cache_memory</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_memory(const std::string&amp; cache_name)</p>
+<p class="method-desc">Get memory usage. Returns <code>"max_memory used_memory"</code> in data.</p>
 </div>
 
 <div class="method-card" id="sdk-ctl-cache-flush">
@@ -1287,13 +1483,25 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
   <span class="badge badge-cache">Cache</span>
 </div>
 <p class="method-sig">result cache_flush(const std::string&amp; cache_name, const std::string&amp; path = "")</p>
-<p class="method-desc">Flush cache data to disk. If path is empty, uses the persistent path configured on the cache.</p>
+<p class="method-desc">Save cache snapshot to disk. If path is empty, uses the persistent path configured on the cache. Requires admin mode.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-load">
+<div class="method-header">
+  <span class="method-name">cache_load</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_load(const std::string&amp; cache_name, const std::string&amp; path = "")</p>
+<p class="method-desc">Load cache snapshot from disk. Requires admin mode.</p>
 </div>
 
 <h3 id="sdk-t1-action">Action Commands</h3>
-<p>The <code>action</code> subcommand exposes the full cache API via daemon IPC. Access any data structure without a TCP connection &mdash; pass the command through <code>socketley::ctl::command()</code>:</p>
-<pre><code><span class="kw">auto</span> r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush mylist item1"</span>);
-<span class="cm">// r.data contains the result ("ok", value, count, or "nil")</span></code></pre>
+<p>All <code>cache_*</code> functions above are convenience wrappers around <code>action</code> subcommands. You can also call them directly via <code>command()</code> for maximum flexibility:</p>
+<pre><code><span class="cm">// These two are equivalent:</span>
+socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"mylist"</span>, <span class="st">"item1"</span>);
+socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush mylist item1"</span>);</code></pre>
+<p>The raw <code>action</code> syntax is useful for commands that don't have a convenience wrapper yet, or for dynamic command construction.</p>
 
 <h4>Strings</h4>
 <table>
@@ -1369,14 +1577,14 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 </tbody>
 </table>
 
-<pre><code><span class="cm">// Exercise multiple data structures through action commands</span>
-socketley::ctl::<span class="fn">command</span>(<span class="st">"action store set user:1 alice"</span>);
-socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush queue job_a"</span>);
-socketley::ctl::<span class="fn">command</span>(<span class="st">"action store sadd tags:1 vip"</span>);
-socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hset session:1 token abc123"</span>);
-socketley::ctl::<span class="fn">command</span>(<span class="st">"action store expire session:1 3600"</span>);
+<pre><code><span class="cm">// Typed convenience functions (recommended)</span>
+socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>, <span class="st">"alice"</span>);
+socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_a"</span>);
+socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"vip"</span>);
+socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>, <span class="st">"abc123"</span>);
+socketley::ctl::<span class="fn">cache_expire</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="nb">3600</span>);
 
-<span class="kw">auto</span> r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hget session:1 token"</span>);
+<span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_hget</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>);
 printf(<span class="st">"token = %s\n"</span>, r.data.c_str()); <span class="cm">// "abc123"</span></code></pre>
 
 <h3 id="sdk-t1-raw">Raw Command</h3>
@@ -4701,69 +4909,69 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
     socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"store"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
 
     <span class="cm">// ── Strings ──</span>
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store set user:1 alice"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store set user:2 bob"</span>);
-    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store get user:1"</span>);
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>, <span class="st">"alice"</span>);
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"user:2"</span>, <span class="st">"bob"</span>);
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>);
     printf(<span class="st">"user:1 = %s\n"</span>, r.data.c_str());  <span class="cm">// "alice"</span>
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store exists user:1"</span>);
+    r = socketley::ctl::<span class="fn">cache_exists</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>);
     printf(<span class="st">"exists = %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
 
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store del user:2"</span>);
+    socketley::ctl::<span class="fn">cache_del</span>(<span class="st">"store"</span>, <span class="st">"user:2"</span>);
 
     <span class="cm">// ── Lists ──</span>
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush queue job_c"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush queue job_b"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpush queue job_a"</span>);
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_c"</span>);
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_b"</span>);
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_a"</span>);
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store llen queue"</span>);
+    r = socketley::ctl::<span class="fn">cache_llen</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>);
     printf(<span class="st">"queue length = %s\n"</span>, r.data.c_str());  <span class="cm">// "3"</span>
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store lpop queue"</span>);
+    r = socketley::ctl::<span class="fn">cache_lpop</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>);
     printf(<span class="st">"dequeued = %s\n"</span>, r.data.c_str());  <span class="cm">// "job_a"</span>
 
     <span class="cm">// ── Sets ──</span>
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store sadd tags:1 vip"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store sadd tags:1 premium"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store sadd tags:1 active"</span>);
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"vip"</span>);
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"premium"</span>);
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"active"</span>);
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store scard tags:1"</span>);
+    r = socketley::ctl::<span class="fn">cache_scard</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>);
     printf(<span class="st">"tag count = %s\n"</span>, r.data.c_str());  <span class="cm">// "3"</span>
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store sismember tags:1 vip"</span>);
+    r = socketley::ctl::<span class="fn">cache_sismember</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"vip"</span>);
     printf(<span class="st">"is vip = %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
 
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store srem tags:1 active"</span>);
+    socketley::ctl::<span class="fn">cache_srem</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"active"</span>);
 
     <span class="cm">// ── Hashes ──</span>
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hset session:1 token abc123"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hset session:1 user alice"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>, <span class="st">"abc123"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"user"</span>, <span class="st">"alice"</span>);
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hget session:1 token"</span>);
+    r = socketley::ctl::<span class="fn">cache_hget</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>);
     printf(<span class="st">"token = %s\n"</span>, r.data.c_str());  <span class="cm">// "abc123"</span>
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hlen session:1"</span>);
+    r = socketley::ctl::<span class="fn">cache_hlen</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
     printf(<span class="st">"fields = %s\n"</span>, r.data.c_str());  <span class="cm">// "2"</span>
 
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hdel session:1 user"</span>);
+    socketley::ctl::<span class="fn">cache_hdel</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"user"</span>);
 
     <span class="cm">// ── TTL ──</span>
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store expire session:1 3600"</span>);
+    socketley::ctl::<span class="fn">cache_expire</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="nb">3600</span>);
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store ttl session:1"</span>);
+    r = socketley::ctl::<span class="fn">cache_ttl</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
     printf(<span class="st">"ttl = %s\n"</span>, r.data.c_str());  <span class="cm">// "3600" (approx)</span>
 
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store persist session:1"</span>);
+    socketley::ctl::<span class="fn">cache_persist</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
 
     <span class="cm">// ── Pub/Sub ──</span>
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store publish notifications hello"</span>);
+    r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"notifications"</span>, <span class="st">"hello"</span>);
     printf(<span class="st">"subscribers = %s\n"</span>, r.data.c_str());  <span class="cm">// "0" (no subscribers yet)</span>
 
     <span class="cm">// ── Admin ──</span>
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store size"</span>);
+    r = socketley::ctl::<span class="fn">cache_size</span>(<span class="st">"store"</span>);
     printf(<span class="st">"total keys = %s\n"</span>, r.data.c_str());
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store memory"</span>);
+    r = socketley::ctl::<span class="fn">cache_memory</span>(<span class="st">"store"</span>);
     printf(<span class="st">"memory = %s\n"</span>, r.data.c_str());
 
     <span class="cm">// Cleanup</span>
@@ -4773,7 +4981,7 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
 
 <p><strong>Compile:</strong></p>
 <pre><code>g++ -std=c++17 dw_cache_full.cpp -Iinclude/linux -o dw_cache_full</code></pre>
-<p><strong>Key concept:</strong> Every cache data structure is accessible via <code>action &lt;name&gt; &lt;cmd&gt; [args]</code>. This IPC path is faster than TCP because it bypasses network and protocol parsing.</p>
+<p><strong>Key concept:</strong> Every cache data structure has a typed <code>cache_*</code> function. IPC is faster than TCP because it bypasses network and protocol parsing.</p>
 </div>
 
 <div class="method-card" id="exsdk-dw-server-cache">
@@ -4798,8 +5006,8 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
 
     <span class="cm">// Path 1: Direct IPC (no TCP, for orchestration)</span>
     socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"config:version"</span>, <span class="st">"1.0"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hset config:limits max_conn 1000"</span>);
-    socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hset config:limits timeout 30"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"max_conn"</span>, <span class="st">"1000"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"timeout"</span>, <span class="st">"30"</span>);
 
     <span class="cm">// Path 2: Through the server (what TCP clients do)</span>
     <span class="cm">// Clients connected to port 9000 can send:</span>
@@ -4811,7 +5019,7 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
     <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"store"</span>, <span class="st">"config:version"</span>);
     printf(<span class="st">"version = %s\n"</span>, r.data.c_str());  <span class="cm">// "1.0"</span>
 
-    r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action store hget config:limits max_conn"</span>);
+    r = socketley::ctl::<span class="fn">cache_hget</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"max_conn"</span>);
     printf(<span class="st">"max_conn = %s\n"</span>, r.data.c_str());  <span class="cm">// "1000"</span>
 
     <span class="cm">// Stats on both</span>
@@ -4869,10 +5077,10 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
         }
 
         <span class="cm">// Also check cache key count</span>
-        <span class="kw">auto</span> r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action data size"</span>);
+        <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_size</span>(<span class="st">"data"</span>);
         printf(<span class="st">"  [data] keys = %s\n"</span>, r.data.c_str());
 
-        r = socketley::ctl::<span class="fn">command</span>(<span class="st">"action data memory"</span>);
+        r = socketley::ctl::<span class="fn">cache_memory</span>(<span class="st">"data"</span>);
         printf(<span class="st">"  [data] memory = %s\n"</span>, r.data.c_str());
 
         std::this_thread::sleep_for(std::chrono::seconds(<span class="nb">1</span>));
