@@ -29,21 +29,27 @@ export SOCKETLEY_DEV=1
 
 echo "Starting daemon node1..."
 SOCKETLEY_SOCKET=/tmp/socketley-node1.sock \
-socketley daemon --name node1 --cluster &
+socketley daemon &
 DAEMON1_PID=$!
-sleep 0.5
+sleep 0.3
+SOCKETLEY_SOCKET=/tmp/socketley-node1.sock \
+socketley daemon --name node1 --cluster "$CLUSTER_DIR"
 
 echo "Starting daemon node2..."
 SOCKETLEY_SOCKET=/tmp/socketley-node2.sock \
-socketley daemon --name node2 --cluster &
+socketley daemon &
 DAEMON2_PID=$!
-sleep 0.5
+sleep 0.3
+SOCKETLEY_SOCKET=/tmp/socketley-node2.sock \
+socketley daemon --name node2 --cluster "$CLUSTER_DIR"
 
 echo "Starting daemon gateway..."
 SOCKETLEY_SOCKET=/tmp/socketley-gateway.sock \
-socketley daemon --name gateway --cluster &
+socketley daemon &
 DAEMON3_PID=$!
-sleep 0.5
+sleep 0.3
+SOCKETLEY_SOCKET=/tmp/socketley-gateway.sock \
+socketley daemon --name gateway --cluster "$CLUSTER_DIR"
 
 # Create runtimes on each daemon
 echo ""

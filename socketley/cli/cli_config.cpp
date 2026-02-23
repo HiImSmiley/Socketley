@@ -36,6 +36,29 @@ int cli_config(int argc, char** argv)
         return 1;
     }
 
+    // Apply daemon settings (name, cluster) before runtimes
+    sol::optional<sol::table> daemon = lua["daemon"];
+    if (daemon)
+    {
+        sol::optional<std::string> name = (*daemon)["name"];
+        if (name && !name->empty())
+        {
+            std::string response;
+            int rc = ipc_send("daemon-name " + *name, response);
+            if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+            if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
+        }
+
+        sol::optional<std::string> cluster = (*daemon)["cluster"];
+        if (cluster && !cluster->empty())
+        {
+            std::string response;
+            int rc = ipc_send("daemon-cluster " + *cluster, response);
+            if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+            if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
+        }
+    }
+
     sol::table runtimes = lua["runtimes"];
 
     if (!runtimes.valid())

@@ -127,10 +127,11 @@ end
 LUAEOF
 
 # ─── Start daemon A ──────────────────────────────────────────────────────────
-CLUA_OUT_FILE="$LUA_OUT" SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon \
-    --name nodeA --cluster "$CLUSTER_DIR" 2>/dev/null &
+CLUA_OUT_FILE="$LUA_OUT" SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon 2>/dev/null &
 DAEMON_PIDS+=($!)
-sleep 0.5
+sleep 0.3
+SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon --name nodeA --cluster "$CLUSTER_DIR"
+sleep 0.2
 
 # Verify socket created
 if [ ! -S "$SOCK_A" ]; then
@@ -151,10 +152,11 @@ assert_contains "$OUT" "daemon=nodeA"
 assert_contains "$OUT" "stats_daemons=1"
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
-SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon \
-    --name nodeB --cluster "$CLUSTER_DIR" 2>/dev/null &
+SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon 2>/dev/null &
 DAEMON_PIDS+=($!)
-sleep 0.5
+sleep 0.3
+SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon --name nodeB --cluster "$CLUSTER_DIR"
+sleep 0.2
 
 # Create server on B in same group
 nodeB create server "$RT_B" -p "$PORT_B" -g api -s 2>&1 || true

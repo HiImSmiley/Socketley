@@ -100,6 +100,15 @@ bool daemon_handler::setup()
 
 void daemon_handler::teardown()
 {
+    // Stop cluster discovery before closing IPC
+    if (m_owned_cluster)
+    {
+        m_owned_cluster->stop();
+        m_owned_cluster.reset();
+        m_cluster = nullptr;
+        m_manager.set_cluster_discovery(nullptr);
+    }
+
     for (auto& [fd, conn] : m_clients)
     {
         if (conn->interactive)
@@ -309,6 +318,8 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("owner"):     return cmd_owner(conn, pa);
         case fnv1a("attach"):    return cmd_attach(conn, pa);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
+        case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
+        case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -1871,11 +1882,111 @@ int daemon_handler::cmd_cluster_dir(ipc_connection* conn)
 {
     if (!m_cluster)
     {
-        conn->write_buf = "daemon is not in cluster mode (start with --name and --cluster)\n";
+        conn->write_buf = "daemon is not in cluster mode (use: daemon --name <n> --cluster <dir>)\n";
         return 1;
     }
 
     conn->write_buf = std::string(m_cluster->get_cluster_dir()) + "\n";
+    return 0;
+}
+
+int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2)
+    {
+        if (m_daemon_name.empty())
+        {
+            conn->write_buf = "no daemon name set\n";
+            return 1;
+        }
+        conn->write_buf = m_daemon_name + "\n";
+        return 0;
+    }
+
+    std::string new_name(pa.args[1]);
+
+    // If cluster is active, restart it with the new name
+    if (m_owned_cluster)
+    {
+        std::string cluster_dir(m_owned_cluster->get_cluster_dir());
+
+        m_owned_cluster->stop();
+        m_owned_cluster.reset();
+        m_cluster = nullptr;
+        m_manager.set_cluster_discovery(nullptr);
+
+        m_daemon_name = new_name;
+
+        m_owned_cluster = std::make_unique<cluster_discovery>(
+            m_daemon_name, cluster_dir, m_manager);
+
+        m_owned_cluster->set_event_callback([this](const std::vector<cluster_event>& events) {
+            m_manager.dispatch_cluster_events(events);
+        });
+
+        if (!m_owned_cluster->start(m_loop))
+        {
+            conn->write_buf = "name updated but failed to restart cluster (name may already be in use)\n";
+            m_owned_cluster.reset();
+            return 1;
+        }
+
+        m_cluster = m_owned_cluster.get();
+        m_manager.set_cluster_discovery(m_cluster);
+        return 0;
+    }
+
+    m_daemon_name = new_name;
+    return 0;
+}
+
+int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2)
+    {
+        if (!m_cluster)
+        {
+            conn->write_buf = "cluster not active\n";
+            return 1;
+        }
+        conn->write_buf = std::string(m_cluster->get_cluster_dir()) + "\n";
+        return 0;
+    }
+
+    if (m_daemon_name.empty())
+    {
+        conn->write_buf = "--cluster requires --name to be set first\n";
+        return 1;
+    }
+
+    std::string cluster_dir(pa.args[1]);
+
+    // Stop existing cluster discovery if any
+    if (m_owned_cluster)
+    {
+        m_owned_cluster->stop();
+        m_owned_cluster.reset();
+        m_cluster = nullptr;
+        m_manager.set_cluster_discovery(nullptr);
+    }
+
+    // Create new cluster discovery
+    m_owned_cluster = std::make_unique<cluster_discovery>(
+        m_daemon_name, cluster_dir, m_manager);
+
+    m_owned_cluster->set_event_callback([this](const std::vector<cluster_event>& events) {
+        m_manager.dispatch_cluster_events(events);
+    });
+
+    if (!m_owned_cluster->start(m_loop))
+    {
+        conn->write_buf = "failed to start cluster discovery (name may already be in use)\n";
+        m_owned_cluster.reset();
+        return 1;
+    }
+
+    m_cluster = m_owned_cluster.get();
+    m_manager.set_cluster_discovery(m_cluster);
     return 0;
 }
 
