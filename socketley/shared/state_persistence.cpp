@@ -13,7 +13,7 @@ namespace fs = std::filesystem;
 
 // ─── Minimal JSON helpers ───
 
-namespace {
+namespace sp_detail {
 
 std::string json_escape(std::string_view s)
 {
@@ -313,7 +313,7 @@ std::string resolve_absolute(std::string_view path)
     return fs::absolute(fs::path(path)).string();
 }
 
-} // namespace
+} // namespace sp_detail
 
 // ─── state_persistence ───
 
@@ -329,6 +329,7 @@ fs::path state_persistence::config_path(std::string_view name) const
 
 runtime_config state_persistence::read_from_instance(const runtime_instance* instance) const
 {
+    using namespace sp_detail;
     runtime_config cfg;
     cfg.name = instance->get_name();
     cfg.id = instance->get_id();
@@ -411,6 +412,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
 
 std::string state_persistence::format_json_pretty(const runtime_config& cfg) const
 {
+    using namespace sp_detail;
     std::ostringstream out;
     out << "{\n";
     out << "    \"name\": \"" << json_escape(cfg.name) << "\",\n";
@@ -528,6 +530,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
 
 bool state_persistence::parse_json_string(const std::string& json, runtime_config& cfg) const
 {
+    using namespace sp_detail;
     cfg.name = json_get_string(json, "name");
     cfg.id = json_get_string(json, "id");
     cfg.type = str_to_type(json_get_string(json, "type"));

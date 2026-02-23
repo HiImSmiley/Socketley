@@ -1714,6 +1714,46 @@ format metrics at
 .BR "GET /metrics" .
 Metrics include: runtimes total/running, connections total/active,
 messages total, bytes in/out, and per-runtime breakdowns.
+.SH SINGLE-HEADER SDK
+Socketley ships a single-header C++ SDK at
+.BR include/linux/socketley.h .
+It uses the stb-style pattern: include it everywhere for declarations,
+define
+.B SOCKETLEY_IMPLEMENTATION
+in exactly one
+.B .cpp
+file for the implementation.
+.PP
+.nf
+// app.cpp
+#define SOCKETLEY_IMPLEMENTATION
+#include "socketley.h"
+.fi
+.PP
+Optional defines (before the include):
+.TP
+.B SOCKETLEY_NO_LUA
+Disable Lua/sol2 scripting support.
+.TP
+.B SOCKETLEY_NO_HTTPS
+Disable the HTTP client in Lua.
+.PP
+Compile and link:
+.nf
+# Without Lua
+g++ -std=c++23 -DSOCKETLEY_NO_LUA -DSOCKETLEY_IMPLEMENTATION \\
+    app.cpp -Iinclude/linux -luring -lssl -lcrypto
+
+# With Lua
+g++ -std=c++23 -DSOCKETLEY_IMPLEMENTATION \\
+    app.cpp -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \\
+    -luring -lssl -lcrypto -lluajit-5.1
+.fi
+.PP
+To regenerate the single header from source:
+.nf
+bash tools/amalgamate.sh
+.fi
 .SH EXIT STATUS
 .TP
 .B 0

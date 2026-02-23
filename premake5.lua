@@ -78,8 +78,7 @@ project "socketley_sdk"
         "socketley/shared/**.h",
         "socketley/shared/**.cpp",
         "socketley/runtime/**.h",
-        "socketley/runtime/**.cpp",
-        "include/linux/**.h"
+        "socketley/runtime/**.cpp"
     }
 
     filter "system:linux"
@@ -128,8 +127,7 @@ project "socketley_sdk_nolua"
 
     files {
         "socketley/shared/**.h", "socketley/shared/**.cpp",
-        "socketley/runtime/**.h", "socketley/runtime/**.cpp",
-        "include/linux/**.h"
+        "socketley/runtime/**.h", "socketley/runtime/**.cpp"
     }
 
     filter "system:linux"
@@ -313,6 +311,79 @@ project "test_ws_parser"
     links { "ssl", "crypto" }
 
     files { "test/unit/test_ws_parser.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: single-header SDK (no Lua) ───
+
+project "test_single_header"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    defines { "SOCKETLEY_NO_LUA", "SOCKETLEY_IMPLEMENTATION" }
+
+    includedirs { "include/linux" }
+
+    links { "uring", "ssl", "crypto" }
+
+    files { "test/unit/test_single_header.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: single-header SDK (with Lua) ───
+
+project "test_single_header_lua"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    defines { "SOCKETLEY_IMPLEMENTATION" }
+
+    includedirs {
+        "include/linux",
+        "thirdparty/sol2",
+        "thirdparty/luajit"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "luajit", "uring", "ssl", "crypto" }
+
+    files { "test/unit/test_single_header_lua.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
