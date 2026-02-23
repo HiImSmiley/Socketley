@@ -90,13 +90,14 @@ function updateActiveNav() {
   const nav     = getActiveNav();
   if (!content || !nav) return;
 
-  const sections = content.querySelectorAll('h2[id], h3[id], .method-card[id], .callback-card[id], .cli-card[id]');
+  const sections = content.querySelectorAll('h2[id], h3[id], h4[id], .method-card[id], .callback-card[id], .cli-card[id]');
   let current = '';
   const scrollY = window.scrollY + 80;
   sections.forEach(s => { if (s.offsetTop <= scrollY) current = s.id; });
 
-  const navItems = nav.querySelectorAll(':scope > li > a');
-  const subItems = nav.querySelectorAll(':scope > li > ul > li > a');
+  const navItems  = nav.querySelectorAll(':scope > li > a');
+  const subItems  = nav.querySelectorAll(':scope > li > ul > li > a');
+  const deepItems = nav.querySelectorAll(':scope > li > ul > li > ul > li > a');
 
   navItems.forEach(a => {
     a.classList.remove('active');
@@ -112,6 +113,19 @@ function updateActiveNav() {
     }
   });
   subItems.forEach(a => {
+    a.classList.remove('active');
+    const href = a.getAttribute('href');
+    if (href && current) {
+      const t = href.slice(1);
+      let match = t === current;
+      const li = a.parentElement;
+      li.querySelectorAll('ul a').forEach(cl => {
+        if (cl.getAttribute('href') && cl.getAttribute('href').slice(1) === current) match = true;
+      });
+      if (match) a.classList.add('active');
+    }
+  });
+  deepItems.forEach(a => {
     a.classList.remove('active');
     if (a.getAttribute('href') && a.getAttribute('href').slice(1) === current) a.classList.add('active');
   });
