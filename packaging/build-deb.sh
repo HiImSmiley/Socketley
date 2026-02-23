@@ -29,8 +29,8 @@ cp "$BINARY" "$PKG_DIR/usr/bin/socketley"
 chmod 755 "$PKG_DIR/usr/bin/socketley"
 
 # Man page
-if [ -f "$PROJECT_ROOT/socketley/man/socketley.1" ]; then
-    cp "$PROJECT_ROOT/socketley/man/socketley.1" "$PKG_DIR/usr/share/man/man1/"
+if [ -f "$PROJECT_ROOT/man/socketley.1" ]; then
+    cp "$PROJECT_ROOT/man/socketley.1" "$PKG_DIR/usr/share/man/man1/"
 fi
 
 # Service file
