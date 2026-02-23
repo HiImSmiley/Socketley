@@ -80,19 +80,20 @@ echo "=== Integration: cluster discovery ==="
 
 # ─── Start 3 daemons ──────────────────────────────────────────────────────────
 
-SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon \
-    --name node1 --cluster "$CLUSTER_DIR" 2>/dev/null &
+SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.3
+SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon --name node1 --cluster "$CLUSTER_DIR"
 
-SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon \
-    --name node2 --cluster "$CLUSTER_DIR" 2>/dev/null &
+SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon 2>/dev/null &
 DAEMON_PIDS+=($!)
 sleep 0.3
+SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon --name node2 --cluster "$CLUSTER_DIR"
 
-SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon \
-    --name gateway --cluster "$CLUSTER_DIR" 2>/dev/null &
+SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon 2>/dev/null &
 DAEMON_PIDS+=($!)
+sleep 0.3
+SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon --name gateway --cluster "$CLUSTER_DIR"
 sleep 0.5
 
 # Verify all sockets exist

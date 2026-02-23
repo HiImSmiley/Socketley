@@ -608,13 +608,13 @@ sudo systemctl start socketley
 <span class="cm"># Development mode (running from build directory)</span>
 ./bin/Release/socketley daemon &amp;
 
-<span class="cm"># Cluster mode with two named daemons sharing a directory</span>
-socketley daemon --name api1 --cluster /shared/cluster &amp;
-socketley daemon --name api2 --cluster /shared/cluster &amp;</code></pre>
+<span class="cm"># Configure cluster mode on running daemons</span>
+socketley daemon --name api1 --cluster /shared/cluster
+socketley daemon --name api2 --cluster /shared/cluster</code></pre>
 
 <div class="cli-card" id="cmd-cluster">
   <div class="cli-name">socketley cluster &lt;subcommand&gt;</div>
-  <div class="cli-desc">Inspect the cluster. Requires a running daemon in cluster mode (<code>--name</code> + <code>--cluster</code>). The cluster directory is read from the daemon automatically. Subcommands:</div>
+  <div class="cli-desc">Inspect the cluster. Requires a running daemon with cluster mode enabled (<code>daemon --name</code> + <code>daemon --cluster</code>). The cluster directory is read from the daemon automatically. Subcommands:</div>
 </div>
 <table><thead><tr><th>Subcommand</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>ls</code></td><td>List all daemons with runtime counts and heartbeat status</td></tr>
@@ -1165,9 +1165,9 @@ socketley reload-lua myserver</code></pre>
 <p>Port-0 sub-servers have no listener — they only receive messages via client routing from the parent.</p>
 
 <h2 id="cluster-api">Cluster Introspection API</h2>
-<p>When the daemon runs in cluster mode (<code>--cluster</code>), the <code>socketley.cluster</code> table provides read-only access to the full cluster topology. All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.</p>
+<p>When the daemon has cluster mode enabled (<code>daemon --name</code> + <code>daemon --cluster</code>), the <code>socketley.cluster</code> table provides read-only access to the full cluster topology. All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.</p>
 
-<div class="info-box"><strong>Requires cluster mode.</strong> The daemon must be started with <code>--name</code> and <code>--cluster &lt;dir&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
+<div class="info-box"><strong>Requires cluster mode.</strong> Enable with <code>socketley daemon --name &lt;n&gt; --cluster &lt;dir&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
 
 <div class="method-card" id="cluster-daemons">
 <div class="method-header"><span class="method-name">socketley.cluster.daemons</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
@@ -1524,7 +1524,7 @@ socketley start api</code></pre>
 <h2 id="addons-cluster-events">Cluster Event Callbacks</h2>
 <p>React to cluster topology changes from Lua. These optional callbacks fire when daemons join or leave the cluster, or when a group's membership count changes. Events are detected during the 2-second scan/publish cycle, so callbacks may fire up to 2&nbsp;seconds after the actual change.</p>
 
-<div class="info-box"><strong>Requires cluster mode.</strong> These callbacks only fire when the daemon is started with <code>--cluster</code>. A daemon is considered stale and triggers <code>on_cluster_leave</code> after 10&nbsp;seconds without a heartbeat update.</div>
+<div class="info-box"><strong>Requires cluster mode.</strong> These callbacks only fire when cluster mode is enabled (<code>daemon --name</code> + <code>daemon --cluster</code>). A daemon is considered stale and triggers <code>on_cluster_leave</code> after 10&nbsp;seconds without a heartbeat update.</div>
 
 <div class="callback-card" id="addons-cluster-join">
 <div class="method-header"><span class="method-name">on_cluster_join(daemon)</span><span class="badge badge-cluster">cluster</span></div>
@@ -1581,9 +1581,9 @@ socketley start api</code></pre>
     socketley.log(<span class="st">"api group: "</span> .. #backends .. <span class="st">" members"</span>)
 <span class="kw">end</span></code></pre>
 
-<pre><code><span class="cm"># Start two clustered daemons with api servers + a monitoring server:</span>
-socketley daemon --name node1 --cluster /shared/cluster &amp;
-socketley daemon --name node2 --cluster /shared/cluster &amp;
+<pre><code><span class="cm"># Configure two daemons for cluster mode + create api servers + monitoring:</span>
+socketley daemon --name node1 --cluster /shared/cluster
+socketley daemon --name node2 --cluster /shared/cluster
 
 <span class="cm"># On node1: api server + monitoring server with cluster callbacks</span>
 SOCKETLEY_SOCKET=/tmp/node1.sock socketley create server api1 -p 9001 -g api -s

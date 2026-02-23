@@ -14,6 +14,7 @@ class event_loop;
 class runtime_manager;
 class state_persistence;
 class cluster_discovery;
+struct cluster_event;
 
 struct ipc_connection
 {
@@ -71,6 +72,8 @@ private:
     int cmd_owner(ipc_connection* conn, const parsed_args& pa);
     int cmd_attach(ipc_connection* conn, const parsed_args& pa);
     int cmd_cluster_dir(ipc_connection* conn);
+    int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
+    int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 
@@ -88,6 +91,8 @@ private:
 
     state_persistence* m_persistence = nullptr;
     cluster_discovery* m_cluster = nullptr;
+    std::unique_ptr<cluster_discovery> m_owned_cluster;
+    std::string m_daemon_name;
 
     // Deferred deletion: runtimes are held here for one event loop tick after cmd_remove so
     // that any in-flight io_uring CQEs referencing their io_request members can be processed
