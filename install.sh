@@ -20,7 +20,16 @@ curl -fsSL "$URL" -o "$TMP/socketley.deb"
 echo "Installing dependencies..."
 apt-get update -qq && apt-get install -y -qq liburing2 > /dev/null
 
+UPGRADE=false
+if dpkg -s socketley >/dev/null 2>&1; then
+  UPGRADE=true
+fi
+
 echo "Installing..."
 dpkg -i "$TMP/socketley.deb"
 
-echo "Done. Start the daemon with: sudo systemctl start socketley"
+if [ "$UPGRADE" = true ]; then
+  echo "Done. Restart the daemon to apply the update: sudo systemctl restart socketley"
+else
+  echo "Done. Start the daemon with: sudo systemctl start socketley"
+fi
