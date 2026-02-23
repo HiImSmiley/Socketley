@@ -1,6 +1,6 @@
 # Socketley
 
-A high-performance Linux daemon and CLI tool that manages long-living network runtimes (servers, clients, proxies, caches) in a Docker-like style. Written in C++ with io_uring for async I/O and Lua scripting via LuaJIT.
+A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style — with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
 
 ## Features
 
