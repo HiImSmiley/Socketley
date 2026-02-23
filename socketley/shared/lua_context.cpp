@@ -379,7 +379,7 @@ void lua_context::register_bindings(runtime_instance* owner)
 
             sol::optional<bool> start = (*config)["start"];
             if (start && *start)
-                mgr->run(name, *loop);
+                mgr->start(name, *loop);
         }
 
         return true;
@@ -390,7 +390,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop) return false;
-        return mgr->run(name, *loop);
+        return mgr->start(name, *loop);
     };
 
     // socketley.stop(name) → bool

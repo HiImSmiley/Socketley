@@ -1068,7 +1068,7 @@ cp -r include/linux/socketley/ /your/project/include/</code></pre>
     srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
     srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
 
-    mgr.<span class="fn">run</span>(<span class="st">"srv"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"srv"</span>, loop);
 
     signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
     loop.<span class="fn">run</span>();
@@ -1670,7 +1670,7 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
   <span class="badge badge-tier2">Tier 2</span>
 </div>
 <p class="method-sig">bool create(runtime_type type, std::string_view name)</p>
-<p class="method-desc">Create a new runtime in <code>created</code> state. Configure it via its type-specific setters before calling <code>run()</code>.</p>
+<p class="method-desc">Create a new runtime in <code>created</code> state. Configure it via its type-specific setters before calling <code>start()</code>.</p>
 <table>
 <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
 <tbody>
@@ -1681,12 +1681,12 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
 <p class="method-returns"><strong>Returns:</strong> <code>false</code> if name already exists</p>
 </div>
 
-<div class="method-card" id="sdk-mgr-run">
+<div class="method-card" id="sdk-mgr-start">
 <div class="method-header">
-  <span class="method-name">runtime_manager::run</span>
+  <span class="method-name">runtime_manager::start</span>
   <span class="badge badge-tier2">Tier 2</span>
 </div>
-<p class="method-sig">bool run(std::string_view name, event_loop&amp; loop)</p>
+<p class="method-sig">bool start(std::string_view name, event_loop&amp; loop)</p>
 <p class="method-desc">Start a runtime. Calls its <code>setup()</code> to bind/listen/connect and register with the event loop.</p>
 <p class="method-returns"><strong>Returns:</strong> <code>false</code> if runtime not found, already running, or setup fails (e.g. port in use)</p>
 </div>
@@ -2571,7 +2571,7 @@ std::string info = cache-&gt;<span class="fn">execute</span>(<span class="st">"D
 
 <span class="cm">// ... event_loop + runtime_manager setup ...</span>
 
-mgr.<span class="fn">run</span>(<span class="st">"my_server"</span>, loop);
+mgr.<span class="fn">start</span>(<span class="st">"my_server"</span>, loop);
 
 <span class="cm">// Register with daemon (Tier 3)</span>
 socketley::<span class="fn">daemon_attach</span>(<span class="st">"my_server"</span>, <span class="st">"server"</span>, <span class="nb">9000</span>);
@@ -5230,7 +5230,7 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
         srv-&gt;<span class="fn">lua_send_to</span>(fd, msg);  <span class="cm">// echo back to sender</span>
     });
 
-    mgr.<span class="fn">run</span>(<span class="st">"echo"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"echo"</span>, loop);
     printf(<span class="st">"echo server on port 9000\n"</span>);
 
     signal(SIGINT,  [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
@@ -5291,8 +5291,8 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
         srv-&gt;<span class="fn">lua_broadcast</span>(msg);
     });
 
-    mgr.<span class="fn">run</span>(<span class="st">"store"</span>, loop);
-    mgr.<span class="fn">run</span>(<span class="st">"api"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"store"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"api"</span>, loop);
     printf(<span class="st">"server :9000 + cache :6379\n"</span>);
 
     signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
@@ -5352,7 +5352,7 @@ echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span 
         });
     }
 
-    mgr.<span class="fn">run</span>(<span class="st">"chat"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"chat"</span>, loop);
     printf(<span class="st">"chat server on port 9000\n"</span>);
 
     signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
@@ -5418,9 +5418,9 @@ echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span 
     px-&gt;<span class="fn">add_backend</span>(<span class="st">"127.0.0.1:9002"</span>);
     px-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr); px-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
 
-    mgr.<span class="fn">run</span>(<span class="st">"backend1"</span>, loop);
-    mgr.<span class="fn">run</span>(<span class="st">"backend2"</span>, loop);
-    mgr.<span class="fn">run</span>(<span class="st">"lb"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"backend1"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"backend2"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"lb"</span>, loop);
     printf(<span class="st">"proxy :8080 -&gt; backend1 :9001, backend2 :9002\n"</span>);
 
     signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
@@ -5559,8 +5559,8 @@ echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm">#
         srv-&gt;<span class="fn">lua_broadcast</span>(msg);
     });
 
-    mgr.<span class="fn">run</span>(<span class="st">"app_cache"</span>, loop);
-    mgr.<span class="fn">run</span>(<span class="st">"app_srv"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"app_cache"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"app_srv"</span>, loop);
 
     <span class="cm">// Register with daemon (Tier 3)</span>
     socketley::<span class="fn">daemon_attach</span>(<span class="st">"app_srv"</span>, <span class="st">"server"</span>, <span class="nb">9000</span>);

@@ -45,7 +45,7 @@ int main()
     inst->set_runtime_manager(&manager);
     inst->set_event_loop(&loop);
 
-    if (!manager.run("srv", loop))
+    if (!manager.start("srv", loop))
     {
         fprintf(stderr, "start failed\n");
         return 1;

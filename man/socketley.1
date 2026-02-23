@@ -1918,7 +1918,7 @@ int main() {
         srv->lua_send_to(fd, msg);  // echo back
     });
 
-    mgr.run("echo", loop);
+    mgr.start("echo", loop);
     signal(SIGINT, [](int) { g_loop->request_stop(); });
     loop.run();
     mgr.stop_all(loop);
@@ -1948,8 +1948,8 @@ srv->set_cache_name("store");  // clients can "cache set k v"
 srv->set_runtime_manager(&mgr);
 srv->set_event_loop(&loop);
 
-mgr.run("store", loop);
-mgr.run("api", loop);
+mgr.start("store", loop);
+mgr.start("api", loop);
 loop.run();
 .fi
 .PP
@@ -1969,7 +1969,7 @@ px->add_backend("127.0.0.1:9001");
 px->add_backend("127.0.0.1:9002");
 px->set_event_loop(&loop);
 px->set_runtime_manager(&mgr);
-mgr.run("lb", loop);
+mgr.start("lb", loop);
 loop.run();
 .fi
 .PP
@@ -2026,8 +2026,8 @@ for fleet monitoring. Best of both worlds.
 
 // ... (create event_loop, runtime_manager, server + cache as above)
 
-mgr.run("app_cache", loop);
-mgr.run("app_srv", loop);
+mgr.start("app_cache", loop);
+mgr.start("app_srv", loop);
 
 // Register with daemon so socketley ls/stats can see them
 socketley::daemon_attach("app_srv", "server", 9000);
