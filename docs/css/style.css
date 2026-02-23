@@ -34,38 +34,6 @@ html { scroll-behavior: smooth; scroll-padding-top: 24px; }
   --td-first-color: #6d8df8;
   --td-border: #2a2a4e;
 }
-[data-theme="light"] {
-  --bg: #f8f9fa;
-  --bg-card: #ffffff;
-  --bg-code: #1e1e2e;
-  --text: #333333;
-  --text-muted: #666666;
-  --text-heading: #1a1a2e;
-  --text-heading2: #2d2d4e;
-  --border: #e0e0e0;
-  --border-card: #e0e0e0;
-  --bg-table-header: #f0f0f5;
-  --bg-inline-code: #eeeef5;
-  --info-bg: #e8f0fe;
-  --info-border: #4361ee;
-  --warn-bg: #fff8e1;
-  --warn-border: #f9a825;
-  --link: #4361ee;
-  --method-name-color: #1a1a2e;
-  --method-sig-color: #666666;
-  --method-desc-color: #555555;
-  --method-returns-color: #666666;
-  --method-returns-strong: #444444;
-  --badge-server-bg: #d4edda; --badge-server-fg: #155724;
-  --badge-client-bg: #cce5ff; --badge-client-fg: #004085;
-  --badge-cache-bg: #fff3cd;  --badge-cache-fg: #856404;
-  --badge-proxy-bg: #e8d5f5;  --badge-proxy-fg: #5b2d8e;
-  --badge-all-bg: #e2e3e5;    --badge-all-fg: #383d41;
-  --badge-cluster-bg: #d1f0f0; --badge-cluster-fg: #1a6060;
-  --td-first-color: #4361ee;
-  --td-border: #eeeeee;
-}
-
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
   color: var(--text); background: var(--bg); line-height: 1.6; display: flex; min-height: 100vh;
@@ -92,14 +60,6 @@ body {
 }
 .sidebar-header .github-link:hover { color: #fff; }
 .sidebar-header .github-link svg { width: 14px; height: 14px; fill: currentColor; }
-.theme-toggle {
-  background: #2a2a4e; border: 1px solid #3a3a5e; border-radius: 6px;
-  width: 34px; height: 34px; cursor: pointer; display: flex;
-  align-items: center; justify-content: center; font-size: 16px;
-  color: #e0e0e0; transition: background .2s; flex-shrink: 0;
-}
-.theme-toggle:hover { background: #3a3a5e; }
-
 /* ===== Tab Switcher ===== */
 .tab-switcher {
   display: flex; margin: 12px 16px 12px; background: #12122a;

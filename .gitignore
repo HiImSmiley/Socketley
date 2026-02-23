@@ -52,3 +52,4 @@ test/benchmark/results/
 # Packages
 *.deb
 *.rpm
+CLAUDE.md
