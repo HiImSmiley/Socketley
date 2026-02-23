@@ -17,6 +17,9 @@ fi
 echo "Downloading $(basename "$URL")..."
 curl -fsSL "$URL" -o "$TMP/socketley.deb"
 
+echo "Installing dependencies..."
+apt-get update -qq && apt-get install -y -qq liburing2 > /dev/null
+
 echo "Installing..."
 dpkg -i "$TMP/socketley.deb"
 
