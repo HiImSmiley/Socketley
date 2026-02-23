@@ -20,6 +20,7 @@ struct server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -53,6 +54,9 @@ struct server_connection
 
     // Master auth attempt tracking
     uint8_t auth_failures{0};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 
     // Per-connection metadata (freed automatically on disconnect)
     std::unordered_map<std::string, std::string> meta;
@@ -163,6 +167,15 @@ private:
     socklen_t m_accept_addrlen;
     io_request m_accept_req;
     event_loop* m_loop;
+
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
+
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
     static constexpr int MAX_FDS = 8192;
@@ -186,6 +199,7 @@ private:
     bool m_use_provided_bufs{false};
 
     // UDP mode
+    static constexpr size_t MAX_UDP_PEERS = 10000;
     struct udp_peer { struct sockaddr_in addr; };
     int m_udp_fd{-1};
     char m_udp_recv_buf[65536];
@@ -194,6 +208,13 @@ private:
     struct msghdr m_udp_recv_msg{};
     io_request m_udp_recv_req{};
     std::vector<udp_peer> m_udp_peers;
+
+    // Per-IP auth failure tracking
+    struct auth_ip_record {
+        uint32_t failures{0};
+        std::chrono::steady_clock::time_point last_failure{};
+    };
+    std::unordered_map<uint32_t, auth_ip_record> m_auth_ip_failures;
 
     // HTTP static file serving
     std::filesystem::path m_http_dir;

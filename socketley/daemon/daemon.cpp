@@ -156,6 +156,8 @@ static void restore_runtimes(state_persistence& persistence,
         if (cfg.bash_timestamp) instance->set_bash_timestamp(true);
         if (cfg.max_connections > 0) instance->set_max_connections(cfg.max_connections);
         if (cfg.rate_limit > 0.0) instance->set_rate_limit(cfg.rate_limit);
+        if (cfg.global_rate_limit > 0.0) instance->set_global_rate_limit(cfg.global_rate_limit);
+        if (cfg.idle_timeout > 0) instance->set_idle_timeout(cfg.idle_timeout);
         if (cfg.drain) instance->set_drain(true);
         if (cfg.reconnect >= 0) instance->set_reconnect(cfg.reconnect);
         if (cfg.tls) instance->set_tls(true);

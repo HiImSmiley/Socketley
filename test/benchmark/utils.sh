@@ -12,16 +12,18 @@ NC='\033[0m' # No Color
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SOCKETLEY_BIN="${PROJECT_ROOT}/bin/Release/socketley"
+# Use system-installed binary if available (run as root), else dev binary
+if [[ -x "/usr/bin/socketley" ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    SOCKETLEY_BIN="/usr/bin/socketley"
+    IPC_SOCKET="/run/socketley/socketley.sock"
+    USE_SYSTEMD=1
+else
+    SOCKETLEY_BIN="${PROJECT_ROOT}/bin/Release/socketley"
+    IPC_SOCKET="/tmp/socketley.sock"
+    USE_SYSTEMD=0
+fi
 RESULTS_DIR="${SCRIPT_DIR}/results"
 DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
-
-# Mirror socketley_paths::resolve(): root + installed binary → system socket
-if [[ -x "/usr/bin/socketley" ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    IPC_SOCKET="/run/socketley/socketley.sock"
-else
-    IPC_SOCKET="/tmp/socketley.sock"
-fi
 
 # Ensure results directory exists
 mkdir -p "$RESULTS_DIR"
@@ -105,6 +107,24 @@ check_k6() {
 
 # Start daemon
 start_daemon() {
+    if [[ "$USE_SYSTEMD" -eq 1 ]]; then
+        log_info "Starting socketley daemon (systemd)..."
+        systemctl restart socketley.service 2>/dev/null
+        # Wait for IPC socket to appear
+        local wait_count=0
+        while [[ ! -S "$IPC_SOCKET" ]] && [[ $wait_count -lt 50 ]]; do
+            sleep 0.1
+            ((wait_count++))
+        done
+        if [[ -S "$IPC_SOCKET" ]]; then
+            log_success "Daemon started (systemd)"
+            return 0
+        else
+            log_error "Daemon failed to start"
+            return 1
+        fi
+    fi
+
     # Kill any existing daemon
     stop_daemon 2>/dev/null
 
@@ -131,6 +151,12 @@ start_daemon() {
 
 # Stop daemon
 stop_daemon() {
+    if [[ "$USE_SYSTEMD" -eq 1 ]]; then
+        systemctl stop socketley.service 2>/dev/null
+        log_info "Daemon stopped (systemd)"
+        return
+    fi
+
     if [[ -f "$DAEMON_PID_FILE" ]]; then
         local pid=$(cat "$DAEMON_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then

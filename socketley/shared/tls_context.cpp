@@ -31,6 +31,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
         std::cerr << "[tls] failed to create SSL context\n";
         return false;
     }
+    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
     if (SSL_CTX_use_certificate_file(m_ctx, std::string(cert_path).c_str(), SSL_FILETYPE_PEM) <= 0)
     {
@@ -72,6 +73,7 @@ bool tls_context::init_client(std::string_view ca_path)
         std::cerr << "[tls] failed to create SSL context\n";
         return false;
     }
+    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
     if (!ca_path.empty())
     {

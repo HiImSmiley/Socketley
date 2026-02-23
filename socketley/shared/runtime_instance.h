@@ -82,6 +82,14 @@ public:
     void set_rate_limit(double rate);
     double get_rate_limit() const;
 
+    // Global rate limiting (across all connections, messages per second, 0 = unlimited)
+    void set_global_rate_limit(double rate);
+    double get_global_rate_limit() const;
+
+    // Idle connection timeout (seconds, 0 = disabled)
+    void set_idle_timeout(uint32_t seconds);
+    uint32_t get_idle_timeout() const;
+
     // Graceful shutdown
     void set_drain(bool enabled);
     bool get_drain() const;
@@ -212,6 +220,9 @@ protected:
     void invoke_on_send(std::string_view msg);
     void invoke_on_client_message(int client_id, std::string_view msg);
 
+    // Global rate limit check (token bucket, shared across all connections)
+    bool check_global_rate_limit();
+
     // Bash output helper
     void print_bash_message(std::string_view msg) const;
 
@@ -239,6 +250,10 @@ private:
     // Resource limits
     uint32_t m_max_connections = 0;
     double m_rate_limit = 0.0;
+    double m_global_rate_limit = 0.0;
+    double m_global_tokens = 0.0;
+    std::chrono::steady_clock::time_point m_global_last{};
+    uint32_t m_idle_timeout = 0;
 
     // Graceful shutdown
     bool m_drain = false;

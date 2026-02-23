@@ -1639,6 +1639,8 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     instance->set_bash_timestamp(cfg.bash_timestamp);
     instance->set_max_connections(cfg.max_connections);
     instance->set_rate_limit(cfg.rate_limit);
+    instance->set_global_rate_limit(cfg.global_rate_limit);
+    instance->set_idle_timeout(cfg.idle_timeout);
     instance->set_drain(cfg.drain);
     instance->set_reconnect(cfg.reconnect);
     instance->set_tls(cfg.tls);
