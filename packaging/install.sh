@@ -25,8 +25,8 @@ fi
 install -Dm755 "$BINARY" /usr/bin/socketley
 
 # Install man page
-if [ -f "$PROJECT_ROOT/socketley/man/socketley.1" ]; then
-    install -Dm644 "$PROJECT_ROOT/socketley/man/socketley.1" /usr/share/man/man1/socketley.1
+if [ -f "$PROJECT_ROOT/man/socketley.1" ]; then
+    install -Dm644 "$PROJECT_ROOT/man/socketley.1" /usr/share/man/man1/socketley.1
     mandb -q 2>/dev/null || true
 fi
 
