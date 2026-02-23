@@ -155,6 +155,10 @@ body {
 .badge-proxy  { background: var(--badge-proxy-bg);  color: var(--badge-proxy-fg);  }
 .badge-all    { background: var(--badge-all-bg);    color: var(--badge-all-fg);    }
 .badge-cluster{ background: var(--badge-cluster-bg);color: var(--badge-cluster-fg);}
+.badge-tier1  { background: #1a2a3a; color: #70b8f8; }
+.badge-tier2  { background: #2a1a3a; color: #b888e8; }
+.badge-tier3  { background: #1a3a2a; color: #6fd89a; }
+.badge-mixed  { background: #3a2a10; color: #e8c060; }
 
 
 /* ===== Cards ===== */

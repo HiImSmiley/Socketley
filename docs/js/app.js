@@ -4,42 +4,45 @@
 const tabBtns    = document.querySelectorAll('.tab-btn');
 const subTabBtns = document.querySelectorAll('.sub-tab-btn');
 const luaSubTabs = document.getElementById('luaSubTabs');
+const skSubTabs  = document.getElementById('skSubTabs');
+const exSubTabs  = document.getElementById('exSubTabs');
 
-let currentTab    = 'socketley';
-let currentSubTab = 'api';   // 'api' | 'addons'
+let currentTab       = 'socketley';
+let currentLuaSubTab = 'api';     // 'api' | 'addons'
+let currentSkSubTab  = 'cli';     // 'cli' | 'sdk'
+let currentExSubTab  = 'cli';     // 'cli' | 'sdk'
 
 function navEl(id)     { return document.getElementById('navList-' + id); }
 function contentEl(id) { return document.getElementById('content-' + id); }
 
-function getActiveNav() {
-  if (currentTab === 'examples') return navEl('examples');
-  if (currentTab === 'lua') return navEl(currentSubTab === 'addons' ? 'addons' : 'lua');
-  return navEl('socketley');
-}
-function getActiveContent() {
-  if (currentTab === 'examples') return contentEl('examples');
-  if (currentTab === 'lua') return contentEl(currentSubTab === 'addons' ? 'addons' : 'lua');
-  return contentEl('socketley');
+function _resolvePane() {
+  if (currentTab === 'socketley') {
+    return currentSkSubTab === 'sdk' ? 'socketley-sdk' : 'socketley';
+  }
+  if (currentTab === 'lua') {
+    return currentLuaSubTab === 'addons' ? 'addons' : 'lua';
+  }
+  if (currentTab === 'examples') {
+    return currentExSubTab === 'sdk' ? 'examples-sdk' : 'examples';
+  }
+  return 'socketley';
 }
 
+function getActiveNav()     { return navEl(_resolvePane()); }
+function getActiveContent() { return contentEl(_resolvePane()); }
+
 function _applyVisibility() {
-  const panes = ['socketley', 'lua', 'addons', 'examples'];
-  let activeNav, activeContent;
-  if (currentTab === 'socketley') {
-    activeNav = 'socketley'; activeContent = 'socketley';
-  } else if (currentTab === 'examples') {
-    activeNav = 'examples'; activeContent = 'examples';
-  } else {
-    activeNav = currentSubTab === 'addons' ? 'addons' : 'lua';
-    activeContent = activeNav;
-  }
+  const panes = ['socketley', 'socketley-sdk', 'lua', 'addons', 'examples', 'examples-sdk'];
+  const active = _resolvePane();
   panes.forEach(id => {
     const n = navEl(id), c = contentEl(id);
-    const show = id === activeNav ? '' : 'none';
+    const show = id === active ? '' : 'none';
     if (n) n.style.display = show;
     if (c) c.style.display = show;
   });
-  luaSubTabs.style.display = currentTab === 'lua' ? '' : 'none';
+  skSubTabs.style.display  = currentTab === 'socketley' ? '' : 'none';
+  luaSubTabs.style.display = currentTab === 'lua'       ? '' : 'none';
+  exSubTabs.style.display  = currentTab === 'examples'  ? '' : 'none';
 }
 
 function activateTab(tab) {
@@ -54,11 +57,23 @@ function activateTab(tab) {
   updateActiveNav();
 }
 
-function activateSubTab(subtab) {
-  currentSubTab = subtab;
-  subTabBtns.forEach(b => b.classList.toggle('active', b.dataset.subtab === subtab));
+function activateSubTab(subtab, group) {
+  if (group === 'lua') {
+    currentLuaSubTab = subtab;
+    localStorage.setItem('sk-lua-subtab', subtab);
+  } else if (group === 'sk') {
+    currentSkSubTab = subtab;
+    localStorage.setItem('sk-sk-subtab', subtab);
+  } else if (group === 'ex') {
+    currentExSubTab = subtab;
+    localStorage.setItem('sk-ex-subtab', subtab);
+  }
+  // Update active class within this group only
+  subTabBtns.forEach(b => {
+    if (b.dataset.subtabGroup === group)
+      b.classList.toggle('active', b.dataset.subtab === subtab);
+  });
   _applyVisibility();
-  localStorage.setItem('sk-lua-subtab', subtab);
   window.scrollTo(0, 0);
   const si = document.getElementById('search');
   if (si) si.value = '';
@@ -67,7 +82,7 @@ function activateSubTab(subtab) {
 }
 
 tabBtns.forEach(b    => b.addEventListener('click', () => activateTab(b.dataset.tab)));
-subTabBtns.forEach(b => b.addEventListener('click', () => activateSubTab(b.dataset.subtab)));
+subTabBtns.forEach(b => b.addEventListener('click', () => activateSubTab(b.dataset.subtab, b.dataset.subtabGroup)));
 
 // ─── Sidebar Nav (active state on scroll) ───
 function updateActiveNav() {
@@ -106,7 +121,7 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  ['socketley', 'lua', 'addons', 'examples'].forEach(id => {
+  ['socketley', 'socketley-sdk', 'lua', 'addons', 'examples', 'examples-sdk'].forEach(id => {
     const nav = navEl(id);
     if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
@@ -162,10 +177,22 @@ document.querySelectorAll('pre').forEach(pre => {
 });
 
 // ─── Init ───
-const savedTab    = localStorage.getItem('sk-tab') || 'socketley';
-const savedSubTab = localStorage.getItem('sk-lua-subtab') || 'api';
-// migrate old top-level addons tab; 'examples' is valid as-is
-currentTab    = savedTab === 'addons' ? 'lua' : savedTab;
-currentSubTab = savedTab === 'addons' ? 'addons' : savedSubTab;
-subTabBtns.forEach(b => b.classList.toggle('active', b.dataset.subtab === currentSubTab));
+const savedTab       = localStorage.getItem('sk-tab') || 'socketley';
+const savedLuaSubTab = localStorage.getItem('sk-lua-subtab') || 'api';
+const savedSkSubTab  = localStorage.getItem('sk-sk-subtab') || 'cli';
+const savedExSubTab  = localStorage.getItem('sk-ex-subtab') || 'cli';
+
+// migrate old top-level addons tab
+currentTab       = savedTab === 'addons' ? 'lua' : savedTab;
+currentLuaSubTab = savedTab === 'addons' ? 'addons' : savedLuaSubTab;
+currentSkSubTab  = savedSkSubTab;
+currentExSubTab  = savedExSubTab;
+
+// Restore sub-tab active classes per group
+subTabBtns.forEach(b => {
+  const g = b.dataset.subtabGroup;
+  if (g === 'lua') b.classList.toggle('active', b.dataset.subtab === currentLuaSubTab);
+  else if (g === 'sk') b.classList.toggle('active', b.dataset.subtab === currentSkSubTab);
+  else if (g === 'ex') b.classList.toggle('active', b.dataset.subtab === currentExSubTab);
+});
 activateTab(currentTab);
