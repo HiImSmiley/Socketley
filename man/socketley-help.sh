@@ -343,6 +343,8 @@ flags_options() {
     echo "│ -bpt             │ Output with timestamp and prefix        │"
     echo "│ --max-connections│ Limit concurrent connections            │"
     echo "│ --rate-limit <n> │ Messages/sec per connection (token bkt) │"
+    echo "│ --global-rate-limit│ Messages/sec across all connections   │"
+    echo "│ --idle-timeout <s>│ Close idle connections after N seconds │"
     echo "│ --drain          │ Graceful shutdown (flush pending writes)│"
     echo "│ --tls            │ Enable TLS encryption                   │"
     echo "│ --cert <file>    │ TLS certificate (PEM)                   │"

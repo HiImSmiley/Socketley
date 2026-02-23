@@ -152,6 +152,14 @@ bool proxy_instance::setup(event_loop& loop)
         m_multishot_active = false;
     }
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -163,6 +171,7 @@ void proxy_instance::teardown(event_loop& loop)
     // this, a CQE processed in the same batch as the "remove" command could read
     // req->owner from already-freed connection memory → SEGFAULT.
     m_accept_req.owner = nullptr;
+    m_idle_sweep_req.owner = nullptr;
     for (auto& [fd, conn] : m_clients)
     {
         conn->read_req.owner  = nullptr;
@@ -248,6 +257,33 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 handle_backend_write(cqe, req);
             break;
         }
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -279,11 +315,23 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         ptr->read_pending = true;
         if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 proxy_resubmit_accept:
@@ -337,6 +385,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         close_pair(fd, conn->backend_fd);
         return;
     }
+
+    conn->last_activity = std::chrono::steady_clock::now();
 
     // Extract read data
     char* read_data;
@@ -396,6 +446,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     conn->partial.append(read_data, cqe->res);
     if (is_provided)
         m_loop->return_buf(BUF_GROUP_ID, buf_id);
+
+    if (conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE)
+    {
+        close_pair(fd, conn->backend_fd);
+        return;
+    }
 
     if (!conn->header_parsed)
     {
@@ -819,6 +875,12 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     auto msg = std::make_shared<const std::string>(data);
 #endif
 
+    if (bconn->write_queue.size() >= proxy_backend_connection::MAX_WRITE_QUEUE)
+    {
+        bconn->closing = true;
+        return;
+    }
+
     bconn->write_queue.push(msg);
 
     if (!bconn->write_pending)
@@ -858,6 +920,12 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
 #else
     auto msg = std::make_shared<const std::string>(data);
 #endif
+
+    if (cconn->write_queue.size() >= proxy_client_connection::MAX_WRITE_QUEUE)
+    {
+        cconn->closing = true;
+        return;
+    }
 
     cconn->write_queue.push(msg);
 

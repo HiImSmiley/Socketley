@@ -3,12 +3,22 @@
 #include "event_loop.h"
 #include "cluster_discovery.h"
 #include "lua_context.h"
+#include <cctype>
 #include <mutex>
 #include <shared_mutex>
 
 bool runtime_manager::create(runtime_type type, std::string_view name)
 {
     std::unique_lock lock(mutex);
+
+    // Validate name: alphanumeric + -_. only, max 128 chars, no leading dot
+    if (name.empty() || name.size() > 128 || name[0] == '.')
+        return false;
+    for (char c : name)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')
+            return false;
+    }
 
     if (runtimes.find(name) != runtimes.end())
         return false;

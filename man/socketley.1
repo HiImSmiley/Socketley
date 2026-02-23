@@ -269,6 +269,8 @@ bash_prefix	bool	Prefix messages with [name]
 bash_timestamp	bool	Prefix messages with [HH:MM:SS]
 max_connections	number	Max concurrent connections (0 = unlimited)
 rate_limit	number	Messages/sec per connection (0 = unlimited)
+global_rate_limit	number	Messages/sec across all connections (0 = unlimited)
+idle_timeout	number	Close idle connections after N seconds (0 = disabled)
 drain	bool	Graceful shutdown (flush writes before close)
 tls	bool	Enable TLS \fB(requires restart)\fR
 cert_path	string	TLS certificate file (PEM)
@@ -442,6 +444,16 @@ are immediately closed. 0 means unlimited (default). Alias:
 .BI "\-\-rate\-limit " "n"
 Limit messages per second per connection using a token bucket algorithm.
 Excess messages are silently dropped. 0 means unlimited (default).
+.TP
+.BI "\-\-global\-rate\-limit " "n"
+Limit total messages per second across all connections using a shared
+token bucket. Excess messages are silently dropped (server) or responded
+with an error (cache). 0 means unlimited (default).
+.TP
+.BI "\-\-idle\-timeout " "seconds"
+Close connections that have been idle (no data received) for longer than
+the specified number of seconds. A sweep timer runs every 30 seconds to
+check for idle connections. 0 means disabled (default).
 .TP
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener

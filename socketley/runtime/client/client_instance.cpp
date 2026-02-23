@@ -295,6 +295,12 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         m_conn.partial.append(m_conn.read_buf, cqe->res);
     }
 
+    if (m_conn.partial.size() > client_tcp_connection::MAX_PARTIAL_SIZE)
+    {
+        m_conn.closing = true;
+        goto resubmit;
+    }
+
     {
     size_t scan_from = 0;
     size_t pos;
