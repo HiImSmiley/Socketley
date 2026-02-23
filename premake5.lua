@@ -66,6 +66,7 @@ project "socketley_sdk"
     location("%{wks.location}")
 
     includedirs {
+        ".",
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
@@ -117,6 +118,7 @@ project "socketley_sdk_nolua"
     location("%{wks.location}")
 
     includedirs {
+        ".",
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
@@ -329,22 +331,18 @@ project "test_ws_parser"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
--- ─── Test: single-header SDK (no Lua) ───
+-- ─── Test: SDK control.h (header-only, no libs) ───
 
-project "test_single_header"
+project "test_sdk_control"
     kind "ConsoleApp"
     language "C++"
     cppdialect "C++latest"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    defines { "SOCKETLEY_NO_LUA", "SOCKETLEY_IMPLEMENTATION" }
-
     includedirs { "include/linux" }
 
-    links { "uring", "ssl", "crypto" }
-
-    files { "test/unit/test_single_header.cpp" }
+    files { "test/unit/test_sdk_control.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -363,27 +361,59 @@ project "test_single_header"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
--- ─── Test: single-header SDK (with Lua) ───
+-- ─── Benchmark: socketley_bench ───
 
-project "test_single_header_lua"
+project "socketley_bench"
+    kind "ConsoleApp"
+    language "C"
+    cdialect "C17"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    buildoptions { "-pipe" }
+
+    links { "pthread", "m" }
+
+    files { "test/benchmark/bench.c" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: SDK engine headers (links libsocketley_sdk.a) ───
+
+project "test_sdk_engine"
     kind "ConsoleApp"
     language "C++"
     cppdialect "C++latest"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    defines { "SOCKETLEY_IMPLEMENTATION" }
-
     includedirs {
+        ".",
         "include/linux",
         "thirdparty/sol2",
-        "thirdparty/luajit"
+        "thirdparty/luajit",
+        "socketley"
     }
 
     libdirs { "thirdparty/luajit" }
-    links { "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
-    files { "test/unit/test_single_header_lua.cpp" }
+    files { "test/unit/test_sdk_engine.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

@@ -1726,46 +1726,330 @@ format metrics at
 .BR "GET /metrics" .
 Metrics include: runtimes total/running, connections total/active,
 messages total, bytes in/out, and per-runtime breakdowns.
-.SH SINGLE-HEADER SDK
-Socketley ships a single-header C++ SDK at
-.BR include/linux/socketley.h .
-It uses the stb-style pattern: include it everywhere for declarations,
-define
-.B SOCKETLEY_IMPLEMENTATION
-in exactly one
-.B .cpp
-file for the implementation.
+.SH C++ SDK
+Socketley ships a three-tier modular C++ SDK in
+.BR include/linux/socketley/ .
+Tiers 1 and 3 are fully self-contained header-only files \(em copy them anywhere,
+compile with
+.BR "g++ -std=c++17" ,
+no library needed. Tier 2 requires building from source.
 .PP
+.TS
+l l l l .
+Tier	Header	Use Case	Dependencies
+_
+1	socketley/control.h	Control a running daemon	None (POSIX)
+2	socketley/{server,cache,proxy,client}.h	Embed the full engine	libsocketley_sdk.a
+3	socketley/attach.h	Register with a daemon	None (Tier 1)
+.TE
+.SS Tier 1: Daemon Control (header-only)
+.B socketley/control.h
+provides full programmatic control over a running daemon through the same Unix
+socket IPC that the CLI uses. Zero dependencies beyond POSIX.
+.PP
+.B "Result type:"
 .nf
-// app.cpp
-#define SOCKETLEY_IMPLEMENTATION
-#include "socketley.h"
+struct socketley::result {
+    int         exit_code;  // 0=success, 1=bad input, 2=fatal, -1=connect fail
+    std::string data;       // response body
+};
 .fi
 .PP
-Optional defines (before the include):
-.TP
-.B SOCKETLEY_NO_LUA
-Disable Lua/sol2 scripting support.
-.TP
-.B SOCKETLEY_NO_HTTPS
-Disable the HTTP client in Lua.
-.PP
-Compile and link:
+.B "Runtime management functions"
+(all in namespace
+.BR socketley::ctl ):
 .nf
-# Without Lua
-g++ -std=c++23 -DSOCKETLEY_NO_LUA -DSOCKETLEY_IMPLEMENTATION \\
-    app.cpp -Iinclude/linux -luring -lssl -lcrypto
+command(cmd)               // raw command (glob patterns work)
+command(socket_path, cmd)  // custom socket path
+create(type, name, flags)  // "server", "client", "proxy", "cache"
+start(name)                stop(name)
+remove(name)               send(name, message)
+ls()   ps()   stats(name)  show(name)
+reload(name)               reload_lua(name)
+edit(name, flags)
+.fi
+.PP
+.B "Cache operations"
+(direct IPC, no TCP connection needed):
+.nf
+cache_get(cache, key)
+cache_set(cache, key, value)
+cache_del(cache, key)
+cache_flush(cache, path)
+.fi
+.PP
+Socket path resolution: checks
+.B SOCKETLEY_SOCKET
+env, then
+.BR /run/socketley/socketley.sock ,
+then
+.BR /tmp/socketley.sock .
+.PP
+.B "Example: lifecycle management"
+.nf
+#include <socketley/control.h>
+#include <cstdio>
 
-# With Lua
-g++ -std=c++23 -DSOCKETLEY_IMPLEMENTATION \\
-    app.cpp -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \\
-    -luring -lssl -lcrypto -lluajit-5.1
+int main() {
+    auto r = socketley::ctl::create("server", "myapp", "-p 9000 -s");
+    if (r.exit_code != 0) return 1;
+
+    socketley::ctl::send("myapp", "Hello from C++!");
+    auto stats = socketley::ctl::stats("myapp");
+    printf("%s\\n", stats.data.c_str());
+
+    socketley::ctl::stop("myapp");
+    socketley::ctl::remove("myapp");
+}
+// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
 .fi
 .PP
-To regenerate the single header from source:
+.B "Example: fleet management with globs"
 .nf
-bash tools/amalgamate.sh
+for (int i = 0; i < 5; ++i) {
+    std::string name  = "api_" + std::to_string(i);
+    std::string flags = "-p " + std::to_string(9000+i) + " -s";
+    socketley::ctl::create("server", name, flags);
+}
+socketley::ctl::command("start api_*");    // start all
+socketley::ctl::command("stats api_*");    // query all
+socketley::ctl::command("stop api_*");     // stop all
+socketley::ctl::command("remove api_*");   // remove all
 .fi
+.PP
+.B "Example: cache operations"
+.nf
+socketley::ctl::create("cache", "store", "-p 6379 --mode admin -s");
+socketley::ctl::cache_set("store", "user:1", "alice");
+auto r = socketley::ctl::cache_get("store", "user:1");
+printf("user:1 = %s\\n", r.data.c_str());  // "alice"
+socketley::ctl::cache_del("store", "user:1");
+socketley::ctl::cache_flush("store", "/tmp/store.bin");
+.fi
+.SS Tier 2: Embed Engine (build from source)
+Embed the full io_uring event loop and all four runtime types in your own binary.
+Maximum performance with no IPC overhead. Requires
+.B libsocketley_sdk.a
+and link flags
+.BR "-luring -lssl -lcrypto [-lluajit]" .
+.PP
+Headers:
+.B socketley/core.h
+(event_loop, runtime_manager, enums),
+.B socketley/server.h ,
+.B socketley/client.h ,
+.B socketley/proxy.h ,
+.B socketley/cache.h .
+.PP
+.B "Core pattern:"
+create event_loop, create runtime_manager, create runtimes, configure, run, loop.
+.PP
+.B "C++ callbacks"
+(alternative to Lua scripts, set on any runtime):
+.nf
+set_on_start(function<void()>)
+set_on_stop(function<void()>)
+set_on_connect(function<void(int fd)>)
+set_on_disconnect(function<void(int fd)>)
+set_on_client_message(function<void(int fd, string_view)>)
+set_on_message(function<void(string_view)>)
+set_on_tick(function<void(double dt_ms)>)
+.fi
+.PP
+.B "Common runtime setters:"
+.nf
+set_port(uint16_t)            set_event_loop(event_loop*)
+set_runtime_manager(mgr*)     set_cache_name(string_view)
+set_tls(bool)                 set_cert_path(string_view)
+set_key_path(string_view)     set_max_connections(uint32_t)
+set_rate_limit(double)        set_idle_timeout(uint32_t)
+set_log_file(string_view)     set_group(string_view)
+set_drain(bool)               load_lua_script(string_view)
+.fi
+.PP
+.B "Server-specific:"
+.nf
+set_mode(mode_inout|mode_in|mode_out|mode_master)
+set_udp(bool)          set_http_dir(string_view)
+lua_broadcast(msg)     lua_send_to(fd, msg)
+lua_disconnect(fd)     lua_peer_ip(fd)
+lua_clients()          lua_multicast(fds, msg)
+.fi
+.PP
+.B "Cache-specific:"
+.nf
+set_mode(cache_mode_readonly|readwrite|admin)
+set_persistent(path)   set_max_memory(bytes)
+set_resp_forced(bool)  set_replicate_target(host:port)
+.fi
+.PP
+.B "Proxy-specific:"
+.nf
+set_protocol(protocol_http|protocol_tcp)
+set_strategy(strategy_round_robin|random|lua)
+add_backend(addr)      clear_backends()
+.fi
+.PP
+.B "Example: echo server with C++ callbacks"
+.nf
+#include <socketley/server.h>
+#include <csignal>
+#include <cstdio>
+
+static event_loop* g_loop = nullptr;
+
+int main() {
+    signal(SIGPIPE, SIG_IGN);
+    event_loop loop; loop.init();
+    g_loop = &loop;
+    runtime_manager mgr;
+
+    mgr.create(runtime_server, "echo");
+    auto* srv = static_cast<server_instance*>(mgr.get("echo"));
+    srv->set_port(9000);
+    srv->set_mode(mode_inout);
+    srv->set_event_loop(&loop);
+    srv->set_runtime_manager(&mgr);
+
+    srv->set_on_connect([](int fd) {
+        printf("client %d connected\\n", fd);
+    });
+    srv->set_on_client_message([srv](int fd, std::string_view msg) {
+        srv->lua_send_to(fd, msg);  // echo back
+    });
+
+    mgr.run("echo", loop);
+    signal(SIGINT, [](int) { g_loop->request_stop(); });
+    loop.run();
+    mgr.stop_all(loop);
+}
+// g++ -std=c++23 echo.cpp -I. -Iinclude/linux \\
+//     -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto
+.fi
+.PP
+.B "Example: multi-runtime (server + cache)"
+.nf
+#include <socketley/server.h>
+#include <socketley/cache.h>
+
+// ... (event_loop + runtime_manager setup as above)
+
+mgr.create(runtime_cache, "store");
+auto* cache = static_cast<cache_instance*>(mgr.get("store"));
+cache->set_port(6379);
+cache->set_mode(cache_mode_admin);
+cache->set_runtime_manager(&mgr);
+cache->set_event_loop(&loop);
+
+mgr.create(runtime_server, "api");
+auto* srv = static_cast<server_instance*>(mgr.get("api"));
+srv->set_port(9000);
+srv->set_cache_name("store");  // clients can "cache set k v"
+srv->set_runtime_manager(&mgr);
+srv->set_event_loop(&loop);
+
+mgr.run("store", loop);
+mgr.run("api", loop);
+loop.run();
+.fi
+.PP
+.B "Example: proxy load balancer"
+.nf
+#include <socketley/server.h>
+#include <socketley/proxy.h>
+
+// ... (event_loop + runtime_manager + 2 backend servers)
+
+mgr.create(runtime_proxy, "lb");
+auto* px = static_cast<proxy_instance*>(mgr.get("lb"));
+px->set_port(8080);
+px->set_protocol(protocol_tcp);
+px->set_strategy(strategy_round_robin);
+px->add_backend("127.0.0.1:9001");
+px->add_backend("127.0.0.1:9002");
+px->set_event_loop(&loop);
+px->set_runtime_manager(&mgr);
+mgr.run("lb", loop);
+loop.run();
+.fi
+.PP
+Define
+.B SOCKETLEY_NO_LUA
+to build without LuaJIT (omit
+.B -lluajit
+from link flags).
+.SS Tier 3: Daemon Attach (header-only)
+.B socketley/attach.h
+registers your own process as a runtime with a running daemon.
+After attaching, your process shows up in
+.BR "socketley ls" ,
+.BR "socketley stats" ,
+and
+.BR "socketley ps" .
+Fully self-contained (builds on control.h). Auto-deregisters on
+.BR exit() .
+.PP
+.B "API:"
+.nf
+bool daemon_attach(name, type, port)  // register, auto-detach on exit
+void daemon_detach(name)              // explicit deregister
+void daemon_detach()                  // deregister attach'd name
+.fi
+.PP
+.B "Example:"
+.nf
+#include <socketley/attach.h>
+#include <cstdio>
+
+int main() {
+    // Start your own TCP server (any framework)
+    // ...bind, listen on port 8080...
+
+    if (socketley::daemon_attach("myservice", "server", 8080))
+        printf("registered with daemon\\n");
+    else
+        printf("daemon not running (standalone mode)\\n");
+
+    // Your accept loop here...
+    // atexit() automatically calls daemon_detach()
+}
+// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+.fi
+.SS Mixed: Engine + Daemon Attach (Tier 2 + 3)
+Embed the full engine for maximum performance, and register with the daemon
+for fleet monitoring. Best of both worlds.
+.PP
+.nf
+#include <socketley/server.h>
+#include <socketley/cache.h>
+#include <socketley/attach.h>
+
+// ... (create event_loop, runtime_manager, server + cache as above)
+
+mgr.run("app_cache", loop);
+mgr.run("app_srv", loop);
+
+// Register with daemon so socketley ls/stats can see them
+socketley::daemon_attach("app_srv", "server", 9000);
+socketley::daemon_attach("app_cache", "cache", 6379);
+
+loop.run();  // daemon sees both runtimes
+.fi
+.PP
+.B "When to use each tier:"
+.PP
+.TP
+.B "Tier 1"
+Orchestration scripts, deployment tools, monitoring, CI/CD.
+.TP
+.B "Tier 2"
+Custom daemons, game servers, IoT gateways, performance-critical services.
+.TP
+.B "Tier 3"
+Legacy services, third-party processes, fleet visibility for external apps.
+.TP
+.B "Mixed"
+Embedded engine with daemon monitoring \(em maximum performance with fleet management.
 .SH EXIT STATUS
 .TP
 .B 0

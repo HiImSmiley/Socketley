@@ -35,7 +35,7 @@
 //     socketley.log("tick, dt=" .. tostring(dt) .. " ms")
 //   end
 
-#include <socketley.h>
+#include <socketley/server.h>
 #include <csignal>
 #include <cstdio>
 

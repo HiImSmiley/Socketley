@@ -1,6 +1,6 @@
 #!/bin/bash
 # WebSocket Benchmark
-# Tests: WS handshake throughput, frame encoding throughput
+# Uses socketley-bench (C binary) for WS handshake, echo RTT, and concurrency.
 
 source "$(dirname "$0")/utils.sh"
 
@@ -18,19 +18,6 @@ append_result() {
     fi
 }
 
-# WS handshake helper — sends upgrade request via bash /dev/tcp, reads the
-# HTTP status line (arrives in <1ms on localhost), then closes. This avoids
-# the nc -q1 behaviour which waits a full second after stdin closes while the
-# server holds the WS connection open.
-ws_handshake() {
-    local resp
-    exec 99<>/dev/tcp/localhost/$WS_PORT 2>/dev/null || return 1
-    printf 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' >&99
-    IFS= read -r -t 1 resp <&99
-    exec 99<&-
-    printf '%s' "$resp"
-}
-
 # Test 1: WebSocket handshake throughput
 test_ws_handshake() {
     local num_ops=${1:-500}
@@ -42,47 +29,55 @@ test_ws_handshake() {
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
 
-    local results_dir=$(mktemp -d)
-    local batch=20
-
-    local start_time=$(get_time_ms)
-
-    for i in $(seq 1 $num_ops); do
-        (
-            local resp=$(ws_handshake)
-            echo "$resp" | grep -q "101 Switching" && touch "$results_dir/ok_$i"
-        ) &
-        if [[ $((i % batch)) -eq 0 ]]; then
-            wait
-            echo -ne "\r  Progress: $i / $num_ops"
-        fi
-    done
-    wait
-    echo ""
-
-    local success=$(ls "$results_dir" | wc -l)
-    rm -rf "$results_dir"
-
-    local end_time=$(get_time_ms)
-    local total_time=$((end_time - start_time))
-    local ops_sec=$(echo "scale=2; $num_ops * 1000 / $total_time" | bc)
-
-    log_success "Handshakes: $success / $num_ops successful"
-    log_success "Total time: $(format_duration $total_time)"
-    log_success "Throughput: $ops_sec handshakes/sec"
-
     append_result
-    write_json_result "$test_name" "$RESULTS_FILE" \
-        "operations" "$num_ops" \
-        "successful" "$success" \
-        "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec"
+    "$SOCKETLEY_BENCH" -j ws handshake 127.0.0.1 $WS_PORT $num_ops >> "$RESULTS_FILE"
+    "$SOCKETLEY_BENCH" ws handshake 127.0.0.1 $WS_PORT $num_ops
 
     socketley_cmd stop bench_ws
     socketley_cmd remove bench_ws
 }
 
-# Test 2: TCP coexistence throughput (mixed WS + TCP clients)
+# Test 2: WebSocket echo RTT
+test_ws_echo() {
+    local num_ops=${1:-5000}
+    local msg_size=${2:-64}
+    local test_name="ws_echo_rtt"
+
+    log_section "Test: WebSocket Echo RTT ($num_ops msgs, ${msg_size}B)"
+
+    socketley_cmd create server bench_ws -p $WS_PORT -s
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    sleep 0.5
+
+    append_result
+    "$SOCKETLEY_BENCH" -j ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size >> "$RESULTS_FILE"
+    "$SOCKETLEY_BENCH" ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size
+
+    socketley_cmd stop bench_ws
+    socketley_cmd remove bench_ws
+}
+
+# Test 3: Concurrent WebSocket connections
+test_ws_concurrent() {
+    local num_clients=${1:-20}
+    local ops_per_client=${2:-25}
+    local test_name="ws_concurrent"
+
+    log_section "Test: Concurrent WebSocket ($num_clients clients, $ops_per_client ops each)"
+
+    socketley_cmd create server bench_ws -p $WS_PORT -s
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    sleep 0.5
+
+    append_result
+    "$SOCKETLEY_BENCH" -j ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client >> "$RESULTS_FILE"
+    "$SOCKETLEY_BENCH" ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client
+
+    socketley_cmd stop bench_ws
+    socketley_cmd remove bench_ws
+}
+
+# Test 4: TCP coexistence throughput (mixed WS + TCP clients) — bash-based
 test_ws_tcp_coexistence() {
     local num_ops=${1:-500}
     local test_name="ws_tcp_coexistence"
@@ -100,7 +95,11 @@ test_ws_tcp_coexistence() {
     for i in $(seq 1 $num_ops); do
         (
             if [[ $((i % 2)) -eq 0 ]]; then
-                local resp=$(ws_handshake)
+                local resp
+                exec 99<>/dev/tcp/localhost/$WS_PORT 2>/dev/null || exit 1
+                printf 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' >&99
+                IFS= read -r -t 1 resp <&99
+                exec 99<&-
                 echo "$resp" | grep -q "101" && echo "ws" > "$results_dir/r_$i"
             else
                 echo "hello tcp $i" | nc -q0 localhost $WS_PORT >/dev/null 2>&1
@@ -120,7 +119,6 @@ test_ws_tcp_coexistence() {
     local ops_sec=$(echo "scale=2; $num_ops * 1000 / $total_time" | bc)
 
     log_success "WS handshakes: $ws_success, TCP messages: $tcp_success"
-    log_success "Total time: $(format_duration $total_time)"
     log_success "Combined throughput: $ops_sec ops/sec"
 
     append_result
@@ -135,74 +133,16 @@ test_ws_tcp_coexistence() {
     socketley_cmd remove bench_ws
 }
 
-# Test 3: Concurrent WebSocket connections
-test_ws_concurrent() {
-    local num_clients=${1:-20}
-    local ops_per_client=${2:-25}
-    local test_name="ws_concurrent"
-
-    log_section "Test: Concurrent WebSocket ($num_clients clients, $ops_per_client ops each)"
-
-    socketley_cmd create server bench_ws -p $WS_PORT -s
-    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
-    sleep 0.5
-
-    local pids=()
-    local results_dir=$(mktemp -d)
-    local start_time=$(get_time_ms)
-
-    for c in $(seq 1 $num_clients); do
-        (
-            local count=0
-            for i in $(seq 1 $ops_per_client); do
-                local resp=$(ws_handshake)
-                if echo "$resp" | grep -q "101"; then
-                    ((count++))
-                fi
-            done
-            echo "$count" > "$results_dir/client_$c"
-        ) &
-        pids+=($!)
-    done
-
-    for pid in "${pids[@]}"; do
-        wait "$pid"
-    done
-
-    local end_time=$(get_time_ms)
-    local total_time=$((end_time - start_time))
-
-    local total_ops=0
-    for f in "$results_dir"/client_*; do
-        total_ops=$((total_ops + $(cat "$f")))
-    done
-    rm -rf "$results_dir"
-
-    local ops_sec=$(echo "scale=2; $total_ops * 1000 / $total_time" | bc)
-
-    log_success "Total successful handshakes: $total_ops"
-    log_success "Total time: $(format_duration $total_time)"
-    log_success "Aggregate throughput: $ops_sec ops/sec"
-
-    append_result
-    write_json_result "$test_name" "$RESULTS_FILE" \
-        "num_clients" "$num_clients" \
-        "ops_per_client" "$ops_per_client" \
-        "total_ops" "$total_ops" \
-        "total_time_ms" "$total_time" \
-        "ops_per_sec" "$ops_sec"
-
-    socketley_cmd stop bench_ws
-    socketley_cmd remove bench_ws
-}
-
 # Main execution
 run_ws_benchmarks() {
     log_section "WEBSOCKET BENCHMARKS"
 
+    ensure_socketley_bench || return 1
+
     test_ws_handshake 200
-    test_ws_tcp_coexistence 200
+    test_ws_echo 5000 64
     test_ws_concurrent 20 25
+    test_ws_tcp_coexistence 200
 
     echo "]" >> "$RESULTS_FILE"
 

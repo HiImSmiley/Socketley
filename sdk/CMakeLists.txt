@@ -62,7 +62,7 @@ install(TARGETS socketley_sdk
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux/"
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux/socketley/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/socketley"
     FILES_MATCHING PATTERN "*.h"
 )
@@ -71,6 +71,13 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux/"
 option(SOCKETLEY_BUILD_EXAMPLES "Build SDK examples" OFF)
 
 if(SOCKETLEY_BUILD_EXAMPLES)
+    # Header-only daemon control (no library needed)
+    add_executable(daemon_control examples/daemon_control.cpp)
+    target_include_directories(daemon_control PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux"
+    )
+
+    # Engine examples (need libsocketley_sdk)
     add_executable(standalone_server examples/standalone_server.cpp)
     target_link_libraries(standalone_server PRIVATE socketley_sdk)
 
