@@ -6,24 +6,32 @@ const subTabBtns = document.querySelectorAll('.sub-tab-btn');
 const luaSubTabs = document.getElementById('luaSubTabs');
 const skSubTabs  = document.getElementById('skSubTabs');
 const exSubTabs  = document.getElementById('exSubTabs');
+const skSdkPlatTabs = document.getElementById('skSdkPlatTabs');
+const exSdkPlatTabs = document.getElementById('exSdkPlatTabs');
 
 let currentTab       = 'socketley';
 let currentLuaSubTab = 'api';     // 'api' | 'addons'
 let currentSkSubTab  = 'cli';     // 'cli' | 'sdk'
 let currentExSubTab  = 'cli';     // 'cli' | 'sdk'
+let currentSkSdkPlat = 'linux';   // 'linux' | 'other'
+let currentExSdkPlat = 'linux';   // 'linux' | 'other'
 
 function navEl(id)     { return document.getElementById('navList-' + id); }
 function contentEl(id) { return document.getElementById('content-' + id); }
 
 function _resolvePane() {
   if (currentTab === 'socketley') {
-    return currentSkSubTab === 'sdk' ? 'socketley-sdk' : 'socketley';
+    if (currentSkSubTab === 'sdk')
+      return currentSkSdkPlat === 'other' ? 'socketley-sdk-cross' : 'socketley-sdk';
+    return 'socketley';
   }
   if (currentTab === 'lua') {
     return currentLuaSubTab === 'addons' ? 'addons' : 'lua';
   }
   if (currentTab === 'examples') {
-    return currentExSubTab === 'sdk' ? 'examples-sdk' : 'examples';
+    if (currentExSubTab === 'sdk')
+      return currentExSdkPlat === 'other' ? 'examples-sdk-cross' : 'examples-sdk';
+    return 'examples';
   }
   return 'socketley';
 }
@@ -32,7 +40,11 @@ function getActiveNav()     { return navEl(_resolvePane()); }
 function getActiveContent() { return contentEl(_resolvePane()); }
 
 function _applyVisibility() {
-  const panes = ['socketley', 'socketley-sdk', 'lua', 'addons', 'examples', 'examples-sdk'];
+  const panes = [
+    'socketley', 'socketley-sdk', 'socketley-sdk-cross',
+    'lua', 'addons',
+    'examples', 'examples-sdk', 'examples-sdk-cross'
+  ];
   const active = _resolvePane();
   panes.forEach(id => {
     const n = navEl(id), c = contentEl(id);
@@ -43,6 +55,10 @@ function _applyVisibility() {
   skSubTabs.style.display  = currentTab === 'socketley' ? '' : 'none';
   luaSubTabs.style.display = currentTab === 'lua'       ? '' : 'none';
   exSubTabs.style.display  = currentTab === 'examples'  ? '' : 'none';
+
+  // Platform switchers: visible only when SDK sub-tab is active
+  skSdkPlatTabs.style.display = (currentTab === 'socketley' && currentSkSubTab === 'sdk') ? '' : 'none';
+  exSdkPlatTabs.style.display = (currentTab === 'examples'  && currentExSubTab === 'sdk') ? '' : 'none';
 }
 
 function activateTab(tab) {
@@ -67,6 +83,12 @@ function activateSubTab(subtab, group) {
   } else if (group === 'ex') {
     currentExSubTab = subtab;
     localStorage.setItem('sk-ex-subtab', subtab);
+  } else if (group === 'sk-sdk') {
+    currentSkSdkPlat = subtab;
+    localStorage.setItem('sk-sk-sdk-plat', subtab);
+  } else if (group === 'ex-sdk') {
+    currentExSdkPlat = subtab;
+    localStorage.setItem('sk-ex-sdk-plat', subtab);
   }
   // Update active class within this group only
   subTabBtns.forEach(b => {
@@ -135,7 +157,7 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  ['socketley', 'socketley-sdk', 'lua', 'addons', 'examples', 'examples-sdk'].forEach(id => {
+  ['socketley', 'socketley-sdk', 'socketley-sdk-cross', 'lua', 'addons', 'examples', 'examples-sdk', 'examples-sdk-cross'].forEach(id => {
     const nav = navEl(id);
     if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
@@ -195,12 +217,16 @@ const savedTab       = localStorage.getItem('sk-tab') || 'socketley';
 const savedLuaSubTab = localStorage.getItem('sk-lua-subtab') || 'api';
 const savedSkSubTab  = localStorage.getItem('sk-sk-subtab') || 'cli';
 const savedExSubTab  = localStorage.getItem('sk-ex-subtab') || 'cli';
+const savedSkSdkPlat = localStorage.getItem('sk-sk-sdk-plat') || 'linux';
+const savedExSdkPlat = localStorage.getItem('sk-ex-sdk-plat') || 'linux';
 
 // migrate old top-level addons tab
 currentTab       = savedTab === 'addons' ? 'lua' : savedTab;
 currentLuaSubTab = savedTab === 'addons' ? 'addons' : savedLuaSubTab;
 currentSkSubTab  = savedSkSubTab;
 currentExSubTab  = savedExSubTab;
+currentSkSdkPlat = savedSkSdkPlat;
+currentExSdkPlat = savedExSdkPlat;
 
 // Restore sub-tab active classes per group
 subTabBtns.forEach(b => {
@@ -208,5 +234,7 @@ subTabBtns.forEach(b => {
   if (g === 'lua') b.classList.toggle('active', b.dataset.subtab === currentLuaSubTab);
   else if (g === 'sk') b.classList.toggle('active', b.dataset.subtab === currentSkSubTab);
   else if (g === 'ex') b.classList.toggle('active', b.dataset.subtab === currentExSubTab);
+  else if (g === 'sk-sdk') b.classList.toggle('active', b.dataset.subtab === currentSkSdkPlat);
+  else if (g === 'ex-sdk') b.classList.toggle('active', b.dataset.subtab === currentExSdkPlat);
 });
 activateTab(currentTab);
