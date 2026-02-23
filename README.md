@@ -1,12 +1,12 @@
 # Socketley
 
-A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style — with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
+A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style - with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
 
 ## About Me and the Project
 
 Hi, I'm Smiley. This project was born out of a university module called Networked Systems, where I spent a lot of time working with Docker, proxies, sockets, caches, and the protocols that tie them all together. While reading into virtual threads, I stumbled upon Linux's io_uring interface and was immediately hooked.
 
-What bothered me was how many moving parts you need to set up a proper networked system — separate tools for servers, proxies, caches, each with their own config and lifecycle. My goal with Socketley was to combine all of that into something simpler and more unified, at least in my opinion and hope.
+What bothered me was how many moving parts you need to set up a proper networked system - separate tools for servers, proxies, caches, each with their own config and lifecycle. My goal with Socketley was to combine all of that into something simpler and more unified, at least in my opinion and hope.
 
 I've been programming for over a decade, but this project pushed me into entirely new territory: io_uring internals, protocol design, benchmarking methodology, hot-path optimization, and rapid prototyping. It's also been my first deep dive into AI-assisted development with Claude Code, which has been a genuinely exciting experiment in seeing how far that workflow can go.
 
@@ -14,26 +14,26 @@ It's been an amazing journey so far, and I hope others see the same potential in
 
 ## Features
 
-- **Server** -- TCP/UDP listener with broadcast, WebSocket auto-detection, master mode
-- **Client** -- TCP/UDP connector with auto-reconnect
-- **Proxy** -- HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
-- **Cache** -- In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
-- **Lua scripting** -- Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
-- **Cluster mode** -- Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
-- **Master mode** -- One client claims master, broadcasts to all; optional forwarding
-- **HTTP static serving** -- `--http <dir>` with auto-injected WebSocket, optional in-memory caching
-- **TLS/SSL** -- Optional encryption for all runtime types
-- **WebSocket** -- Auto-detected per connection, coexists with raw TCP on the same port
-- **io_uring** -- Multishot accept, SQPOLL, provided buffers, writev coalescing
-- **State persistence** -- Runtime configs saved as JSON, auto-restored on daemon restart
-- **Ownership** -- Parent-child runtime relationships with configurable `on_parent_stop` policies
-- **Monitoring** -- `socketley stats` for live metrics, `--rate-limit` and `--max-connections` for resource control
+- **Server**:TCP/UDP listener with broadcast, WebSocket auto-detection, master mode
+- **Client**:TCP/UDP connector with auto-reconnect
+- **Proxy**:HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
+- **Cache**:In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
+- **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
+- **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
+- **Master mode**:One client claims master, broadcasts to all; optional forwarding
+- **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
+- **TLS/SSL**:Optional encryption for all runtime types
+- **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
+- **io_uring**:Multishot accept, SQPOLL, provided buffers, writev coalescing
+- **State persistence**:Runtime configs saved as JSON, auto-restored on daemon restart
+- **Ownership**:Parent-child runtime relationships with configurable `on_parent_stop` policies
+- **Monitoring**:`socketley stats` for live metrics, `--rate-limit` and `--max-connections` for resource control
 
 ## Performance
 
 All benchmarks: single-threaded, loopback TCP, Intel Core Ultra 5 125H, Linux 6.8, Release build.
 
-### Cache — vs Redis 7.0 (RESP2, `redis-benchmark`)
+### Cache vs Redis 7.0 (RESP2, `redis-benchmark`)
 
 > Both servers use the same Redis wire protocol (RESP2) and the same benchmark tool.
 > Socketley is **single-threaded**. Redis 7.x is also single-threaded (event loop).
@@ -49,7 +49,7 @@ All benchmarks: single-threaded, loopback TCP, Intel Core Ultra 5 125H, Linux 6.
 | SADD        | 190K ops/s    | 184K ops/s    | 1.0x   |
 | HSET        | 200K ops/s    | 180K ops/s    | **1.1x** |
 
-At P=1, throughput is dominated by loopback round-trip latency (~0.14 ms) — both servers are essentially equivalent.
+At P=1, throughput is dominated by loopback round-trip latency (~0.14 ms), both servers are essentially equivalent.
 
 **Pipeline depth = 100** (100 pipelined requests, 50 clients, 2M ops each):
 
@@ -62,13 +62,13 @@ At P=1, throughput is dominated by loopback round-trip latency (~0.14 ms) — bo
 | SADD        | **7.17M ops/s** | 3.67M ops/s  | **2.0x**  |
 | HSET        | **8.30M ops/s** | 3.00M ops/s  | **2.8x**  |
 
-Socketley is **2–4x faster than Redis 7** at sustained pipelined throughput.
+Socketley is **2-4x faster than Redis 7** at sustained pipelined throughput.
 
 The advantage comes from:
-- **io_uring SQPOLL** eliminates all `epoll_wait`/`sendmsg` syscalls — zero syscalls per op in the hot path
-- **Zero-allocation RESP2 codec** — parse and encode directly into/from the connection buffer using `to_chars` and `string_view`; no heap allocations per command
-- **Batch CQE drain** — all completions from a submit round are processed in one pass; single `io_uring_cq_advance`
-- **writev coalescing** — up to 16 responses batched into a single `writev` SQE
+- **io_uring SQPOLL** eliminates all `epoll_wait`/`sendmsg` syscalls, zero syscalls per op in the hot path
+- **Zero-allocation RESP2 codec**: parse and encode directly into/from the connection buffer using `to_chars` and `string_view`; no heap allocations per command
+- **Batch CQE drain**: all completions from a submit round are processed in one pass; single `io_uring_cq_advance`
+- **writev coalescing**: up to 16 responses batched into a single `writev` SQE
 
 **Latency comparison** (P=100):
 
@@ -79,7 +79,7 @@ The advantage comes from:
 | p99 SET  | 0.82 ms   | 1.78 ms   |
 | p99 GET  | 0.38 ms   | 1.40 ms   |
 
-### Server — Connection Rate & Message Throughput
+### Server: Connection Rate & Message Throughput
 
 | Test                               | Result             |
 |------------------------------------|--------------------|
@@ -89,9 +89,9 @@ The advantage comes from:
 | Single client 1KB msg throughput   | **792K msg/s** (775 MB/s)  |
 | 100 clients × 500 msgs (aggregate) | **3.12M msg/s**    |
 
-All on a single-threaded io_uring event loop. `IORING_SETUP_SQPOLL` keeps the submission thread hot — no syscalls during sustained traffic.
+All on a single-threaded io_uring event loop. `IORING_SETUP_SQPOLL` keeps the submission thread hot, no syscalls during sustained traffic.
 
-### Proxy — Overhead vs Direct
+### Proxy: Overhead vs Direct
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
@@ -100,7 +100,7 @@ All on a single-threaded io_uring event loop. `IORING_SETUP_SQPOLL` keeps the su
 | Latency overhead vs direct        | **+5.5%**          |
 | Named-runtime backend resolution  | **50.0K req/s**    |
 
-The proxy adds roughly 2 ms median latency on top of the direct path — mostly loopback TCP overhead, not protocol processing.
+The proxy adds roughly 2 ms median latency on top of the direct path, mostly loopback TCP overhead, not protocol processing.
 
 ## Quick Start
 
@@ -210,13 +210,13 @@ end
 socketley create server echo -p 9000 --lua example.lua -s
 ```
 
-## Cache — DB Backend
+## Cache: DB Backend
 
-Four Lua callbacks connect the cache to any database — no built-in drivers, no rebuild required. Install whichever Lua DB library you prefer and implement the hooks you need.
+Four Lua callbacks connect the cache to any database, no built-in drivers, no rebuild required. Install whichever Lua DB library you prefer and implement the hooks you need.
 
 | Callback | Signature | When |
 |---|---|---|
-| `on_miss(key)` | → `value [, ttl_seconds]` | GET miss — fetch from DB and populate cache |
+| `on_miss(key)` | → `value [, ttl_seconds]` | GET miss, fetch from DB and populate cache |
 | `on_write(key, value, ttl)` | → nothing | After SET / SETEX / SETNX / MSET |
 | `on_delete(key)` | → nothing | After DEL |
 | `on_expire(key)` | → nothing | After TTL sweep removes key |
