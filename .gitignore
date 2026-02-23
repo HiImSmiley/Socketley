@@ -52,5 +52,12 @@ test/benchmark/results/
 # Packages
 *.deb
 *.rpm
+# Project files
 CLAUDE.md
 CONTRIBUTING.md
+
+# IDE and editor
+.vscode/
+.idea/
+.vs/
+.DS_Store
