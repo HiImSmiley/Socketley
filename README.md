@@ -125,24 +125,29 @@ The advantage comes from:
 
 | Test                               | Result             |
 |------------------------------------|--------------------|
-| Connection rate (2000 conns)       | **72.9K conn/s**   |
-| Burst (5000 simultaneous)          | **117.6K conn/s**  |
-| Single client 64B msg throughput   | **719K msg/s** (44.6 MB/s) |
-| Single client 1KB msg throughput   | **792K msg/s** (775 MB/s)  |
-| 100 clients × 500 msgs (aggregate) | **3.12M msg/s**    |
+| Connection rate (2000 conns)       | **75.7K conn/s**   |
+| Burst (5000 simultaneous)          | **91.9K conn/s**   |
+| Single client 64B msg throughput   | **474K msg/s** (29.4 MB/s) |
+| Single client 1KB msg throughput   | **530K msg/s** (518 MB/s)  |
+| 100 clients × 500 msgs (aggregate) | **3.32M msg/s**    |
 
-All on a single-threaded io_uring event loop. `IORING_SETUP_SQPOLL` keeps the submission thread hot, no syscalls during sustained traffic.
+5-run median, 10% warm-up, `clock_gettime(CLOCK_MONOTONIC)`. All on a single-threaded io_uring event loop with `IORING_SETUP_SQPOLL`.
 
-### Proxy: Overhead vs Direct
+### Proxy: TCP Forwarding
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
-| TCP message throughput            | **49.2K msg/s** (5.9 MB/s) |
-| 20 concurrent clients             | **62.5K msg/s**    |
-| Latency overhead vs direct        | **+5.5%**          |
-| Named-runtime backend resolution  | **50.0K req/s**    |
+| TCP message throughput (128B)     | **463K msg/s** (57 MB/s) |
+| 20 concurrent clients             | **1.07M msg/s**    |
+| Named-runtime backend resolution  | **844K msg/s**     |
 
-The proxy adds roughly 2 ms median latency on top of the direct path, mostly loopback TCP overhead, not protocol processing.
+### WebSocket
+
+| Test                              | Result             |
+|-----------------------------------|--------------------|
+| Handshake throughput (200 ops)    | **30.8K handshake/s** |
+| Frame send throughput (64B)       | **581K frame/s** (38.8 MB/s) |
+| 20 concurrent clients             | **63.0K handshake/s** |
 
 ## Quick Start
 
