@@ -3,8 +3,8 @@
 --
 -- Usage:
 --   socketley create server dashboard -p 8080 \
---     --http ./socketley/examples/server/http-dashboard/ \
---     --lua ./socketley/examples/server/http-dashboard.lua -s
+--     --http ./examples/server/http-dashboard/ \
+--     --lua ./examples/server/http-dashboard.lua -s
 --
 -- Open http://localhost:8080 in a browser. The page loads with an
 -- auto-injected WebSocket connection (`socketley` global). Messages

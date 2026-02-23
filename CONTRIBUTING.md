@@ -66,7 +66,7 @@ bash test/benchmark/run_all.sh
 2. Add CLI flag handling in `socketley/daemon/flag_handlers.cpp`
 3. Update state persistence in `socketley/shared/state_persistence.cpp`
 4. Add tests (unit and/or integration)
-5. Update documentation: man page (`socketley/man/socketley.1`), help script (`socketley/man/socketley-help.sh`), examples (`socketley/examples/`), and `CLAUDE.md`
+5. Update documentation: man page (`socketley/man/socketley.1`), help script (`socketley/man/socketley-help.sh`), examples (`examples/`), and `CLAUDE.md`
 
 ## Adding a New Integration Test
 
