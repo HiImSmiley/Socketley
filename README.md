@@ -73,7 +73,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 
 ## Performance
 
-All benchmarks: single-threaded, loopback TCP, Intel Core Ultra 5 125H, Linux 6.8, Release build.
+All benchmarks: single-threaded, loopback TCP, Release build. Measured inside a Lima VM (4 vCPU / 3.8 GiB) on an Intel Core Ultra 5 125H, Linux 6.8. Bare-metal performance will be higher.
 
 ### Cache vs Redis 7.0 (RESP2, `redis-benchmark`)
 
