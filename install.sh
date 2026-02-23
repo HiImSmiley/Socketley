@@ -23,4 +23,4 @@ apt-get update -qq && apt-get install -y -qq liburing2 > /dev/null
 echo "Installing..."
 dpkg -i "$TMP/socketley.deb"
 
-echo "Done. Run 'socketley daemon &' to start."
+echo "Done. Start the daemon with: sudo systemctl start socketley"

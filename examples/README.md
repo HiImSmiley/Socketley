@@ -17,10 +17,7 @@ examples/
 
 ## Quick Start
 
-1. **Start the daemon** (required for all examples):
-   ```bash
-   socketley daemon &
-   ```
+1. **Ensure the daemon is running.** When installed via package, it runs as a systemd service automatically. In dev mode, start it manually: `./bin/Release/socketley daemon &`
 
 2. **Choose an example** and follow its README.
 
