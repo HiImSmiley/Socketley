@@ -2,6 +2,8 @@
 
 A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style - with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
 
+**[Documentation](https://hiimsmiley.github.io/Socketley/)**
+
 ## About Me and the Project
 
 Hi, I'm Smiley. This project was born out of a university module called Networked Systems, where I spent a lot of time working with Docker, proxies, sockets, caches, and the protocols that tie them all together. While reading into virtual threads, I stumbled upon Linux's io_uring interface and was immediately hooked.
