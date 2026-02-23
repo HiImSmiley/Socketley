@@ -342,6 +342,69 @@ inline result cache_publish(const std::string& cache_name, const std::string& ch
     return command("action " + cache_name + " publish " + channel + " " + message);
 }
 
+// ── Cache: string arithmetic ────────────────────────────────────────
+
+inline result cache_incr(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " incr " + key);
+}
+
+inline result cache_decr(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " decr " + key);
+}
+
+inline result cache_incrby(const std::string& cache_name, const std::string& key, int delta)
+{
+    return command("action " + cache_name + " incrby " + key + " " + std::to_string(delta));
+}
+
+inline result cache_decrby(const std::string& cache_name, const std::string& key, int delta)
+{
+    return command("action " + cache_name + " decrby " + key + " " + std::to_string(delta));
+}
+
+inline result cache_append(const std::string& cache_name, const std::string& key,
+                           const std::string& value)
+{
+    return command("action " + cache_name + " append " + key + " " + value);
+}
+
+// ── Cache: list range/index ─────────────────────────────────────────
+
+inline result cache_lrange(const std::string& cache_name, const std::string& key,
+                           int start, int stop)
+{
+    return command("action " + cache_name + " lrange " + key + " " +
+                   std::to_string(start) + " " + std::to_string(stop));
+}
+
+inline result cache_lindex(const std::string& cache_name, const std::string& key, int index)
+{
+    return command("action " + cache_name + " lindex " + key + " " + std::to_string(index));
+}
+
+// ── Cache: set enumeration ──────────────────────────────────────────
+
+inline result cache_smembers(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " smembers " + key);
+}
+
+// ── Cache: hash enumeration ─────────────────────────────────────────
+
+inline result cache_hgetall(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " hgetall " + key);
+}
+
+// ── Cache: multi-key ────────────────────────────────────────────────
+
+inline result cache_keys(const std::string& cache_name, const std::string& pattern = "*")
+{
+    return command("action " + cache_name + " keys " + pattern);
+}
+
 // ── Cache: admin ────────────────────────────────────────────────────
 
 inline result cache_size(const std::string& cache_name)

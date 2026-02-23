@@ -1769,13 +1769,54 @@ reload(name)               reload_lua(name)
 edit(name, flags)
 .fi
 .PP
-.B "Cache operations"
+.B "Cache string operations"
 (direct IPC, no TCP connection needed):
 .nf
-cache_get(cache, key)
-cache_set(cache, key, value)
-cache_del(cache, key)
-cache_flush(cache, path)
+cache_get(cache, key)           cache_set(cache, key, value)
+cache_del(cache, key)           cache_exists(cache, key)
+cache_incr(cache, key)          cache_decr(cache, key)
+cache_incrby(cache, key, n)     cache_decrby(cache, key, n)
+cache_append(cache, key, val)
+.fi
+.PP
+.B "Cache list operations:"
+.nf
+cache_lpush(cache, key, val)    cache_rpush(cache, key, val)
+cache_lpop(cache, key)          cache_rpop(cache, key)
+cache_llen(cache, key)          cache_lrange(cache, key, start, stop)
+cache_lindex(cache, key, idx)
+.fi
+.PP
+.B "Cache set operations:"
+.nf
+cache_sadd(cache, key, member)  cache_srem(cache, key, member)
+cache_sismember(cache, key, m)  cache_scard(cache, key)
+cache_smembers(cache, key)
+.fi
+.PP
+.B "Cache hash operations:"
+.nf
+cache_hset(cache, key, f, v)    cache_hget(cache, key, field)
+cache_hdel(cache, key, field)   cache_hlen(cache, key)
+cache_hgetall(cache, key)
+.fi
+.PP
+.B "Cache TTL:"
+.nf
+cache_expire(cache, key, sec)   cache_ttl(cache, key)
+cache_persist(cache, key)
+.fi
+.PP
+.B "Cache pub/sub:"
+.nf
+cache_publish(cache, ch, msg)
+.fi
+.PP
+.B "Cache admin:"
+.nf
+cache_size(cache)               cache_memory(cache)
+cache_keys(cache, pattern)
+cache_flush(cache [, path])     cache_load(cache [, path])
 .fi
 .PP
 Socket path resolution: checks
