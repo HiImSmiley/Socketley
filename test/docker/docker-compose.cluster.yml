@@ -12,8 +12,9 @@ services:
       context: ../..
       dockerfile: Dockerfile
     command: >
-      sh -c "socketley daemon --name api1 --cluster /cluster &
+      sh -c "socketley daemon &
              sleep 1 &&
+             socketley daemon --name api1 --cluster /cluster &&
              socketley create server web -p 9001 -g api -s &&
              wait"
     volumes:
@@ -24,8 +25,9 @@ services:
       context: ../..
       dockerfile: Dockerfile
     command: >
-      sh -c "socketley daemon --name api2 --cluster /cluster &
+      sh -c "socketley daemon &
              sleep 1 &&
+             socketley daemon --name api2 --cluster /cluster &&
              socketley create server web -p 9001 -g api -s &&
              wait"
     volumes:
@@ -36,8 +38,10 @@ services:
       context: ../..
       dockerfile: Dockerfile
     command: >
-      sh -c "socketley daemon --name gateway --cluster /cluster &
-             sleep 2 &&
+      sh -c "socketley daemon &
+             sleep 1 &&
+             socketley daemon --name gateway --cluster /cluster &&
+             sleep 1 &&
              socketley create proxy gw -p 8080 --backend @api --protocol tcp -s &&
              wait"
     volumes:

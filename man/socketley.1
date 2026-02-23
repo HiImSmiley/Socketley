@@ -11,9 +11,11 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .br
 .B socketley
 .B daemon
-.RI [ \-\-name
-.IR name ]
-.RI [ \-\-cluster
+.br
+.B socketley
+.B daemon
+.BI \-\-name " name"
+.RB [ \-\-cluster
 .IR dir ]
 .br
 .B socketley
@@ -102,12 +104,24 @@ Creates IPC socket at /run/socketley/socketley.sock (system install) or
 /tmp/socketley.sock (development mode).
 On startup, restores persisted runtime configurations. Runtimes that were
 running when the daemon last stopped are auto-started.
-Use
+.TP
+.BI "daemon \-\-name " "name " "[\-\-cluster " "dir" "]"
+Configure the running daemon for cluster mode. These flags are sent as IPC
+commands to the already-running daemon (auto-started if not running).
 .B \-\-name
-and
+sets the daemon's identity in the cluster.
 .B \-\-cluster
-to enable multi-daemon cluster discovery (see
+enables cluster discovery on the given shared directory (see
 .BR "CLUSTER MODE" ).
+The name can be changed at any time; if cluster mode is active, the cluster
+file is republished under the new name.
+.RS
+.PP
+.nf
+socketley daemon --name node1 --cluster /shared/cluster
+socketley daemon --name new-name   # rename while cluster is active
+.fi
+.RE
 .TP
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
@@ -337,8 +351,11 @@ Show ownership info for a runtime: parent name, children list, and
 on_parent_stop policy (stop or remove).
 .TP
 .BI "cluster " "[subcommand]"
-Inspect the cluster. Requires a running daemon in cluster mode
-.RB ( \-\-name " + " \-\-cluster ).
+Inspect the cluster. Requires a running daemon with cluster mode enabled
+(via
+.B daemon \-\-name
++
+.BR "daemon \-\-cluster" ).
 The cluster directory is read from the daemon automatically.
 .RS
 .TP
@@ -362,31 +379,28 @@ Continuously refresh the cluster view every 2 seconds (Ctrl+C to stop).
 .RE
 .TP
 .BI "\-\-lua " "lua_file"
-Load Lua orchestration configuration. Creates multiple runtimes from
-a single config file.
+Load Lua orchestration configuration. Optionally configures daemon name
+and cluster mode, then creates multiple runtimes from a single config file.
 .SH DAEMON FLAGS
-.TP
-.BI "\-\-log\-level " "level"
-Set daemon log verbosity:
-.B debug
-,
-.B info
-(default),
-.B warn
-, or
-.BR error .
+These flags configure the running daemon via IPC commands. The daemon is
+auto-started if not already running.
 .TP
 .BI "\-\-name " "name" " | \-n " "name"
-Name this daemon instance (required for cluster mode).
+Set this daemon's identity. Required before enabling cluster mode.
+Can be changed at any time; if cluster mode is active, the cluster file
+is republished under the new name (old name is removed).
 .TP
 .BI "\-\-cluster " "dir"
-Enable cluster mode. Each daemon publishes its runtime state to this shared
-directory every 2 seconds and scans for peer daemons. Proxy
+Enable cluster mode on the given shared directory. Each daemon publishes
+its runtime state there every 2 seconds and scans for peer daemons. Proxy
 .B @group
 backends automatically discover runtimes on remote daemons.
 In Docker Compose, mount a shared volume at this path.
 The advertised host address is set automatically via
 .BR gethostname (3).
+Requires
+.B \-\-name
+to be set first.
 .SH COMMON FLAGS
 These flags work with all runtime types:
 .TP
@@ -922,6 +936,12 @@ echo "subscribe news" | nc localhost 9000
 Lua scripts can define multiple runtimes and attach callbacks.
 .SS Configuration File Format
 .nf
+\-\- Optional: configure daemon name and cluster directory
+daemon = {
+    name = "node1",
+    cluster = "/shared/cluster"
+}
+
 runtimes = {
     { type = "server", name = "api", port = 9000, group = "api", start = true },
     { type = "client", name = "cli", port = 9000, target = "127.0.0.1:9000" },
@@ -931,6 +951,11 @@ runtimes = {
       persistent = "/data/store.bin" }
 }
 .fi
+.PP
+The
+.B daemon
+table is processed first (name, then cluster). If omitted, the daemon
+runs without cluster mode.
 .SS Available Callbacks
 .TP
 .B on_start()
@@ -1555,24 +1580,46 @@ services:
   api1:
     image: socketley
     command: >
-      sh -c "socketley daemon --name api1 --cluster /cluster &
-             sleep 1 && socketley create server web -p 9001 -g api -s && wait"
+      sh -c "socketley daemon &
+             sleep 1 &&
+             socketley daemon --name api1 --cluster /cluster &&
+             socketley create server web -p 9001 -g api -s && wait"
     volumes: [cluster:/cluster]
 
   api2:
     image: socketley
     command: >
-      sh -c "socketley daemon --name api2 --cluster /cluster &
-             sleep 1 && socketley create server web -p 9001 -g api -s && wait"
+      sh -c "socketley daemon &
+             sleep 1 &&
+             socketley daemon --name api2 --cluster /cluster &&
+             socketley create server web -p 9001 -g api -s && wait"
     volumes: [cluster:/cluster]
 
   gateway:
     image: socketley
     command: >
-      sh -c "socketley daemon --name gateway --cluster /cluster &
-             sleep 2 && socketley create proxy gw -p 8080 --backend @api -s && wait"
+      sh -c "socketley daemon &
+             sleep 1 &&
+             socketley daemon --name gateway --cluster /cluster &&
+             sleep 1 &&
+             socketley create proxy gw -p 8080 --backend @api -s && wait"
     volumes: [cluster:/cluster]
     ports: ["8080:8080"]
+.fi
+.PP
+Alternatively, use a Lua config file:
+.PP
+.nf
+\-\- /etc/socketley/setup.lua
+daemon = { name = "api1", cluster = "/cluster" }
+runtimes = {
+    { type = "server", name = "web", port = 9001, group = "api", start = true }
+}
+.fi
+.PP
+.nf
+socketley daemon &
+sleep 1 && socketley --lua /etc/socketley/setup.lua
 .fi
 .PP
 .B Inspecting the cluster:
