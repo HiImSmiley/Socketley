@@ -12,14 +12,14 @@ function on_start()
 
     socketley.create("server", "chess-rapid", {
         port = 0,
-        config = "socketley/examples/advanced/rapid-handler.lua",
+        config = "examples/advanced/rapid-handler.lua",
         on_parent_stop = "remove"
     })
     socketley.start("chess-rapid")
 
     socketley.create("server", "chess-blitz", {
         port = 0,
-        config = "socketley/examples/advanced/blitz-handler.lua",
+        config = "examples/advanced/blitz-handler.lua",
         on_parent_stop = "remove"
     })
     socketley.start("chess-blitz")
