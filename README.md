@@ -12,6 +12,35 @@ I've been programming for over a decade, but this project pushed me into entirel
 
 It's been an amazing journey so far, and I hope others see the same potential in this project that I do. I'll keep building with the same mindset and love I started with.
 
+## Installation
+
+### Quick install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+```
+
+### From source
+
+```bash
+# Dependencies (Ubuntu/Debian)
+sudo apt install build-essential liburing-dev libssl-dev
+
+# Build
+./bin/premake5 gmake2
+cd make && make config=release_x64 -j$(nproc)
+
+# Install system-wide (optional)
+sudo bash packaging/install.sh
+```
+
+### Debian package
+
+```bash
+bash packaging/build-deb.sh
+sudo dpkg -i socketley_*.deb
+```
+
 ## What's Included
 
 Beyond the CLI and daemon, there's a lot more in this repository:
@@ -141,35 +170,6 @@ socketley ls
 
 # View stats
 socketley stats myapp
-```
-
-## Installation
-
-### Quick install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
-```
-
-### From source
-
-```bash
-# Dependencies (Ubuntu/Debian)
-sudo apt install build-essential liburing-dev libssl-dev
-
-# Build
-./bin/premake5 gmake2
-cd make && make config=release_x64 -j$(nproc)
-
-# Install system-wide (optional)
-sudo bash packaging/install.sh
-```
-
-### Debian package
-
-```bash
-bash packaging/build-deb.sh
-sudo dpkg -i socketley_*.deb
 ```
 
 ## CLI Reference
