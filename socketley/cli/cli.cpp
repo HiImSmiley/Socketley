@@ -97,7 +97,52 @@ int cli_dispatch(int argc, char** argv)
     switch (fnv1a(cmd.data()))
     {
         case fnv1a("daemon"):
-            return cli_daemon(argc, argv);
+        {
+            // Check for configuration flags (--name, --cluster)
+            bool has_config = false;
+            for (int i = 2; i < argc; ++i)
+            {
+                std::string_view arg = argv[i];
+                if (arg == "--name" || arg == "-n" || arg == "--cluster")
+                {
+                    has_config = true;
+                    break;
+                }
+            }
+
+            if (!has_config)
+                return cli_daemon(argc, argv);
+
+            // Configuration mode — ensure daemon is running, then send IPC
+            if (!ensure_daemon(argv[0]))
+            {
+                std::cerr << "failed to start daemon\n";
+                return 2;
+            }
+
+            for (int i = 2; i < argc; ++i)
+            {
+                std::string_view arg = argv[i];
+                if ((arg == "--name" || arg == "-n") && i + 1 < argc)
+                {
+                    std::string ipc_cmd = std::string("daemon-name ") + argv[++i];
+                    std::string data;
+                    int rc = ipc_send(ipc_cmd, data);
+                    if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+                    if (rc != 0) { if (!data.empty()) std::cerr << data; return rc; }
+                }
+                else if (arg == "--cluster" && i + 1 < argc)
+                {
+                    std::string ipc_cmd = std::string("daemon-cluster ") + argv[++i];
+                    std::string data;
+                    int rc = ipc_send(ipc_cmd, data);
+                    if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+                    if (rc != 0) { if (!data.empty()) std::cerr << data; return rc; }
+                }
+            }
+
+            return 0;
+        }
 
         case fnv1a("--lua"):
             return cli_config(argc, argv);

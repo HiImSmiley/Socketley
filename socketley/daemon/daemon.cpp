@@ -3,7 +3,6 @@
 #include "metrics_endpoint.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
-#include "../shared/cluster_discovery.h"
 #include "../shared/logging.h"
 #include "../shared/paths.h"
 #include "../shared/state_persistence.h"
@@ -245,19 +244,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
 
-    // Parse daemon-specific flags: --name, --cluster
-    std::string daemon_name;
-    std::string cluster_dir;
-
-    for (int i = 2; i < argc; ++i)
-    {
-        std::string_view arg = argv[i];
-        if ((arg == "--name" || arg == "-n") && i + 1 < argc)
-            daemon_name = argv[++i];
-        else if (arg == "--cluster" && i + 1 < argc)
-            cluster_dir = argv[++i];
-    }
-
     // Load config file (sets log level, metrics port, etc.) before anything else
     uint16_t metrics_port = load_daemon_config(paths.config_path.string());
 
@@ -283,23 +269,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         return 1;
     }
 
-    // Create cluster discovery if --cluster is specified
-    std::unique_ptr<cluster_discovery> cluster;
-    if (!cluster_dir.empty())
-    {
-        if (daemon_name.empty())
-        {
-            LOG_ERROR("--cluster requires --name");
-            handler.teardown();
-            return 1;
-        }
-
-        cluster = std::make_unique<cluster_discovery>(
-            daemon_name, cluster_dir, manager);
-        manager.set_cluster_discovery(cluster.get());
-        handler.set_cluster_discovery(cluster.get());
-    }
-
     // Start metrics endpoint if configured
     metrics_endpoint metrics(manager);
     if (metrics_port > 0)
@@ -312,22 +281,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
-
-    // Start cluster discovery timer AFTER restoring runtimes so the first
-    // publish includes all restored runtimes
-    if (cluster)
-    {
-        cluster->set_event_callback([&manager](const std::vector<cluster_event>& events) {
-            manager.dispatch_cluster_events(events);
-        });
-
-        if (!cluster->start(loop))
-        {
-            handler.teardown();
-            return 1;
-        }
-        LOG_INFO("cluster discovery started");
-    }
 
     g_signal_write_fd = loop.get_signal_write_fd();
 
@@ -345,10 +298,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     LOG_INFO("daemon started");
 
     loop.run();
-
-    // Shutdown cluster discovery before stopping runtimes
-    if (cluster)
-        cluster->stop();
 
     manager.stop_all(loop);
     handler.teardown();

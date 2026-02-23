@@ -1,6 +1,6 @@
 # Multi-stage build for Socketley
 # Build:  docker build -t socketley .
-# Run:    docker run --rm socketley daemon --name mynode
+# Run:    docker run --rm socketley daemon
 
 # ─── Builder ───────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04 AS builder
