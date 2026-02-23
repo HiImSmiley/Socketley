@@ -4,9 +4,7 @@ HTTP and TCP reverse proxy configurations with load balancing.
 
 ## Prerequisites
 
-```bash
-socketley daemon &
-```
+The daemon must be running. When installed via package, it runs as a systemd service automatically. In dev mode, start it manually: `./bin/Release/socketley daemon &`
 
 ## Examples
 

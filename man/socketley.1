@@ -85,9 +85,21 @@ with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
 .SH COMMANDS
 .TP
 .B daemon
-Start the socketley daemon. Must be running before any other commands.
-When installed system-wide, creates IPC socket at /run/socketley/socketley.sock.
-In development mode, uses /tmp/socketley.sock.
+Start the socketley daemon.
+When installed system-wide (via .deb package or install.sh), the daemon is
+managed by systemd and starts automatically \(em you do not need to run this
+command manually. Use
+.B systemctl start socketley
+or
+.B systemctl enable socketley
+to control the service.
+.PP
+When running from the build directory (development mode), start the daemon
+manually:
+.B ./bin/Release/socketley daemon &
+.PP
+Creates IPC socket at /run/socketley/socketley.sock (system install) or
+/tmp/socketley.sock (development mode).
 On startup, restores persisted runtime configurations. Runtimes that were
 running when the daemon last stopped are auto-started.
 Use
@@ -1283,10 +1295,9 @@ Stopped but can be restarted.
 .B failed
 Setup failed, cannot recover.
 .SH EXAMPLES
-Start daemon and create a simple server:
+Create a simple server (daemon is managed by systemd when installed):
 .PP
 .nf
-socketley daemon &
 socketley create server myserver -p 9000 -s
 .fi
 .PP
@@ -1591,8 +1602,8 @@ sudo systemctl start socketley
 .fi
 .SS Debian Package
 .nf
-bash packaging/build-deb.sh 1.0.0
-sudo dpkg -i socketley_1.0.0_amd64.deb
+bash packaging/build-deb.sh 1.0.2
+sudo dpkg -i socketley_1.0.2_amd64.deb
 sudo systemctl start socketley
 .fi
 .SS Uninstall
