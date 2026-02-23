@@ -24,6 +24,8 @@ struct runtime_config
     bool bash_timestamp = false;
     uint32_t max_connections = 0;
     double rate_limit = 0.0;
+    double global_rate_limit = 0.0;
+    uint32_t idle_timeout = 0;
     bool drain = false;
     int reconnect = -1;
     bool tls = false;

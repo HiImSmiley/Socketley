@@ -253,14 +253,24 @@ void runtime_instance::print_bash_message(std::string_view msg) const
     {
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
-        std::tm tm = *std::localtime(&time);
+        std::tm tm{};
+        localtime_r(&time, &tm);
         std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] ";
     }
 
     if (m_bash_prefix)
         std::cout << "[" << m_name << "] ";
 
-    std::cout << msg << std::endl;
+    // Sanitize control characters (terminal escape injection prevention)
+    for (char c : msg)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if ((uc < 0x20 && uc != '\t') || uc == 0x7F)
+            std::cout << '?';
+        else
+            std::cout << c;
+    }
+    std::cout << std::endl;
 }
 
 bool runtime_instance::load_lua_script(std::string_view path)
@@ -479,6 +489,24 @@ uint32_t runtime_instance::get_max_connections() const { return m_max_connection
 
 void runtime_instance::set_rate_limit(double rate) { m_rate_limit = rate; }
 double runtime_instance::get_rate_limit() const { return m_rate_limit; }
+
+void runtime_instance::set_global_rate_limit(double rate) { m_global_rate_limit = rate; m_global_tokens = rate; m_global_last = std::chrono::steady_clock::now(); }
+double runtime_instance::get_global_rate_limit() const { return m_global_rate_limit; }
+
+bool runtime_instance::check_global_rate_limit()
+{
+    if (m_global_rate_limit <= 0.0) return true;
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - m_global_last).count();
+    m_global_last = now;
+    m_global_tokens = std::min(m_global_rate_limit, m_global_tokens + elapsed * m_global_rate_limit);
+    if (m_global_tokens < 1.0) return false;
+    m_global_tokens -= 1.0;
+    return true;
+}
+
+void runtime_instance::set_idle_timeout(uint32_t seconds) { m_idle_timeout = seconds; }
+uint32_t runtime_instance::get_idle_timeout() const { return m_idle_timeout; }
 
 void runtime_instance::set_drain(bool enabled) { m_drain = enabled; }
 bool runtime_instance::get_drain() const { return m_drain; }

@@ -324,6 +324,15 @@ state_persistence::state_persistence(const fs::path& state_dir)
 
 fs::path state_persistence::config_path(std::string_view name) const
 {
+    // Reject path traversal characters in name
+    for (char c : name)
+    {
+        if (c == '/' || c == '\\' || c == '\0')
+            return m_state_dir / "invalid.json";
+    }
+    if (name.find("..") != std::string_view::npos)
+        return m_state_dir / "invalid.json";
+
     return m_state_dir / (std::string(name) + ".json");
 }
 
@@ -346,6 +355,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.bash_timestamp = instance->get_bash_timestamp();
     cfg.max_connections = instance->get_max_connections();
     cfg.rate_limit = instance->get_rate_limit();
+    cfg.global_rate_limit = instance->get_global_rate_limit();
+    cfg.idle_timeout = instance->get_idle_timeout();
     cfg.drain = instance->get_drain();
     cfg.reconnect = instance->get_reconnect();
     cfg.tls = instance->get_tls();
@@ -438,6 +449,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"max_connections\": " << cfg.max_connections << ",\n";
     if (cfg.rate_limit > 0.0)
         out << "    \"rate_limit\": " << cfg.rate_limit << ",\n";
+    if (cfg.global_rate_limit > 0.0)
+        out << "    \"global_rate_limit\": " << cfg.global_rate_limit << ",\n";
+    if (cfg.idle_timeout > 0)
+        out << "    \"idle_timeout\": " << cfg.idle_timeout << ",\n";
     if (cfg.drain)
         out << "    \"drain\": true,\n";
     if (cfg.reconnect >= 0)
@@ -546,6 +561,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.bash_timestamp = json_get_bool(json, "bash_timestamp");
     cfg.max_connections = json_get_uint32(json, "max_connections");
     cfg.rate_limit = json_get_double(json, "rate_limit");
+    cfg.global_rate_limit = json_get_double(json, "global_rate_limit");
+    cfg.idle_timeout = json_get_uint32(json, "idle_timeout");
     cfg.drain = json_get_bool(json, "drain");
     cfg.reconnect = json_get_int(json, "reconnect", -1);
     cfg.tls = json_get_bool(json, "tls");

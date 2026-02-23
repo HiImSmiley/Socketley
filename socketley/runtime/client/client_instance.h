@@ -16,6 +16,8 @@ struct client_tcp_connection
     std::string write_buf;
     std::string partial;
 
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};

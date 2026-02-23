@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -474,6 +475,9 @@ inline std::string ws_frame_text(std::string_view payload)
 // Create pong frame
 inline std::string ws_frame_pong(std::string_view payload)
 {
+    // RFC 6455: control frame payloads must not exceed 125 bytes
+    if (payload.size() > 125)
+        payload = payload.substr(0, 125);
     std::string frame;
     frame.resize(2 + payload.size());
     frame[0] = static_cast<char>(0x80 | WS_OP_PONG); // FIN + pong
@@ -503,6 +507,7 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     uint8_t b1 = static_cast<uint8_t>(data[1]);
 
     out.opcode = b0 & 0x0F;
+    bool fin = (b0 & 0x80) != 0;
     bool masked = (b1 & 0x80) != 0;
     uint64_t payload_len = b1 & 0x7F;
     size_t header_size = 2;
@@ -524,6 +529,14 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     }
 
     if (payload_len > WS_MAX_PAYLOAD)
+        return false;
+
+    // Reject control frames with payload > 125 (RFC 6455 §5.5)
+    if (out.opcode >= 0x8 && payload_len > 125)
+        return false;
+
+    // Reject fragmented frames (FIN=0) — we don't support reassembly
+    if (!fin)
         return false;
 
     size_t mask_size = masked ? 4 : 0;
@@ -1327,6 +1340,14 @@ public:
     void set_rate_limit(double rate);
     double get_rate_limit() const;
 
+    // Global rate limiting (across all connections, messages per second, 0 = unlimited)
+    void set_global_rate_limit(double rate);
+    double get_global_rate_limit() const;
+
+    // Idle connection timeout (seconds, 0 = disabled)
+    void set_idle_timeout(uint32_t seconds);
+    uint32_t get_idle_timeout() const;
+
     // Graceful shutdown
     void set_drain(bool enabled);
     bool get_drain() const;
@@ -1457,6 +1478,9 @@ protected:
     void invoke_on_send(std::string_view msg);
     void invoke_on_client_message(int client_id, std::string_view msg);
 
+    // Global rate limit check (token bucket, shared across all connections)
+    bool check_global_rate_limit();
+
     // Bash output helper
     void print_bash_message(std::string_view msg) const;
 
@@ -1484,6 +1508,10 @@ private:
     // Resource limits
     uint32_t m_max_connections = 0;
     double m_rate_limit = 0.0;
+    double m_global_rate_limit = 0.0;
+    double m_global_tokens = 0.0;
+    std::chrono::steady_clock::time_point m_global_last{};
+    uint32_t m_idle_timeout = 0;
 
     // Graceful shutdown
     bool m_drain = false;
@@ -1561,6 +1589,8 @@ struct runtime_config
     bool bash_timestamp = false;
     uint32_t max_connections = 0;
     double rate_limit = 0.0;
+    double global_rate_limit = 0.0;
+    uint32_t idle_timeout = 0;
     bool drain = false;
     int reconnect = -1;
     bool tls = false;
@@ -1850,6 +1880,7 @@ struct server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -1883,6 +1914,9 @@ struct server_connection
 
     // Master auth attempt tracking
     uint8_t auth_failures{0};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 
     // Per-connection metadata (freed automatically on disconnect)
     std::unordered_map<std::string, std::string> meta;
@@ -1993,6 +2027,15 @@ private:
     socklen_t m_accept_addrlen;
     io_request m_accept_req;
     event_loop* m_loop;
+
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
+
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
     static constexpr int MAX_FDS = 8192;
@@ -2016,6 +2059,7 @@ private:
     bool m_use_provided_bufs{false};
 
     // UDP mode
+    static constexpr size_t MAX_UDP_PEERS = 10000;
     struct udp_peer { struct sockaddr_in addr; };
     int m_udp_fd{-1};
     char m_udp_recv_buf[65536];
@@ -2024,6 +2068,13 @@ private:
     struct msghdr m_udp_recv_msg{};
     io_request m_udp_recv_req{};
     std::vector<udp_peer> m_udp_peers;
+
+    // Per-IP auth failure tracking
+    struct auth_ip_record {
+        uint32_t failures{0};
+        std::chrono::steady_clock::time_point last_failure{};
+    };
+    std::unordered_map<uint32_t, auth_ip_record> m_auth_ip_failures;
 
     // HTTP static file serving
     std::filesystem::path m_http_dir;
@@ -2045,6 +2096,8 @@ struct client_tcp_connection
     char read_buf[4096];
     std::string write_buf;
     std::string partial;
+
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     bool read_pending{false};
     bool write_pending{false};
@@ -2134,6 +2187,8 @@ struct resolved_backend
 struct proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -2154,11 +2209,16 @@ struct proxy_client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 };
 
 struct proxy_backend_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -2236,6 +2296,14 @@ private:
     event_loop* m_loop = nullptr;
     bool m_multishot_active = false;
 
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
+
     std::unordered_map<int, std::unique_ptr<proxy_client_connection>> m_clients;
     std::unordered_map<int, std::unique_ptr<proxy_backend_connection>> m_backend_conns;
 
@@ -2257,6 +2325,7 @@ struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -2283,6 +2352,9 @@ struct client_connection
     double rl_tokens{0.0};
     double rl_max{0.0};
     std::chrono::steady_clock::time_point rl_last{};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 };
 
 enum cache_mode : uint8_t
@@ -2433,6 +2505,15 @@ private:
     client_connection* m_conn_idx[MAX_FDS]{};
 
     event_loop* m_loop;
+
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
+
     std::string m_persistent_path;
     cache_mode m_mode = cache_mode_readwrite;
     bool m_resp_forced{false};
@@ -2583,6 +2664,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
         std::cerr << "[tls] failed to create SSL context\n";
         return false;
     }
+    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
     if (SSL_CTX_use_certificate_file(m_ctx, std::string(cert_path).c_str(), SSL_FILETYPE_PEM) <= 0)
     {
@@ -2624,6 +2706,7 @@ bool tls_context::init_client(std::string_view ca_path)
         std::cerr << "[tls] failed to create SSL context\n";
         return false;
     }
+    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
     if (!ca_path.empty())
     {
@@ -3424,7 +3507,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     auto colon = host_port.rfind(':');
     if (colon != std::string::npos) {
         host = host_port.substr(0, colon);
-        try { port = std::stoi(host_port.substr(colon + 1)); } catch (...) {}
+        {
+            auto ps = host_port.substr(colon + 1);
+            std::from_chars(ps.data(), ps.data() + ps.size(), port);
+        }
     } else {
         host = host_port;
     }
@@ -3520,7 +3606,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     auto sp1 = response.find(' ');
     if (sp1 != std::string::npos) {
         auto sp2 = response.find(' ', sp1 + 1);
-        try { status = std::stoi(response.substr(sp1 + 1, sp2 - sp1 - 1)); } catch (...) {}
+        {
+            auto ss = response.substr(sp1 + 1, sp2 - sp1 - 1);
+            std::from_chars(ss.data(), ss.data() + ss.size(), status);
+        }
     }
     auto body_start = response.find("\r\n\r\n");
     result["status"] = status;
@@ -4354,14 +4443,24 @@ void runtime_instance::print_bash_message(std::string_view msg) const
     {
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
-        std::tm tm = *std::localtime(&time);
+        std::tm tm{};
+        localtime_r(&time, &tm);
         std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] ";
     }
 
     if (m_bash_prefix)
         std::cout << "[" << m_name << "] ";
 
-    std::cout << msg << std::endl;
+    // Sanitize control characters (terminal escape injection prevention)
+    for (char c : msg)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if ((uc < 0x20 && uc != '\t') || uc == 0x7F)
+            std::cout << '?';
+        else
+            std::cout << c;
+    }
+    std::cout << std::endl;
 }
 
 bool runtime_instance::load_lua_script(std::string_view path)
@@ -4580,6 +4679,24 @@ uint32_t runtime_instance::get_max_connections() const { return m_max_connection
 
 void runtime_instance::set_rate_limit(double rate) { m_rate_limit = rate; }
 double runtime_instance::get_rate_limit() const { return m_rate_limit; }
+
+void runtime_instance::set_global_rate_limit(double rate) { m_global_rate_limit = rate; m_global_tokens = rate; m_global_last = std::chrono::steady_clock::now(); }
+double runtime_instance::get_global_rate_limit() const { return m_global_rate_limit; }
+
+bool runtime_instance::check_global_rate_limit()
+{
+    if (m_global_rate_limit <= 0.0) return true;
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - m_global_last).count();
+    m_global_last = now;
+    m_global_tokens = std::min(m_global_rate_limit, m_global_tokens + elapsed * m_global_rate_limit);
+    if (m_global_tokens < 1.0) return false;
+    m_global_tokens -= 1.0;
+    return true;
+}
+
+void runtime_instance::set_idle_timeout(uint32_t seconds) { m_idle_timeout = seconds; }
+uint32_t runtime_instance::get_idle_timeout() const { return m_idle_timeout; }
 
 void runtime_instance::set_drain(bool enabled) { m_drain = enabled; }
 bool runtime_instance::get_drain() const { return m_drain; }
@@ -6152,6 +6269,15 @@ state_persistence::state_persistence(const fs::path& state_dir)
 
 fs::path state_persistence::config_path(std::string_view name) const
 {
+    // Reject path traversal characters in name
+    for (char c : name)
+    {
+        if (c == '/' || c == '\\' || c == '\0')
+            return m_state_dir / "invalid.json";
+    }
+    if (name.find("..") != std::string_view::npos)
+        return m_state_dir / "invalid.json";
+
     return m_state_dir / (std::string(name) + ".json");
 }
 
@@ -6174,6 +6300,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.bash_timestamp = instance->get_bash_timestamp();
     cfg.max_connections = instance->get_max_connections();
     cfg.rate_limit = instance->get_rate_limit();
+    cfg.global_rate_limit = instance->get_global_rate_limit();
+    cfg.idle_timeout = instance->get_idle_timeout();
     cfg.drain = instance->get_drain();
     cfg.reconnect = instance->get_reconnect();
     cfg.tls = instance->get_tls();
@@ -6266,6 +6394,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         out << "    \"max_connections\": " << cfg.max_connections << ",\n";
     if (cfg.rate_limit > 0.0)
         out << "    \"rate_limit\": " << cfg.rate_limit << ",\n";
+    if (cfg.global_rate_limit > 0.0)
+        out << "    \"global_rate_limit\": " << cfg.global_rate_limit << ",\n";
+    if (cfg.idle_timeout > 0)
+        out << "    \"idle_timeout\": " << cfg.idle_timeout << ",\n";
     if (cfg.drain)
         out << "    \"drain\": true,\n";
     if (cfg.reconnect >= 0)
@@ -6374,6 +6506,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.bash_timestamp = json_get_bool(json, "bash_timestamp");
     cfg.max_connections = json_get_uint32(json, "max_connections");
     cfg.rate_limit = json_get_double(json, "rate_limit");
+    cfg.global_rate_limit = json_get_double(json, "global_rate_limit");
+    cfg.idle_timeout = json_get_uint32(json, "idle_timeout");
     cfg.drain = json_get_bool(json, "drain");
     cfg.reconnect = json_get_int(json, "reconnect", -1);
     cfg.tls = json_get_bool(json, "tls");
@@ -7060,6 +7194,15 @@ bool runtime_manager::create(runtime_type type, std::string_view name)
 {
     std::unique_lock lock(mutex);
 
+    // Validate name: alphanumeric + -_. only, max 128 chars, no leading dot
+    if (name.empty() || name.size() > 128 || name[0] == '.')
+        return false;
+    for (char c : name)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')
+            return false;
+    }
+
     if (runtimes.find(name) != runtimes.end())
         return false;
 
@@ -7629,6 +7772,34 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     if (url_path == "/")
         url_path = "/index.html";
 
+    // Percent-decode the path to catch %2e%2e → .. traversal
+    auto percent_decode = [](std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++)
+        {
+            if (s[i] == '%' && i + 2 < s.size())
+            {
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                int h = hex(s[i+1]), l = hex(s[i+2]);
+                if (h >= 0 && l >= 0)
+                {
+                    out += static_cast<char>((h << 4) | l);
+                    i += 2;
+                    continue;
+                }
+            }
+            out += s[i];
+        }
+        s = std::move(out);
+    };
+    percent_decode(url_path);
+
     // Security: reject path traversal and null bytes
     if (url_path.find("..") != std::string::npos ||
         url_path.find('\0') != std::string::npos)
@@ -7828,6 +7999,14 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -7903,6 +8082,7 @@ void server_instance::teardown(event_loop& loop)
     // Do NOT call m_clients.clear() here.  The server_connection objects must
     // stay alive until the server_instance itself is destroyed (see setup() for
     // when they are freed on a restart, or the destructor for the remove case).
+    m_idle_sweep_req.owner = nullptr;
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
@@ -7959,6 +8139,33 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             else
                 handle_write(cqe, req);
             break;
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -7970,6 +8177,13 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (client_fd >= 0)
     {
+        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+        if (client_fd >= MAX_FDS)
+        {
+            close(client_fd);
+            goto resubmit_accept;
+        }
+
         // Max connections check
         if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
         {
@@ -7991,6 +8205,8 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         if (client_fd < MAX_FDS)
             m_conn_idx[client_fd] = ptr;
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
         if (m_clients.size() > m_stat_peak_connections)
             m_stat_peak_connections = static_cast<uint32_t>(m_clients.size());
@@ -8002,6 +8218,29 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_max = rl;
             ptr->rl_tokens = rl;
             ptr->rl_last = std::chrono::steady_clock::now();
+        }
+
+        // Check per-IP auth failure rate (master mode only)
+        if (!m_master_pw.empty())
+        {
+            uint32_t ip = m_accept_addr.sin_addr.s_addr;
+            auto it = m_auth_ip_failures.find(ip);
+            if (it != m_auth_ip_failures.end())
+            {
+                auto elapsed = std::chrono::steady_clock::now() - it->second.last_failure;
+                if (elapsed > std::chrono::seconds(60))
+                {
+                    m_auth_ip_failures.erase(it);
+                }
+                else if (it->second.failures >= 10)
+                {
+                    if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
+                    m_clients.erase(client_fd);
+                    shutdown(client_fd, SHUT_RDWR);
+                    close(client_fd);
+                    goto resubmit_accept;
+                }
+            }
         }
 
         // on_auth fires before on_connect; a rejected client never triggers on_connect
@@ -8021,6 +8260,16 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 resubmit_accept:
@@ -8091,6 +8340,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    conn->last_activity = std::chrono::steady_clock::now();
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     if (is_provided)
@@ -8109,6 +8359,12 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->partial.append(conn->read_buf, cqe->res);
     }
 
+    if (conn->partial.size() > server_connection::MAX_PARTIAL_SIZE)
+    {
+        conn->closing = true;
+        goto submit_next_read;
+    }
+
     // WebSocket auto-detection
     if (conn->ws == ws_unknown)
     {
@@ -8125,7 +8381,15 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     {
         auto hdr_end = conn->partial.find("\r\n\r\n");
         if (hdr_end == std::string::npos)
+        {
+            // Reject oversized upgrade requests (belt-and-suspenders for F1 partial limit)
+            if (conn->partial.size() > 16384)
+            {
+                conn->closing = true;
+                goto submit_next_read;
+            }
             goto submit_next_read; // Incomplete headers
+        }
 
         // Single-pass header scan: find Upgrade + Sec-WebSocket-Key without allocation
         {
@@ -8322,18 +8586,14 @@ submit_next_read:
 // Constant-time string compare to prevent timing attacks on password
 static bool constant_time_eq(std::string_view a, std::string_view b)
 {
-    if (a.size() != b.size())
+    volatile uint8_t diff = static_cast<uint8_t>(a.size() != b.size());
+    size_t max_len = std::max(a.size(), b.size());
+    for (size_t i = 0; i < max_len; i++)
     {
-        // Still do work proportional to max size to avoid length leak
-        volatile uint8_t dummy = 0;
-        for (size_t i = 0; i < std::max(a.size(), b.size()); i++)
-            dummy |= 0;
-        (void)dummy;
-        return false;
+        uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
+        uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
+        diff |= ca ^ cb;
     }
-    volatile uint8_t diff = 0;
-    for (size_t i = 0; i < a.size(); i++)
-        diff |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
     return diff == 0;
 }
 
@@ -8360,8 +8620,12 @@ static bool check_rate_limit(server_connection* conn)
 
 void server_instance::process_message(server_connection* sender, std::string_view msg)
 {
-    // Rate limit check
+    // Rate limit check (per-connection)
     if (sender && !check_rate_limit(sender))
+        return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
         return;
 
     // Check if this client is routed to a sub-server
@@ -8507,6 +8771,19 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 else
                 {
                     sender->auth_failures++;
+
+                    // Record per-IP failure
+                    {
+                        struct sockaddr_in peer_addr{};
+                        socklen_t peer_len = sizeof(peer_addr);
+                        if (getpeername(sender->fd, reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_len) == 0)
+                        {
+                            auto& rec = m_auth_ip_failures[peer_addr.sin_addr.s_addr];
+                            rec.failures++;
+                            rec.last_failure = std::chrono::steady_clock::now();
+                        }
+                    }
+
                     auto deny_msg = std::make_shared<const std::string>("master: denied\n");
                     send_to(sender, deny_msg);
                 }
@@ -8602,6 +8879,12 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
     {
         if (fd == exclude_fd || conn->closing)
             continue;
+
+        if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+        {
+            conn->closing = true;
+            continue;
+        }
 
         if (conn->ws == ws_active)
         {
@@ -8751,8 +9034,14 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
         return;
     }
 
-    // Register peer if new
-    find_or_add_peer(m_udp_recv_addr);
+    // Register peer if new; skip processing if peer list is full
+    if (find_or_add_peer(m_udp_recv_addr) < 0)
+    {
+        m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
+        if (m_loop && m_udp_fd >= 0)
+            m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+        return;
+    }
 
     // Extract message — whole datagram = one message
     std::string_view msg(m_udp_recv_buf, static_cast<size_t>(cqe->res));
@@ -9011,6 +9300,9 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
             m_udp_peers[i].addr.sin_port == addr.sin_port)
             return static_cast<int>(i);
     }
+
+    if (m_udp_peers.size() >= MAX_UDP_PEERS)
+        return -1;
 
     m_udp_peers.push_back({addr});
     return static_cast<int>(m_udp_peers.size() - 1);
@@ -9352,6 +9644,12 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         m_conn.partial.append(m_conn.read_buf, cqe->res);
     }
 
+    if (m_conn.partial.size() > client_tcp_connection::MAX_PARTIAL_SIZE)
+    {
+        m_conn.closing = true;
+        goto resubmit;
+    }
+
     {
     size_t scan_from = 0;
     size_t pos;
@@ -9633,6 +9931,14 @@ bool proxy_instance::setup(event_loop& loop)
         m_multishot_active = false;
     }
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -9644,6 +9950,7 @@ void proxy_instance::teardown(event_loop& loop)
     // this, a CQE processed in the same batch as the "remove" command could read
     // req->owner from already-freed connection memory → SEGFAULT.
     m_accept_req.owner = nullptr;
+    m_idle_sweep_req.owner = nullptr;
     for (auto& [fd, conn] : m_clients)
     {
         conn->read_req.owner  = nullptr;
@@ -9729,6 +10036,33 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 handle_backend_write(cqe, req);
             break;
         }
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -9760,11 +10094,23 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         ptr->read_pending = true;
         if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 proxy_resubmit_accept:
@@ -9818,6 +10164,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         close_pair(fd, conn->backend_fd);
         return;
     }
+
+    conn->last_activity = std::chrono::steady_clock::now();
 
     // Extract read data
     char* read_data;
@@ -9877,6 +10225,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     conn->partial.append(read_data, cqe->res);
     if (is_provided)
         m_loop->return_buf(BUF_GROUP_ID, buf_id);
+
+    if (conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE)
+    {
+        close_pair(fd, conn->backend_fd);
+        return;
+    }
 
     if (!conn->header_parsed)
     {
@@ -10300,6 +10654,12 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     auto msg = std::make_shared<const std::string>(data);
 #endif
 
+    if (bconn->write_queue.size() >= proxy_backend_connection::MAX_WRITE_QUEUE)
+    {
+        bconn->closing = true;
+        return;
+    }
+
     bconn->write_queue.push(msg);
 
     if (!bconn->write_pending)
@@ -10339,6 +10699,12 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
 #else
     auto msg = std::make_shared<const std::string>(data);
 #endif
+
+    if (cconn->write_queue.size() >= proxy_client_connection::MAX_WRITE_QUEUE)
+    {
+        cconn->closing = true;
+        return;
+    }
 
     cconn->write_queue.push(msg);
 
@@ -10615,6 +10981,14 @@ bool cache_instance::setup(event_loop& loop)
     m_ttl_req = {op_timeout, -1, nullptr, 0, this};
     loop.submit_timeout(&m_ttl_ts, &m_ttl_req);
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -10672,6 +11046,7 @@ void cache_instance::teardown(event_loop& loop)
     m_follower_fds.clear();
 
     m_ttl_req.owner = nullptr;
+    m_idle_sweep_req.owner = nullptr;
     m_loop = nullptr;
     m_multishot_active = false;
 }
@@ -10723,6 +11098,33 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_writev:
             handle_write(cqe, req);
             break;
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -10734,6 +11136,13 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (client_fd >= 0)
     {
+        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+        if (client_fd >= MAX_FDS)
+        {
+            close(client_fd);
+            goto cache_resubmit_accept;
+        }
+
         if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
         {
             close(client_fd);
@@ -10766,11 +11175,23 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_last = std::chrono::steady_clock::now();
         }
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         ptr->read_pending = true;
         if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 cache_resubmit_accept:
@@ -10834,6 +11255,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    conn->last_activity = std::chrono::steady_clock::now();
+
     if (is_provided)
     {
         uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
@@ -10847,6 +11270,12 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     else
     {
         conn->partial.append(conn->read_buf, cqe->res);
+    }
+
+    if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
+    {
+        conn->closing = true;
+        return;
     }
 
     // Auto-detect RESP mode on first data
@@ -10970,6 +11399,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 {
     if (line.empty())
         return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
+    {
+        conn->response_buf.append("error: rate limited\n", 20);
+        return;
+    }
 
     // Rate limit check
     if (conn->rl_max > 0)
@@ -11834,7 +12270,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = args.empty() ? std::string_view(m_persistent_path) : args;
+            std::string_view path = m_persistent_path;
             if (path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
@@ -11850,7 +12286,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = args.empty() ? std::string_view(m_persistent_path) : args;
+            std::string_view path = m_persistent_path;
             if (path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
@@ -12271,6 +12707,13 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 {
     if (argc == 0)
         return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
+    {
+        resp::encode_error_into(conn->response_buf, "rate limited");
+        return;
+    }
 
     // Rate limit check
     if (conn->rl_max > 0)
@@ -12998,6 +13441,12 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             auto* sub_conn = m_conn_idx[fd];
             if (sub_conn->closing)
                 continue;
+
+            if (sub_conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE)
+            {
+                sub_conn->closing = true;
+                continue;
+            }
 
             sub_conn->write_queue.push(*shared_msg);
             if (!sub_conn->write_pending)

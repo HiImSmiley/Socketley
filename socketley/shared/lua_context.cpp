@@ -15,6 +15,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <charconv>
 #ifndef SOCKETLEY_NO_HTTPS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -197,7 +198,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     auto colon = host_port.rfind(':');
     if (colon != std::string::npos) {
         host = host_port.substr(0, colon);
-        try { port = std::stoi(host_port.substr(colon + 1)); } catch (...) {}
+        {
+            auto ps = host_port.substr(colon + 1);
+            std::from_chars(ps.data(), ps.data() + ps.size(), port);
+        }
     } else {
         host = host_port;
     }
@@ -293,7 +297,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     auto sp1 = response.find(' ');
     if (sp1 != std::string::npos) {
         auto sp2 = response.find(' ', sp1 + 1);
-        try { status = std::stoi(response.substr(sp1 + 1, sp2 - sp1 - 1)); } catch (...) {}
+        {
+            auto ss = response.substr(sp1 + 1, sp2 - sp1 - 1);
+            std::from_chars(ss.data(), ss.data() + ss.size(), status);
+        }
     }
     auto body_start = response.find("\r\n\r\n");
     result["status"] = status;

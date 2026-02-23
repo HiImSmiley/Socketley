@@ -95,6 +95,9 @@ inline std::string ws_frame_text(std::string_view payload)
 // Create pong frame
 inline std::string ws_frame_pong(std::string_view payload)
 {
+    // RFC 6455: control frame payloads must not exceed 125 bytes
+    if (payload.size() > 125)
+        payload = payload.substr(0, 125);
     std::string frame;
     frame.resize(2 + payload.size());
     frame[0] = static_cast<char>(0x80 | WS_OP_PONG); // FIN + pong
@@ -124,6 +127,7 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     uint8_t b1 = static_cast<uint8_t>(data[1]);
 
     out.opcode = b0 & 0x0F;
+    bool fin = (b0 & 0x80) != 0;
     bool masked = (b1 & 0x80) != 0;
     uint64_t payload_len = b1 & 0x7F;
     size_t header_size = 2;
@@ -145,6 +149,14 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     }
 
     if (payload_len > WS_MAX_PAYLOAD)
+        return false;
+
+    // Reject control frames with payload > 125 (RFC 6455 §5.5)
+    if (out.opcode >= 0x8 && payload_len > 125)
+        return false;
+
+    // Reject fragmented frames (FIN=0) — we don't support reassembly
+    if (!fin)
         return false;
 
     size_t mask_size = masked ? 4 : 0;

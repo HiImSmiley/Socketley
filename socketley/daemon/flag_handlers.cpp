@@ -125,6 +125,40 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        case fnv1a("--global-rate-limit"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--global-rate-limit requires a value\n";
+                return 1;
+            }
+            double rate;
+            if (!parse_double(pa.args[++i], rate) || rate < 0)
+            {
+                std::cout << "invalid global-rate-limit value\n";
+                return 1;
+            }
+            instance->set_global_rate_limit(rate);
+            return 0;
+        }
+
+        case fnv1a("--idle-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--idle-timeout requires a value\n";
+                return 1;
+            }
+            uint32_t secs;
+            if (!parse_uint32(pa.args[++i], secs))
+            {
+                std::cout << "invalid idle-timeout value\n";
+                return 1;
+            }
+            instance->set_idle_timeout(secs);
+            return 0;
+        }
+
         case fnv1a("--drain"):
             instance->set_drain(true);
             return 0;
@@ -607,6 +641,40 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             instance->set_rate_limit(rate);
+            return 0;
+        }
+
+        case fnv1a("--global-rate-limit"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--global-rate-limit requires a value\n";
+                return 1;
+            }
+            double rate;
+            if (!parse_double(pa.args[++i], rate) || rate < 0)
+            {
+                std::cout << "invalid global-rate-limit value\n";
+                return 1;
+            }
+            instance->set_global_rate_limit(rate);
+            return 0;
+        }
+
+        case fnv1a("--idle-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--idle-timeout requires a value\n";
+                return 1;
+            }
+            uint32_t secs;
+            if (!parse_uint32(pa.args[++i], secs))
+            {
+                std::cout << "invalid idle-timeout value\n";
+                return 1;
+            }
+            instance->set_idle_timeout(secs);
             return 0;
         }
 

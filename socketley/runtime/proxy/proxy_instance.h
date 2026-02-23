@@ -34,6 +34,8 @@ struct resolved_backend
 struct proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -54,11 +56,16 @@ struct proxy_client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 };
 
 struct proxy_backend_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -135,6 +142,14 @@ private:
     io_request m_accept_req{};
     event_loop* m_loop = nullptr;
     bool m_multishot_active = false;
+
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
 
     std::unordered_map<int, std::unique_ptr<proxy_client_connection>> m_clients;
     std::unordered_map<int, std::unique_ptr<proxy_backend_connection>> m_backend_conns;
