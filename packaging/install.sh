@@ -30,6 +30,9 @@ if [ -f "$PROJECT_ROOT/man/socketley.1" ]; then
     mandb -q 2>/dev/null || true
 fi
 
+# Install help script
+install -Dm755 "$PROJECT_ROOT/man/socketley-help.sh" /usr/share/socketley/socketley-help.sh
+
 # Install systemd service
 install -Dm644 "$SCRIPT_DIR/socketley.service" /usr/lib/systemd/system/socketley.service
 
