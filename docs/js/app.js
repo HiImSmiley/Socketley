@@ -1,23 +1,5 @@
 'use strict';
 
-// ─── Theme Toggle ───
-const themeToggle = document.getElementById('themeToggle');
-const html = document.documentElement;
-const savedTheme = localStorage.getItem('sk-theme');
-if (savedTheme === 'light') { html.setAttribute('data-theme', 'light'); themeToggle.textContent = '\u2600'; }
-themeToggle.addEventListener('click', () => {
-  const isLight = html.getAttribute('data-theme') === 'light';
-  if (isLight) {
-    html.removeAttribute('data-theme');
-    themeToggle.textContent = '\u263E';
-    localStorage.setItem('sk-theme', 'dark');
-  } else {
-    html.setAttribute('data-theme', 'light');
-    themeToggle.textContent = '\u2600';
-    localStorage.setItem('sk-theme', 'light');
-  }
-});
-
 // ─── Tab / Sub-tab Switching ───
 const tabBtns    = document.querySelectorAll('.tab-btn');
 const subTabBtns = document.querySelectorAll('.sub-tab-btn');
