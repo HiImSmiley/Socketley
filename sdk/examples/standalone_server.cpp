@@ -7,15 +7,15 @@
 //       -o /tmp/standalone_server
 //
 // Build (without LuaJIT):
-//   g++ -std=c++23 sdk/examples/standalone_server.cpp \
-//       -DSOCKETLEY_NO_LUA -I. -Iinclude/linux \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto \
+//   g++ -std=c++23 -DSOCKETLEY_NO_LUA sdk/examples/standalone_server.cpp \
+//       -I. -Iinclude/linux \
+//       -Lbin/Release -lsocketley_sdk_nolua -luring -lssl -lcrypto \
 //       -o /tmp/standalone_server_nolua
 //
 // Run: /tmp/standalone_server
 // Test: echo "hello" | nc 127.0.0.1 9000
 
-#include <socketley.h>
+#include <socketley/server.h>
 #include <csignal>
 #include <cstdio>
 

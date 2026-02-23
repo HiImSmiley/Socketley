@@ -54,7 +54,7 @@ main_menu() {
     echo -e "  ${GREEN}7)${NC} Architecture Overview"
     echo -e "  ${GREEN}8)${NC} Troubleshooting"
     echo -e "  ${GREEN}9)${NC} Installation & Packaging"
-    echo -e "  ${GREEN}10)${NC} Single-Header SDK"
+    echo -e "  ${GREEN}10)${NC} C++ SDK"
     echo ""
     echo -e "  ${RED}q)${NC} Quit"
     echo ""
@@ -1085,43 +1085,322 @@ installation_help() {
     main_menu
 }
 
-# Single-Header SDK
+# C++ SDK
 sdk_help() {
     show_header
-    echo -e "${BOLD}${YELLOW}=== Single-Header SDK ===${NC}\n"
+    echo -e "${BOLD}${YELLOW}=== C++ SDK ===${NC}\n"
 
-    echo -e "${BOLD}Overview:${NC}"
-    echo -e "  include/linux/socketley.h is a self-contained stb-style header."
-    echo -e "  Drop it into your project — no other source files needed."
+    echo -e "  Three-tier modular SDK in ${CYAN}include/linux/socketley/${NC}."
+    echo -e "  Tiers 1 & 3 are header-only (zero deps). Tier 2 needs the static library."
+    echo ""
+    echo -e "  ${GREEN}1)${NC} Overview & When to Use Each Tier"
+    echo -e "  ${GREEN}2)${NC} Tier 1: Daemon Control (control.h)"
+    echo -e "  ${GREEN}3)${NC} Tier 2: Embed Engine (server.h, cache.h, proxy.h, client.h)"
+    echo -e "  ${GREEN}4)${NC} Tier 3: Daemon Attach (attach.h)"
+    echo -e "  ${GREEN}5)${NC} Mixed: Engine + Attach (Tier 2 + 3)"
+    echo ""
+    echo -e "  ${RED}b)${NC} Back"
+    echo ""
+    read -p "Enter choice: " choice
+    case $choice in
+        1) sdk_overview ;;
+        2) sdk_tier1 ;;
+        3) sdk_tier2 ;;
+        4) sdk_tier3 ;;
+        5) sdk_mixed ;;
+        b|B) main_menu ;;
+        *) sdk_help ;;
+    esac
+}
+
+sdk_overview() {
+    show_header
+    echo -e "${BOLD}${YELLOW}=== SDK Overview ===${NC}\n"
+
+    echo -e "${BOLD}Tier Summary:${NC}"
+    echo ""
+    echo -e "  ┌──────┬───────────────────────┬──────────────────────────────┬──────────────────┐"
+    echo -e "  │ Tier │ Header                │ Use Case                     │ Dependencies     │"
+    echo -e "  ├──────┼───────────────────────┼──────────────────────────────┼──────────────────┤"
+    echo -e "  │  1   │ socketley/control.h   │ Control a running daemon     │ None (POSIX)     │"
+    echo -e "  │  2   │ socketley/server.h    │ Embed the full engine        │ libsocketley_sdk │"
+    echo -e "  │      │ socketley/cache.h     │                              │ + uring + ssl    │"
+    echo -e "  │      │ socketley/proxy.h     │                              │                  │"
+    echo -e "  │      │ socketley/client.h    │                              │                  │"
+    echo -e "  │  3   │ socketley/attach.h    │ Register with a daemon       │ None (Tier 1)    │"
+    echo -e "  └──────┴───────────────────────┴──────────────────────────────┴──────────────────┘"
     echo ""
 
-    echo -e "${BOLD}Usage:${NC}"
-    echo -e "  ${CYAN}// In exactly ONE .cpp file:"
-    echo -e "  #define SOCKETLEY_IMPLEMENTATION"
-    echo -e "  #include \"socketley.h\""
-    echo -e ""
-    echo -e "  // In all other files:"
-    echo -e "  #include \"socketley.h\"${NC}"
+    echo -e "${BOLD}When to Use Each Tier:${NC}"
+    echo ""
+    echo -e "  ${GREEN}Tier 1${NC} — Orchestration scripts, deployment tools, monitoring dashboards,"
+    echo -e "           CI/CD pipelines, admin tools. Quick: copy header, compile, done."
+    echo ""
+    echo -e "  ${BLUE}Tier 2${NC} — Custom daemons, game servers, IoT gateways, performance-critical"
+    echo -e "           services. You get the full io_uring engine with zero IPC overhead."
+    echo ""
+    echo -e "  ${YELLOW}Tier 3${NC} — Legacy services, third-party processes, microservices that need"
+    echo -e "           fleet visibility. Your process shows up in socketley ls/stats/ps."
+    echo ""
+    echo -e "  ${RED}Mixed${NC}  — Embedded engine (Tier 2) with daemon registration (Tier 3)."
+    echo -e "           Maximum performance with fleet management. Best of both worlds."
     echo ""
 
-    echo -e "${BOLD}Optional Defines:${NC}"
-    echo -e "  ${CYAN}SOCKETLEY_NO_LUA${NC}    Disable Lua/sol2 (no -lluajit needed)"
-    echo -e "  ${CYAN}SOCKETLEY_NO_HTTPS${NC}  Disable HTTP client in Lua"
-    echo ""
-
-    echo -e "${BOLD}Compile (without Lua):${NC}"
-    echo -e "  ${CYAN}g++ -std=c++23 -DSOCKETLEY_NO_LUA -DSOCKETLEY_IMPLEMENTATION \\"
-    echo -e "      app.cpp -Iinclude/linux -luring -lssl -lcrypto${NC}"
-    echo ""
-
-    echo -e "${BOLD}Compile (with Lua):${NC}"
-    echo -e "  ${CYAN}g++ -std=c++23 -DSOCKETLEY_IMPLEMENTATION \\"
-    echo -e "      app.cpp -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \\"
-    echo -e "      -luring -lssl -lcrypto -lluajit-5.1${NC}"
+    echo -e "${BOLD}Examples:${NC}"
+    echo -e "  ${CYAN}sdk/examples/daemon_control.cpp${NC}        — Tier 1 control"
+    echo -e "  ${CYAN}sdk/examples/standalone_server.cpp${NC}     — Tier 2 engine"
+    echo -e "  ${CYAN}sdk/examples/standalone_server_lua.cpp${NC} — Tier 2 with Lua"
     echo ""
 
     read -p "Press Enter to continue..."
-    main_menu
+    sdk_help
+}
+
+sdk_tier1() {
+    show_header
+    echo -e "${BOLD}${GREEN}=== Tier 1: Daemon Control (control.h) ===${NC}\n"
+
+    echo -e "  ${CYAN}#include <socketley/control.h>${NC}"
+    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Iinclude/linux${NC}"
+    echo -e "  No library needed. Fully self-contained. Copy anywhere."
+    echo ""
+
+    echo -e "${BOLD}Result Type:${NC}"
+    echo -e "  struct socketley::result { int exit_code; std::string data; };"
+    echo -e "  exit_code: 0=success, 1=bad input, 2=fatal, -1=connect failed"
+    echo ""
+
+    echo -e "${BOLD}Runtime Management (socketley::ctl::):${NC}"
+    echo -e "  ${CYAN}command(cmd)${NC}               Send raw command (globs work)"
+    echo -e "  ${CYAN}command(socket, cmd)${NC}       Send to custom socket path"
+    echo -e "  ${CYAN}create(type, name, flags)${NC}  Create runtime (server/client/proxy/cache)"
+    echo -e "  ${CYAN}start(name)${NC}                Start a created runtime"
+    echo -e "  ${CYAN}stop(name)${NC}                 Stop a running runtime"
+    echo -e "  ${CYAN}remove(name)${NC}               Remove a stopped runtime"
+    echo -e "  ${CYAN}send(name, message)${NC}        Send text to a runtime"
+    echo -e "  ${CYAN}ls()${NC}                       List all runtimes"
+    echo -e "  ${CYAN}ps()${NC}                       Show running runtimes + PIDs"
+    echo -e "  ${CYAN}stats(name)${NC}                Get JSON statistics"
+    echo -e "  ${CYAN}show(name)${NC}                 Show runtime configuration"
+    echo -e "  ${CYAN}reload(name)${NC}               Reload runtime config"
+    echo -e "  ${CYAN}reload_lua(name)${NC}           Hot-reload Lua script"
+    echo -e "  ${CYAN}edit(name, flags)${NC}          Edit runtime flags"
+    echo ""
+
+    echo -e "${BOLD}Cache Operations:${NC}"
+    echo -e "  ${CYAN}cache_get(cache, key)${NC}           Get a string value"
+    echo -e "  ${CYAN}cache_set(cache, key, value)${NC}    Set a string value"
+    echo -e "  ${CYAN}cache_del(cache, key)${NC}           Delete a key"
+    echo -e "  ${CYAN}cache_flush(cache, path)${NC}        Flush to disk"
+    echo ""
+
+    echo -e "${BOLD}Socket Path Resolution:${NC}"
+    echo -e "  1. \$SOCKETLEY_SOCKET env var"
+    echo -e "  2. /run/socketley/socketley.sock"
+    echo -e "  3. /tmp/socketley.sock"
+    echo ""
+
+    echo -e "${BOLD}Example — Lifecycle:${NC}"
+    echo -e "  ${CYAN}auto r = socketley::ctl::create(\"server\", \"myapp\", \"-p 9000 -s\");${NC}"
+    echo -e "  ${CYAN}socketley::ctl::send(\"myapp\", \"Hello!\");${NC}"
+    echo -e "  ${CYAN}socketley::ctl::stop(\"myapp\");${NC}"
+    echo -e "  ${CYAN}socketley::ctl::remove(\"myapp\");${NC}"
+    echo ""
+
+    echo -e "${BOLD}Example — Fleet with Globs:${NC}"
+    echo -e "  ${CYAN}socketley::ctl::command(\"start api_*\");${NC}     // start all api_ runtimes"
+    echo -e "  ${CYAN}socketley::ctl::command(\"stats api_*\");${NC}     // query all"
+    echo -e "  ${CYAN}socketley::ctl::command(\"stop api_*\");${NC}      // stop all"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    sdk_help
+}
+
+sdk_tier2() {
+    show_header
+    echo -e "${BOLD}${BLUE}=== Tier 2: Embed Engine ===${NC}\n"
+
+    echo -e "  Embed the full io_uring event loop + all runtime types in your binary."
+    echo -e "  Maximum performance — no IPC overhead, direct C++ callbacks."
+    echo ""
+    echo -e "  Compile: ${CYAN}g++ -std=c++23 app.cpp -I. -Iinclude/linux \\"
+    echo -e "      -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto${NC}"
+    echo -e "  Add ${CYAN}-lluajit${NC} for Lua, or define ${CYAN}SOCKETLEY_NO_LUA${NC} to skip it."
+    echo ""
+
+    echo -e "${BOLD}Headers:${NC}"
+    echo -e "  ${CYAN}socketley/core.h${NC}    — event_loop, runtime_manager, enums"
+    echo -e "  ${CYAN}socketley/server.h${NC}  — server_instance (TCP/UDP server)"
+    echo -e "  ${CYAN}socketley/client.h${NC}  — client_instance (TCP/UDP connector)"
+    echo -e "  ${CYAN}socketley/proxy.h${NC}   — proxy_instance (HTTP/TCP proxy)"
+    echo -e "  ${CYAN}socketley/cache.h${NC}   — cache_instance (Redis-compatible store)"
+    echo ""
+
+    echo -e "${BOLD}Core Pattern:${NC}"
+    echo -e "  1. ${CYAN}event_loop loop; loop.init();${NC}"
+    echo -e "  2. ${CYAN}runtime_manager mgr;${NC}"
+    echo -e "  3. ${CYAN}mgr.create(runtime_server, \"name\");${NC}"
+    echo -e "  4. Configure: ${CYAN}set_port(), set_mode(), set_event_loop(), ...${NC}"
+    echo -e "  5. ${CYAN}mgr.run(\"name\", loop);${NC}"
+    echo -e "  6. ${CYAN}loop.run();${NC}  (blocks until SIGINT)"
+    echo ""
+
+    echo -e "${BOLD}C++ Callbacks (alternative to Lua):${NC}"
+    echo -e "  ${CYAN}set_on_start(void())${NC}                      Runtime started"
+    echo -e "  ${CYAN}set_on_stop(void())${NC}                       Runtime stopped"
+    echo -e "  ${CYAN}set_on_connect(void(int fd))${NC}              Client connected"
+    echo -e "  ${CYAN}set_on_disconnect(void(int fd))${NC}           Client disconnected"
+    echo -e "  ${CYAN}set_on_client_message(void(fd, msg))${NC}      Message from client"
+    echo -e "  ${CYAN}set_on_message(void(msg))${NC}                 Broadcast received"
+    echo -e "  ${CYAN}set_on_tick(void(double dt_ms))${NC}           Periodic tick"
+    echo ""
+
+    echo -e "${BOLD}Common Setters (all runtime types):${NC}"
+    echo -e "  set_port()  set_event_loop()  set_runtime_manager()  set_cache_name()"
+    echo -e "  set_tls()  set_cert_path()  set_key_path()  set_max_connections()"
+    echo -e "  set_rate_limit()  set_idle_timeout()  set_log_file()  set_group()"
+    echo -e "  set_drain()  load_lua_script()  reload_lua_script()"
+    echo ""
+
+    echo -e "${BOLD}Server-Specific:${NC}"
+    echo -e "  set_mode(mode_inout | mode_in | mode_out | mode_master)"
+    echo -e "  lua_broadcast(msg)  lua_send_to(fd, msg)  lua_disconnect(fd)"
+    echo -e "  lua_peer_ip(fd)  lua_clients()  lua_multicast(fds, msg)"
+    echo ""
+
+    echo -e "${BOLD}Cache-Specific:${NC}"
+    echo -e "  set_mode(cache_mode_readonly | readwrite | admin)"
+    echo -e "  set_persistent(path)  set_max_memory(bytes)  set_resp_forced(bool)"
+    echo ""
+
+    echo -e "${BOLD}Proxy-Specific:${NC}"
+    echo -e "  set_protocol(protocol_http | protocol_tcp)"
+    echo -e "  set_strategy(strategy_round_robin | random | lua)"
+    echo -e "  add_backend(addr)  clear_backends()"
+    echo ""
+
+    echo -e "${BOLD}Example — Echo Server:${NC}"
+    echo -e "  ${CYAN}srv->set_on_client_message([srv](int fd, std::string_view msg) {${NC}"
+    echo -e "  ${CYAN}    srv->lua_send_to(fd, msg);  // echo back${NC}"
+    echo -e "  ${CYAN}});${NC}"
+    echo ""
+
+    echo -e "${BOLD}Example — Multi-Runtime (Server + Cache):${NC}"
+    echo -e "  ${CYAN}mgr.create(runtime_cache, \"store\");${NC}"
+    echo -e "  ${CYAN}cache->set_port(6379); cache->set_mode(cache_mode_admin);${NC}"
+    echo -e "  ${CYAN}mgr.create(runtime_server, \"api\");${NC}"
+    echo -e "  ${CYAN}srv->set_port(9000); srv->set_cache_name(\"store\");${NC}"
+    echo -e "  Clients can send 'cache set k v' through the server connection."
+    echo ""
+
+    echo -e "${BOLD}Example — Proxy Load Balancer:${NC}"
+    echo -e "  ${CYAN}mgr.create(runtime_proxy, \"lb\");${NC}"
+    echo -e "  ${CYAN}px->set_protocol(protocol_tcp);${NC}"
+    echo -e "  ${CYAN}px->set_strategy(strategy_round_robin);${NC}"
+    echo -e "  ${CYAN}px->add_backend(\"127.0.0.1:9001\");${NC}"
+    echo -e "  ${CYAN}px->add_backend(\"127.0.0.1:9002\");${NC}"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    sdk_help
+}
+
+sdk_tier3() {
+    show_header
+    echo -e "${BOLD}${YELLOW}=== Tier 3: Daemon Attach (attach.h) ===${NC}\n"
+
+    echo -e "  ${CYAN}#include <socketley/attach.h>${NC}"
+    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Iinclude/linux${NC}"
+    echo -e "  Header-only, zero deps. Builds on control.h."
+    echo ""
+
+    echo -e "${BOLD}What It Does:${NC}"
+    echo -e "  Registers your own process as a runtime in a running daemon."
+    echo -e "  After attaching, your process shows up in:"
+    echo -e "    ${CYAN}socketley ls${NC}     — listed as a managed runtime"
+    echo -e "    ${CYAN}socketley ps${NC}     — shows your PID"
+    echo -e "    ${CYAN}socketley stats${NC}  — queryable"
+    echo ""
+
+    echo -e "${BOLD}API (socketley::):${NC}"
+    echo -e "  ${CYAN}daemon_attach(name, type, port)${NC}  Register, auto-detach on exit()"
+    echo -e "  ${CYAN}daemon_detach(name)${NC}              Explicit deregister by name"
+    echo -e "  ${CYAN}daemon_detach()${NC}                  Deregister the attach'd name"
+    echo ""
+    echo -e "  Returns ${CYAN}true${NC} if daemon is running and registration succeeded,"
+    echo -e "  ${CYAN}false${NC} if daemon is not running (your app still works standalone)."
+    echo ""
+
+    echo -e "${BOLD}Example:${NC}"
+    echo -e "  ${CYAN}#include <socketley/attach.h>${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}int main() {${NC}"
+    echo -e "  ${CYAN}    // start your own TCP server on port 8080...${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}    if (socketley::daemon_attach(\"myservice\", \"server\", 8080))${NC}"
+    echo -e "  ${CYAN}        printf(\"registered with daemon\\n\");${NC}"
+    echo -e "  ${CYAN}    else${NC}"
+    echo -e "  ${CYAN}        printf(\"daemon not running (standalone)\\n\");${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}    // your accept loop here...${NC}"
+    echo -e "  ${CYAN}    // atexit() auto-calls daemon_detach()${NC}"
+    echo -e "  ${CYAN}}${NC}"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    sdk_help
+}
+
+sdk_mixed() {
+    show_header
+    echo -e "${BOLD}${RED}=== Mixed: Engine + Attach (Tier 2 + 3) ===${NC}\n"
+
+    echo -e "${BOLD}The Power Use Case:${NC}"
+    echo -e "  Embed the full engine (Tier 2) for maximum performance — your own"
+    echo -e "  io_uring event loop, zero IPC overhead, direct C++ callbacks."
+    echo -e "  Then register with the daemon (Tier 3) so your runtimes show up in"
+    echo -e "  ${CYAN}socketley ls${NC}, ${CYAN}socketley stats${NC}, and the fleet dashboard."
+    echo ""
+
+    echo -e "${BOLD}Pattern:${NC}"
+    echo -e "  1. Create event_loop + runtime_manager (Tier 2)"
+    echo -e "  2. Create and configure runtimes"
+    echo -e "  3. Start runtimes: ${CYAN}mgr.run(\"name\", loop);${NC}"
+    echo -e "  4. Register with daemon: ${CYAN}socketley::daemon_attach(\"name\", type, port);${NC}"
+    echo -e "  5. Run the loop: ${CYAN}loop.run();${NC}"
+    echo ""
+
+    echo -e "${BOLD}Example:${NC}"
+    echo -e "  ${CYAN}#include <socketley/server.h>${NC}"
+    echo -e "  ${CYAN}#include <socketley/cache.h>${NC}"
+    echo -e "  ${CYAN}#include <socketley/attach.h>${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}// ... create event_loop, runtime_manager, server + cache ...${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}mgr.run(\"app_cache\", loop);${NC}"
+    echo -e "  ${CYAN}mgr.run(\"app_srv\", loop);${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}// Register with daemon${NC}"
+    echo -e "  ${CYAN}socketley::daemon_attach(\"app_srv\", \"server\", 9000);${NC}"
+    echo -e "  ${CYAN}socketley::daemon_attach(\"app_cache\", \"cache\", 6379);${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}loop.run();  // daemon sees both runtimes${NC}"
+    echo ""
+
+    echo -e "${BOLD}Compile:${NC}"
+    echo -e "  ${CYAN}g++ -std=c++23 app.cpp -I. -Iinclude/linux \\"
+    echo -e "      -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto${NC}"
+    echo ""
+
+    echo -e "${BOLD}Verify:${NC}"
+    echo -e "  ${CYAN}socketley ls${NC}         — shows app_srv + app_cache"
+    echo -e "  ${CYAN}socketley stats app_srv${NC}  — query your embedded server"
+    echo -e "  ${CYAN}echo 'set k v' | nc -q1 127.0.0.1 6379${NC}  — talk to embedded cache"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    sdk_help
 }
 
 # Start the interactive help

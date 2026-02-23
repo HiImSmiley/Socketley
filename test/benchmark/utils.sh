@@ -22,6 +22,7 @@ else
     IPC_SOCKET="/tmp/socketley.sock"
     USE_SYSTEMD=0
 fi
+SOCKETLEY_BENCH="${PROJECT_ROOT}/bin/Release/socketley_bench"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
 
@@ -302,6 +303,18 @@ print_table_header() {
 
 print_table_footer() {
     echo "└───────────────────────────┴──────────────┴──────────────┴──────────────┘"
+}
+
+# Ensure socketley-bench binary is compiled
+ensure_socketley_bench() {
+    if [[ ! -x "$SOCKETLEY_BENCH" ]]; then
+        log_info "Building socketley-bench..."
+        (cd "$PROJECT_ROOT" && ./bin/premake5 gmake2 >/dev/null 2>&1 && \
+         cd make && make config=release_x64 socketley_bench -j$(nproc) >/dev/null 2>&1) \
+            || { log_error "Failed to build socketley-bench"; return 1; }
+    fi
+    log_success "socketley-bench found: $SOCKETLEY_BENCH"
+    return 0
 }
 
 # Trap for cleanup on exit
