@@ -12,6 +12,16 @@ I've been programming for over a decade, but this project pushed me into entirel
 
 It's been an amazing journey so far, and I hope others see the same potential in this project that I do. I'll keep building with the same mindset and love I started with.
 
+## What's Included
+
+Beyond the CLI and daemon, there's a lot more in this repository:
+
+- **Web documentation**: A full interactive documentation site lives in the `docs/` folder, covering every runtime type, flag, Lua callback, and addon pattern with working examples.
+- **Man page**: A complete `man socketley` page ships with the `.deb` package and is available in `socketley/man/`. It covers every command, flag, and configuration option.
+- **C++ SDK**: The `include/linux/` directory provides headers (`socketley.h`, `server.h`, `client.h`, `proxy.h`, `cache.h`, etc.) so you can build your own custom C++ runtimes on top of Socketley's io_uring event loop and runtime lifecycle, without going through the CLI at all.
+- **Persistent networks**: Runtime configurations are saved as JSON and automatically restored when the daemon restarts. You can build entire network topologies that survive reboots.
+- **Working examples**: The `examples/` directory has ready-to-run scripts and Lua configs for every use case, from basic echo servers to SQLite-backed caches, auth middleware, reverse proxies, and multi-daemon clusters.
+
 ## Features
 
 - **Server**:TCP/UDP listener with broadcast, WebSocket auto-detection, master mode
