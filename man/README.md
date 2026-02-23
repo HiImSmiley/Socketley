@@ -25,7 +25,7 @@ man ./socketley.1
 
 | Command | Description |
 |---------|-------------|
-| `socketley daemon` | Start the daemon |
+| `socketley daemon` | Start the daemon (systemd-managed when installed) |
 | `socketley create <type> <name>` | Create runtime |
 | `socketley start <name>` | Start runtime |
 | `socketley stop <name>` | Stop runtime |

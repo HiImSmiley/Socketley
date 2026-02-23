@@ -144,14 +144,9 @@ The proxy adds roughly 2 ms median latency on top of the direct path, mostly loo
 
 ## Quick Start
 
+After installing (via `dpkg -i` or `install.sh`), the daemon runs as a systemd service — no manual startup needed:
+
 ```bash
-# Build
-./bin/premake5 gmake2
-cd make && make config=release_x64 -j$(nproc)
-
-# Start daemon
-./bin/Release/socketley daemon &
-
 # Create and start a server
 socketley create server myapp -p 9000 -s
 
@@ -176,7 +171,6 @@ socketley stats myapp
 ## CLI Reference
 
 ```
-socketley daemon [--name <n>] [--cluster <dir>]  # start the daemon
 socketley create <type> <name> [flags]    # types: server, client, proxy, cache
 socketley attach <type> <name> <port>     # register an external process as a runtime
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive

@@ -78,9 +78,10 @@ quick_start() {
     show_header
     echo -e "${BOLD}${YELLOW}═══ Quick Start Guide ═══${NC}\n"
 
-    echo -e "${BOLD}Step 1: Start the Daemon${NC}"
-    echo -e "  ${CYAN}socketley daemon &${NC}"
-    echo "  The daemon must be running for all other commands."
+    echo -e "${BOLD}Step 1: Daemon${NC}"
+    echo "  When installed via package, the daemon runs as a systemd service"
+    echo "  automatically — no manual startup needed."
+    echo -e "  Dev mode: ${CYAN}./bin/Release/socketley daemon &${NC}"
     echo ""
 
     echo -e "${BOLD}Step 2: Create a Server${NC}"
@@ -113,8 +114,10 @@ cli_commands() {
     echo -e "${BOLD}${YELLOW}═══ CLI Commands ═══${NC}\n"
 
     echo -e "${BOLD}daemon${NC}"
-    echo "  Start the socketley daemon (required first)"
-    echo -e "  ${CYAN}socketley daemon${NC}"
+    echo "  Start the daemon. When installed, runs as a systemd service"
+    echo "  automatically. Only needed manually in dev mode or cluster mode."
+    echo -e "  ${CYAN}sudo systemctl start socketley${NC}  # installed"
+    echo -e "  ${CYAN}./bin/Release/socketley daemon &${NC}  # dev mode"
     echo ""
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
@@ -552,10 +555,7 @@ examples_menu() {
 example_basic_server() {
     show_header
     echo -e "${BOLD}${YELLOW}═══ Basic Server Example ═══${NC}\n"
-    echo -e "${CYAN}# Start daemon"
-    echo "socketley daemon &"
-    echo ""
-    echo "# Create and start server"
+    echo -e "${CYAN}# Create and start server (daemon runs via systemd when installed)"
     echo "socketley create server myserver -p 9000 -s"
     echo ""
     echo "# Test with netcat"
@@ -981,8 +981,9 @@ troubleshooting() {
     echo -e "${BOLD}${YELLOW}═══ Troubleshooting ═══${NC}\n"
 
     echo -e "${BOLD}Problem: Commands return \"Connection refused\"${NC}"
-    echo -e "  ${GREEN}Solution:${NC} Start the daemon first"
-    echo -e "  ${CYAN}socketley daemon &${NC}"
+    echo -e "  ${GREEN}Solution:${NC} Ensure the daemon is running"
+    echo -e "  ${CYAN}sudo systemctl start socketley${NC}  # installed"
+    echo -e "  ${CYAN}./bin/Release/socketley daemon &${NC}  # dev mode"
     echo ""
 
     echo -e "${BOLD}Problem: \"Runtime not found\"${NC}"
@@ -1038,8 +1039,8 @@ installation_help() {
     echo ""
 
     echo -e "${BOLD}Build Debian Package:${NC}"
-    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.0${NC}"
-    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.0_amd64.deb${NC}"
+    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.2${NC}"
+    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.2_amd64.deb${NC}"
     echo ""
 
     echo -e "${BOLD}Daemon Configuration (config.lua):${NC}"
