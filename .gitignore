@@ -53,3 +53,4 @@ test/benchmark/results/
 *.deb
 *.rpm
 CLAUDE.md
+CONTRIBUTING.md
