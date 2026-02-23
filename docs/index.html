@@ -1982,7 +1982,7 @@ tick_ms = <span class="nb">2000</span>
 
 <div class="warn-box"><strong>Blocking calls.</strong> <code>redis-lua</code> uses synchronous sockets and blocks the io_uring event loop for the duration of each Redis round-trip. Keep calls in <code>on_start</code>/<code>on_stop</code> or rate-limit how often they fire in <code>on_client_message</code>. For high-frequency paths, batch writes in a local table and flush in <code>on_tick</code>.</div>
 
-<p>Full example: <code>socketley/examples/server/redis-session.lua</code></p>
+<p>Full example: <code>examples/server/redis-session.lua</code></p>
 
 
 <h2 id="addons-session-ids">Session IDs &amp; Tracing</h2>
@@ -2017,7 +2017,7 @@ uuid.seed()
 
 <div class="info-box"><strong>Tip — combine with redis-lua.</strong> Use the UUID as the Redis session store key (<code>r:hset("session:" .. session_ids[client_id], ...)</code>) so the same correlation ID flows from the TCP layer through your Redis session store and into your logs.</div>
 
-<p>Full example: <code>socketley/examples/server/session-ids.lua</code></p>
+<p>Full example: <code>examples/server/session-ids.lua</code></p>
 
 </div><!-- #content-addons -->
 
