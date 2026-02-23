@@ -42,7 +42,7 @@ body {
 /* ===== Sidebar ===== */
 .sidebar {
   width: 280px; min-width: 280px; background: #1a1a2e; color: #e0e0e0;
-  position: fixed; top: 0; left: 0; height: 100vh; overflow-y: auto;
+  position: fixed; top: 0; left: 0; height: 100vh; overflow-y: auto; overflow-x: hidden;
   padding: 24px 0 40px; z-index: 100; transition: transform .3s;
 }
 .sidebar::-webkit-scrollbar { width: 6px; }
@@ -111,6 +111,13 @@ body {
 }
 .sidebar nav > ul > li > ul > li > a:hover { color: #e0e0e0; }
 .sidebar nav > ul > li > ul > li > a.active { color: #4361ee; }
+.sidebar nav > ul > li > ul > li > ul { margin: 0; padding: 0; }
+.sidebar nav > ul > li > ul > li > ul > li > a {
+  display: block; padding: 4px 20px 4px 48px; color: #7878a0; text-decoration: none;
+  font-size: 12px; transition: color .2s;
+}
+.sidebar nav > ul > li > ul > li > ul > li > a:hover { color: #e0e0e0; }
+.sidebar nav > ul > li > ul > li > ul > li > a.active { color: #4361ee; }
 
 /* ===== Mobile Toggle ===== */
 .menu-toggle {

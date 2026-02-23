@@ -323,6 +323,7 @@
         <li><a href="#exsdk-dw-cache-full">Full Cache Operations</a></li>
         <li><a href="#exsdk-dw-server-cache">Server + Cache</a></li>
         <li><a href="#exsdk-dw-monitoring">Monitoring Dashboard</a></li>
+        <li><a href="#exsdk-dw-pubsub">Pub/Sub Callbacks</a></li>
       </ul></li>
       <li><a href="#exsdk-tier2">Tier 2: Embedded Engine</a><ul>
         <li><a href="#exsdk-echo">Echo Server</a></li>
@@ -2272,6 +2273,28 @@ srv-&gt;<span class="fn">set_on_tick</span>([](<span class="kw">double</span> dt
 <p class="method-desc">Publish a message to a channel. All clients subscribed to the channel (via SUBSCRIBE command or Lua <code>socketley.subscribe()</code>) receive the message.</p>
 <p class="method-returns"><strong>Returns:</strong> Number of subscribers that received the message</p>
 </div>
+
+<h5>Receiving Published Messages</h5>
+<p>The <code>publish()</code> method above sends messages. To <strong>receive</strong> them, use one of these approaches:</p>
+
+<table>
+<thead><tr><th>Method</th><th>How</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td>Lua callback</td><td><code>socketley.subscribe(cache_name, channel, fn)</code> in any runtime's Lua script</td><td>Cross-runtime event handling (recommended)</td></tr>
+<tr><td>RESP client</td><td>Connect via TCP, send <code>SUBSCRIBE channel</code>, receive RESP push messages</td><td>External Redis-compatible clients</td></tr>
+<tr><td>Text-mode client</td><td>Connect via TCP, send <code>subscribe channel</code>, receive <code>message &lt;channel&gt; &lt;payload&gt;\n</code></td><td>Simple scripting / netcat</td></tr>
+</tbody>
+</table>
+
+<div class="info-box"><strong>Lua is the primary receive mechanism.</strong> Tier 1 SDK (IPC) cannot receive async push messages &mdash; it's request/response only. Use <code>socketley.subscribe()</code> in a Lua script attached to any runtime to react to published messages. See <a href="#addons-pubsub">Cross-Runtime Pub/Sub</a> for the full API.</div>
+
+<p><strong>Example:</strong> A server that broadcasts cache events to all TCP clients:</p>
+<pre><code><span class="cm">-- notify.lua (attach to a server runtime)</span>
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.<span class="fn">subscribe</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(ch, msg)
+        self.<span class="fn">broadcast</span>(<span class="st">"event: "</span> .. msg)
+    <span class="kw">end</span>)
+<span class="kw">end</span></code></pre>
 
 <h4 id="sdk-t2-cache-mgmt">Management</h4>
 
@@ -5098,6 +5121,62 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
 <p><strong>Compile:</strong></p>
 <pre><code>g++ -std=c++17 dw_monitoring.cpp -Iinclude/linux -o dw_monitoring</code></pre>
 <p><strong>Key concept:</strong> Tier 1 is ideal for orchestration tools. Poll <code>stats()</code> and <code>action ... size/memory</code> to build monitoring dashboards without touching the data path.</p>
+</div>
+
+<div class="method-card" id="exsdk-dw-pubsub">
+<div class="method-header">
+  <span class="method-name">Pub/Sub with Lua Callbacks</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Create a cache and a server with a Lua script that subscribes to cache events. When the C++ driver publishes to the cache, the server's Lua callback fires and broadcasts the message to all connected TCP clients. This is the primary pattern for receiving pub/sub messages from C++.</p>
+
+<p><strong>notify.lua</strong> (save to disk before running):</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.<span class="fn">subscribe</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(ch, msg)
+        socketley.<span class="fn">log</span>(<span class="st">"event on "</span> .. ch .. <span class="st">": "</span> .. msg)
+        self.<span class="fn">broadcast</span>(<span class="st">"EVENT: "</span> .. msg)
+    <span class="kw">end</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    <span class="cm">-- Clients can also trigger publishes</span>
+    socketley.<span class="fn">log</span>(<span class="st">"client "</span> .. id .. <span class="st">" says: "</span> .. msg)
+<span class="kw">end</span></code></pre>
+
+<p><strong>C++ driver:</strong></p>
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create cache + server with Lua subscribe callback</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"store"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"notifier"</span>,
+        <span class="st">"-p 9000 --lua notify.lua -s"</span>);
+
+    <span class="cm">// Publish events &mdash; the server's Lua callback broadcasts them</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="st">"user_signup"</span>);
+    printf(<span class="st">"subscribers: %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="st">"order_placed"</span>);
+    printf(<span class="st">"subscribers: %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    <span class="cm">// Any TCP client connected to port 9000 receives:</span>
+    <span class="cm">//   "EVENT: user_signup"</span>
+    <span class="cm">//   "EVENT: order_placed"</span>
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"notifier"</span>);
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"store"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"notifier"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"store"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_pubsub.cpp -Iinclude/linux -o dw_pubsub</code></pre>
+<p><strong>Key concept:</strong> Tier 1 can publish but not subscribe (IPC is request/response). Use <code>socketley.subscribe()</code> in a Lua script on any runtime to receive messages. The Lua callback fires on the subscribing runtime's event loop &mdash; no polling, no extra TCP connections.</p>
 </div>
 
 <!-- ── Tier 2: Embedded Engine Examples ── -->
