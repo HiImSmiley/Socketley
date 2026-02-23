@@ -288,8 +288,7 @@ bash packaging/build-deb.sh && sudo dpkg -i socketley_*.deb</code></pre>
 <h3 id="gs-first-server">Your First Server</h3>
 <p>Let's build a working server in under a minute. Each step shows what's happening behind the scenes.</p>
 
-<p><strong>1. Start the daemon</strong> (runs in the background, manages all your runtimes):</p>
-<pre><code>socketley daemon &</code></pre>
+<p><strong>1. The daemon is already running.</strong> When installed via package (<code>dpkg -i</code> or <code>install.sh</code>), the daemon runs as a systemd service automatically. No manual startup needed.</p>
 
 <p><strong>2. Create a server called "hello" on port 9000</strong> &mdash; the <code>-s</code> flag starts it immediately:</p>
 <pre><code>socketley create server hello -p 9000 -s</code></pre>
@@ -601,10 +600,13 @@ d4e5f6    my-client       client  -       1     -           Up 45 minutes       
 
 <div class="cli-card" id="cmd-daemon">
   <div class="cli-name">socketley daemon [flags]</div>
-  <div class="cli-desc">Start the background daemon. Usually auto-started on first CLI use, but run explicitly when you need cluster mode or custom logging. Add <code>--name</code> and <code>--cluster</code> for multi-daemon discovery.</div>
+  <div class="cli-desc">Start the background daemon. When installed via package, the daemon runs as a systemd service automatically &mdash; you don't need this command. Use it explicitly for cluster mode, custom logging, or when running from the build directory (development mode).</div>
 </div>
-<pre><code><span class="cm"># Standalone (auto-started, rarely needed)</span>
-socketley daemon &amp;
+<pre><code><span class="cm"># Installed: daemon is managed by systemd (no manual start needed)</span>
+sudo systemctl start socketley
+
+<span class="cm"># Development mode (running from build directory)</span>
+./bin/Release/socketley daemon &amp;
 
 <span class="cm"># Cluster mode with two named daemons sharing a directory</span>
 socketley daemon --name api1 --cluster /shared/cluster &amp;
