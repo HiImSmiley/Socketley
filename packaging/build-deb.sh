@@ -33,6 +33,11 @@ if [ -f "$PROJECT_ROOT/man/socketley.1" ]; then
     cp "$PROJECT_ROOT/man/socketley.1" "$PKG_DIR/usr/share/man/man1/"
 fi
 
+# Help script
+mkdir -p "$PKG_DIR/usr/share/socketley"
+cp "$PROJECT_ROOT/man/socketley-help.sh" "$PKG_DIR/usr/share/socketley/"
+chmod 755 "$PKG_DIR/usr/share/socketley/socketley-help.sh"
+
 # Service file
 cp "$SCRIPT_DIR/socketley.service" "$PKG_DIR/usr/lib/systemd/system/"
 
