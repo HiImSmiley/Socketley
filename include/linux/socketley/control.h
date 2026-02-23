@@ -214,7 +214,7 @@ inline result edit(const std::string& name, const std::string& flags)
     return command("edit " + name + " " + flags);
 }
 
-// ── Cache operations ────────────────────────────────────────────────
+// ── Cache: strings ──────────────────────────────────────────────────
 
 inline result cache_get(const std::string& cache_name, const std::string& key)
 {
@@ -232,10 +232,141 @@ inline result cache_del(const std::string& cache_name, const std::string& key)
     return command("action " + cache_name + " del " + key);
 }
 
+inline result cache_exists(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " exists " + key);
+}
+
+// ── Cache: lists ────────────────────────────────────────────────────
+
+inline result cache_lpush(const std::string& cache_name, const std::string& key,
+                          const std::string& value)
+{
+    return command("action " + cache_name + " lpush " + key + " " + value);
+}
+
+inline result cache_rpush(const std::string& cache_name, const std::string& key,
+                          const std::string& value)
+{
+    return command("action " + cache_name + " rpush " + key + " " + value);
+}
+
+inline result cache_lpop(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " lpop " + key);
+}
+
+inline result cache_rpop(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " rpop " + key);
+}
+
+inline result cache_llen(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " llen " + key);
+}
+
+// ── Cache: sets ─────────────────────────────────────────────────────
+
+inline result cache_sadd(const std::string& cache_name, const std::string& key,
+                         const std::string& member)
+{
+    return command("action " + cache_name + " sadd " + key + " " + member);
+}
+
+inline result cache_srem(const std::string& cache_name, const std::string& key,
+                         const std::string& member)
+{
+    return command("action " + cache_name + " srem " + key + " " + member);
+}
+
+inline result cache_sismember(const std::string& cache_name, const std::string& key,
+                              const std::string& member)
+{
+    return command("action " + cache_name + " sismember " + key + " " + member);
+}
+
+inline result cache_scard(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " scard " + key);
+}
+
+// ── Cache: hashes ───────────────────────────────────────────────────
+
+inline result cache_hset(const std::string& cache_name, const std::string& key,
+                         const std::string& field, const std::string& value)
+{
+    return command("action " + cache_name + " hset " + key + " " + field + " " + value);
+}
+
+inline result cache_hget(const std::string& cache_name, const std::string& key,
+                         const std::string& field)
+{
+    return command("action " + cache_name + " hget " + key + " " + field);
+}
+
+inline result cache_hdel(const std::string& cache_name, const std::string& key,
+                         const std::string& field)
+{
+    return command("action " + cache_name + " hdel " + key + " " + field);
+}
+
+inline result cache_hlen(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " hlen " + key);
+}
+
+// ── Cache: TTL ──────────────────────────────────────────────────────
+
+inline result cache_expire(const std::string& cache_name, const std::string& key,
+                           int seconds)
+{
+    return command("action " + cache_name + " expire " + key + " " + std::to_string(seconds));
+}
+
+inline result cache_ttl(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " ttl " + key);
+}
+
+inline result cache_persist(const std::string& cache_name, const std::string& key)
+{
+    return command("action " + cache_name + " persist " + key);
+}
+
+// ── Cache: pub/sub ──────────────────────────────────────────────────
+
+inline result cache_publish(const std::string& cache_name, const std::string& channel,
+                            const std::string& message)
+{
+    return command("action " + cache_name + " publish " + channel + " " + message);
+}
+
+// ── Cache: admin ────────────────────────────────────────────────────
+
+inline result cache_size(const std::string& cache_name)
+{
+    return command("action " + cache_name + " size");
+}
+
+inline result cache_memory(const std::string& cache_name)
+{
+    return command("action " + cache_name + " memory");
+}
+
 inline result cache_flush(const std::string& cache_name,
                           const std::string& path = "")
 {
     std::string cmd = "action " + cache_name + " flush";
+    if (!path.empty())
+        cmd += " " + path;
+    return command(cmd);
+}
+
+inline result cache_load(const std::string& cache_name,
+                         const std::string& path = "")
+{
+    std::string cmd = "action " + cache_name + " load";
     if (!path.empty())
         cmd += " " + path;
     return command(cmd);
