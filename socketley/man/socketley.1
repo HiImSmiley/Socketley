@@ -3,7 +3,7 @@
 .\"
 .TH SOCKETLEY 1 "2026" "socketley" "User Commands"
 .SH NAME
-socketley \- manage long-living network runtimes in Docker-like style
+socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches) in Docker-like style
 .SH SYNOPSIS
 .B socketley
 .I command
@@ -79,11 +79,9 @@ socketley \- manage long-living network runtimes in Docker-like style
 .I lua_file
 .SH DESCRIPTION
 .B socketley
-is a Linux-only central daemon and CLI tool for managing persistent network
-runtimes (server, client, proxy, cache). It provides Docker-like management
-with persistent configurations, simple CLI, and Lua scripting support.
-All runtimes are managed centrally through a single daemon process, using
-io_uring for high-performance async I/O.
+is a high-performance Linux daemon and CLI that manages network runtimes
+(servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
+with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
 .SH COMMANDS
 .TP
 .B daemon
