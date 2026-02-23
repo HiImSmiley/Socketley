@@ -248,7 +248,7 @@ end
 socketley create cache mydb -p 9000 --lua sqlite-backend.lua -s
 ```
 
-See [`socketley/examples/cache/db-backend.lua`](socketley/examples/cache/db-backend.lua) for MySQL and PostgreSQL examples.
+See [`examples/cache/db-backend.lua`](examples/cache/db-backend.lua) for MySQL and PostgreSQL examples.
 
 ## Testing
 
