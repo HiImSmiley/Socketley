@@ -1120,10 +1120,6 @@ sdk_help() {
     echo -e "      -luring -lssl -lcrypto -lluajit-5.1${NC}"
     echo ""
 
-    echo -e "${BOLD}Regenerate from source:${NC}"
-    echo -e "  ${CYAN}bash tools/amalgamate.sh${NC}"
-    echo ""
-
     read -p "Press Enter to continue..."
     main_menu
 }
