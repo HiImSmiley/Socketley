@@ -1293,6 +1293,38 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 <p class="method-desc">Check if a key exists. Returns <code>"1"</code> or <code>"0"</code> in data.</p>
 </div>
 
+<div class="method-card" id="sdk-ctl-cache-incr">
+<div class="method-header">
+  <span class="method-name">cache_incr / cache_decr</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_incr(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-sig">result cache_decr(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Increment or decrement a numeric string value by 1. Creates the key with value <code>"1"</code> or <code>"-1"</code> if it doesn't exist.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-incrby">
+<div class="method-header">
+  <span class="method-name">cache_incrby / cache_decrby</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_incrby(const std::string&amp; cache_name, const std::string&amp; key, int delta)</p>
+<p class="method-sig">result cache_decrby(const std::string&amp; cache_name, const std::string&amp; key, int delta)</p>
+<p class="method-desc">Increment or decrement a numeric string value by a given amount.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-append">
+<div class="method-header">
+  <span class="method-name">cache_append</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_append(const std::string&amp; cache_name, const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-desc">Append a string to an existing value. Returns the new length. Creates the key if it doesn't exist.</p>
+</div>
+
 <h4>Lists</h4>
 
 <div class="method-card" id="sdk-ctl-cache-lpush">
@@ -1325,6 +1357,26 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 </div>
 <p class="method-sig">result cache_llen(const std::string&amp; cache_name, const std::string&amp; key)</p>
 <p class="method-desc">Get the length of a list. Returns count in data.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-lrange">
+<div class="method-header">
+  <span class="method-name">cache_lrange</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_lrange(const std::string&amp; cache_name, const std::string&amp; key, int start, int stop)</p>
+<p class="method-desc">Get a range of elements from a list. Supports negative indices (<code>-1</code> = last element). Returns newline-separated values.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-lindex">
+<div class="method-header">
+  <span class="method-name">cache_lindex</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_lindex(const std::string&amp; cache_name, const std::string&amp; key, int index)</p>
+<p class="method-desc">Get an element by index. Supports negative indices. Returns <code>"nil"</code> if out of range.</p>
 </div>
 
 <h4>Sets</h4>
@@ -1369,6 +1421,16 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 <p class="method-desc">Get the number of members in a set.</p>
 </div>
 
+<div class="method-card" id="sdk-ctl-cache-smembers">
+<div class="method-header">
+  <span class="method-name">cache_smembers</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_smembers(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get all members of a set. Returns newline-separated members.</p>
+</div>
+
 <h4>Hashes</h4>
 
 <div class="method-card" id="sdk-ctl-cache-hset">
@@ -1409,6 +1471,16 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 </div>
 <p class="method-sig">result cache_hlen(const std::string&amp; cache_name, const std::string&amp; key)</p>
 <p class="method-desc">Get the number of fields in a hash.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-hgetall">
+<div class="method-header">
+  <span class="method-name">cache_hgetall</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_hgetall(const std::string&amp; cache_name, const std::string&amp; key)</p>
+<p class="method-desc">Get all fields and values from a hash. Returns alternating field/value pairs, newline-separated.</p>
 </div>
 
 <h4>TTL</h4>
@@ -1497,6 +1569,16 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 <p class="method-desc">Load cache snapshot from disk. Requires admin mode.</p>
 </div>
 
+<div class="method-card" id="sdk-ctl-cache-keys">
+<div class="method-header">
+  <span class="method-name">cache_keys</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_keys(const std::string&amp; cache_name, const std::string&amp; pattern = "*")</p>
+<p class="method-desc">Get all keys matching a glob pattern. Returns newline-separated key names.</p>
+</div>
+
 <h3 id="sdk-t1-action">Action Commands</h3>
 <p>All <code>cache_*</code> functions above are convenience wrappers around <code>action</code> subcommands. You can also call them directly via <code>command()</code> for maximum flexibility:</p>
 <pre><code><span class="cm">// These two are equivalent:</span>
@@ -1512,6 +1594,11 @@ socketley::ctl::<span class="fn">command</span>(<span class="st">"action store l
 <tr><td><code>set</code></td><td><code>action &lt;name&gt; set &lt;key&gt; &lt;value&gt;</code></td><td><code>"ok"</code></td></tr>
 <tr><td><code>del</code></td><td><code>action &lt;name&gt; del &lt;key&gt;</code></td><td><code>"ok"</code> or <code>"nil"</code></td></tr>
 <tr><td><code>exists</code></td><td><code>action &lt;name&gt; exists &lt;key&gt;</code></td><td><code>"1"</code> or <code>"0"</code></td></tr>
+<tr><td><code>incr</code></td><td><code>action &lt;name&gt; incr &lt;key&gt;</code></td><td>New value</td></tr>
+<tr><td><code>decr</code></td><td><code>action &lt;name&gt; decr &lt;key&gt;</code></td><td>New value</td></tr>
+<tr><td><code>incrby</code></td><td><code>action &lt;name&gt; incrby &lt;key&gt; &lt;delta&gt;</code></td><td>New value</td></tr>
+<tr><td><code>decrby</code></td><td><code>action &lt;name&gt; decrby &lt;key&gt; &lt;delta&gt;</code></td><td>New value</td></tr>
+<tr><td><code>append</code></td><td><code>action &lt;name&gt; append &lt;key&gt; &lt;value&gt;</code></td><td>New length</td></tr>
 </tbody>
 </table>
 
@@ -1524,6 +1611,8 @@ socketley::ctl::<span class="fn">command</span>(<span class="st">"action store l
 <tr><td><code>lpop</code></td><td><code>action &lt;name&gt; lpop &lt;key&gt;</code></td><td>Value or <code>"nil"</code></td></tr>
 <tr><td><code>rpop</code></td><td><code>action &lt;name&gt; rpop &lt;key&gt;</code></td><td>Value or <code>"nil"</code></td></tr>
 <tr><td><code>llen</code></td><td><code>action &lt;name&gt; llen &lt;key&gt;</code></td><td>Count</td></tr>
+<tr><td><code>lrange</code></td><td><code>action &lt;name&gt; lrange &lt;key&gt; &lt;start&gt; &lt;stop&gt;</code></td><td>Newline-separated values</td></tr>
+<tr><td><code>lindex</code></td><td><code>action &lt;name&gt; lindex &lt;key&gt; &lt;index&gt;</code></td><td>Value or <code>"nil"</code></td></tr>
 </tbody>
 </table>
 
@@ -1535,6 +1624,7 @@ socketley::ctl::<span class="fn">command</span>(<span class="st">"action store l
 <tr><td><code>srem</code></td><td><code>action &lt;name&gt; srem &lt;key&gt; &lt;member&gt;</code></td><td><code>"1"</code> or <code>"0"</code></td></tr>
 <tr><td><code>sismember</code></td><td><code>action &lt;name&gt; sismember &lt;key&gt; &lt;member&gt;</code></td><td><code>"1"</code> or <code>"0"</code></td></tr>
 <tr><td><code>scard</code></td><td><code>action &lt;name&gt; scard &lt;key&gt;</code></td><td>Count</td></tr>
+<tr><td><code>smembers</code></td><td><code>action &lt;name&gt; smembers &lt;key&gt;</code></td><td>Newline-separated members</td></tr>
 </tbody>
 </table>
 
@@ -1546,6 +1636,7 @@ socketley::ctl::<span class="fn">command</span>(<span class="st">"action store l
 <tr><td><code>hget</code></td><td><code>action &lt;name&gt; hget &lt;key&gt; &lt;field&gt;</code></td><td>Value or <code>"nil"</code></td></tr>
 <tr><td><code>hdel</code></td><td><code>action &lt;name&gt; hdel &lt;key&gt; &lt;field&gt;</code></td><td><code>"1"</code> or <code>"0"</code></td></tr>
 <tr><td><code>hlen</code></td><td><code>action &lt;name&gt; hlen &lt;key&gt;</code></td><td>Count</td></tr>
+<tr><td><code>hgetall</code></td><td><code>action &lt;name&gt; hgetall &lt;key&gt;</code></td><td>Alternating field/value, newline-separated</td></tr>
 </tbody>
 </table>
 
@@ -1575,6 +1666,9 @@ socketley::ctl::<span class="fn">command</span>(<span class="st">"action store l
 <tr><td><code>memory</code></td><td><code>action &lt;name&gt; memory</code></td><td><code>"max_memory used_memory"</code></td></tr>
 <tr><td><code>flush</code></td><td><code>action &lt;name&gt; flush [path]</code></td><td><code>"ok"</code> (requires admin mode)</td></tr>
 <tr><td><code>load</code></td><td><code>action &lt;name&gt; load [path]</code></td><td><code>"ok"</code> (requires admin mode)</td></tr>
+<tr><td><code>keys</code></td><td><code>action &lt;name&gt; keys [pattern]</code></td><td>Newline-separated key names</td></tr>
+<tr><td><code>mget</code></td><td><code>action &lt;name&gt; mget &lt;key1&gt; [key2] ...</code></td><td>Newline-separated values</td></tr>
+<tr><td><code>mset</code></td><td><code>action &lt;name&gt; mset &lt;k1&gt; &lt;v1&gt; [k2] [v2] ...</code></td><td><code>"ok"</code></td></tr>
 </tbody>
 </table>
 
@@ -1932,6 +2026,8 @@ srv-&gt;<span class="fn">set_on_tick</span>([](<span class="kw">double</span> dt
 <tr><td><code>set_udp(bool)</code></td><td>Enable UDP datagram mode</td></tr>
 <tr><td><code>set_http_dir(string_view)</code></td><td>Serve static files from directory (enables HTTP mode)</td></tr>
 <tr><td><code>set_http_cache(bool)</code></td><td>Cache file contents in memory</td></tr>
+<tr><td><code>set_master_pw(string_view)</code></td><td>Set password for master/replica authentication</td></tr>
+<tr><td><code>set_master_forward(bool)</code></td><td>Enable forwarding writes to master in replica mode</td></tr>
 </tbody>
 </table>
 

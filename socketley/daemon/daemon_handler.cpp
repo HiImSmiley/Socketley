@@ -1422,6 +1422,190 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
             }
             return 0;
         }
+
+        // ─── String arithmetic actions (via execute()) ───
+
+        case fnv1a("incr"):
+        case fnv1a("decr"):
+        case fnv1a("append"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = std::string(action) + " is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 4)
+            {
+                conn->write_buf = "usage: <cache> " + std::string(action) + " <key> [value]\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+        case fnv1a("incrby"):
+        case fnv1a("decrby"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = std::string(action) + " is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 5)
+            {
+                conn->write_buf = "usage: <cache> " + std::string(action) + " <key> <delta>\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+
+        // ─── List range/index actions (via execute()) ───
+
+        case fnv1a("lrange"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "lrange is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 6)
+            {
+                conn->write_buf = "usage: <cache> lrange <key> <start> <stop>\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+        case fnv1a("lindex"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "lindex is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 5)
+            {
+                conn->write_buf = "usage: <cache> lindex <key> <index>\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+
+        // ─── Set enumeration (via execute()) ───
+
+        case fnv1a("smembers"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "smembers is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 4)
+            {
+                conn->write_buf = "usage: <cache> smembers <key>\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+
+        // ─── Hash enumeration (via execute()) ───
+
+        case fnv1a("hgetall"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "hgetall is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 4)
+            {
+                conn->write_buf = "usage: <cache> hgetall <key>\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+
+        // ─── Multi-key actions (via execute()) ───
+
+        case fnv1a("keys"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "keys is only valid for cache runtimes\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+        case fnv1a("mget"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "mget is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 4)
+            {
+                conn->write_buf = "usage: <cache> mget <key1> [key2] ...\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
+        case fnv1a("mset"):
+        {
+            if (type != runtime_cache)
+            {
+                conn->write_buf = "mset is only valid for cache runtimes\n";
+                return 1;
+            }
+            if (pa.count < 6)
+            {
+                conn->write_buf = "usage: <cache> mset <key1> <val1> [key2] [val2] ...\n";
+                return 1;
+            }
+            auto* cache = static_cast<cache_instance*>(instance);
+            std::string cmd(pa.rest_from(2));
+            conn->write_buf = cache->execute(cmd);
+            if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+                conn->write_buf += '\n';
+            return 0;
+        }
         default:
             conn->write_buf = "unknown action: " + std::string(action) + "\n";
             return 1;
