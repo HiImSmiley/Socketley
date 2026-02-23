@@ -102,6 +102,31 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("--lua"):
             return cli_config(argc, argv);
 
+        case fnv1a("help"):
+        case fnv1a("--help"):
+        case fnv1a("-h"):
+        {
+            // Try system install path first, then relative to binary
+            std::string help_script = "/usr/share/socketley/socketley-help.sh";
+            if (access(help_script.c_str(), R_OK) != 0)
+            {
+                char self_exe[4096];
+                ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+                if (len > 0)
+                {
+                    self_exe[len] = '\0';
+                    auto bin_dir = std::filesystem::path(self_exe).parent_path().parent_path().parent_path();
+                    help_script = (bin_dir / "man" / "socketley-help.sh").string();
+                }
+            }
+            if (access(help_script.c_str(), R_OK) != 0)
+            {
+                std::cerr << "help script not found\n";
+                return 1;
+            }
+            return system(("bash " + help_script).c_str());
+        }
+
         default:
             break;
     }
