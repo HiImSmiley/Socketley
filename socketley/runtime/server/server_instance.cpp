@@ -247,6 +247,34 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     if (url_path == "/")
         url_path = "/index.html";
 
+    // Percent-decode the path to catch %2e%2e → .. traversal
+    auto percent_decode = [](std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++)
+        {
+            if (s[i] == '%' && i + 2 < s.size())
+            {
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                int h = hex(s[i+1]), l = hex(s[i+2]);
+                if (h >= 0 && l >= 0)
+                {
+                    out += static_cast<char>((h << 4) | l);
+                    i += 2;
+                    continue;
+                }
+            }
+            out += s[i];
+        }
+        s = std::move(out);
+    };
+    percent_decode(url_path);
+
     // Security: reject path traversal and null bytes
     if (url_path.find("..") != std::string::npos ||
         url_path.find('\0') != std::string::npos)
@@ -447,6 +475,14 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -522,6 +558,7 @@ void server_instance::teardown(event_loop& loop)
     // Do NOT call m_clients.clear() here.  The server_connection objects must
     // stay alive until the server_instance itself is destroyed (see setup() for
     // when they are freed on a restart, or the destructor for the remove case).
+    m_idle_sweep_req.owner = nullptr;
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
@@ -578,6 +615,33 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             else
                 handle_write(cqe, req);
             break;
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -589,6 +653,13 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (client_fd >= 0)
     {
+        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+        if (client_fd >= MAX_FDS)
+        {
+            close(client_fd);
+            goto resubmit_accept;
+        }
+
         // Max connections check
         if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
         {
@@ -610,6 +681,8 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         if (client_fd < MAX_FDS)
             m_conn_idx[client_fd] = ptr;
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
         if (m_clients.size() > m_stat_peak_connections)
             m_stat_peak_connections = static_cast<uint32_t>(m_clients.size());
@@ -621,6 +694,29 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_max = rl;
             ptr->rl_tokens = rl;
             ptr->rl_last = std::chrono::steady_clock::now();
+        }
+
+        // Check per-IP auth failure rate (master mode only)
+        if (!m_master_pw.empty())
+        {
+            uint32_t ip = m_accept_addr.sin_addr.s_addr;
+            auto it = m_auth_ip_failures.find(ip);
+            if (it != m_auth_ip_failures.end())
+            {
+                auto elapsed = std::chrono::steady_clock::now() - it->second.last_failure;
+                if (elapsed > std::chrono::seconds(60))
+                {
+                    m_auth_ip_failures.erase(it);
+                }
+                else if (it->second.failures >= 10)
+                {
+                    if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
+                    m_clients.erase(client_fd);
+                    shutdown(client_fd, SHUT_RDWR);
+                    close(client_fd);
+                    goto resubmit_accept;
+                }
+            }
         }
 
         // on_auth fires before on_connect; a rejected client never triggers on_connect
@@ -640,6 +736,16 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 resubmit_accept:
@@ -710,6 +816,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    conn->last_activity = std::chrono::steady_clock::now();
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     if (is_provided)
@@ -728,6 +835,12 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->partial.append(conn->read_buf, cqe->res);
     }
 
+    if (conn->partial.size() > server_connection::MAX_PARTIAL_SIZE)
+    {
+        conn->closing = true;
+        goto submit_next_read;
+    }
+
     // WebSocket auto-detection
     if (conn->ws == ws_unknown)
     {
@@ -744,7 +857,15 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     {
         auto hdr_end = conn->partial.find("\r\n\r\n");
         if (hdr_end == std::string::npos)
+        {
+            // Reject oversized upgrade requests (belt-and-suspenders for F1 partial limit)
+            if (conn->partial.size() > 16384)
+            {
+                conn->closing = true;
+                goto submit_next_read;
+            }
             goto submit_next_read; // Incomplete headers
+        }
 
         // Single-pass header scan: find Upgrade + Sec-WebSocket-Key without allocation
         {
@@ -941,18 +1062,14 @@ submit_next_read:
 // Constant-time string compare to prevent timing attacks on password
 static bool constant_time_eq(std::string_view a, std::string_view b)
 {
-    if (a.size() != b.size())
+    volatile uint8_t diff = static_cast<uint8_t>(a.size() != b.size());
+    size_t max_len = std::max(a.size(), b.size());
+    for (size_t i = 0; i < max_len; i++)
     {
-        // Still do work proportional to max size to avoid length leak
-        volatile uint8_t dummy = 0;
-        for (size_t i = 0; i < std::max(a.size(), b.size()); i++)
-            dummy |= 0;
-        (void)dummy;
-        return false;
+        uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
+        uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
+        diff |= ca ^ cb;
     }
-    volatile uint8_t diff = 0;
-    for (size_t i = 0; i < a.size(); i++)
-        diff |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
     return diff == 0;
 }
 
@@ -979,8 +1096,12 @@ static bool check_rate_limit(server_connection* conn)
 
 void server_instance::process_message(server_connection* sender, std::string_view msg)
 {
-    // Rate limit check
+    // Rate limit check (per-connection)
     if (sender && !check_rate_limit(sender))
+        return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
         return;
 
     // Check if this client is routed to a sub-server
@@ -1126,6 +1247,19 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 else
                 {
                     sender->auth_failures++;
+
+                    // Record per-IP failure
+                    {
+                        struct sockaddr_in peer_addr{};
+                        socklen_t peer_len = sizeof(peer_addr);
+                        if (getpeername(sender->fd, reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_len) == 0)
+                        {
+                            auto& rec = m_auth_ip_failures[peer_addr.sin_addr.s_addr];
+                            rec.failures++;
+                            rec.last_failure = std::chrono::steady_clock::now();
+                        }
+                    }
+
                     auto deny_msg = std::make_shared<const std::string>("master: denied\n");
                     send_to(sender, deny_msg);
                 }
@@ -1221,6 +1355,12 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
     {
         if (fd == exclude_fd || conn->closing)
             continue;
+
+        if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+        {
+            conn->closing = true;
+            continue;
+        }
 
         if (conn->ws == ws_active)
         {
@@ -1370,8 +1510,14 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
         return;
     }
 
-    // Register peer if new
-    find_or_add_peer(m_udp_recv_addr);
+    // Register peer if new; skip processing if peer list is full
+    if (find_or_add_peer(m_udp_recv_addr) < 0)
+    {
+        m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
+        if (m_loop && m_udp_fd >= 0)
+            m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+        return;
+    }
 
     // Extract message — whole datagram = one message
     std::string_view msg(m_udp_recv_buf, static_cast<size_t>(cqe->res));
@@ -1630,6 +1776,9 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
             m_udp_peers[i].addr.sin_port == addr.sin_port)
             return static_cast<int>(i);
     }
+
+    if (m_udp_peers.size() >= MAX_UDP_PEERS)
+        return -1;
 
     m_udp_peers.push_back({addr});
     return static_cast<int>(m_udp_peers.size() - 1);

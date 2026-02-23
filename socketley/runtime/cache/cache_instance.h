@@ -16,6 +16,7 @@ struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
     io_request read_req;
@@ -42,6 +43,9 @@ struct client_connection
     double rl_tokens{0.0};
     double rl_max{0.0};
     std::chrono::steady_clock::time_point rl_last{};
+
+    // Idle connection tracking
+    std::chrono::steady_clock::time_point last_activity{};
 };
 
 enum cache_mode : uint8_t
@@ -192,6 +196,15 @@ private:
     client_connection* m_conn_idx[MAX_FDS]{};
 
     event_loop* m_loop;
+
+    // EMFILE/ENFILE accept backoff
+    io_request m_accept_backoff_req{};
+    struct __kernel_timespec m_accept_backoff_ts{};
+
+    // Idle connection sweep timer
+    io_request m_idle_sweep_req{};
+    struct __kernel_timespec m_idle_sweep_ts{};
+
     std::string m_persistent_path;
     cache_mode m_mode = cache_mode_readwrite;
     bool m_resp_forced{false};

@@ -131,6 +131,14 @@ bool cache_instance::setup(event_loop& loop)
     m_ttl_req = {op_timeout, -1, nullptr, 0, this};
     loop.submit_timeout(&m_ttl_ts, &m_ttl_req);
 
+    if (get_idle_timeout() > 0)
+    {
+        m_idle_sweep_ts.tv_sec = 30;
+        m_idle_sweep_ts.tv_nsec = 0;
+        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
     return true;
 }
 
@@ -188,6 +196,7 @@ void cache_instance::teardown(event_loop& loop)
     m_follower_fds.clear();
 
     m_ttl_req.owner = nullptr;
+    m_idle_sweep_req.owner = nullptr;
     m_loop = nullptr;
     m_multishot_active = false;
 }
@@ -239,6 +248,33 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_writev:
             handle_write(cqe, req);
             break;
+        case op_timeout:
+            if (req == &m_idle_sweep_req)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto timeout = std::chrono::seconds(get_idle_timeout());
+                for (auto& [cfd, cconn] : m_clients)
+                {
+                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                    }
+                }
+                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Accept backoff expired — resubmit accept
+            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            {
+                if (m_multishot_active)
+                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                else
+                {
+                    m_accept_addrlen = sizeof(m_accept_addr);
+                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -250,6 +286,13 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (client_fd >= 0)
     {
+        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+        if (client_fd >= MAX_FDS)
+        {
+            close(client_fd);
+            goto cache_resubmit_accept;
+        }
+
         if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
         {
             close(client_fd);
@@ -282,11 +325,23 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_last = std::chrono::steady_clock::now();
         }
 
+        ptr->last_activity = std::chrono::steady_clock::now();
+
         ptr->read_pending = true;
         if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    }
+
+    // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
+    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    {
+        m_accept_backoff_ts.tv_sec = 0;
+        m_accept_backoff_ts.tv_nsec = 100000000LL;
+        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        return;
     }
 
 cache_resubmit_accept:
@@ -350,6 +405,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    conn->last_activity = std::chrono::steady_clock::now();
+
     if (is_provided)
     {
         uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
@@ -363,6 +420,12 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     else
     {
         conn->partial.append(conn->read_buf, cqe->res);
+    }
+
+    if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
+    {
+        conn->closing = true;
+        return;
     }
 
     // Auto-detect RESP mode on first data
@@ -486,6 +549,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 {
     if (line.empty())
         return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
+    {
+        conn->response_buf.append("error: rate limited\n", 20);
+        return;
+    }
 
     // Rate limit check
     if (conn->rl_max > 0)
@@ -1350,7 +1420,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = args.empty() ? std::string_view(m_persistent_path) : args;
+            std::string_view path = m_persistent_path;
             if (path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
@@ -1366,7 +1436,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = args.empty() ? std::string_view(m_persistent_path) : args;
+            std::string_view path = m_persistent_path;
             if (path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
@@ -1787,6 +1857,13 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 {
     if (argc == 0)
         return;
+
+    // Global rate limit check (across all connections)
+    if (!check_global_rate_limit())
+    {
+        resp::encode_error_into(conn->response_buf, "rate limited");
+        return;
+    }
 
     // Rate limit check
     if (conn->rl_max > 0)
@@ -2514,6 +2591,12 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             auto* sub_conn = m_conn_idx[fd];
             if (sub_conn->closing)
                 continue;
+
+            if (sub_conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE)
+            {
+                sub_conn->closing = true;
+                continue;
+            }
 
             sub_conn->write_queue.push(*shared_msg);
             if (!sub_conn->write_pending)
