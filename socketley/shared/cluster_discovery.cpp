@@ -19,7 +19,7 @@ namespace fs = std::filesystem;
 
 // ─── Minimal JSON helpers (local to this TU) ───
 
-namespace {
+namespace cd_detail {
 
 std::string json_escape(std::string_view s)
 {
@@ -145,7 +145,7 @@ const char* state_str(runtime_state s)
     }
 }
 
-} // namespace
+} // namespace cd_detail
 
 // ─── cluster_discovery implementation ───
 
@@ -170,6 +170,7 @@ cluster_discovery::~cluster_discovery()
 
 bool cluster_discovery::start(event_loop& loop)
 {
+    using namespace cd_detail;
     m_loop = &loop;
 
     // Ensure cluster directory exists
@@ -240,6 +241,7 @@ void cluster_discovery::schedule_timer()
 
 std::string cluster_discovery::build_publish_json() const
 {
+    using namespace cd_detail;
     std::string json;
     json.reserve(1024);
 
@@ -497,6 +499,7 @@ void cluster_discovery::unpublish()
 
 bool cluster_discovery::parse_daemon_json(const std::string& json, remote_daemon& out) const
 {
+    using namespace cd_detail;
     out.name = json_get_string(json, "daemon");
     out.host = json_get_string(json, "host");
     out.heartbeat = static_cast<time_t>(json_get_number(json, "heartbeat"));

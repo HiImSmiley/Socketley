@@ -54,6 +54,7 @@ main_menu() {
     echo -e "  ${GREEN}7)${NC} Architecture Overview"
     echo -e "  ${GREEN}8)${NC} Troubleshooting"
     echo -e "  ${GREEN}9)${NC} Installation & Packaging"
+    echo -e "  ${GREEN}10)${NC} Single-Header SDK"
     echo ""
     echo -e "  ${RED}q)${NC} Quit"
     echo ""
@@ -68,6 +69,7 @@ main_menu() {
         7) architecture ;;
         8) troubleshooting ;;
         9) installation_help ;;
+        10) sdk_help ;;
         q|Q) exit 0 ;;
         *) main_menu ;;
     esac
@@ -1075,6 +1077,49 @@ installation_help() {
 
     echo -e "${BOLD}Uninstall:${NC}"
     echo -e "  ${CYAN}sudo bash packaging/uninstall.sh${NC}"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    main_menu
+}
+
+# Single-Header SDK
+sdk_help() {
+    show_header
+    echo -e "${BOLD}${YELLOW}=== Single-Header SDK ===${NC}\n"
+
+    echo -e "${BOLD}Overview:${NC}"
+    echo -e "  include/linux/socketley.h is a self-contained stb-style header."
+    echo -e "  Drop it into your project — no other source files needed."
+    echo ""
+
+    echo -e "${BOLD}Usage:${NC}"
+    echo -e "  ${CYAN}// In exactly ONE .cpp file:"
+    echo -e "  #define SOCKETLEY_IMPLEMENTATION"
+    echo -e "  #include \"socketley.h\""
+    echo -e ""
+    echo -e "  // In all other files:"
+    echo -e "  #include \"socketley.h\"${NC}"
+    echo ""
+
+    echo -e "${BOLD}Optional Defines:${NC}"
+    echo -e "  ${CYAN}SOCKETLEY_NO_LUA${NC}    Disable Lua/sol2 (no -lluajit needed)"
+    echo -e "  ${CYAN}SOCKETLEY_NO_HTTPS${NC}  Disable HTTP client in Lua"
+    echo ""
+
+    echo -e "${BOLD}Compile (without Lua):${NC}"
+    echo -e "  ${CYAN}g++ -std=c++23 -DSOCKETLEY_NO_LUA -DSOCKETLEY_IMPLEMENTATION \\"
+    echo -e "      app.cpp -Iinclude/linux -luring -lssl -lcrypto${NC}"
+    echo ""
+
+    echo -e "${BOLD}Compile (with Lua):${NC}"
+    echo -e "  ${CYAN}g++ -std=c++23 -DSOCKETLEY_IMPLEMENTATION \\"
+    echo -e "      app.cpp -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \\"
+    echo -e "      -luring -lssl -lcrypto -lluajit-5.1${NC}"
+    echo ""
+
+    echo -e "${BOLD}Regenerate from source:${NC}"
+    echo -e "  ${CYAN}bash tools/amalgamate.sh${NC}"
     echo ""
 
     read -p "Press Enter to continue..."
