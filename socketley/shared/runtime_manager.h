@@ -46,7 +46,7 @@ public:
                                             runtime_string_hash, runtime_string_equal>;
 
     bool create(runtime_type type, std::string_view name);
-    bool run(std::string_view name, event_loop& loop);
+    bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
     bool remove(std::string_view name);
     // Like remove(), but returns ownership so the caller controls when destruction happens.

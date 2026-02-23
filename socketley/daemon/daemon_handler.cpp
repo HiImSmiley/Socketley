@@ -406,7 +406,7 @@ int daemon_handler::cmd_create(const parsed_args& pa)
 
     if (autostart && !instance->get_test_mode())
     {
-        if (!m_manager.run(name, m_loop))
+        if (!m_manager.start(name, m_loop))
         {
             std::cout << "could not start runtime\n";
             m_manager.remove(name);
@@ -463,7 +463,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
 
         if (!already_running)
         {
-            if (!m_manager.run(n, m_loop))
+            if (!m_manager.start(n, m_loop))
             {
                 conn->write_buf += "failed to start: " + std::string(n) + "\n";
                 ++failed;
@@ -1760,7 +1760,7 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         if (!inst || inst->get_state() != runtime_running)
             continue;
         m_manager.stop(n, m_loop);
-        if (m_manager.run(n, m_loop) && m_persistence)
+        if (m_manager.start(n, m_loop) && m_persistence)
             m_persistence->set_was_running(n, true);
     }
     return 0;
@@ -1864,10 +1864,10 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Mark as external — must come before run() so start() skips io_uring setup
+    // Mark as external — must come before start() so it skips io_uring setup
     inst->mark_external();
 
-    if (!m_manager.run(name, m_loop))
+    if (!m_manager.start(name, m_loop))
     {
         conn->write_buf = "could not register external runtime\n";
         m_manager.remove(name);

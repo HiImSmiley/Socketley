@@ -230,7 +230,7 @@ static void restore_runtimes(state_persistence& persistence,
         if (!cfg.was_running)
             continue;
 
-        if (!manager.run(cfg.name, loop))
+        if (!manager.start(cfg.name, loop))
             LOG_WARN("restore: could not start runtime");
         else
             LOG_DEBUG("restored runtime");

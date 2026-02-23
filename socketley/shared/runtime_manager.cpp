@@ -31,7 +31,7 @@ bool runtime_manager::create(runtime_type type, std::string_view name)
     return true;
 }
 
-bool runtime_manager::run(std::string_view name, event_loop& loop)
+bool runtime_manager::start(std::string_view name, event_loop& loop)
 {
     std::shared_lock lock(mutex);
 

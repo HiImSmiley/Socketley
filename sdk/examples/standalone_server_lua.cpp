@@ -73,7 +73,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (!manager.run("srv", loop))
+    if (!manager.start("srv", loop))
     {
         fprintf(stderr, "start failed\n");
         return 1;
