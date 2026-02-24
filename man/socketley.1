@@ -1932,6 +1932,175 @@ Headers:
 .B socketley/proxy.h ,
 .B socketley/cache.h .
 .PP
+Define
+.B SOCKETLEY_NO_LUA
+to build without LuaJIT (omit
+.B -lluajit
+from link flags).
+.PP
+.B "High-Level Wrapper Classes (recommended)"
+.PP
+The
+.B socketley::server\fR, \fBsocketley::client\fR, \fBsocketley::proxy\fR, and \fBsocketley::cache
+classes wrap the raw engine API into a fluent, chainable interface.
+All boilerplate (event loop, runtime manager, signal handling) is internal.
+.PP
+.B "socketley::server"
+.nf
+server(uint16_t port)
+
+// Config (all return server& for chaining)
+tls(cert, key)         max_connections(n)    rate_limit(r)
+global_rate_limit(r)   idle_timeout(s)       lua(path)
+mode(m)                udp()                 http_dir(path)
+http_cache()           upstream(addr)        master_pw(pw)
+drain()                group(g)              tick_interval(ms)
+
+// Callbacks (return server& for chaining)
+on_start(void())                             on_stop(void())
+on_connect(void(int fd))                     on_disconnect(void(int fd))
+on_message(void(int fd, string_view msg))    on_tick(void(double dt_ms))
+
+// Actions
+send(fd, msg)       broadcast(msg)      disconnect(fd)
+peer_ip(fd)         clients()           multicast(fds, msg)
+set_data(fd,k,v)    get_data(fd,k)
+
+// Lifecycle
+run()   stop()
+
+// Escape hatches (raw engine access)
+instance() -> server_instance*
+manager()  -> runtime_manager&
+loop()     -> event_loop&
+.fi
+.PP
+.B "socketley::client"
+.nf
+client(string_view host, uint16_t port)
+
+// Config
+tls()              tls_ca(ca)         reconnect(max)
+mode(m)            udp()              lua(path)
+tick_interval(ms)
+
+// Callbacks
+on_start    on_stop    on_connect    on_disconnect
+on_message(void(string_view msg))   on_tick
+
+// Actions
+send(msg)
+
+// Lifecycle: run()  stop()
+// Escape hatches: instance()  manager()  loop()
+.fi
+.PP
+.B "socketley::proxy"
+.nf
+proxy(uint16_t port)
+
+// Config
+backend(addr)      strategy(s)        protocol(p)
+tls(cert, key)     max_connections(n)  idle_timeout(s)
+lua(path)          group(g)
+
+// Callbacks: on_start  on_stop
+// Lifecycle: run()  stop()
+// Escape hatches: instance()  manager()  loop()
+.fi
+.PP
+.B "socketley::cache"
+.nf
+cache(uint16_t port)
+
+// Config
+persistent(path)   max_memory(bytes)   eviction(policy)
+resp()             mode(m)             tls(cert, key)
+max_connections(n) idle_timeout(s)     replicate(target)
+lua(path)          group(g)
+
+// Callbacks: on_start  on_stop
+// Lifecycle: run()  stop()
+// Escape hatches: instance()  manager()  loop()
+.fi
+.PP
+.B "Limitations:"
+One
+.B run()
+per process (the signal handler points to one event_loop).
+.B run()
+blocks until SIGINT/SIGTERM. For multi-runtime or async patterns, use the raw API
+via the escape hatches or directly.
+.PP
+.B "Example: echo server (3 lines)"
+.nf
+#include <socketley/server.h>
+#include <cstdio>
+
+int main() {
+    socketley::server srv(9000);
+
+    srv.on_connect([](int fd) {
+        printf("client %d connected\\n", fd);
+    });
+    srv.on_message([&](int fd, std::string_view msg) {
+        srv.send(fd, "echo: " + std::string(msg));
+    });
+    srv.on_disconnect([](int fd) {
+        printf("client %d disconnected\\n", fd);
+    });
+
+    srv.run();
+}
+// g++ -std=c++23 echo.cpp -I. -Iinclude/linux \\
+//     -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto
+.fi
+.PP
+.B "Example: server with Lua scripting"
+.nf
+int main(int argc, char* argv[]) {
+    socketley::server srv(9000);
+    srv.lua(argv[1]);
+    srv.run();
+}
+.fi
+.PP
+.B "Example: TCP proxy"
+.nf
+socketley::proxy px(8080);
+px.backend("127.0.0.1:9001")
+  .backend("127.0.0.1:9002")
+  .protocol(protocol_tcp)
+  .strategy(strategy_round_robin);
+px.run();
+.fi
+.PP
+.B "Example: Redis-compatible cache"
+.nf
+socketley::cache c(6379);
+c.persistent("/var/data/store.dat")
+ .resp()
+ .max_memory(256 * 1024 * 1024)
+ .eviction(evict_allkeys_lru);
+c.run();
+.fi
+.PP
+.B "Example: client with auto-reconnect"
+.nf
+socketley::client cli("127.0.0.1", 9000);
+cli.reconnect(0);  // 0 = infinite
+cli.on_connect([&](int) { cli.send("hello"); });
+cli.on_message([](std::string_view msg) {
+    printf("%.*s\\n", (int)msg.size(), msg.data());
+});
+cli.run();
+.fi
+.PP
+.B "Raw Engine API (advanced)"
+.PP
+For multi-runtime processes or custom event loop control, use the raw types directly.
+The wrapper classes use this API internally.
+.PP
 .B "Core pattern:"
 create event_loop, create runtime_manager, create runtimes, configure, run, loop.
 .PP
@@ -1981,44 +2150,7 @@ set_strategy(strategy_round_robin|random|lua)
 add_backend(addr)      clear_backends()
 .fi
 .PP
-.B "Example: echo server with C++ callbacks"
-.nf
-#include <socketley/server.h>
-#include <csignal>
-#include <cstdio>
-
-static event_loop* g_loop = nullptr;
-
-int main() {
-    signal(SIGPIPE, SIG_IGN);
-    event_loop loop; loop.init();
-    g_loop = &loop;
-    runtime_manager mgr;
-
-    mgr.create(runtime_server, "echo");
-    auto* srv = static_cast<server_instance*>(mgr.get("echo"));
-    srv->set_port(9000);
-    srv->set_mode(mode_inout);
-    srv->set_event_loop(&loop);
-    srv->set_runtime_manager(&mgr);
-
-    srv->set_on_connect([](int fd) {
-        printf("client %d connected\\n", fd);
-    });
-    srv->set_on_client_message([srv](int fd, std::string_view msg) {
-        srv->lua_send_to(fd, msg);  // echo back
-    });
-
-    mgr.start("echo", loop);
-    signal(SIGINT, [](int) { g_loop->request_stop(); });
-    loop.run();
-    mgr.stop_all(loop);
-}
-// g++ -std=c++23 echo.cpp -I. -Iinclude/linux \\
-//     -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto
-.fi
-.PP
-.B "Example: multi-runtime (server + cache)"
+.B "Example: multi-runtime with raw API (server + cache)"
 .nf
 #include <socketley/server.h>
 #include <socketley/cache.h>
@@ -2043,32 +2175,6 @@ mgr.start("store", loop);
 mgr.start("api", loop);
 loop.run();
 .fi
-.PP
-.B "Example: proxy load balancer"
-.nf
-#include <socketley/server.h>
-#include <socketley/proxy.h>
-
-// ... (event_loop + runtime_manager + 2 backend servers)
-
-mgr.create(runtime_proxy, "lb");
-auto* px = static_cast<proxy_instance*>(mgr.get("lb"));
-px->set_port(8080);
-px->set_protocol(protocol_tcp);
-px->set_strategy(strategy_round_robin);
-px->add_backend("127.0.0.1:9001");
-px->add_backend("127.0.0.1:9002");
-px->set_event_loop(&loop);
-px->set_runtime_manager(&mgr);
-mgr.start("lb", loop);
-loop.run();
-.fi
-.PP
-Define
-.B SOCKETLEY_NO_LUA
-to build without LuaJIT (omit
-.B -lluajit
-from link flags).
 .SS Cross-Platform SDK (Windows / macOS)
 Header-only TCP clients for connecting to Socketley runtimes from non-Linux platforms.
 Available in
@@ -2146,19 +2252,17 @@ for fleet monitoring. Best of both worlds.
 .PP
 .nf
 #include <socketley/server.h>
-#include <socketley/cache.h>
 #include <socketley/attach.h>
 
-// ... (create event_loop, runtime_manager, server + cache as above)
+socketley::server srv(9000);
+srv.on_message([&](int fd, std::string_view msg) {
+    srv.send(fd, msg);
+});
 
-mgr.start("app_cache", loop);
-mgr.start("app_srv", loop);
-
-// Register with daemon so socketley ls/stats can see them
+// Register with daemon so socketley ls/stats can see it
 socketley::daemon_attach("app_srv", "server", 9000);
-socketley::daemon_attach("app_cache", "cache", 6379);
 
-loop.run();  // daemon sees both runtimes
+srv.run();  // daemon sees the runtime
 .fi
 .PP
 .B "When to use each tier:"
