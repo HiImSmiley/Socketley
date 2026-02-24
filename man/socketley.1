@@ -533,6 +533,41 @@ on
 Without this flag, files are read from disk on each request (suitable for
 development).
 .TP
+.TP
+.BI "\-u " "host:port"
+.TQ
+.BI "\-\-upstream " "host:port"
+Add an outbound upstream connection. The server connects to the specified
+host:port on startup and auto-reconnects with exponential backoff (1s\(en30s)
+if the connection drops. Multiple \-u flags may be specified, or multiple
+addresses separated by semicolons (e.g. \-u "feed:9000;cache:6379").
+Each upstream gets a stable 1-based conn_id for use in Lua callbacks.
+.PP
+.RS
+Upstream Lua callbacks:
+.TP
+.B on_upstream(conn_id, data)
+Called for each newline-delimited message received from an upstream.
+.TP
+.B on_upstream_connect(conn_id)
+Called when an upstream connects (including reconnects).
+.TP
+.B on_upstream_disconnect(conn_id)
+Called when an upstream disconnects.
+.RE
+.RS
+Upstream Lua actions:
+.TP
+.B self.upstream_send(conn_id, msg)
+Send a message to a specific upstream.
+.TP
+.B self.upstream_broadcast(msg)
+Send a message to all connected upstreams.
+.TP
+.B self.upstreams()
+Returns a table of currently connected upstream conn_ids.
+.RE
+.TP
 .BI "\-\-cache " "name"
 Link this server to an existing cache runtime. Clients can then send
 "cache <command>" messages (e.g. "cache set foo bar", "cache get foo")
@@ -1057,6 +1092,16 @@ function on_tick(dt)
 end
 .fi
 .TP
+.B on_upstream(conn_id, data)
+Server only. Called for each newline-delimited message received from an
+upstream connection. Use \-u to configure upstreams.
+.TP
+.B on_upstream_connect(conn_id)
+Server only. Called when an upstream connects (including auto-reconnects).
+.TP
+.B on_upstream_disconnect(conn_id)
+Server only. Called when an upstream disconnects.
+.TP
 .B on_cluster_join(daemon)
 Cluster only. Called when a new remote daemon is discovered. See
 .BR "Cluster Event Callbacks" .
@@ -1076,6 +1121,11 @@ self.protocol  -- "tcp" or "udp" (server/client only)
 self.send(msg)             -- Send message (client)
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server)
+
+-- Upstream actions (server with -u)
+self.upstream_send(conn_id, msg) -- Send to a specific upstream
+self.upstream_broadcast(msg)     -- Send to all connected upstreams
+self.upstreams()                 -- Table of connected upstream conn_ids
 
 -- Cache: strings
 self.get(key)       -- Get string value
@@ -2019,6 +2069,40 @@ Define
 to build without LuaJIT (omit
 .B -lluajit
 from link flags).
+.SS Cross-Platform SDK (Windows / macOS)
+Header-only TCP clients for connecting to Socketley runtimes from non-Linux platforms.
+Available in
+.B include/windows/socketley/
+and
+.BR include/darwin/socketley/ .
+.PP
+.B socketley/ws_client.h
+\(em WebSocket (RFC 6455) + raw TCP client for server runtimes.
+Embedded SHA-1 and Base64 (no OpenSSL). Modes:
+.BR ws_mode::websocket " and " ws_mode::raw_tcp .
+.PP
+.B socketley/cache_client.h
+\(em text protocol client for cache runtimes. Supports all cache commands
+(get, set, del, lpush, sadd, hset, expire, publish, subscribe, etc.).
+Returns
+.B cache_result
+with
+.IR ok ", " value ", " values ", " integer
+fields.
+.PP
+Build with C++17, no external dependencies:
+.RS
+.nf
+# MSVC
+cl /std:c++17 /I include\\windows app.cpp
+
+# clang++ (macOS)
+clang++ -std=c++17 -I include/darwin app.cpp -o app
+
+# g++ (Linux)
+g++ -std=c++17 -I include/windows app.cpp -o app
+.fi
+.RE
 .SS Tier 3: Daemon Attach (header-only)
 .B socketley/attach.h
 registers your own process as a runtime with a running daemon.

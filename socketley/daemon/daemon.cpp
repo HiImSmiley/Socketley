@@ -191,6 +191,8 @@ static void restore_runtimes(state_persistence& persistence,
                     srv->set_http_dir(cfg.http_dir);
                 if (cfg.http_cache)
                     srv->set_http_cache(true);
+                for (const auto& u : cfg.upstreams)
+                    srv->add_upstream_target(u);
                 break;
             }
             case runtime_client:

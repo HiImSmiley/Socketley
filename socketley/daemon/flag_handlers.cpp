@@ -331,6 +331,29 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
         case fnv1a("--http-cache"):
             srv->set_http_cache(true);
             return 0;
+        case fnv1a("-u"):
+        case fnv1a("--upstream"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "-u requires host:port\n";
+                return 1;
+            }
+            std::string_view upstream_str = pa.args[++i];
+            // Parse semicolon-separated: "host1:port1;host2:port2"
+            size_t start = 0;
+            size_t semi;
+            while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
+            {
+                auto addr = upstream_str.substr(start, semi - start);
+                if (!addr.empty())
+                    srv->add_upstream_target(addr);
+                start = semi + 1;
+            }
+            if (start < upstream_str.size())
+                srv->add_upstream_target(upstream_str.substr(start));
+            return 0;
+        }
         default:
             return -1;
     }
@@ -764,6 +787,33 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
         case fnv1a("--http-cache"):
             srv->set_http_cache(true);
             return 0;
+        case fnv1a("-u"):
+        case fnv1a("--upstream"):
+        {
+            if (is_running)
+            {
+                std::cout << "cannot change upstreams while running\n";
+                return 1;
+            }
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "-u requires host:port\n";
+                return 1;
+            }
+            std::string_view upstream_str = pa.args[++i];
+            size_t start = 0;
+            size_t semi;
+            while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
+            {
+                auto addr = upstream_str.substr(start, semi - start);
+                if (!addr.empty())
+                    srv->add_upstream_target(addr);
+                start = semi + 1;
+            }
+            if (start < upstream_str.size())
+                srv->add_upstream_target(upstream_str.substr(start));
+            return 0;
+        }
         default:
             return -1;
     }

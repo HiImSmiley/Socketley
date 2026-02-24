@@ -49,6 +49,9 @@ public:
     bool has_on_cluster_join()   const;
     bool has_on_cluster_leave()  const;
     bool has_on_group_change()   const;
+    bool has_on_upstream()           const;
+    bool has_on_upstream_connect()   const;
+    bool has_on_upstream_disconnect() const;
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -72,6 +75,9 @@ public:
     sol::function& on_cluster_join()   { return m_on_cluster_join; }
     sol::function& on_cluster_leave()  { return m_on_cluster_leave; }
     sol::function& on_group_change()   { return m_on_group_change; }
+    sol::function& on_upstream()           { return m_on_upstream; }
+    sol::function& on_upstream_connect()   { return m_on_upstream_connect; }
+    sol::function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
@@ -106,6 +112,9 @@ private:
     sol::function m_on_cluster_join;
     sol::function m_on_cluster_leave;
     sol::function m_on_group_change;
+    sol::function m_on_upstream;
+    sol::function m_on_upstream_connect;
+    sol::function m_on_upstream_disconnect;
     uint32_t m_tick_ms{0};
 
     // Timer lifetime guard — set to false in destructor; timers check before firing
@@ -154,6 +163,9 @@ public:
     bool has_on_cluster_join()   const { return false; }
     bool has_on_cluster_leave()  const { return false; }
     bool has_on_group_change()   const { return false; }
+    bool has_on_upstream()           const { return false; }
+    bool has_on_upstream_connect()   const { return false; }
+    bool has_on_upstream_disconnect() const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,

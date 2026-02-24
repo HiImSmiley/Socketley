@@ -58,6 +58,9 @@ struct runtime_config
     std::string http_dir;
     bool http_cache = false;
 
+    // Server upstreams
+    std::vector<std::string> upstreams;
+
     // Proxy
     uint8_t protocol = 0;   // proxy_protocol
     uint8_t strategy = 0;   // proxy_strategy

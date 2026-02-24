@@ -1863,6 +1863,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 srv->set_master_pw(cfg.master_pw);
             if (cfg.master_forward)
                 srv->set_master_forward(true);
+            srv->clear_upstream_targets();
+            for (const auto& u : cfg.upstreams)
+                srv->add_upstream_target(u);
             break;
         }
         case runtime_client:
