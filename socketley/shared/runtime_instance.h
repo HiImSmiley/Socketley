@@ -143,6 +143,11 @@ public:
     void set_pid(pid_t pid);
     pid_t get_pid() const;
 
+    // Managed external — daemon owns fork+exec lifecycle
+    void mark_managed(std::string exec_path);
+    bool is_managed() const;
+    std::string_view get_exec_path() const;
+
     enum class child_policy { stop, remove };
     void set_child_policy(child_policy p);
     child_policy get_child_policy() const;
@@ -292,6 +297,8 @@ private:
     std::string m_owner;
     bool m_lua_created = false;
     bool m_external = false;
+    bool m_managed = false;
+    std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;
 

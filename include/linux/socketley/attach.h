@@ -35,16 +35,26 @@ inline std::string& attached_name()
 inline bool daemon_attach(const std::string& name, const std::string& type,
                           uint16_t port)
 {
-    std::string cmd = "attach " + type + " " + name + " " + std::to_string(port)
+    bool is_managed = std::getenv("SOCKETLEY_MANAGED") != nullptr;
+    const char* env_name = std::getenv("SOCKETLEY_NAME");
+    const std::string& actual_name = (env_name && env_name[0])
+        ? *new std::string(env_name) : name;  // intentional leak — lives for process lifetime
+
+    std::string cmd = "attach " + type + " " + actual_name + " " + std::to_string(port)
                     + " --pid " + std::to_string(getpid());
+    if (is_managed)
+        cmd += " --managed";
     auto r = ctl::command(cmd);
     if (r.exit_code == 0)
     {
-        detail::attached_name() = name;
-        std::atexit([] {
-            if (!detail::attached_name().empty())
-                ctl::command("remove " + detail::attached_name());
-        });
+        if (!is_managed)
+        {
+            detail::attached_name() = actual_name;
+            std::atexit([] {
+                if (!detail::attached_name().empty())
+                    ctl::command("remove " + detail::attached_name());
+            });
+        }
         return true;
     }
     return false;

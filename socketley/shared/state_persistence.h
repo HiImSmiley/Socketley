@@ -44,6 +44,8 @@ struct runtime_config
 
     // External (attach) mode
     bool external_runtime = false;
+    bool managed = false;
+    std::string exec_path;
     int32_t pid = 0;  // PID of external process (0 = unknown)
 
     // Server/Client

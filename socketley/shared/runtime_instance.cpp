@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 runtime_instance::runtime_instance(runtime_type type, std::string_view name)
     : m_name(name), m_id(generate_runtime_id()), m_type(type), m_state(runtime_created),
@@ -69,6 +72,34 @@ bool runtime_instance::start(event_loop& loop)
 
     if (m_external)
     {
+        if (m_managed && !m_exec_path.empty())
+        {
+            // Reap any zombie from a previous stop() before forking a new child
+            if (m_pid > 0)
+                waitpid(m_pid, nullptr, WNOHANG);
+
+            pid_t child = fork();
+            if (child < 0)
+                return false;
+            if (child == 0)
+            {
+                setsid();
+                setenv("SOCKETLEY_MANAGED", "1", 1);
+                setenv("SOCKETLEY_NAME", m_name.c_str(), 1);
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0)
+                {
+                    dup2(devnull, STDIN_FILENO);
+                    dup2(devnull, STDOUT_FILENO);
+                    dup2(devnull, STDERR_FILENO);
+                    if (devnull > 2) close(devnull);
+                }
+                const char* path = m_exec_path.c_str();
+                execl(path, path, nullptr);
+                _exit(127);
+            }
+            m_pid = child;
+        }
         m_state.store(runtime_running, std::memory_order_release);
         m_start_time = std::chrono::system_clock::now();
         return true;  // skip setup(), on_start, tick timer
@@ -96,7 +127,11 @@ bool runtime_instance::stop(event_loop& loop)
     if (m_external)
     {
         if (m_pid > 0)
+        {
             kill(m_pid, SIGTERM);   // ask the external process to shut down
+            if (m_managed)
+                waitpid(m_pid, nullptr, WNOHANG);  // reap immediately if already dead
+        }
         m_state.store(runtime_stopped, std::memory_order_release);
         return true;  // skip teardown(), on_stop
     }
@@ -461,6 +496,9 @@ void runtime_instance::mark_external() { m_external = true; }
 bool runtime_instance::is_external() const { return m_external; }
 void runtime_instance::set_pid(pid_t pid) { m_pid = pid; }
 pid_t runtime_instance::get_pid() const { return m_pid; }
+void runtime_instance::mark_managed(std::string exec_path) { m_managed = true; m_external = true; m_exec_path = std::move(exec_path); }
+bool runtime_instance::is_managed() const { return m_managed; }
+std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
 

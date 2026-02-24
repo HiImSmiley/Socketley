@@ -38,6 +38,7 @@
       <li><a href="#sdk-t3">Tier 3: Daemon Attach</a><ul>
         <li><a href="#sdk-t3-api">API</a></li>
         <li><a href="#sdk-t3-lifecycle">Lifecycle</a></li>
+        <li><a href="#sdk-t3-managed">Managed Mode</a></li>
       </ul></li>
       <li><a href="#sdk-patterns">Patterns &amp; Best Practices</a><ul>
         <li><a href="#sdk-pat-mixed">Mixed (Tier 2 + 3)</a></li>
@@ -1895,6 +1896,25 @@ std::string info = cache-&gt;<span class="fn">execute</span>(<span class="st">"D
 
 <div class="info-box"><strong>Graceful degradation:</strong> If the daemon isn't running, <code>daemon_attach()</code> returns <code>false</code> and your service continues working in standalone mode. This makes Tier 3 safe to use unconditionally.</div>
 
+<h3 id="sdk-t3-managed">Managed Mode</h3>
+<p>When a binary is registered via <code>socketley add</code>, the daemon fork+exec's it with two environment variables:</p>
+<table>
+<thead><tr><th>Variable</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>SOCKETLEY_MANAGED=1</code></td><td>Always <code>"1"</code> for managed binaries</td></tr>
+<tr><td><code>SOCKETLEY_NAME=&lt;name&gt;</code></td><td>The runtime name assigned by <code>--name</code> or derived from the binary path</td></tr>
+</tbody>
+</table>
+<p><code>daemon_attach()</code> detects these automatically:</p>
+<ul>
+<li>Uses <code>SOCKETLEY_NAME</code> as the runtime name (overriding the <code>name</code> parameter)</li>
+<li>Sends <code>--managed</code> flag in the attach IPC command so the daemon updates the existing entry instead of creating a new one</li>
+<li>Skips the <code>atexit()</code> self-removal &mdash; the daemon owns the lifecycle</li>
+</ul>
+<p>No code changes are needed in the binary &mdash; the same <code>daemon_attach()</code> call works both standalone and managed.</p>
+
+<div class="info-box"><strong>Managed vs Attached:</strong> <code>attach</code> gives the daemon visibility only. <code>add</code> gives full lifecycle management: auto-restart on crash (~2s), re-launch on daemon boot, and proper <code>stop</code>/<code>start</code> cycling. See the <code>socketley add</code> command in the CLI reference.</div>
+
 <!-- ══════════════════════════════════════════════════════════════
      PATTERNS & BEST PRACTICES
 ══════════════════════════════════════════════════════════════ -->
@@ -1956,6 +1976,7 @@ signal(SIGTERM, [](<span class="kw">int</span>) { <span class="kw">if</span> (g_
 <tr><td>Custom game server</td><td><span class="badge badge-tier2">Tier 2</span></td><td>Full control, max performance, C++ callbacks</td></tr>
 <tr><td>IoT gateway</td><td><span class="badge badge-tier2">Tier 2</span></td><td>Embed engine, multiple protocols</td></tr>
 <tr><td>Legacy service integration</td><td><span class="badge badge-tier3">Tier 3</span></td><td>Register existing service with daemon fleet</td></tr>
+<tr><td>Auto-restarting service</td><td><span class="badge badge-tier3">Tier 3</span> + <code>add</code></td><td>Daemon manages lifecycle: auto-restart, boot re-launch</td></tr>
 <tr><td>Microservice with monitoring</td><td><span class="badge badge-mixed">Mixed</span></td><td>Embedded engine + daemon visibility</td></tr>
 </tbody>
 </table>

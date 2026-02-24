@@ -196,6 +196,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("ps"):
         case fnv1a("create"):
         case fnv1a("attach"):
+        case fnv1a("add"):
         case fnv1a("stop"):
         case fnv1a("remove"):
         case fnv1a("stats"):

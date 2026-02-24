@@ -11,6 +11,7 @@ examples/
 ├── proxy/              # HTTP/TCP proxy configurations
 ├── cache/              # Caching with persistence
 ├── lua-config/         # Lua configuration and scripting
+├── managed/            # Managed external binaries (C++ SDK)
 ├── udp/                # UDP server/client examples
 └── advanced/           # Complex multi-runtime setups
 ```
@@ -58,6 +59,12 @@ examples/
 - `callbacks.lua` - Event callbacks (on_start, on_stop, etc.)
 - `custom-routing.lua` - Lua-based proxy routing
 - `full-setup.lua` - Complete orchestration
+
+### Managed External Runtimes
+- `echo-service.cpp` - Minimal C++ echo server using the SDK
+- `01-add-and-run.sh` - Register and start a managed binary
+- `02-auto-restart.sh` - Daemon auto-restarts crashed binaries
+- `03-stop-start-cycle.sh` - Full lifecycle: add, stop, start, remove
 
 ### UDP
 - `udp-echo.sh` - Fire-and-forget UDP messaging

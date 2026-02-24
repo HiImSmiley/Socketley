@@ -296,6 +296,46 @@ project "test_name_resolver"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: managed runtime ───
+
+project "test_managed_runtime"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/doctest",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files { "test/unit/test_managed_runtime.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "On"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: WebSocket parser ───
 
 project "test_ws_parser"

@@ -21,6 +21,7 @@
         <li><a href="#cmd-reload">reload / reload-lua</a></li>
         <li><a href="#cmd-show-edit">show / edit</a></li>
         <li><a href="#cmd-ls-ps">ls / ps / owner</a></li>
+        <li><a href="#cmd-add">add</a></li>
         <li><a href="#cmd-daemon">daemon</a></li>
         <li><a href="#cmd-cluster">cluster</a></li>
       </ul></li>
@@ -396,6 +397,28 @@ socketley create proxy gw -p 8080 --backend @api -s</code></pre>
 <pre><code>ID        NAME            TYPE    PORT    CONN  OWNED BY    STATUS              CREATED
 a1b2c3    api-server      server  9000    3     -           Up 2 hours          3 hours ago
 d4e5f6    my-client       client  -       1     -           Up 45 minutes       1 hour ago</code></pre>
+
+<div class="cli-card" id="cmd-add">
+  <div class="cli-name">socketley add &lt;path&gt; [--name &lt;name&gt;] [-s]</div>
+  <div class="cli-desc">Register a standalone binary as a <strong>managed external runtime</strong>. The daemon owns the process lifecycle: fork+exec on start, SIGTERM on stop, auto-restart on crash, and re-launch on daemon boot. The binary should call <code>daemon_attach()</code> from the C++ SDK to report its type and port.</div>
+</div>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>&lt;path&gt;</code></td><td>Path to the executable binary (must be executable)</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Custom runtime name (default: basename of the binary)</td></tr>
+<tr><td><code>-s</code></td><td>Start immediately after registration</td></tr>
+</tbody></table>
+<pre><code><span class="cm"># Register and start immediately</span>
+socketley add /usr/local/bin/myapp --name myapp -s
+
+<span class="cm"># Register without starting</span>
+socketley add /usr/local/bin/myapp --name myapp
+
+<span class="cm"># Later: start, stop, restart, remove</span>
+socketley start myapp
+socketley stop myapp
+socketley start myapp
+socketley remove myapp</code></pre>
+<div class="info-box"><strong>Managed vs Attach:</strong> Plain <code>attach</code> gives the daemon visibility only &mdash; it cannot restart the process. <code>add</code> gives the daemon full ownership: auto-restart on crash, re-launch on daemon boot, and proper stop/start cycling. The binary receives <code>SOCKETLEY_MANAGED=1</code> and <code>SOCKETLEY_NAME=&lt;name&gt;</code> environment variables when launched.</div>
 
 <div class="cli-card" id="cmd-daemon">
   <div class="cli-name">socketley daemon [flags]</div>

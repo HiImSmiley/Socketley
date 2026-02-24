@@ -142,7 +142,10 @@ static void restore_runtimes(state_persistence& persistence,
         // External (attached) runtimes: mark as external so start() skips io_uring setup
         if (cfg.external_runtime)
         {
-            instance->mark_external();
+            if (cfg.managed && !cfg.exec_path.empty())
+                instance->mark_managed(cfg.exec_path);
+            else
+                instance->mark_external();
             if (cfg.pid > 0)
                 instance->set_pid(static_cast<pid_t>(cfg.pid));
         }
