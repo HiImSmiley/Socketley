@@ -65,6 +65,10 @@ examples/
 - `01-add-and-run.sh` - Register and start a managed binary
 - `02-auto-restart.sh` - Daemon auto-restarts crashed binaries
 - `03-stop-start-cycle.sh` - Full lifecycle: add, stop, start, remove
+- `chat-server.cpp` - Chat server using wrapper API (`socketley::server`)
+- `04-managed-chat.sh` - Managed chat with auto-restart demo
+- `counter-server.cpp` - Per-connection counter using wrapper API
+- `05-managed-counter.sh` - Managed counter with stop/start lifecycle
 
 ### UDP
 - `udp-echo.sh` - Fire-and-forget UDP messaging

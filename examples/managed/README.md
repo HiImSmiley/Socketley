@@ -8,7 +8,8 @@ auto-restart on crash, re-launch on daemon boot, and normal stop/start/remove.
 The daemon must be running. When installed via package, it runs as a systemd
 service automatically. In dev mode: `./bin/Release/socketley daemon &`
 
-A C++17 compiler is needed to build the example binary.
+A C++17 compiler is needed to build the example binaries. The wrapper-based
+examples (04, 05) also require `libsocketley_sdk.a` — build the project first.
 
 ## How It Works
 
@@ -75,9 +76,46 @@ Full lifecycle: add, stop, start, remove.
 ./03-stop-start-cycle.sh
 ```
 
+### chat-server.cpp (Wrapper API)
+
+Multi-client chat server using the `socketley::server` wrapper. Messages
+from any client are broadcast to all others. Much simpler than raw POSIX —
+the wrapper handles io_uring, signals, and the event loop automatically.
+
+```bash
+g++ -std=c++17 -O2 -I../../include/linux chat-server.cpp \
+    -L../../bin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat-server
+```
+
+### 04 - Managed Chat
+
+Register the wrapper-based chat server and test auto-restart.
+
+```bash
+./04-managed-chat.sh
+```
+
+### counter-server.cpp (Wrapper API)
+
+Per-connection message counter using the `socketley::server` wrapper with
+`set_data`/`get_data` for per-connection metadata.
+
+```bash
+g++ -std=c++17 -O2 -I../../include/linux counter-server.cpp \
+    -L../../bin/Release -lsocketley_sdk -luring -lssl -lcrypto -o counter-server
+```
+
+### 05 - Managed Counter
+
+Register the counter server and demonstrate stop/start lifecycle.
+
+```bash
+./05-managed-counter.sh
+```
+
 ## Cleanup
 
 ```bash
-socketley stop echo-svc crash-test lifecycle 2>/dev/null
-socketley remove echo-svc crash-test lifecycle 2>/dev/null
+socketley stop echo-svc crash-test lifecycle chat counter 2>/dev/null
+socketley remove echo-svc crash-test lifecycle chat counter 2>/dev/null
 ```
