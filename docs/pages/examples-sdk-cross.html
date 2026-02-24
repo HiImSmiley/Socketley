@@ -1,0 +1,276 @@
+    <ul id="navList-examples-sdk-cross" style="display:none">
+      <li class="open"><a href="#exx-ws">WebSocket Examples</a><ul>
+        <li><a href="#exx-ws-echo">Echo Client</a></li>
+        <li><a href="#exx-ws-raw">Raw TCP Client</a></li>
+      </ul></li>
+      <li><a href="#exx-cache">Cache Examples</a><ul>
+        <li><a href="#exx-cache-crud">CRUD Operations</a></li>
+        <li><a href="#exx-cache-ds">Data Structures</a></li>
+        <li><a href="#exx-cache-pubsub">Pub/Sub</a></li>
+        <li><a href="#exx-cache-scan">Scan &amp; TTL</a></li>
+      </ul></li>
+      <li><a href="#exx-patterns">Patterns</a><ul>
+        <li><a href="#exx-reconnect">Reconnection</a></li>
+      </ul></li>
+    </ul>
+<div id="content-examples-sdk-cross" class="content" style="display:none">
+
+<!-- ── WebSocket Examples ── -->
+<h2 id="exx-ws">WebSocket Examples</h2>
+
+<h3 id="exx-ws-echo">Echo Client</h3>
+<p>Connect to a Socketley server in WebSocket mode, send a message, and print the response:</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/ws_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::ws_client client;
+
+    <span class="kw">if</span> (!client.connect(<span class="str">"192.168.1.100"</span>, <span class="num">8080</span>)) {
+        std::cerr &lt;&lt; <span class="str">"Connection failed\n"</span>;
+        <span class="kw">return</span> <span class="num">1</span>;
+    }
+
+    client.send(<span class="str">"Hello from Windows!"</span>);
+
+    <span class="kw">auto</span> msg = client.recv();
+    <span class="kw">if</span> (msg.error) {
+        std::cerr &lt;&lt; <span class="str">"Receive error\n"</span>;
+        <span class="kw">return</span> <span class="num">1</span>;
+    }
+
+    std::cout &lt;&lt; <span class="str">"Server: "</span> &lt;&lt; msg.data &lt;&lt; <span class="str">"\n"</span>;
+    client.close();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code><span class="cm"># MSVC</span>
+cl /std:c++17 /EHsc /I include\windows echo_client.cpp
+
+<span class="cm"># macOS</span>
+clang++ -std=c++17 -I include/darwin echo_client.cpp -o echo_client
+
+<span class="cm"># Linux</span>
+g++ -std=c++17 -I include/windows echo_client.cpp -o echo_client</code></pre>
+
+<h3 id="exx-ws-raw">Raw TCP Client</h3>
+<p>Use <code>ws_mode::raw_tcp</code> for plain newline-delimited text (no WebSocket framing):</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/ws_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::ws_client client;
+
+    <span class="cm">// raw_tcp mode — no WebSocket handshake, just newline-delimited text</span>
+    <span class="kw">if</span> (!client.connect(<span class="str">"192.168.1.100"</span>, <span class="num">8080</span>, socketley::ws_mode::raw_tcp))
+        <span class="kw">return</span> <span class="num">1</span>;
+
+    client.send(<span class="str">"hello"</span>);
+    client.send(<span class="str">"world"</span>);
+
+    <span class="cm">// Read two responses</span>
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">2</span>; i++) {
+        <span class="kw">auto</span> msg = client.recv();
+        <span class="kw">if</span> (msg.error) <span class="kw">break</span>;
+        std::cout &lt;&lt; msg.data &lt;&lt; <span class="str">"\n"</span>;
+    }
+}</code></pre>
+<div class="info-box"><strong>When to use raw TCP:</strong> Raw TCP mode matches the Socketley server&rsquo;s text mode (<code>--mode in</code>, <code>--mode out</code>, <code>--mode inout</code>). Use it when your server doesn&rsquo;t need WebSocket features like framing, ping/pong, or close handshakes.</div>
+
+<!-- ── Cache Examples ── -->
+<h2 id="exx-cache">Cache Examples</h2>
+
+<h3 id="exx-cache-crud">CRUD Operations</h3>
+<p>Basic set/get/del/exists workflow:</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/cache_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::cache_client cache;
+    <span class="kw">if</span> (!cache.connect(<span class="str">"192.168.1.100"</span>, <span class="num">6379</span>))
+        <span class="kw">return</span> <span class="num">1</span>;
+
+    <span class="cm">// Set and get</span>
+    cache.set(<span class="str">"user:1"</span>, <span class="str">"Alice"</span>);
+    <span class="kw">auto</span> r = cache.get(<span class="str">"user:1"</span>);
+    std::cout &lt;&lt; r.value &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// Alice</span>
+
+    <span class="cm">// Check existence</span>
+    <span class="kw">auto</span> e = cache.exists(<span class="str">"user:1"</span>);
+    std::cout &lt;&lt; <span class="str">"exists: "</span> &lt;&lt; e.integer &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// 1</span>
+
+    <span class="cm">// Atomic increment</span>
+    cache.set(<span class="str">"counter"</span>, <span class="str">"0"</span>);
+    cache.incr(<span class="str">"counter"</span>);
+    cache.incrby(<span class="str">"counter"</span>, <span class="num">10</span>);
+    <span class="kw">auto</span> c = cache.get(<span class="str">"counter"</span>);
+    std::cout &lt;&lt; <span class="str">"counter: "</span> &lt;&lt; c.value &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// 11</span>
+
+    <span class="cm">// Delete</span>
+    cache.del(<span class="str">"user:1"</span>);
+    <span class="kw">auto</span> g = cache.get(<span class="str">"user:1"</span>);
+    std::cout &lt;&lt; <span class="str">"nil: "</span> &lt;&lt; g.is_nil() &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// 1</span>
+}</code></pre>
+
+<h3 id="exx-cache-ds">Data Structures</h3>
+<p>Lists, sets, and hashes:</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/cache_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::cache_client c;
+    c.connect(<span class="str">"192.168.1.100"</span>, <span class="num">6379</span>);
+
+    <span class="cm">// ── Lists ──</span>
+    c.rpush(<span class="str">"queue"</span>, <span class="str">"task1"</span>);
+    c.rpush(<span class="str">"queue"</span>, <span class="str">"task2"</span>);
+    c.rpush(<span class="str">"queue"</span>, <span class="str">"task3"</span>);
+
+    <span class="kw">auto</span> items = c.lrange(<span class="str">"queue"</span>, <span class="num">0</span>, -<span class="num">1</span>);
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; v : items.values)
+        std::cout &lt;&lt; v &lt;&lt; <span class="str">" "</span>;  <span class="cm">// task1 task2 task3</span>
+    std::cout &lt;&lt; <span class="str">"\n"</span>;
+
+    <span class="cm">// ── Sets ──</span>
+    c.sadd(<span class="str">"tags"</span>, <span class="str">"cpp"</span>);
+    c.sadd(<span class="str">"tags"</span>, <span class="str">"networking"</span>);
+    c.sadd(<span class="str">"tags"</span>, <span class="str">"cpp"</span>);  <span class="cm">// duplicate, ignored</span>
+
+    std::cout &lt;&lt; <span class="str">"tag count: "</span> &lt;&lt; c.scard(<span class="str">"tags"</span>).integer &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// 2</span>
+
+    <span class="kw">auto</span> members = c.smembers(<span class="str">"tags"</span>);
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; m : members.values)
+        std::cout &lt;&lt; m &lt;&lt; <span class="str">" "</span>;
+    std::cout &lt;&lt; <span class="str">"\n"</span>;
+
+    <span class="cm">// ── Hashes ──</span>
+    c.hset(<span class="str">"user:42"</span>, <span class="str">"name"</span>, <span class="str">"Bob"</span>);
+    c.hset(<span class="str">"user:42"</span>, <span class="str">"email"</span>, <span class="str">"bob@example.com"</span>);
+    c.hset(<span class="str">"user:42"</span>, <span class="str">"role"</span>, <span class="str">"admin"</span>);
+
+    std::cout &lt;&lt; <span class="str">"name: "</span> &lt;&lt; c.hget(<span class="str">"user:42"</span>, <span class="str">"name"</span>).value &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// Bob</span>
+
+    <span class="kw">auto</span> all = c.hgetall(<span class="str">"user:42"</span>);
+    <span class="kw">for</span> (<span class="kw">size_t</span> i = <span class="num">0</span>; i + <span class="num">1</span> &lt; all.values.size(); i += <span class="num">2</span>)
+        std::cout &lt;&lt; all.values[i] &lt;&lt; <span class="str">"="</span> &lt;&lt; all.values[i + <span class="num">1</span>] &lt;&lt; <span class="str">" "</span>;
+    std::cout &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// name=Bob email=bob@example.com role=admin</span>
+}</code></pre>
+
+<h3 id="exx-cache-pubsub">Pub/Sub</h3>
+<p>Subscribe to a channel and receive messages. Typically run the publisher and subscriber in separate processes:</p>
+<pre><code><span class="cm">// ── subscriber.cpp ──</span>
+<span class="pp">#include</span> <span class="str">&lt;socketley/cache_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::cache_client c;
+    c.connect(<span class="str">"192.168.1.100"</span>, <span class="num">6379</span>);
+
+    c.subscribe(<span class="str">"events"</span>);
+    std::cout &lt;&lt; <span class="str">"Subscribed, waiting for messages...\n"</span>;
+
+    <span class="kw">for</span> (;;) {
+        <span class="kw">auto</span> msg = c.recv_message();
+        <span class="kw">if</span> (!msg.ok) <span class="kw">break</span>;
+
+        std::cout &lt;&lt; <span class="str">"["</span> &lt;&lt; msg.values[<span class="num">0</span>] &lt;&lt; <span class="str">"] "</span>
+                  &lt;&lt; msg.value &lt;&lt; <span class="str">"\n"</span>;
+    }
+}</code></pre>
+
+<pre><code><span class="cm">// ── publisher.cpp ──</span>
+<span class="pp">#include</span> <span class="str">&lt;socketley/cache_client.h&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::cache_client c;
+    c.connect(<span class="str">"192.168.1.100"</span>, <span class="num">6379</span>);
+
+    c.publish(<span class="str">"events"</span>, <span class="str">"user_login"</span>);
+    c.publish(<span class="str">"events"</span>, <span class="str">"order_placed"</span>);
+    c.publish(<span class="str">"events"</span>, <span class="str">"payment_received"</span>);
+}</code></pre>
+
+<h3 id="exx-cache-scan">Scan &amp; TTL</h3>
+<p>Iterate keys with cursor-based scan, and set TTLs:</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/cache_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::cache_client c;
+    c.connect(<span class="str">"192.168.1.100"</span>, <span class="num">6379</span>);
+
+    <span class="cm">// Create some keys with TTL</span>
+    c.setex(<span class="str">"session:abc"</span>, <span class="num">300</span>, <span class="str">"user1"</span>);   <span class="cm">// expires in 5 min</span>
+    c.setex(<span class="str">"session:def"</span>, <span class="num">300</span>, <span class="str">"user2"</span>);
+    c.set(<span class="str">"config:max_retries"</span>, <span class="str">"3"</span>);        <span class="cm">// no TTL</span>
+
+    <span class="cm">// Check TTL</span>
+    <span class="kw">auto</span> t = c.ttl(<span class="str">"session:abc"</span>);
+    std::cout &lt;&lt; <span class="str">"TTL: "</span> &lt;&lt; t.integer &lt;&lt; <span class="str">"s\n"</span>;  <span class="cm">// ~300</span>
+
+    <span class="cm">// Scan all session keys</span>
+    uint64_t cursor = <span class="num">0</span>;
+    <span class="kw">do</span> {
+        <span class="kw">auto</span> r = c.scan(cursor, <span class="str">"session:*"</span>, <span class="num">100</span>);
+        cursor = <span class="kw">static_cast</span>&lt;uint64_t&gt;(r.integer);
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; key : r.values)
+            std::cout &lt;&lt; <span class="str">"  "</span> &lt;&lt; key &lt;&lt; <span class="str">"\n"</span>;
+    } <span class="kw">while</span> (cursor != <span class="num">0</span>);
+
+    <span class="cm">// Remove TTL from a key</span>
+    c.persist(<span class="str">"session:abc"</span>);
+    std::cout &lt;&lt; <span class="str">"TTL after persist: "</span> &lt;&lt; c.ttl(<span class="str">"session:abc"</span>).integer &lt;&lt; <span class="str">"\n"</span>;  <span class="cm">// -1</span>
+}</code></pre>
+
+<!-- ── Patterns ── -->
+<h2 id="exx-patterns">Patterns</h2>
+
+<h3 id="exx-reconnect">Reconnection</h3>
+<p>Handle disconnections with automatic reconnection:</p>
+<pre><code><span class="pp">#include</span> <span class="str">&lt;socketley/ws_client.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;iostream&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;thread&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;chrono&gt;</span>
+
+<span class="kw">int</span> main() {
+    socketley::ws_client client;
+    <span class="kw">const</span> std::string host = <span class="str">"192.168.1.100"</span>;
+    <span class="kw">const</span> uint16_t port = <span class="num">8080</span>;
+
+    client.connect(host, port);
+
+    <span class="kw">for</span> (;;) {
+        <span class="kw">if</span> (!client.is_connected()) {
+            std::cerr &lt;&lt; <span class="str">"Disconnected, reconnecting...\n"</span>;
+            <span class="kw">while</span> (!client.reconnect()) {
+                std::this_thread::sleep_for(std::chrono::seconds(<span class="num">2</span>));
+                std::cerr &lt;&lt; <span class="str">"Retry...\n"</span>;
+            }
+            std::cerr &lt;&lt; <span class="str">"Reconnected!\n"</span>;
+        }
+
+        client.set_recv_timeout(<span class="num">5000</span>);  <span class="cm">// 5s timeout</span>
+        <span class="kw">auto</span> msg = client.recv();
+
+        <span class="kw">if</span> (msg.error) {
+            <span class="cm">// Timeout or connection lost</span>
+            <span class="kw">if</span> (!client.is_connected())
+                <span class="kw">continue</span>;  <span class="cm">// will reconnect at top of loop</span>
+            <span class="cm">// Timeout — send heartbeat</span>
+            client.send_ping();
+            <span class="kw">continue</span>;
+        }
+
+        <span class="kw">if</span> (msg.is_close) {
+            std::cerr &lt;&lt; <span class="str">"Server closed connection\n"</span>;
+            <span class="kw">continue</span>;  <span class="cm">// reconnect at top</span>
+        }
+
+        std::cout &lt;&lt; <span class="str">"Received: "</span> &lt;&lt; msg.data &lt;&lt; <span class="str">"\n"</span>;
+        client.send(<span class="str">"ack"</span>);
+    }
+}</code></pre>
+
+<div class="info-box"><strong>Reconnect preserves parameters.</strong> <code>reconnect()</code> reuses the host, port, mode, and path from the last <code>connect()</code> call. No need to store them separately.</div>
+
+</div><!-- #content-examples-sdk-cross -->

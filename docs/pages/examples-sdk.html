@@ -1,0 +1,1006 @@
+    <ul id="navList-examples-sdk" style="display:none">
+      <li class="open"><a href="#exsdk-tier1">Tier 1: Daemon Control</a><ul>
+        <li><a href="#exsdk-control-basics">Control Basics</a></li>
+        <li><a href="#exsdk-cache-ops">Cache Operations</a></li>
+        <li><a href="#exsdk-fleet">Fleet Manager</a></li>
+      </ul></li>
+      <li><a href="#exsdk-daemon-workflows">Daemon Workflows</a><ul>
+        <li><a href="#exsdk-dw-lua-echo">Lua Echo Server</a></li>
+        <li><a href="#exsdk-dw-cache-full">Full Cache Operations</a></li>
+        <li><a href="#exsdk-dw-server-cache">Server + Cache</a></li>
+        <li><a href="#exsdk-dw-monitoring">Monitoring Dashboard</a></li>
+        <li><a href="#exsdk-dw-pubsub">Pub/Sub Callbacks</a></li>
+      </ul></li>
+      <li><a href="#exsdk-tier2">Tier 2: Embedded Engine</a><ul>
+        <li><a href="#exsdk-wrapper-echo">Echo Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-proxy">TCP Proxy (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-cache">Cache (Wrapper)</a></li>
+        <li><a href="#exsdk-echo">Echo Server (Raw)</a></li>
+        <li><a href="#exsdk-multi">Multi-Runtime (Raw)</a></li>
+        <li><a href="#exsdk-chat">Chat Server (Lua)</a></li>
+        <li><a href="#exsdk-proxy-lb">Proxy Load Balancer (Raw)</a></li>
+      </ul></li>
+      <li><a href="#exsdk-tier3">Tier 3: Daemon Attach</a><ul>
+        <li><a href="#exsdk-attach">Attached Service</a></li>
+      </ul></li>
+      <li><a href="#exsdk-mixed">Mixed: Engine + Attach</a><ul>
+        <li><a href="#exsdk-fullstack">Full Stack</a></li>
+      </ul></li>
+    </ul>
+<div id="content-examples-sdk" class="content" style="display:none">
+
+<!-- ── Tier 1: Daemon Control Examples ── -->
+<h2 id="exsdk-tier1">Tier 1: Daemon Control</h2>
+<p>These examples use only <code>socketley/control.h</code> &mdash; header-only, zero dependencies. They control a running daemon programmatically.</p>
+
+<div class="method-card" id="exsdk-control-basics">
+<div class="method-header">
+  <span class="method-name">Control Basics</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-desc">Full lifecycle walkthrough: create runtimes, start them, query stats, send messages, stop, and remove. Demonstrates every core <code>socketley::ctl</code> function.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create a server and a cache</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"ctl_test_srv"</span>, <span class="st">"-p 19001"</span>);
+    <span class="kw">if</span> (r.exit_code != <span class="nb">0</span>) { printf(<span class="st">"create failed: %s\n"</span>, r.data.c_str()); <span class="kw">return</span> <span class="nb">1</span>; }
+
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"ctl_test_cache"</span>, <span class="st">"-p 19002"</span>);
+
+    <span class="cm">// List runtimes</span>
+    r = socketley::ctl::<span class="fn">ls</span>();
+    printf(<span class="st">"runtimes:\n%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Start both</span>
+    socketley::ctl::<span class="fn">start</span>(<span class="st">"ctl_test_srv"</span>);
+    socketley::ctl::<span class="fn">start</span>(<span class="st">"ctl_test_cache"</span>);
+
+    <span class="cm">// Check running processes</span>
+    r = socketley::ctl::<span class="fn">ps</span>();
+    printf(<span class="st">"running:\n%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Query stats</span>
+    r = socketley::ctl::<span class="fn">stats</span>(<span class="st">"ctl_test_srv"</span>);
+    printf(<span class="st">"stats:\n%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Show configuration</span>
+    r = socketley::ctl::<span class="fn">show</span>(<span class="st">"ctl_test_srv"</span>);
+
+    <span class="cm">// Send a message (broadcasts to 0 clients &mdash; still succeeds)</span>
+    socketley::ctl::<span class="fn">send</span>(<span class="st">"ctl_test_srv"</span>, <span class="st">"hello from SDK"</span>);
+
+    <span class="cm">// Reload (restart)</span>
+    socketley::ctl::<span class="fn">reload</span>(<span class="st">"ctl_test_srv"</span>);
+
+    <span class="cm">// Stop and remove</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"ctl_test_srv"</span>);
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"ctl_test_cache"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"ctl_test_srv"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"ctl_test_cache"</span>);
+
+    <span class="cm">// Verify removal (should fail)</span>
+    r = socketley::ctl::<span class="fn">stats</span>(<span class="st">"ctl_test_srv"</span>);
+    printf(<span class="st">"after remove: exit=%d (expected 1)\n"</span>, r.exit_code);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 01_control_basics.cpp -Iinclude/linux -o control_basics</code></pre>
+<p><strong>Test:</strong> Requires a running socketley daemon. Run <code>./control_basics</code> and verify each operation succeeds.</p>
+</div>
+
+<div class="method-card" id="exsdk-cache-ops">
+<div class="method-header">
+  <span class="method-name">Cache Operations</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">Direct cache read/write through daemon IPC. No TCP connection needed &mdash; the daemon reads/writes the cache store directly.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create and start an admin cache</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"sdk_cache_test"</span>, <span class="st">"-p 19010 --mode admin"</span>);
+    socketley::ctl::<span class="fn">start</span>(<span class="st">"sdk_cache_test"</span>);
+
+    <span class="cm">// String operations</span>
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"greeting"</span>, <span class="st">"hello_world"</span>);
+
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"greeting"</span>);
+    printf(<span class="st">"greeting = %s\n"</span>, r.data.c_str());  <span class="cm">// "hello_world"</span>
+
+    <span class="cm">// Overwrite</span>
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"count"</span>, <span class="st">"42"</span>);
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"count"</span>, <span class="st">"100"</span>);
+    r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"count"</span>);
+    printf(<span class="st">"count = %s\n"</span>, r.data.c_str());  <span class="cm">// "100"</span>
+
+    <span class="cm">// Delete</span>
+    socketley::ctl::<span class="fn">cache_del</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"greeting"</span>);
+    r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"sdk_cache_test"</span>, <span class="st">"greeting"</span>);
+    printf(<span class="st">"after del = %s\n"</span>, r.data.c_str());  <span class="cm">// "nil"</span>
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"sdk_cache_test"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"sdk_cache_test"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 02_cache_ops.cpp -Iinclude/linux -o cache_ops</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-fleet">
+<div class="method-header">
+  <span class="method-name">Fleet Manager</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-desc">Create a fleet of servers and caches, manage them with glob patterns, and tear them all down. Demonstrates programmatic orchestration at scale.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;string&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create a fleet of 5 servers</span>
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nb">0</span>; i &lt; <span class="nb">5</span>; ++i) {
+        std::string name  = <span class="st">"fleet_srv_"</span> + std::to_string(i);
+        std::string flags = <span class="st">"-p "</span> + std::to_string(<span class="nb">19110</span> + i);
+        socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, name, flags);
+    }
+
+    <span class="cm">// Create 2 caches</span>
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nb">0</span>; i &lt; <span class="nb">2</span>; ++i) {
+        std::string name  = <span class="st">"fleet_cache_"</span> + std::to_string(i);
+        std::string flags = <span class="st">"-p "</span> + std::to_string(<span class="nb">19200</span> + i);
+        socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, name, flags);
+    }
+
+    <span class="cm">// List all &mdash; should show 7 runtimes</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">ls</span>();
+    printf(<span class="st">"%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Start all servers with glob pattern</span>
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"start fleet_srv_*"</span>);
+    socketley::ctl::<span class="fn">start</span>(<span class="st">"fleet_cache_0"</span>);
+    socketley::ctl::<span class="fn">start</span>(<span class="st">"fleet_cache_1"</span>);
+
+    <span class="cm">// Stats on all servers at once</span>
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"stats fleet_srv_*"</span>);
+
+    <span class="cm">// Stop and remove everything</span>
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"stop fleet_srv_*"</span>);
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"stop fleet_cache_*"</span>);
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"remove fleet_srv_*"</span>);
+    socketley::ctl::<span class="fn">command</span>(<span class="st">"remove fleet_cache_*"</span>);
+
+    printf(<span class="st">"fleet cleaned up\n"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 03_fleet_manager.cpp -Iinclude/linux -o fleet_manager</code></pre>
+<p><strong>Key concept:</strong> <code>socketley::ctl::command()</code> accepts any raw command string, including glob patterns like <code>"start fleet_srv_*"</code>.</p>
+</div>
+
+<!-- ── Daemon Workflows ── -->
+<h2 id="exsdk-daemon-workflows">Daemon Workflows</h2>
+<p>The most common pattern: Tier 1 SDK driving daemon-managed runtimes with Lua callbacks. These examples combine <code>socketley::ctl</code> control with Lua scripts and the <code>action</code> subcommand.</p>
+
+<div class="method-card" id="exsdk-dw-lua-echo">
+<div class="method-header">
+  <span class="method-name">Lua Echo Server via Daemon</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Create a daemon-managed server with a Lua echo script, send a message, query stats, and clean up. This is how callbacks work in daemon mode &mdash; you write Lua, the daemon runs it.</p>
+
+<p><strong>echo.lua</strong> (save to disk before running):</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    self.<span class="fn">broadcast</span>(msg)
+<span class="kw">end</span></code></pre>
+
+<p><strong>C++ driver:</strong></p>
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create server with Lua script, auto-start (-s)</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"echo"</span>,
+        <span class="st">"-p 9000 --lua echo.lua -s"</span>);
+    <span class="kw">if</span> (r.exit_code != <span class="nb">0</span>) { printf(<span class="st">"create: %s\n"</span>, r.data.c_str()); <span class="kw">return</span> <span class="nb">1</span>; }
+
+    <span class="cm">// Send a test message (broadcasts to all connected clients)</span>
+    socketley::ctl::<span class="fn">send</span>(<span class="st">"echo"</span>, <span class="st">"hello from SDK"</span>);
+
+    <span class="cm">// Query stats</span>
+    r = socketley::ctl::<span class="fn">stats</span>(<span class="st">"echo"</span>);
+    printf(<span class="st">"stats:\n%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Hot-reload Lua without dropping connections</span>
+    socketley::ctl::<span class="fn">reload_lua</span>(<span class="st">"echo"</span>);
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"echo"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"echo"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_lua_echo.cpp -Iinclude/linux -o dw_lua_echo</code></pre>
+<p><strong>Key concept:</strong> Lua scripts run inside the daemon process. The SDK just controls lifecycle and sends messages. <code>reload_lua()</code> hot-swaps the script without restarting.</p>
+</div>
+
+<div class="method-card" id="exsdk-dw-cache-full">
+<div class="method-header">
+  <span class="method-name">Full Cache Operations</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">Exercise every cache data structure through the <code>action</code> subcommand: strings, lists, sets, hashes, TTL, pub/sub, and admin operations. The <code>action</code> command gives you full Redis-like access from C++.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create admin cache (all commands enabled)</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"store"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
+
+    <span class="cm">// ── Strings ──</span>
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>, <span class="st">"alice"</span>);
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"user:2"</span>, <span class="st">"bob"</span>);
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>);
+    printf(<span class="st">"user:1 = %s\n"</span>, r.data.c_str());  <span class="cm">// "alice"</span>
+
+    r = socketley::ctl::<span class="fn">cache_exists</span>(<span class="st">"store"</span>, <span class="st">"user:1"</span>);
+    printf(<span class="st">"exists = %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    socketley::ctl::<span class="fn">cache_del</span>(<span class="st">"store"</span>, <span class="st">"user:2"</span>);
+
+    <span class="cm">// ── Lists ──</span>
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_c"</span>);
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_b"</span>);
+    socketley::ctl::<span class="fn">cache_lpush</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>, <span class="st">"job_a"</span>);
+
+    r = socketley::ctl::<span class="fn">cache_llen</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>);
+    printf(<span class="st">"queue length = %s\n"</span>, r.data.c_str());  <span class="cm">// "3"</span>
+
+    r = socketley::ctl::<span class="fn">cache_lpop</span>(<span class="st">"store"</span>, <span class="st">"queue"</span>);
+    printf(<span class="st">"dequeued = %s\n"</span>, r.data.c_str());  <span class="cm">// "job_a"</span>
+
+    <span class="cm">// ── Sets ──</span>
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"vip"</span>);
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"premium"</span>);
+    socketley::ctl::<span class="fn">cache_sadd</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"active"</span>);
+
+    r = socketley::ctl::<span class="fn">cache_scard</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>);
+    printf(<span class="st">"tag count = %s\n"</span>, r.data.c_str());  <span class="cm">// "3"</span>
+
+    r = socketley::ctl::<span class="fn">cache_sismember</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"vip"</span>);
+    printf(<span class="st">"is vip = %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    socketley::ctl::<span class="fn">cache_srem</span>(<span class="st">"store"</span>, <span class="st">"tags:1"</span>, <span class="st">"active"</span>);
+
+    <span class="cm">// ── Hashes ──</span>
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>, <span class="st">"abc123"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"user"</span>, <span class="st">"alice"</span>);
+
+    r = socketley::ctl::<span class="fn">cache_hget</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"token"</span>);
+    printf(<span class="st">"token = %s\n"</span>, r.data.c_str());  <span class="cm">// "abc123"</span>
+
+    r = socketley::ctl::<span class="fn">cache_hlen</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
+    printf(<span class="st">"fields = %s\n"</span>, r.data.c_str());  <span class="cm">// "2"</span>
+
+    socketley::ctl::<span class="fn">cache_hdel</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="st">"user"</span>);
+
+    <span class="cm">// ── TTL ──</span>
+    socketley::ctl::<span class="fn">cache_expire</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>, <span class="nb">3600</span>);
+
+    r = socketley::ctl::<span class="fn">cache_ttl</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
+    printf(<span class="st">"ttl = %s\n"</span>, r.data.c_str());  <span class="cm">// "3600" (approx)</span>
+
+    socketley::ctl::<span class="fn">cache_persist</span>(<span class="st">"store"</span>, <span class="st">"session:1"</span>);
+
+    <span class="cm">// ── Pub/Sub ──</span>
+    r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"notifications"</span>, <span class="st">"hello"</span>);
+    printf(<span class="st">"subscribers = %s\n"</span>, r.data.c_str());  <span class="cm">// "0" (no subscribers yet)</span>
+
+    <span class="cm">// ── Admin ──</span>
+    r = socketley::ctl::<span class="fn">cache_size</span>(<span class="st">"store"</span>);
+    printf(<span class="st">"total keys = %s\n"</span>, r.data.c_str());
+
+    r = socketley::ctl::<span class="fn">cache_memory</span>(<span class="st">"store"</span>);
+    printf(<span class="st">"memory = %s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"store"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"store"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_cache_full.cpp -Iinclude/linux -o dw_cache_full</code></pre>
+<p><strong>Key concept:</strong> Every cache data structure has a typed <code>cache_*</code> function. IPC is faster than TCP because it bypasses network and protocol parsing.</p>
+</div>
+
+<div class="method-card" id="exsdk-dw-server-cache">
+<div class="method-header">
+  <span class="method-name">Server + Cache Integration</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-server">Server</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">Create a server linked to a cache via <code>--cache</code>, then access data through two paths: server TCP (for clients) and direct IPC (for orchestration). Shows the most common production pattern.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create cache first (server depends on it)</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"store"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
+
+    <span class="cm">// Create server linked to the cache</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"api"</span>, <span class="st">"-p 9000 --cache store -s"</span>);
+
+    <span class="cm">// Path 1: Direct IPC (no TCP, for orchestration)</span>
+    socketley::ctl::<span class="fn">cache_set</span>(<span class="st">"store"</span>, <span class="st">"config:version"</span>, <span class="st">"1.0"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"max_conn"</span>, <span class="st">"1000"</span>);
+    socketley::ctl::<span class="fn">cache_hset</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"timeout"</span>, <span class="st">"30"</span>);
+
+    <span class="cm">// Path 2: Through the server (what TCP clients do)</span>
+    <span class="cm">// Clients connected to port 9000 can send:</span>
+    <span class="cm">//   "cache set session:abc token123"</span>
+    <span class="cm">//   "cache get session:abc"</span>
+    <span class="cm">// The server forwards these to the linked cache automatically.</span>
+
+    <span class="cm">// Verify via direct IPC</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_get</span>(<span class="st">"store"</span>, <span class="st">"config:version"</span>);
+    printf(<span class="st">"version = %s\n"</span>, r.data.c_str());  <span class="cm">// "1.0"</span>
+
+    r = socketley::ctl::<span class="fn">cache_hget</span>(<span class="st">"store"</span>, <span class="st">"config:limits"</span>, <span class="st">"max_conn"</span>);
+    printf(<span class="st">"max_conn = %s\n"</span>, r.data.c_str());  <span class="cm">// "1000"</span>
+
+    <span class="cm">// Stats on both</span>
+    r = socketley::ctl::<span class="fn">stats</span>(<span class="st">"api"</span>);
+    printf(<span class="st">"server:\n%s\n"</span>, r.data.c_str());
+
+    r = socketley::ctl::<span class="fn">stats</span>(<span class="st">"store"</span>);
+    printf(<span class="st">"cache:\n%s\n"</span>, r.data.c_str());
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"api"</span>);
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"store"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"api"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"store"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_server_cache.cpp -Iinclude/linux -o dw_server_cache</code></pre>
+<p><strong>Key concept:</strong> <code>--cache store</code> links the server to the cache. Clients send <code>"cache set key val"</code> through the server; the SDK uses <code>cache_get</code>/<code>action</code> for direct access. Two paths, same data.</p>
+</div>
+
+<div class="method-card" id="exsdk-dw-monitoring">
+<div class="method-header">
+  <span class="method-name">Monitoring Dashboard</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-desc">Create a small fleet and monitor it: query stats from each runtime, parse connection counts, and print a summary. Demonstrates Tier 1 for orchestration and monitoring.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;string&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;vector&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;thread&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;chrono&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create a small fleet</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"web"</span>,  <span class="st">"-p 8080 -s"</span>);
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"api"</span>,  <span class="st">"-p 8081 -s"</span>);
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>,  <span class="st">"data"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
+
+    std::vector&lt;std::string&gt; runtimes = {<span class="st">"web"</span>, <span class="st">"api"</span>, <span class="st">"data"</span>};
+
+    <span class="cm">// Monitor loop (3 iterations)</span>
+    <span class="kw">for</span> (<span class="kw">int</span> i = <span class="nb">0</span>; i &lt; <span class="nb">3</span>; ++i) {
+        printf(<span class="st">"── Snapshot %d ──\n"</span>, i + <span class="nb">1</span>);
+
+        <span class="kw">for</span> (<span class="kw">const auto</span>&amp; name : runtimes) {
+            <span class="kw">auto</span> r = socketley::ctl::<span class="fn">stats</span>(name);
+            <span class="kw">if</span> (r.exit_code == <span class="nb">0</span>)
+                printf(<span class="st">"  [%s] %s\n"</span>, name.c_str(), r.data.c_str());
+            <span class="kw">else</span>
+                printf(<span class="st">"  [%s] down\n"</span>, name.c_str());
+        }
+
+        <span class="cm">// Also check cache key count</span>
+        <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_size</span>(<span class="st">"data"</span>);
+        printf(<span class="st">"  [data] keys = %s\n"</span>, r.data.c_str());
+
+        r = socketley::ctl::<span class="fn">cache_memory</span>(<span class="st">"data"</span>);
+        printf(<span class="st">"  [data] memory = %s\n"</span>, r.data.c_str());
+
+        std::this_thread::sleep_for(std::chrono::seconds(<span class="nb">1</span>));
+    }
+
+    <span class="cm">// Cleanup</span>
+    <span class="kw">for</span> (<span class="kw">const auto</span>&amp; name : runtimes) {
+        socketley::ctl::<span class="fn">stop</span>(name);
+        socketley::ctl::<span class="fn">remove</span>(name);
+    }
+
+    printf(<span class="st">"fleet shut down\n"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_monitoring.cpp -Iinclude/linux -o dw_monitoring</code></pre>
+<p><strong>Key concept:</strong> Tier 1 is ideal for orchestration tools. Poll <code>stats()</code> and <code>action ... size/memory</code> to build monitoring dashboards without touching the data path.</p>
+</div>
+
+<div class="method-card" id="exsdk-dw-pubsub">
+<div class="method-header">
+  <span class="method-name">Pub/Sub with Lua Callbacks</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Create a cache and a server with a Lua script that subscribes to cache events. When the C++ driver publishes to the cache, the server's Lua callback fires and broadcasts the message to all connected TCP clients. This is the primary pattern for receiving pub/sub messages from C++.</p>
+
+<p><strong>notify.lua</strong> (save to disk before running):</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.<span class="fn">subscribe</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(ch, msg)
+        socketley.<span class="fn">log</span>(<span class="st">"event on "</span> .. ch .. <span class="st">": "</span> .. msg)
+        self.<span class="fn">broadcast</span>(<span class="st">"EVENT: "</span> .. msg)
+    <span class="kw">end</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    <span class="cm">-- Clients can also trigger publishes</span>
+    socketley.<span class="fn">log</span>(<span class="st">"client "</span> .. id .. <span class="st">" says: "</span> .. msg)
+<span class="kw">end</span></code></pre>
+
+<p><strong>C++ driver:</strong></p>
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/control.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    <span class="cm">// Create cache + server with Lua subscribe callback</span>
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"cache"</span>, <span class="st">"store"</span>, <span class="st">"-p 6379 --mode admin -s"</span>);
+    socketley::ctl::<span class="fn">create</span>(<span class="st">"server"</span>, <span class="st">"notifier"</span>,
+        <span class="st">"-p 9000 --lua notify.lua -s"</span>);
+
+    <span class="cm">// Publish events &mdash; the server's Lua callback broadcasts them</span>
+    <span class="kw">auto</span> r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="st">"user_signup"</span>);
+    printf(<span class="st">"subscribers: %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    r = socketley::ctl::<span class="fn">cache_publish</span>(<span class="st">"store"</span>, <span class="st">"events"</span>, <span class="st">"order_placed"</span>);
+    printf(<span class="st">"subscribers: %s\n"</span>, r.data.c_str());  <span class="cm">// "1"</span>
+
+    <span class="cm">// Any TCP client connected to port 9000 receives:</span>
+    <span class="cm">//   "EVENT: user_signup"</span>
+    <span class="cm">//   "EVENT: order_placed"</span>
+
+    <span class="cm">// Cleanup</span>
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"notifier"</span>);
+    socketley::ctl::<span class="fn">stop</span>(<span class="st">"store"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"notifier"</span>);
+    socketley::ctl::<span class="fn">remove</span>(<span class="st">"store"</span>);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 dw_pubsub.cpp -Iinclude/linux -o dw_pubsub</code></pre>
+<p><strong>Key concept:</strong> Tier 1 can publish but not subscribe (IPC is request/response). Use <code>socketley.subscribe()</code> in a Lua script on any runtime to receive messages. The Lua callback fires on the subscribing runtime's event loop &mdash; no polling, no extra TCP connections.</p>
+</div>
+
+<!-- ── Tier 2: Embedded Engine Examples ── -->
+<h2 id="exsdk-tier2">Tier 2: Embedded Engine</h2>
+<p>These examples embed the full io_uring engine in a standalone binary. No daemon needed.</p>
+
+<div class="method-card" id="exsdk-wrapper-echo">
+<div class="method-header">
+  <span class="method-name">Echo Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">The simplest way to embed a server. The wrapper handles event loop setup, signal handling, and cleanup. Compare with the raw API version below.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+
+    srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"client %d connected\n"</span>, fd);
+    });
+
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        printf(<span class="st">"client %d: %.*s\n"</span>, fd, (<span class="kw">int</span>)msg.size(), msg.data());
+        srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+    });
+
+    srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"client %d disconnected\n"</span>, fd);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 echo_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o echo_server</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-proxy">
+<div class="method-header">
+  <span class="method-name">TCP Proxy (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-proxy">Proxy</span>
+</div>
+<p class="method-desc">A round-robin TCP proxy in 5 lines. No event loop or signal handling code needed.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/proxy.h&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::proxy <span class="fn">px</span>(<span class="nb">8080</span>);
+    px.<span class="fn">backend</span>(<span class="st">"127.0.0.1:9001"</span>)
+      .<span class="fn">backend</span>(<span class="st">"127.0.0.1:9002"</span>)
+      .<span class="fn">protocol</span>(protocol_tcp)
+      .<span class="fn">strategy</span>(strategy_round_robin);
+    px.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 proxy.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o proxy</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-cache">
+<div class="method-header">
+  <span class="method-name">Redis-Compatible Cache (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">A persistent, Redis-compatible cache with LRU eviction. Supports both text protocol and RESP.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/cache.h&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::cache <span class="fn">c</span>(<span class="nb">6379</span>);
+    c.<span class="fn">persistent</span>(<span class="st">"/var/data/store.dat"</span>)
+     .<span class="fn">resp</span>()
+     .<span class="fn">max_memory</span>(<span class="nb">256</span> * <span class="nb">1024</span> * <span class="nb">1024</span>)
+     .<span class="fn">eviction</span>(evict_allkeys_lru);
+    c.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 cache.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o cache</code></pre>
+<p><strong>Test:</strong> Use <code>redis-benchmark</code> or <code>redis-cli</code> against port 6379.</p>
+</div>
+
+<div class="method-card" id="exsdk-echo">
+<div class="method-header">
+  <span class="method-name">Echo Server (Raw API)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A standalone TCP echo server using C++ callbacks. Demonstrates the core Tier 2 pattern: event loop + runtime manager + callbacks. Tracks connection and message counts with atomics.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;atomic&gt;</span>
+
+<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
+<span class="kw">static</span> std::atomic&lt;<span class="kw">int</span>&gt; g_conn_count{<span class="nb">0</span>};
+<span class="kw">static</span> std::atomic&lt;uint64_t&gt; g_msg_count{<span class="nb">0</span>};
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+
+    event_loop loop;
+    loop.<span class="fn">init</span>();
+    g_loop = &amp;loop;
+    runtime_manager mgr;
+
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"echo"</span>);
+    <span class="kw">auto</span>* srv = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"echo"</span>));
+    srv-&gt;<span class="fn">set_port</span>(<span class="nb">9000</span>);
+    srv-&gt;<span class="fn">set_mode</span>(mode_inout);
+    srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    <span class="cm">// C++ callbacks &mdash; no Lua needed</span>
+    srv-&gt;<span class="fn">set_on_connect</span>([](<span class="kw">int</span> fd) {
+        g_conn_count++;
+        printf(<span class="st">"client %d connected (total: %d)\n"</span>, fd, g_conn_count.load());
+    });
+    srv-&gt;<span class="fn">set_on_disconnect</span>([](<span class="kw">int</span> fd) {
+        g_conn_count--;
+        printf(<span class="st">"client %d disconnected (total: %d)\n"</span>, fd, g_conn_count.load());
+    });
+    srv-&gt;<span class="fn">set_on_client_message</span>([srv](<span class="kw">int</span> fd, std::string_view msg) {
+        g_msg_count++;
+        srv-&gt;<span class="fn">lua_send_to</span>(fd, msg);  <span class="cm">// echo back to sender</span>
+    });
+
+    mgr.<span class="fn">start</span>(<span class="st">"echo"</span>, loop);
+    printf(<span class="st">"echo server on port 9000\n"</span>);
+
+    signal(SIGINT,  [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    signal(SIGTERM, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    loop.<span class="fn">run</span>();
+    mgr.<span class="fn">stop_all</span>(loop);
+    printf(<span class="st">"%lu messages processed\n"</span>, g_msg_count.load());
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 04_echo_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o echo_server</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-multi">
+<div class="method-header">
+  <span class="method-name">Multi-Runtime (Raw API)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">Run a server and cache in the same event loop. The server is linked to the cache via <code>set_cache_name()</code>, so clients can run cache commands (e.g. <code>cache set foo bar</code>) through the server connection.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;socketley/cache.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    event_loop loop; loop.<span class="fn">init</span>();
+    g_loop = &amp;loop;
+    runtime_manager mgr;
+
+    <span class="cm">// Create cache</span>
+    mgr.<span class="fn">create</span>(runtime_cache, <span class="st">"store"</span>);
+    <span class="kw">auto</span>* cache = <span class="kw">static_cast</span>&lt;cache_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"store"</span>));
+    cache-&gt;<span class="fn">set_port</span>(<span class="nb">6379</span>);
+    cache-&gt;<span class="fn">set_mode</span>(cache_mode_admin);
+    cache-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    cache-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    <span class="cm">// Create server linked to cache</span>
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"api"</span>);
+    <span class="kw">auto</span>* srv = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"api"</span>));
+    srv-&gt;<span class="fn">set_port</span>(<span class="nb">9000</span>);
+    srv-&gt;<span class="fn">set_mode</span>(mode_inout);
+    srv-&gt;<span class="fn">set_cache_name</span>(<span class="st">"store"</span>);  <span class="cm">// clients can "cache set k v" through this server</span>
+    srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    srv-&gt;<span class="fn">set_on_client_message</span>([srv](<span class="kw">int</span> fd, std::string_view msg) {
+        printf(<span class="st">"[api] %d: %.*s\n"</span>, fd, (<span class="kw">int</span>)msg.size(), msg.data());
+        srv-&gt;<span class="fn">lua_broadcast</span>(msg);
+    });
+
+    mgr.<span class="fn">start</span>(<span class="st">"store"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"api"</span>, loop);
+    printf(<span class="st">"server :9000 + cache :6379\n"</span>);
+
+    signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    loop.<span class="fn">run</span>();
+    mgr.<span class="fn">stop_all</span>(loop);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 05_multi_runtime.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o multi_runtime</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>echo <span class="st">"cache set foo bar"</span> | nc -q1 127.0.0.1 9000
+echo <span class="st">"cache get foo"</span>     | nc -q1 127.0.0.1 9000  <span class="cm"># returns "bar"</span>
+echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span class="cm"># direct cache access</span></code></pre>
+</div>
+
+<div class="method-card" id="exsdk-chat">
+<div class="method-header">
+  <span class="method-name">Chat Server (Lua)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Embedded server that loads a Lua script for chat logic. If the Lua file isn't found, it falls back to C++ echo callbacks. Demonstrates Lua + C++ callback coexistence.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    event_loop loop; loop.<span class="fn">init</span>();
+    g_loop = &amp;loop;
+    runtime_manager mgr;
+
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"chat"</span>);
+    <span class="kw">auto</span>* srv = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"chat"</span>));
+    srv-&gt;<span class="fn">set_port</span>(<span class="nb">9000</span>);
+    srv-&gt;<span class="fn">set_mode</span>(mode_inout);
+    srv-&gt;<span class="fn">set_max_connections</span>(<span class="nb">50</span>);
+    srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    <span class="cm">// Try Lua first, fallback to C++</span>
+    <span class="kw">bool</span> lua_ok = srv-&gt;<span class="fn">load_lua_script</span>(<span class="st">"chat.lua"</span>);
+    <span class="kw">if</span> (!lua_ok) {
+        printf(<span class="st">"Lua not found, using C++ echo fallback\n"</span>);
+        srv-&gt;<span class="fn">set_on_connect</span>([](<span class="kw">int</span> fd) {
+            printf(<span class="st">"client %d joined\n"</span>, fd);
+        });
+        srv-&gt;<span class="fn">set_on_disconnect</span>([](<span class="kw">int</span> fd) {
+            printf(<span class="st">"client %d left\n"</span>, fd);
+        });
+        srv-&gt;<span class="fn">set_on_client_message</span>([srv](<span class="kw">int</span>, std::string_view msg) {
+            srv-&gt;<span class="fn">lua_broadcast</span>(msg);
+        });
+    }
+
+    mgr.<span class="fn">start</span>(<span class="st">"chat"</span>, loop);
+    printf(<span class="st">"chat server on port 9000\n"</span>);
+
+    signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    loop.<span class="fn">run</span>();
+    mgr.<span class="fn">stop_all</span>(loop);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 06_chat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chat_server</code></pre>
+<p><strong>Test:</strong> Open multiple terminals with <code>nc 127.0.0.1 9000</code>. Messages from one client appear on all others.</p>
+</div>
+
+<div class="method-card" id="exsdk-proxy-lb">
+<div class="method-header">
+  <span class="method-name">Proxy Load Balancer (Raw API)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-proxy">Proxy</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Two backend servers with a TCP round-robin proxy in front. Demonstrates multi-runtime orchestration with different runtime types. Each backend tags its response so you can see the load balancing in action.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;socketley/proxy.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    event_loop loop; loop.<span class="fn">init</span>();
+    g_loop = &amp;loop;
+    runtime_manager mgr;
+
+    <span class="cm">// Backend 1 &mdash; echoes with prefix</span>
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"backend1"</span>);
+    <span class="kw">auto</span>* b1 = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"backend1"</span>));
+    b1-&gt;<span class="fn">set_port</span>(<span class="nb">9001</span>); b1-&gt;<span class="fn">set_mode</span>(mode_inout);
+    b1-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr); b1-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+    b1-&gt;<span class="fn">set_on_client_message</span>([b1](<span class="kw">int</span> fd, std::string_view msg) {
+        std::string resp = <span class="st">"[backend1] "</span> + std::string(msg);
+        b1-&gt;<span class="fn">lua_send_to</span>(fd, resp);
+    });
+
+    <span class="cm">// Backend 2</span>
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"backend2"</span>);
+    <span class="kw">auto</span>* b2 = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"backend2"</span>));
+    b2-&gt;<span class="fn">set_port</span>(<span class="nb">9002</span>); b2-&gt;<span class="fn">set_mode</span>(mode_inout);
+    b2-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr); b2-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+    b2-&gt;<span class="fn">set_on_client_message</span>([b2](<span class="kw">int</span> fd, std::string_view msg) {
+        std::string resp = <span class="st">"[backend2] "</span> + std::string(msg);
+        b2-&gt;<span class="fn">lua_send_to</span>(fd, resp);
+    });
+
+    <span class="cm">// TCP round-robin proxy</span>
+    mgr.<span class="fn">create</span>(runtime_proxy, <span class="st">"lb"</span>);
+    <span class="kw">auto</span>* px = <span class="kw">static_cast</span>&lt;proxy_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"lb"</span>));
+    px-&gt;<span class="fn">set_port</span>(<span class="nb">8080</span>);
+    px-&gt;<span class="fn">set_protocol</span>(protocol_tcp);
+    px-&gt;<span class="fn">set_strategy</span>(strategy_round_robin);
+    px-&gt;<span class="fn">add_backend</span>(<span class="st">"127.0.0.1:9001"</span>);
+    px-&gt;<span class="fn">add_backend</span>(<span class="st">"127.0.0.1:9002"</span>);
+    px-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr); px-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    mgr.<span class="fn">start</span>(<span class="st">"backend1"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"backend2"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"lb"</span>, loop);
+    printf(<span class="st">"proxy :8080 -&gt; backend1 :9001, backend2 :9002\n"</span>);
+
+    signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    loop.<span class="fn">run</span>();
+    mgr.<span class="fn">stop_all</span>(loop);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 07_proxy_lb.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o proxy_lb</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [backend1] hello</span>
+echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [backend2] hello</span>
+echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [backend1] hello  (round-robin)</span></code></pre>
+</div>
+
+<!-- ── Tier 3: Daemon Attach Examples ── -->
+<h2 id="exsdk-tier3">Tier 3: Daemon Attach</h2>
+<p>Register your own processes with the daemon fleet.</p>
+
+<div class="method-card" id="exsdk-attach">
+<div class="method-header">
+  <span class="method-name">Attached Service</span>
+  <span class="badge badge-tier3">Tier 3</span>
+</div>
+<p class="method-desc">A raw POSIX TCP server that registers with the socketley daemon via <code>daemon_attach()</code>. Shows up in <code>socketley ls</code> and <code>socketley ps</code>. Degrades gracefully if daemon isn't running.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/attach.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;arpa/inet.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;netinet/in.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;poll.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;sys/socket.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unistd.h&gt;</span>
+
+<span class="kw">static volatile</span> sig_atomic_t g_quit = <span class="nb">0</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT,  [](<span class="kw">int</span>) { g_quit = <span class="nb">1</span>; });
+
+    <span class="cm">// Own TCP server (raw POSIX)</span>
+    <span class="kw">int</span> sock = socket(AF_INET, SOCK_STREAM, <span class="nb">0</span>);
+    <span class="kw">int</span> opt = <span class="nb">1</span>;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &amp;opt, <span class="kw">sizeof</span>(opt));
+
+    <span class="kw">struct</span> sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(<span class="nb">8080</span>);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (<span class="kw">struct</span> sockaddr*)&amp;addr, <span class="kw">sizeof</span>(addr));
+    listen(sock, <span class="nb">128</span>);
+
+    <span class="cm">// Register with daemon</span>
+    <span class="kw">if</span> (socketley::<span class="fn">daemon_attach</span>(<span class="st">"ext_service"</span>, <span class="st">"server"</span>, <span class="nb">8080</span>))
+        printf(<span class="st">"registered with daemon\n"</span>);
+    <span class="kw">else</span>
+        printf(<span class="st">"daemon not running (standalone mode)\n"</span>);
+
+    <span class="cm">// Accept loop</span>
+    <span class="kw">struct</span> pollfd pfd{};
+    pfd.fd = sock; pfd.events = POLLIN;
+
+    <span class="kw">while</span> (!g_quit) {
+        <span class="kw">if</span> (poll(&amp;pfd, <span class="nb">1</span>, <span class="nb">500</span>) &lt;= <span class="nb">0</span>) <span class="kw">continue</span>;
+        <span class="kw">int</span> client = accept(sock, <span class="kw">nullptr</span>, <span class="kw">nullptr</span>);
+        <span class="kw">if</span> (client &lt; <span class="nb">0</span>) <span class="kw">continue</span>;
+
+        <span class="kw">char</span> buf[<span class="nb">4096</span>];
+        ssize_t n = read(client, buf, <span class="kw">sizeof</span>(buf) - <span class="nb">1</span>);
+        <span class="kw">if</span> (n &gt; <span class="nb">0</span>) {
+            buf[n] = <span class="st">'\0'</span>;
+            std::string resp = <span class="st">"[ext_service] "</span> + std::string(buf, n) + <span class="st">"\n"</span>;
+            <span class="kw">if</span> (write(client, resp.data(), resp.size()) &lt; <span class="nb">0</span>) {}
+        }
+        close(client);
+    }
+
+    close(sock);
+    socketley::<span class="fn">daemon_detach</span>();  <span class="cm">// also called via atexit()</span>
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 08_attach_service.cpp -Iinclude/linux -o attach_service</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>socketley ls                         <span class="cm"># shows "ext_service"</span>
+echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [ext_service] hello</span></code></pre>
+</div>
+
+<!-- ── Mixed: Engine + Attach ── -->
+<h2 id="exsdk-mixed">Mixed: Engine + Attach</h2>
+<p>Combine Tier 2 (embedded engine) with Tier 3 (daemon registration) for the best of both worlds.</p>
+
+<div class="method-card" id="exsdk-fullstack">
+<div class="method-header">
+  <span class="method-name">Full Stack</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-tier3">Tier 3</span>
+</div>
+<p class="method-desc">Runs its own io_uring event loop with a server + cache, AND registers both with the daemon. Your binary gets maximum performance from the embedded engine while remaining visible to <code>socketley ls</code> and <code>socketley stats</code>.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;socketley/cache.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;socketley/attach.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    event_loop loop; loop.<span class="fn">init</span>();
+    g_loop = &amp;loop;
+    runtime_manager mgr;
+
+    <span class="cm">// Embedded cache + server (Tier 2)</span>
+    mgr.<span class="fn">create</span>(runtime_cache, <span class="st">"app_cache"</span>);
+    <span class="kw">auto</span>* cache = <span class="kw">static_cast</span>&lt;cache_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"app_cache"</span>));
+    cache-&gt;<span class="fn">set_port</span>(<span class="nb">6379</span>);
+    cache-&gt;<span class="fn">set_mode</span>(cache_mode_admin);
+    cache-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    cache-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"app_srv"</span>);
+    <span class="kw">auto</span>* srv = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"app_srv"</span>));
+    srv-&gt;<span class="fn">set_port</span>(<span class="nb">9000</span>);
+    srv-&gt;<span class="fn">set_mode</span>(mode_inout);
+    srv-&gt;<span class="fn">set_cache_name</span>(<span class="st">"app_cache"</span>);
+    srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
+    srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
+
+    srv-&gt;<span class="fn">set_on_client_message</span>([srv](<span class="kw">int</span> fd, std::string_view msg) {
+        printf(<span class="st">"[full] %d: %.*s\n"</span>, fd, (<span class="kw">int</span>)msg.size(), msg.data());
+        srv-&gt;<span class="fn">lua_broadcast</span>(msg);
+    });
+
+    mgr.<span class="fn">start</span>(<span class="st">"app_cache"</span>, loop);
+    mgr.<span class="fn">start</span>(<span class="st">"app_srv"</span>, loop);
+
+    <span class="cm">// Register with daemon (Tier 3)</span>
+    socketley::<span class="fn">daemon_attach</span>(<span class="st">"app_srv"</span>, <span class="st">"server"</span>, <span class="nb">9000</span>);
+
+    <span class="cm">// Attach second runtime manually</span>
+    <span class="kw">bool</span> cache_attached = <span class="kw">false</span>;
+    {
+        std::string cmd = <span class="st">"attach cache app_cache 6379 --pid "</span>
+                        + std::to_string(getpid());
+        <span class="kw">auto</span> r = socketley::ctl::<span class="fn">command</span>(cmd);
+        cache_attached = (r.exit_code == <span class="nb">0</span>);
+    }
+
+    printf(<span class="st">"server :9000, cache :6379 (check: socketley ls)\n"</span>);
+
+    signal(SIGINT,  [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    signal(SIGTERM, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
+    loop.<span class="fn">run</span>();
+
+    mgr.<span class="fn">stop_all</span>(loop);
+    <span class="kw">if</span> (cache_attached)
+        socketley::ctl::<span class="fn">command</span>(<span class="st">"remove app_cache"</span>);
+    <span class="cm">// daemon_detach() auto-called for app_srv via atexit()</span>
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 09_full_stack.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o full_stack</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>socketley ls                                     <span class="cm"># shows app_srv + app_cache</span>
+echo <span class="st">"hello"</span>         | nc -q1 127.0.0.1 9000    <span class="cm"># broadcast</span>
+echo <span class="st">"cache set k v"</span> | nc -q1 127.0.0.1 9000    <span class="cm"># cache through server</span>
+echo <span class="st">"get k"</span>          | nc -q1 127.0.0.1 6379    <span class="cm"># direct cache: "v"</span></code></pre>
+<p><strong>Key concept:</strong> <code>daemon_attach()</code> registers one name via <code>atexit()</code>. For additional runtimes, use <code>socketley::ctl::command("attach ...")</code> and manually clean up on shutdown.</p>
+</div>
+
+</div><!-- #content-examples-sdk -->

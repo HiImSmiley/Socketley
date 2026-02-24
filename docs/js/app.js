@@ -39,19 +39,108 @@ function _resolvePane() {
 function getActiveNav()     { return navEl(_resolvePane()); }
 function getActiveContent() { return contentEl(_resolvePane()); }
 
-function _applyVisibility() {
-  const panes = [
-    'socketley', 'socketley-sdk', 'socketley-sdk-cross',
-    'lua', 'addons',
-    'examples', 'examples-sdk', 'examples-sdk-cross'
-  ];
-  const active = _resolvePane();
-  panes.forEach(id => {
-    const n = navEl(id), c = contentEl(id);
-    const show = id === active ? '' : 'none';
-    if (n) n.style.display = show;
-    if (c) c.style.display = show;
+// ─── Page Loading ───
+const _pageMap = {
+  'socketley':           'pages/socketley.html',
+  'socketley-sdk':       'pages/sdk.html',
+  'socketley-sdk-cross': 'pages/sdk-cross.html',
+  'lua':                 'pages/lua.html',
+  'addons':              'pages/addons.html',
+  'examples':            'pages/examples.html',
+  'examples-sdk':        'pages/examples-sdk.html',
+  'examples-sdk-cross':  'pages/examples-sdk-cross.html'
+};
+const _pageCache = {};
+const _loadingPromises = {};
+
+function _loadPage(pane) {
+  if (_pageCache[pane]) return Promise.resolve();
+  if (_loadingPromises[pane]) return _loadingPromises[pane];
+
+  const url = _pageMap[pane];
+  if (!url) return Promise.resolve();
+
+  const promise = fetch(url)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(html => {
+      // Parse the HTML fragment
+      const tmp = document.createElement('div');
+      tmp.innerHTML = html;
+
+      // Find the nav <ul> and content <div>/<main>
+      const navUl = tmp.querySelector('ul[id^="navList-"]');
+      const contentDiv = tmp.querySelector('[id^="content-"]');
+
+      // Inject nav into placeholder (strip inline display:none — container handles visibility)
+      const navPlaceholder = document.getElementById('nav-' + pane);
+      if (navPlaceholder && navUl) {
+        navUl.style.display = '';
+        navPlaceholder.appendChild(navUl);
+      }
+
+      // Inject content into placeholder
+      const contentPlaceholder = document.getElementById('content-' + pane);
+      if (contentPlaceholder && contentDiv) {
+        // Move children from the parsed content div into the existing placeholder
+        while (contentDiv.childNodes.length > 0) {
+          contentPlaceholder.appendChild(contentDiv.childNodes[0]);
+        }
+      }
+
+      _pageCache[pane] = true;
+      delete _loadingPromises[pane];
+
+      // Re-inject copy buttons for new <pre> elements
+      _injectCopyButtons(contentPlaceholder);
+    })
+    .catch(err => {
+      delete _loadingPromises[pane];
+      console.error('Failed to load page:', pane, err);
+    });
+
+  _loadingPromises[pane] = promise;
+  return promise;
+}
+
+function _injectCopyButtons(container) {
+  if (!container) return;
+  container.querySelectorAll('pre').forEach(pre => {
+    if (pre.querySelector('.copy-btn')) return; // already has one
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText((pre.querySelector('code') || pre).textContent).then(() => {
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+      });
+    });
+    pre.appendChild(btn);
   });
+}
+
+// ─── Visibility ───
+const _allPanes = [
+  'socketley', 'socketley-sdk', 'socketley-sdk-cross',
+  'lua', 'addons',
+  'examples', 'examples-sdk', 'examples-sdk-cross'
+];
+
+function _applyVisibility() {
+  const active = _resolvePane();
+
+  // Load the page if not cached, then show
+  _loadPage(active).then(() => {
+    _allPanes.forEach(id => {
+      const np = document.getElementById('nav-' + id);
+      const cp = contentEl(id);
+      const show = id === active ? '' : 'none';
+      if (np) np.style.display = show;
+      if (cp) cp.style.display = show;
+    });
+    updateActiveNav();
+  });
+
   skSubTabs.style.display  = currentTab === 'socketley' ? '' : 'none';
   luaSubTabs.style.display = currentTab === 'lua'       ? '' : 'none';
   exSubTabs.style.display  = currentTab === 'examples'  ? '' : 'none';
@@ -70,7 +159,6 @@ function activateTab(tab) {
   const si = document.getElementById('search');
   if (si) si.value = '';
   resetSearch();
-  updateActiveNav();
 }
 
 function activateSubTab(subtab, group) {
@@ -100,7 +188,6 @@ function activateSubTab(subtab, group) {
   const si = document.getElementById('search');
   if (si) si.value = '';
   resetSearch();
-  updateActiveNav();
 }
 
 tabBtns.forEach(b    => b.addEventListener('click', () => activateTab(b.dataset.tab)));
@@ -157,7 +244,7 @@ window.addEventListener('scroll', updateActiveNav);
 
 // ─── Search ───
 function resetSearch() {
-  ['socketley', 'socketley-sdk', 'socketley-sdk-cross', 'lua', 'addons', 'examples', 'examples-sdk', 'examples-sdk-cross'].forEach(id => {
+  _allPanes.forEach(id => {
     const nav = navEl(id);
     if (!nav) return;
     nav.querySelectorAll(':scope > li').forEach(li => {
@@ -171,6 +258,7 @@ const searchInput = document.getElementById('search');
 searchInput.addEventListener('input', function() {
   const q = this.value.toLowerCase().trim();
   const nav = getActiveNav();
+  if (!nav) { resetSearch(); return; }
   const allLis = nav.querySelectorAll(':scope > li');
   if (!q) { resetSearch(); return; }
   allLis.forEach(li => {
@@ -196,20 +284,6 @@ document.querySelectorAll('.sidebar a[href]').forEach(a => {
   a.addEventListener('click', () => {
     if (window.innerWidth <= 768) { sidebar.classList.remove('open'); overlay.classList.remove('open'); }
   });
-});
-
-// ─── Copy Buttons ───
-document.querySelectorAll('pre').forEach(pre => {
-  const btn = document.createElement('button');
-  btn.className = 'copy-btn';
-  btn.textContent = 'Copy';
-  btn.addEventListener('click', () => {
-    navigator.clipboard.writeText((pre.querySelector('code') || pre).textContent).then(() => {
-      btn.textContent = 'Copied!';
-      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-    });
-  });
-  pre.appendChild(btn);
 });
 
 // ─── Init ───

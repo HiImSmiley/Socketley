@@ -1,0 +1,461 @@
+    <ul id="navList-socketley-sdk-cross" style="display:none">
+      <li class="open"><a href="#xsdk-intro">Introduction</a><ul>
+        <li><a href="#xsdk-install">Installation</a></li>
+      </ul></li>
+      <li><a href="#xsdk-ws">ws_client</a><ul>
+        <li><a href="#xsdk-ws-connect">connect</a></li>
+        <li><a href="#xsdk-ws-send">send</a></li>
+        <li><a href="#xsdk-ws-recv">recv</a></li>
+        <li><a href="#xsdk-ws-ping">send_ping</a></li>
+        <li><a href="#xsdk-ws-close">close / reconnect</a></li>
+        <li><a href="#xsdk-ws-timeout">set_recv_timeout</a></li>
+        <li><a href="#xsdk-ws-accessors">Accessors</a></li>
+        <li><a href="#xsdk-ws-types">Types</a></li>
+      </ul></li>
+      <li><a href="#xsdk-cache">cache_client</a><ul>
+        <li><a href="#xsdk-cache-connect">connect</a></li>
+        <li><a href="#xsdk-cache-strings">Strings</a></li>
+        <li><a href="#xsdk-cache-multikey">Multi-Key</a></li>
+        <li><a href="#xsdk-cache-lists">Lists</a></li>
+        <li><a href="#xsdk-cache-sets">Sets</a></li>
+        <li><a href="#xsdk-cache-hashes">Hashes</a></li>
+        <li><a href="#xsdk-cache-ttl">TTL / Expiry</a></li>
+        <li><a href="#xsdk-cache-pubsub">Pub/Sub</a></li>
+        <li><a href="#xsdk-cache-admin">Admin</a></li>
+        <li><a href="#xsdk-cache-raw">Raw Command</a></li>
+        <li><a href="#xsdk-cache-types">Types</a></li>
+      </ul></li>
+      <li><a href="#xsdk-build">Build Instructions</a><ul>
+        <li><a href="#xsdk-build-platform">Platform Notes</a></li>
+      </ul></li>
+    </ul>
+
+<div id="content-socketley-sdk-cross" class="content" style="display:none">
+
+<!-- ── Introduction ── -->
+<h2 id="xsdk-intro">Cross-Platform SDK</h2>
+<p>Header-only C++17 TCP clients that let <strong>Windows</strong>, <strong>macOS</strong>, and <strong>Linux</strong> applications connect to running Socketley runtimes over the network. No daemon required on the client side &mdash; just a TCP connection to the server&rsquo;s IP and port.</p>
+
+<table>
+<thead><tr><th>Header</th><th>Connects To</th><th>Protocol</th><th>Dependencies</th></tr></thead>
+<tbody>
+<tr><td><code>socketley/ws_client.h</code></td><td>Server runtimes</td><td>WebSocket (RFC 6455) + raw TCP text</td><td>None (embedded SHA-1 + Base64)</td></tr>
+<tr><td><code>socketley/cache_client.h</code></td><td>Cache runtimes</td><td>Text protocol (<code>COMMAND args\n</code>)</td><td>None</td></tr>
+</tbody>
+</table>
+
+<div class="info-box"><strong>Zero external dependencies.</strong> Both headers are fully self-contained. The WebSocket client embeds its own SHA-1 and Base64 implementations for the handshake &mdash; no OpenSSL needed. <code>#ifdef _WIN32</code> handles Winsock vs POSIX internally.</div>
+
+<p>Both headers ship in <code>include/windows/socketley/</code> and <code>include/darwin/socketley/</code> (byte-identical). Use whichever include path you prefer.</p>
+
+<h3 id="xsdk-install">Installation</h3>
+<p>Copy the headers into your project&rsquo;s include path:</p>
+<pre><code><span class="cm"># From the Socketley repo</span>
+cp -r include/windows/socketley/ /your/project/include/</code></pre>
+<p>That&rsquo;s it. No library to link (except Winsock on Windows, which is auto-linked via <code>#pragma comment</code>).</p>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     ws_client FULL API
+═══════════════════════════════════════════════════════════════ -->
+<h2 id="xsdk-ws">ws_client</h2>
+<p><code>#include &lt;socketley/ws_client.h&gt;</code> &mdash; WebSocket + raw TCP client with embedded SHA-1 and Base64.</p>
+<p>Non-copyable, movable. Destructor calls <code>close()</code> automatically.</p>
+
+<h3 id="xsdk-ws-connect">connect</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::connect</span>
+</div>
+<p class="method-sig">bool connect(const std::string&amp; host, uint16_t port, ws_mode mode = ws_mode::websocket, const std::string&amp; path = "/")</p>
+<p class="method-desc">Connect to a Socketley server runtime. Resolves hostname via <code>getaddrinfo</code> (IPv4/IPv6). Sets <code>TCP_NODELAY</code>. In <code>ws_mode::websocket</code>, performs the full HTTP Upgrade handshake (RFC 6455) with a random 16-byte key. In <code>ws_mode::raw_tcp</code>, opens a plain TCP connection for newline-delimited text.</p>
+<table>
+<thead><tr><th>Parameter</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>host</code></td><td>Hostname or IP address of the Socketley server</td></tr>
+<tr><td><code>port</code></td><td>Port the server runtime is listening on</td></tr>
+<tr><td><code>mode</code></td><td><code>ws_mode::websocket</code> (default) or <code>ws_mode::raw_tcp</code></td></tr>
+<tr><td><code>path</code></td><td>WebSocket path (default <code>"/"</code>, ignored in raw_tcp mode)</td></tr>
+</tbody>
+</table>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> on success, <code>false</code> on connection or handshake failure</p>
+</div>
+
+<h3 id="xsdk-ws-send">send</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::send</span>
+</div>
+<p class="method-sig">bool send(const std::string&amp; message)</p>
+<p class="method-desc">Send a text message. In WebSocket mode, builds a masked text frame (opcode 0x1, FIN bit set, random 4-byte mask). In raw TCP mode, appends <code>\n</code> and sends.</p>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> if all bytes were sent, <code>false</code> on error or disconnection</p>
+</div>
+
+<h3 id="xsdk-ws-recv">recv</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::recv</span>
+</div>
+<p class="method-sig">ws_message recv()</p>
+<p class="method-desc">Blocking receive. In WebSocket mode, parses frames from the server (which are unmasked per RFC 6455). Auto-responds to server pings with pong frames. Pong frames from the server are silently consumed. In raw TCP mode, reads until <code>\n</code> and strips trailing <code>\r</code>.</p>
+<p class="method-returns"><strong>Returns:</strong> a <code>ws_message</code> struct &mdash; check <code>.error</code> for connection failure, <code>.is_close</code> for server-initiated close, <code>.is_ping</code> for ping frames, or read <code>.data</code> for the message content</p>
+</div>
+
+<h3 id="xsdk-ws-ping">send_ping</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::send_ping</span>
+</div>
+<p class="method-sig">bool send_ping(const std::string&amp; payload = "")</p>
+<p class="method-desc">Send a WebSocket ping frame with optional payload (max 125 bytes). Only valid in <code>ws_mode::websocket</code>; returns <code>false</code> in raw_tcp mode.</p>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> if the frame was sent</p>
+</div>
+
+<h3 id="xsdk-ws-close">close / reconnect</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::close</span>
+</div>
+<p class="method-sig">void close()</p>
+<p class="method-desc">Close the connection. In WebSocket mode, sends a close frame (best-effort) before closing the socket. Safe to call multiple times or on an already-closed client.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::reconnect</span>
+</div>
+<p class="method-sig">bool reconnect()</p>
+<p class="method-desc">Close the current connection (if any) and re-connect using the same host, port, mode, and path from the last successful <code>connect()</code> call.</p>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> on success, <code>false</code> if no previous connection parameters exist or connection fails</p>
+</div>
+
+<h3 id="xsdk-ws-timeout">set_recv_timeout</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_client::set_recv_timeout</span>
+</div>
+<p class="method-sig">void set_recv_timeout(uint32_t ms)</p>
+<p class="method-desc">Set the receive timeout on the underlying socket. After <code>ms</code> milliseconds with no data, <code>recv()</code> returns with <code>.error = true</code>. Set to <code>0</code> for no timeout (blocking). Uses <code>SO_RCVTIMEO</code> &mdash; <code>DWORD</code> on Windows, <code>struct timeval</code> on POSIX.</p>
+</div>
+
+<h3 id="xsdk-ws-accessors">Accessors</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">Accessors</span>
+</div>
+<p class="method-sig">bool is_connected() const</p>
+<p class="method-sig">ws_mode mode() const</p>
+<p class="method-sig">const std::string&amp; host() const</p>
+<p class="method-sig">uint16_t port() const</p>
+<p class="method-desc">Query the client state. <code>is_connected()</code> returns <code>true</code> if the socket is open.</p>
+</div>
+
+<h3 id="xsdk-ws-types">Types</h3>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_mode</span>
+</div>
+<p class="method-sig">enum class ws_mode { websocket, raw_tcp };</p>
+<p class="method-desc">Connection mode. <code>websocket</code> performs the HTTP Upgrade handshake and uses WebSocket framing. <code>raw_tcp</code> uses plain newline-delimited text (matching Socketley server&rsquo;s text mode).</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">ws_message</span>
+</div>
+<p class="method-sig">struct ws_message { std::string data; bool is_close; bool is_ping; bool error; };</p>
+<table>
+<thead><tr><th>Field</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>data</code></td><td>Message payload (text content)</td></tr>
+<tr><td><code>is_close</code></td><td><code>true</code> if the server sent a close frame</td></tr>
+<tr><td><code>is_ping</code></td><td><code>true</code> if the server sent a ping (auto-ponged)</td></tr>
+<tr><td><code>error</code></td><td><code>true</code> on connection error or timeout</td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     cache_client FULL API
+═══════════════════════════════════════════════════════════════ -->
+<h2 id="xsdk-cache">cache_client</h2>
+<p><code>#include &lt;socketley/cache_client.h&gt;</code> &mdash; TCP client for the cache text protocol.</p>
+<p>Non-copyable, movable. Destructor calls <code>close()</code> automatically.</p>
+
+<h3 id="xsdk-cache-connect">connect</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_client::connect</span>
+</div>
+<p class="method-sig">bool connect(const std::string&amp; host, uint16_t port)</p>
+<p class="method-desc">Connect to a Socketley cache runtime via TCP. Resolves hostname via <code>getaddrinfo</code> (IPv4/IPv6). Sets <code>TCP_NODELAY</code>.</p>
+<table>
+<thead><tr><th>Parameter</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>host</code></td><td>Hostname or IP address of the cache runtime</td></tr>
+<tr><td><code>port</code></td><td>Port the cache runtime is listening on</td></tr>
+</tbody>
+</table>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> on success</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_client::close</span>
+</div>
+<p class="method-sig">void close()</p>
+<p class="method-desc">Close the connection. Safe to call multiple times.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_client::reconnect</span>
+</div>
+<p class="method-sig">bool reconnect()</p>
+<p class="method-desc">Re-connect using the host and port from the last <code>connect()</code> call.</p>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> on success</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_client::is_connected</span>
+</div>
+<p class="method-sig">bool is_connected() const</p>
+<p class="method-desc">Returns <code>true</code> if the socket is open.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_client::set_recv_timeout</span>
+</div>
+<p class="method-sig">void set_recv_timeout(uint32_t ms)</p>
+<p class="method-desc">Set the receive timeout. After <code>ms</code> milliseconds with no data, commands return with <code>ok = false</code>. Set to <code>0</code> for no timeout.</p>
+</div>
+
+<h3 id="xsdk-cache-strings">Strings</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">get / set / del</span>
+</div>
+<p class="method-sig">cache_result get(const std::string&amp; key)</p>
+<p class="method-sig">cache_result set(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result del(const std::string&amp; key)</p>
+<p class="method-desc">Basic string operations. <code>get</code> returns the value in <code>.value</code> (<code>"nil"</code> if key doesn&rsquo;t exist &mdash; check with <code>.is_nil()</code>). <code>set</code> returns <code>"ok"</code>. <code>del</code> returns <code>"ok"</code> or <code>"nil"</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">exists / type</span>
+</div>
+<p class="method-sig">cache_result exists(const std::string&amp; key)</p>
+<p class="method-sig">cache_result type(const std::string&amp; key)</p>
+<p class="method-desc"><code>exists</code> returns <code>.integer = 1</code> if key exists, <code>0</code> otherwise. <code>type</code> returns the key type in <code>.value</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">incr / decr / incrby / decrby</span>
+</div>
+<p class="method-sig">cache_result incr(const std::string&amp; key)</p>
+<p class="method-sig">cache_result decr(const std::string&amp; key)</p>
+<p class="method-sig">cache_result incrby(const std::string&amp; key, int64_t delta)</p>
+<p class="method-sig">cache_result decrby(const std::string&amp; key, int64_t delta)</p>
+<p class="method-desc">Atomic increment/decrement. Returns the new value in <code>.integer</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">append / strlen</span>
+</div>
+<p class="method-sig">cache_result append(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result strlen(const std::string&amp; key)</p>
+<p class="method-desc"><code>append</code> appends to the string value and returns the new length in <code>.integer</code>. <code>strlen</code> returns the string length in <code>.integer</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">getset / setnx / setex / psetex</span>
+</div>
+<p class="method-sig">cache_result getset(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result setnx(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result setex(const std::string&amp; key, int seconds, const std::string&amp; value)</p>
+<p class="method-sig">cache_result psetex(const std::string&amp; key, int64_t ms, const std::string&amp; value)</p>
+<p class="method-desc"><code>getset</code> sets a new value and returns the old one. <code>setnx</code> sets only if the key doesn&rsquo;t exist (<code>.integer = 1</code> on success, <code>0</code> if already set). <code>setex</code>/<code>psetex</code> set with a TTL in seconds/milliseconds.</p>
+</div>
+
+<h3 id="xsdk-cache-multikey">Multi-Key</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">mget / mset</span>
+</div>
+<p class="method-sig">cache_result mget(const std::vector&lt;std::string&gt;&amp; keys)</p>
+<p class="method-sig">cache_result mset(const std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;&amp; kvs)</p>
+<p class="method-desc"><code>mget</code> returns values in <code>.values</code> (in order). <code>mset</code> sets multiple key-value pairs atomically.</p>
+</div>
+
+<h3 id="xsdk-cache-lists">Lists</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">lpush / rpush / lpop / rpop</span>
+</div>
+<p class="method-sig">cache_result lpush(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result rpush(const std::string&amp; key, const std::string&amp; value)</p>
+<p class="method-sig">cache_result lpop(const std::string&amp; key)</p>
+<p class="method-sig">cache_result rpop(const std::string&amp; key)</p>
+<p class="method-desc">Push to/pop from the left or right of a list. Pop returns the removed element in <code>.value</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">llen / lindex / lrange</span>
+</div>
+<p class="method-sig">cache_result llen(const std::string&amp; key)</p>
+<p class="method-sig">cache_result lindex(const std::string&amp; key, int index)</p>
+<p class="method-sig">cache_result lrange(const std::string&amp; key, int start, int stop)</p>
+<p class="method-desc"><code>llen</code> returns the list length in <code>.integer</code>. <code>lindex</code> returns the element at the given index in <code>.value</code>. <code>lrange</code> returns a range of elements in <code>.values</code> (supports negative indices).</p>
+</div>
+
+<h3 id="xsdk-cache-sets">Sets</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">sadd / srem / sismember / scard / smembers</span>
+</div>
+<p class="method-sig">cache_result sadd(const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-sig">cache_result srem(const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-sig">cache_result sismember(const std::string&amp; key, const std::string&amp; member)</p>
+<p class="method-sig">cache_result scard(const std::string&amp; key)</p>
+<p class="method-sig">cache_result smembers(const std::string&amp; key)</p>
+<p class="method-desc"><code>sadd</code>/<code>srem</code> add/remove a member. <code>sismember</code> returns <code>.integer = 1</code> if the member exists. <code>scard</code> returns the set size in <code>.integer</code>. <code>smembers</code> returns all members in <code>.values</code>.</p>
+</div>
+
+<h3 id="xsdk-cache-hashes">Hashes</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">hset / hget / hdel / hlen / hgetall</span>
+</div>
+<p class="method-sig">cache_result hset(const std::string&amp; key, const std::string&amp; field, const std::string&amp; value)</p>
+<p class="method-sig">cache_result hget(const std::string&amp; key, const std::string&amp; field)</p>
+<p class="method-sig">cache_result hdel(const std::string&amp; key, const std::string&amp; field)</p>
+<p class="method-sig">cache_result hlen(const std::string&amp; key)</p>
+<p class="method-sig">cache_result hgetall(const std::string&amp; key)</p>
+<p class="method-desc"><code>hset</code> sets a field in a hash. <code>hget</code> returns the field value. <code>hdel</code> removes a field. <code>hlen</code> returns the number of fields in <code>.integer</code>. <code>hgetall</code> returns alternating field/value pairs in <code>.values</code>.</p>
+</div>
+
+<h3 id="xsdk-cache-ttl">TTL / Expiry</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">expire / pexpire / ttl / pttl / persist</span>
+</div>
+<p class="method-sig">cache_result expire(const std::string&amp; key, int seconds)</p>
+<p class="method-sig">cache_result pexpire(const std::string&amp; key, int64_t ms)</p>
+<p class="method-sig">cache_result ttl(const std::string&amp; key)</p>
+<p class="method-sig">cache_result pttl(const std::string&amp; key)</p>
+<p class="method-sig">cache_result persist(const std::string&amp; key)</p>
+<p class="method-desc"><code>expire</code>/<code>pexpire</code> set a TTL in seconds/milliseconds. <code>ttl</code>/<code>pttl</code> return the remaining TTL in <code>.integer</code> (<code>-1</code> = no expiry, <code>-2</code> = key doesn&rsquo;t exist). <code>persist</code> removes the TTL.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">expireat / pexpireat</span>
+</div>
+<p class="method-sig">cache_result expireat(const std::string&amp; key, int64_t unix_seconds)</p>
+<p class="method-sig">cache_result pexpireat(const std::string&amp; key, int64_t unix_ms)</p>
+<p class="method-desc">Set expiry to an absolute Unix timestamp (seconds or milliseconds).</p>
+</div>
+
+<h3 id="xsdk-cache-pubsub">Pub/Sub</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">publish / subscribe / unsubscribe</span>
+</div>
+<p class="method-sig">cache_result publish(const std::string&amp; channel, const std::string&amp; message)</p>
+<p class="method-sig">cache_result subscribe(const std::string&amp; channel)</p>
+<p class="method-sig">cache_result unsubscribe(const std::string&amp; channel)</p>
+<p class="method-desc"><code>publish</code> sends a message to a channel and returns the number of subscribers in <code>.integer</code>. <code>subscribe</code> registers for push messages on a channel. <code>unsubscribe</code> stops receiving.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">recv_message</span>
+</div>
+<p class="method-sig">cache_result recv_message()</p>
+<p class="method-desc">Blocking read for the next pub/sub message. Returns the channel name in <code>.values[0]</code> and the message payload in <code>.value</code>. Returns <code>.ok = false</code> on connection error.</p>
+</div>
+
+<h3 id="xsdk-cache-admin">Admin</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">size / memory / maxmemory</span>
+</div>
+<p class="method-sig">cache_result size()</p>
+<p class="method-sig">cache_result memory()</p>
+<p class="method-sig">cache_result maxmemory()</p>
+<p class="method-desc"><code>size</code> returns the number of keys in <code>.integer</code>. <code>memory</code> returns estimated memory usage in bytes in <code>.integer</code>. <code>maxmemory</code> returns the configured memory limit in <code>.integer</code>.</p>
+</div>
+
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">keys / scan / flush / load</span>
+</div>
+<p class="method-sig">cache_result keys(const std::string&amp; pattern = "*")</p>
+<p class="method-sig">cache_result scan(uint64_t cursor, const std::string&amp; pattern = "*", size_t count = 10)</p>
+<p class="method-sig">cache_result flush()</p>
+<p class="method-sig">cache_result load()</p>
+<p class="method-desc"><code>keys</code> returns all matching keys in <code>.values</code>. <code>scan</code> iterates keys incrementally &mdash; <code>.integer</code> = next cursor, <code>.values</code> = matching keys. <code>flush</code> deletes all keys. <code>load</code> reloads persisted data from disk.</p>
+</div>
+
+<h3 id="xsdk-cache-raw">Raw Command</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">execute</span>
+</div>
+<p class="method-sig">cache_result execute(const std::string&amp; command)</p>
+<p class="method-desc">Send any text-protocol command string. Returns the single-line response in <code>.value</code>.</p>
+</div>
+
+<h3 id="xsdk-cache-types">Types</h3>
+<div class="method-card">
+<div class="method-header">
+  <span class="method-name">cache_result</span>
+</div>
+<p class="method-sig">struct cache_result { bool ok; std::string value; std::vector&lt;std::string&gt; values; int64_t integer; bool is_nil(); explicit operator bool(); };</p>
+<table>
+<thead><tr><th>Field</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>ok</code></td><td><code>true</code> if the command succeeded (no error response)</td></tr>
+<tr><td><code>value</code></td><td>Single-line response string</td></tr>
+<tr><td><code>values</code></td><td>Multi-line responses (lrange, smembers, hgetall, keys, mget, scan)</td></tr>
+<tr><td><code>integer</code></td><td>Numeric result for integer commands (incr, exists, ttl, etc.)</td></tr>
+<tr><td><code>is_nil()</code></td><td>Returns <code>true</code> if value is <code>"nil"</code> (key not found)</td></tr>
+<tr><td><code>operator bool()</code></td><td>Returns <code>ok</code> &mdash; allows <code>if (result) { ... }</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     BUILD INSTRUCTIONS
+═══════════════════════════════════════════════════════════════ -->
+<h2 id="xsdk-build">Build Instructions</h2>
+<p>Copy the headers to your project and compile with C++17:</p>
+<pre><code><span class="cm"># Windows (MSVC)</span>
+cl /std:c++17 /EHsc /I include\windows myapp.cpp
+
+<span class="cm"># macOS (clang++)</span>
+clang++ -std=c++17 -I include/darwin myapp.cpp -o myapp
+
+<span class="cm"># Linux (g++ &mdash; also works)</span>
+g++ -std=c++17 -I include/windows myapp.cpp -o myapp</code></pre>
+
+<h3 id="xsdk-build-platform">Platform Notes</h3>
+<table>
+<thead><tr><th>Platform</th><th>SIGPIPE Handling</th><th>Linking</th></tr></thead>
+<tbody>
+<tr><td><strong>Windows</strong></td><td>N/A (no SIGPIPE)</td><td><code>ws2_32.lib</code> auto-linked via <code>#pragma comment</code></td></tr>
+<tr><td><strong>macOS</strong></td><td><code>SO_NOSIGPIPE</code> set per-socket automatically</td><td>No extra libs needed</td></tr>
+<tr><td><strong>Linux</strong></td><td><code>MSG_NOSIGNAL</code> flag on every <code>send()</code> call</td><td>No extra libs needed</td></tr>
+</tbody>
+</table>
+
+<div class="info-box"><strong>Single include.</strong> Each header is fully self-contained. <code>ws_client.h</code> embeds SHA-1 and Base64 for the WebSocket handshake. <code>cache_client.h</code> speaks plain text. No OpenSSL, no Boost, no dependencies beyond the C++17 standard library and the OS socket API.</div>
+
+</div><!-- #content-socketley-sdk-cross -->
