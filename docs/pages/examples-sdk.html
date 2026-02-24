@@ -13,8 +13,14 @@
       </ul></li>
       <li><a href="#exsdk-tier2">Tier 2: Embedded Engine</a><ul>
         <li><a href="#exsdk-wrapper-echo">Echo Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-client">Client (Wrapper)</a></li>
         <li><a href="#exsdk-wrapper-proxy">TCP Proxy (Wrapper)</a></li>
         <li><a href="#exsdk-wrapper-cache">Cache (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-chat">Chat Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-reconnect">Reconnecting Client (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-heartbeat">Heartbeat Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-tls">TLS Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-httpfiles">HTTP File Server (Wrapper)</a></li>
         <li><a href="#exsdk-echo">Echo Server (Raw)</a></li>
         <li><a href="#exsdk-multi">Multi-Runtime (Raw)</a></li>
         <li><a href="#exsdk-chat">Chat Server (Lua)</a></li>
@@ -541,6 +547,42 @@
 <pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
 </div>
 
+<div class="method-card" id="exsdk-wrapper-client">
+<div class="method-header">
+  <span class="method-name">Client (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-client">Client</span>
+</div>
+<p class="method-desc">A minimal TCP client that connects to a server, sends a message, and prints the reply. Demonstrates <code>socketley::client</code> with <code>on_connect</code>, <code>on_message</code>, and <code>send()</code>.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/client.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::client <span class="fn">cli</span>(<span class="st">"127.0.0.1"</span>, <span class="nb">9000</span>);
+
+    cli.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span>) {
+        printf(<span class="st">"connected to server\n"</span>);
+        cli.<span class="fn">send</span>(<span class="st">"hello from SDK client\n"</span>);
+    });
+
+    cli.<span class="fn">on_message</span>([](std::string_view msg) {
+        printf(<span class="st">"server: %.*s\n"</span>, (<span class="kw">int</span>)msg.size(), msg.data());
+    });
+
+    cli.<span class="fn">on_disconnect</span>([](<span class="kw">int</span>) {
+        printf(<span class="st">"disconnected\n"</span>);
+    });
+
+    cli.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 client.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o client</code></pre>
+<p><strong>Test:</strong> Start an echo server on port 9000 first, then run the client.</p>
+</div>
+
 <div class="method-card" id="exsdk-wrapper-proxy">
 <div class="method-header">
   <span class="method-name">TCP Proxy (Wrapper)</span>
@@ -588,6 +630,279 @@
 <p><strong>Compile:</strong></p>
 <pre><code>g++ -std=c++23 cache.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o cache</code></pre>
 <p><strong>Test:</strong> Use <code>redis-benchmark</code> or <code>redis-cli</code> against port 6379.</p>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-chat">
+<div class="method-header">
+  <span class="method-name">Chat Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A chat server with nicknames, commands (<code>/nick</code>, <code>/who</code>, <code>/quit</code>), and broadcast. Uses <code>set_data</code>/<code>get_data</code> for per-connection state, <code>peer_ip</code> for logging, and <code>clients()</code> for user listing.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;string&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+
+    srv.<span class="fn">on_start</span>([] {
+        printf(<span class="st">"chat server ready on port 9000\n"</span>);
+    });
+
+    srv.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span> fd) {
+        std::string name = <span class="st">"user_"</span> + std::to_string(fd);
+        srv.<span class="fn">set_data</span>(fd, <span class="st">"nick"</span>, name);
+        srv.<span class="fn">send</span>(fd, <span class="st">"Welcome! You are "</span> + name + <span class="st">". Use /nick &lt;name&gt; to change.\n"</span>);
+        srv.<span class="fn">broadcast</span>(<span class="st">"["</span> + name + <span class="st">" joined]\n"</span>);
+        printf(<span class="st">"[+] %s (%s)\n"</span>, name.c_str(), srv.<span class="fn">peer_ip</span>(fd).c_str());
+    });
+
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        std::string nick = srv.<span class="fn">get_data</span>(fd, <span class="st">"nick"</span>);
+        std::string_view trimmed = msg;
+        <span class="kw">while</span> (!trimmed.empty() &amp;&amp; (trimmed.back() == <span class="st">'\n'</span> || trimmed.back() == <span class="st">'\r'</span>))
+            trimmed.remove_suffix(<span class="nb">1</span>);
+
+        <span class="kw">if</span> (trimmed.starts_with(<span class="st">"/nick "</span>) &amp;&amp; trimmed.size() &gt; <span class="nb">6</span>) {
+            std::string old_nick = nick;
+            std::string new_nick(trimmed.substr(<span class="nb">6</span>));
+            srv.<span class="fn">set_data</span>(fd, <span class="st">"nick"</span>, new_nick);
+            srv.<span class="fn">broadcast</span>(<span class="st">"["</span> + old_nick + <span class="st">" is now "</span> + new_nick + <span class="st">"]\n"</span>);
+            <span class="kw">return</span>;
+        }
+        <span class="kw">if</span> (trimmed == <span class="st">"/who"</span>) {
+            std::string list = <span class="st">"Online:"</span>;
+            <span class="kw">for</span> (<span class="kw">int</span> id : srv.<span class="fn">clients</span>())
+                list += <span class="st">" "</span> + srv.<span class="fn">get_data</span>(id, <span class="st">"nick"</span>);
+            srv.<span class="fn">send</span>(fd, list + <span class="st">"\n"</span>);
+            <span class="kw">return</span>;
+        }
+        <span class="kw">if</span> (trimmed == <span class="st">"/quit"</span>) {
+            srv.<span class="fn">send</span>(fd, <span class="st">"Goodbye!\n"</span>);
+            srv.<span class="fn">disconnect</span>(fd);
+            <span class="kw">return</span>;
+        }
+        srv.<span class="fn">broadcast</span>(<span class="st">"["</span> + nick + <span class="st">"] "</span> + std::string(msg));
+    });
+
+    srv.<span class="fn">on_disconnect</span>([&amp;](<span class="kw">int</span> fd) {
+        std::string nick = srv.<span class="fn">get_data</span>(fd, <span class="st">"nick"</span>);
+        srv.<span class="fn">broadcast</span>(<span class="st">"["</span> + nick + <span class="st">" left]\n"</span>);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 chat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat_server</code></pre>
+<p><strong>Test:</strong> Open multiple terminals with <code>nc 127.0.0.1 9000</code>. Try <code>/nick Alice</code>, <code>/who</code>, then type messages.</p>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-reconnect">
+<div class="method-header">
+  <span class="method-name">Reconnecting Client (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-client">Client</span>
+</div>
+<p class="method-desc">A client with auto-reconnect and periodic heartbeat pings. Demonstrates <code>reconnect()</code>, <code>tick_interval()</code>, and <code>on_tick</code>.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/client.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::client <span class="fn">cli</span>(<span class="st">"127.0.0.1"</span>, <span class="nb">9000</span>);
+
+    cli.<span class="fn">reconnect</span>(<span class="nb">10</span>);
+    cli.<span class="fn">tick_interval</span>(<span class="nb">5000</span>);
+
+    cli.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span>) {
+        printf(<span class="st">"[connected] sending hello\n"</span>);
+        cli.<span class="fn">send</span>(<span class="st">"hello\n"</span>);
+    });
+
+    cli.<span class="fn">on_disconnect</span>([](<span class="kw">int</span>) {
+        printf(<span class="st">"[disconnected] will reconnect...\n"</span>);
+    });
+
+    cli.<span class="fn">on_message</span>([](std::string_view msg) {
+        printf(<span class="st">"[recv] %.*s\n"</span>, (<span class="kw">int</span>)msg.size(), msg.data());
+    });
+
+    cli.<span class="fn">on_tick</span>([&amp;](<span class="kw">double</span> dt) {
+        printf(<span class="st">"[tick] %.0f ms &mdash; sending ping\n"</span>, dt);
+        cli.<span class="fn">send</span>(<span class="st">"ping\n"</span>);
+    });
+
+    cli.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 reconnecting_client.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o reconnecting_client</code></pre>
+<p><strong>Test:</strong> Start an echo server, run the client, then kill and restart the server &mdash; the client reconnects automatically.</p>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-heartbeat">
+<div class="method-header">
+  <span class="method-name">Heartbeat Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A server that disconnects idle clients after 30 seconds. Uses <code>set_data</code>/<code>get_data</code> for last-seen timestamps, <code>on_tick</code> for periodic checks, and <code>idle_timeout</code> as a network-level backup.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;ctime&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;string&gt;</span>
+
+<span class="kw">static</span> std::string <span class="fn">now_str</span>()
+{
+    <span class="kw">return</span> std::to_string(<span class="kw">static_cast</span>&lt;<span class="kw">long</span>&gt;(time(<span class="kw">nullptr</span>)));
+}
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+    <span class="kw">constexpr long</span> idle_limit = <span class="nb">30</span>;
+
+    srv.<span class="fn">tick_interval</span>(<span class="nb">1000</span>);
+    srv.<span class="fn">idle_timeout</span>(<span class="nb">60</span>);
+
+    srv.<span class="fn">on_start</span>([] {
+        printf(<span class="st">"heartbeat server on port 9000 (idle limit: 30s)\n"</span>);
+    });
+
+    srv.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span> fd) {
+        srv.<span class="fn">set_data</span>(fd, <span class="st">"last_seen"</span>, <span class="fn">now_str</span>());
+        srv.<span class="fn">send</span>(fd, <span class="st">"connected &mdash; send data to stay alive\n"</span>);
+        printf(<span class="st">"[+] client %d (%s)\n"</span>, fd, srv.<span class="fn">peer_ip</span>(fd).c_str());
+    });
+
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        srv.<span class="fn">set_data</span>(fd, <span class="st">"last_seen"</span>, <span class="fn">now_str</span>());
+        srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+    });
+
+    srv.<span class="fn">on_tick</span>([&amp;](<span class="kw">double</span>) {
+        <span class="kw">long</span> now = <span class="kw">static_cast</span>&lt;<span class="kw">long</span>&gt;(time(<span class="kw">nullptr</span>));
+        <span class="kw">for</span> (<span class="kw">int</span> fd : srv.<span class="fn">clients</span>()) {
+            std::string ts = srv.<span class="fn">get_data</span>(fd, <span class="st">"last_seen"</span>);
+            <span class="kw">if</span> (ts.empty()) <span class="kw">continue</span>;
+            <span class="kw">long</span> last = std::stol(ts);
+            <span class="kw">if</span> (now - last &gt; idle_limit) {
+                printf(<span class="st">"[idle] disconnecting client %d\n"</span>, fd);
+                srv.<span class="fn">send</span>(fd, <span class="st">"idle timeout &mdash; disconnecting\n"</span>);
+                srv.<span class="fn">disconnect</span>(fd);
+            }
+        }
+    });
+
+    srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"[-] client %d\n"</span>, fd);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 heartbeat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o heartbeat_server</code></pre>
+<p><strong>Test:</strong> Connect with <code>nc 127.0.0.1 9000</code> and wait 30 seconds without sending data.</p>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-tls">
+<div class="method-header">
+  <span class="method-name">TLS Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A production-hardened TLS echo server with connection cap, rate limiting, and idle timeout. Demonstrates <code>tls()</code>, <code>max_connections()</code>, <code>rate_limit()</code>, and <code>peer_ip()</code>.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">9443</span>);
+
+    srv.<span class="fn">tls</span>(<span class="st">"cert.pem"</span>, <span class="st">"key.pem"</span>)
+       .<span class="fn">max_connections</span>(<span class="nb">10000</span>)
+       .<span class="fn">rate_limit</span>(<span class="nb">100</span>)
+       .<span class="fn">idle_timeout</span>(<span class="nb">60</span>);
+
+    srv.<span class="fn">on_start</span>([] {
+        printf(<span class="st">"TLS server ready on port 9443\n"</span>);
+    });
+
+    srv.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span> fd) {
+        printf(<span class="st">"[+] %s (fd %d)\n"</span>, srv.<span class="fn">peer_ip</span>(fd).c_str(), fd);
+    });
+
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+    });
+
+    srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"[-] fd %d\n"</span>, fd);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 tls_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o tls_server</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code><span class="cm"># Generate self-signed cert:</span>
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj <span class="st">"/CN=localhost"</span>
+<span class="cm"># Connect:</span>
+openssl s_client -connect 127.0.0.1:9443 -quiet &lt;&lt;&lt; <span class="st">"hello"</span></code></pre>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-httpfiles">
+<div class="method-header">
+  <span class="method-name">HTTP File Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A static HTTP file server with response caching and access logging. Demonstrates <code>http_dir()</code>, <code>http_cache()</code>, and lifecycle callbacks.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">8080</span>);
+
+    srv.<span class="fn">http_dir</span>(<span class="st">"./public"</span>)
+       .<span class="fn">http_cache</span>()
+       .<span class="fn">idle_timeout</span>(<span class="nb">30</span>);
+
+    srv.<span class="fn">on_start</span>([] {
+        printf(<span class="st">"HTTP file server on port 8080 (serving ./public)\n"</span>);
+    });
+
+    srv.<span class="fn">on_stop</span>([] {
+        printf(<span class="st">"HTTP file server stopped\n"</span>);
+    });
+
+    srv.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span> fd) {
+        printf(<span class="st">"[+] %s\n"</span>, srv.<span class="fn">peer_ip</span>(fd).c_str());
+    });
+
+    srv.<span class="fn">on_disconnect</span>([&amp;](<span class="kw">int</span> fd) {
+        printf(<span class="st">"[-] fd %d\n"</span>, fd);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 http_file_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o http_file_server</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>mkdir -p ./public &amp;&amp; echo <span class="st">"&lt;h1&gt;Hello&lt;/h1&gt;"</span> &gt; ./public/index.html
+curl http://127.0.0.1:8080/index.html</code></pre>
 </div>
 
 <div class="method-card" id="exsdk-echo">

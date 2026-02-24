@@ -1,19 +1,13 @@
-// Socketley SDK — standalone server example (no daemon required)
+// Socketley SDK — echo server example (no daemon required)
 //
-// Build (with LuaJIT):
-//   g++ -std=c++23 sdk/examples/standalone_server.cpp \
+// Build:
+//   g++ -std=c++23 sdk/examples/basic/echo_server.cpp \
 //       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
 //       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/standalone_server
+//       -o /tmp/echo_server
 //
-// Build (without LuaJIT):
-//   g++ -std=c++23 -DSOCKETLEY_NO_LUA sdk/examples/standalone_server.cpp \
-//       -I. -Iinclude/linux \
-//       -Lbin/Release -lsocketley_sdk_nolua -luring -lssl -lcrypto \
-//       -o /tmp/standalone_server_nolua
-//
-// Run: /tmp/standalone_server
-// Test: echo "hello" | nc 127.0.0.1 9000
+// Run: /tmp/echo_server
+// Test: echo "hello" | nc -q1 127.0.0.1 9000
 
 #include <socketley/server.h>
 #include <cstdio>
