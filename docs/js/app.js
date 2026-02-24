@@ -71,11 +71,11 @@ function _loadPage(pane) {
       const navUl = tmp.querySelector('ul[id^="navList-"]');
       const contentDiv = tmp.querySelector('[id^="content-"]');
 
-      // Inject nav into placeholder (strip inline display:none — container handles visibility)
-      const navPlaceholder = document.getElementById('nav-' + pane);
-      if (navPlaceholder && navUl) {
-        navUl.style.display = '';
-        navPlaceholder.appendChild(navUl);
+      // Inject nav <ul> directly into <nav> (strip inline display:none from partial)
+      const sidebarNav = document.getElementById('sidebarNav');
+      if (sidebarNav && navUl) {
+        navUl.style.display = 'none';
+        sidebarNav.appendChild(navUl);
       }
 
       // Inject content into placeholder
@@ -132,7 +132,7 @@ function _applyVisibility() {
   // Load the page if not cached, then show
   _loadPage(active).then(() => {
     _allPanes.forEach(id => {
-      const np = document.getElementById('nav-' + id);
+      const np = navEl(id);
       const cp = contentEl(id);
       const show = id === active ? '' : 'none';
       if (np) np.style.display = show;

@@ -96,28 +96,28 @@ body {
 
 /* ===== Nav ===== */
 .sidebar nav ul { list-style: none; }
-.sidebar nav > div > ul > li > a {
+.sidebar nav > ul > li > a {
   display: block; padding: 8px 20px; color: #b0b0cc; text-decoration: none;
   font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
   transition: color .2s, background .2s; cursor: pointer;
 }
-.sidebar nav > div > ul > li > a:hover,
-.sidebar nav > div > ul > li > a.active { color: #fff; background: rgba(67,97,238,.15); }
-.sidebar nav > div > ul > li > a.active { border-left: 3px solid #4361ee; padding-left: 17px; }
-.sidebar nav > div > ul > li > ul { display: block; }
-.sidebar nav > div > ul > li > ul > li > a {
+.sidebar nav > ul > li > a:hover,
+.sidebar nav > ul > li > a.active { color: #fff; background: rgba(67,97,238,.15); }
+.sidebar nav > ul > li > a.active { border-left: 3px solid #4361ee; padding-left: 17px; }
+.sidebar nav > ul > li > ul { display: block; }
+.sidebar nav > ul > li > ul > li > a {
   display: block; padding: 5px 20px 5px 36px; color: #9090b0; text-decoration: none;
   font-size: 13px; transition: color .2s;
 }
-.sidebar nav > div > ul > li > ul > li > a:hover { color: #e0e0e0; }
-.sidebar nav > div > ul > li > ul > li > a.active { color: #4361ee; }
-.sidebar nav > div > ul > li > ul > li > ul { margin: 0; padding: 0; }
-.sidebar nav > div > ul > li > ul > li > ul > li > a {
+.sidebar nav > ul > li > ul > li > a:hover { color: #e0e0e0; }
+.sidebar nav > ul > li > ul > li > a.active { color: #4361ee; }
+.sidebar nav > ul > li > ul > li > ul { margin: 0; padding: 0; }
+.sidebar nav > ul > li > ul > li > ul > li > a {
   display: block; padding: 4px 20px 4px 48px; color: #7878a0; text-decoration: none;
   font-size: 12px; transition: color .2s;
 }
-.sidebar nav > div > ul > li > ul > li > ul > li > a:hover { color: #e0e0e0; }
-.sidebar nav > div > ul > li > ul > li > ul > li > a.active { color: #4361ee; }
+.sidebar nav > ul > li > ul > li > ul > li > a:hover { color: #e0e0e0; }
+.sidebar nav > ul > li > ul > li > ul > li > a.active { color: #4361ee; }
 
 /* ===== Mobile Toggle ===== */
 .menu-toggle {
