@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
 #include <liburing.h>
 #include <sstream>
 #include <algorithm>
@@ -99,6 +100,35 @@ void server_instance::set_http_cache(bool enabled)
 bool server_instance::get_http_cache() const
 {
     return m_http_cache_enabled;
+}
+
+void server_instance::add_upstream_target(std::string_view addr)
+{
+    upstream_target t;
+    t.address = std::string(addr);
+    auto colon = addr.rfind(':');
+    if (colon != std::string_view::npos)
+    {
+        t.resolved_host = std::string(addr.substr(0, colon));
+        auto port_sv = addr.substr(colon + 1);
+        std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), t.resolved_port);
+    }
+    else
+    {
+        t.resolved_host = std::string(addr);
+        t.resolved_port = 0;
+    }
+    m_upstream_targets.push_back(std::move(t));
+}
+
+void server_instance::clear_upstream_targets()
+{
+    m_upstream_targets.clear();
+}
+
+const std::vector<upstream_target>& server_instance::get_upstream_targets() const
+{
+    return m_upstream_targets;
 }
 
 static std::string_view http_content_type(std::string_view ext)
@@ -366,7 +396,10 @@ size_t server_instance::get_connection_count() const
 {
     if (m_udp)
         return m_udp_peers.size();
-    return m_clients.size() + m_forwarded_clients.size();
+    size_t upstream_connected = 0;
+    for (const auto& [_, uc] : m_upstreams)
+        if (uc->connected) ++upstream_connected;
+    return m_clients.size() + m_forwarded_clients.size() + upstream_connected;
 }
 
 bool server_instance::setup(event_loop& loop)
@@ -483,6 +516,22 @@ bool server_instance::setup(event_loop& loop)
         m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
     }
 
+    // Connect to upstreams
+    // Clear stale upstream connections from a previous stop (deferred for CQE safety)
+    m_upstreams.clear();
+    m_upstream_by_fd.clear();
+    m_next_upstream_id = 1;
+    for (const auto& target : m_upstream_targets)
+    {
+        auto uc = std::make_unique<upstream_connection>();
+        uc->conn_id = m_next_upstream_id++;
+        uc->target = target;
+        auto* ptr = uc.get();
+        m_upstreams[uc->conn_id] = std::move(uc);
+        if (!upstream_try_connect(ptr))
+            upstream_schedule_reconnect(ptr);
+    }
+
     return true;
 }
 
@@ -555,6 +604,30 @@ void server_instance::teardown(event_loop& loop)
         conn->write_batch_count = 0;
     }
 
+    // Tear down upstream connections
+    for (auto& [cid, uc] : m_upstreams)
+    {
+        // Null timeout owner to prevent stale CQE dispatch
+        uc->timeout_req.owner = nullptr;
+
+        if (uc->fd >= 0)
+        {
+            m_upstream_by_fd.erase(uc->fd);
+            shutdown(uc->fd, SHUT_RDWR);
+            close(uc->fd);
+            uc->fd = -1;
+        }
+        uc->connected = false;
+        // Release write queue refs
+        while (!uc->write_queue.empty())
+            uc->write_queue.pop();
+        for (size_t j = 0; j < uc->write_batch_count; j++)
+            uc->write_batch[j].reset();
+        uc->write_batch_count = 0;
+    }
+    // Do NOT clear m_upstreams here — keep structs alive for pending CQEs.
+    // They are freed in the next setup() call.
+
     // Do NOT call m_clients.clear() here.  The server_connection objects must
     // stay alive until the server_instance itself is destroyed (see setup() for
     // when they are freed on a restart, or the destructor for the remove case).
@@ -608,13 +681,29 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_read_provided:
         case op_write:
         case op_writev:
-            if (req->fd < 0 || req->fd >= MAX_FDS || !m_conn_idx[req->fd])
-                return;
-            if (req->type == op_read || req->type == op_read_provided)
-                handle_read(cqe, req);
+        {
+            if (req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd])
+            {
+                // Client connection (fast path)
+                if (req->type == op_read || req->type == op_read_provided)
+                    handle_read(cqe, req);
+                else
+                    handle_write(cqe, req);
+            }
             else
-                handle_write(cqe, req);
+            {
+                // Check upstream connections
+                auto uit = m_upstream_by_fd.find(req->fd);
+                if (uit != m_upstream_by_fd.end())
+                {
+                    if (req->type == op_read || req->type == op_read_provided)
+                        handle_upstream_read(cqe, uit->second);
+                    else
+                        handle_upstream_write(cqe, uit->second);
+                }
+            }
             break;
+        }
         case op_timeout:
             if (req == &m_idle_sweep_req)
             {
@@ -639,6 +728,20 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 {
                     m_accept_addrlen = sizeof(m_accept_addr);
                     m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                }
+            }
+            else
+            {
+                // Upstream reconnect timers
+                for (auto& [cid, uc] : m_upstreams)
+                {
+                    if (req == &uc->timeout_req)
+                    {
+                        uc->reconnect_attempt++;
+                        if (!upstream_try_connect(uc.get()))
+                            upstream_schedule_reconnect(uc.get());
+                        break;
+                    }
                 }
             }
             break;
@@ -1664,6 +1767,13 @@ std::string server_instance::get_stats() const
         << "udp:" << (m_udp ? "true" : "false") << "\n";
     if (m_mode == mode_master)
         out << "master_fd:" << m_master_fd << "\n";
+    if (!m_upstream_targets.empty())
+    {
+        size_t connected = 0;
+        for (const auto& [_, uc] : m_upstreams)
+            if (uc->connected) ++connected;
+        out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n";
+    }
     return out.str();
 }
 
@@ -1828,4 +1938,330 @@ std::string server_instance::lua_get_data(int fd, std::string_view key) const
     const auto& m = m_conn_idx[fd]->meta;
     auto it = m.find(std::string(key));
     return (it != m.end()) ? it->second : "";
+}
+
+// ─── Upstream Connections ───
+
+bool server_instance::upstream_try_connect(upstream_connection* uc)
+{
+    if (!m_loop)
+        return false;
+
+    const auto& host = uc->target.resolved_host;
+    uint16_t port = uc->target.resolved_port;
+    if (host.empty() || port == 0)
+        return false;
+
+    // DNS resolve
+    struct addrinfo hints{}, *addrs = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_buf[8];
+    auto [pe, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+    *pe = '\0';
+    if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs)
+        return false;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        freeaddrinfo(addrs);
+        return false;
+    }
+
+    int opt = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    if (connect(fd, addrs->ai_addr, addrs->ai_addrlen) < 0)
+    {
+        freeaddrinfo(addrs);
+        close(fd);
+        return false;
+    }
+    freeaddrinfo(addrs);
+
+    uc->fd = fd;
+    uc->connected = true;
+    uc->closing = false;
+    uc->reconnect_attempt = 0;
+    uc->partial.clear();
+    uc->partial.reserve(4096);
+    uc->read_pending = false;
+    uc->write_pending = false;
+
+    m_upstream_by_fd[fd] = uc;
+
+    uc->read_req = { op_read, fd, uc->read_buf, sizeof(uc->read_buf), this };
+    uc->write_req = { op_write, fd, nullptr, 0, this };
+
+    // Submit first read
+    uc->read_pending = true;
+    m_loop->submit_read(fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req);
+
+    // Fire on_upstream_connect callback
+    invoke_on_upstream_connect(uc->conn_id);
+
+    return true;
+}
+
+void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
+{
+    if (!m_loop)
+        return;
+
+    // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
+    int base_sec = 1 << std::min(uc->reconnect_attempt, 4); // 1,2,4,8,16
+    int delay_sec = std::min(base_sec, 30);
+    int jitter_ms = (uc->reconnect_attempt * 137) % 500;
+
+    uc->timeout_ts.tv_sec = delay_sec;
+    uc->timeout_ts.tv_nsec = jitter_ms * 1000000LL;
+    uc->timeout_req = { op_timeout, -1, nullptr, 0, this };
+    m_loop->submit_timeout(&uc->timeout_ts, &uc->timeout_req);
+}
+
+void server_instance::upstream_disconnect(upstream_connection* uc)
+{
+    if (uc->fd >= 0)
+    {
+        m_upstream_by_fd.erase(uc->fd);
+        shutdown(uc->fd, SHUT_RDWR);
+        close(uc->fd);
+        uc->fd = -1;
+    }
+
+    bool was_connected = uc->connected;
+    uc->connected = false;
+    uc->closing = false;
+    uc->read_pending = false;
+    uc->write_pending = false;
+    uc->partial.clear();
+
+    // Release write queue refs
+    while (!uc->write_queue.empty())
+        uc->write_queue.pop();
+    for (size_t i = 0; i < uc->write_batch_count; i++)
+        uc->write_batch[i].reset();
+    uc->write_batch_count = 0;
+
+    if (was_connected)
+        invoke_on_upstream_disconnect(uc->conn_id);
+
+    // Schedule reconnect
+    upstream_schedule_reconnect(uc);
+}
+
+void server_instance::handle_upstream_read(struct io_uring_cqe* cqe, upstream_connection* uc)
+{
+    uc->read_pending = false;
+
+    if (cqe->res <= 0)
+    {
+        // EOF or error
+        if (uc->write_pending)
+        {
+            uc->closing = true;
+        }
+        else
+        {
+            upstream_disconnect(uc);
+        }
+        return;
+    }
+
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    uc->partial.append(uc->read_buf, cqe->res);
+
+    if (uc->partial.size() > upstream_connection::MAX_PARTIAL_SIZE)
+    {
+        uc->closing = true;
+        goto submit_next;
+    }
+
+    // Parse newline-delimited messages
+    {
+        size_t scan_from = 0;
+        size_t pos;
+        while ((pos = uc->partial.find('\n', scan_from)) != std::string::npos)
+        {
+            std::string_view line(uc->partial.data() + scan_from, pos - scan_from);
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            if (!line.empty())
+                invoke_on_upstream(uc->conn_id, line);
+            scan_from = pos + 1;
+        }
+        if (scan_from > 0)
+        {
+            if (scan_from >= uc->partial.size())
+                uc->partial.clear();
+            else
+                uc->partial.erase(0, scan_from);
+        }
+    }
+
+submit_next:
+    if (m_loop && !uc->closing)
+    {
+        uc->read_pending = true;
+        m_loop->submit_read(uc->fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req);
+    }
+    else if (uc->closing && !uc->write_pending)
+    {
+        upstream_disconnect(uc);
+    }
+}
+
+void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc)
+{
+    uc->write_pending = false;
+
+    // Release batch references
+    for (uint32_t i = 0; i < uc->write_batch_count; i++)
+        uc->write_batch[i].reset();
+    uc->write_batch_count = 0;
+
+    if (cqe->res <= 0)
+    {
+        uc->closing = true;
+        if (!uc->read_pending)
+            upstream_disconnect(uc);
+        return;
+    }
+
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
+    if (!uc->write_queue.empty())
+    {
+        upstream_flush_write_queue(uc);
+    }
+    else if (uc->closing && !uc->read_pending)
+    {
+        upstream_disconnect(uc);
+    }
+}
+
+void server_instance::upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg)
+{
+    if (!m_loop || !uc->connected || uc->closing)
+        return;
+
+    if (uc->write_queue.size() >= upstream_connection::MAX_WRITE_QUEUE)
+    {
+        uc->closing = true;
+        return;
+    }
+
+    uc->write_queue.push(msg);
+    if (!uc->write_pending)
+        upstream_flush_write_queue(uc);
+}
+
+void server_instance::upstream_flush_write_queue(upstream_connection* uc)
+{
+    if (!m_loop || uc->write_queue.empty())
+        return;
+
+    uint32_t count = 0;
+    while (!uc->write_queue.empty() && count < upstream_connection::MAX_WRITE_BATCH)
+    {
+        uc->write_batch[count] = std::move(uc->write_queue.front());
+        uc->write_queue.pop();
+        uc->write_iovs[count].iov_base = const_cast<char*>(uc->write_batch[count]->data());
+        uc->write_iovs[count].iov_len = uc->write_batch[count]->size();
+        count++;
+    }
+
+    uc->write_batch_count = count;
+    uc->write_pending = true;
+
+    if (count == 1)
+    {
+        uc->write_req.type = op_write;
+        m_loop->submit_write(uc->fd, uc->write_batch[0]->data(),
+            static_cast<uint32_t>(uc->write_batch[0]->size()), &uc->write_req);
+    }
+    else
+    {
+        uc->write_req.type = op_writev;
+        m_loop->submit_writev(uc->fd, uc->write_iovs, count, &uc->write_req);
+    }
+}
+
+// ─── Lua upstream actions ───
+
+void server_instance::lua_upstream_send(int conn_id, std::string_view msg)
+{
+    auto it = m_upstreams.find(conn_id);
+    if (it == m_upstreams.end() || !it->second->connected)
+        return;
+
+    std::string full;
+    full.reserve(msg.size() + 1);
+    full.append(msg.data(), msg.size());
+    if (full.empty() || full.back() != '\n')
+        full += '\n';
+    upstream_send(it->second.get(), std::make_shared<const std::string>(std::move(full)));
+}
+
+void server_instance::lua_upstream_broadcast(std::string_view msg)
+{
+    std::string full;
+    full.reserve(msg.size() + 1);
+    full.append(msg.data(), msg.size());
+    if (full.empty() || full.back() != '\n')
+        full += '\n';
+    auto shared = std::make_shared<const std::string>(std::move(full));
+    for (auto& [cid, uc] : m_upstreams)
+    {
+        if (uc->connected && !uc->closing)
+            upstream_send(uc.get(), shared);
+    }
+}
+
+std::vector<int> server_instance::lua_upstreams() const
+{
+    std::vector<int> result;
+    for (const auto& [cid, uc] : m_upstreams)
+        if (uc->connected) result.push_back(cid);
+    return result;
+}
+
+void server_instance::invoke_on_upstream(int conn_id, std::string_view data)
+{
+#ifndef SOCKETLEY_NO_LUA
+    auto* lctx = lua();
+    if (!lctx || !lctx->has_on_upstream()) return;
+    try {
+        lctx->on_upstream()(conn_id, std::string(data));
+    } catch (const sol::error& e) {
+        fprintf(stderr, "[lua] on_upstream error: %s\n", e.what());
+    }
+#endif
+}
+
+void server_instance::invoke_on_upstream_connect(int conn_id)
+{
+#ifndef SOCKETLEY_NO_LUA
+    auto* lctx = lua();
+    if (!lctx || !lctx->has_on_upstream_connect()) return;
+    try {
+        lctx->on_upstream_connect()(conn_id);
+    } catch (const sol::error& e) {
+        fprintf(stderr, "[lua] on_upstream_connect error: %s\n", e.what());
+    }
+#endif
+}
+
+void server_instance::invoke_on_upstream_disconnect(int conn_id)
+{
+#ifndef SOCKETLEY_NO_LUA
+    auto* lctx = lua();
+    if (!lctx || !lctx->has_on_upstream_disconnect()) return;
+    try {
+        lctx->on_upstream_disconnect()(conn_id);
+    } catch (const sol::error& e) {
+        fprintf(stderr, "[lua] on_upstream_disconnect error: %s\n", e.what());
+    }
+#endif
 }

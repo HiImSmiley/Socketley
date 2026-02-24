@@ -104,6 +104,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_cluster_join   = m_lua["on_cluster_join"];
     m_on_cluster_leave  = m_lua["on_cluster_leave"];
     m_on_group_change   = m_lua["on_group_change"];
+    m_on_upstream           = m_lua["on_upstream"];
+    m_on_upstream_connect   = m_lua["on_upstream_connect"];
+    m_on_upstream_disconnect = m_lua["on_upstream_disconnect"];
 
     return true;
 }
@@ -129,6 +132,9 @@ bool lua_context::has_on_proxy_response()  const { return m_on_proxy_response.va
 bool lua_context::has_on_cluster_join()    const { return m_on_cluster_join.valid(); }
 bool lua_context::has_on_cluster_leave()   const { return m_on_cluster_leave.valid(); }
 bool lua_context::has_on_group_change()    const { return m_on_group_change.valid(); }
+bool lua_context::has_on_upstream()            const { return m_on_upstream.valid(); }
+bool lua_context::has_on_upstream_connect()    const { return m_on_upstream_connect.valid(); }
+bool lua_context::has_on_upstream_disconnect() const { return m_on_upstream_disconnect.valid(); }
 
 void lua_context::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
@@ -785,6 +791,20 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         auto v = static_cast<server_instance*>(owner)->lua_get_data(id, key);
         if (v.empty()) return sol::nil;
         return sol::make_object(m_lua, v);
+    };
+
+    // Upstream actions
+    self["upstream_send"] = [owner](int conn_id, std::string msg) {
+        static_cast<server_instance*>(owner)->lua_upstream_send(conn_id, msg);
+    };
+    self["upstream_broadcast"] = [owner](std::string msg) {
+        static_cast<server_instance*>(owner)->lua_upstream_broadcast(msg);
+    };
+    self["upstreams"] = [owner, this]() -> sol::table {
+        sol::table t = m_lua.create_table();
+        auto ids = static_cast<server_instance*>(owner)->lua_upstreams();
+        for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
+        return t;
     };
 }
 

@@ -364,6 +364,7 @@ flags_options() {
     echo "│ --master-forward │ Forward non-master msgs to master       │"
     echo "│ --udp            │ Use UDP instead of TCP                  │"
     echo "│ --cache <name>   │ Link to cache (\"cache <cmd>\") [server]  │"
+    echo "│ -u <host:port>   │ Upstream connection (auto-reconnect)    │"
     echo "│ --http <dir>     │ Serve static files from dir [server]    │"
     echo "│ --http-cache     │ Cache files in memory at startup        │"
     echo "└──────────────────┴─────────────────────────────────────────┘"
@@ -460,6 +461,9 @@ lua_config() {
     echo "│ on_write(key,val,ttl)        │ Cache: after SET — write to DB   │"
     echo "│ on_delete(key)               │ Cache: after DEL — delete in DB  │"
     echo "│ on_expire(key)               │ Cache: after TTL expiry          │"
+    echo "│ on_upstream(id, data)         │ Server: message from upstream     │"
+    echo "│ on_upstream_connect(id)      │ Server: upstream connected        │"
+    echo "│ on_upstream_disconnect(id)   │ Server: upstream disconnected     │"
     echo "│ on_cluster_join(daemon)      │ Cluster: new daemon discovered   │"
     echo "│ on_cluster_leave(daemon)     │ Cluster: daemon left/stale       │"
     echo "│ on_group_change(grp, mems)   │ Cluster: group membership change │"
@@ -483,6 +487,9 @@ lua_config() {
     echo "  self.disconnect(id)         - Terminate a client connection (server)"
     echo "  self.peer_ip(id)            - Get client IP address string (server)"
     echo "  self.ws_headers(id)         - Get WS upgrade headers table (nil for TCP)"
+    echo "  self.upstream_send(id, msg) - Send to specific upstream (server)"
+    echo "  self.upstream_broadcast(msg)- Send to all upstreams (server)"
+    echo "  self.upstreams()            - Table of connected upstream conn_ids"
     echo "  self.publish(ch, msg)       - Publish to channel (cache)"
     echo ""
     echo -e "${BOLD}Timers & Pub/Sub:${NC}"
@@ -545,6 +552,7 @@ examples_menu() {
     echo -e "  ${GREEN}13)${NC} Master Mode"
     echo -e "  ${GREEN}14)${NC} WebSocket Server"
     echo -e "  ${GREEN}15)${NC} Cache Access via Server"
+    echo -e "  ${GREEN}16)${NC} Upstream Hub"
     echo ""
     echo -e "  ${RED}b)${NC} Back to main menu"
     echo ""
@@ -565,6 +573,7 @@ examples_menu() {
         13) example_master_mode ;;
         14) example_websocket ;;
         15) example_cache_access ;;
+        16) example_upstream_hub ;;
         b|B) main_menu ;;
         *) examples_menu ;;
     esac
@@ -954,6 +963,38 @@ example_cache_access() {
     examples_menu
 }
 
+example_upstream_hub() {
+    show_header
+    echo -e "${BOLD}${YELLOW}=== Upstream Hub Example ===${NC}\n"
+    echo -e "${CYAN}# Start a simple upstream service (nc listener on port 9000)"
+    echo "nc -lk 9000 &"
+    echo ""
+    echo "# Create a server that connects to the upstream"
+    echo "socketley create server hub -p 8080 -u \"127.0.0.1:9000\" --lua examples/server/upstream-hub.lua -s"
+    echo ""
+    echo "# Multiple upstreams (semicolon-separated or multiple -u flags):"
+    echo "# socketley create server hub -p 8080 -u \"feed:9000;cache:6379\" --lua hub.lua -s"
+    echo "# socketley create server hub -p 8080 -u feed:9000 -u cache:6379 --lua hub.lua -s"
+    echo ""
+    echo "# Connect a client"
+    echo "nc localhost 8080"
+    echo "# Type a message -> forwarded to upstream"
+    echo "# Upstream replies -> forwarded to all clients"
+    echo ""
+    echo "# Kill upstream -> auto-reconnects with exponential backoff (1s-30s)"
+    echo "# Restart upstream -> on_upstream_connect fires again"
+    echo ""
+    echo "# Lua callbacks: on_upstream(id, data), on_upstream_connect(id), on_upstream_disconnect(id)"
+    echo "# Lua actions:   self.upstream_send(id, msg), self.upstream_broadcast(msg), self.upstreams()"
+    echo ""
+    echo "# Cleanup"
+    echo "socketley stop hub"
+    echo -e "socketley remove hub${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+    examples_menu
+}
+
 # Architecture Overview
 architecture() {
     show_header
@@ -1098,6 +1139,7 @@ sdk_help() {
     echo -e "  ${GREEN}3)${NC} Tier 2: Embed Engine (server.h, cache.h, proxy.h, client.h)"
     echo -e "  ${GREEN}4)${NC} Tier 3: Daemon Attach (attach.h)"
     echo -e "  ${GREEN}5)${NC} Mixed: Engine + Attach (Tier 2 + 3)"
+    echo -e "  ${GREEN}6)${NC} Cross-Platform SDK (ws_client.h, cache_client.h)"
     echo ""
     echo -e "  ${RED}b)${NC} Back"
     echo ""
@@ -1108,6 +1150,7 @@ sdk_help() {
         3) sdk_tier2 ;;
         4) sdk_tier3 ;;
         5) sdk_mixed ;;
+        6) sdk_cross ;;
         b|B) main_menu ;;
         *) sdk_help ;;
     esac
@@ -1128,6 +1171,8 @@ sdk_overview() {
     echo -e "  │      │ socketley/proxy.h     │                              │                  │"
     echo -e "  │      │ socketley/client.h    │                              │                  │"
     echo -e "  │  3   │ socketley/attach.h    │ Register with a daemon       │ None (Tier 1)    │"
+    echo -e "  │Cross │ socketley/ws_client.h │ Connect from Windows/macOS   │ None (C++17)     │"
+    echo -e "  │      │ socketley/cache_cli.. │                              │                  │"
     echo -e "  └──────┴───────────────────────┴──────────────────────────────┴──────────────────┘"
     echo ""
 
@@ -1144,6 +1189,9 @@ sdk_overview() {
     echo ""
     echo -e "  ${RED}Mixed${NC}  — Embedded engine (Tier 2) with daemon registration (Tier 3)."
     echo -e "           Maximum performance with fleet management. Best of both worlds."
+    echo ""
+    echo -e "  ${CYAN}Cross${NC}  — Header-only TCP clients for Windows/macOS. Connect to server"
+    echo -e "           runtimes (WebSocket) or cache runtimes (text protocol) over TCP."
     echo ""
 
     echo -e "${BOLD}Examples:${NC}"
@@ -1250,6 +1298,11 @@ sdk_tier1() {
     echo -e "  ${CYAN}socketley::ctl::remove(\"myapp\");${NC}"
     echo ""
 
+    echo -e "${BOLD}Example — Server with Upstreams:${NC}"
+    echo -e "  ${CYAN}socketley::ctl::create(\"server\", \"hub\","
+    echo -e "      \"-p 8080 -u feed:9000 -u cache:6379 --lua hub.lua -s\");${NC}"
+    echo ""
+
     echo -e "${BOLD}Example — Fleet with Globs:${NC}"
     echo -e "  ${CYAN}socketley::ctl::command(\"start api_*\");${NC}     // start all api_ runtimes"
     echo -e "  ${CYAN}socketley::ctl::command(\"stats api_*\");${NC}     // query all"
@@ -1310,6 +1363,8 @@ sdk_tier2() {
     echo -e "  set_mode(mode_inout | mode_in | mode_out | mode_master)"
     echo -e "  lua_broadcast(msg)  lua_send_to(fd, msg)  lua_disconnect(fd)"
     echo -e "  lua_peer_ip(fd)  lua_clients()  lua_multicast(fds, msg)"
+    echo -e "  add_upstream_target(addr)  clear_upstream_targets()  get_upstream_targets()"
+    echo -e "  lua_upstream_send(conn_id, msg)  lua_upstream_broadcast(msg)  lua_upstreams()"
     echo ""
 
     echo -e "${BOLD}Cache-Specific:${NC}"
@@ -1335,6 +1390,14 @@ sdk_tier2() {
     echo -e "  ${CYAN}mgr.create(runtime_server, \"api\");${NC}"
     echo -e "  ${CYAN}srv->set_port(9000); srv->set_cache_name(\"store\");${NC}"
     echo -e "  Clients can send 'cache set k v' through the server connection."
+    echo ""
+
+    echo -e "${BOLD}Example — Server with Upstream:${NC}"
+    echo -e "  ${CYAN}mgr.create(runtime_server, \"hub\");${NC}"
+    echo -e "  ${CYAN}srv->set_port(8080);${NC}"
+    echo -e "  ${CYAN}srv->add_upstream_target(\"127.0.0.1:9000\");${NC}"
+    echo -e "  ${CYAN}srv->load_lua_script(\"hub.lua\");${NC}"
+    echo -e "  Auto-connects, auto-reconnects. Lua gets on_upstream/on_upstream_connect."
     echo ""
 
     echo -e "${BOLD}Example — Proxy Load Balancer:${NC}"
@@ -1440,6 +1503,50 @@ sdk_mixed() {
     echo -e "  ${CYAN}socketley ls${NC}         — shows app_srv + app_cache"
     echo -e "  ${CYAN}socketley stats app_srv${NC}  — query your embedded server"
     echo -e "  ${CYAN}echo 'set k v' | nc -q1 127.0.0.1 6379${NC}  — talk to embedded cache"
+    echo ""
+
+    read -p "Press Enter to continue..."
+    sdk_help
+}
+
+sdk_cross() {
+    show_header
+    echo -e "${BOLD}${CYAN}=== Cross-Platform SDK (Windows / macOS) ===${NC}\n"
+
+    echo -e "  Header-only TCP clients for connecting to Socketley runtimes"
+    echo -e "  from ${BOLD}Windows${NC} and ${BOLD}macOS${NC}. No daemon on the client side —"
+    echo -e "  just a TCP connection to the server's IP and port."
+    echo ""
+
+    echo -e "${BOLD}Headers:${NC}"
+    echo -e "  ${CYAN}include/windows/socketley/ws_client.h${NC}     — WebSocket + raw TCP"
+    echo -e "  ${CYAN}include/windows/socketley/cache_client.h${NC}  — Cache text protocol"
+    echo -e "  ${CYAN}include/darwin/socketley/ws_client.h${NC}      — (identical copy)"
+    echo -e "  ${CYAN}include/darwin/socketley/cache_client.h${NC}   — (identical copy)"
+    echo ""
+
+    echo -e "${BOLD}ws_client.h:${NC}"
+    echo -e "  Connects to server runtimes. WebSocket (RFC 6455) with embedded"
+    echo -e "  SHA-1 and Base64 (no OpenSSL). Also supports raw TCP text mode."
+    echo -e "  API: connect, send, recv, send_ping, close, reconnect, set_recv_timeout"
+    echo ""
+
+    echo -e "${BOLD}cache_client.h:${NC}"
+    echo -e "  Connects to cache runtimes via text protocol (COMMAND args\\n)."
+    echo -e "  Full API: get, set, del, incr/decr, lpush/rpush/lpop/rpop, sadd/srem,"
+    echo -e "  hset/hget, expire/ttl, publish/subscribe, keys, scan, and more."
+    echo -e "  Returns cache_result with ok, value, values, integer fields."
+    echo ""
+
+    echo -e "${BOLD}Build:${NC}"
+    echo -e "  ${CYAN}# MSVC (Windows)"
+    echo -e "  cl /std:c++17 /I include\\windows app.cpp"
+    echo ""
+    echo -e "  # clang++ (macOS)"
+    echo -e "  clang++ -std=c++17 -I include/darwin app.cpp -o app"
+    echo ""
+    echo -e "  # g++ (Linux)"
+    echo -e "  g++ -std=c++17 -I include/windows app.cpp -o app${NC}"
     echo ""
 
     read -p "Press Enter to continue..."

@@ -387,6 +387,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.master_forward = srv->get_master_forward();
             cfg.http_dir = srv->get_http_dir().string();
             cfg.http_cache = srv->get_http_cache();
+            for (const auto& ut : srv->get_upstream_targets())
+                cfg.upstreams.push_back(ut.address);
             break;
         }
         case runtime_client:
@@ -497,6 +499,16 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 out << "    \"http_dir\": \"" << json_escape(cfg.http_dir) << "\",\n";
             if (cfg.http_cache)
                 out << "    \"http_cache\": true,\n";
+            if (!cfg.upstreams.empty())
+            {
+                out << "    \"upstreams\": [";
+                for (size_t i = 0; i < cfg.upstreams.size(); ++i)
+                {
+                    if (i > 0) out << ", ";
+                    out << "\"" << json_escape(cfg.upstreams[i]) << "\"";
+                }
+                out << "],\n";
+            }
             break;
         case runtime_client:
             out << "    \"mode\": \"" << server_mode_str(cfg.mode) << "\",\n";
@@ -587,6 +599,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.master_forward = json_get_bool(json, "master_forward");
             cfg.http_dir = json_get_string(json, "http_dir");
             cfg.http_cache = json_get_bool(json, "http_cache");
+            cfg.upstreams = json_get_array(json, "upstreams");
             break;
         case runtime_client:
             cfg.mode = str_to_server_mode(json_get_string(json, "mode"));

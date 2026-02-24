@@ -11,6 +11,7 @@
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
+#include <linux/time_types.h>
 
 class runtime_manager;
 
@@ -68,6 +69,39 @@ enum server_mode : uint8_t
     mode_in     = 1,
     mode_out    = 2,
     mode_master = 3
+};
+
+struct upstream_target
+{
+    std::string address;        // "host:port" as specified by user
+    std::string resolved_host;
+    uint16_t resolved_port{0};
+};
+
+struct upstream_connection
+{
+    static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+
+    int conn_id;                  // 1-based Lua-facing ID (stable across reconnects)
+    int fd{-1};
+    upstream_target target;
+    io_request read_req;
+    io_request write_req;
+    char read_buf[4096];
+    std::string partial;
+    std::queue<std::shared_ptr<const std::string>> write_queue;
+    std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
+    struct iovec write_iovs[MAX_WRITE_BATCH];
+    uint32_t write_batch_count{0};
+    bool read_pending{false};
+    bool write_pending{false};
+    bool closing{false};
+    bool connected{false};
+    int reconnect_attempt{0};
+    io_request timeout_req{};
+    struct __kernel_timespec timeout_ts{};
 };
 
 class server_instance : public runtime_instance
@@ -138,12 +172,34 @@ public:
     bool get_http_cache() const;
     void rebuild_http_cache();
 
+    // Upstream connections
+    void add_upstream_target(std::string_view addr);
+    void clear_upstream_targets();
+    const std::vector<upstream_target>& get_upstream_targets() const;
+
+    // Lua upstream actions
+    void lua_upstream_send(int conn_id, std::string_view msg);
+    void lua_upstream_broadcast(std::string_view msg);
+    std::vector<int> lua_upstreams() const;
+
 private:
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void invoke_on_websocket(int fd);
     void serve_http(server_connection* conn, std::string_view path);
+
+    // Upstream helpers
+    bool upstream_try_connect(upstream_connection* uc);
+    void upstream_schedule_reconnect(upstream_connection* uc);
+    void upstream_disconnect(upstream_connection* uc);
+    void handle_upstream_read(struct io_uring_cqe* cqe, upstream_connection* uc);
+    void handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc);
+    void upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
+    void upstream_flush_write_queue(upstream_connection* uc);
+    void invoke_on_upstream(int conn_id, std::string_view data);
+    void invoke_on_upstream_connect(int conn_id);
+    void invoke_on_upstream_disconnect(int conn_id);
 
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
@@ -222,4 +278,10 @@ private:
     bool m_http_cache_enabled{false};
     struct cached_file { std::shared_ptr<const std::string> response; };
     std::unordered_map<std::string, cached_file> m_http_cache;
+
+    // Upstream connections
+    std::vector<upstream_target> m_upstream_targets;
+    std::unordered_map<int, std::unique_ptr<upstream_connection>> m_upstreams;     // conn_id → upstream
+    std::unordered_map<int, upstream_connection*> m_upstream_by_fd;                // fd → upstream (CQE dispatch)
+    int m_next_upstream_id{1};
 };
