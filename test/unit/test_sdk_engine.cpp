@@ -1,4 +1,5 @@
 // SDK compile test: engine headers + high-level wrapper classes (links libsocketley_sdk.a)
+#include <optional>
 #include "socketley/server.h"
 #include "socketley/client.h"
 #include "socketley/proxy.h"
@@ -24,7 +25,9 @@ int main()
            .on_connect([](int) { })
            .on_disconnect([](int) { })
            .on_message([](int, std::string_view) { })
-           .on_tick([](double) { });
+           .on_tick([](double) { })
+           .on_auth([](int) -> bool { return true; })
+           .on_websocket([](int, const server_instance::ws_headers_result&) { });
 
         // Verify escape hatches compile
         (void)srv.instance();
@@ -58,7 +61,13 @@ int main()
           .idle_timeout(60);
 
         px.on_start([]{ })
-          .on_stop([]{ });
+          .on_stop([]{ })
+          .on_connect([](int) { })
+          .on_disconnect([](int) { })
+          .on_tick([](double) { })
+          .tick_interval(500)
+          .on_proxy_request([](int, std::string_view) -> std::optional<std::string> { return std::nullopt; })
+          .on_proxy_response([](int, std::string_view) -> std::optional<std::string> { return "modified"; });
 
         (void)px.instance();
     }

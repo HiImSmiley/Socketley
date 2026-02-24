@@ -6,6 +6,8 @@
 #include <vector>
 #include <queue>
 #include <random>
+#include <optional>
+#include <functional>
 #include <netinet/in.h>
 #include <sys/uio.h>
 
@@ -87,6 +89,8 @@ struct proxy_backend_connection
 class proxy_instance : public runtime_instance
 {
 public:
+    using proxy_hook = std::function<std::optional<std::string>(int client_fd, std::string_view data)>;
+
     proxy_instance(std::string_view name);
     ~proxy_instance() override;
 
@@ -105,6 +109,10 @@ public:
     void teardown(event_loop& loop) override;
 
     size_t get_connection_count() const override;
+
+    // C++ proxy intercept hooks
+    void set_on_proxy_request(proxy_hook cb);
+    void set_on_proxy_response(proxy_hook cb);
 
     // Stats
     std::string get_stats() const override;
@@ -162,4 +170,8 @@ private:
     static constexpr uint32_t BUF_COUNT = 256;
     static constexpr uint32_t BUF_SIZE = 8192;
     bool m_use_provided_bufs{false};
+
+    // C++ proxy intercept hooks
+    proxy_hook m_cb_on_proxy_request;
+    proxy_hook m_cb_on_proxy_response;
 };

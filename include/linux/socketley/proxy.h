@@ -33,8 +33,14 @@ public:
     proxy& group(std::string_view g)        { raw()->set_group(g); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
-    proxy& on_start(std::function<void()> cb) { raw()->set_on_start(std::move(cb)); return *this; }
-    proxy& on_stop(std::function<void()> cb)  { raw()->set_on_stop(std::move(cb)); return *this; }
+    proxy& on_start(std::function<void()> cb)                         { raw()->set_on_start(std::move(cb)); return *this; }
+    proxy& on_stop(std::function<void()> cb)                          { raw()->set_on_stop(std::move(cb)); return *this; }
+    proxy& on_connect(std::function<void(int)> cb)                    { raw()->set_on_connect(std::move(cb)); return *this; }
+    proxy& on_disconnect(std::function<void(int)> cb)                 { raw()->set_on_disconnect(std::move(cb)); return *this; }
+    proxy& on_tick(std::function<void(double)> cb)                    { raw()->set_on_tick(std::move(cb)); return *this; }
+    proxy& tick_interval(uint32_t ms)                                 { raw()->set_tick_interval(ms); return *this; }
+    proxy& on_proxy_request(proxy_instance::proxy_hook cb)            { prx()->set_on_proxy_request(std::move(cb)); return *this; }
+    proxy& on_proxy_response(proxy_instance::proxy_hook cb)           { prx()->set_on_proxy_response(std::move(cb)); return *this; }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
     void start() {

@@ -1689,8 +1689,19 @@ std::string server_instance::lua_peer_ip(int client_fd)
     return ip;
 }
 
+void server_instance::set_on_websocket(std::function<void(int fd, const ws_headers_result&)> cb)
+{
+    m_cb_on_websocket = std::move(cb);
+}
+
 void server_instance::invoke_on_websocket(int fd)
 {
+    if (m_cb_on_websocket)
+    {
+        auto hdrs = lua_ws_headers(fd);
+        m_cb_on_websocket(fd, hdrs);
+        return;
+    }
 #ifndef SOCKETLEY_NO_LUA
     auto* lctx = lua();
     if (!lctx || !lctx->has_on_websocket()) return;

@@ -317,6 +317,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 
         ptr->last_activity = std::chrono::steady_clock::now();
 
+        invoke_on_connect(client_fd);
+
         ptr->read_pending = true;
         if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
@@ -821,6 +823,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             }
             else
             {
+                invoke_on_disconnect(client_fd);
                 close(client_fd);
                 m_clients.erase(it);
             }
@@ -841,6 +844,9 @@ std::string proxy_instance::get_stats() const
     return out.str();
 }
 
+void proxy_instance::set_on_proxy_request(proxy_hook cb) { m_cb_on_proxy_request = std::move(cb); }
+void proxy_instance::set_on_proxy_response(proxy_hook cb) { m_cb_on_proxy_response = std::move(cb); }
+
 void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::string_view data)
 {
     if (conn->backend_fd < 0 || !m_loop)
@@ -854,10 +860,17 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     if (bconn->closing)
         return;
 
-#ifndef SOCKETLEY_NO_LUA
     std::string hook_storage;
     std::string_view effective = data;
-    if (auto* lctx = lua(); lctx && lctx->has_on_proxy_request())
+
+    if (m_cb_on_proxy_request)
+    {
+        auto result = m_cb_on_proxy_request(conn->fd, data);
+        if (!result) return;  // nullopt = drop
+        if (!result->empty()) { hook_storage = std::move(*result); effective = hook_storage; }
+    }
+#ifndef SOCKETLEY_NO_LUA
+    else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_request())
     {
         try {
             sol::object r = lctx->on_proxy_request()(conn->fd, std::string(data));
@@ -870,10 +883,9 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
             fprintf(stderr, "[lua] on_proxy_request error: %s\n", e.what());
         }
     }
-    auto msg = std::make_shared<const std::string>(effective);
-#else
-    auto msg = std::make_shared<const std::string>(data);
 #endif
+
+    auto msg = std::make_shared<const std::string>(effective);
 
     if (bconn->write_queue.size() >= proxy_backend_connection::MAX_WRITE_QUEUE)
     {
@@ -900,10 +912,17 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (cconn->closing)
         return;
 
-#ifndef SOCKETLEY_NO_LUA
     std::string hook_storage;
     std::string_view effective = data;
-    if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
+
+    if (m_cb_on_proxy_response)
+    {
+        auto result = m_cb_on_proxy_response(conn->client_fd, data);
+        if (!result) return;  // nullopt = drop
+        if (!result->empty()) { hook_storage = std::move(*result); effective = hook_storage; }
+    }
+#ifndef SOCKETLEY_NO_LUA
+    else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
     {
         try {
             sol::object r = lctx->on_proxy_response()(conn->client_fd, std::string(data));
@@ -916,10 +935,9 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
             fprintf(stderr, "[lua] on_proxy_response error: %s\n", e.what());
         }
     }
-    auto msg = std::make_shared<const std::string>(effective);
-#else
-    auto msg = std::make_shared<const std::string>(data);
 #endif
+
+    auto msg = std::make_shared<const std::string>(effective);
 
     if (cconn->write_queue.size() >= proxy_client_connection::MAX_WRITE_QUEUE)
     {

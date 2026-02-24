@@ -437,7 +437,12 @@ int cli_edit(int argc, char** argv)
 
     std::string tmp_file = std::string(tmpl) + ".json";
     close(tmpfd);
-    rename(tmpl, tmp_file.c_str());
+    if (rename(tmpl, tmp_file.c_str()) < 0)
+    {
+        std::cerr << "failed to rename temporary file\n";
+        unlink(tmpl);
+        return 2;
+    }
 
     {
         std::ofstream f(tmp_file, std::ios::trunc);

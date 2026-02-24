@@ -1,0 +1,35 @@
+BasedOnStyle: LLVM
+
+# Braces
+BreakBeforeBraces: Allman
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+NamespaceIndentation: None
+IndentCaseLabels: true
+
+# Line width
+ColumnLimit: 120
+
+# Spaces
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+SpacesInParentheses: false
+
+# Pointer/reference alignment
+PointerAlignment: Left
+
+# Short forms
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortBlocksOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Includes — do not sort (project uses deliberate ordering)
+SortIncludes: Never
+
+# Access modifiers
+AccessModifierOffset: -4

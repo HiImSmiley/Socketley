@@ -167,6 +167,7 @@ public:
     void set_on_client_message (std::function<void(int fd, std::string_view)> cb);
     void set_on_message        (std::function<void(std::string_view)>         cb);
     void set_on_tick           (std::function<void(double dt_ms)>             cb);
+    void set_on_auth           (std::function<bool(int fd)>                  cb);
     void set_tick_interval     (uint32_t ms);   // tick period in ms; 0 = use Lua value (default)
 
     // Cross-runtime pub/sub dispatch (called by runtime_manager on publish)
@@ -278,6 +279,7 @@ private:
     std::function<void(int, std::string_view)>   m_cb_on_client_message;
     std::function<void(std::string_view)>        m_cb_on_message;
     std::function<void(double)>                  m_cb_on_tick;
+    std::function<bool(int)>                     m_cb_on_auth;
     uint32_t                                     m_cb_tick_ms = 0;
 
     // Interactive mode observer fds (IPC sockets)

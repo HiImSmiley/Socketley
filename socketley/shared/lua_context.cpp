@@ -229,8 +229,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     struct timeval tv;
     tv.tv_sec  = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {}
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {}
 
     if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0) {
         freeaddrinfo(addrs); ::close(sock);
