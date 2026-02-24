@@ -1,7 +1,7 @@
 // Socketley SDK — daemon control example (header-only, no library needed)
 //
 // Build:
-//   g++ -std=c++17 sdk/examples/daemon_control.cpp \
+//   g++ -std=c++17 sdk/examples/basic/daemon_control.cpp \
 //       -Iinclude/linux -o /tmp/daemon_control
 //
 // Run (requires a running socketley daemon):

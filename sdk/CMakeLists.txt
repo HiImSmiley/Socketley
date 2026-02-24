@@ -71,18 +71,46 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux/socketley/"
 option(SOCKETLEY_BUILD_EXAMPLES "Build SDK examples" OFF)
 
 if(SOCKETLEY_BUILD_EXAMPLES)
+    # ── Basic examples ───────────────────────────────────────────────
+
     # Header-only daemon control (no library needed)
-    add_executable(daemon_control examples/daemon_control.cpp)
+    add_executable(daemon_control examples/basic/daemon_control.cpp)
     target_include_directories(daemon_control PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux"
     )
 
     # Engine examples (need libsocketley_sdk)
-    add_executable(standalone_server examples/standalone_server.cpp)
-    target_link_libraries(standalone_server PRIVATE socketley_sdk)
+    add_executable(echo_server examples/basic/echo_server.cpp)
+    target_link_libraries(echo_server PRIVATE socketley_sdk)
+
+    add_executable(client examples/basic/client.cpp)
+    target_link_libraries(client PRIVATE socketley_sdk)
+
+    add_executable(tcp_proxy examples/basic/tcp_proxy.cpp)
+    target_link_libraries(tcp_proxy PRIVATE socketley_sdk)
+
+    add_executable(redis_cache examples/basic/redis_cache.cpp)
+    target_link_libraries(redis_cache PRIVATE socketley_sdk)
 
     if(NOT SOCKETLEY_NO_LUA)
-        add_executable(standalone_server_lua examples/standalone_server_lua.cpp)
-        target_link_libraries(standalone_server_lua PRIVATE socketley_sdk)
+        add_executable(echo_server_lua examples/basic/echo_server_lua.cpp)
+        target_link_libraries(echo_server_lua PRIVATE socketley_sdk)
     endif()
+
+    # ── Advanced examples ────────────────────────────────────────────
+
+    add_executable(chat_server examples/advanced/chat_server.cpp)
+    target_link_libraries(chat_server PRIVATE socketley_sdk)
+
+    add_executable(reconnecting_client examples/advanced/reconnecting_client.cpp)
+    target_link_libraries(reconnecting_client PRIVATE socketley_sdk)
+
+    add_executable(heartbeat_server examples/advanced/heartbeat_server.cpp)
+    target_link_libraries(heartbeat_server PRIVATE socketley_sdk)
+
+    add_executable(tls_server examples/advanced/tls_server.cpp)
+    target_link_libraries(tls_server PRIVATE socketley_sdk)
+
+    add_executable(http_file_server examples/advanced/http_file_server.cpp)
+    target_link_libraries(http_file_server PRIVATE socketley_sdk)
 endif()

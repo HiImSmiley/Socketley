@@ -1,14 +1,14 @@
-// Socketley SDK — standalone server example with Lua scripting
+// Socketley SDK — echo server with Lua scripting
 //
 // Requires: apt install libluajit-5.1-dev  (or build LuaJIT from source)
 //
 // Build:
-//   g++ -std=c++23 sdk/examples/standalone_server_lua.cpp \
+//   g++ -std=c++23 sdk/examples/basic/echo_server_lua.cpp \
 //       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
 //       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/standalone_server_lua
+//       -o /tmp/echo_server_lua
 //
-// Run: /tmp/standalone_server_lua sdk/examples/server_config.lua
+// Run: /tmp/echo_server_lua sdk/examples/server_config.lua
 //
 // Example Lua config (sdk/examples/server_config.lua):
 //
