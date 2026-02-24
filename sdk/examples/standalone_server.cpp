@@ -16,46 +16,25 @@
 // Test: echo "hello" | nc 127.0.0.1 9000
 
 #include <socketley/server.h>
-#include <csignal>
 #include <cstdio>
-
-static event_loop* g_loop = nullptr;
 
 int main()
 {
-    signal(SIGPIPE, SIG_IGN);
+    socketley::server srv(9000);
 
-    event_loop loop;
-    if (!loop.init())
-    {
-        fprintf(stderr, "event_loop::init() failed\n");
-        return 1;
-    }
-    g_loop = &loop;
+    srv.on_connect([](int fd) {
+        printf("client %d connected\n", fd);
+    });
 
-    runtime_manager manager;
-    if (!manager.create(runtime_server, "srv"))
-    {
-        fprintf(stderr, "create failed\n");
-        return 1;
-    }
+    srv.on_message([&](int fd, std::string_view msg) {
+        printf("client %d: %.*s\n", fd, (int)msg.size(), msg.data());
+        srv.send(fd, "echo: " + std::string(msg));
+    });
 
-    auto* inst = manager.get("srv");
-    inst->set_port(9000);
-    inst->set_runtime_manager(&manager);
-    inst->set_event_loop(&loop);
+    srv.on_disconnect([](int fd) {
+        printf("client %d disconnected\n", fd);
+    });
 
-    if (!manager.start("srv", loop))
-    {
-        fprintf(stderr, "start failed\n");
-        return 1;
-    }
-
-    signal(SIGINT,  [](int){ if (g_loop) g_loop->request_stop(); });
-    signal(SIGTERM, [](int){ if (g_loop) g_loop->request_stop(); });
-
-    loop.run();
-
-    manager.stop_all(loop);
+    srv.run();
     return 0;
 }

@@ -22,3 +22,28 @@
 #include "socketley/shared/runtime_instance.h"
 #include "socketley/shared/runtime_manager.h"
 #include "socketley/shared/runtime_factory.h"
+
+#include <csignal>
+
+namespace socketley {
+namespace detail {
+
+inline event_loop*& signal_loop_ptr() {
+    static event_loop* ptr = nullptr;
+    return ptr;
+}
+inline void signal_handler(int) {
+    if (auto* lp = signal_loop_ptr()) lp->request_stop();
+}
+inline void install_signal_handlers(event_loop* loop) {
+    signal(SIGPIPE, SIG_IGN);
+    signal_loop_ptr() = loop;
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
+} // namespace detail
+} // namespace socketley
