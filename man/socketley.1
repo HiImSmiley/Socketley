@@ -28,6 +28,13 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .RI [ flags ]
 .br
 .B socketley
+.B add
+.I path
+.RB [ \-\-name
+.IR name ]
+.RB [ \-s ]
+.br
+.B socketley
 .B start
 .IR name | pattern ...
 .RB [ \-i ]
@@ -149,6 +156,41 @@ Port number the external process is listening on (informational only).
 .TP
 .B \-\-owner \fIname\fR
 Optional owner runtime name.
+.RE
+.TP
+.BI "add " "path " "[\-\-name " "name" "] [\-s]"
+Register and manage an external binary (built with the C++ SDK).
+The daemon will fork+exec the binary and manage its full lifecycle:
+auto-restart on crash, re-launch on daemon boot, and normal
+start/stop/remove commands.
+.RS
+.TP
+.I path
+Path to the executable (must exist and be executable).
+.TP
+.B \-\-name \fIname\fR, \fB\-n\fR \fIname\fR
+Name for the runtime. If omitted, derived from the binary's filename
+(basename without extension).
+.TP
+.B \-s
+Start immediately after adding.
+.PP
+The binary receives
+.B SOCKETLEY_MANAGED=1
+and
+.B SOCKETLEY_NAME=\fIname\fR
+environment variables. When using
+.BR daemon_attach() ,
+these cause the binary to re-attach to the existing runtime entry
+and skip the atexit self-removal.
+.PP
+.nf
+socketley add /usr/local/bin/myapp -s
+socketley add /usr/local/bin/myapp --name chat
+socketley stop chat
+socketley start chat
+socketley remove chat
+.fi
 .RE
 .TP
 .BI "start " "name|pattern" "... [\-i]"

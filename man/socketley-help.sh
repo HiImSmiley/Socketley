@@ -142,6 +142,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley attach server my-app 8080 --owner api${NC}"
     echo ""
 
+    echo -e "${BOLD}add <path> [--name <name>] [-s]${NC}"
+    echo "  Register and manage an external binary (C++ SDK). The daemon"
+    echo "  fork+exec's the binary and manages its full lifecycle:"
+    echo "  auto-restart on crash, re-launch on daemon boot."
+    echo -e "  ${CYAN}socketley add /usr/local/bin/myapp -s${NC}"
+    echo -e "  ${CYAN}socketley add /usr/local/bin/myapp --name chat${NC}"
+    echo ""
+
     echo -e "${BOLD}start <name|pattern>... [-i]${NC}"
     echo "  Start runtimes. Accepts multiple names, glob patterns (*,?,[])"
     echo "  -i: Interactive mode (stdin/stdout live session, single name only)"

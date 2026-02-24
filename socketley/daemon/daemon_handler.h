@@ -71,6 +71,7 @@ private:
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
     int cmd_owner(ipc_connection* conn, const parsed_args& pa);
     int cmd_attach(ipc_connection* conn, const parsed_args& pa);
+    int cmd_add(ipc_connection* conn, const parsed_args& pa);
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
@@ -101,4 +102,11 @@ private:
     struct __kernel_timespec m_cleanup_ts{};
     io_request m_cleanup_req{};
     bool m_cleanup_pending{false};
+
+    // Health monitoring for managed runtimes
+    io_request m_health_req{};
+    struct __kernel_timespec m_health_ts{};
+    bool m_health_pending{false};
+    void start_health_timer();
+    void check_managed_health();
 };

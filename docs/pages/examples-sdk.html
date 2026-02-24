@@ -28,6 +28,7 @@
       </ul></li>
       <li><a href="#exsdk-tier3">Tier 3: Daemon Attach</a><ul>
         <li><a href="#exsdk-attach">Attached Service</a></li>
+        <li><a href="#exsdk-managed">Managed Service</a></li>
       </ul></li>
       <li><a href="#exsdk-mixed">Mixed: Engine + Attach</a><ul>
         <li><a href="#exsdk-fullstack">Full Stack</a></li>
@@ -1231,6 +1232,86 @@ echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm">#
 <p><strong>Test:</strong></p>
 <pre><code>socketley ls                         <span class="cm"># shows "ext_service"</span>
 echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [ext_service] hello</span></code></pre>
+</div>
+
+<div class="method-card" id="exsdk-managed">
+<div class="method-header">
+  <span class="method-name">Managed Service</span>
+  <span class="badge badge-tier3">Tier 3</span>
+</div>
+<p class="method-desc">A TCP echo server designed to run as a managed external via <code>socketley add</code>. The daemon fork+exec's the binary, auto-restarts on crash, and re-launches on daemon boot. The same binary also works standalone.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/attach.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;arpa/inet.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;netinet/in.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;poll.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;sys/socket.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;unistd.h&gt;</span>
+
+<span class="kw">static volatile</span> sig_atomic_t g_quit = <span class="nb">0</span>;
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, [](<span class="kw">int</span>) { g_quit = <span class="nb">1</span>; });  <span class="cm">// daemon sends SIGTERM on stop</span>
+    signal(SIGINT,  [](<span class="kw">int</span>) { g_quit = <span class="nb">1</span>; });
+
+    <span class="kw">constexpr uint16_t</span> PORT = <span class="nb">7070</span>;
+
+    <span class="kw">int</span> sock = socket(AF_INET, SOCK_STREAM, <span class="nb">0</span>);
+    <span class="kw">int</span> opt = <span class="nb">1</span>;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &amp;opt, <span class="kw">sizeof</span>(opt));
+
+    <span class="kw">struct</span> sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (<span class="kw">struct</span> sockaddr*)&amp;addr, <span class="kw">sizeof</span>(addr));
+    listen(sock, <span class="nb">128</span>);
+
+    <span class="cm">// Register with daemon — works both standalone and managed</span>
+    <span class="cm">// When managed: uses SOCKETLEY_NAME env var, skips atexit removal</span>
+    socketley::<span class="fn">daemon_attach</span>(<span class="st">"echo-svc"</span>, <span class="st">"server"</span>, PORT);
+
+    <span class="kw">struct</span> pollfd pfd{};
+    pfd.fd = sock; pfd.events = POLLIN;
+
+    <span class="kw">while</span> (!g_quit) {
+        <span class="kw">if</span> (poll(&amp;pfd, <span class="nb">1</span>, <span class="nb">500</span>) &lt;= <span class="nb">0</span>) <span class="kw">continue</span>;
+        <span class="kw">int</span> client = accept(sock, <span class="kw">nullptr</span>, <span class="kw">nullptr</span>);
+        <span class="kw">if</span> (client &lt; <span class="nb">0</span>) <span class="kw">continue</span>;
+
+        <span class="kw">char</span> buf[<span class="nb">4096</span>];
+        ssize_t n = read(client, buf, <span class="kw">sizeof</span>(buf));
+        <span class="kw">if</span> (n &gt; <span class="nb">0</span>)
+            <span class="kw">if</span> (write(client, buf, n) &lt; <span class="nb">0</span>) {}
+        close(client);
+    }
+
+    close(sock);
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++17 echo_managed.cpp -Iinclude/linux -o echo_managed</code></pre>
+<p><strong>Usage:</strong></p>
+<pre><code><span class="cm"># Register and start — daemon fork+exec's the binary</span>
+socketley add ./echo_managed --name echo-svc -s
+
+<span class="cm"># Verify it's running</span>
+socketley ls
+echo <span class="st">"hello"</span> | nc -w1 127.0.0.1 7070  <span class="cm"># hello</span>
+
+<span class="cm"># Kill it — daemon auto-restarts within ~2 seconds</span>
+kill $(socketley ps | grep echo-svc | awk <span class="st">'{print $NF}'</span>)
+sleep 3
+socketley ps  <span class="cm"># new PID</span>
+
+<span class="cm"># Full lifecycle</span>
+socketley stop echo-svc
+socketley start echo-svc
+socketley remove echo-svc</code></pre>
 </div>
 
 <!-- ── Mixed: Engine + Attach ── -->

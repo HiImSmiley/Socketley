@@ -371,8 +371,11 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.external_runtime = instance->is_external();
     if (cfg.external_runtime)
     {
-        cfg.was_running = false;  // prevent daemon from trying to re-bind on restart
+        cfg.managed = instance->is_managed();
+        cfg.exec_path = instance->get_exec_path();
         cfg.pid = static_cast<int32_t>(instance->get_pid());
+        if (!cfg.managed)
+            cfg.was_running = false;  // prevent daemon from trying to re-bind on restart
     }
 
     // Type-specific
@@ -480,6 +483,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     if (cfg.external_runtime)
     {
         out << "    \"external_runtime\": true,\n";
+        if (cfg.managed)
+        {
+            out << "    \"managed\": true,\n";
+            if (!cfg.exec_path.empty())
+                out << "    \"exec_path\": \"" << json_escape(cfg.exec_path) << "\",\n";
+        }
         if (cfg.pid > 0)
             out << "    \"pid\": " << cfg.pid << ",\n";
     }
@@ -587,6 +596,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
     cfg.external_runtime = json_get_bool(json, "external_runtime");
+    cfg.managed = json_get_bool(json, "managed");
+    cfg.exec_path = json_get_string(json, "exec_path");
     cfg.pid = static_cast<int32_t>(json_get_int(json, "pid"));
 
     // Type-specific

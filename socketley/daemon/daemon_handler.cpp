@@ -22,6 +22,9 @@
 #include <iomanip>
 #include <sstream>
 #include <iostream>
+#include <filesystem>
+#include <sys/wait.h>
+#include "../shared/logging.h"
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 
@@ -95,11 +98,23 @@ bool daemon_handler::setup()
         reinterpret_cast<struct sockaddr_in*>(&m_accept_addr),
         &m_accept_addrlen, &m_accept_req);
 
+    start_health_timer();
+
     return true;
 }
 
 void daemon_handler::teardown()
 {
+    // Reap managed children
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (auto& [name, inst] : m_manager.list())
+        {
+            if (inst->is_managed() && inst->get_pid() > 0)
+                waitpid(inst->get_pid(), nullptr, WNOHANG);
+        }
+    }
+
     // Stop cluster discovery before closing IPC
     if (m_owned_cluster)
     {
@@ -148,11 +163,20 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
         case op_write:
             break;
         case op_timeout:
-            // Deferred-delete cleanup: all in-flight CQEs for the removed runtimes have
-            // now been processed (event loop completed at least one full iteration), so
-            // it is safe to destroy the runtime objects.
-            m_deferred_delete.clear();
-            m_cleanup_pending = false;
+            if (req == &m_cleanup_req)
+            {
+                // Deferred-delete cleanup: all in-flight CQEs for the removed runtimes have
+                // now been processed (event loop completed at least one full iteration), so
+                // it is safe to destroy the runtime objects.
+                m_deferred_delete.clear();
+                m_cleanup_pending = false;
+            }
+            else if (req == &m_health_req)
+            {
+                m_health_pending = false;
+                check_managed_health();
+                start_health_timer();
+            }
             break;
         default:
             break;
@@ -317,6 +341,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("reload-lua"):return cmd_reload_lua(conn, pa);
         case fnv1a("owner"):     return cmd_owner(conn, pa);
         case fnv1a("attach"):    return cmd_attach(conn, pa);
+        case fnv1a("add"):       return cmd_add(conn, pa);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
@@ -1981,6 +2006,103 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
+int daemon_handler::cmd_add(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2)
+    {
+        conn->write_buf = "usage: add <path> [--name <name>] [-s]\n";
+        return 1;
+    }
+
+    std::string exec_path = std::string(pa.args[1]);
+
+    // Validate executable exists and is executable
+    if (access(exec_path.c_str(), X_OK) != 0)
+    {
+        conn->write_buf = "not executable: " + exec_path + "\n";
+        return 1;
+    }
+
+    // Resolve to absolute path
+    {
+        std::error_code ec;
+        auto canonical = std::filesystem::canonical(exec_path, ec);
+        if (!ec)
+            exec_path = canonical.string();
+        else
+            exec_path = std::filesystem::absolute(exec_path).string();
+    }
+
+    // Parse flags
+    std::string name;
+    bool autostart = false;
+
+    for (size_t i = 2; i < pa.count; ++i)
+    {
+        if ((pa.args[i] == "--name" || pa.args[i] == "-n") && i + 1 < pa.count)
+            name = std::string(pa.args[++i]);
+        else if (pa.args[i] == "-s")
+            autostart = true;
+        else
+        {
+            conn->write_buf = "unknown flag: " + std::string(pa.args[i]) + "\n";
+            return 1;
+        }
+    }
+
+    // Derive name from basename if not given
+    if (name.empty())
+    {
+        auto p = std::filesystem::path(exec_path).stem().string();
+        if (p.empty())
+        {
+            conn->write_buf = "could not derive name from path\n";
+            return 1;
+        }
+        name = p;
+    }
+
+    // Check name doesn't already exist
+    if (m_manager.get(name))
+    {
+        conn->write_buf = "runtime already exists: " + name + "\n";
+        return 1;
+    }
+
+    // Create a server-type placeholder
+    if (!m_manager.create(runtime_server, name))
+    {
+        conn->write_buf = "could not create runtime\n";
+        return 2;
+    }
+
+    auto* inst = m_manager.get(name);
+    if (!inst)
+    {
+        conn->write_buf = "internal error\n";
+        return 2;
+    }
+
+    inst->mark_managed(exec_path);
+    inst->set_runtime_manager(&m_manager);
+    inst->set_event_loop(&m_loop);
+
+    if (autostart)
+    {
+        if (!m_manager.start(name, m_loop))
+        {
+            conn->write_buf = "could not start managed runtime\n";
+            m_manager.remove(name);
+            return 2;
+        }
+    }
+
+    if (m_persistence)
+        m_persistence->save_runtime(inst);
+
+    return 0;
+}
+
 int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 4)
@@ -2010,9 +2132,39 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Check for name collision
-    if (m_manager.get(name))
+    // Parse optional flags (need --managed and --pid early for re-attach check)
+    pid_t pid = 0;
+    std::string owner_name;
+    for (size_t i = 4; i < pa.count; ++i)
     {
+        if (pa.args[i] == "--pid" && i + 1 < pa.count)
+        {
+            auto sv = pa.args[++i];
+            std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+        }
+        else if (pa.args[i] == "--managed")
+        {
+            // Consumed but not stored — re-attach is detected via existing->is_managed()
+        }
+        else if ((pa.args[i] == "--owner" || pa.args[i] == "-o") && i + 1 < pa.count)
+        {
+            owner_name = std::string(pa.args[++i]);
+        }
+    }
+
+    // Check for name collision — allow re-attach of managed runtimes
+    if (auto* existing = m_manager.get(name))
+    {
+        if (existing->is_managed() && existing->get_state() == runtime_running)
+        {
+            // Re-attach: update port/pid on existing managed runtime
+            existing->set_port(port);
+            if (pid > 0)
+                existing->set_pid(pid);
+            if (m_persistence)
+                m_persistence->save_runtime(existing);
+            return 0;
+        }
         conn->write_buf = std::string("runtime already exists: ") + std::string(name) + "\n";
         return 1;
     }
@@ -2034,22 +2186,11 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     inst->set_runtime_manager(&m_manager);
     inst->set_event_loop(&m_loop);
 
-    // Parse optional flags
-    for (size_t i = 4; i < pa.count; ++i)
-    {
-        if ((pa.args[i] == "--owner" || pa.args[i] == "-o") && i + 1 < pa.count)
-        {
-            inst->set_owner(pa.args[++i]);
-        }
-        else if (pa.args[i] == "--pid" && i + 1 < pa.count)
-        {
-            pid_t pid = 0;
-            auto sv = pa.args[++i];
-            std::from_chars(sv.data(), sv.data() + sv.size(), pid);
-            if (pid > 0)
-                inst->set_pid(pid);
-        }
-    }
+    // Apply parsed flags
+    if (!owner_name.empty())
+        inst->set_owner(owner_name);
+    if (pid > 0)
+        inst->set_pid(pid);
 
     // Mark as external — must come before start() so it skips io_uring setup
     inst->mark_external();
@@ -2065,6 +2206,42 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         m_persistence->save_runtime(inst);
 
     return 0;
+}
+
+void daemon_handler::start_health_timer()
+{
+    if (m_health_pending)
+        return;
+    m_health_req = { op_timeout, -1, nullptr, 0, this };
+    m_health_ts = { 2, 0 };  // 2 seconds
+    m_loop.submit_timeout(&m_health_ts, &m_health_req);
+    m_health_pending = true;
+}
+
+void daemon_handler::check_managed_health()
+{
+    std::shared_lock lock(m_manager.mutex);
+    for (auto& [name, inst] : m_manager.list())
+    {
+        if (!inst->is_managed() || inst->get_state() != runtime_running)
+            continue;
+        pid_t pid = inst->get_pid();
+        if (pid <= 0)
+            continue;
+        int status = 0;
+        pid_t ret = waitpid(pid, &status, WNOHANG);
+        if (ret <= 0)
+            continue;  // still alive or error
+
+        // Process died — stop and restart
+        LOG_WARN("managed runtime died, restarting");
+        lock.unlock();
+        inst->stop(m_loop);   // set state to stopped (no SIGTERM needed, process is dead)
+        m_manager.start(name, m_loop);  // fork+exec again
+        if (m_persistence)
+            m_persistence->save_runtime(inst.get());
+        return;  // restart one at a time per health check cycle
+    }
 }
 
 int daemon_handler::cmd_cluster_dir(ipc_connection* conn)
