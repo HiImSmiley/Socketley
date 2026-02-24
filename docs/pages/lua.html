@@ -13,10 +13,17 @@
         <li><a href="#cb-on-tick">on_tick</a></li>
         <li><a href="#cb-on-route">on_route</a></li>
         <li><a href="#cb-on-master-auth">on_master_auth</a></li>
+        <li><a href="#cb-on-auth">on_auth</a></li>
+        <li><a href="#cb-on-websocket">on_websocket</a></li>
+        <li><a href="#cb-on-proxy-hooks">on_proxy_request / on_proxy_response</a></li>
       </ul></li>
       <li><a href="#server-api">Server API</a><ul>
         <li><a href="#srv-broadcast">broadcast / send</a></li>
         <li><a href="#srv-connections">connections</a></li>
+        <li><a href="#srv-peer-ip">peer_ip / disconnect</a></li>
+        <li><a href="#srv-clients">clients / multicast</a></li>
+        <li><a href="#srv-set-data">set_data / get_data</a></li>
+        <li><a href="#srv-ws-headers">ws_headers</a></li>
         <li><a href="#srv-master">Master Mode</a></li>
       </ul></li>
       <li><a href="#client-api">Client API</a><ul>
@@ -47,6 +54,11 @@
       <li><a href="#cluster-api">Cluster API</a><ul>
         <li><a href="#cluster-daemons">daemons / runtimes</a></li>
         <li><a href="#cluster-group">group / stats</a></li>
+      </ul></li>
+      <li><a href="#utilities-api">Utilities</a><ul>
+        <li><a href="#util-timers">set_timeout / set_interval</a></li>
+        <li><a href="#util-subscribe">subscribe</a></li>
+        <li><a href="#util-http">http</a></li>
       </ul></li>
     </ul>
 <div id="content-lua" class="content" style="display:none">
@@ -165,6 +177,36 @@ socketley reload-lua myserver</code></pre>
 <div class="method-returns"><strong>Returns:</strong> boolean — true to grant master role</div>
 </div>
 
+<div class="callback-card" id="cb-on-auth">
+<div class="method-header"><span class="method-name">on_auth(client_id) &rarr; boolean</span><span class="badge badge-server">server</span></div>
+<div class="fires">Fires after TCP accept, <strong>before</strong> <code>on_connect</code>. Return <code>false</code> to reject the connection (fail-closed: Lua errors also reject). The client fd is valid for <code>self.peer_ip()</code> inside this callback.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_auth</span>(client_id)
+    <span class="kw">local</span> ip = self.peer_ip(client_id)
+    <span class="kw">if</span> ip == <span class="st">"10.0.0.1"</span> <span class="kw">then</span> <span class="kw">return</span> <span class="kw">false</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="kw">true</span>
+<span class="kw">end</span></code></pre>
+<div class="method-desc">See <a href="#addons-auth">Addons: Auth Middleware</a> for full patterns (IP allowlists, token auth).</div>
+</div>
+
+<div class="callback-card" id="cb-on-websocket">
+<div class="method-header"><span class="method-name">on_websocket(client_id, headers)</span><span class="badge badge-server">server</span></div>
+<div class="fires">Fires when a client completes the WebSocket upgrade handshake. <code>headers</code> is a table with optional keys: <code>cookie</code>, <code>origin</code>, <code>protocol</code> (Sec-WebSocket-Protocol), <code>authorization</code>.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_websocket</span>(client_id, headers)
+    socketley.log(<span class="st">"WS client "</span> .. client_id .. <span class="st">" origin: "</span> .. (headers.origin <span class="kw">or</span> <span class="st">"none"</span>))
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-proxy-hooks">
+<div class="method-header"><span class="method-name">on_proxy_request(client_id, data) &rarr; string or nil</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-header"><span class="method-name">on_proxy_response(client_id, data) &rarr; string or nil</span><span class="badge badge-proxy">proxy</span></div>
+<div class="fires">Intercept hooks for data flowing through a TCP proxy. <code>on_proxy_request</code> fires on client&rarr;backend data; <code>on_proxy_response</code> fires on backend&rarr;client data. Return a string to replace the data, or <code>nil</code> to drop the chunk entirely. Return the original <code>data</code> unchanged to pass through.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_proxy_request</span>(id, data)
+    <span class="kw">if</span> data:find(<span class="st">"DROP"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">nil</span> <span class="kw">end</span>
+    <span class="kw">return</span> data
+<span class="kw">end</span></code></pre>
+<div class="method-desc">See <a href="#addons-proxy-hooks">Addons: Proxy Data Hooks</a> for logging and filtering patterns.</div>
+</div>
+
 <h2 id="server-api">Lua Server API</h2>
 
 <div class="method-card" id="srv-broadcast">
@@ -178,6 +220,35 @@ socketley reload-lua myserver</code></pre>
 <div class="method-card" id="srv-connections">
 <div class="method-header"><span class="method-name">self.connections</span><span class="method-sig">() &rarr; number</span><span class="badge badge-server">server</span></div>
 <div class="method-desc">Current connected client count.</div>
+</div>
+
+<div class="method-card" id="srv-peer-ip">
+<div class="method-header"><span class="method-name">self.peer_ip</span><span class="method-sig">(client_id) &rarr; string</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns the remote IPv4/IPv6 address of the client via <code>getpeername()</code>. Works in any callback including <code>on_auth</code>.</div>
+</div>
+<div class="method-card" id="srv-disconnect">
+<div class="method-header"><span class="method-name">self.disconnect</span><span class="method-sig">(client_id)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Gracefully close a client connection. Uses <code>SHUT_RD</code> so any queued outgoing messages (e.g. an "AUTH FAIL" response) are still delivered before the socket closes.</div>
+</div>
+<div class="method-card" id="srv-clients">
+<div class="method-header"><span class="method-name">self.clients</span><span class="method-sig">() &rarr; table</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns a Lua array of all connected client file descriptors.</div>
+</div>
+<div class="method-card" id="srv-multicast">
+<div class="method-header"><span class="method-name">self.multicast</span><span class="method-sig">(ids, msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Send a message to a subset of clients. <code>ids</code> is a Lua array of client fd integers. Uses zero-copy shared buffer internally.</div>
+</div>
+<div class="method-card" id="srv-set-data">
+<div class="method-header"><span class="method-name">self.set_data</span><span class="method-sig">(client_id, key, value)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Store per-connection metadata. Pass <code>nil</code> as value to delete the key. Metadata is automatically freed on disconnect.</div>
+</div>
+<div class="method-card" id="srv-get-data">
+<div class="method-header"><span class="method-name">self.get_data</span><span class="method-sig">(client_id, key) &rarr; string or nil</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Retrieve per-connection metadata previously set with <code>set_data</code>.</div>
+</div>
+<div class="method-card" id="srv-ws-headers">
+<div class="method-header"><span class="method-name">self.ws_headers</span><span class="method-sig">(client_id) &rarr; table or nil</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Returns WebSocket handshake headers for a WS-connected client, or <code>nil</code> if the client is plain TCP. Table keys: <code>cookie</code>, <code>origin</code>, <code>protocol</code>, <code>authorization</code>.</div>
 </div>
 
 <h3 id="srv-master">Master Mode</h3>
@@ -365,6 +436,55 @@ socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span cla
     <span class="kw">for</span> name, count <span class="kw">in</span> <span class="fn">pairs</span>(s.groups) <span class="kw">do</span>
         socketley.log(<span class="st">"  group "</span> .. name .. <span class="st">": "</span> .. count .. <span class="st">" members"</span>)
     <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<h2 id="utilities-api">Utilities</h2>
+<p>Global utility functions available via the <code>socketley</code> namespace in any runtime type.</p>
+
+<div class="method-card" id="util-set-timeout">
+<div class="method-header"><span class="method-name">socketley.set_timeout</span><span class="method-sig">(ms, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Schedule a one-shot timer. <code>fn</code> fires once after <code>ms</code> milliseconds. Uses an io_uring timeout internally (no polling overhead).</div>
+<pre><code>socketley.set_timeout(<span class="nb">5000</span>, <span class="kw">function</span>()
+    socketley.log(<span class="st">"5 seconds elapsed"</span>)
+<span class="kw">end</span>)</code></pre>
+</div>
+
+<div class="method-card" id="util-set-interval">
+<div class="method-header"><span class="method-name">socketley.set_interval</span><span class="method-sig">(ms, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Schedule a repeating timer. <code>fn</code> fires every <code>ms</code> milliseconds until the runtime stops.</div>
+<pre><code>socketley.set_interval(<span class="nb">1000</span>, <span class="kw">function</span>()
+    socketley.log(<span class="st">"heartbeat"</span>)
+<span class="kw">end</span>)</code></pre>
+</div>
+
+<div class="method-card" id="util-subscribe">
+<div class="method-header"><span class="method-name">socketley.subscribe</span><span class="method-sig">(cache_name, channel, fn)</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Subscribe to messages published on a cache runtime's channel. <code>fn(channel, message)</code> fires on each publish. Enables cross-runtime pub/sub without TCP connections.</div>
+<pre><code>socketley.subscribe(<span class="st">"mycache"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(channel, msg)
+    socketley.log(<span class="st">"["</span> .. channel .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span>)</code></pre>
+</div>
+
+<div class="method-card" id="util-http">
+<div class="method-header"><span class="method-name">socketley.http</span><span class="method-sig">(opts) &rarr; table</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Synchronous HTTP/HTTPS client. Returns <code>{ok, status, body, error}</code>.</div>
+<div class="warn-box"><strong>Blocking call.</strong> This blocks the event loop. Only use in <code>on_start</code>/<code>on_stop</code> or low-frequency <code>on_tick</code> callbacks.</div>
+<table><thead><tr><th>Option</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td>url</td><td>string</td><td><em>required</em></td><td>Full URL (http:// or https://)</td></tr>
+<tr><td>method</td><td>string</td><td>"GET"</td><td>HTTP method</td></tr>
+<tr><td>body</td><td>string</td><td>""</td><td>Request body</td></tr>
+<tr><td>headers</td><td>table</td><td>{}</td><td>Key-value header pairs</td></tr>
+<tr><td>timeout_ms</td><td>number</td><td>5000</td><td>Timeout in milliseconds</td></tr>
+</tbody></table>
+<pre><code><span class="kw">local</span> res = socketley.http({
+    url = <span class="st">"https://api.example.com/data"</span>,
+    method = <span class="st">"POST"</span>,
+    body = <span class="st">'{"key":"value"}'</span>,
+    headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"application/json"</span> }
+})
+<span class="kw">if</span> res.ok <span class="kw">then</span>
+    socketley.log(<span class="st">"Response: "</span> .. res.body)
 <span class="kw">end</span></code></pre>
 </div>
 

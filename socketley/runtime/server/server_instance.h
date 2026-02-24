@@ -143,6 +143,9 @@ public:
     };
     ws_headers_result lua_ws_headers(int client_fd) const;
 
+    // C++ WebSocket callback
+    void set_on_websocket(std::function<void(int fd, const ws_headers_result&)> cb);
+
     // Stats
     std::string get_stats() const override;
 
@@ -187,6 +190,8 @@ private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void invoke_on_websocket(int fd);
+
+    std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
     void serve_http(server_connection* conn, std::string_view path);
 
     // Upstream helpers

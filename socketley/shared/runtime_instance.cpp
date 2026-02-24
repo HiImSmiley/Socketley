@@ -405,6 +405,7 @@ void runtime_instance::invoke_on_disconnect(int client_id)
 
 bool runtime_instance::invoke_on_auth(int client_id)
 {
+    if (m_cb_on_auth) return m_cb_on_auth(client_id);
 #ifndef SOCKETLEY_NO_LUA
     if (!m_lua || !m_lua->has_on_auth()) return true;  // no hook = allow
     try {
@@ -442,6 +443,7 @@ void runtime_instance::set_on_disconnect(std::function<void(int)> cb)           
 void runtime_instance::set_on_client_message(std::function<void(int, std::string_view)> cb) { m_cb_on_client_message = std::move(cb); }
 void runtime_instance::set_on_message(std::function<void(std::string_view)> cb)          { m_cb_on_message = std::move(cb); }
 void runtime_instance::set_on_tick(std::function<void(double)> cb)                       { m_cb_on_tick = std::move(cb); }
+void runtime_instance::set_on_auth(std::function<bool(int)> cb)                          { m_cb_on_auth = std::move(cb); }
 void runtime_instance::set_tick_interval(uint32_t ms)                                    { m_cb_tick_ms = ms; }
 
 // ─── Group ───

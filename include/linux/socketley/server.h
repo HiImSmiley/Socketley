@@ -52,6 +52,8 @@ public:
     server& on_disconnect(std::function<void(int)> cb)                      { raw()->set_on_disconnect(std::move(cb)); return *this; }
     server& on_message(std::function<void(int, std::string_view)> cb)       { raw()->set_on_client_message(std::move(cb)); return *this; }
     server& on_tick(std::function<void(double)> cb)                         { raw()->set_on_tick(std::move(cb)); return *this; }
+    server& on_auth(std::function<bool(int)> cb)                           { raw()->set_on_auth(std::move(cb)); return *this; }
+    server& on_websocket(std::function<void(int, const server_instance::ws_headers_result&)> cb) { srv()->set_on_websocket(std::move(cb)); return *this; }
 
     // ── Actions ─────────────────────────────────────────────────────────
     void send(int fd, std::string_view msg)                          { srv()->lua_send_to(fd, msg); }
