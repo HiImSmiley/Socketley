@@ -1,0 +1,371 @@
+    <ul id="navList-lua" style="display:none">
+      <li class="open"><a href="#lua-scripting">Lua Scripting</a><ul>
+        <li><a href="#lua-attaching">Attaching Scripts</a></li>
+        <li><a href="#lua-bindings">How Bindings Work</a></li>
+        <li><a href="#lua-globals">Globals &amp; self</a></li>
+      </ul></li>
+      <li><a href="#callbacks">Callbacks</a><ul>
+        <li><a href="#cb-on-start">on_start / on_stop</a></li>
+        <li><a href="#cb-on-message">on_message</a></li>
+        <li><a href="#cb-on-client-message">on_client_message</a></li>
+        <li><a href="#cb-on-connect">on_connect / on_disconnect</a></li>
+        <li><a href="#cb-on-send">on_send</a></li>
+        <li><a href="#cb-on-tick">on_tick</a></li>
+        <li><a href="#cb-on-route">on_route</a></li>
+        <li><a href="#cb-on-master-auth">on_master_auth</a></li>
+      </ul></li>
+      <li><a href="#server-api">Server API</a><ul>
+        <li><a href="#srv-broadcast">broadcast / send</a></li>
+        <li><a href="#srv-connections">connections</a></li>
+        <li><a href="#srv-master">Master Mode</a></li>
+      </ul></li>
+      <li><a href="#client-api">Client API</a><ul>
+        <li><a href="#cli-send">send</a></li>
+        <li><a href="#cli-connections">connections</a></li>
+      </ul></li>
+      <li><a href="#cache-api">Cache API</a><ul>
+        <li><a href="#cache-strings">Strings</a></li>
+        <li><a href="#cache-lists">Lists</a></li>
+        <li><a href="#cache-sets">Sets</a></li>
+        <li><a href="#cache-hashes">Hashes</a></li>
+        <li><a href="#cache-ttl">TTL / Expiry</a></li>
+        <li><a href="#cache-pubsub">Pub/Sub</a></li>
+      </ul></li>
+      <li><a href="#proxy-api">Proxy API</a><ul>
+        <li><a href="#proxy-connections">connections</a></li>
+        <li><a href="#proxy-routing">Lua Routing</a></li>
+      </ul></li>
+      <li><a href="#runtime-mgmt">Runtime Management</a><ul>
+        <li><a href="#mgmt-create">create / start / stop</a></li>
+        <li><a href="#mgmt-send">send / list / get</a></li>
+        <li><a href="#mgmt-ownership">Ownership</a></li>
+      </ul></li>
+      <li><a href="#client-routing">Client Routing</a><ul>
+        <li><a href="#route-route">route / unroute</a></li>
+        <li><a href="#route-owner-send">owner_send / owner_broadcast</a></li>
+      </ul></li>
+      <li><a href="#cluster-api">Cluster API</a><ul>
+        <li><a href="#cluster-daemons">daemons / runtimes</a></li>
+        <li><a href="#cluster-group">group / stats</a></li>
+      </ul></li>
+    </ul>
+<div id="content-lua" class="content" style="display:none">
+
+<h2 id="lua-scripting">Lua Scripting</h2>
+<p>Socketley embeds LuaJIT via sol2. Scripts attach to runtimes and can define lifecycle callbacks, call runtime action methods, and manage other runtimes programmatically.</p>
+
+<h3 id="lua-attaching">Attaching Scripts</h3>
+<pre><code><span class="cm"># Per-runtime script</span>
+socketley create server myserver -p 9000 --lua handler.lua -s
+
+<span class="cm"># Orchestration script (defines runtimes table)</span>
+socketley --lua setup.lua
+
+<span class="cm"># Hot-reload without restarting</span>
+socketley reload-lua myserver</code></pre>
+
+<h3 id="lua-bindings">How Bindings Work</h3>
+<div class="info-box"><strong>Binding order:</strong> <code>register_bindings()</code> runs <em>before</em> script execution. The <code>self</code>, <code>socketley</code>, and type-alias tables are already available at the top level of your script.</div>
+<ol>
+<li>Fresh LuaJIT state with <code>base</code>, <code>string</code>, <code>table</code>, <code>math</code>, <code>os</code> libs</li>
+<li>Registers <code>socketley</code> namespace (log, create, start, stop, remove, send, list, get)</li>
+<li>Registers <code>self</code> table with runtime properties and type-specific action methods</li>
+<li>Registers a type alias (<code>server</code> / <code>client</code> / <code>cache</code> / <code>proxy</code>) pointing to the same <code>self</code> table</li>
+<li>Executes the script, then captures any defined callback functions</li>
+</ol>
+
+<h3 id="lua-globals">Globals &amp; self</h3>
+<h4>self Table (read-only properties)</h4>
+<table><thead><tr><th>Property</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>self.name</td><td>string</td><td>Runtime name</td></tr>
+<tr><td>self.port</td><td>number</td><td>Port number (0 = internal-only)</td></tr>
+<tr><td>self.type</td><td>string</td><td><code>"server"</code>, <code>"client"</code>, <code>"cache"</code>, <code>"proxy"</code></td></tr>
+<tr><td>self.state</td><td>string</td><td><code>"created"</code>, <code>"running"</code>, <code>"stopped"</code>, <code>"failed"</code></td></tr>
+<tr><td>self.protocol</td><td>string</td><td><code>"tcp"</code> or <code>"udp"</code> (server/client)</td></tr>
+</tbody></table>
+
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.log</span><span class="method-sig">(msg)</span><span class="badge badge-all">all types</span></div>
+<div class="method-desc">Write to stderr with <code>[lua]</code> prefix. Useful for debugging.</div>
+</div>
+
+<h2 id="callbacks">Lua Callbacks</h2>
+<p>Define global functions to react to lifecycle events. All are optional. <code>self.state</code> is updated before each callback fires.</p>
+
+<div class="callback-card" id="cb-on-start">
+<div class="method-header"><span class="method-name">on_start()</span><span class="badge badge-all">all types</span></div>
+<div class="fires">Fires when runtime enters <code>running</code> state. Also fires again on reconnect (client).</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.log(self.name .. <span class="st">" started on port "</span> .. tostring(self.port))
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-stop">
+<div class="method-header"><span class="method-name">on_stop()</span><span class="badge badge-all">all types</span></div>
+<div class="fires">Fires when runtime enters <code>stopped</code> state.</div>
+</div>
+
+<div class="callback-card" id="cb-on-message">
+<div class="method-header"><span class="method-name">on_message(msg)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span><span class="badge badge-cache">cache</span></div>
+<div class="fires">Fires on each received message. Trailing newline is stripped.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_message</span>(msg)
+    self.broadcast(<span class="st">"[echo] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-client-message">
+<div class="method-header"><span class="method-name">on_client_message(client_id, msg)</span><span class="badge badge-server">server</span></div>
+<div class="fires">Fires with the sender's client_id. Fires <em>alongside</em> <code>on_message</code> (not instead of).</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">if</span> msg == <span class="st">"whoami"</span> <span class="kw">then</span>
+        self.send(client_id, <span class="st">"You are client #"</span> .. tostring(client_id))
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-connect">
+<div class="method-header"><span class="method-name">on_connect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-cache">cache</span></div>
+<div class="fires">Fires when a client connects. <code>client_id</code> is the file descriptor.</div>
+</div>
+
+<div class="callback-card" id="cb-on-disconnect">
+<div class="method-header"><span class="method-name">on_disconnect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-cache">cache</span></div>
+<div class="fires">Fires when a client disconnects.</div>
+</div>
+
+<div class="callback-card" id="cb-on-send">
+<div class="method-header"><span class="method-name">on_send(msg)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span></div>
+<div class="fires">Fires after a message is sent or broadcast.</div>
+</div>
+
+<div class="callback-card" id="cb-on-tick">
+<div class="method-header"><span class="method-name">on_tick(dt)</span><span class="badge badge-all">all types</span></div>
+<div class="fires">Fires at a configurable interval while the runtime is running. <code>dt</code> is the actual elapsed time in milliseconds since the last tick (double). Requires a top-level <code>tick_ms</code> global (minimum 10&nbsp;ms, default 100&nbsp;ms if omitted). Self-rescheduling — if Lua is slow, ticks do not queue.</div>
+<pre><code>tick_ms = <span class="nb">50</span>   <span class="cm">-- fire every ~50 ms</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    self.broadcast(<span class="st">"ping"</span>)
+    socketley.log(<span class="st">"tick dt="</span> .. tostring(dt))
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-route">
+<div class="method-header"><span class="method-name">on_route(method, path)</span><span class="badge badge-proxy">proxy</span></div>
+<div class="fires">Fires for each HTTP request when strategy is <code>"lua"</code>.</div>
+<div class="method-returns"><strong>Returns:</strong> number (0-based backend index) or nil (use default strategy)</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"^/api/"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">0</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="kw">nil</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-master-auth">
+<div class="method-header"><span class="method-name">on_master_auth(client_id, password)</span><span class="badge badge-server">server</span></div>
+<div class="fires">Fires when a client sends <code>master &lt;password&gt;</code>. If defined, overrides <code>--master-pw</code>.</div>
+<div class="method-returns"><strong>Returns:</strong> boolean — true to grant master role</div>
+</div>
+
+<h2 id="server-api">Lua Server API</h2>
+
+<div class="method-card" id="srv-broadcast">
+<div class="method-header"><span class="method-name">self.broadcast</span><span class="method-sig">(msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Send to <strong>all</strong> connected clients. Newline appended automatically. WebSocket clients receive a framed text message.</div>
+</div>
+<div class="method-card" id="srv-send">
+<div class="method-header"><span class="method-name">self.send</span><span class="method-sig">(client_id, msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Send to a <strong>specific</strong> client by file descriptor.</div>
+</div>
+<div class="method-card" id="srv-connections">
+<div class="method-header"><span class="method-name">self.connections</span><span class="method-sig">() &rarr; number</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Current connected client count.</div>
+</div>
+
+<h3 id="srv-master">Master Mode</h3>
+<p>With <code>--mode master</code>, one authenticated client becomes the broadcaster. Others are silenced (or forwarded via <code>--master-forward</code>). Auth via <code>--master-pw</code> or the <code>on_master_auth</code> callback.</p>
+
+<h2 id="client-api">Lua Client API</h2>
+
+<div class="method-card" id="cli-send">
+<div class="method-header"><span class="method-name">self.send</span><span class="method-sig">(msg)</span><span class="badge badge-client">client</span></div>
+<div class="method-desc">Send a message to the connected server.</div>
+</div>
+<div class="method-card" id="cli-connections">
+<div class="method-header"><span class="method-name">self.connections</span><span class="method-sig">() &rarr; number</span><span class="badge badge-client">client</span></div>
+<div class="method-desc"><code>0</code> = disconnected, <code>1</code> = connected.</div>
+</div>
+
+<div class="info-box"><strong>Auto-reconnect:</strong> Enable with <code>--reconnect [max]</code>. Uses exponential backoff. <code>on_start</code> fires again on each successful reconnect.</div>
+
+<h2 id="cache-api">Lua Cache API</h2>
+<p>Direct in-memory access from Lua — no TCP round-trip. Use from a cache runtime's own script, or from a server script linked with <code>--cache &lt;name&gt;</code>.</p>
+<div class="warn-box"><strong>Type enforcement:</strong> One type per key. Use <code>self.del(key)</code> to clear before changing type.</div>
+
+<h3 id="cache-strings">Strings</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.set</span><span class="method-sig">(key, value) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.get</span><span class="method-sig">(key) &rarr; string</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.del</span><span class="method-sig">(key) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+
+<h3 id="cache-lists">Lists</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.lpush / self.rpush</span><span class="method-sig">(key, value) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.lpop / self.rpop</span><span class="method-sig">(key) &rarr; string</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.llen</span><span class="method-sig">(key) &rarr; number</span><span class="badge badge-cache">cache</span></div></div>
+
+<h3 id="cache-sets">Sets</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.sadd</span><span class="method-sig">(key, member) &rarr; number</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.srem</span><span class="method-sig">(key, member) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.sismember</span><span class="method-sig">(key, member) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.scard</span><span class="method-sig">(key) &rarr; number</span><span class="badge badge-cache">cache</span></div></div>
+
+<h3 id="cache-hashes">Hashes</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.hset</span><span class="method-sig">(key, field, value) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.hget</span><span class="method-sig">(key, field) &rarr; string</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.hdel</span><span class="method-sig">(key, field) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.hlen</span><span class="method-sig">(key) &rarr; number</span><span class="badge badge-cache">cache</span></div></div>
+
+<h3 id="cache-ttl">TTL / Expiry</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.expire</span><span class="method-sig">(key, seconds) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.ttl</span><span class="method-sig">(key) &rarr; number</span><span class="badge badge-cache">cache</span></div>
+<div class="method-desc"><code>-1</code> = no TTL set, <code>-2</code> = key not found.</div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">self.persist</span><span class="method-sig">(key) &rarr; boolean</span><span class="badge badge-cache">cache</span></div></div>
+
+<h3 id="cache-pubsub">Pub/Sub</h3>
+<div class="method-card"><div class="method-header"><span class="method-name">self.publish</span><span class="method-sig">(channel, message) &rarr; number</span><span class="badge badge-cache">cache</span></div>
+<div class="method-desc">Publish to a channel. Returns the subscriber count.</div></div>
+
+<h2 id="proxy-api">Lua Proxy API</h2>
+
+<div class="method-card" id="proxy-connections">
+<div class="method-header"><span class="method-name">self.connections</span><span class="method-sig">() &rarr; number</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">Current active connection count through the proxy.</div>
+</div>
+
+<h3 id="proxy-routing">Lua Routing</h3>
+<p>Set strategy to <code>"lua"</code> and define <code>on_route</code>. Backends are 0-indexed. Return <code>nil</code> to fall back to the default strategy.</p>
+
+<h2 id="runtime-mgmt">Runtime Management API</h2>
+<p>Manage other runtimes from within a Lua script using the <code>socketley</code> namespace.</p>
+
+<div class="method-card" id="mgmt-create">
+<div class="method-header"><span class="method-name">socketley.create</span><span class="method-sig">(type, name, config?) &rarr; boolean</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Config keys: <code>port</code>, <code>lua</code>/<code>config</code>, <code>target</code>, <code>mode</code>, <code>on_parent_stop</code> (<code>"stop"</code>|<code>"remove"</code>), <code>start</code>.</div>
+</div>
+<div class="method-card"><div class="method-header"><span class="method-name">socketley.start</span><span class="method-sig">(name) &rarr; boolean</span><span class="badge badge-all">all</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">socketley.stop</span><span class="method-sig">(name) &rarr; boolean</span><span class="badge badge-all">all</span></div></div>
+<div class="method-card"><div class="method-header"><span class="method-name">socketley.remove</span><span class="method-sig">(name) &rarr; boolean</span><span class="badge badge-all">all</span></div></div>
+
+<div class="method-card" id="mgmt-send">
+<div class="method-header"><span class="method-name">socketley.send</span><span class="method-sig">(name, msg) &rarr; boolean</span><span class="badge badge-all">all</span></div>
+</div>
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.list</span><span class="method-sig">() &rarr; table</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Returns an array of all runtime names.</div>
+</div>
+<div class="method-card">
+<div class="method-header"><span class="method-name">socketley.get</span><span class="method-sig">(name) &rarr; table or nil</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Returns <code>{name, type, state, port, connections, owner}</code> or nil if not found.</div>
+</div>
+
+<h3 id="mgmt-ownership">Ownership</h3>
+<p>Runtimes created via <code>socketley.create()</code> are owned by the calling runtime. Use <code>on_parent_stop = "remove"</code> to auto-remove children when the parent stops.</p>
+<pre><code>socketley.create(<span class="st">"server"</span>, <span class="st">"worker"</span>, {
+    port = <span class="nb">0</span>, lua = <span class="st">"worker.lua"</span>,
+    on_parent_stop = <span class="st">"remove"</span>, start = <span class="kw">true</span>
+})</code></pre>
+
+<h2 id="client-routing">Client Routing</h2>
+<p>Forward clients from a parent server to child sub-servers. Ideal for game lobbies, chat rooms, and microservice dispatch.</p>
+<div class="info-box">Routed clients' messages go to the sub-server's <code>on_client_message</code>. Sub-servers reply with <code>owner_send</code> / <code>owner_broadcast</code>.</div>
+
+<div class="method-card" id="route-route">
+<div class="method-header"><span class="method-name">self.route</span><span class="method-sig">(client_id, target) &rarr; boolean</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Route a client to a named sub-server. Messages from that client will be forwarded.</div>
+</div>
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.unroute</span><span class="method-sig">(client_id) &rarr; boolean</span><span class="badge badge-server">server</span></div>
+</div>
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.get_route</span><span class="method-sig">(client_id) &rarr; string or nil</span><span class="badge badge-server">server</span></div>
+</div>
+<div class="method-card" id="route-owner-send">
+<div class="method-header"><span class="method-name">self.owner_send</span><span class="method-sig">(client_id, msg) &rarr; boolean</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">From a sub-server, send to a specific client on the parent server.</div>
+</div>
+<div class="method-card">
+<div class="method-header"><span class="method-name">self.owner_broadcast</span><span class="method-sig">(msg) &rarr; boolean</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">From a sub-server, broadcast to all clients on the parent server.</div>
+</div>
+
+<p>Port-0 sub-servers have no listener — they only receive messages via client routing from the parent.</p>
+
+<h2 id="cluster-api">Cluster Introspection API</h2>
+<p>When the daemon has cluster mode enabled (<code>daemon --name</code> + <code>daemon --cluster</code>), the <code>socketley.cluster</code> table provides read-only access to the full cluster topology. All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.</p>
+
+<div class="info-box"><strong>Requires cluster mode.</strong> Enable with <code>socketley daemon --name &lt;n&gt; --cluster &lt;dir&gt;</code>. Remote daemons are discovered via JSON heartbeat files in the shared cluster directory. Discovery runs every 2&nbsp;seconds.</div>
+
+<div class="method-card" id="cluster-daemons">
+<div class="method-header"><span class="method-name">socketley.cluster.daemons</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns an array of all daemons in the cluster. The local daemon is always the first entry.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>name</td><td>string</td><td>Daemon name (from <code>--name</code>)</td></tr>
+<tr><td>host</td><td>string</td><td>Hostname (from <code>gethostname()</code>)</td></tr>
+<tr><td>runtimes</td><td>number</td><td>Count of runtimes on this daemon</td></tr>
+</tbody></table>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">for</span> _, d <span class="kw">in</span> <span class="fn">ipairs</span>(socketley.cluster.daemons()) <span class="kw">do</span>
+        socketley.log(d.name .. <span class="st">" @ "</span> .. d.host .. <span class="st">" ("</span> .. d.runtimes .. <span class="st">" runtimes)"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="method-card" id="cluster-runtimes">
+<div class="method-header"><span class="method-name">socketley.cluster.runtimes</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns a flat array of every runtime across all daemons in the cluster (local + remote).</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon</td><td>string</td><td>Hosting daemon name</td></tr>
+<tr><td>name</td><td>string</td><td>Runtime name</td></tr>
+<tr><td>type</td><td>string</td><td><code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
+<tr><td>port</td><td>number</td><td>Listen port (0 = internal-only)</td></tr>
+<tr><td>group</td><td>string</td><td>Group tag (empty string if unset)</td></tr>
+<tr><td>state</td><td>string</td><td><code>"created"</code>, <code>"running"</code>, <code>"stopped"</code>, or <code>"failed"</code></td></tr>
+<tr><td>connections</td><td>number</td><td>Current connection count</td></tr>
+</tbody></table>
+</div>
+
+<div class="method-card" id="cluster-group">
+<div class="method-header"><span class="method-name">socketley.cluster.group</span><span class="method-sig">(name) &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns running members of the named group that have a valid port. Useful for building custom routing, health checks, or failover logic.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemon</td><td>string</td><td>Daemon name</td></tr>
+<tr><td>host</td><td>string</td><td>Advertised address</td></tr>
+<tr><td>port</td><td>number</td><td>Listen port</td></tr>
+<tr><td>connections</td><td>number</td><td>Current connection count</td></tr>
+</tbody></table>
+<pre><code><span class="cm">-- Pick the least-loaded backend from the "api" group</span>
+<span class="kw">local</span> members = socketley.cluster.group(<span class="st">"api"</span>)
+<span class="kw">local</span> best = members[<span class="nb">1</span>]
+<span class="kw">for</span> _, m <span class="kw">in</span> <span class="fn">ipairs</span>(members) <span class="kw">do</span>
+    <span class="kw">if</span> m.connections &lt; best.connections <span class="kw">then</span> best = m <span class="kw">end</span>
+<span class="kw">end</span>
+socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span class="st">":"</span> .. best.port)</code></pre>
+</div>
+
+<div class="method-card" id="cluster-stats">
+<div class="method-header"><span class="method-name">socketley.cluster.stats</span><span class="method-sig">() &rarr; table</span><span class="badge badge-cluster">cluster</span></div>
+<div class="method-desc">Returns aggregate cluster statistics in a single call.</div>
+<table><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>daemons</td><td>number</td><td>Total daemon count (local + remote)</td></tr>
+<tr><td>runtimes</td><td>number</td><td>Total runtime count across all daemons</td></tr>
+<tr><td>running</td><td>number</td><td>Runtimes currently in <code>"running"</code> state</td></tr>
+<tr><td>groups</td><td>table</td><td>Maps group name &rarr; member count</td></tr>
+</tbody></table>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> s = socketley.cluster.stats()
+    socketley.log(<span class="st">"cluster: "</span> .. s.daemons .. <span class="st">" daemons, "</span>
+                  .. s.running .. <span class="st">"/"</span> .. s.runtimes .. <span class="st">" running"</span>)
+    <span class="kw">for</span> name, count <span class="kw">in</span> <span class="fn">pairs</span>(s.groups) <span class="kw">do</span>
+        socketley.log(<span class="st">"  group "</span> .. name .. <span class="st">": "</span> .. count .. <span class="st">" members"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+</div><!-- #content-lua -->

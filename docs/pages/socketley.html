@@ -1,0 +1,714 @@
+    <ul id="navList-socketley">
+      <li><a href="#getting-started">Getting Started</a><ul>
+        <li><a href="#gs-install">Installation</a></li>
+        <li><a href="#gs-first-server">Your First Server</a></li>
+        <li><a href="#gs-next">Where to Go Next</a></li>
+      </ul></li>
+      <li><a href="#concepts">Key Concepts</a><ul>
+        <li><a href="#concept-runtimes">Runtimes</a></li>
+        <li><a href="#concept-websocket">WebSocket Auto-Detection</a></li>
+        <li><a href="#concept-cache">Cache Attachment</a></li>
+        <li><a href="#concept-http">HTTP Serving</a></li>
+        <li><a href="#concept-names">Runtime Name Networking</a></li>
+        <li><a href="#concept-groups">Group-Based Discovery</a></li>
+        <li><a href="#concept-lua">Writing Lua Scripts</a></li>
+      </ul></li>
+      <li><a href="#cli-commands">CLI Commands</a><ul>
+        <li><a href="#cmd-create">create</a></li>
+        <li><a href="#cmd-start-stop">start / stop / remove</a></li>
+        <li><a href="#cmd-send">send</a></li>
+        <li><a href="#cmd-stats">stats</a></li>
+        <li><a href="#cmd-reload">reload / reload-lua</a></li>
+        <li><a href="#cmd-show-edit">show / edit</a></li>
+        <li><a href="#cmd-ls-ps">ls / ps / owner</a></li>
+        <li><a href="#cmd-daemon">daemon</a></li>
+        <li><a href="#cmd-cluster">cluster</a></li>
+      </ul></li>
+      <li><a href="#cli-flags">CLI Flags</a><ul>
+        <li><a href="#flags-daemon">Daemon</a></li>
+        <li><a href="#flags-common">Common</a></li>
+        <li><a href="#flags-server">Server</a></li>
+        <li><a href="#flags-client">Client</a></li>
+        <li><a href="#flags-cache">Cache</a></li>
+        <li><a href="#flags-proxy">Proxy</a></li>
+      </ul></li>
+      <li><a href="#runtime-types">Runtime Types</a><ul>
+        <li><a href="#rt-server">Server</a></li>
+        <li><a href="#rt-client">Client</a></li>
+        <li><a href="#rt-proxy">Proxy</a></li>
+        <li><a href="#rt-cache">Cache</a></li>
+      </ul></li>
+      <li><a href="#cache-protocol">Cache Protocol</a><ul>
+        <li><a href="#cp-strings">Strings</a></li>
+        <li><a href="#cp-lists">Lists</a></li>
+        <li><a href="#cp-sets">Sets</a></li>
+        <li><a href="#cp-hashes">Hashes</a></li>
+        <li><a href="#cp-ttl">TTL / Expiry</a></li>
+        <li><a href="#cp-pubsub">Pub/Sub</a></li>
+        <li><a href="#cp-memory">Memory &amp; Admin</a></li>
+        <li><a href="#cp-resp">RESP2</a></li>
+      </ul></li>
+      <li><a href="#configuration">Configuration</a><ul>
+        <li><a href="#config-flag">--lua Flag</a></li>
+        <li><a href="#config-runtimes">runtimes Table</a></li>
+        <li><a href="#config-daemon">Daemon Config</a></li>
+      </ul></li>
+    </ul>
+<div id="content-socketley" class="content">
+
+<!-- ── GETTING STARTED ── -->
+<h2 id="getting-started">Getting Started</h2>
+<p>Socketley is a high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style &mdash; with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O. Wire them together into anything from a chat app to a microservices backend.</p>
+
+<div class="info-box"><strong>What you can build:</strong>
+<ul style="margin:6px 0 0;padding-left:20px">
+<li><strong>Real-time web apps</strong> &mdash; <code>--http</code> serves your HTML, auto-injects a WebSocket connection, Lua handles messages</li>
+<li><strong>Redis-compatible caches</strong> &mdash; drop-in replacement, 2.5&ndash;3.9x faster than Redis with pipelining</li>
+<li><strong>Load-balanced microservices</strong> &mdash; proxy runtimes target backends by name, not hardcoded ports</li>
+<li><strong>Cache-backed APIs</strong> &mdash; clients send <code>cache set key val</code> through your server, no separate connection needed</li>
+<li><strong>Game servers with lobby routing</strong> &mdash; create sub-servers on the fly, route players between them with Lua</li>
+</ul></div>
+
+<div class="info-box"><strong>Source code:</strong> <a href="https://github.com/HiImSmiley/Socketley" target="_blank" rel="noopener">github.com/HiImSmiley/Socketley</a></div>
+
+<h3 id="gs-install">Installation</h3>
+<h4>From source (recommended)</h4>
+<pre><code>git clone https://github.com/HiImSmiley/Socketley.git
+<span class="kw">cd</span> socketley
+./bin/premake5 gmake2
+<span class="kw">cd</span> make && make config=release_x64 -j$(nproc)</code></pre>
+<p>Binary output: <code>bin/Release/socketley</code></p>
+
+<h4>System-wide install</h4>
+<pre><code>sudo bash packaging/install.sh
+<span class="cm"># Or build a .deb:</span>
+bash packaging/build-deb.sh && sudo dpkg -i socketley_*.deb</code></pre>
+
+<h3 id="gs-first-server">Your First Server</h3>
+<p>Let's build a working server in under a minute. Each step shows what's happening behind the scenes.</p>
+
+<p><strong>1. The daemon is already running.</strong> When installed via package (<code>dpkg -i</code> or <code>install.sh</code>), the daemon runs as a systemd service automatically. No manual startup needed.</p>
+
+<p><strong>2. Create a server called "hello" on port 9000</strong> &mdash; the <code>-s</code> flag starts it immediately:</p>
+<pre><code>socketley create server hello -p 9000 -s</code></pre>
+<p>Your server is now listening. Any TCP client or WebSocket client can connect to port 9000.</p>
+
+<p><strong>3. Connect with netcat</strong> in another terminal:</p>
+<pre><code>nc localhost 9000</code></pre>
+<p>You're connected. Anything broadcast to "hello" will appear here.</p>
+
+<p><strong>4. Broadcast a message</strong> from a third terminal:</p>
+<pre><code>socketley send hello <span class="st">"Hi everyone!"</span></code></pre>
+<p>The netcat client receives "Hi everyone!" &mdash; <code>send</code> broadcasts to all connected clients.</p>
+
+<p><strong>5. Add Lua behavior.</strong> Create a file called <code>echo.lua</code>:</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    self.broadcast(<span class="st">"["</span> .. client_id .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<p>Now create a server that uses it:</p>
+<pre><code>socketley create server chat -p 9001 --lua echo.lua -s</code></pre>
+<p>Every message from a client gets broadcast to all others, prefixed with the sender's ID.</p>
+
+<p><strong>6. Check what's running:</strong></p>
+<pre><code>socketley ls</code></pre>
+<pre><code>ID        NAME    TYPE    PORT  CONN  OWNED BY  STATUS       CREATED
+a1b2c3    hello   server  9000  1     -         Up 2 min     3 min ago
+d4e5f6    chat    server  9001  0     -         Up 30 sec    30 sec ago</code></pre>
+
+<p><strong>7. Clean up</strong> when you're done:</p>
+<pre><code>socketley remove hello chat</code></pre>
+
+<h3 id="gs-next">Where to Go Next</h3>
+<ul>
+<li><strong>Want Lua scripting?</strong> &rarr; <a href="#concept-lua">Writing Lua Scripts</a></li>
+<li><strong>Building a web app?</strong> &rarr; <a href="#concept-http">HTTP Serving</a> (serve HTML + auto WebSocket)</li>
+<li><strong>Need a cache?</strong> &rarr; <a href="#concept-cache">Cache Attachment</a></li>
+<li><strong>Load balancing?</strong> &rarr; <a href="#concept-names">Runtime Name Networking</a> and <a href="#concept-groups">Group Discovery</a></li>
+<li><strong>See all examples</strong> &rarr; <a href="#ex-getting-started">Examples tab</a></li>
+<li><strong>Full Lua API reference</strong> &rarr; <a href="#lua-scripting">Lua tab</a></li>
+</ul>
+<details style="margin-top:12px"><summary><strong>Building from source (advanced)</strong></summary>
+<pre><code>./bin/premake5 gmake2
+<span class="kw">cd</span> make
+make config=release_x64 -j$(nproc)   <span class="cm"># Release</span>
+make config=debug_x64 -j$(nproc)     <span class="cm"># Debug</span></code></pre>
+<p>Requirements: Linux with io_uring (kernel 5.11+), GCC/Clang with C++20. All dependencies vendored.</p>
+</details>
+
+<!-- ── KEY CONCEPTS ── -->
+<h2 id="concepts">Key Concepts</h2>
+<p>Socketley's power comes from how its pieces connect. Each concept below unlocks a new capability.</p>
+
+<h3 id="concept-runtimes">Runtimes</h3>
+<p>A <strong>runtime</strong> is a long-living named network process &mdash; a server, client, proxy, or cache. You create it once, then start and stop it as needed. Think of it like a Docker container for a network socket.</p>
+
+<p><strong>Lifecycle:</strong> <code>create</code> &rarr; <code>start</code> &rarr; <code>stop</code> &rarr; <code>start</code> again &rarr; <code>remove</code>. Runtimes survive daemon restarts (state is persisted to disk), so you can reboot your machine and everything comes back up.</p>
+
+<pre><code><span class="cm"># Create but don't start yet</span>
+socketley create server api -p 9000
+
+<span class="cm"># Start when ready</span>
+socketley start api
+
+<span class="cm"># Stop (keeps config, can restart later)</span>
+socketley stop api
+
+<span class="cm"># Remove permanently</span>
+socketley remove api</code></pre>
+
+<p><strong>Glob patterns</strong> let you manage many runtimes at once:</p>
+<pre><code>socketley stop <span class="st">'api*'</span>          <span class="cm"># Stop all runtimes starting with "api"</span>
+socketley start <span class="st">'*'</span>            <span class="cm"># Start everything</span>
+socketley remove <span class="st">'test-?'</span>      <span class="cm"># Remove test-1, test-2, etc.</span></code></pre>
+
+<p><strong>Interactive mode</strong> (<code>-i</code>) pipes stdin/stdout through the runtime &mdash; you type messages and see responses in real time:</p>
+<pre><code>socketley start api -i</code></pre>
+
+<h3 id="concept-websocket">WebSocket Auto-Detection</h3>
+<p>Every Socketley server automatically detects WebSocket connections. <strong>No flag needed.</strong> When a client sends an HTTP upgrade request, the server completes the handshake and switches to WebSocket framing. Regular TCP clients continue working on the same port.</p>
+
+<pre><code><span class="cm"># This server accepts both TCP and WebSocket connections on port 9000</span>
+socketley create server app -p 9000 -s
+
+<span class="cm"># TCP client</span>
+nc localhost 9000
+
+<span class="cm"># WebSocket client (browser JavaScript)</span>
+<span class="cm"># const ws = new WebSocket("ws://localhost:9000")</span></code></pre>
+
+<p>The <code>on_websocket(client_id, headers)</code> Lua callback fires after a WebSocket handshake completes, giving you access to the upgrade headers for session tracking:</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_websocket</span>(client_id, headers)
+    socketley.log(<span class="st">"WS connected: "</span> .. (headers.origin <span class="kw">or</span> <span class="st">"unknown"</span>))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="cm">-- Works for both TCP and WebSocket clients</span>
+    self.broadcast(msg)
+<span class="kw">end</span></code></pre>
+
+<p>You can also call <code>self.ws_headers(client_id)</code> at any time to retrieve the stored headers (<code>cookie</code>, <code>origin</code>, <code>sec-websocket-protocol</code>, <code>authorization</code>).</p>
+
+<div class="info-box"><strong>How detection works:</strong> The server inspects the first 4 bytes of each new connection. If they're <code>GET </code>, it parses the HTTP upgrade headers. Otherwise it treats the connection as raw TCP. This happens per-connection, so mixed traffic just works.</div>
+
+<h3 id="concept-cache">Cache Attachment</h3>
+<p>The <code>--cache &lt;name&gt;</code> flag on a server lets clients access a cache <em>through</em> the server. Clients send <code>cache &lt;command&gt;</code> messages, and the server forwards them to the linked cache runtime. The response goes back only to the sender &mdash; never broadcast.</p>
+
+<pre><code><span class="cm"># 1. Create a cache</span>
+socketley create cache store -p 9001 -s
+
+<span class="cm"># 2. Create a server linked to that cache</span>
+socketley create server api -p 9000 --cache store -s
+
+<span class="cm"># 3. A client connected to the server can now run cache commands</span>
+nc localhost 9000
+cache set user:1 Alice       <span class="cm"># → ok</span>
+cache get user:1             <span class="cm"># → Alice</span>
+Hello everyone!              <span class="cm"># → broadcast normally (no "cache" prefix)</span></code></pre>
+
+<p>This means your clients don't need a separate connection to the cache. Regular messages still work as normal &mdash; only messages starting with <code>cache </code> are intercepted.</p>
+
+<p>In Lua orchestration files, use the <code>cache_name</code> key:</p>
+<pre><code>runtimes = {
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, cache_name = <span class="st">"store"</span>, start = <span class="kw">true</span> },
+}</code></pre>
+
+<h3 id="concept-http">HTTP Serving</h3>
+<p>The <code>--http &lt;directory&gt;</code> flag turns a server into a static file server with automatic WebSocket integration. This is how you build real-time web UIs on Socketley.</p>
+
+<pre><code><span class="cm"># Serve files from ./public/ on port 8080</span>
+socketley create server web -p 8080 --http ./public -s</code></pre>
+
+<p><strong>What happens:</strong></p>
+<ul>
+<li>HTTP GET requests serve files from the directory (HTML, CSS, JS, images, fonts, WASM, etc.)</li>
+<li><strong>HTML files automatically get a WebSocket connection script injected</strong> before <code>&lt;/head&gt;</code>:
+<pre><code>&lt;script&gt;<span class="kw">const</span> socketley=<span class="kw">new</span> WebSocket(<span class="st">"ws://"+location.host</span>)&lt;/script&gt;</code></pre></li>
+<li>Your page loads with a live WebSocket connection to the same server &mdash; zero configuration</li>
+<li>WebSocket messages from the browser arrive in your Lua callbacks just like any other client</li>
+</ul>
+
+<p><strong>Full example:</strong> Create <code>public/index.html</code>:</p>
+<pre><code>&lt;!DOCTYPE html&gt;
+&lt;html&gt;&lt;head&gt;&lt;title&gt;Live&lt;/title&gt;&lt;/head&gt;
+&lt;body&gt;
+  &lt;div id=<span class="st">"log"</span>&gt;&lt;/div&gt;
+  &lt;script&gt;
+    socketley.onmessage = e =&gt; {
+      document.getElementById(<span class="st">"log"</span>).innerHTML += e.data + <span class="st">"&lt;br&gt;"</span>
+    }
+  &lt;/script&gt;
+&lt;/body&gt;&lt;/html&gt;</code></pre>
+<p>Then serve it:</p>
+<pre><code>socketley create server web -p 8080 --http ./public --lua handler.lua -s</code></pre>
+<p>Open <code>http://localhost:8080</code> in a browser &mdash; the page auto-connects via WebSocket. Your <code>handler.lua</code> receives messages from the browser through <code>on_client_message</code>.</p>
+
+<p><strong>Production mode:</strong> Add <code>--http-cache</code> to pre-load all files into memory at startup instead of reading from disk on each request. The cache is rebuilt on <code>reload-lua</code>.</p>
+<pre><code>socketley create server web -p 8080 --http ./dist --http-cache -s</code></pre>
+
+<div class="info-box">Supported file types: <code>.html</code>, <code>.css</code>, <code>.js</code>, <code>.json</code>, <code>.png</code>, <code>.jpg</code>, <code>.gif</code>, <code>.svg</code>, <code>.ico</code>, <code>.woff2</code>, <code>.woff</code>, <code>.ttf</code>, <code>.wasm</code>, <code>.webp</code>, <code>.mp4</code>, <code>.webm</code>, <code>.mp3</code>, <code>.ogg</code>, <code>.pdf</code>, <code>.xml</code>, <code>.txt</code>, and more. Unknown extensions serve as <code>application/octet-stream</code>.</div>
+
+<h3 id="concept-names">Runtime Name Networking</h3>
+<p>Runtime names are first-class network identifiers. Instead of hardcoding IP addresses and ports, you can reference runtimes by name &mdash; Socketley resolves them at startup.</p>
+
+<p><strong>Proxy backends by name:</strong></p>
+<pre><code><span class="cm"># Create three servers (ports assigned automatically or manually)</span>
+socketley create server api1 -p 9001 -s
+socketley create server api2 -p 9002 -s
+socketley create server api3 -p 9003 -s
+
+<span class="cm"># Proxy references them by name &mdash; no hardcoded ports</span>
+socketley create proxy gateway -p 8080 --backend api1,api2,api3 -s</code></pre>
+<p>If you change a server's port, the proxy picks up the new address on next reload. No config file edits needed.</p>
+
+<p><strong>Client targets by name:</strong> Clients can also target runtimes by name, resolved at connect time.</p>
+
+<p><strong>Why this matters:</strong> You can build entire architectures without a single hardcoded address. Names are stable identifiers; ports are implementation details.</p>
+
+<h3 id="concept-groups">Group-Based Discovery</h3>
+<p>Groups take runtime name networking one step further: tag runtimes with <code>-g &lt;name&gt;</code>, then use <code>@groupname</code> as a proxy backend. The proxy discovers all running members of that group <strong>at connection time</strong> &mdash; no restarts, no config changes.</p>
+
+<pre><code><span class="cm"># Tag servers with a group</span>
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+
+<span class="cm"># Proxy targets the group &mdash; discovers members dynamically</span>
+socketley create proxy gw -p 8080 --backend @api -s
+
+<span class="cm"># Add a new member while the proxy is running &mdash; no restart needed</span>
+socketley create server api3 -p 9003 -g api -s
+<span class="cm"># Next connection is automatically routed to api1, api2, or api3</span></code></pre>
+
+<p><strong>How it works:</strong> When a new connection arrives at the proxy, <code>@api</code> is expanded into the list of all <em>running</em> runtimes tagged with group <code>api</code>. The configured strategy (round-robin, random, lua) then picks from that pool. Stopped members are excluded automatically.</p>
+
+<p><strong>Mix and match:</strong> You can combine group backends with static addresses and runtime names in the same proxy:</p>
+<pre><code>socketley create proxy gw -p 8080 --backend @api,10.0.0.5:9000,legacy-server -s</code></pre>
+
+<p><strong>Use cases:</strong> Auto-scaling (Lua scripts creating new servers join the group automatically), blue-green deploys (swap group tags with <code>socketley edit</code>), microservice pools, game lobby routing.</p>
+
+<div class="info-box"><strong>Naming:</strong> The <code>@</code> prefix distinguishes group references from runtime names and IP:port addresses. Group names can be any non-empty string.</div>
+
+<h3 id="concept-lua">Writing Lua Scripts</h3>
+<p>Lua scripts give you full control over how your runtimes behave. There are two ways to use them:</p>
+
+<p><strong>1. Per-runtime scripts</strong> &mdash; attach behavior to a single runtime:</p>
+<pre><code>socketley create server myapp -p 9000 --lua handler.lua -s</code></pre>
+
+<p><strong>2. Orchestration scripts</strong> &mdash; define and configure multiple runtimes in one file:</p>
+<pre><code>socketley --lua setup.lua</code></pre>
+
+<p><strong>The callback model:</strong> You define functions, Socketley calls them at the right time. Here's a minimal script:</p>
+<pre><code><span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.log(<span class="st">"Server started!"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    self.send(client_id, <span class="st">"You said: "</span> .. msg)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    self.send(client_id, <span class="st">"Welcome!"</span>)
+<span class="kw">end</span></code></pre>
+
+<p><strong>Available callbacks</strong> (see the <a href="#lua-scripting">Lua tab</a> for the full API reference):</p>
+<table><thead><tr><th>Callback</th><th>Fires when...</th></tr></thead><tbody>
+<tr><td>on_start / on_stop</td><td>Runtime starts or stops</td></tr>
+<tr><td>on_message(msg)</td><td>Any message received (server broadcast)</td></tr>
+<tr><td>on_client_message(id, msg)</td><td>A specific client sends a message</td></tr>
+<tr><td>on_connect / on_disconnect(id)</td><td>Client connects or disconnects</td></tr>
+<tr><td>on_websocket(id, headers)</td><td>WebSocket handshake completes</td></tr>
+<tr><td>on_auth(id)</td><td>Client TCP accepted, before on_connect (return false to reject)</td></tr>
+<tr><td>on_tick()</td><td>Periodic timer fires</td></tr>
+<tr><td>on_route(method, path)</td><td>Proxy needs a backend (return index)</td></tr>
+<tr><td>on_master_auth(id, pw)</td><td>Client attempts master authentication</td></tr>
+</tbody></table>
+
+<p><strong>Error handling:</strong> Lua errors are logged but the runtime keeps running. The one exception is <code>on_auth</code> &mdash; if the script errors, the client is rejected (fail-closed).</p>
+
+<p><strong>Hot reload:</strong> Change your Lua script, then reload without restarting the runtime:</p>
+<pre><code>socketley reload-lua myapp</code></pre>
+
+<p><strong>Debugging:</strong> Use <code>socketley.log("message")</code> in your scripts. Combine with the <code>--log &lt;file&gt;</code> flag to write output to a file.</p>
+
+<div class="info-box"><strong>Libraries:</strong> You can <code>require()</code> any Lua module. Install libraries with <code>luarocks install &lt;name&gt;</code> for database drivers, JSON parsers, etc. The <code>io</code> library is enabled for shell commands via <code>io.popen()</code>.</div>
+
+<!-- ── CLI COMMANDS ── -->
+<h2 id="cli-commands">CLI Commands</h2>
+<p>All commands talk to the daemon via Unix socket (<code>/tmp/socketley.sock</code>). The daemon is auto-started if not running. Most name arguments accept glob patterns: <code>'*'</code>, <code>?</code>, <code>[abc]</code>.</p>
+
+<div class="info-box">Quote glob patterns to prevent shell expansion: <code>socketley start '*'</code> not <code>socketley start *</code>.</div>
+
+<div class="cli-card" id="cmd-create">
+  <div class="cli-name">socketley create &lt;type&gt; &lt;name&gt; [flags]</div>
+  <div class="cli-desc">Define a new runtime with its configuration. Types: <code>server</code>, <code>client</code>, <code>proxy</code>, <code>cache</code>. Add <code>-s</code> to start immediately. Config is persisted &mdash; you only create once.</div>
+</div>
+<pre><code>socketley create server myapp -p 9000 -s
+socketley create cache store -p 9001 --persistent /tmp/data.bin --maxmemory 256M -s
+socketley create client bot -t 127.0.0.1:9000 --reconnect -s
+socketley create server api1 -p 9001 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s</code></pre>
+
+<div class="cli-card" id="cmd-start-stop">
+  <div class="cli-name">socketley start &lt;name|pattern&gt;... [-i]</div>
+  <div class="cli-desc">Start one or more runtimes. Use <code>-i</code> for interactive mode &mdash; stdin/stdout are piped through the runtime so you can type messages and see responses live. Ctrl+C to detach. Also attaches to already-running runtimes.</div>
+</div>
+<div class="cli-card">
+  <div class="cli-name">socketley stop &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Gracefully stop running runtimes. Config is preserved &mdash; you can <code>start</code> again later. Use <code>'*'</code> (quoted) to stop all.</div>
+</div>
+<div class="cli-card">
+  <div class="cli-name">socketley remove &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Stop and permanently delete runtimes. This removes all persisted config.</div>
+</div>
+
+<div class="cli-card" id="cmd-send">
+  <div class="cli-name">socketley send &lt;name&gt; [message]</div>
+  <div class="cli-desc">Broadcast a message to all connected clients of a runtime. Supports stdin piping: <code>echo "hi" | socketley send myapp</code></div>
+</div>
+
+<div class="cli-card" id="cmd-stats">
+  <div class="cli-name">socketley stats &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Show live statistics: connection count, total messages, bytes in/out, uptime.</div>
+</div>
+
+<div class="cli-card" id="cmd-reload">
+  <div class="cli-name">socketley reload &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Full restart (stop + start). Re-applies all config including port changes.</div>
+</div>
+<div class="cli-card">
+  <div class="cli-name">socketley reload-lua &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Hot-reload the Lua script without restarting. Connections stay open, state resets. Also rebuilds the HTTP file cache if <code>--http-cache</code> is set.</div>
+</div>
+
+<div class="cli-card" id="cmd-show-edit">
+  <div class="cli-name">socketley show &lt;name|pattern&gt;...</div>
+  <div class="cli-desc">Print runtime config as pretty JSON. Useful for verifying flags before starting.</div>
+</div>
+<div class="cli-card">
+  <div class="cli-name">socketley edit &lt;name&gt; [flags]</div>
+  <div class="cli-desc">Modify a runtime's config. With flags: apply directly (<code>socketley edit myapp -p 9001</code>). Without flags: opens <code>$EDITOR</code> for interactive editing. Add <code>-r</code> to auto-reload-lua after saving.</div>
+</div>
+
+<div class="cli-card" id="cmd-ls-ps">
+  <div class="cli-name">socketley ls / ps / owner &lt;name&gt;</div>
+  <div class="cli-desc"><code>ls</code> = list all runtimes (running and stopped), <code>ps</code> = running only, <code>owner</code> = show parent/child relationships for Lua-created runtimes.</div>
+</div>
+<pre><code>ID        NAME            TYPE    PORT    CONN  OWNED BY    STATUS              CREATED
+a1b2c3    api-server      server  9000    3     -           Up 2 hours          3 hours ago
+d4e5f6    my-client       client  -       1     -           Up 45 minutes       1 hour ago</code></pre>
+
+<div class="cli-card" id="cmd-daemon">
+  <div class="cli-name">socketley daemon [flags]</div>
+  <div class="cli-desc">Start the background daemon. When installed via package, the daemon runs as a systemd service automatically &mdash; you don't need this command. Use it explicitly for cluster mode, custom logging, or when running from the build directory (development mode).</div>
+</div>
+<pre><code><span class="cm"># Installed: daemon is managed by systemd (no manual start needed)</span>
+sudo systemctl start socketley
+
+<span class="cm"># Development mode (running from build directory)</span>
+./bin/Release/socketley daemon &amp;
+
+<span class="cm"># Configure cluster mode on running daemons</span>
+socketley daemon --name api1 --cluster /shared/cluster
+socketley daemon --name api2 --cluster /shared/cluster</code></pre>
+
+<div class="cli-card" id="cmd-cluster">
+  <div class="cli-name">socketley cluster &lt;subcommand&gt;</div>
+  <div class="cli-desc">Inspect the cluster. Requires a running daemon with cluster mode enabled (<code>daemon --name</code> + <code>daemon --cluster</code>). The cluster directory is read from the daemon automatically. Subcommands:</div>
+</div>
+<table><thead><tr><th>Subcommand</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>ls</code></td><td>List all daemons with runtime counts and heartbeat status</td></tr>
+<tr><td><code>ps</code></td><td>List all runtimes across every daemon in the cluster</td></tr>
+<tr><td><code>group &lt;name&gt;</code></td><td>Show all members of a specific group</td></tr>
+<tr><td><code>show &lt;daemon&gt;</code></td><td>Print a daemon's raw cluster JSON file</td></tr>
+<tr><td><code>stats</code></td><td>Aggregate summary: daemon counts, runtime totals, group membership</td></tr>
+<tr><td><code>watch</code></td><td>Live-refresh the cluster view every 2&nbsp;seconds (Ctrl+C to stop)</td></tr>
+</tbody></table>
+<pre><code>socketley cluster ls
+socketley cluster ps
+socketley cluster group api
+socketley cluster stats
+socketley cluster watch</code></pre>
+
+<!-- ── CLI FLAGS ── -->
+<h2 id="cli-flags">CLI Flags</h2>
+
+<h3 id="flags-daemon">Daemon Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>--name &lt;name&gt; / -n</td><td>Name this daemon instance. Required for cluster mode</td></tr>
+<tr><td>--cluster &lt;dir&gt;</td><td>Enable cluster mode. Publishes runtime state every 2&nbsp;seconds and scans for peers. Host address is set automatically via <code>gethostname()</code></td></tr>
+<tr><td>--log-level &lt;level&gt;</td><td>Daemon log verbosity: <code>debug</code>, <code>info</code> (default), <code>warn</code>, <code>error</code></td></tr>
+</tbody></table>
+
+<h3 id="flags-common">Common Flags (all types)</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>-p &lt;port&gt;</td><td>Port number</td></tr>
+<tr><td>-s</td><td>Start immediately after creation</td></tr>
+<tr><td>--test</td><td>Dry run &mdash; validate config without starting</td></tr>
+<tr><td>--log &lt;file&gt;</td><td>Log state transitions and <code>socketley.log()</code> output to file</td></tr>
+<tr><td>-w &lt;file&gt;</td><td>Write every received message to file</td></tr>
+<tr><td>--lua &lt;file&gt;</td><td>Attach Lua script to this runtime</td></tr>
+<tr><td>-b / -bp / -bt / -bpt</td><td>Bash output: raw / +prefix / +timestamp / both</td></tr>
+<tr><td>--max-connections &lt;n&gt;</td><td>Connection limit (alias: <code>--max-conn</code>). 0 = unlimited</td></tr>
+<tr><td>--rate-limit &lt;n&gt;</td><td>Messages/sec per connection (token bucket). 0 = unlimited</td></tr>
+<tr><td>--drain</td><td>Graceful shutdown &mdash; flush pending writes before closing connections</td></tr>
+<tr><td>--tls</td><td>Enable TLS encryption (requires <code>--cert</code> + <code>--key</code>, or <code>--ca</code>)</td></tr>
+<tr><td>--cert / --key / --ca</td><td>TLS certificate, key, CA paths (PEM format)</td></tr>
+<tr><td>-g / --group &lt;name&gt;</td><td>Assign to a <a href="#concept-groups">group</a> for dynamic proxy backend discovery via <code>@groupname</code></td></tr>
+</tbody></table>
+
+<h3 id="flags-server">Server Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>--mode &lt;inout|in|out|master&gt;</td><td>Message flow direction. <code>master</code> = one privileged client broadcasts</td></tr>
+<tr><td>--udp</td><td>Use UDP instead of TCP</td></tr>
+<tr><td>--cache &lt;name&gt;</td><td>Link to a cache runtime &mdash; clients send <code>cache &lt;cmd&gt;</code> for passthrough</td></tr>
+<tr><td>--http &lt;dir&gt;</td><td>Serve static files from directory. HTML files get an auto-injected WebSocket connection script</td></tr>
+<tr><td>--http-cache</td><td>Pre-load all files into memory at startup (production mode)</td></tr>
+<tr><td>--master-pw &lt;password&gt;</td><td>Static password for master mode authentication</td></tr>
+<tr><td>--master-forward</td><td>Forward non-master messages to the master client</td></tr>
+</tbody></table>
+<div class="info-box"><strong>WebSocket:</strong> Auto-detected on every server &mdash; no flag needed. TCP and WebSocket clients coexist on the same port.</div>
+
+<h3 id="flags-client">Client Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>-t &lt;host:port&gt;</td><td>Target server address</td></tr>
+<tr><td>--mode &lt;inout|in|out&gt;</td><td>Message flow direction</td></tr>
+<tr><td>--udp</td><td>Use UDP instead of TCP</td></tr>
+<tr><td>--reconnect [max]</td><td>Auto-reconnect with exponential backoff (1s &rarr; 2s &rarr; ... &rarr; 30s cap). 0 = infinite retries</td></tr>
+</tbody></table>
+
+<h3 id="flags-cache">Cache Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>--persistent &lt;file&gt;</td><td>Persist store to disk on shutdown / <code>flush</code>. Auto-loaded on start</td></tr>
+<tr><td>--maxmemory &lt;size&gt;</td><td>Memory limit. Suffixes: <code>K</code>, <code>M</code>, <code>G</code>. 0 = unlimited</td></tr>
+<tr><td>--eviction &lt;policy&gt;</td><td><code>noeviction</code> (default), <code>allkeys-lru</code>, <code>allkeys-random</code></td></tr>
+<tr><td>--mode &lt;readwrite|readonly|admin&gt;</td><td>Access control. <code>admin</code> enables FLUSH/LOAD commands</td></tr>
+<tr><td>--resp</td><td>Force RESP2 protocol (Redis wire protocol). Also auto-detected</td></tr>
+<tr><td>--replicate &lt;host:port&gt;</td><td>Connect as read-only follower to a leader cache</td></tr>
+</tbody></table>
+
+<h3 id="flags-proxy">Proxy Flags</h3>
+<table><thead><tr><th>Flag</th><th>Description</th></tr></thead><tbody>
+<tr><td>--backend &lt;addr&gt;</td><td>Comma-separated backends: IP:port, runtime names, or <code>@group</code> for <a href="#concept-groups">dynamic group discovery</a></td></tr>
+<tr><td>--strategy &lt;s&gt;</td><td><code>round-robin</code> (default), <code>random</code>, or <code>lua</code></td></tr>
+<tr><td>--protocol &lt;p&gt;</td><td><code>http</code> (default, per-request routing) or <code>tcp</code> (raw byte forwarding, connection-sticky)</td></tr>
+</tbody></table>
+
+<!-- ── RUNTIME TYPES ── -->
+<h2 id="runtime-types">Runtime Types</h2>
+
+<h3 id="rt-server">Server</h3>
+<p>A TCP/UDP listener that accepts connections, broadcasts messages, and runs Lua callbacks on every event. Servers are the most versatile runtime type &mdash; they can serve static files, auto-detect WebSocket upgrades, link to caches, and route clients to sub-servers.</p>
+
+<ul>
+<li><strong>WebSocket auto-detection:</strong> Every server detects WebSocket upgrades automatically. TCP and WS clients coexist on the same port with zero configuration.</li>
+<li><strong>HTTP static serving:</strong> <code>--http &lt;dir&gt;</code> serves files and auto-injects a WebSocket connection into HTML pages. Add <code>--http-cache</code> for in-memory serving.</li>
+<li><strong>Cache attachment:</strong> <code>--cache &lt;name&gt;</code> lets clients run cache commands through the server connection.</li>
+<li><strong>Master mode:</strong> <code>--mode master</code> designates one client as the broadcaster. Others listen (or forward via <code>--master-forward</code>).</li>
+<li><strong>Client routing:</strong> Lua scripts can <code>self.route(client_id, "sub-server")</code> to move clients between servers on the fly.</li>
+<li><strong>UDP mode:</strong> <code>--udp</code> for datagram-based communication.</li>
+<li><strong>Full Lua API:</strong> broadcast, send, disconnect, per-connection metadata, client enumeration, multicast, timers, and more.</li>
+</ul>
+
+<pre><code><span class="cm"># Real-time web app: static files + WebSocket + Lua</span>
+socketley create server web -p 8080 --http ./public --lua app.lua -s
+
+<span class="cm"># API server with cache access</span>
+socketley create server api -p 9000 --cache store --lua api.lua -s
+
+<span class="cm"># Master-controlled broadcast</span>
+socketley create server ctrl -p 9000 --mode master --master-pw secret -s</code></pre>
+
+<h3 id="rt-client">Client</h3>
+<p>A TCP/UDP connector that connects to a server and exchanges messages. Clients are ideal for building bots, bridges between servers, or automated testing.</p>
+
+<ul>
+<li><strong>Auto-reconnect:</strong> <code>--reconnect</code> with exponential backoff (1s &rarr; 2s &rarr; ... &rarr; 30s cap). Survives server restarts.</li>
+<li><strong>Message modes:</strong> <code>inout</code> (bidirectional), <code>in</code> (receive only), <code>out</code> (send only).</li>
+<li><strong>Server routing:</strong> Lua scripts on a parent server can route clients between sub-servers for game lobbies, chat rooms, etc.</li>
+<li><strong>UDP mode:</strong> <code>--udp</code> for datagram-based communication.</li>
+</ul>
+
+<pre><code><span class="cm"># Auto-reconnecting bot</span>
+socketley create client bot -t 127.0.0.1:9000 --reconnect --lua bot.lua -s
+
+<span class="cm"># Receive-only listener</span>
+socketley create client listener -t 127.0.0.1:9000 --mode in -b -s</code></pre>
+
+<h3 id="rt-proxy">Proxy</h3>
+<p>An HTTP or TCP reverse proxy that distributes traffic across backend servers. Backends can be IP:port addresses, runtime names, or <code>@group</code> references for dynamic discovery.</p>
+
+<ul>
+<li><strong>Runtime name backends:</strong> <code>--backend api1,api2</code> instead of <code>--backend 127.0.0.1:9001,127.0.0.1:9002</code>.</li>
+<li><strong>Group discovery:</strong> <code>--backend @api</code> dynamically routes to all running members of group <code>api</code>. New members are picked up at connection time &mdash; no proxy restart needed. See <a href="#concept-groups">Group-Based Discovery</a>.</li>
+<li><strong>Load balancing:</strong> Round-robin, random, or Lua-based custom routing via <code>on_route(method, path)</code>.</li>
+<li><strong>Protocol modes:</strong> <code>http</code> for per-request routing, <code>tcp</code> for raw byte forwarding (connection-sticky).</li>
+<li><strong>Data hooks:</strong> <code>on_proxy_request</code> and <code>on_proxy_response</code> Lua callbacks let you inspect/modify/drop traffic in flight.</li>
+</ul>
+
+<pre><code><span class="cm"># Dynamic group discovery &mdash; proxy auto-discovers backends</span>
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s
+
+<span class="cm"># Load balancer with runtime name backends</span>
+socketley create proxy lb -p 8080 --backend api1,api2,api3 -s
+
+<span class="cm"># Lua-routed HTTP proxy</span>
+socketley create proxy gw2 -p 8081 --backend api1,api2 --strategy lua --lua router.lua -s
+
+<span class="cm"># Raw TCP proxy</span>
+socketley create proxy tcp-gw -p 8080 --backend 10.0.0.1:9000 --protocol tcp -s</code></pre>
+
+<h3 id="rt-cache">Cache</h3>
+<p>A Redis-compatible in-memory store with strings, lists, sets, hashes, TTL, pub/sub, persistence, replication, and LRU eviction. With RESP2 mode, you can use <code>redis-cli</code> and any Redis client library directly &mdash; benchmarks show 2.5&ndash;3.9x faster than Redis with pipelining.</p>
+
+<ul>
+<li><strong>Redis compatibility:</strong> <code>--resp</code> enables the RESP2 wire protocol. Also auto-detected.</li>
+<li><strong>Persistence:</strong> <code>--persistent &lt;file&gt;</code> saves to disk on stop, auto-loads on start.</li>
+<li><strong>Replication:</strong> <code>--replicate &lt;host:port&gt;</code> for leader-follower setups. Follower syncs full dump then receives ongoing commands.</li>
+<li><strong>Eviction:</strong> <code>allkeys-lru</code> or <code>allkeys-random</code> when <code>--maxmemory</code> is reached.</li>
+<li><strong>Pub/Sub:</strong> SUBSCRIBE/PUBLISH commands, plus cross-runtime Lua subscriptions via <code>socketley.subscribe()</code>.</li>
+<li><strong>DB backend hooks:</strong> Attach Lua scripts with <code>on_miss</code>, <code>on_write</code>, <code>on_delete</code> callbacks to connect any database. See <a href="#db-backend">DB Backend Hooks</a>.</li>
+<li><strong>Access modes:</strong> <code>readwrite</code> (default), <code>readonly</code>, or <code>admin</code> (enables FLUSH/LOAD).</li>
+</ul>
+
+<pre><code><span class="cm"># Redis-compatible cache with persistence and LRU eviction</span>
+socketley create cache store -p 6379 --resp --persistent /tmp/data.bin --maxmemory 256M --eviction allkeys-lru -s
+redis-cli -p 6379 SET mykey myval
+
+<span class="cm"># Leader-follower replication</span>
+socketley create cache leader   -p 9000 -s
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pre>
+
+<!-- ── CACHE PROTOCOL ── -->
+<h2 id="cache-protocol">Cache Protocol</h2>
+<p>TCP newline-terminated plaintext commands. Also supports RESP2 (auto-detected or forced with <code>--resp</code>). One type per key &mdash; operations on the wrong type return an error.</p>
+
+<h3 id="cp-strings">Strings</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>set key value</td><td><code>ok</code> or <code>error: type conflict</code></td></tr>
+<tr><td>get key</td><td>Value or <code>nil</code></td></tr>
+<tr><td>del key</td><td><code>ok</code> or <code>nil</code> (any type)</td></tr>
+<tr><td>exists key</td><td><code>1</code> or <code>0</code></td></tr>
+<tr><td>size</td><td>Total key count</td></tr>
+</tbody></table>
+
+<h3 id="cp-lists">Lists (deque-backed)</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>lpush / rpush key value</td><td><code>ok</code></td></tr>
+<tr><td>lpop / rpop key</td><td>Value or <code>nil</code></td></tr>
+<tr><td>llen key</td><td>Number</td></tr>
+<tr><td>lindex key index</td><td>Value or <code>nil</code></td></tr>
+<tr><td>lrange key start stop</td><td>Multi-line values + <code>end</code></td></tr>
+</tbody></table>
+
+<h3 id="cp-sets">Sets</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>sadd key member</td><td><code>ok</code>, <code>exists</code>, or error</td></tr>
+<tr><td>srem key member</td><td><code>ok</code> or <code>nil</code></td></tr>
+<tr><td>sismember key member</td><td><code>1</code> or <code>0</code></td></tr>
+<tr><td>scard key</td><td>Number</td></tr>
+<tr><td>smembers key</td><td>Multi-line members + <code>end</code></td></tr>
+</tbody></table>
+
+<h3 id="cp-hashes">Hashes</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>hset key field value</td><td><code>ok</code></td></tr>
+<tr><td>hget key field</td><td>Value or <code>nil</code></td></tr>
+<tr><td>hdel key field</td><td><code>ok</code> or <code>nil</code></td></tr>
+<tr><td>hlen key</td><td>Number</td></tr>
+<tr><td>hgetall key</td><td>Multi-line <code>field value</code> pairs + <code>end</code></td></tr>
+</tbody></table>
+
+<h3 id="cp-ttl">TTL / Expiry</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>expire key seconds</td><td><code>ok</code> or <code>nil</code></td></tr>
+<tr><td>ttl key</td><td>Seconds remaining, <code>-1</code> (no TTL), or <code>-2</code> (not found)</td></tr>
+<tr><td>persist key</td><td><code>ok</code> or <code>nil</code></td></tr>
+</tbody></table>
+
+<h3 id="cp-pubsub">Pub/Sub</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>subscribe channel</td><td><code>ok</code></td></tr>
+<tr><td>unsubscribe channel</td><td><code>ok</code></td></tr>
+<tr><td>publish channel message</td><td>Subscriber count</td></tr>
+</tbody></table>
+<p>Subscribers receive: <code>message &lt;channel&gt; &lt;payload&gt;\n</code></p>
+
+<h3 id="cp-memory">Memory &amp; Admin</h3>
+<table><thead><tr><th>Command</th><th>Response</th></tr></thead><tbody>
+<tr><td>maxmemory</td><td>Limit in bytes (0 = unlimited)</td></tr>
+<tr><td>memory</td><td>Current usage in bytes</td></tr>
+<tr><td>flush [path]</td><td>Persist to disk (admin mode required)</td></tr>
+<tr><td>load [path]</td><td>Load from disk (admin mode required)</td></tr>
+</tbody></table>
+
+<h3 id="cp-resp">RESP2 Protocol</h3>
+<p>Force with <code>--resp</code> flag or auto-detected on first RESP byte. Fully compatible with <code>redis-cli</code> and Redis client libraries. Supports SET (with EX, PX, NX, XX), GET, DEL, EXISTS, PING, DBSIZE, INCR/DECR, APPEND, STRLEN, MGET, MSET, TYPE, KEYS, SCAN, and all list/set/hash/TTL/pub-sub operations.</p>
+<pre><code>socketley create cache myredis -p 6379 --resp -s
+redis-cli -p 6379 SET mykey myval
+
+<span class="cm"># Replication (follower syncs from leader)</span>
+socketley create cache leader   -p 9000 -s
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s</code></pre>
+
+<!-- ── CONFIGURATION ── -->
+<h2 id="configuration">Configuration</h2>
+
+<h3 id="config-flag">The --lua Flag</h3>
+<p>Attach a Lua script to a single runtime at creation time:</p>
+<pre><code>socketley create server myserver -p 9000 --lua handler.lua -s</code></pre>
+<p>Load an orchestration file that defines multiple runtimes:</p>
+<pre><code>socketley --lua setup.lua</code></pre>
+
+<h3 id="config-runtimes">The runtimes Table</h3>
+<p>Orchestration files define runtimes in a Lua table. All CLI flags have table equivalents:</p>
+<pre><code>runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"api"</span>,   port = <span class="nb">9000</span>, group = <span class="st">"web"</span>,
+      cache_name = <span class="st">"store"</span>, http = <span class="st">"./public"</span>, http_cache = <span class="kw">true</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"store"</span>, port = <span class="nb">9001</span>, persistent = <span class="st">"/tmp/data.bin"</span>,
+      maxmemory = <span class="st">"256M"</span>, eviction = <span class="st">"allkeys-lru"</span>, resp = <span class="kw">true</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"gw"</span>,    port = <span class="nb">8080</span>,
+      backends = { <span class="st">"@web"</span> }, strategy = <span class="st">"round-robin"</span>, start = <span class="kw">true</span> },
+}</code></pre>
+<table><thead><tr><th>Key</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td>type</td><td>string</td><td>Required. <code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
+<tr><td>name</td><td>string</td><td>Required. Unique runtime name</td></tr>
+<tr><td>port</td><td>number</td><td>Port number. 0 = internal only (no network bind)</td></tr>
+<tr><td>start</td><td>boolean</td><td>Start immediately after creation</td></tr>
+<tr><td>mode</td><td>string</td><td><code>"inout"</code> / <code>"in"</code> / <code>"out"</code> / <code>"master"</code></td></tr>
+<tr><td>target</td><td>string</td><td>Client target address (<code>"host:port"</code>)</td></tr>
+<tr><td>lua / config</td><td>string</td><td>Lua script path for this runtime</td></tr>
+<tr><td>cache_name</td><td>string</td><td>Link server to a cache runtime (equivalent of <code>--cache</code>)</td></tr>
+<tr><td>http</td><td>string</td><td>Static file serving directory (equivalent of <code>--http</code>)</td></tr>
+<tr><td>http_cache</td><td>boolean</td><td>Pre-load files into memory (equivalent of <code>--http-cache</code>)</td></tr>
+<tr><td>persistent</td><td>string</td><td>Cache persistence file path</td></tr>
+<tr><td>maxmemory</td><td>string</td><td>Cache memory limit (<code>"256M"</code>, <code>"1G"</code>)</td></tr>
+<tr><td>eviction</td><td>string</td><td>Eviction policy: <code>"noeviction"</code>, <code>"allkeys-lru"</code>, <code>"allkeys-random"</code></td></tr>
+<tr><td>resp</td><td>boolean</td><td>Force RESP2 protocol mode (cache)</td></tr>
+<tr><td>replicate</td><td>string</td><td>Leader address for cache replication (<code>"host:port"</code>)</td></tr>
+<tr><td>group</td><td>string</td><td>Group tag for <a href="#concept-groups">dynamic proxy discovery</a> (<code>-g</code>)</td></tr>
+<tr><td>backends</td><td>table</td><td>Proxy backends array (IP:port, runtime names, or <code>"@group"</code>)</td></tr>
+<tr><td>strategy</td><td>string</td><td>Proxy strategy: <code>"round-robin"</code>, <code>"random"</code>, <code>"lua"</code></td></tr>
+<tr><td>protocol</td><td>string</td><td>Proxy protocol: <code>"http"</code> or <code>"tcp"</code></td></tr>
+<tr><td>udp</td><td>boolean</td><td>UDP mode (server/client)</td></tr>
+<tr><td>reconnect</td><td>boolean/number</td><td>Auto-reconnect for clients. <code>true</code> = infinite, number = max attempts</td></tr>
+<tr><td>rate_limit</td><td>number</td><td>Messages/sec per connection</td></tr>
+<tr><td>max_connections</td><td>number</td><td>Connection limit</td></tr>
+<tr><td>drain</td><td>boolean</td><td>Graceful shutdown</td></tr>
+<tr><td>tls</td><td>boolean</td><td>Enable TLS encryption</td></tr>
+<tr><td>cert / key / ca</td><td>string</td><td>TLS certificate, key, CA file paths</td></tr>
+<tr><td>master_pw</td><td>string</td><td>Master mode password</td></tr>
+<tr><td>master_forward</td><td>boolean</td><td>Forward non-master messages to master</td></tr>
+</tbody></table>
+
+<h3 id="config-daemon">Daemon Config</h3>
+<p><code>/etc/socketley/config.lua</code> or <code>~/.config/socketley/config.lua</code>:</p>
+<pre><code>config = {
+    log_level    = <span class="st">"info"</span>,
+    metrics_port = <span class="nb">9100</span>   <span class="cm">-- GET /metrics exposes Prometheus counters</span>
+}</code></pre>
+<p>The <code>metrics_port</code> enables a Prometheus-compatible endpoint at <code>http://localhost:9100/metrics</code> with per-runtime connection counts, message rates, and byte counters.</p>
+
+
+</div>

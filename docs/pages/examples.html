@@ -1,0 +1,1021 @@
+    <ul id="navList-examples" style="display:none">
+      <li class="open"><a href="#ex-getting-started">Getting Started</a><ul>
+        <li><a href="#ex-hello-server">Hello Server</a></li>
+        <li><a href="#ex-hello-client">Hello Client</a></li>
+        <li><a href="#ex-combined">Combined Setup</a></li>
+        <li><a href="#ex-bash-output">Bash Output</a></li>
+      </ul></li>
+      <li><a href="#ex-server-client">Server &amp; Client</a><ul>
+        <li><a href="#ex-echo-server">Echo Server</a></li>
+        <li><a href="#ex-broadcast">Broadcast</a></li>
+        <li><a href="#ex-bidirectional">Bidirectional</a></li>
+        <li><a href="#ex-modes">Message Modes</a></li>
+      </ul></li>
+      <li><a href="#ex-proxy-cat">Proxy</a><ul>
+        <li><a href="#ex-http-proxy">HTTP Proxy</a></li>
+        <li><a href="#ex-load-balancer">Load Balancer</a></li>
+        <li><a href="#ex-group-discovery">Group Discovery</a></li>
+        <li><a href="#ex-tcp-proxy">TCP Proxy</a></li>
+        <li><a href="#ex-name-backend">Named Backends</a></li>
+        <li><a href="#ex-lua-routing">Lua Routing</a></li>
+      </ul></li>
+      <li><a href="#ex-cache-cat">Cache</a><ul>
+        <li><a href="#ex-basic-cache">Basic Cache</a></li>
+        <li><a href="#ex-persistent-cache">Persistent</a></li>
+        <li><a href="#ex-cache-modes">Access Modes</a></li>
+        <li><a href="#ex-resp-mode">RESP Mode</a></li>
+        <li><a href="#ex-datastructures">Data Structures</a></li>
+        <li><a href="#ex-pubsub">Pub/Sub</a></li>
+        <li><a href="#ex-replication">Replication</a></li>
+        <li><a href="#ex-db-backend">DB Backend</a></li>
+        <li><a href="#ex-cache-integration">Cache + Server</a></li>
+      </ul></li>
+      <li><a href="#ex-server-addons">Server Addons</a><ul>
+        <li><a href="#ex-ip-allowlist">IP Allowlist</a></li>
+        <li><a href="#ex-token-auth">Token Auth</a></li>
+        <li><a href="#ex-rate-limit">Rate Limiting</a></li>
+        <li><a href="#ex-session-ids">Session IDs</a></li>
+        <li><a href="#ex-redis-session">Redis Sessions</a></li>
+        <li><a href="#ex-service-discovery">Service Discovery</a></li>
+        <li><a href="#ex-ws-session">WebSocket Sessions</a></li>
+        <li><a href="#ex-http-dashboard">HTTP Dashboard</a></li>
+      </ul></li>
+      <li><a href="#ex-lua-config">Lua Configuration</a><ul>
+        <li><a href="#ex-simple-config">Simple Config</a></li>
+        <li><a href="#ex-callbacks">Callbacks</a></li>
+        <li><a href="#ex-conn-callbacks">Connection Callbacks</a></li>
+        <li><a href="#ex-custom-routing">Custom Routing</a></li>
+        <li><a href="#ex-full-setup">Full Setup</a></li>
+      </ul></li>
+      <li><a href="#ex-advanced">Advanced</a><ul>
+        <li><a href="#ex-microservices">Microservices</a></li>
+        <li><a href="#ex-high-availability">High Availability</a></li>
+        <li><a href="#ex-logging-pipeline">Logging Pipeline</a></li>
+        <li><a href="#ex-dev-env">Development Env</a></li>
+        <li><a href="#ex-game-routing">Game Routing</a></li>
+        <li><a href="#ex-udp-echo">UDP Echo</a></li>
+      </ul></li>
+    </ul>
+<div id="content-examples" class="content" style="display:none">
+
+<!-- ── Getting Started ── -->
+<h2 id="ex-getting-started">Getting Started</h2>
+<p>The basics: create runtimes, connect them, and see output. These examples use only CLI flags &mdash; no Lua required.</p>
+
+<div class="method-card" id="ex-hello-server">
+<div class="method-header">
+  <span class="method-name">Hello Server</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Create a TCP server listening on port 9000. This is the simplest possible runtime &mdash; it accepts connections and broadcasts any message it receives to all connected clients.</p>
+<pre><code>socketley create server hello-server -p 9000 -s --log /tmp/hello-server.log</code></pre>
+<pre><code><span class="cm"># Test with netcat from another terminal:</span>
+nc localhost 9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-hello-client">
+<div class="method-header">
+  <span class="method-name">Hello Client</span>
+  <span class="badge badge-client">client</span>
+</div>
+<p class="method-desc">Create a client that connects to an existing server. The <code>-t</code> flag specifies the target address. Make sure the server from the previous example is running first.</p>
+<pre><code>socketley create client hello-client -t 127.0.0.1:9000 -s --log /tmp/hello-client.log</code></pre>
+</div>
+
+<div class="method-card" id="ex-combined">
+<div class="method-header">
+  <span class="method-name">Combined Setup</span>
+  <span class="badge badge-server">server</span>
+  <span class="badge badge-client">client</span>
+</div>
+<p class="method-desc">A complete script that creates both a server and client, with message logging via <code>-w</code>. Demonstrates the typical create &rarr; start &rarr; use &rarr; stop &rarr; remove lifecycle with cleanup on exit.</p>
+<pre><code><span class="cm"># Create server with message logging</span>
+socketley create server demo-server -p 9000 -w /tmp/demo-server-messages.txt
+socketley start demo-server
+
+<span class="cm"># Create client that connects to it</span>
+socketley create client demo-client -t 127.0.0.1:9000 -w /tmp/demo-client-messages.txt
+socketley start demo-client
+
+<span class="cm"># Check status</span>
+socketley ps
+
+<span class="cm"># Cleanup</span>
+socketley stop demo-client demo-server
+socketley remove demo-client demo-server</code></pre>
+</div>
+
+<div class="method-card" id="ex-bash-output">
+<div class="method-header">
+  <span class="method-name">Bash Output Modes</span>
+  <span class="badge badge-all">all types</span>
+</div>
+<p class="method-desc">The <code>-b</code> flag family pipes received messages to stdout, useful for scripting and monitoring. Combine with <code>-p</code> (prefix with runtime name) and <code>-t</code> (timestamp) for formatted output.</p>
+<pre><code><span class="cm"># Raw output</span>
+socketley create server raw-echo -p 9001 -b -s
+<span class="cm"># Output: hello world</span>
+
+<span class="cm"># With runtime name prefix</span>
+socketley create server prefix-echo -p 9002 -bp -s
+<span class="cm"># Output: [prefix-echo] hello world</span>
+
+<span class="cm"># With timestamp</span>
+socketley create server time-echo -p 9003 -bt -s
+<span class="cm"># Output: [14:32:05] hello world</span>
+
+<span class="cm"># Both prefix and timestamp</span>
+socketley create server full-echo -p 9004 -bpt -s
+<span class="cm"># Output: [14:32:05] [full-echo] hello world</span></code></pre>
+</div>
+
+<!-- ── Server & Client ── -->
+<h2 id="ex-server-client">Server &amp; Client</h2>
+<p>Common server-client patterns: echo, broadcast, bidirectional chat, and message mode control.</p>
+
+<div class="method-card" id="ex-echo-server">
+<div class="method-header">
+  <span class="method-name">Echo Server</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">A Lua-powered echo server. The <code>on_message</code> callback intercepts every incoming message and broadcasts it back to all connected clients. The simplest useful Lua script.</p>
+<pre><code><span class="cm">-- echo-server.lua</span>
+<span class="kw">function</span> <span class="fn">on_message</span>(msg)
+    socketley.log(<span class="st">"Received: "</span> .. msg)
+    self.broadcast(msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server echo-server -p 9000 --lua echo-server.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-broadcast">
+<div class="method-header">
+  <span class="method-name">Broadcast</span>
+  <span class="badge badge-server">server</span>
+  <span class="badge badge-client">client</span>
+</div>
+<p class="method-desc">One server, multiple clients. Any message sent to the server is broadcast to all connected clients. Each client logs received messages to a file via <code>-w</code>.</p>
+<pre><code><span class="cm"># Create server</span>
+socketley create server broadcast-hub -p 9000 -s
+
+<span class="cm"># Connect 3 clients, each logging to a file</span>
+socketley create client client-1 -t 127.0.0.1:9000 -w /tmp/client-1.txt -s
+socketley create client client-2 -t 127.0.0.1:9000 -w /tmp/client-2.txt -s
+socketley create client client-3 -t 127.0.0.1:9000 -w /tmp/client-3.txt -s
+
+<span class="cm"># Send a message via netcat — all 3 clients receive it</span>
+echo <span class="st">"hello everyone"</span> | nc localhost 9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-bidirectional">
+<div class="method-header">
+  <span class="method-name">Bidirectional Chat</span>
+  <span class="badge badge-server">server</span>
+  <span class="badge badge-client">client</span>
+</div>
+<p class="method-desc">Full-duplex communication with timestamped messages. The server script prepends timestamps to broadcasts, and clients receive all messages from all participants.</p>
+<pre><code><span class="cm">-- chat-server.lua</span>
+<span class="kw">function</span> <span class="fn">on_message</span>(msg)
+    self.broadcast(<span class="st">"["</span> .. os.date(<span class="st">"%H:%M:%S"</span>) .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server chat -p 9000 --lua chat-server.lua -s
+socketley create client alice -t 127.0.0.1:9000 -w /tmp/alice.txt -s
+socketley create client bob -t 127.0.0.1:9000 -w /tmp/bob.txt -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-modes">
+<div class="method-header">
+  <span class="method-name">Message Modes</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Compare the three message flow modes. <code>inout</code> is bidirectional (default), <code>in</code> receives only (useful for log collectors), and <code>out</code> sends only (ignores incoming data).</p>
+<pre><code><span class="cm"># Bidirectional — receives and broadcasts</span>
+socketley create server srv-inout -p 9001 --mode inout -s
+
+<span class="cm"># Receive-only — accepts messages, never responds</span>
+socketley create server srv-in -p 9002 --mode in -w /tmp/received.txt -s
+
+<span class="cm"># Send-only — broadcasts only, ignores input</span>
+socketley create server srv-out -p 9003 --mode out -s</code></pre>
+</div>
+
+<!-- ── Proxy ── -->
+<h2 id="ex-proxy-cat">Proxy</h2>
+<p>Reverse proxying, load balancing, group-based discovery, and custom Lua routing. Backends can be IP:port addresses, runtime names, or <code>@group</code> references.</p>
+
+<div class="method-card" id="ex-http-proxy">
+<div class="method-header">
+  <span class="method-name">HTTP Reverse Proxy</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Forward HTTP requests from a public-facing port to an internal backend server. The simplest proxy setup &mdash; one frontend, one backend.</p>
+<pre><code>socketley create server backend-api -p 9001 -s
+socketley create proxy gateway -p 8080 --backend 127.0.0.1:9001 --protocol http -s
+
+<span class="cm"># Requests to :8080 are forwarded to :9001</span>
+curl localhost:8080/gateway/api/data</code></pre>
+</div>
+
+<div class="method-card" id="ex-load-balancer">
+<div class="method-header">
+  <span class="method-name">Load Balancer</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Distribute HTTP traffic across multiple backend servers using round-robin. Add or remove backends at any time. Other strategies available: <code>random</code> and <code>lua</code>.</p>
+<pre><code>socketley create server api-1 -p 9001 -s
+socketley create server api-2 -p 9002 -s
+socketley create server api-3 -p 9003 -s
+
+socketley create proxy lb -p 8080 \
+    --backend 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003 \
+    --strategy round-robin --protocol http -s
+
+<span class="cm"># Requests cycle: api-1 → api-2 → api-3 → api-1 → ...</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-group-discovery">
+<div class="method-header">
+  <span class="method-name">Group Discovery</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Tag runtimes with <code>-g &lt;group&gt;</code> and use <code>@group</code> as a proxy backend. The proxy discovers all running group members <strong>at connection time</strong> &mdash; add or remove members dynamically without touching the proxy.</p>
+<pre><code><span class="cm"># Tag servers with a group</span>
+socketley create server api-1 -p 9001 -g api -s
+socketley create server api-2 -p 9002 -g api -s
+
+<span class="cm"># Proxy discovers group members dynamically</span>
+socketley create proxy gw -p 8080 --backend @api --strategy round-robin -s
+
+<span class="cm"># Scale up: add a new member without restarting the proxy</span>
+socketley create server api-3 -p 9003 -g api -s
+<span class="cm"># Next connection automatically includes api-3 in the pool</span>
+
+<span class="cm"># Scale down: stop a member and it's excluded automatically</span>
+socketley stop api-2
+<span class="cm"># Proxy routes only to api-1 and api-3</span>
+
+<span class="cm"># Mix groups with static backends</span>
+socketley create proxy gw2 -p 8081 --backend @api,10.0.0.5:9000 -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-tcp-proxy">
+<div class="method-header">
+  <span class="method-name">TCP Proxy</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Raw TCP byte forwarding with no HTTP parsing. Protocol-agnostic &mdash; works with any TCP protocol (databases, custom binary protocols, TLS passthrough).</p>
+<pre><code>socketley create server tcp-backend -p 9001 -s
+socketley create proxy tcp-gw -p 8080 --backend 127.0.0.1:9001 --protocol tcp -s
+
+<span class="cm"># Raw bytes forwarded in both directions</span>
+nc localhost 8080</code></pre>
+</div>
+
+<div class="method-card" id="ex-name-backend">
+<div class="method-header">
+  <span class="method-name">Runtime-Name Backends</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Reference backends by their runtime name instead of IP:port. The proxy resolves names to addresses automatically via the runtime manager &mdash; no hardcoded ports needed.</p>
+<pre><code>socketley create server api-service -p 9001 -s
+socketley create server auth-service -p 9002 -s
+
+<span class="cm"># Use names instead of addresses</span>
+socketley create proxy gateway -p 8080 \
+    --backend api-service,auth-service \
+    --strategy round-robin --protocol http -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-lua-routing">
+<div class="method-header">
+  <span class="method-name">Lua Routing</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">Custom routing logic via the <code>on_route(method, path)</code> callback. Route requests to different backends based on HTTP method, URL path, or any combination. Return a 0-based backend index.</p>
+<pre><code><span class="cm">-- multi-backend.lua</span>
+runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"read-backend"</span>,  port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"write-backend"</span>, port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"admin-backend"</span>, port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"smart-proxy"</span>,   port = <span class="nb">8080</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
+      backends = { <span class="st">"127.0.0.1:9001"</span>, <span class="st">"127.0.0.1:9002"</span>, <span class="st">"127.0.0.1:9003"</span> },
+      start = <span class="kw">true</span> }
+}
+
+<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"^/admin"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">2</span> <span class="kw">end</span>
+    <span class="kw">if</span> method == <span class="st">"POST"</span> <span class="kw">or</span> method == <span class="st">"PUT"</span> <span class="kw">or</span> method == <span class="st">"DELETE"</span> <span class="kw">then</span> <span class="kw">return</span> <span class="nb">1</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="nb">0</span>
+<span class="kw">end</span></code></pre>
+<pre><code>socketley --lua multi-backend.lua</code></pre>
+</div>
+
+<!-- ── Cache ── -->
+<h2 id="ex-cache-cat">Cache</h2>
+<p>In-memory key-value store with persistence, RESP2 (Redis-compatible), data structures, pub/sub, replication, and database backend hooks.</p>
+
+<div class="method-card" id="ex-basic-cache">
+<div class="method-header">
+  <span class="method-name">Basic Cache</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">An in-memory key-value store listening on a TCP port. Supports plaintext commands over netcat. Data lives in memory only &mdash; lost when the cache stops.</p>
+<pre><code>socketley create cache my-cache -p 9000 -s
+
+<span class="cm"># Store and retrieve data</span>
+echo <span class="st">"set user alice"</span> | nc -q1 localhost 9000
+echo <span class="st">"get user"</span> | nc -q1 localhost 9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-persistent-cache">
+<div class="method-header">
+  <span class="method-name">Persistent Cache</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Add <code>--persistent</code> to save data to disk on shutdown and reload it on startup. Data survives restarts. The <code>flush</code> command triggers an immediate save.</p>
+<pre><code>socketley create cache persistent-store -p 9000 \
+    --persistent /tmp/cache-data.bin -s
+
+<span class="cm"># Data survives stop/start cycles:</span>
+echo <span class="st">"set mykey myval"</span> | nc -q1 localhost 9000
+socketley stop persistent-store
+socketley start persistent-store
+echo <span class="st">"get mykey"</span> | nc -q1 localhost 9000   <span class="cm"># → myval</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-cache-modes">
+<div class="method-header">
+  <span class="method-name">Access Modes</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Control what operations clients can perform. <code>readonly</code> allows only GET, <code>readwrite</code> allows GET/SET/DEL but not admin commands, and <code>admin</code> allows everything including <code>flush</code> and <code>load</code>.</p>
+<pre><code><span class="cm"># Read-only: GET allowed, SET denied</span>
+socketley create cache ro-cache -p 9001 --mode readonly -s
+
+<span class="cm"># Read-write: GET + SET allowed, flush denied</span>
+socketley create cache rw-cache -p 9002 --mode readwrite -s
+
+<span class="cm"># Admin: all operations including flush/load</span>
+socketley create cache admin-cache -p 9003 --mode admin -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-resp-mode">
+<div class="method-header">
+  <span class="method-name">RESP Mode (Redis-Compatible)</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Force the RESP2 wire protocol with <code>--resp</code> for full compatibility with <code>redis-cli</code> and any Redis client library (Python redis, Node ioredis, Go redigo, etc.).</p>
+<pre><code>socketley create cache myredis -p 6379 --resp -s
+
+<span class="cm"># Use standard redis-cli</span>
+redis-cli -p 6379 SET greeting <span class="st">"Hello, World!"</span>
+redis-cli -p 6379 GET greeting
+redis-cli -p 6379 HSET user:1 name <span class="st">"Alice"</span> age <span class="st">"30"</span>
+redis-cli -p 6379 HGETALL user:1
+redis-cli -p 6379 PING</code></pre>
+</div>
+
+<div class="method-card" id="ex-datastructures">
+<div class="method-header">
+  <span class="method-name">Data Structures</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Beyond simple strings: lists (deque-backed task queues), sets (unique membership), hashes (field-value maps), and TTL-based expiry. One type per key, enforced at runtime.</p>
+<pre><code><span class="cm"># Lists — task queue</span>
+echo -e <span class="st">"rpush tasks build\nrpush tasks test\nrpush tasks deploy"</span> | nc -q1 localhost 9000
+echo <span class="st">"lpop tasks"</span> | nc -q1 localhost 9000   <span class="cm"># → build</span>
+
+<span class="cm"># Sets — unique tags</span>
+echo -e <span class="st">"sadd tags linux\nsadd tags io-uring\nsmembers tags"</span> | nc -q1 localhost 9000
+
+<span class="cm"># Hashes — user profile</span>
+echo -e <span class="st">"hset user:1 name Alice\nhset user:1 role admin\nhgetall user:1"</span> | nc -q1 localhost 9000
+
+<span class="cm"># TTL — auto-expire after 30 seconds</span>
+echo -e <span class="st">"set session abc123\nexpire session 30\nttl session"</span> | nc -q1 localhost 9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-pubsub">
+<div class="method-header">
+  <span class="method-name">Pub/Sub</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Publish/subscribe messaging through the cache. Subscribers receive messages in real time on named channels. Multiple subscribers per channel, multiple channels per client.</p>
+<pre><code>socketley create cache pubstore -p 9000 -s
+
+<span class="cm"># Terminal 1: subscribe</span>
+(echo <span class="st">"subscribe news"</span>; sleep 60) | nc localhost 9000
+
+<span class="cm"># Terminal 2: publish</span>
+echo <span class="st">"publish news breaking-update"</span> | nc -q1 localhost 9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-replication">
+<div class="method-header">
+  <span class="method-name">Replication</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Leader-follower replication. Writes go to the leader and are automatically replicated to followers. Read from followers to distribute load.</p>
+<pre><code><span class="cm"># Create leader</span>
+socketley create cache leader -p 9000 -s
+
+<span class="cm"># Create follower that syncs from leader</span>
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
+
+<span class="cm"># Write to leader</span>
+echo <span class="st">"set user alice"</span> | nc -q1 localhost 9000
+
+<span class="cm"># Read from follower — replicated automatically</span>
+echo <span class="st">"get user"</span> | nc -q1 localhost 9001   <span class="cm"># → alice</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-db-backend">
+<div class="method-header">
+  <span class="method-name">Database Backend</span>
+  <span class="badge badge-cache">cache</span>
+</div>
+<p class="method-desc">Wire the cache to any database with four Lua callbacks: <code>on_miss</code> (read-through), <code>on_write</code> (write-behind/write-through), <code>on_delete</code>, and <code>on_expire</code>. Works with SQLite, MySQL, and PostgreSQL via luarocks libraries.</p>
+<pre><code><span class="cm">-- db-backend.lua (SQLite example, trimmed)</span>
+<span class="kw">local</span> db, pending = <span class="kw">nil</span>, {}
+tick_ms = <span class="nb">2000</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    db = require(<span class="st">"lsqlite3"</span>).open(<span class="st">"/tmp/cache.db"</span>)
+    db:exec(<span class="st">"CREATE TABLE IF NOT EXISTS cache_kv (key TEXT PRIMARY KEY, value TEXT)"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_miss</span>(key)
+    <span class="kw">for</span> row <span class="kw">in</span> db:nrows(<span class="st">"SELECT value FROM cache_kv WHERE key="</span> .. db:quote(key)) <span class="kw">do</span>
+        <span class="kw">return</span> row.value, <span class="nb">300</span>
+    <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_write</span>(key, value, ttl)  pending[key] = value  <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">if not</span> next(pending) <span class="kw">then</span> <span class="kw">return</span> <span class="kw">end</span>
+    <span class="kw">for</span> k, v <span class="kw">in</span> pairs(pending) <span class="kw">do</span>
+        db:exec(<span class="st">"INSERT OR REPLACE INTO cache_kv(key,value) VALUES("</span>
+                ..db:quote(k)..<span class="st">","</span>..db:quote(v)..<span class="st">")"</span>)
+    <span class="kw">end</span>
+    pending = {}
+<span class="kw">end</span>
+<span class="cm">-- (see full example in examples/cache/db-backend.lua)</span></code></pre>
+<pre><code>socketley create cache mydb -p 9000 --lua db-backend.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-cache-integration">
+<div class="method-header">
+  <span class="method-name">Cache + Server Integration</span>
+  <span class="badge badge-cache">cache</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Use the cache as a shared data store between runtimes. An orchestration Lua script creates a persistent cache, an API server, and a client &mdash; the server reads and writes the shared cache directly from Lua.</p>
+<pre><code><span class="cm">-- cache-integration.lua</span>
+runtimes = {
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"shared-state"</span>, port = <span class="nb">9000</span>,
+      persistent = <span class="st">"/tmp/shared-state.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-server"</span>,   port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+}
+
+<span class="kw">function</span> <span class="fn">on_message</span>(msg)
+    <span class="kw">local</span> cmd, key, value = msg:match(<span class="st">"^(%w+)%s+(%S+)%s*(.*)"</span>)
+    <span class="kw">if</span> cmd == <span class="st">"GET"</span> <span class="kw">then</span>
+        self.send(self.get(key) <span class="kw">or</span> <span class="st">"NOT_FOUND"</span>)
+    <span class="kw">elseif</span> cmd == <span class="st">"SET"</span> <span class="kw">then</span>
+        self.set(key, value); self.send(<span class="st">"OK"</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+<pre><code>socketley --lua cache-integration.lua</code></pre>
+</div>
+
+<!-- ── Server Addons ── -->
+<h2 id="ex-server-addons">Server Addons</h2>
+<p>Extend servers with auth, rate limiting, session management, service discovery, and more &mdash; all in pure Lua using the addon primitives (<code>on_auth</code>, <code>self.disconnect</code>, <code>self.peer_ip</code>, <code>socketley.http</code>).</p>
+
+<div class="method-card" id="ex-ip-allowlist">
+<div class="method-header">
+  <span class="method-name">IP Allowlist</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Network-level admission control. The <code>on_auth</code> callback fires immediately after TCP accept, before <code>on_connect</code>. Check the client's IP with <code>self.peer_ip</code> and return <code>false</code> to reject. Fail-closed: Lua errors also reject.</p>
+<pre><code><span class="cm">-- auth-ip-allowlist.lua</span>
+<span class="kw">local</span> allowed_prefix = <span class="st">"192.168."</span>
+
+<span class="kw">function</span> <span class="fn">on_auth</span>(client_id)
+    <span class="kw">local</span> ip = self.peer_ip(client_id)
+    <span class="kw">local</span> ok = ip:sub(<span class="nb">1</span>, #allowed_prefix) == allowed_prefix
+    <span class="kw">if not</span> ok <span class="kw">then</span> socketley.log(<span class="st">"rejected: "</span> .. ip) <span class="kw">end</span>
+    <span class="kw">return</span> ok
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    self.broadcast(<span class="st">"["</span> .. tostring(client_id) .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server authtest -p 9000 --lua auth-ip-allowlist.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-token-auth">
+<div class="method-header">
+  <span class="method-name">Token Authentication</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">First-message token auth. Clients must send a secret as their first message &mdash; authenticated clients get broadcast access, others are disconnected with <code>self.disconnect</code>.</p>
+<pre><code><span class="cm">-- auth-token.lua</span>
+<span class="kw">local</span> SECRET = <span class="st">"my-secret-token"</span>
+<span class="kw">local</span> authenticated = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)    authenticated[client_id] = <span class="kw">false</span> <span class="kw">end</span>
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id) authenticated[client_id] = <span class="kw">nil</span>   <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">if not</span> authenticated[client_id] <span class="kw">then</span>
+        <span class="kw">if</span> msg == SECRET <span class="kw">then</span>
+            authenticated[client_id] = <span class="kw">true</span>
+            self.send(client_id, <span class="st">"AUTH OK"</span>)
+        <span class="kw">else</span>
+            self.send(client_id, <span class="st">"AUTH FAIL"</span>)
+            self.disconnect(client_id)
+        <span class="kw">end</span>
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(<span class="st">"["</span> .. tostring(client_id) .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server auth -p 9000 --lua auth-token.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-rate-limit">
+<div class="method-header">
+  <span class="method-name">Rate Limiting</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Per-client message throttling. Counts messages per client and resets every tick interval (1 second). Clients exceeding the limit are disconnected. Pure Lua, no external deps.</p>
+<pre><code><span class="cm">-- rate-limit.lua: 10 messages per second per client</span>
+<span class="kw">local</span> MAX_MSGS = <span class="nb">10</span>
+<span class="kw">local</span> counts   = {}
+tick_ms = <span class="nb">1000</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)    counts[client_id] = <span class="nb">0</span>   <span class="kw">end</span>
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id) counts[client_id] = <span class="kw">nil</span> <span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    counts[client_id] = (counts[client_id] <span class="kw">or</span> <span class="nb">0</span>) + <span class="nb">1</span>
+    <span class="kw">if</span> counts[client_id] > MAX_MSGS <span class="kw">then</span>
+        self.send(client_id, <span class="st">"ERROR rate limit exceeded"</span>)
+        self.disconnect(client_id)
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(msg)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_tick</span>(dt)
+    <span class="kw">for</span> id <span class="kw">in</span> pairs(counts) <span class="kw">do</span> counts[id] = <span class="nb">0</span> <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server limited -p 9000 --lua rate-limit.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-session-ids">
+<div class="method-header">
+  <span class="method-name">UUID Session IDs</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Assign a UUID to every connection for end-to-end distributed tracing. Session IDs are embedded in every outbound JSON envelope, making it easy to correlate events across logs and external systems.</p>
+<pre><code><span class="cm">-- session-ids.lua (requires: luarocks install uuid)</span>
+<span class="kw">local</span> uuid  = require <span class="st">"uuid"</span>
+<span class="kw">local</span> cjson = require <span class="st">"cjson"</span>
+uuid.seed()
+
+<span class="kw">local</span> session_ids = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    session_ids[client_id] = uuid()
+    socketley.log(<span class="st">"connect sid="</span> .. session_ids[client_id]
+                  .. <span class="st">" ip="</span> .. self.peer_ip(client_id))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
+    session_ids[client_id] = <span class="kw">nil</span>
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    self.broadcast(cjson.encode({
+        sid = session_ids[client_id], from = client_id, data = msg,
+    }))
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server traced -p 9000 --lua session-ids.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-redis-session">
+<div class="method-header">
+  <span class="method-name">Redis Distributed Sessions</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Shared state via an external Redis instance using <code>redis-lua</code>. Enables distributed rate limiting (INCR/EXPIRE per IP), presence tracking (SADD/SREM), and per-connection session data across multiple Socketley instances.</p>
+<pre><code><span class="cm">-- redis-session.lua (requires: luarocks install redis-lua)</span>
+<span class="kw">local</span> redis = require <span class="st">"redis"</span>
+<span class="kw">local</span> r     = redis.connect(<span class="st">"127.0.0.1"</span>, <span class="nb">6379</span>)
+<span class="kw">local</span> RATE_LIMIT = <span class="nb">20</span>
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    r:sadd(<span class="st">"socketley:online"</span>, tostring(client_id))
+    <span class="kw">local</span> key = <span class="st">"session:"</span> .. tostring(client_id)
+    r:hset(key, <span class="st">"ip"</span>, self.peer_ip(client_id))
+    r:expire(key, <span class="nb">3600</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">local</span> key = <span class="st">"rl:"</span> .. self.peer_ip(client_id)
+    <span class="kw">local</span> n = r:incr(key)
+    <span class="kw">if</span> n == <span class="nb">1</span> <span class="kw">then</span> r:expire(key, <span class="nb">1</span>) <span class="kw">end</span>
+    <span class="kw">if</span> n > RATE_LIMIT <span class="kw">then</span>
+        self.send(client_id, <span class="st">"ERROR rate limit exceeded"</span>)
+        self.disconnect(client_id)
+        <span class="kw">return</span>
+    <span class="kw">end</span>
+    self.broadcast(msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server distributed -p 9000 --lua redis-session.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-service-discovery">
+<div class="method-header">
+  <span class="method-name">Service Discovery (Consul)</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Automatic Consul registration via <code>socketley.http</code>. Registers the runtime as a service on start and deregisters on stop. The same pattern works with etcd, Eureka, or any REST-based registry.</p>
+<pre><code><span class="cm">-- service-discovery.lua</span>
+<span class="kw">local</span> CONSUL = <span class="st">"http://127.0.0.1:8500"</span>
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    <span class="kw">local</span> payload = string.format(
+        <span class="st">'{"ID":"%s","Name":"%s","Port":%d,"Address":"127.0.0.1"}'</span>,
+        self.name, self.name, self.port)
+    socketley.http({
+        method  = <span class="st">"PUT"</span>,
+        url     = CONSUL .. <span class="st">"/v1/agent/service/register"</span>,
+        body    = payload,
+        headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"application/json"</span> },
+    })
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    socketley.http({
+        method = <span class="st">"PUT"</span>,
+        url    = CONSUL .. <span class="st">"/v1/agent/service/deregister/"</span> .. self.name,
+    })
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server myapi -p 9000 --lua service-discovery.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-ws-session">
+<div class="method-header">
+  <span class="method-name">WebSocket Session Tracking</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Track browser sessions via WebSocket upgrade headers. The <code>on_websocket</code> callback fires after the handshake with <code>Cookie</code>, <code>Origin</code>, and <code>Authorization</code> headers. Session cookies provide a durable identifier that survives fd recycling and IP changes.</p>
+<pre><code><span class="cm">-- websocket-session.lua</span>
+<span class="kw">local</span> cjson    = require <span class="st">"cjson"</span>
+<span class="kw">local</span> sessions = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    sessions[client_id] = { sid = tostring(client_id), ip = self.peer_ip(client_id) }
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_websocket</span>(client_id, headers)
+    <span class="kw">local</span> sid = sessions[client_id] <span class="kw">and</span> sessions[client_id].sid <span class="kw">or</span> tostring(client_id)
+    <span class="kw">if</span> headers.cookie <span class="kw">then</span>
+        sid = headers.cookie:match(<span class="st">"session_id=([^;%s]+)"</span>) <span class="kw">or</span> sid
+    <span class="kw">end</span>
+    sessions[client_id] = { sid = sid, ip = self.peer_ip(client_id),
+                            origin = headers.origin <span class="kw">or</span> <span class="st">"unknown"</span> }
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">local</span> s = sessions[client_id] <span class="kw">or</span> {}
+    self.broadcast(cjson.encode({ sid = s.sid, data = msg }))
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server ws-test -p 9000 --lua websocket-session.lua -s
+wscat --header <span class="st">"Cookie: session_id=abc123"</span> --connect ws://localhost:9000</code></pre>
+</div>
+
+<div class="method-card" id="ex-http-dashboard">
+<div class="method-header">
+  <span class="method-name">HTTP Dashboard</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Serve a static HTML/CSS dashboard via the <code>--http</code> flag and handle WebSocket messages in Lua. The page loads with an auto-injected <code>socketley</code> WebSocket global for real-time communication.</p>
+<pre><code><span class="cm">-- http-dashboard.lua</span>
+<span class="kw">local</span> clients = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(id)
+    clients[id] = <span class="kw">true</span>
+    self.broadcast(<span class="st">"system: client "</span> .. id .. <span class="st">" joined"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(id)
+    clients[id] = <span class="kw">nil</span>
+    self.broadcast(<span class="st">"system: client "</span> .. id .. <span class="st">" left"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(id, msg)
+    self.broadcast(<span class="st">"["</span> .. id .. <span class="st">"] "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server dashboard -p 8080 \
+    --http ./examples/server/http-dashboard/ \
+    --lua http-dashboard.lua -s
+<span class="cm"># Open http://localhost:8080 in a browser</span></code></pre>
+</div>
+
+<!-- ── Lua Configuration ── -->
+<h2 id="ex-lua-config">Lua Configuration</h2>
+<p>Orchestrate multiple runtimes from a single Lua file using the <code>runtimes</code> table and lifecycle callbacks.</p>
+
+<div class="method-card" id="ex-simple-config">
+<div class="method-header">
+  <span class="method-name">Simple Config</span>
+  <span class="badge badge-all">all types</span>
+</div>
+<p class="method-desc">The <code>runtimes</code> table is the simplest way to declare multiple runtimes in one file. Each entry specifies the type, name, port, and optional flags. Run with <code>socketley --lua</code>.</p>
+<pre><code><span class="cm">-- simple-config.lua</span>
+runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"my-server"</span>, port = <span class="nb">9000</span>,
+      mode = <span class="st">"inout"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"client"</span>, name = <span class="st">"my-client"</span>,
+      target = <span class="st">"127.0.0.1:9000"</span>, start = <span class="kw">true</span> },
+}
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.log(self.name .. <span class="st">" started on port "</span> .. tostring(self.port))
+<span class="kw">end</span></code></pre>
+<pre><code>socketley --lua simple-config.lua</code></pre>
+</div>
+
+<div class="method-card" id="ex-callbacks">
+<div class="method-header">
+  <span class="method-name">Lifecycle Callbacks</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">All available callbacks demonstrated: <code>on_start</code>, <code>on_stop</code>, <code>on_message</code>, and <code>on_send</code>. Each fires at a specific lifecycle event. All are optional &mdash; define only the ones you need.</p>
+<pre><code><span class="cm">-- callbacks.lua</span>
+runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"callback-demo"</span>, port = <span class="nb">9000</span>, start = <span class="kw">true</span> }
+}
+
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.log(<span class="st">"on_start: "</span> .. self.name .. <span class="st">" running on "</span> .. tostring(self.port))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_stop</span>()
+    socketley.log(<span class="st">"on_stop: "</span> .. self.name .. <span class="st">" shutting down"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_message</span>(msg)
+    self.broadcast(<span class="st">"[ECHO] "</span> .. msg)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_send</span>(msg)
+    socketley.log(<span class="st">"on_send: "</span> .. msg)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley --lua callbacks.lua</code></pre>
+</div>
+
+<div class="method-card" id="ex-conn-callbacks">
+<div class="method-header">
+  <span class="method-name">Connection Callbacks</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Track individual client connections with <code>on_connect</code> and <code>on_disconnect</code>. Useful for client counting, connection logging, and per-client state management.</p>
+<pre><code><span class="cm">-- callbacks-connect.lua</span>
+<span class="kw">local</span> clients = {}
+
+<span class="kw">function</span> <span class="fn">on_connect</span>(client_id)
+    clients[client_id] = os.time()
+    socketley.log(<span class="st">"connected: "</span> .. tostring(client_id))
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_disconnect</span>(client_id)
+    <span class="kw">local</span> t = clients[client_id]
+    clients[client_id] = <span class="kw">nil</span>
+    socketley.log(<span class="st">"disconnected: "</span> .. tostring(client_id)
+                  .. <span class="st">" after "</span> .. tostring(os.time() - (t <span class="kw">or</span> <span class="nb">0</span>)) .. <span class="st">"s"</span>)
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server tracker -p 9000 --lua callbacks-connect.lua -s</code></pre>
+</div>
+
+<div class="method-card" id="ex-custom-routing">
+<div class="method-header">
+  <span class="method-name">Custom Routing</span>
+  <span class="badge badge-proxy">proxy</span>
+</div>
+<p class="method-desc">A Lua-strategy proxy that routes by content type: static assets go to a static backend, API calls go to an API backend, and compute-heavy requests go to a compute backend. Demonstrates pattern matching in <code>on_route</code>.</p>
+<pre><code><span class="cm">-- custom-routing.lua</span>
+runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"static-backend"</span>,  port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-backend"</span>,     port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"compute-backend"</span>, port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"smart-router"</span>,    port = <span class="nb">8080</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
+      backends = { <span class="st">"127.0.0.1:9001"</span>, <span class="st">"127.0.0.1:9002"</span>, <span class="st">"127.0.0.1:9003"</span> },
+      start = <span class="kw">true</span> }
+}
+
+<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"%.css$"</span>) <span class="kw">or</span> path:match(<span class="st">"%.js$"</span>) <span class="kw">or</span> path:match(<span class="st">"^/static/"</span>) <span class="kw">then</span>
+        <span class="kw">return</span> <span class="nb">0</span>  <span class="cm">-- static-backend</span>
+    <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/compute/"</span>) <span class="kw">or</span> path:match(<span class="st">"^/ml/"</span>) <span class="kw">then</span>
+        <span class="kw">return</span> <span class="nb">2</span>  <span class="cm">-- compute-backend</span>
+    <span class="kw">end</span>
+    <span class="kw">return</span> <span class="nb">1</span>      <span class="cm">-- api-backend (default)</span>
+<span class="kw">end</span></code></pre>
+<pre><code>socketley --lua custom-routing.lua</code></pre>
+</div>
+
+<div class="method-card" id="ex-full-setup">
+<div class="method-header">
+  <span class="method-name">Full Production Setup</span>
+  <span class="badge badge-all">all types</span>
+</div>
+<p class="method-desc">A complete 4-layer production-like architecture: persistent cache (data layer), 3 backend services, a Lua-routed API gateway (proxy layer), and inter-service communication clients. Includes path-based routing and lifecycle logging.</p>
+<pre><code><span class="cm">-- full-setup.lua (essential excerpt)</span>
+<span class="kw">local</span> CONFIG = { base_port = <span class="nb">9000</span>, cache_file = <span class="st">"/tmp/state.bin"</span> }
+
+runtimes = {
+    <span class="cm">-- Layer 1: Data</span>
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"state-store"</span>,   port = CONFIG.base_port,
+      persistent = CONFIG.cache_file, start = <span class="kw">true</span> },
+    <span class="cm">-- Layer 2: Services</span>
+    { type = <span class="st">"server"</span>, name = <span class="st">"auth-service"</span>,  port = CONFIG.base_port + <span class="nb">1</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,  port = CONFIG.base_port + <span class="nb">2</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>, port = CONFIG.base_port + <span class="nb">3</span>, start = <span class="kw">true</span> },
+    <span class="cm">-- Layer 3: Gateway</span>
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-gateway"</span>,   port = <span class="nb">8080</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
+      backends = { <span class="st">"auth-service"</span>, <span class="st">"user-service"</span>, <span class="st">"order-service"</span> },
+      start = <span class="kw">true</span> },
+}
+
+<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"^/auth"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">0</span> <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/users"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">1</span> <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/orders"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">2</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="nb">1</span>
+<span class="kw">end</span>
+<span class="cm">-- (see full example in examples/lua-config/full-setup.lua)</span></code></pre>
+<pre><code>socketley --lua full-setup.lua</code></pre>
+</div>
+
+<!-- ── Advanced ── -->
+<h2 id="ex-advanced">Advanced</h2>
+<p>Production-grade patterns: microservices, high availability, centralized logging, development environments, game servers, and UDP.</p>
+
+<div class="method-card" id="ex-microservices">
+<div class="method-header">
+  <span class="method-name">Microservices Architecture</span>
+  <span class="badge badge-all">all types</span>
+</div>
+<p class="method-desc">A complete e-commerce backend with 5 microservices (users, products, orders, inventory, cache) and an API gateway with Lua-based path routing. Demonstrates service isolation, shared state, and clean URL dispatch.</p>
+<pre><code><span class="cm">-- microservices.lua (essential excerpt)</span>
+runtimes = {
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"service-cache"</span>,     port = <span class="nb">9005</span>,
+      persistent = <span class="st">"/tmp/micro-cache.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"user-service"</span>,      port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"product-service"</span>,   port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"order-service"</span>,     port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"inventory-service"</span>, port = <span class="nb">9004</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-gateway"</span>,       port = <span class="nb">8080</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
+      backends = { <span class="st">"user-service"</span>, <span class="st">"product-service"</span>, <span class="st">"order-service"</span>, <span class="st">"inventory-service"</span> },
+      start = <span class="kw">true</span> },
+}
+
+<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"^/users"</span>)     <span class="kw">then</span> <span class="kw">return</span> <span class="nb">0</span> <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/products"</span>)  <span class="kw">then</span> <span class="kw">return</span> <span class="nb">1</span> <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/orders"</span>)    <span class="kw">then</span> <span class="kw">return</span> <span class="nb">2</span> <span class="kw">end</span>
+    <span class="kw">if</span> path:match(<span class="st">"^/inventory"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">3</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="nb">0</span>
+<span class="kw">end</span>
+<span class="cm">-- (see full example in examples/advanced/microservices.lua)</span></code></pre>
+<pre><code>socketley --lua microservices.lua</code></pre>
+</div>
+
+<div class="method-card" id="ex-high-availability">
+<div class="method-header">
+  <span class="method-name">High Availability</span>
+  <span class="badge badge-proxy">proxy</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">3 API replicas behind a round-robin load balancer, plus 2 worker replicas with random distribution. Stop any replica and traffic automatically redistributes. Health tracking via cache.</p>
+<pre><code><span class="cm">-- high-availability.lua (essential excerpt)</span>
+runtimes = {
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"health-store"</span>,    port = <span class="nb">9000</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-1"</span>,   port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-2"</span>,   port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-replica-3"</span>,   port = <span class="nb">9003</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"api-lb"</span>,          port = <span class="nb">8080</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"round-robin"</span>,
+      backends = { <span class="st">"api-replica-1"</span>, <span class="st">"api-replica-2"</span>, <span class="st">"api-replica-3"</span> },
+      start = <span class="kw">true</span> },
+}
+<span class="cm">-- (see full example in examples/advanced/high-availability.lua)</span></code></pre>
+<pre><code>socketley --lua high-availability.lua
+
+<span class="cm"># Simulate failover: stop one replica, traffic redistributes</span>
+socketley stop api-replica-2</code></pre>
+</div>
+
+<div class="method-card" id="ex-logging-pipeline">
+<div class="method-header">
+  <span class="method-name">Logging Pipeline</span>
+  <span class="badge badge-server">server</span>
+  <span class="badge badge-client">client</span>
+</div>
+<p class="method-desc">Centralized log collection: application servers have log forwarder clients that send to a central collector server. Logs are aggregated to a single file and metrics are tracked in a cache. The collector uses <code>--mode in</code> (receive-only).</p>
+<pre><code><span class="cm">-- logging-pipeline.lua (essential excerpt)</span>
+runtimes = {
+    { type = <span class="st">"server"</span>, name = <span class="st">"log-collector"</span>, port = <span class="nb">9999</span>, mode = <span class="st">"in"</span>,
+      write = <span class="st">"/tmp/all-logs.log"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"log-metrics"</span>,   port = <span class="nb">9998</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"web-app"</span>,        port = <span class="nb">9001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"api-app"</span>,        port = <span class="nb">9002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"client"</span>, name = <span class="st">"web-log-fwd"</span>,   target = <span class="st">"127.0.0.1:9999"</span>,
+      mode = <span class="st">"out"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"client"</span>, name = <span class="st">"api-log-fwd"</span>,   target = <span class="st">"127.0.0.1:9999"</span>,
+      mode = <span class="st">"out"</span>, start = <span class="kw">true</span> },
+}
+<span class="cm">-- (see full example in examples/advanced/logging-pipeline.lua)</span></code></pre>
+<pre><code>socketley --lua logging-pipeline.lua
+tail -f /tmp/all-logs.log</code></pre>
+</div>
+
+<div class="method-card" id="ex-dev-env">
+<div class="method-header">
+  <span class="method-name">Development Environment</span>
+  <span class="badge badge-all">all types</span>
+</div>
+<p class="method-desc">A local 4-tier dev stack accessible on <code>localhost:3000</code>: a mock database (persistent cache on :5432), REST API server (:3001), WebSocket server (:3002), and a Lua-routed proxy that combines everything behind a single port.</p>
+<pre><code><span class="cm">-- development-env.lua (essential excerpt)</span>
+runtimes = {
+    { type = <span class="st">"cache"</span>,  name = <span class="st">"dev-db"</span>,    port = <span class="nb">5432</span>,
+      persistent = <span class="st">"/tmp/dev-db.bin"</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"dev-api"</span>,   port = <span class="nb">3001</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"server"</span>, name = <span class="st">"dev-ws"</span>,    port = <span class="nb">3002</span>, start = <span class="kw">true</span> },
+    { type = <span class="st">"proxy"</span>,  name = <span class="st">"dev-proxy"</span>, port = <span class="nb">3000</span>,
+      protocol = <span class="st">"http"</span>, strategy = <span class="st">"lua"</span>,
+      backends = { <span class="st">"dev-api"</span>, <span class="st">"dev-ws"</span> }, start = <span class="kw">true</span> },
+}
+
+<span class="kw">function</span> <span class="fn">on_route</span>(method, path)
+    <span class="kw">if</span> path:match(<span class="st">"^/ws"</span>) <span class="kw">then</span> <span class="kw">return</span> <span class="nb">1</span> <span class="kw">end</span>
+    <span class="kw">return</span> <span class="nb">0</span>
+<span class="kw">end</span>
+<span class="cm">-- (see full example in examples/advanced/development-env.lua)</span></code></pre>
+<pre><code>socketley --lua development-env.lua
+<span class="cm"># http://localhost:3000 — unified entry point</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-game-routing">
+<div class="method-header">
+  <span class="method-name">Game Server Routing</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">A lobby server that dynamically creates game mode sub-servers and routes players to them. Clients send <code>join rapid</code> or <code>join blitz</code> to be routed. Sub-servers are auto-removed when the lobby stops via <code>on_parent_stop = "remove"</code>.</p>
+<pre><code><span class="cm">-- game-routing.lua</span>
+<span class="kw">function</span> <span class="fn">on_start</span>()
+    socketley.create(<span class="st">"server"</span>, <span class="st">"chess-rapid"</span>, {
+        port = <span class="nb">0</span>, config = <span class="st">"rapid-handler.lua"</span>,
+        on_parent_stop = <span class="st">"remove"</span>
+    })
+    socketley.start(<span class="st">"chess-rapid"</span>)
+
+    socketley.create(<span class="st">"server"</span>, <span class="st">"chess-blitz"</span>, {
+        port = <span class="nb">0</span>, config = <span class="st">"blitz-handler.lua"</span>,
+        on_parent_stop = <span class="st">"remove"</span>
+    })
+    socketley.start(<span class="st">"chess-blitz"</span>)
+<span class="kw">end</span>
+
+<span class="kw">function</span> <span class="fn">on_client_message</span>(client_id, msg)
+    <span class="kw">if</span> msg:match(<span class="st">"^join "</span>) <span class="kw">then</span>
+        <span class="kw">local</span> mode = msg:match(<span class="st">"^join (%S+)"</span>)
+        self.route(client_id, <span class="st">"chess-"</span> .. mode)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+<pre><code>socketley create server lobby -p 9000 --lua game-routing.lua -s
+<span class="cm"># Connect and type: join rapid</span></code></pre>
+</div>
+
+<div class="method-card" id="ex-udp-echo">
+<div class="method-header">
+  <span class="method-name">UDP Echo</span>
+  <span class="badge badge-server">server</span>
+</div>
+<p class="method-desc">Fire-and-forget datagram messaging with <code>--udp</code>. Each UDP datagram is one message (no line-parsing needed). Useful for telemetry, logging, and game state updates where occasional packet loss is acceptable.</p>
+<pre><code>socketley create server udpecho -p 9000 --udp -b -s
+
+<span class="cm"># Send datagrams</span>
+echo <span class="st">"hello"</span> | socat - UDP:localhost:9000
+echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
+</div>
+
+</div><!-- #content-examples -->
