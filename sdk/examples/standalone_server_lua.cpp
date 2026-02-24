@@ -36,54 +36,15 @@
 //   end
 
 #include <socketley/server.h>
-#include <csignal>
 #include <cstdio>
-
-static event_loop* g_loop = nullptr;
 
 int main(int argc, char* argv[])
 {
     const char* lua_script = (argc > 1) ? argv[1] : "sdk/examples/server_config.lua";
 
-    signal(SIGPIPE, SIG_IGN);
+    socketley::server srv(9000);
+    srv.lua(lua_script);
+    srv.run();
 
-    event_loop loop;
-    if (!loop.init())
-    {
-        fprintf(stderr, "event_loop::init() failed\n");
-        return 1;
-    }
-    g_loop = &loop;
-
-    runtime_manager manager;
-    if (!manager.create(runtime_server, "srv"))
-    {
-        fprintf(stderr, "create failed\n");
-        return 1;
-    }
-
-    auto* inst = manager.get("srv");
-    inst->set_port(9000);
-    inst->set_runtime_manager(&manager);
-    inst->set_event_loop(&loop);
-
-    if (!inst->load_lua_script(lua_script))
-    {
-        fprintf(stderr, "failed to load Lua script: %s\n", lua_script);
-        return 1;
-    }
-
-    if (!manager.start("srv", loop))
-    {
-        fprintf(stderr, "start failed\n");
-        return 1;
-    }
-
-    signal(SIGINT,  [](int){ if (g_loop) g_loop->request_stop(); });
-    signal(SIGTERM, [](int){ if (g_loop) g_loop->request_stop(); });
-
-    loop.run();
-
-    manager.stop_all(loop);
     return 0;
 }
