@@ -1967,7 +1967,7 @@ peer_ip(fd)         clients()           multicast(fds, msg)
 set_data(fd,k,v)    get_data(fd,k)
 
 // Lifecycle
-run()   stop()
+start()   stop()
 
 // Escape hatches (raw engine access)
 instance() -> server_instance*
@@ -1991,7 +1991,7 @@ on_message(void(string_view msg))   on_tick
 // Actions
 send(msg)
 
-// Lifecycle: run()  stop()
+// Lifecycle: start()  stop()
 // Escape hatches: instance()  manager()  loop()
 .fi
 .PP
@@ -2005,7 +2005,7 @@ tls(cert, key)     max_connections(n)  idle_timeout(s)
 lua(path)          group(g)
 
 // Callbacks: on_start  on_stop
-// Lifecycle: run()  stop()
+// Lifecycle: start()  stop()
 // Escape hatches: instance()  manager()  loop()
 .fi
 .PP
@@ -2020,15 +2020,15 @@ max_connections(n) idle_timeout(s)     replicate(target)
 lua(path)          group(g)
 
 // Callbacks: on_start  on_stop
-// Lifecycle: run()  stop()
+// Lifecycle: start()  stop()
 // Escape hatches: instance()  manager()  loop()
 .fi
 .PP
 .B "Limitations:"
 One
-.B run()
+.B start()
 per process (the signal handler points to one event_loop).
-.B run()
+.B start()
 blocks until SIGINT/SIGTERM. For multi-runtime or async patterns, use the raw API
 via the escape hatches or directly.
 .PP
@@ -2050,7 +2050,7 @@ int main() {
         printf("client %d disconnected\\n", fd);
     });
 
-    srv.run();
+    srv.start();
 }
 // g++ -std=c++23 echo.cpp -I. -Iinclude/linux \\
 //     -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto
@@ -2061,7 +2061,7 @@ int main() {
 int main(int argc, char* argv[]) {
     socketley::server srv(9000);
     srv.lua(argv[1]);
-    srv.run();
+    srv.start();
 }
 .fi
 .PP
@@ -2072,7 +2072,7 @@ px.backend("127.0.0.1:9001")
   .backend("127.0.0.1:9002")
   .protocol(protocol_tcp)
   .strategy(strategy_round_robin);
-px.run();
+px.start();
 .fi
 .PP
 .B "Example: Redis-compatible cache"
@@ -2082,7 +2082,7 @@ c.persistent("/var/data/store.dat")
  .resp()
  .max_memory(256 * 1024 * 1024)
  .eviction(evict_allkeys_lru);
-c.run();
+c.start();
 .fi
 .PP
 .B "Example: client with auto-reconnect"
@@ -2093,7 +2093,7 @@ cli.on_connect([&](int) { cli.send("hello"); });
 cli.on_message([](std::string_view msg) {
     printf("%.*s\\n", (int)msg.size(), msg.data());
 });
-cli.run();
+cli.start();
 .fi
 .PP
 .B "Raw Engine API (advanced)"
@@ -2262,7 +2262,7 @@ srv.on_message([&](int fd, std::string_view msg) {
 // Register with daemon so socketley ls/stats can see it
 socketley::daemon_attach("app_srv", "server", 9000);
 
-srv.run();  // daemon sees the runtime
+srv.start();  // daemon sees the runtime
 .fi
 .PP
 .B "When to use each tier:"

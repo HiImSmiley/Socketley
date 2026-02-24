@@ -11,11 +11,11 @@ namespace socketley {
 //   srv.on_message([&](int fd, std::string_view msg) {
 //       srv.send(fd, "echo: " + std::string(msg));
 //   });
-//   srv.run();
+//   srv.start();
 //
 // Limitations:
-//   - One run() per process (signal handler points to one event_loop)
-//   - run() blocks; for async patterns, use the raw API via instance()/loop()
+//   - One start() per process (signal handler points to one event_loop)
+//   - start() blocks; for async patterns, use the raw API via instance()/loop()
 class server {
 public:
     explicit server(uint16_t port) : m_name("_sdk_server") {
@@ -64,7 +64,7 @@ public:
     std::string get_data(int fd, std::string_view k)                 { return srv()->lua_get_data(fd, k); }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
-    void run() {
+    void start() {
         if (!m_loop.init()) return;
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
