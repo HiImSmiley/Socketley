@@ -35,6 +35,6 @@ int main()
         printf("client %d disconnected\n", fd);
     });
 
-    srv.run();
+    srv.start();
     return 0;
 }

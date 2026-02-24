@@ -9,7 +9,7 @@ namespace socketley {
 // Usage:
 //   socketley::cache c(6379);
 //   c.persistent("/tmp/cache.dat").resp();
-//   c.run();
+//   c.start();
 class cache {
 public:
     explicit cache(uint16_t port) : m_name("_sdk_cache") {
@@ -40,7 +40,7 @@ public:
     cache& on_stop(std::function<void()> cb)  { raw()->set_on_stop(std::move(cb)); return *this; }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
-    void run() {
+    void start() {
         if (!m_loop.init()) return;
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);

@@ -221,6 +221,11 @@ code {
   background: var(--bg-inline-code); padding: 2px 6px; border-radius: 4px; font-size: 13px;
 }
 pre code { background: none; padding: 0; border-radius: 0; }
+pre::-webkit-scrollbar { height: 6px; }
+pre::-webkit-scrollbar-track { background: var(--bg-code); border-radius: 0 0 8px 8px; }
+pre::-webkit-scrollbar-thumb { background: #3a3a5e; border-radius: 3px; }
+pre::-webkit-scrollbar-thumb:hover { background: #4a4a6e; }
+pre { scrollbar-width: thin; scrollbar-color: #3a3a5e var(--bg-code); }
 
 /* ===== Tables ===== */
 table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }

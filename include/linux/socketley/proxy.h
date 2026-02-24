@@ -9,7 +9,7 @@ namespace socketley {
 // Usage:
 //   socketley::proxy px(8080);
 //   px.backend("127.0.0.1:9000").protocol(protocol_tcp);
-//   px.run();
+//   px.start();
 class proxy {
 public:
     explicit proxy(uint16_t port) : m_name("_sdk_proxy") {
@@ -37,7 +37,7 @@ public:
     proxy& on_stop(std::function<void()> cb)  { raw()->set_on_stop(std::move(cb)); return *this; }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
-    void run() {
+    void start() {
         if (!m_loop.init()) return;
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);

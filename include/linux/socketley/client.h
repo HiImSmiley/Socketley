@@ -10,7 +10,7 @@ namespace socketley {
 //   socketley::client cli("127.0.0.1", 9000);
 //   cli.on_message([](std::string_view msg) { printf("%.*s\n", (int)msg.size(), msg.data()); });
 //   cli.on_connect([&](int) { cli.send("hello"); });
-//   cli.run();
+//   cli.start();
 class client {
 public:
     client(std::string_view host, uint16_t port) : m_name("_sdk_client") {
@@ -42,7 +42,7 @@ public:
     void send(std::string_view msg) { cli()->lua_send(msg); }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
-    void run() {
+    void start() {
         if (!m_loop.init()) return;
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);

@@ -1338,7 +1338,7 @@ sdk_tier2() {
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo -e "  Fluent, chainable API. All boilerplate (event loop, signals) is internal."
-    echo -e "  One run() per process — blocks until SIGINT/SIGTERM."
+    echo -e "  One start() per process — blocks until SIGINT/SIGTERM."
     echo ""
 
     echo -e "${BOLD}socketley::server(port):${NC}"
@@ -1367,7 +1367,7 @@ sdk_tier2() {
     echo -e "  Callbacks: ${CYAN}on_start  on_stop${NC}"
     echo ""
 
-    echo -e "  All wrappers: ${CYAN}run()  stop()  instance()  manager()  loop()${NC}"
+    echo -e "  All wrappers: ${CYAN}start()  stop()  instance()  manager()  loop()${NC}"
     echo ""
 
     echo -e "${BOLD}Example — Echo Server:${NC}"
@@ -1375,27 +1375,27 @@ sdk_tier2() {
     echo -e "  ${CYAN}srv.on_message([&](int fd, std::string_view msg) {${NC}"
     echo -e "  ${CYAN}    srv.send(fd, \"echo: \" + std::string(msg));${NC}"
     echo -e "  ${CYAN}});${NC}"
-    echo -e "  ${CYAN}srv.run();${NC}"
+    echo -e "  ${CYAN}srv.start();${NC}"
     echo ""
 
     echo -e "${BOLD}Example — TCP Proxy:${NC}"
     echo -e "  ${CYAN}socketley::proxy px(8080);${NC}"
     echo -e "  ${CYAN}px.backend(\"127.0.0.1:9001\").backend(\"127.0.0.1:9002\");${NC}"
     echo -e "  ${CYAN}px.protocol(protocol_tcp).strategy(strategy_round_robin);${NC}"
-    echo -e "  ${CYAN}px.run();${NC}"
+    echo -e "  ${CYAN}px.start();${NC}"
     echo ""
 
     echo -e "${BOLD}Example — Redis-Compatible Cache:${NC}"
     echo -e "  ${CYAN}socketley::cache c(6379);${NC}"
     echo -e "  ${CYAN}c.persistent(\"/var/data/store.dat\").resp();${NC}"
-    echo -e "  ${CYAN}c.run();${NC}"
+    echo -e "  ${CYAN}c.start();${NC}"
     echo ""
 
     echo -e "${BOLD}Example — Client with Auto-Reconnect:${NC}"
     echo -e "  ${CYAN}socketley::client cli(\"127.0.0.1\", 9000);${NC}"
     echo -e "  ${CYAN}cli.reconnect(0);  // 0 = infinite${NC}"
     echo -e "  ${CYAN}cli.on_connect([&](int) { cli.send(\"hello\"); });${NC}"
-    echo -e "  ${CYAN}cli.run();${NC}"
+    echo -e "  ${CYAN}cli.start();${NC}"
     echo ""
 
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1511,7 +1511,7 @@ sdk_mixed() {
     echo -e "${BOLD}Pattern:${NC}"
     echo -e "  1. Create a wrapper (socketley::server, etc.) or raw event_loop + mgr"
     echo -e "  2. Register with daemon: ${CYAN}socketley::daemon_attach(\"name\", type, port);${NC}"
-    echo -e "  3. ${CYAN}srv.run();${NC}  — daemon sees your runtime"
+    echo -e "  3. ${CYAN}srv.start();${NC}  — daemon sees your runtime"
     echo ""
 
     echo -e "${BOLD}Example:${NC}"
@@ -1524,7 +1524,7 @@ sdk_mixed() {
     echo -e "  ${CYAN}});${NC}"
     echo -e ""
     echo -e "  ${CYAN}socketley::daemon_attach(\"app_srv\", \"server\", 9000);${NC}"
-    echo -e "  ${CYAN}srv.run();  // daemon sees the runtime${NC}"
+    echo -e "  ${CYAN}srv.start();  // daemon sees the runtime${NC}"
     echo ""
 
     echo -e "${BOLD}Compile:${NC}"

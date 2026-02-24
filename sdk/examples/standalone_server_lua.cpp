@@ -44,7 +44,7 @@ int main(int argc, char* argv[])
 
     socketley::server srv(9000);
     srv.lua(lua_script);
-    srv.run();
+    srv.start();
 
     return 0;
 }
