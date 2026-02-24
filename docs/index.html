@@ -292,6 +292,7 @@
       </ul></li>
       <li><a href="#sdk-t2">Tier 2: Embed Engine</a><ul>
         <li><a href="#sdk-t2-build">Build &amp; Link</a></li>
+        <li><a href="#sdk-t2-wrappers">Wrapper Classes</a></li>
         <li><a href="#sdk-t2-eventloop">event_loop</a></li>
         <li><a href="#sdk-t2-manager">runtime_manager</a></li>
         <li><a href="#sdk-t2-base">runtime_instance (Base)</a></li>
@@ -338,10 +339,13 @@
         <li><a href="#exsdk-dw-pubsub">Pub/Sub Callbacks</a></li>
       </ul></li>
       <li><a href="#exsdk-tier2">Tier 2: Embedded Engine</a><ul>
-        <li><a href="#exsdk-echo">Echo Server</a></li>
-        <li><a href="#exsdk-multi">Multi-Runtime</a></li>
+        <li><a href="#exsdk-wrapper-echo">Echo Server (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-proxy">TCP Proxy (Wrapper)</a></li>
+        <li><a href="#exsdk-wrapper-cache">Cache (Wrapper)</a></li>
+        <li><a href="#exsdk-echo">Echo Server (Raw)</a></li>
+        <li><a href="#exsdk-multi">Multi-Runtime (Raw)</a></li>
         <li><a href="#exsdk-chat">Chat Server (Lua)</a></li>
-        <li><a href="#exsdk-proxy-lb">Proxy Load Balancer</a></li>
+        <li><a href="#exsdk-proxy-lb">Proxy Load Balancer (Raw)</a></li>
       </ul></li>
       <li><a href="#exsdk-tier3">Tier 3: Daemon Attach</a><ul>
         <li><a href="#exsdk-attach">Attached Service</a></li>
@@ -1113,28 +1117,13 @@ cp -r include/linux/socketley/ /your/project/include/</code></pre>
 
 <p><strong>Tier 2</strong> &mdash; Embed the engine:</p>
 <pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
-<span class="kw">#include</span> <span class="st">&lt;csignal&gt;</span>
-
-<span class="kw">static</span> event_loop* g_loop = <span class="kw">nullptr</span>;
 
 <span class="kw">int</span> <span class="fn">main</span>() {
-    signal(SIGPIPE, SIG_IGN);
-    event_loop loop; loop.<span class="fn">init</span>();
-    g_loop = &amp;loop;
-    runtime_manager mgr;
-
-    mgr.<span class="fn">create</span>(runtime_server, <span class="st">"srv"</span>);
-    <span class="kw">auto</span>* srv = <span class="kw">static_cast</span>&lt;server_instance*&gt;(mgr.<span class="fn">get</span>(<span class="st">"srv"</span>));
-    srv-&gt;<span class="fn">set_port</span>(<span class="nb">9000</span>);
-    srv-&gt;<span class="fn">set_mode</span>(mode_inout);
-    srv-&gt;<span class="fn">set_event_loop</span>(&amp;loop);
-    srv-&gt;<span class="fn">set_runtime_manager</span>(&amp;mgr);
-
-    mgr.<span class="fn">start</span>(<span class="st">"srv"</span>, loop);
-
-    signal(SIGINT, [](<span class="kw">int</span>) { g_loop-&gt;<span class="fn">request_stop</span>(); });
-    loop.<span class="fn">run</span>();
-    mgr.<span class="fn">stop_all</span>(loop);
+    socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+    });
+    srv.<span class="fn">start</span>();
 }
 <span class="cm">// g++ -std=c++23 app.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto</span></code></pre>
 
@@ -1779,13 +1768,228 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
 <table>
 <thead><tr><th>Header</th><th>Provides</th></tr></thead>
 <tbody>
-<tr><td><code>socketley/core.h</code></td><td><code>event_loop</code>, <code>runtime_manager</code>, enums, logging</td></tr>
-<tr><td><code>socketley/server.h</code></td><td><code>server_instance</code> (TCP/UDP server with callbacks)</td></tr>
-<tr><td><code>socketley/client.h</code></td><td><code>client_instance</code> (TCP/UDP connector)</td></tr>
-<tr><td><code>socketley/proxy.h</code></td><td><code>proxy_instance</code> (HTTP/TCP reverse proxy)</td></tr>
-<tr><td><code>socketley/cache.h</code></td><td><code>cache_instance</code> (Redis-compatible in-memory store)</td></tr>
+<tr><td><code>socketley/server.h</code></td><td><code>socketley::server</code> wrapper + <code>server_instance</code> raw API</td></tr>
+<tr><td><code>socketley/client.h</code></td><td><code>socketley::client</code> wrapper + <code>client_instance</code> raw API</td></tr>
+<tr><td><code>socketley/proxy.h</code></td><td><code>socketley::proxy</code> wrapper + <code>proxy_instance</code> raw API</td></tr>
+<tr><td><code>socketley/cache.h</code></td><td><code>socketley::cache</code> wrapper + <code>cache_instance</code> raw API</td></tr>
+<tr><td><code>socketley/core.h</code></td><td><code>event_loop</code>, <code>runtime_manager</code>, enums (included by above)</td></tr>
 </tbody>
 </table>
+
+<h3 id="sdk-t2-wrappers">High-Level Wrapper Classes</h3>
+<p>The recommended way to use Tier 2. Each wrapper manages its own event loop, runtime manager, and signal handlers internally. All config methods return <code>*this</code> for chaining. <code>start()</code> blocks until SIGINT/SIGTERM.</p>
+
+<div class="warn-box"><strong>One <code>start()</code> per process</strong> &mdash; the signal handler points to one event loop. For multi-runtime in a single process, use the <a href="#sdk-t2-eventloop">raw API</a> below.</div>
+
+<div class="method-card" id="sdk-wrap-server">
+<div class="method-header">
+  <span class="method-name">socketley::server</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-sig">server(uint16_t port)</p>
+<p class="method-desc">High-level TCP/UDP server. Handles event loop, signal handlers, and lifecycle internally.</p>
+
+<h4>Config (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tls(cert, key)</code></td><td>Enable TLS with certificate and key paths</td></tr>
+<tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
+<tr><td><code>rate_limit(r)</code></td><td>Per-connection rate limit (msg/sec)</td></tr>
+<tr><td><code>global_rate_limit(r)</code></td><td>Shared rate limit across all connections</td></tr>
+<tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle clients after <em>s</em> seconds</td></tr>
+<tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
+<tr><td><code>mode(m)</code></td><td><code>mode_inout</code>, <code>mode_in</code>, <code>mode_out</code>, <code>mode_master</code></td></tr>
+<tr><td><code>udp()</code></td><td>Switch to UDP mode</td></tr>
+<tr><td><code>http_dir(path)</code></td><td>Serve static files from directory</td></tr>
+<tr><td><code>http_cache()</code></td><td>Enable in-memory HTTP file cache</td></tr>
+<tr><td><code>upstream(addr)</code></td><td>Add an upstream connection target</td></tr>
+<tr><td><code>master_pw(pw)</code></td><td>Set master mode password</td></tr>
+<tr><td><code>drain()</code></td><td>Enable graceful shutdown (finish pending writes)</td></tr>
+<tr><td><code>group(g)</code></td><td>Tag for dynamic proxy backend discovery</td></tr>
+<tr><td><code>tick_interval(ms)</code></td><td>Set periodic tick interval in milliseconds</td></tr>
+</tbody>
+</table>
+
+<h4>Callbacks (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Signature</th></tr></thead>
+<tbody>
+<tr><td><code>on_start(cb)</code></td><td><code>void()</code></td></tr>
+<tr><td><code>on_stop(cb)</code></td><td><code>void()</code></td></tr>
+<tr><td><code>on_connect(cb)</code></td><td><code>void(int fd)</code></td></tr>
+<tr><td><code>on_disconnect(cb)</code></td><td><code>void(int fd)</code></td></tr>
+<tr><td><code>on_message(cb)</code></td><td><code>void(int fd, string_view msg)</code></td></tr>
+<tr><td><code>on_tick(cb)</code></td><td><code>void(double dt_ms)</code></td></tr>
+</tbody>
+</table>
+
+<h4>Actions</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>send(fd, msg)</code></td><td>Send message to a specific client</td></tr>
+<tr><td><code>broadcast(msg)</code></td><td>Send to all connected clients</td></tr>
+<tr><td><code>disconnect(fd)</code></td><td>Disconnect a client</td></tr>
+<tr><td><code>peer_ip(fd)</code></td><td>Get client's IP address</td></tr>
+<tr><td><code>clients()</code></td><td>Get vector of all connected client fds</td></tr>
+<tr><td><code>multicast(fds, msg)</code></td><td>Send to a subset of clients</td></tr>
+<tr><td><code>set_data(fd, k, v)</code></td><td>Set per-connection metadata</td></tr>
+<tr><td><code>get_data(fd, k)</code></td><td>Get per-connection metadata</td></tr>
+</tbody>
+</table>
+
+<h4>Lifecycle &amp; Escape Hatches</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>start()</code></td><td>Initialize event loop, install signal handlers, run &mdash; blocks until SIGINT/SIGTERM</td></tr>
+<tr><td><code>stop()</code></td><td>Request the event loop to stop</td></tr>
+<tr><td><code>instance()</code></td><td>Access the underlying <code>server_instance*</code></td></tr>
+<tr><td><code>manager()</code></td><td>Access the underlying <code>runtime_manager&amp;</code></td></tr>
+<tr><td><code>loop()</code></td><td>Access the underlying <code>event_loop&amp;</code></td></tr>
+</tbody>
+</table>
+
+<pre><code>socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+
+srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
+    printf(<span class="st">"client %d connected\n"</span>, fd);
+});
+srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+    srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+});
+srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
+    printf(<span class="st">"client %d disconnected\n"</span>, fd);
+});
+
+srv.<span class="fn">start</span>();</code></pre>
+</div>
+
+<div class="method-card" id="sdk-wrap-client">
+<div class="method-header">
+  <span class="method-name">socketley::client</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-client">Client</span>
+</div>
+<p class="method-sig">client(std::string_view host, uint16_t port)</p>
+<p class="method-desc">High-level TCP/UDP client with optional auto-reconnect.</p>
+
+<h4>Config (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tls()</code></td><td>Enable TLS</td></tr>
+<tr><td><code>tls_ca(ca)</code></td><td>Enable TLS with custom CA certificate</td></tr>
+<tr><td><code>reconnect(max)</code></td><td>Auto-reconnect: 0 = infinite, &gt;0 = max attempts</td></tr>
+<tr><td><code>mode(m)</code></td><td><code>client_mode_inout</code>, <code>client_mode_in</code>, <code>client_mode_out</code></td></tr>
+<tr><td><code>udp()</code></td><td>Switch to UDP mode</td></tr>
+<tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
+<tr><td><code>tick_interval(ms)</code></td><td>Set periodic tick interval</td></tr>
+</tbody>
+</table>
+
+<h4>Callbacks (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Signature</th></tr></thead>
+<tbody>
+<tr><td><code>on_start(cb)</code></td><td><code>void()</code></td></tr>
+<tr><td><code>on_stop(cb)</code></td><td><code>void()</code></td></tr>
+<tr><td><code>on_connect(cb)</code></td><td><code>void(int fd)</code></td></tr>
+<tr><td><code>on_disconnect(cb)</code></td><td><code>void(int fd)</code></td></tr>
+<tr><td><code>on_message(cb)</code></td><td><code>void(string_view msg)</code></td></tr>
+<tr><td><code>on_tick(cb)</code></td><td><code>void(double dt_ms)</code></td></tr>
+</tbody>
+</table>
+
+<h4>Actions &amp; Lifecycle</h4>
+<p><code>send(msg)</code> &mdash; send to server. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
+
+<pre><code>socketley::client <span class="fn">cli</span>(<span class="st">"127.0.0.1"</span>, <span class="nb">9000</span>);
+cli.<span class="fn">reconnect</span>(<span class="nb">0</span>);  <span class="cm">// infinite reconnect</span>
+cli.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span>) { cli.<span class="fn">send</span>(<span class="st">"hello"</span>); });
+cli.<span class="fn">on_message</span>([](std::string_view msg) {
+    printf(<span class="st">"%.*s\n"</span>, (<span class="kw">int</span>)msg.size(), msg.data());
+});
+cli.<span class="fn">start</span>();</code></pre>
+</div>
+
+<div class="method-card" id="sdk-wrap-proxy">
+<div class="method-header">
+  <span class="method-name">socketley::proxy</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-proxy">Proxy</span>
+</div>
+<p class="method-sig">proxy(uint16_t port)</p>
+<p class="method-desc">High-level HTTP/TCP reverse proxy with round-robin or random load balancing.</p>
+
+<h4>Config (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>backend(addr)</code></td><td>Add a backend target (call multiple times for load balancing)</td></tr>
+<tr><td><code>strategy(s)</code></td><td><code>strategy_round_robin</code>, <code>strategy_random</code>, <code>strategy_lua</code></td></tr>
+<tr><td><code>protocol(p)</code></td><td><code>protocol_http</code> or <code>protocol_tcp</code></td></tr>
+<tr><td><code>tls(cert, key)</code></td><td>Enable TLS on the listen socket</td></tr>
+<tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
+<tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle connections after <em>s</em> seconds</td></tr>
+<tr><td><code>lua(path)</code></td><td>Load a Lua script (enables <code>strategy_lua</code>)</td></tr>
+<tr><td><code>group(g)</code></td><td>Group tag for discovery</td></tr>
+</tbody>
+</table>
+
+<h4>Callbacks &amp; Lifecycle</h4>
+<p><code>on_start(cb)</code> / <code>on_stop(cb)</code>. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
+
+<pre><code>socketley::proxy <span class="fn">px</span>(<span class="nb">8080</span>);
+px.<span class="fn">backend</span>(<span class="st">"127.0.0.1:9001"</span>)
+  .<span class="fn">backend</span>(<span class="st">"127.0.0.1:9002"</span>)
+  .<span class="fn">protocol</span>(protocol_tcp)
+  .<span class="fn">strategy</span>(strategy_round_robin);
+px.<span class="fn">start</span>();</code></pre>
+</div>
+
+<div class="method-card" id="sdk-wrap-cache">
+<div class="method-header">
+  <span class="method-name">socketley::cache</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">cache(uint16_t port)</p>
+<p class="method-desc">High-level Redis-compatible in-memory cache with optional persistence and replication.</p>
+
+<h4>Config (chainable)</h4>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>persistent(path)</code></td><td>Auto-save/load cache data to disk</td></tr>
+<tr><td><code>max_memory(bytes)</code></td><td>Set memory limit for cache store</td></tr>
+<tr><td><code>eviction(policy)</code></td><td><code>evict_none</code>, <code>evict_allkeys_lru</code>, <code>evict_allkeys_random</code></td></tr>
+<tr><td><code>resp()</code></td><td>Force RESP protocol mode (Redis-compatible binary protocol)</td></tr>
+<tr><td><code>mode(m)</code></td><td><code>cache_mode_readonly</code>, <code>cache_mode_readwrite</code>, <code>cache_mode_admin</code></td></tr>
+<tr><td><code>tls(cert, key)</code></td><td>Enable TLS on the listen socket</td></tr>
+<tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
+<tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle connections after <em>s</em> seconds</td></tr>
+<tr><td><code>replicate(target)</code></td><td>Set replication target (<code>"host:port"</code>)</td></tr>
+<tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
+<tr><td><code>group(g)</code></td><td>Group tag for discovery</td></tr>
+</tbody>
+</table>
+
+<h4>Callbacks &amp; Lifecycle</h4>
+<p><code>on_start(cb)</code> / <code>on_stop(cb)</code>. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
+
+<pre><code>socketley::cache <span class="fn">c</span>(<span class="nb">6379</span>);
+c.<span class="fn">persistent</span>(<span class="st">"/var/data/store.dat"</span>)
+ .<span class="fn">resp</span>()
+ .<span class="fn">max_memory</span>(<span class="nb">256</span> * <span class="nb">1024</span> * <span class="nb">1024</span>)
+ .<span class="fn">eviction</span>(evict_allkeys_lru);
+c.<span class="fn">start</span>();</code></pre>
+</div>
+
+<h4>Raw Engine API</h4>
+<p>For multi-runtime in a single process or custom event loop control, use the raw types (<code>event_loop</code>, <code>runtime_manager</code>, <code>server_instance</code>, etc.) documented below. The wrapper classes use this API internally &mdash; access it via the <code>instance()</code>, <code>manager()</code>, and <code>loop()</code> escape hatches.</p>
 
 <h3 id="sdk-t2-eventloop">event_loop</h3>
 <p>The io_uring event loop drives all I/O. One per process, shared by all runtimes.</p>
@@ -2727,16 +2931,15 @@ std::string info = cache-&gt;<span class="fn">execute</span>(<span class="st">"D
 <pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
 <span class="kw">#include</span> <span class="st">&lt;socketley/attach.h&gt;</span>
 
-<span class="cm">// ... event_loop + runtime_manager setup ...</span>
-
-mgr.<span class="fn">start</span>(<span class="st">"my_server"</span>, loop);
+socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+    srv.<span class="fn">send</span>(fd, msg);
+});
 
 <span class="cm">// Register with daemon (Tier 3)</span>
-socketley::<span class="fn">daemon_attach</span>(<span class="st">"my_server"</span>, <span class="st">"server"</span>, <span class="nb">9000</span>);
+socketley::<span class="fn">daemon_attach</span>(<span class="st">"app_srv"</span>, <span class="st">"server"</span>, <span class="nb">9000</span>);
 
-<span class="cm">// Now: socketley ls shows my_server</span>
-<span class="cm">// Now: socketley stats my_server works</span>
-loop.<span class="fn">run</span>();
+srv.<span class="fn">start</span>();  <span class="cm">// daemon sees the runtime</span>
 <span class="cm">// daemon_detach() called automatically via atexit()</span></code></pre>
 
 <div class="info-box"><strong>Multiple runtimes:</strong> <code>daemon_attach()</code> can only auto-detach one name via <code>atexit()</code>. For additional runtimes, use <code>socketley::ctl::command("attach ...")</code> and manually detach on shutdown.</div>
@@ -2754,6 +2957,7 @@ g_loop = &amp;loop;
 signal(SIGINT,  [](<span class="kw">int</span>) { <span class="kw">if</span> (g_loop) g_loop-&gt;<span class="fn">request_stop</span>(); });
 signal(SIGTERM, [](<span class="kw">int</span>) { <span class="kw">if</span> (g_loop) g_loop-&gt;<span class="fn">request_stop</span>(); });</code></pre>
 <div class="warn-box"><strong>SIGPIPE is critical.</strong> Without <code>signal(SIGPIPE, SIG_IGN)</code>, a disconnected client can kill your entire process when io_uring delivers a write to a closed socket.</div>
+<div class="info-box"><strong>Wrapper classes handle all of this automatically.</strong> <code>socketley::server</code>, <code>socketley::client</code>, <code>socketley::proxy</code>, and <code>socketley::cache</code> install SIGPIPE, SIGINT, and SIGTERM handlers internally. Manual signal setup is only needed with the raw API.</div>
 
 <h3 id="sdk-pat-lua">Lua Integration</h3>
 <p>Tier 2 runtimes can load Lua scripts just like daemon-managed runtimes. The Lua callbacks and C++ callbacks work together &mdash; C++ callbacks fire first, then Lua callbacks (if both are set).</p>
@@ -5774,9 +5978,95 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
 <h2 id="exsdk-tier2">Tier 2: Embedded Engine</h2>
 <p>These examples embed the full io_uring engine in a standalone binary. No daemon needed.</p>
 
+<div class="method-card" id="exsdk-wrapper-echo">
+<div class="method-header">
+  <span class="method-name">Echo Server (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">The simplest way to embed a server. The wrapper handles event loop setup, signal handling, and cleanup. Compare with the raw API version below.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
+<span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+
+    srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"client %d connected\n"</span>, fd);
+    });
+
+    srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
+        printf(<span class="st">"client %d: %.*s\n"</span>, fd, (<span class="kw">int</span>)msg.size(), msg.data());
+        srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
+    });
+
+    srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
+        printf(<span class="st">"client %d disconnected\n"</span>, fd);
+    });
+
+    srv.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 echo_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o echo_server</code></pre>
+<p><strong>Test:</strong></p>
+<pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-proxy">
+<div class="method-header">
+  <span class="method-name">TCP Proxy (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-proxy">Proxy</span>
+</div>
+<p class="method-desc">A round-robin TCP proxy in 5 lines. No event loop or signal handling code needed.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/proxy.h&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::proxy <span class="fn">px</span>(<span class="nb">8080</span>);
+    px.<span class="fn">backend</span>(<span class="st">"127.0.0.1:9001"</span>)
+      .<span class="fn">backend</span>(<span class="st">"127.0.0.1:9002"</span>)
+      .<span class="fn">protocol</span>(protocol_tcp)
+      .<span class="fn">strategy</span>(strategy_round_robin);
+    px.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 proxy.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o proxy</code></pre>
+</div>
+
+<div class="method-card" id="exsdk-wrapper-cache">
+<div class="method-header">
+  <span class="method-name">Redis-Compatible Cache (Wrapper)</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-desc">A persistent, Redis-compatible cache with LRU eviction. Supports both text protocol and RESP.</p>
+
+<pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/cache.h&gt;</span>
+
+<span class="kw">int</span> <span class="fn">main</span>()
+{
+    socketley::cache <span class="fn">c</span>(<span class="nb">6379</span>);
+    c.<span class="fn">persistent</span>(<span class="st">"/var/data/store.dat"</span>)
+     .<span class="fn">resp</span>()
+     .<span class="fn">max_memory</span>(<span class="nb">256</span> * <span class="nb">1024</span> * <span class="nb">1024</span>)
+     .<span class="fn">eviction</span>(evict_allkeys_lru);
+    c.<span class="fn">start</span>();
+}</code></pre>
+
+<p><strong>Compile:</strong></p>
+<pre><code>g++ -std=c++23 cache.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o cache</code></pre>
+<p><strong>Test:</strong> Use <code>redis-benchmark</code> or <code>redis-cli</code> against port 6379.</p>
+</div>
+
 <div class="method-card" id="exsdk-echo">
 <div class="method-header">
-  <span class="method-name">Echo Server</span>
+  <span class="method-name">Echo Server (Raw API)</span>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-server">Server</span>
 </div>
@@ -5839,7 +6129,7 @@ echo <span class="st">"world"</span> | socat - UDP:localhost:9000</code></pre>
 
 <div class="method-card" id="exsdk-multi">
 <div class="method-header">
-  <span class="method-name">Multi-Runtime</span>
+  <span class="method-name">Multi-Runtime (Raw API)</span>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-server">Server</span>
   <span class="badge badge-cache">Cache</span>
@@ -5958,7 +6248,7 @@ echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span 
 
 <div class="method-card" id="exsdk-proxy-lb">
 <div class="method-header">
-  <span class="method-name">Proxy Load Balancer</span>
+  <span class="method-name">Proxy Load Balancer (Raw API)</span>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-proxy">Proxy</span>
   <span class="badge badge-server">Server</span>
