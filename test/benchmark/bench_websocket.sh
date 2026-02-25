@@ -25,6 +25,7 @@ test_ws_handshake() {
 
     log_section "Test: WebSocket Handshake Throughput ($num_ops handshakes)"
 
+    wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -34,6 +35,7 @@ test_ws_handshake() {
     "$SOCKETLEY_BENCH" ws handshake 127.0.0.1 $WS_PORT $num_ops
 
     socketley_cmd stop bench_ws
+    sleep 0.5
     socketley_cmd remove bench_ws
 }
 
@@ -45,6 +47,7 @@ test_ws_echo() {
 
     log_section "Test: WebSocket Echo RTT ($num_ops msgs, ${msg_size}B)"
 
+    wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -54,6 +57,7 @@ test_ws_echo() {
     "$SOCKETLEY_BENCH" ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size
 
     socketley_cmd stop bench_ws
+    sleep 0.5
     socketley_cmd remove bench_ws
 }
 
@@ -65,6 +69,7 @@ test_ws_concurrent() {
 
     log_section "Test: Concurrent WebSocket ($num_clients clients, $ops_per_client ops each)"
 
+    wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -74,6 +79,7 @@ test_ws_concurrent() {
     "$SOCKETLEY_BENCH" ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client
 
     socketley_cmd stop bench_ws
+    sleep 0.5
     socketley_cmd remove bench_ws
 }
 
@@ -84,6 +90,7 @@ test_ws_tcp_coexistence() {
 
     log_section "Test: WS + TCP Coexistence ($num_ops mixed connections)"
 
+    wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -130,6 +137,7 @@ test_ws_tcp_coexistence() {
         "ops_per_sec" "$ops_sec"
 
     socketley_cmd stop bench_ws
+    sleep 0.5
     socketley_cmd remove bench_ws
 }
 

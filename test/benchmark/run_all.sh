@@ -336,6 +336,13 @@ case "${1:-}" in
         start_daemon || exit 1
         bash "$(dirname "$0")/bench_k6_ws.sh"
         ;;
+    --cache-resp-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        setup_cleanup_trap
+        start_daemon || exit 1
+        bash "$(dirname "$0")/bench_cache_resp.sh" "${2:-3}"
+        ;;
     --help|-h)
         echo "Usage: $0 [options]"
         echo ""
@@ -347,6 +354,7 @@ case "${1:-}" in
         echo "  --k6-only        Run only k6 benchmarks (HTTP + WebSocket)"
         echo "  --k6-http-only   Run only k6 HTTP benchmarks"
         echo "  --k6-ws-only     Run only k6 WebSocket benchmarks"
+        echo "  --cache-resp-only Run cache vs Redis (RESP2, redis-benchmark)"
         echo "  --help           Show this help"
         echo ""
         echo "Without options, runs the complete benchmark suite."

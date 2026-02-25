@@ -25,6 +25,7 @@ test_connection_rate() {
 
     log_section "Test: Connection Establishment Rate ($num_connections connections)"
 
+    wait_for_port_free $SERVER_PORT
     socketley_cmd create server bench_srv -p $SERVER_PORT -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
@@ -33,6 +34,7 @@ test_connection_rate() {
     "$SOCKETLEY_BENCH" server conn 127.0.0.1 $SERVER_PORT $num_connections
 
     socketley_cmd stop bench_srv
+    sleep 0.5
     socketley_cmd remove bench_srv
 }
 
@@ -43,6 +45,7 @@ test_burst_connections() {
 
     log_section "Test: Burst Connections ($count simultaneous)"
 
+    wait_for_port_free $SERVER_PORT
     socketley_cmd create server bench_srv -p $SERVER_PORT -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
@@ -51,6 +54,7 @@ test_burst_connections() {
     "$SOCKETLEY_BENCH" server burst 127.0.0.1 $SERVER_PORT $count
 
     socketley_cmd stop bench_srv
+    sleep 0.5
     socketley_cmd remove bench_srv
 }
 
@@ -62,6 +66,7 @@ test_single_client_throughput() {
 
     log_section "Test: Single Client Throughput ($num_messages msgs, ${message_size}B)"
 
+    wait_for_port_free $SERVER_PORT
     socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
@@ -70,6 +75,7 @@ test_single_client_throughput() {
     "$SOCKETLEY_BENCH" server msg 127.0.0.1 $SERVER_PORT $num_messages $message_size
 
     socketley_cmd stop bench_srv
+    sleep 0.5
     socketley_cmd remove bench_srv
 }
 
@@ -81,6 +87,7 @@ test_concurrent_clients() {
 
     log_section "Test: Concurrent Clients ($num_clients clients × $msgs_per_client msgs)"
 
+    wait_for_port_free $SERVER_PORT
     socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
@@ -89,6 +96,7 @@ test_concurrent_clients() {
     "$SOCKETLEY_BENCH" server concurrent 127.0.0.1 $SERVER_PORT $num_clients $msgs_per_client
 
     socketley_cmd stop bench_srv
+    sleep 0.5
     socketley_cmd remove bench_srv
 }
 
