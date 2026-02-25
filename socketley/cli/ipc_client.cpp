@@ -3,6 +3,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <cstring>
 
@@ -22,13 +23,20 @@ int ipc_send(std::string_view command, std::string& data)
         return -1;
     }
 
+    struct timeval tv{5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     std::string msg(command);
     msg += '\n';
 
-    if (write(fd, msg.data(), msg.size()) < 0)
     {
-        close(fd);
-        return -1;
+        size_t total = 0;
+        while (total < msg.size())
+        {
+            ssize_t w = write(fd, msg.data() + total, msg.size() - total);
+            if (w < 0) { close(fd); return -1; }
+            total += static_cast<size_t>(w);
+        }
     }
 
     // Read response: first byte = exit code, then data until NUL terminator

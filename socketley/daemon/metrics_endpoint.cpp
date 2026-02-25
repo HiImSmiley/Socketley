@@ -50,18 +50,20 @@ bool metrics_endpoint::start(uint16_t port)
     }
 
     m_running.store(true, std::memory_order_release);
-    std::thread(&metrics_endpoint::serve_loop, this).detach();
+    m_thread = std::thread(&metrics_endpoint::serve_loop, this);
     return true;
 }
 
 void metrics_endpoint::stop()
 {
-    m_running.store(false, std::memory_order_release);
+    bool was = m_running.exchange(false, std::memory_order_acq_rel);
     if (m_listen_fd >= 0)
     {
         close(m_listen_fd);
         m_listen_fd = -1;
     }
+    if (was && m_thread.joinable())
+        m_thread.join();
 }
 
 void metrics_endpoint::serve_loop()

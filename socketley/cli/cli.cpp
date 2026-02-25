@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/wait.h>
 
 #include "command_hashing.h"
 #include "ipc_client.h"
@@ -169,7 +170,15 @@ int cli_dispatch(int argc, char** argv)
                 std::cerr << "help script not found\n";
                 return 1;
             }
-            return system(("bash " + help_script).c_str());
+            {
+                pid_t pid = fork();
+                if (pid < 0) return -1;
+                if (pid == 0) { execlp("bash", "bash", help_script.c_str(), nullptr); _exit(127); }
+
+                int status = 0;
+                if (waitpid(pid, &status, 0) < 0) return -1;
+                return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            }
         }
 
         default:
@@ -376,8 +385,13 @@ static int open_editor(const std::string& path)
     if (!editor || !editor[0])
         editor = "vim";
 
-    std::string cmd = std::string(editor) + " " + path;
-    return system(cmd.c_str());
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) { execlp(editor, editor, path.c_str(), nullptr); _exit(127); }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 int cli_edit(int argc, char** argv)

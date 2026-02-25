@@ -96,7 +96,10 @@ TEST_CASE("ws_parse_frame: close frame")
     bool ok = ws_parse_frame(frame.data(), frame.size(), out);
     CHECK(ok);
     CHECK(out.opcode == WS_OP_CLOSE);
-    CHECK(out.payload.empty());
+    CHECK(out.payload.size() == 2);
+    // Status code 1000 (normal closure) in network byte order
+    CHECK(static_cast<uint8_t>(out.payload[0]) == 0x03);
+    CHECK(static_cast<uint8_t>(out.payload[1]) == 0xE8);
 }
 
 TEST_CASE("ws_parse_frame: oversized payload rejected")

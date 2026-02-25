@@ -65,6 +65,12 @@ bool proxy_instance::resolve_backend(backend_info& b)
         auto port_str = b.address.data() + colon + 1;
         auto port_end = b.address.data() + b.address.size();
         std::from_chars(port_str, port_end, b.resolved_port);
+        if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
+        {
+            b.cached_addr.sin_family = AF_INET;
+            b.cached_addr.sin_port = htons(b.resolved_port);
+            b.has_cached_addr = true;
+        }
         return true;
     }
 
@@ -81,6 +87,10 @@ bool proxy_instance::resolve_backend(backend_info& b)
 
     b.resolved_host = "127.0.0.1";
     b.resolved_port = port;
+    b.cached_addr.sin_family = AF_INET;
+    b.cached_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    b.cached_addr.sin_port = htons(port);
+    b.has_cached_addr = true;
     return true;
 }
 
@@ -88,6 +98,7 @@ bool proxy_instance::setup(event_loop& loop)
 {
     // Clear any connections left from a previous stop() — safe to free now that
     // all in-flight CQEs have been processed (we're starting a fresh run).
+    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
     m_clients.clear();
     m_backend_conns.clear();
 
@@ -183,6 +194,8 @@ void proxy_instance::teardown(event_loop& loop)
         conn->write_req.owner = nullptr;
     }
 
+    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
+
     // Shutdown the listen socket before closing — same reasoning as server_instance:
     // shutdown() forces the pending io_uring accept op to complete synchronously,
     // placing its CQE in the ring before the deferred-delete timeout SQE is submitted.
@@ -201,7 +214,7 @@ void proxy_instance::teardown(event_loop& loop)
             while (!conn->write_queue.empty())
             {
                 auto& msg = conn->write_queue.front();
-                if (::write(fd, msg->data(), msg->size()) < 0) break;
+                if (::write(fd, msg.data(), msg.size()) < 0) break;
                 conn->write_queue.pop();
             }
         }
@@ -242,18 +255,22 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_read:
         case op_read_provided:
         {
-            if (m_clients.count(req->fd))
+            if (req->fd < 0 || req->fd >= MAX_FDS) break;
+            auto& re = m_conn_idx[req->fd];
+            if (re.side == conn_client)
                 handle_client_read(cqe, req);
-            else if (m_backend_conns.count(req->fd))
+            else if (re.side == conn_backend)
                 handle_backend_read(cqe, req);
             break;
         }
         case op_write:
         case op_writev:
         {
-            if (m_clients.count(req->fd))
+            if (req->fd < 0 || req->fd >= MAX_FDS) break;
+            auto& we = m_conn_idx[req->fd];
+            if (we.side == conn_client)
                 handle_client_write(cqe, req);
-            else if (m_backend_conns.count(req->fd))
+            else if (we.side == conn_backend)
                 handle_backend_write(cqe, req);
             break;
         }
@@ -295,7 +312,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (client_fd >= 0)
     {
-        if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
+        if (client_fd >= MAX_FDS || (get_max_connections() > 0 && m_clients.size() >= get_max_connections()))
         {
             close(client_fd);
             goto proxy_resubmit_accept;
@@ -314,6 +331,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
+        m_conn_idx[client_fd].side = conn_client;
+        m_conn_idx[client_fd].client = ptr;
 
         ptr->last_activity = std::chrono::steady_clock::now();
 
@@ -358,11 +377,11 @@ proxy_resubmit_accept:
 void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_clients.find(fd);
-    if (it == m_clients.end())
+    auto& entry = m_conn_idx[fd];
+    if (entry.side != conn_client)
         return;
 
-    auto* conn = it->second.get();
+    auto* conn = entry.client;
     conn->read_pending = false;
 
     bool is_provided = (req->type == op_read_provided);
@@ -413,8 +432,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // TCP mode: connect on first read, then forward raw bytes
         if (conn->backend_fd < 0)
         {
-            auto target = select_and_resolve_backend(conn);
-            if (!connect_to_backend(conn, target))
+            auto* target = select_and_resolve_backend(conn);
+            if (!target || !connect_to_backend(conn, target))
             {
                 if (is_provided)
                     m_loop->return_buf(BUF_GROUP_ID, buf_id);
@@ -479,15 +498,15 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         }
 
         // Strip prefix
-        std::string new_path;
+        std::string_view new_path;
         if (conn->path == bare)
             new_path = "/";
         else
-            new_path = conn->path.substr(m_prefix.size() - 1); // Keep leading /
+            new_path = std::string_view(conn->path).substr(m_prefix.size() - 1); // Keep leading /
 
         // Select and connect to backend
-        auto target = select_and_resolve_backend(conn);
-        if (!connect_to_backend(conn, target))
+        auto* target = select_and_resolve_backend(conn);
+        if (!target || !connect_to_backend(conn, target))
         {
             send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
             return;
@@ -522,11 +541,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_backend_conns.find(fd);
-    if (it == m_backend_conns.end())
+    auto& entry = m_conn_idx[fd];
+    if (entry.side != conn_backend)
         return;
 
-    auto* conn = it->second.get();
+    auto* conn = entry.backend;
     conn->read_pending = false;
 
     bool is_provided = (req->type == op_read_provided);
@@ -590,20 +609,20 @@ bool proxy_instance::parse_http_request_line(proxy_client_connection* conn)
     if (pos == std::string::npos)
         return false;
 
-    std::string line = conn->partial.substr(0, pos);
+    std::string_view line(conn->partial.data(), pos);
 
     // Parse: METHOD SP PATH SP VERSION
     auto sp1 = line.find(' ');
-    if (sp1 == std::string::npos)
+    if (sp1 == std::string_view::npos)
         return false;
 
     auto sp2 = line.find(' ', sp1 + 1);
-    if (sp2 == std::string::npos)
+    if (sp2 == std::string_view::npos)
         return false;
 
-    conn->method = line.substr(0, sp1);
-    conn->path = line.substr(sp1 + 1, sp2 - sp1 - 1);
-    conn->version = line.substr(sp2 + 1);
+    conn->method.assign(line.data(), sp1);
+    conn->path.assign(line.data() + sp1 + 1, sp2 - sp1 - 1);
+    conn->version.assign(line.data() + sp2 + 1, line.size() - sp2 - 1);
 
     return true;
 }
@@ -621,14 +640,63 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     result += new_path;
     result += ' ';
     result += conn->version;
-    result += conn->partial.substr(pos); // includes \r\n and rest of headers+body
+    result.append(conn->partial, pos); // includes \r\n and rest of headers+body
     conn->partial.clear();
     return result;
 }
 
-resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
+const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
 {
-    // Build expanded pool of all available backends
+    if (m_backends.empty())
+        return nullptr;
+
+    // Fast path: check if any backend is a group
+    bool has_group = false;
+    for (const auto& b : m_backends)
+    {
+        if (b.is_group) { has_group = true; break; }
+    }
+
+    if (!has_group)
+    {
+        // Zero-alloc fast path: select directly from m_backends
+        if (m_backends.size() == 1)
+            return &m_backends[0];
+
+        size_t pool_size = m_backends.size();
+
+        if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
+        {
+#ifndef SOCKETLEY_NO_LUA
+            sol::object result;
+            if (m_protocol == protocol_http)
+                result = lua()->on_route()(conn->method, conn->path);
+            else
+                result = lua()->on_route()();
+
+            if (result.is<int>())
+            {
+                int idx = result.as<int>();
+                if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
+                    return &m_backends[static_cast<size_t>(idx)];
+            }
+#endif
+            // Fallback to round-robin
+        }
+
+        if (m_strategy == strategy_random)
+        {
+            std::uniform_int_distribution<size_t> dist(0, pool_size - 1);
+            return &m_backends[dist(m_rng)];
+        }
+
+        // round-robin (default, also fallback for lua)
+        size_t idx = m_rr_index % pool_size;
+        ++m_rr_index;
+        return &m_backends[idx];
+    }
+
+    // Slow path: has group backends — build pool and resolve dynamically
     std::vector<resolved_backend> pool;
     pool.reserve(m_backends.size());
 
@@ -641,7 +709,6 @@ resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connect
             {
                 std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
 
-                // Local group members
                 auto members = mgr->get_by_group(group_name);
                 for (auto* inst : members)
                 {
@@ -650,7 +717,6 @@ resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connect
                         pool.push_back({"127.0.0.1", port});
                 }
 
-                // Remote group members (from cluster discovery)
                 auto* cd = mgr->get_cluster_discovery();
                 if (cd)
                 {
@@ -667,78 +733,117 @@ resolved_backend proxy_instance::select_and_resolve_backend(proxy_client_connect
     }
 
     if (pool.empty())
-        return {};
+        return nullptr;
 
-    if (pool.size() == 1)
-        return pool[0];
+    resolved_backend* selected = &pool[0];
 
-    if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
+    if (pool.size() > 1)
     {
-#ifndef SOCKETLEY_NO_LUA
-        sol::object result;
-        if (m_protocol == protocol_http)
-            result = lua()->on_route()(conn->method, conn->path);
-        else
-            result = lua()->on_route()();
-
-        if (result.is<int>())
+        if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
         {
-            int idx = result.as<int>();
-            if (idx >= 0 && static_cast<size_t>(idx) < pool.size())
-                return pool[static_cast<size_t>(idx)];
-        }
+#ifndef SOCKETLEY_NO_LUA
+            sol::object result;
+            if (m_protocol == protocol_http)
+                result = lua()->on_route()(conn->method, conn->path);
+            else
+                result = lua()->on_route()();
+
+            if (result.is<int>())
+            {
+                int idx = result.as<int>();
+                if (idx >= 0 && static_cast<size_t>(idx) < pool.size())
+                    selected = &pool[static_cast<size_t>(idx)];
+            }
 #endif
-        // Fallback to round-robin
+        }
+        else if (m_strategy == strategy_random)
+        {
+            std::uniform_int_distribution<size_t> dist(0, pool.size() - 1);
+            selected = &pool[dist(m_rng)];
+        }
+        else
+        {
+            size_t idx = m_rr_index % pool.size();
+            ++m_rr_index;
+            selected = &pool[idx];
+        }
     }
 
-    if (m_strategy == strategy_random)
+    // Write selected result into scratch space
+    m_scratch_backend.resolved_host = std::move(selected->host);
+    m_scratch_backend.resolved_port = selected->port;
+    m_scratch_backend.has_cached_addr = false;
+    if (inet_pton(AF_INET, m_scratch_backend.resolved_host.c_str(),
+                  &m_scratch_backend.cached_addr.sin_addr) == 1)
     {
-        std::uniform_int_distribution<size_t> dist(0, pool.size() - 1);
-        return pool[dist(m_rng)];
+        m_scratch_backend.cached_addr.sin_family = AF_INET;
+        m_scratch_backend.cached_addr.sin_port = htons(m_scratch_backend.resolved_port);
+        m_scratch_backend.has_cached_addr = true;
     }
-
-    // round-robin (default, also fallback for lua)
-    size_t idx = m_rr_index % pool.size();
-    ++m_rr_index;
-    return pool[idx];
+    return &m_scratch_backend;
 }
 
-bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const resolved_backend& target)
+bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const backend_info* target)
 {
-    if (target.port == 0)
+    if (!target || target->resolved_port == 0)
         return false;
 
-    // Use getaddrinfo for hostname resolution (supports Docker DNS, IPv4/IPv6)
-    char port_str[8];
-    auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), target.port);
-    *pend = '\0';
+    int bfd;
 
-    struct addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo* result = nullptr;
-    if (getaddrinfo(target.host.c_str(), port_str, &hints, &result) != 0 || !result)
-        return false;
-
-    int bfd = socket(result->ai_family, SOCK_STREAM, 0);
-    if (bfd < 0)
+    if (target->has_cached_addr)
     {
+        // Fast path: use pre-cached sockaddr_in directly — no getaddrinfo
+        bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (bfd < 0)
+            return false;
+
+        if (::connect(bfd, reinterpret_cast<const struct sockaddr*>(&target->cached_addr),
+                       sizeof(target->cached_addr)) < 0 && errno != EINPROGRESS)
+        {
+            close(bfd);
+            return false;
+        }
+    }
+    else
+    {
+        // Slow path: getaddrinfo for hostname resolution (Docker DNS, etc.)
+        char port_str[8];
+        auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), target->resolved_port);
+        *pend = '\0';
+
+        struct addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        struct addrinfo* result = nullptr;
+        if (getaddrinfo(target->resolved_host.c_str(), port_str, &hints, &result) != 0 || !result)
+            return false;
+
+        bfd = socket(result->ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (bfd < 0)
+        {
+            freeaddrinfo(result);
+            return false;
+        }
+
+        if (::connect(bfd, result->ai_addr, result->ai_addrlen) < 0 && errno != EINPROGRESS)
+        {
+            close(bfd);
+            freeaddrinfo(result);
+            return false;
+        }
+
         freeaddrinfo(result);
+    }
+
+    if (bfd >= MAX_FDS)
+    {
+        close(bfd);
         return false;
     }
 
     int opt = 1;
     setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    if (::connect(bfd, result->ai_addr, result->ai_addrlen) < 0)
-    {
-        close(bfd);
-        freeaddrinfo(result);
-        return false;
-    }
-
-    freeaddrinfo(result);
 
     conn->backend_fd = bfd;
 
@@ -750,6 +855,8 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const res
 
     auto* ptr = bconn.get();
     m_backend_conns[bfd] = std::move(bconn);
+    m_conn_idx[bfd].side = conn_backend;
+    m_conn_idx[bfd].backend = ptr;
 
     ptr->read_pending = true;
     if (m_use_provided_bufs)
@@ -776,10 +883,14 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             {
                 // Clear the stale reference on the client side so a later
                 // close_pair call does not re-close this (now-freed) fd.
-                auto cit = m_clients.find(bconn->client_fd);
-                if (cit != m_clients.end())
-                    cit->second->backend_fd = -1;
+                if (bconn->client_fd >= 0 && bconn->client_fd < MAX_FDS)
+                {
+                    auto& ce = m_conn_idx[bconn->client_fd];
+                    if (ce.side == conn_client)
+                        ce.client->backend_fd = -1;
+                }
                 close(backend_fd);
+                m_conn_idx[backend_fd] = {};
                 m_backend_conns.erase(bit);
             }
         }
@@ -810,6 +921,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                     else
                     {
                         close(conn->backend_fd);
+                        m_conn_idx[conn->backend_fd] = {};
                         m_backend_conns.erase(bit2);
                     }
                 }
@@ -825,6 +937,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             {
                 invoke_on_disconnect(client_fd);
                 close(client_fd);
+                m_conn_idx[client_fd] = {};
                 m_clients.erase(it);
             }
         }
@@ -852,11 +965,11 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     if (conn->backend_fd < 0 || !m_loop)
         return;
 
-    auto it = m_backend_conns.find(conn->backend_fd);
-    if (it == m_backend_conns.end())
+    auto& be = m_conn_idx[conn->backend_fd];
+    if (be.side != conn_backend)
         return;
 
-    auto* bconn = it->second.get();
+    auto* bconn = be.backend;
     if (bconn->closing)
         return;
 
@@ -873,7 +986,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_request())
     {
         try {
-            sol::object r = lctx->on_proxy_request()(conn->fd, std::string(data));
+            sol::object r = lctx->on_proxy_request()(conn->fd, data);
             if (r.get_type() == sol::type::nil) return;   // drop
             if (r.is<std::string>()) {
                 hook_storage = r.as<std::string>();
@@ -885,15 +998,13 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     }
 #endif
 
-    auto msg = std::make_shared<const std::string>(effective);
-
     if (bconn->write_queue.size() >= proxy_backend_connection::MAX_WRITE_QUEUE)
     {
         bconn->closing = true;
         return;
     }
 
-    bconn->write_queue.push(msg);
+    bconn->write_queue.emplace(effective);
 
     if (!bconn->write_pending)
         flush_backend_write_queue(bconn);
@@ -904,11 +1015,11 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (!m_loop)
         return;
 
-    auto it = m_clients.find(conn->client_fd);
-    if (it == m_clients.end())
+    auto& ce = m_conn_idx[conn->client_fd];
+    if (ce.side != conn_client)
         return;
 
-    auto* cconn = it->second.get();
+    auto* cconn = ce.client;
     if (cconn->closing)
         return;
 
@@ -925,7 +1036,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
     {
         try {
-            sol::object r = lctx->on_proxy_response()(conn->client_fd, std::string(data));
+            sol::object r = lctx->on_proxy_response()(conn->client_fd, data);
             if (r.get_type() == sol::type::nil) return;   // drop
             if (r.is<std::string>()) {
                 hook_storage = r.as<std::string>();
@@ -937,15 +1048,13 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     }
 #endif
 
-    auto msg = std::make_shared<const std::string>(effective);
-
     if (cconn->write_queue.size() >= proxy_client_connection::MAX_WRITE_QUEUE)
     {
         cconn->closing = true;
         return;
     }
 
-    cconn->write_queue.push(msg);
+    cconn->write_queue.emplace(effective);
 
     if (!cconn->write_pending)
         flush_client_write_queue(cconn);
@@ -967,8 +1076,7 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     response += "\r\nConnection: close\r\n\r\n";
     response += body;
 
-    auto msg = std::make_shared<const std::string>(std::move(response));
-    conn->write_queue.push(msg);
+    conn->write_queue.push(std::move(response));
     conn->closing = true;
 
     if (!conn->write_pending)
@@ -986,8 +1094,8 @@ void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
         conn->write_batch[count] = std::move(conn->write_queue.front());
         conn->write_queue.pop();
 
-        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
-        conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
+        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+        conn->write_iovs[count].iov_len = conn->write_batch[count].size();
         count++;
     }
 
@@ -997,8 +1105,8 @@ void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     if (count == 1)
     {
         conn->write_req.type = op_write;
-        m_loop->submit_write(conn->fd, conn->write_batch[0]->data(),
-            static_cast<uint32_t>(conn->write_batch[0]->size()), &conn->write_req);
+        m_loop->submit_write(conn->fd, conn->write_batch[0].data(),
+            static_cast<uint32_t>(conn->write_batch[0].size()), &conn->write_req);
     }
     else
     {
@@ -1018,8 +1126,8 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
         conn->write_batch[count] = std::move(conn->write_queue.front());
         conn->write_queue.pop();
 
-        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
-        conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
+        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+        conn->write_iovs[count].iov_len = conn->write_batch[count].size();
         count++;
     }
 
@@ -1029,8 +1137,8 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     if (count == 1)
     {
         conn->write_req.type = op_write;
-        m_loop->submit_write(conn->fd, conn->write_batch[0]->data(),
-            static_cast<uint32_t>(conn->write_batch[0]->size()), &conn->write_req);
+        m_loop->submit_write(conn->fd, conn->write_batch[0].data(),
+            static_cast<uint32_t>(conn->write_batch[0].size()), &conn->write_req);
     }
     else
     {
@@ -1042,16 +1150,16 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
 void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_clients.find(fd);
-    if (it == m_clients.end())
+    auto& entry = m_conn_idx[fd];
+    if (entry.side != conn_client)
         return;
 
-    auto* conn = it->second.get();
+    auto* conn = entry.client;
     conn->write_pending = false;
 
     // Release batch references
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].reset();
+        conn->write_batch[i].clear();
     conn->write_batch_count = 0;
 
     if (cqe->res <= 0)
@@ -1073,16 +1181,16 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
 void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    auto it = m_backend_conns.find(fd);
-    if (it == m_backend_conns.end())
+    auto& entry = m_conn_idx[fd];
+    if (entry.side != conn_backend)
         return;
 
-    auto* conn = it->second.get();
+    auto* conn = entry.backend;
     conn->write_pending = false;
 
     // Release batch references
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].reset();
+        conn->write_batch[i].clear();
     conn->write_batch_count = 0;
 
     if (cqe->res <= 0)

@@ -63,11 +63,14 @@ bool client_instance::try_connect()
         {
             host = std::string(target.substr(0, colon));
             auto port_sv = target.substr(colon + 1);
-            std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port);
+            uint32_t parsed_port = 0;
+            auto [ptr, ec] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), parsed_port);
+            if (ec == std::errc{} && parsed_port > 0 && parsed_port <= 65535)
+                port = static_cast<uint16_t>(parsed_port);
         }
     }
 
-    m_conn.fd = socket(AF_INET, m_udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    m_conn.fd = socket(AF_INET, m_udp ? (SOCK_DGRAM | SOCK_NONBLOCK) : (SOCK_STREAM | SOCK_NONBLOCK), 0);
     if (m_conn.fd < 0)
         return false;
 
@@ -88,7 +91,7 @@ bool client_instance::try_connect()
         return false;
     }
 
-    if (connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    if (connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0 && errno != EINPROGRESS)
     {
         close(m_conn.fd);
         m_conn.fd = -1;
@@ -418,13 +421,17 @@ void client_instance::lua_send(std::string_view msg)
         return;
     }
 
-    std::string full_msg;
-    full_msg.reserve(msg.size() + 1);
-    full_msg = msg;
-    if (full_msg.empty() || full_msg.back() != '\n')
-        full_msg += '\n';
+    // Build directly in write_buf to avoid intermediate string + copy
+    if (m_conn.write_pending || m_conn.closing)
+        return;
 
-    send_to_server(full_msg);
+    m_conn.write_buf.assign(msg.data(), msg.size());
+    if (m_conn.write_buf.empty() || m_conn.write_buf.back() != '\n')
+        m_conn.write_buf.push_back('\n');
+
+    m_conn.write_pending = true;
+    m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
+        static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
 }
 
 void client_instance::send_to_server(std::string_view msg)
@@ -432,7 +439,7 @@ void client_instance::send_to_server(std::string_view msg)
     if (!m_loop || !m_connected || m_mode == client_mode_in || m_conn.write_pending || m_conn.closing)
         return;
 
-    m_conn.write_buf = std::string(msg);
+    m_conn.write_buf.assign(msg.data(), msg.size());
     m_conn.write_req.buffer = m_conn.write_buf.data();
     m_conn.write_req.length = static_cast<uint32_t>(m_conn.write_buf.size());
 

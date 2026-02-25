@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <atomic>
 #include <string>
+#include <thread>
 
 class runtime_manager;
 
@@ -21,4 +22,5 @@ private:
     runtime_manager& m_manager;
     int m_listen_fd{-1};
     std::atomic<bool> m_running{false};
+    std::thread m_thread;
 };

@@ -107,12 +107,14 @@ inline std::string ws_frame_pong(std::string_view payload)
     return frame;
 }
 
-// Create close frame
+// Create close frame with 1000 (normal closure) status code
 inline std::string ws_frame_close()
 {
-    std::string frame(2, '\0');
+    std::string frame(4, '\0');
     frame[0] = static_cast<char>(0x80 | WS_OP_CLOSE); // FIN + close
-    frame[1] = 0;
+    frame[1] = 2;                                       // payload = 2 bytes (status code)
+    frame[2] = static_cast<char>(0x03);                 // 1000 >> 8
+    frame[3] = static_cast<char>(0xE8);                 // 1000 & 0xFF
     return frame;
 }
 
@@ -181,4 +183,175 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
 
     out.consumed = total;
     return true;
+}
+
+// Zero-alloc frame view — points into the (now unmasked) input buffer
+struct ws_frame_view
+{
+    uint8_t opcode;
+    const char* payload_ptr;
+    size_t payload_len;
+    size_t consumed;
+};
+
+// In-place unmask parse — modifies data buffer, sets view pointers into it.
+// Uses uint64_t-widened XOR for ~4-8x fewer mask iterations.
+inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
+{
+    if (len < 2)
+        return false;
+
+    uint8_t b0 = static_cast<uint8_t>(data[0]);
+    uint8_t b1 = static_cast<uint8_t>(data[1]);
+
+    out.opcode = b0 & 0x0F;
+    bool fin = (b0 & 0x80) != 0;
+    bool masked = (b1 & 0x80) != 0;
+    uint64_t payload_len = b1 & 0x7F;
+    size_t header_size = 2;
+
+    if (payload_len == 126)
+    {
+        if (len < 4) return false;
+        payload_len = (static_cast<uint64_t>(static_cast<uint8_t>(data[2])) << 8) |
+                       static_cast<uint64_t>(static_cast<uint8_t>(data[3]));
+        header_size = 4;
+    }
+    else if (payload_len == 127)
+    {
+        if (len < 10) return false;
+        payload_len = 0;
+        for (int i = 0; i < 8; i++)
+            payload_len = (payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
+        header_size = 10;
+    }
+
+    if (payload_len > WS_MAX_PAYLOAD)
+        return false;
+
+    if (out.opcode >= 0x8 && payload_len > 125)
+        return false;
+
+    if (!fin)
+        return false;
+
+    size_t mask_size = masked ? 4 : 0;
+    size_t total = header_size + mask_size + payload_len;
+    if (len < total)
+        return false;
+
+    char* payload_start = data + header_size + mask_size;
+
+    if (masked)
+    {
+        const uint8_t* mask_key = reinterpret_cast<const uint8_t*>(data + header_size);
+
+        // Replicate 4-byte mask to 8 bytes for widened XOR
+        uint32_t mask32;
+        std::memcpy(&mask32, mask_key, 4);
+        uint64_t mask64 = (static_cast<uint64_t>(mask32) << 32) | mask32;
+
+        size_t i = 0;
+        for (; i + 8 <= payload_len; i += 8)
+        {
+            uint64_t chunk;
+            std::memcpy(&chunk, payload_start + i, 8);
+            chunk ^= mask64;
+            std::memcpy(payload_start + i, &chunk, 8);
+        }
+        for (; i < payload_len; i++)
+            payload_start[i] ^= mask_key[i & 3];
+    }
+
+    out.payload_ptr = payload_start;
+    out.payload_len = payload_len;
+    out.consumed = total;
+    return true;
+}
+
+// Append text frame directly into buf (no intermediate allocation)
+inline void ws_frame_text_into(std::string& buf, std::string_view payload)
+{
+    size_t len = payload.size();
+    if (len <= 125)
+    {
+        size_t off = buf.size();
+        buf.resize(off + 2 + len);
+        buf[off]     = static_cast<char>(0x81);
+        buf[off + 1] = static_cast<char>(len);
+        std::memcpy(&buf[off + 2], payload.data(), len);
+    }
+    else if (len <= 65535)
+    {
+        size_t off = buf.size();
+        buf.resize(off + 4 + len);
+        buf[off]     = static_cast<char>(0x81);
+        buf[off + 1] = static_cast<char>(126);
+        buf[off + 2] = static_cast<char>((len >> 8) & 0xFF);
+        buf[off + 3] = static_cast<char>(len & 0xFF);
+        std::memcpy(&buf[off + 4], payload.data(), len);
+    }
+    else
+    {
+        size_t off = buf.size();
+        buf.resize(off + 10 + len);
+        buf[off]     = static_cast<char>(0x81);
+        buf[off + 1] = static_cast<char>(127);
+        for (int i = 0; i < 8; i++)
+            buf[off + 2 + i] = static_cast<char>((len >> (56 - 8 * i)) & 0xFF);
+        std::memcpy(&buf[off + 10], payload.data(), len);
+    }
+}
+
+// Append pong frame directly into buf
+inline void ws_frame_pong_into(std::string& buf, std::string_view payload)
+{
+    if (payload.size() > 125)
+        payload = payload.substr(0, 125);
+    size_t off = buf.size();
+    buf.resize(off + 2 + payload.size());
+    buf[off]     = static_cast<char>(0x80 | WS_OP_PONG);
+    buf[off + 1] = static_cast<char>(payload.size());
+    if (!payload.empty())
+        std::memcpy(&buf[off + 2], payload.data(), payload.size());
+}
+
+// Append close frame (1000 normal closure) directly into buf
+inline void ws_frame_close_into(std::string& buf)
+{
+    size_t off = buf.size();
+    buf.resize(off + 4, '\0');
+    buf[off]     = static_cast<char>(0x80 | WS_OP_CLOSE);
+    buf[off + 1] = 2;
+    buf[off + 2] = static_cast<char>(0x03);
+    buf[off + 3] = static_cast<char>(0xE8);
+}
+
+// Compute Sec-WebSocket-Accept and append to buf (no intermediate string)
+inline void ws_accept_key_into(std::string& buf, std::string_view client_key)
+{
+    unsigned char sha1_hash[SHA_DIGEST_LENGTH];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    SHA_CTX sha_ctx;
+    SHA1_Init(&sha_ctx);
+    SHA1_Update(&sha_ctx, client_key.data(), client_key.size());
+    SHA1_Update(&sha_ctx, WS_GUID, 36);
+    SHA1_Final(sha1_hash, &sha_ctx);
+#pragma GCC diagnostic pop
+
+    char b64[32];
+    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, SHA_DIGEST_LENGTH);
+    buf.append(b64);
+}
+
+// Build full 101 response directly into buf (no intermediate strings)
+inline void ws_handshake_response_into(std::string& buf, std::string_view client_key)
+{
+    buf += "HTTP/1.1 101 Switching Protocols\r\n"
+           "Upgrade: websocket\r\n"
+           "Connection: Upgrade\r\n"
+           "Sec-WebSocket-Accept: ";
+    ws_accept_key_into(buf, client_key);
+    buf += "\r\n\r\n";
 }

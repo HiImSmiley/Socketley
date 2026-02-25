@@ -37,8 +37,8 @@ inline bool daemon_attach(const std::string& name, const std::string& type,
 {
     bool is_managed = std::getenv("SOCKETLEY_MANAGED") != nullptr;
     const char* env_name = std::getenv("SOCKETLEY_NAME");
-    const std::string& actual_name = (env_name && env_name[0])
-        ? *new std::string(env_name) : name;  // intentional leak — lives for process lifetime
+    const std::string env_name_str = (env_name && env_name[0]) ? env_name : "";
+    const std::string& actual_name = env_name_str.empty() ? name : env_name_str;
 
     std::string cmd = "attach " + type + " " + actual_name + " " + std::to_string(port)
                     + " --pid " + std::to_string(getpid());
