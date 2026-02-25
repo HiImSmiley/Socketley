@@ -8,8 +8,9 @@ BIN_DIR="$ROOT/bin/Release"
 PASS=0; FAIL=0
 DAEMON_PID=""
 
-# Always use system-wide installed socketley
-SYS_BIN="$(command -v socketley 2>/dev/null)" || { echo "ERROR: socketley not found in PATH"; exit 1; }
+# Prefer system-wide socketley, fall back to local build
+SYS_BIN="$(command -v socketley 2>/dev/null)" || SYS_BIN="$ROOT/bin/Release/socketley"
+[ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried PATH and $ROOT/bin/Release/)"; exit 1; }
 
 # Use a fixed test socket path (avoids system-mode path resolution issues)
 export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
