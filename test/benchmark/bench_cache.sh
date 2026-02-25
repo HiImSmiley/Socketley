@@ -111,7 +111,7 @@ test_persistence() {
     local persist_file="/tmp/bench_cache_persist.bin"
     rm -f "$persist_file"
 
-    socketley_cmd create cache bench_cache -p $CACHE_PORT --persistent "$persist_file" -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --persistent "$persist_file" --mode admin -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
 

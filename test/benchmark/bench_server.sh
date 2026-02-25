@@ -62,7 +62,7 @@ test_single_client_throughput() {
 
     log_section "Test: Single Client Throughput ($num_messages msgs, ${message_size}B)"
 
-    socketley_cmd create server bench_srv -p $SERVER_PORT -s
+    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
     append_result
@@ -81,7 +81,7 @@ test_concurrent_clients() {
 
     log_section "Test: Concurrent Clients ($num_clients clients × $msgs_per_client msgs)"
 
-    socketley_cmd create server bench_srv -p $SERVER_PORT -s
+    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; return 1; }
 
     append_result
