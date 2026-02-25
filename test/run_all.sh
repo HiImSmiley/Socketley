@@ -8,6 +8,9 @@ BIN_DIR="$ROOT/bin/Release"
 PASS=0; FAIL=0
 DAEMON_PID=""
 
+# Always use system-wide installed socketley
+SYS_BIN="$(command -v socketley 2>/dev/null)" || { echo "ERROR: socketley not found in PATH"; exit 1; }
+
 # Use a fixed test socket path (avoids system-mode path resolution issues)
 export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
 
@@ -54,7 +57,7 @@ pkill -f "socketley daemon" 2>/dev/null || true
 sleep 0.2
 rm -f "$SOCKETLEY_SOCKET"
 
-export BIN="$BIN_DIR/socketley"
+export BIN="$SYS_BIN"
 "$BIN" daemon 2>/dev/null &
 DAEMON_PID=$!
 sleep 0.5

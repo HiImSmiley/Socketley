@@ -119,6 +119,7 @@ test_http_single_backend() {
 
     socketley_cmd stop bench_proxy
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     kill "$backend_pid" 2>/dev/null
     wait "$backend_pid" 2>/dev/null
@@ -183,6 +184,7 @@ test_http_load_balancing() {
 
     socketley_cmd stop bench_proxy
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     kill "$backend_pid1" "$backend_pid2" 2>/dev/null
     wait "$backend_pid1" "$backend_pid2" 2>/dev/null
@@ -211,6 +213,7 @@ test_tcp_throughput() {
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 }
@@ -238,6 +241,7 @@ test_concurrent_proxy_connections() {
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 }
@@ -264,6 +268,7 @@ test_proxy_overhead() {
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     socketley_cmd remove backend1
 }
@@ -290,6 +295,7 @@ test_runtime_name_backend() {
     socketley_cmd stop bench_proxy
     socketley_cmd stop named_backend
     sleep 0.5
+    wait_for_port_free $PROXY_PORT
     socketley_cmd remove bench_proxy
     socketley_cmd remove named_backend
 }

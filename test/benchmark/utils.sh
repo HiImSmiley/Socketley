@@ -212,6 +212,18 @@ wait_for_port() {
     return 1
 }
 
+# Wait for port to be free (not listening)
+wait_for_port_free() {
+    local port=$1
+    local max_wait=${2:-50}
+    local count=0
+
+    while nc -z localhost "$port" 2>/dev/null && [[ $count -lt $max_wait ]]; do
+        sleep 0.1
+        ((count++))
+    done
+}
+
 # Get high-resolution timestamp in milliseconds
 get_time_ms() {
     echo $(($(date +%s%N) / 1000000))

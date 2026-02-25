@@ -31,6 +31,7 @@ test_set_throughput() {
 
     log_section "Test: SET Throughput ($num_ops ops, ${value_size}B values)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -40,6 +41,7 @@ test_set_throughput() {
     "$SOCKETLEY_BENCH" cache set 127.0.0.1 $CACHE_PORT $num_ops $value_size
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -50,6 +52,7 @@ test_get_throughput() {
 
     log_section "Test: GET Throughput ($num_ops ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -59,6 +62,7 @@ test_get_throughput() {
     "$SOCKETLEY_BENCH" cache get 127.0.0.1 $CACHE_PORT $num_ops
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -69,6 +73,7 @@ test_mixed_workload() {
 
     log_section "Test: Mixed Workload ($num_ops ops, 80% GET / 20% SET)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -78,6 +83,7 @@ test_mixed_workload() {
     "$SOCKETLEY_BENCH" cache mixed 127.0.0.1 $CACHE_PORT $num_ops
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -89,6 +95,7 @@ test_concurrent_access() {
 
     log_section "Test: Concurrent Access ($num_clients clients × $ops_per_client ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -98,6 +105,7 @@ test_concurrent_access() {
     "$SOCKETLEY_BENCH" cache concurrent 127.0.0.1 $CACHE_PORT $num_clients $ops_per_client
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -111,6 +119,7 @@ test_persistence() {
     local persist_file="/tmp/bench_cache_persist.bin"
     rm -f "$persist_file"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT --persistent "$persist_file" --mode admin -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -158,6 +167,7 @@ test_persistence() {
         "keys_restored"   "$size_result"
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
     rm -f "$persist_file"
 
@@ -193,6 +203,7 @@ test_list_throughput() {
 
     log_section "Test: LIST Throughput ($num_ops ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -222,6 +233,7 @@ test_list_throughput() {
         "lpop_ops_sec"  "$lpop_ops"
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -232,6 +244,7 @@ test_set_ds_throughput() {
 
     log_section "Test: SET (data structure) Throughput ($num_ops ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -261,6 +274,7 @@ test_set_ds_throughput() {
         "sismember_ops_sec" "$sismember_ops"
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -271,6 +285,7 @@ test_hash_throughput() {
 
     log_section "Test: HASH Throughput ($num_ops ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -300,6 +315,7 @@ test_hash_throughput() {
         "hget_ops_sec" "$hget_ops"
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 
@@ -310,6 +326,7 @@ test_ttl_throughput() {
 
     log_section "Test: TTL Throughput ($num_ops ops)"
 
+    wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache -p $CACHE_PORT -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; return 1; }
     sleep 0.5
@@ -344,6 +361,7 @@ test_ttl_throughput() {
         "ttl_ops_sec"    "$ttl_ops"
 
     socketley_cmd stop bench_cache
+    sleep 0.5
     socketley_cmd remove bench_cache
 }
 

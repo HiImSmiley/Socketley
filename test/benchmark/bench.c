@@ -484,7 +484,7 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
 
     for (int i = 0; i < cfg->num_ops; i++) {
         int64_t t0 = time_ns();
-        ssize_t n = write(fd, msg, cfg->msg_size + 1);
+        ssize_t n = send_all(fd, msg, cfg->msg_size + 1);
         int64_t t1 = time_ns();
 
         if (n == cfg->msg_size + 1) {
@@ -493,6 +493,7 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
                 lat_record(&r.latencies, t1 - t0);
         } else {
             r.failed++;
+            break;
         }
     }
 
@@ -527,8 +528,8 @@ static void *server_concurrent_worker(void *arg)
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
-        ssize_t n = write(fd, msg, cfg->msg_size + 1);
-        if (n == cfg->msg_size + 1) local++;
+        if (send_all(fd, msg, cfg->msg_size + 1) == cfg->msg_size + 1) local++;
+        else break;
     }
 
     close(fd);
