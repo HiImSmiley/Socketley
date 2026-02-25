@@ -401,7 +401,7 @@ void runtime_instance::invoke_on_message(std::string_view msg)
 
 #ifndef SOCKETLEY_NO_LUA
     try {
-        m_lua->on_message()(std::string(msg));
+        m_lua->on_message()(msg);
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_message error: " << e.what() << std::endl;
     }
@@ -462,7 +462,7 @@ void runtime_instance::invoke_on_send(std::string_view msg)
 
 #ifndef SOCKETLEY_NO_LUA
     try {
-        m_lua->on_send()(std::string(msg));
+        m_lua->on_send()(msg);
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_send error: " << e.what() << std::endl;
     }
@@ -515,7 +515,7 @@ void runtime_instance::invoke_on_client_message(int client_id, std::string_view 
 
 #ifndef SOCKETLEY_NO_LUA
     try {
-        m_lua->on_client_message()(client_id, std::string(msg));
+        m_lua->on_client_message()(client_id, msg);
     } catch (const sol::error& e) {
         std::cerr << "[lua] on_client_message error: " << e.what() << std::endl;
     }

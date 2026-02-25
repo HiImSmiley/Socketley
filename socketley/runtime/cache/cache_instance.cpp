@@ -15,6 +15,7 @@
 #include <liburing.h>
 #include <sstream>
 #include <sys/stat.h>
+#include <poll.h>
 
 cache_instance::cache_instance(std::string_view name)
     : runtime_instance(runtime_cache, name), m_listen_fd(-1), m_loop(nullptr)
@@ -623,7 +624,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(std::string(key), std::string(value), 0); }
+                    try { lua()->on_write()(key, value, 0); }
                     catch (const sol::error& e)
                     { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
                 }
@@ -648,7 +649,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 {
                     try
                     {
-                        auto res = lua()->on_miss()(std::string(args));
+                        auto res = lua()->on_miss()(args);
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
                         {
@@ -687,7 +688,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_delete())
                 {
-                    try { lua()->on_delete_cb()(std::string(args)); }
+                    try { lua()->on_delete_cb()(args); }
                     catch (const sol::error& e)
                     { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
                 }
@@ -842,7 +843,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                    try { lua()->on_write()(key, val, 0); }
                     catch (const sol::error& e)
                     { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
                 }
@@ -1255,7 +1256,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                    try { lua()->on_write()(key, val, 0); }
                     catch (const sol::error& e)
                     { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
                 }
@@ -1279,7 +1280,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(key), std::string(val), sec); }
+                try { lua()->on_write()(key, val, sec); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -1305,7 +1306,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(key), std::string(val), 0); }
+                try { lua()->on_write()(key, val, 0); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -1935,7 +1936,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(args[1]), std::string(args[2]), ex_sec); }
+                try { lua()->on_write()(args[1], args[2], ex_sec); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -1959,7 +1960,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 {
                     try
                     {
-                        auto res = lua()->on_miss()(std::string(args[1]));
+                        auto res = lua()->on_miss()(args[1]);
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
                         {
@@ -1996,7 +1997,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                     if (lua() && lua()->has_on_delete())
                     {
-                        try { lua()->on_delete_cb()(std::string(args[i])); }
+                        try { lua()->on_delete_cb()(args[i]); }
                         catch (const sol::error& e)
                         { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
                     }
@@ -2120,7 +2121,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(std::string(args[i]), std::string(args[i+1]), 0); }
+                    try { lua()->on_write()(args[i], args[i+1], 0); }
                     catch (const sol::error& e)
                     { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
                 }
@@ -2398,7 +2399,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (did_set && lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(args[1]), std::string(args[2]), 0); }
+                try { lua()->on_write()(args[1], args[2], 0); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -2419,7 +2420,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(args[1]), std::string(args[3]), sec); }
+                try { lua()->on_write()(args[1], args[3], sec); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -2440,7 +2441,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(std::string(args[1]), std::string(args[3]), 0); }
+                try { lua()->on_write()(args[1], args[3], 0); }
                 catch (const sol::error& e)
                 { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
             }
@@ -2760,6 +2761,21 @@ bool cache_instance::connect_to_master()
             close(fd);
             return false;
         }
+        // Wait for non-blocking connect to complete (up to 5s)
+        struct pollfd pfd{fd, POLLOUT, 0};
+        if (poll(&pfd, 1, 5000) <= 0 || !(pfd.revents & POLLOUT))
+        {
+            close(fd);
+            return false;
+        }
+        int sock_err = 0;
+        socklen_t errlen = sizeof(sock_err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &errlen);
+        if (sock_err != 0)
+        {
+            close(fd);
+            return false;
+        }
     }
 
     // Send REPLICATE command
@@ -2876,7 +2892,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         if (scan_from >= m_master_partial.size())
             m_master_partial.clear();
         else
-            m_master_partial = m_master_partial.substr(scan_from);
+            m_master_partial.erase(0, scan_from);
     }
 
     // Re-submit read

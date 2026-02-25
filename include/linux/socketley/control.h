@@ -27,6 +27,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace socketley {
@@ -75,15 +76,25 @@ inline result ipc_send(const std::string& socket_path, std::string_view command)
         return {-1, "failed to connect to daemon"};
     }
 
+    struct timeval tv{5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     // Send: command + newline
     std::string msg(command);
     msg += '\n';
 
-    ssize_t written = write(fd, msg.data(), msg.size());
-    if (written < 0)
     {
-        close(fd);
-        return {-1, "write() failed"};
+        size_t total = 0;
+        while (total < msg.size())
+        {
+            ssize_t w = write(fd, msg.data() + total, msg.size() - total);
+            if (w < 0)
+            {
+                close(fd);
+                return {-1, "write() failed"};
+            }
+            total += static_cast<size_t>(w);
+        }
     }
 
     // Read response: first byte = exit code, then data until NUL terminator

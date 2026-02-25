@@ -13,13 +13,13 @@ event_loop::event_loop(uint32_t queue_depth)
 
 event_loop::~event_loop()
 {
-    for (auto& [gid, pool] : m_buf_rings)
+    for (uint16_t gid = 0; gid < MAX_BUF_GROUPS; ++gid)
     {
+        auto& pool = m_buf_rings[gid];
         if (pool.ring)
             io_uring_free_buf_ring(&m_ring, pool.ring, pool.buf_count, gid);
         free(pool.base);
     }
-    m_buf_rings.clear();
 
     if (m_signal_pipe[0] >= 0) close(m_signal_pipe[0]);
     if (m_signal_pipe[1] >= 0) close(m_signal_pipe[1]);
@@ -313,8 +313,11 @@ void event_loop::submit_cancel_fd(int fd)
 
 bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size)
 {
+    if (group_id >= MAX_BUF_GROUPS)
+        return false;
+
     // Already registered — reuse
-    if (m_buf_rings.count(group_id))
+    if (m_buf_rings[group_id].ring)
         return true;
 
     int ret;
@@ -343,8 +346,7 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
 
 void event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req)
 {
-    auto it = m_buf_rings.find(group_id);
-    if (it == m_buf_rings.end())
+    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return;
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
@@ -355,7 +357,7 @@ void event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
         if (!sqe) return;
     }
 
-    io_uring_prep_read(sqe, fd, nullptr, it->second.buf_size, 0);
+    io_uring_prep_read(sqe, fd, nullptr, m_buf_rings[group_id].buf_size, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
@@ -365,12 +367,11 @@ void event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
 
 char* event_loop::get_buf_ptr(uint16_t group_id, uint16_t buf_id)
 {
-    auto it = m_buf_rings.find(group_id);
-    if (it == m_buf_rings.end())
+    if (group_id >= MAX_BUF_GROUPS)
         return nullptr;
 
-    auto& pool = it->second;
-    if (buf_id >= pool.buf_count)
+    auto& pool = m_buf_rings[group_id];
+    if (!pool.ring || buf_id >= pool.buf_count)
         return nullptr;
 
     return pool.base + (static_cast<size_t>(buf_id) * pool.buf_size);
@@ -378,11 +379,13 @@ char* event_loop::get_buf_ptr(uint16_t group_id, uint16_t buf_id)
 
 void event_loop::return_buf(uint16_t group_id, uint16_t buf_id)
 {
-    auto it = m_buf_rings.find(group_id);
-    if (it == m_buf_rings.end())
+    if (group_id >= MAX_BUF_GROUPS)
         return;
 
-    auto& pool = it->second;
+    auto& pool = m_buf_rings[group_id];
+    if (!pool.ring)
+        return;
+
     io_uring_buf_ring_add(pool.ring,
         pool.base + (static_cast<size_t>(buf_id) * pool.buf_size),
         pool.buf_size, buf_id,
@@ -392,5 +395,5 @@ void event_loop::return_buf(uint16_t group_id, uint16_t buf_id)
 
 bool event_loop::has_buf_ring(uint16_t group_id) const
 {
-    return m_buf_rings.count(group_id) > 0;
+    return group_id < MAX_BUF_GROUPS && m_buf_rings[group_id].ring != nullptr;
 }

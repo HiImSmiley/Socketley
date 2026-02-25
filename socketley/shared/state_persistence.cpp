@@ -689,12 +689,41 @@ void state_persistence::set_was_running(std::string_view name, bool running)
 {
     fs::path path = config_path(name);
 
-    runtime_config cfg;
-    if (!read_json(path, cfg))
+    // Fast path: read file, find "was_running" key, flip in-place, atomic rewrite.
+    // Avoids full JSON parse + re-serialization for a single boolean toggle.
+    std::ifstream f(path);
+    if (!f.is_open())
         return;
 
-    cfg.was_running = running;
-    write_json(cfg);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    f.close();
+    std::string json = ss.str();
+
+    std::string_view old_val = running ? "false" : "true";
+    std::string_view new_val = running ? "true" : "false";
+    std::string needle = "\"was_running\": ";
+    needle += old_val;
+
+    auto pos = json.find(needle);
+    if (pos == std::string::npos)
+        return; // Already set or key missing
+
+    json.replace(pos + 16, old_val.size(), new_val);
+
+    // Atomic write via .tmp + rename
+    fs::path tmp_path = path;
+    tmp_path += ".tmp";
+    std::ofstream out(tmp_path, std::ios::trunc);
+    if (!out.is_open())
+        return;
+    out << json;
+    out.close();
+    if (!out.fail())
+    {
+        std::error_code ec;
+        fs::rename(tmp_path, path, ec);
+    }
 }
 
 std::vector<runtime_config> state_persistence::load_all()

@@ -1065,9 +1065,10 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
 
             // Send 101 response
-            std::string response = ws_handshake_response(ws_key);
-            auto resp_msg = std::make_shared<const std::string>(std::move(response));
-            conn->write_queue.push(resp_msg);
+            auto resp_msg = std::make_shared<std::string>();
+            resp_msg->reserve(160);
+            ws_handshake_response_into(*resp_msg, ws_key);
+            conn->write_queue.push(std::move(resp_msg));
             if (!conn->write_pending)
                 flush_write_queue(conn);
 
@@ -1079,29 +1080,34 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (conn->ws == ws_active)
     {
-        // Parse WebSocket frames
-        ws_frame frame;
-        while (ws_parse_frame(conn->partial.data(), conn->partial.size(), frame))
+        // Parse WebSocket frames (in-place unmask, zero-alloc parse)
+        ws_frame_view frame;
+        size_t offset = 0;
+        while (ws_parse_frame_inplace(conn->partial.data() + offset,
+                                       conn->partial.size() - offset, frame))
         {
-            conn->partial.erase(0, frame.consumed);
+            std::string_view payload(frame.payload_ptr, frame.payload_len);
+            offset += frame.consumed;
             switch (frame.opcode)
             {
                 case WS_OP_TEXT:
-                    if (!frame.payload.empty())
-                        process_message(conn, frame.payload);
+                    if (!payload.empty())
+                        process_message(conn, payload);
                     break;
                 case WS_OP_PING:
                 {
-                    auto pong = std::make_shared<const std::string>(ws_frame_pong(frame.payload));
-                    conn->write_queue.push(pong);
+                    auto pong = std::make_shared<std::string>();
+                    ws_frame_pong_into(*pong, payload);
+                    conn->write_queue.push(std::move(pong));
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     break;
                 }
                 case WS_OP_CLOSE:
                 {
-                    auto close_frame = std::make_shared<const std::string>(ws_frame_close());
-                    conn->write_queue.push(close_frame);
+                    auto close_resp = std::make_shared<std::string>();
+                    ws_frame_close_into(*close_resp);
+                    conn->write_queue.push(std::move(close_resp));
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     conn->closing = true;
@@ -1110,6 +1116,14 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 default:
                     break;
             }
+        }
+        // Single erase at end instead of per-frame
+        if (offset > 0)
+        {
+            if (offset >= conn->partial.size())
+                conn->partial.clear();
+            else
+                conn->partial.erase(0, offset);
         }
         goto submit_next_read;
     }
@@ -1291,11 +1305,10 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             }
             else
             {
-                std::string relay_str;
-                relay_str.reserve(msg.size() + 1);
-                relay_str.append(msg.data(), msg.size());
-                relay_str += '\n';
-                auto relay_msg = std::make_shared<const std::string>(std::move(relay_str));
+                auto relay_msg = std::make_shared<std::string>();
+                relay_msg->reserve(msg.size() + 1);
+                relay_msg->append(msg);
+                relay_msg->push_back('\n');
                 broadcast(relay_msg, sender ? sender->fd : -1);
             }
             break;
@@ -1329,7 +1342,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 #ifndef SOCKETLEY_NO_LUA
                     try {
                         sol::protected_function_result result =
-                            lctx->on_master_auth()(sender->fd, std::string(pw));
+                            lctx->on_master_auth()(sender->fd, pw);
                         if (result.valid())
                             auth_ok = result.get<bool>();
                     } catch (...) {}
@@ -1376,11 +1389,10 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
                 if (!(lua() && lua()->has_on_message()))
                 {
-                    std::string relay_str;
-                    relay_str.reserve(msg.size() + 1);
-                    relay_str.append(msg.data(), msg.size());
-                    relay_str += '\n';
-                    auto relay_msg = std::make_shared<const std::string>(std::move(relay_str));
+                    auto relay_msg = std::make_shared<std::string>();
+                    relay_msg->reserve(msg.size() + 1);
+                    relay_msg->append(msg);
+                    relay_msg->push_back('\n');
                     broadcast(relay_msg, sender->fd);
                 }
                 break;
@@ -1422,13 +1434,11 @@ void server_instance::lua_broadcast(std::string_view msg)
         return;
     }
 
-    std::string full_str;
-    full_str.reserve(msg.size() + 1);
-    full_str.append(msg.data(), msg.size());
-    if (full_str.empty() || full_str.back() != '\n')
-        full_str += '\n';
-
-    auto full_msg = std::make_shared<const std::string>(std::move(full_str));
+    auto full_msg = std::make_shared<std::string>();
+    full_msg->reserve(msg.size() + 1);
+    full_msg->append(msg);
+    if (full_msg->empty() || full_msg->back() != '\n')
+        full_msg->push_back('\n');
     broadcast(full_msg, -1);  // -1 = don't exclude anyone
 
     // Also send to forwarded clients through their parent servers
@@ -1473,7 +1483,10 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
                 std::string_view payload(*msg);
                 if (!payload.empty() && payload.back() == '\n')
                     payload.remove_suffix(1);
-                ws_msg = std::make_shared<const std::string>(ws_frame_text(payload));
+                auto framed = std::make_shared<std::string>();
+                framed->reserve(2 + payload.size());
+                ws_frame_text_into(*framed, payload);
+                ws_msg = std::move(framed);
             }
             conn->write_queue.push(ws_msg);
             if (!conn->write_pending)
@@ -1505,8 +1518,10 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
-        auto framed = std::make_shared<const std::string>(ws_frame_text(payload));
-        conn->write_queue.push(framed);
+        auto framed = std::make_shared<std::string>();
+        framed->reserve(2 + payload.size());
+        ws_frame_text_into(*framed, payload);
+        conn->write_queue.push(std::move(framed));
     }
     else
     {
@@ -1740,13 +1755,11 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
         if (conn->closing)
             return;
 
-        std::string full_str;
-        full_str.reserve(msg.size() + 1);
-        full_str.append(msg.data(), msg.size());
-        if (full_str.empty() || full_str.back() != '\n')
-            full_str += '\n';
-
-        auto full_msg = std::make_shared<const std::string>(std::move(full_str));
+        auto full_msg = std::make_shared<std::string>();
+        full_msg->reserve(msg.size() + 1);
+        full_msg->append(msg);
+        if (full_msg->empty() || full_msg->back() != '\n')
+            full_msg->push_back('\n');
         send_to(conn, full_msg);
         return;
     }
@@ -1851,9 +1864,10 @@ void server_instance::send_to_client(int client_fd, std::string_view msg)
     auto* conn = m_conn_idx[client_fd];
     if (conn->closing) return;
 
-    std::string full(msg);
-    if (full.empty() || full.back() != '\n') full += '\n';
-    auto shared = std::make_shared<const std::string>(std::move(full));
+    auto shared = std::make_shared<std::string>();
+    shared->reserve(msg.size() + 1);
+    shared->append(msg);
+    if (shared->empty() || shared->back() != '\n') shared->push_back('\n');
     send_to(conn, shared);
 }
 
@@ -1973,7 +1987,7 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs)
         return false;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0)
     {
         freeaddrinfo(addrs);
@@ -1983,7 +1997,7 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    if (connect(fd, addrs->ai_addr, addrs->ai_addrlen) < 0)
+    if (connect(fd, addrs->ai_addr, addrs->ai_addrlen) < 0 && errno != EINPROGRESS)
     {
         freeaddrinfo(addrs);
         close(fd);
@@ -2207,22 +2221,21 @@ void server_instance::lua_upstream_send(int conn_id, std::string_view msg)
     if (it == m_upstreams.end() || !it->second->connected)
         return;
 
-    std::string full;
-    full.reserve(msg.size() + 1);
-    full.append(msg.data(), msg.size());
-    if (full.empty() || full.back() != '\n')
-        full += '\n';
-    upstream_send(it->second.get(), std::make_shared<const std::string>(std::move(full)));
+    auto shared = std::make_shared<std::string>();
+    shared->reserve(msg.size() + 1);
+    shared->append(msg);
+    if (shared->empty() || shared->back() != '\n')
+        shared->push_back('\n');
+    upstream_send(it->second.get(), std::move(shared));
 }
 
 void server_instance::lua_upstream_broadcast(std::string_view msg)
 {
-    std::string full;
-    full.reserve(msg.size() + 1);
-    full.append(msg.data(), msg.size());
-    if (full.empty() || full.back() != '\n')
-        full += '\n';
-    auto shared = std::make_shared<const std::string>(std::move(full));
+    auto shared = std::make_shared<std::string>();
+    shared->reserve(msg.size() + 1);
+    shared->append(msg);
+    if (shared->empty() || shared->back() != '\n')
+        shared->push_back('\n');
     for (auto& [cid, uc] : m_upstreams)
     {
         if (uc->connected && !uc->closing)
@@ -2244,7 +2257,7 @@ void server_instance::invoke_on_upstream(int conn_id, std::string_view data)
     auto* lctx = lua();
     if (!lctx || !lctx->has_on_upstream()) return;
     try {
-        lctx->on_upstream()(conn_id, std::string(data));
+        lctx->on_upstream()(conn_id, data);
     } catch (const sol::error& e) {
         fprintf(stderr, "[lua] on_upstream error: %s\n", e.what());
     }

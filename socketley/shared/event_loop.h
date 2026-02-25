@@ -1,7 +1,6 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
-#include <unordered_map>
 #include <liburing.h>
 #include <netinet/in.h>
 
@@ -66,5 +65,6 @@ private:
     char m_signal_buf{};
     bool m_multishot_supported{false};
     bool m_sqpoll_enabled{false};
-    std::unordered_map<uint16_t, buf_ring_pool> m_buf_rings;
+    static constexpr uint16_t MAX_BUF_GROUPS = 8;
+    buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};
 };

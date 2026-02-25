@@ -260,7 +260,15 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 {
                     std::string resp = static_cast<cache_instance*>(inst)->execute(line);
                     if (!resp.empty())
-                        if (::write(conn->fd, resp.data(), resp.size()) < 0) {}
+                    {
+                        size_t total = 0;
+                        while (total < resp.size())
+                        {
+                            ssize_t w = ::write(conn->fd, resp.data() + total, resp.size() - total);
+                            if (w < 0) break;
+                            total += static_cast<size_t>(w);
+                        }
+                    }
                     break;
                 }
                 default:
@@ -2270,6 +2278,21 @@ int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
     }
 
     std::string new_name(pa.args[1]);
+
+    // Validate name: reject path-unsafe characters
+    for (char c : new_name)
+    {
+        if (c == '/' || c == '\\' || c == '\0')
+        {
+            conn->write_buf = "invalid daemon name: contains path separator\n";
+            return 1;
+        }
+    }
+    if (new_name == "." || new_name == ".." || new_name.empty())
+    {
+        conn->write_buf = "invalid daemon name\n";
+        return 1;
+    }
 
     // If cluster is active, restart it with the new name
     if (m_owned_cluster)

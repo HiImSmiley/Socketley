@@ -108,42 +108,48 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_upstream_connect   = m_lua["on_upstream_connect"];
     m_on_upstream_disconnect = m_lua["on_upstream_disconnect"];
 
+    // Build callback bitmask for O(1) has_on_*() checks
+    m_callback_mask = 0;
+    if (m_on_start.valid())              m_callback_mask |= CB_ON_START;
+    if (m_on_stop.valid())               m_callback_mask |= CB_ON_STOP;
+    if (m_on_message.valid())            m_callback_mask |= CB_ON_MESSAGE;
+    if (m_on_send.valid())               m_callback_mask |= CB_ON_SEND;
+    if (m_on_connect.valid())            m_callback_mask |= CB_ON_CONNECT;
+    if (m_on_disconnect.valid())         m_callback_mask |= CB_ON_DISCONNECT;
+    if (m_on_route.valid())              m_callback_mask |= CB_ON_ROUTE;
+    if (m_on_master_auth.valid())        m_callback_mask |= CB_ON_MASTER_AUTH;
+    if (m_on_client_message.valid())     m_callback_mask |= CB_ON_CLIENT_MESSAGE;
+    if (m_on_tick.valid())               m_callback_mask |= CB_ON_TICK;
+    if (m_on_miss.valid())               m_callback_mask |= CB_ON_MISS;
+    if (m_on_write.valid())              m_callback_mask |= CB_ON_WRITE;
+    if (m_on_delete.valid())             m_callback_mask |= CB_ON_DELETE;
+    if (m_on_expire.valid())             m_callback_mask |= CB_ON_EXPIRE;
+    if (m_on_auth.valid())               m_callback_mask |= CB_ON_AUTH;
+    if (m_on_websocket.valid())          m_callback_mask |= CB_ON_WEBSOCKET;
+    if (m_on_proxy_request.valid())      m_callback_mask |= CB_ON_PROXY_REQUEST;
+    if (m_on_proxy_response.valid())     m_callback_mask |= CB_ON_PROXY_RESPONSE;
+    if (m_on_cluster_join.valid())       m_callback_mask |= CB_ON_CLUSTER_JOIN;
+    if (m_on_cluster_leave.valid())      m_callback_mask |= CB_ON_CLUSTER_LEAVE;
+    if (m_on_group_change.valid())       m_callback_mask |= CB_ON_GROUP_CHANGE;
+    if (m_on_upstream.valid())           m_callback_mask |= CB_ON_UPSTREAM;
+    if (m_on_upstream_connect.valid())   m_callback_mask |= CB_ON_UPSTREAM_CONNECT;
+    if (m_on_upstream_disconnect.valid()) m_callback_mask |= CB_ON_UPSTREAM_DISCONNECT;
+
     return true;
 }
 
-bool lua_context::has_on_start() const { return m_on_start.valid(); }
-bool lua_context::has_on_stop() const { return m_on_stop.valid(); }
-bool lua_context::has_on_message() const { return m_on_message.valid(); }
-bool lua_context::has_on_send() const { return m_on_send.valid(); }
-bool lua_context::has_on_connect() const { return m_on_connect.valid(); }
-bool lua_context::has_on_disconnect() const { return m_on_disconnect.valid(); }
-bool lua_context::has_on_route() const { return m_on_route.valid(); }
-bool lua_context::has_on_master_auth() const { return m_on_master_auth.valid(); }
-bool lua_context::has_on_client_message() const { return m_on_client_message.valid(); }
-bool lua_context::has_on_tick() const { return m_on_tick.valid(); }
-bool lua_context::has_on_miss()   const { return m_on_miss.valid(); }
-bool lua_context::has_on_write()  const { return m_on_write.valid(); }
-bool lua_context::has_on_delete() const { return m_on_delete.valid(); }
-bool lua_context::has_on_expire() const { return m_on_expire.valid(); }
-bool lua_context::has_on_auth()            const { return m_on_auth.valid(); }
-bool lua_context::has_on_websocket()       const { return m_on_websocket.valid(); }
-bool lua_context::has_on_proxy_request()   const { return m_on_proxy_request.valid(); }
-bool lua_context::has_on_proxy_response()  const { return m_on_proxy_response.valid(); }
-bool lua_context::has_on_cluster_join()    const { return m_on_cluster_join.valid(); }
-bool lua_context::has_on_cluster_leave()   const { return m_on_cluster_leave.valid(); }
-bool lua_context::has_on_group_change()    const { return m_on_group_change.valid(); }
-bool lua_context::has_on_upstream()            const { return m_on_upstream.valid(); }
-bool lua_context::has_on_upstream_connect()    const { return m_on_upstream_connect.valid(); }
-bool lua_context::has_on_upstream_disconnect() const { return m_on_upstream_disconnect.valid(); }
-
 void lua_context::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    auto key = std::string(cache_name) + '\0' + std::string(channel);
+    std::string key;
+    key.reserve(cache_name.size() + 1 + channel.size());
+    key.append(cache_name);
+    key.push_back('\0');
+    key.append(channel);
     auto it = m_subscriptions.find(key);
     if (it == m_subscriptions.end()) return;
     for (auto& fn : it->second)
     {
-        try { fn(std::string(channel), std::string(message)); }
+        try { fn(channel, message); }
         catch (const sol::error& e)
         {
             fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
@@ -273,9 +279,17 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
             result["error"] = "TLS handshake failed"; return result;
         }
-        if (SSL_write(ssl, req.c_str(), static_cast<int>(req.size())) <= 0) {
-            send_err = "SSL_write failed";
-        } else {
+        {
+            const char* wr_ptr = req.c_str();
+            int wr_rem = static_cast<int>(req.size());
+            while (wr_rem > 0) {
+                int w = SSL_write(ssl, wr_ptr, wr_rem);
+                if (w <= 0) { send_err = "SSL_write failed"; break; }
+                wr_ptr += w;
+                wr_rem -= w;
+            }
+        }
+        if (send_err.empty()) {
             char buf[4096]; int n;
             while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0)
                 response.append(buf, n);
@@ -286,9 +300,15 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     } else
 #endif
     {
-        if (::send(sock, req.c_str(), req.size(), 0) < 0) {
-            send_err = "send() failed";
-        } else {
+        {
+            size_t s_total = 0;
+            while (s_total < req.size()) {
+                ssize_t w = ::send(sock, req.c_str() + s_total, req.size() - s_total, 0);
+                if (w < 0) { send_err = "send() failed"; break; }
+                s_total += static_cast<size_t>(w);
+            }
+        }
+        if (send_err.empty()) {
             char buf[4096]; ssize_t n;
             while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0)
                 response.append(buf, n);
@@ -433,12 +453,13 @@ void lua_context::register_bindings(runtime_instance* owner)
 
     // socketley.list() → table of names
     sk["list"] = [owner, this]() -> sol::table {
-        sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
-        if (!mgr) return result;
+        if (!mgr) return m_lua.create_table();
         std::shared_lock lock(mgr->mutex);
+        auto& list = mgr->list();
+        sol::table result = m_lua.create_table(static_cast<int>(list.size()), 0);
         int i = 1;
-        for (const auto& [name, _] : mgr->list())
+        for (const auto& [name, _] : list)
             result[i++] = name;
         return result;
     };
@@ -765,8 +786,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
 
     // Client enumeration
     self["clients"] = [owner, this]() -> sol::table {
-        sol::table t = m_lua.create_table();
         auto ids = static_cast<server_instance*>(owner)->lua_clients();
+        sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
     };
@@ -801,8 +822,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         static_cast<server_instance*>(owner)->lua_upstream_broadcast(msg);
     };
     self["upstreams"] = [owner, this]() -> sol::table {
-        sol::table t = m_lua.create_table();
         auto ids = static_cast<server_instance*>(owner)->lua_upstreams();
+        sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
     };

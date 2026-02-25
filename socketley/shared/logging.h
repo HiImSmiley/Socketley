@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <ctime>
 #include <chrono>
+#include <mutex>
 
 enum log_level : uint8_t
 {
@@ -35,6 +36,8 @@ struct logger
             default:        tag = "?";     break;
         }
 
+        static std::mutex mtx;
+        std::lock_guard<std::mutex> lock(mtx);
         std::fprintf(stderr, "[%02d:%02d:%02d] [%s] %s\n",
             tm.tm_hour, tm.tm_min, tm.tm_sec, tag, msg);
     }

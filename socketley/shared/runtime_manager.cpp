@@ -54,31 +54,27 @@ bool runtime_manager::stop(std::string_view name, event_loop& loop)
     }
 
     // Cascade to children based on child_policy
-    auto* inst = get(name);
-    if (inst)
+    auto children = get_children(name);
+    for (const auto& child : children)
     {
-        auto children = get_children(name);
-        for (const auto& child : children)
+        auto* child_inst = get(child);
+        if (!child_inst) continue;
+
+        if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
+            remove_children(child, loop);
+        else
+            stop_children(child, loop);
+
+        if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
         {
-            auto* child_inst = get(child);
-            if (!child_inst) continue;
-
-            if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
-                remove_children(child, loop);
-            else
-                stop_children(child, loop);
-
-            if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
-            {
-                if (child_inst->get_state() == runtime_running)
-                    stop(child, loop);
-                remove(child);
-            }
-            else
-            {
-                if (child_inst->get_state() == runtime_running)
-                    stop(child, loop);
-            }
+            if (child_inst->get_state() == runtime_running)
+                stop(child, loop);
+            remove(child);
+        }
+        else
+        {
+            if (child_inst->get_state() == runtime_running)
+                stop(child, loop);
         }
     }
 
@@ -178,39 +174,67 @@ void runtime_manager::stop_all(event_loop& loop)
 
 void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    // Snapshot under read lock — do NOT hold the lock during callbacks.
+    // Snapshot names under read lock — do NOT hold the lock during callbacks.
     // A Lua subscribe callback may call socketley.stop/remove which needs a write lock,
     // which would deadlock if we held the read lock here.
-    std::vector<runtime_instance*> targets;
+    // We snapshot names (not raw pointers) so that if a callback removes a runtime,
+    // we safely skip it on re-lookup instead of dereferencing a dangling pointer.
+    std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
-        targets.reserve(runtimes.size());
-        for (auto& [_, inst] : runtimes)
-            targets.push_back(inst.get());
+        names.reserve(runtimes.size());
+        for (auto& [n, _] : runtimes)
+            names.push_back(n);
     }
-    for (auto* inst : targets)
+    for (auto& n : names)
+    {
+        runtime_instance* inst;
+        {
+            std::shared_lock lock(mutex);
+            auto it = runtimes.find(n);
+            if (it == runtimes.end()) continue;
+            inst = it->second.get();
+        }
         inst->on_publish_dispatch(cache_name, channel, message);
+    }
 }
 
 void runtime_manager::dispatch_cluster_events(const std::vector<cluster_event>& events)
 {
-    // Snapshot under read lock — same pattern as dispatch_publish()
-    std::vector<runtime_instance*> targets;
+    // Snapshot names under read lock — same pattern as dispatch_publish().
+    // Re-lookup each name before invoking callbacks so that if a prior callback
+    // removed/stopped a runtime, we safely skip it instead of dereferencing
+    // a dangling pointer.
+    std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
-        targets.reserve(runtimes.size());
-        for (auto& [_, inst] : runtimes)
-            targets.push_back(inst.get());
+        names.reserve(runtimes.size());
+        for (auto& [n, _] : runtimes)
+            names.push_back(n);
     }
 
 #ifndef SOCKETLEY_NO_LUA
-    for (auto* inst : targets)
+    for (auto& n : names)
     {
+        runtime_instance* inst;
+        {
+            std::shared_lock lock(mutex);
+            auto it = runtimes.find(n);
+            if (it == runtimes.end()) continue;
+            inst = it->second.get();
+        }
+
         auto* lua = inst->lua();
         if (!lua) continue;
 
         for (const auto& ev : events)
         {
+            // Re-validate: a previous event callback may have removed this runtime
+            {
+                std::shared_lock lock(mutex);
+                if (runtimes.find(n) == runtimes.end()) break;
+            }
+
             try {
                 switch (ev.kind)
                 {
