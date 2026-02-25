@@ -196,7 +196,7 @@ test_tcp_throughput() {
 
     log_section "Test: TCP Proxy Throughput ($num_messages msgs, ${message_size}B)"
 
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 -s
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -223,7 +223,7 @@ test_concurrent_proxy_connections() {
 
     log_section "Test: Concurrent Proxy Connections ($num_clients clients)"
 
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 -s
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -249,7 +249,7 @@ test_proxy_overhead() {
 
     log_section "Test: Proxy Overhead (Direct vs Proxied)"
 
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 -s
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -275,7 +275,7 @@ test_runtime_name_backend() {
 
     log_section "Test: Backend by Runtime Name ($num_requests requests)"
 
-    socketley_cmd create server named_backend -p $BACKEND_PORT_1 -s
+    socketley_cmd create server named_backend -p $BACKEND_PORT_1 --mode in -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
