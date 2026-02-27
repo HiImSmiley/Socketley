@@ -5,6 +5,7 @@
 #include "../../shared/ws_protocol.h"
 #include "../../cli/command_hashing.h"
 #include "../cache/cache_instance.h"
+#include "../cache/resp_parser.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -18,6 +19,8 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 server_instance::server_instance(std::string_view name)
     : runtime_instance(runtime_server, name), m_mode(mode_inout), m_listen_fd(-1), m_loop(nullptr)
@@ -33,6 +36,52 @@ server_instance::~server_instance()
         close(m_listen_fd);
     if (m_udp_fd >= 0)
         close(m_udp_fd);
+}
+
+std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
+{
+    std::unique_ptr<server_connection> conn;
+    if (SOCKETLEY_LIKELY(!m_conn_pool.empty()))
+    {
+        conn = std::move(m_conn_pool.back());
+        m_conn_pool.pop_back();
+        conn->reset(fd);
+    }
+    else
+    {
+        conn = std::make_unique<server_connection>();
+        conn->fd = fd;
+    }
+    return conn;
+}
+
+void server_instance::pool_release(std::unique_ptr<server_connection> conn)
+{
+    // Reset heavy state to free memory, then return to pool
+    conn->partial.clear();
+    conn->partial.shrink_to_fit();
+    conn->meta.clear();
+    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
+    conn->write_batch_count = 0;
+    conn->ws_cookie.clear();
+    conn->ws_cookie.shrink_to_fit();
+    conn->ws_origin.clear();
+    conn->ws_origin.shrink_to_fit();
+    conn->ws_protocol.clear();
+    conn->ws_protocol.shrink_to_fit();
+    conn->ws_auth.clear();
+    conn->ws_auth.shrink_to_fit();
+    if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
+    if (conn->file_buf) { free(conn->file_buf); conn->file_buf = nullptr; }
+    conn->file_size = 0;
+    conn->file_content_type.clear();
+    conn->file_content_type.shrink_to_fit();
+    conn->file_is_html = false;
+    conn->file_read_pending = false;
+    conn->http_keep_alive = false;
+    conn->fd = -1;
+    m_conn_pool.push_back(std::move(conn));
 }
 
 void server_instance::set_mode(server_mode mode)
@@ -195,7 +244,7 @@ static std::string inject_ws_script(std::string_view content)
     return result;
 }
 
-static std::string build_http_response(std::string_view content_type, std::string_view body)
+static std::string build_http_response(std::string_view content_type, std::string_view body, bool keep_alive = false)
 {
     std::string resp;
     resp.reserve(128 + body.size());
@@ -205,20 +254,26 @@ static std::string build_http_response(std::string_view content_type, std::strin
     char len_buf[24];
     auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
     resp.append(len_buf, len_end - len_buf);
-    resp.append("\r\nConnection: close\r\n\r\n");
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     resp.append(body);
     return resp;
 }
 
-static const std::shared_ptr<const std::string>& http_404_response()
+static const std::shared_ptr<const std::string>& http_404_response(bool keep_alive = false)
 {
-    static const auto resp = std::make_shared<const std::string>(
+    static const auto resp_close = std::make_shared<const std::string>(
         "HTTP/1.1 404 Not Found\r\n"
         "Content-Type: text/plain\r\n"
         "Content-Length: 13\r\n"
         "Connection: close\r\n\r\n"
         "404 Not Found");
-    return resp;
+    static const auto resp_ka = std::make_shared<const std::string>(
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 13\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "404 Not Found");
+    return keep_alive ? resp_ka : resp_close;
 }
 
 void server_instance::rebuild_http_cache()
@@ -264,8 +319,9 @@ void server_instance::rebuild_http_cache()
             content = inject_ws_script(content);
 
         // Store pre-built response as shared_ptr (zero-copy on cache hit)
+        // Use keep-alive since 99%+ clients are HTTP/1.1
         m_http_cache[url_path] = {
-            std::make_shared<const std::string>(build_http_response(ct, content))
+            std::make_shared<const std::string>(build_http_response(ct, content, true))
         };
     }
 }
@@ -309,10 +365,13 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     if (url_path.find("..") != std::string::npos ||
         url_path.find('\0') != std::string::npos)
     {
-        conn->write_queue.push(http_404_response());
+        conn->write_queue.push(http_404_response(conn->http_keep_alive));
         if (!conn->write_pending)
             flush_write_queue(conn);
-        conn->closing = true;
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
         return;
     }
 
@@ -326,11 +385,18 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
         auto it = m_http_cache.find(url_path);
         conn->write_queue.push(it != m_http_cache.end()
-            ? it->second.response : http_404_response());
+            ? it->second.response : http_404_response(conn->http_keep_alive));
+
+        if (!conn->write_pending)
+            flush_write_queue(conn);
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
     }
     else
     {
-        // Disk mode: read file on each request
+        // Disk mode: async file read via io_uring
         namespace fs = std::filesystem;
         std::error_code ec;
 
@@ -340,10 +406,13 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             m_http_base = fs::canonical(m_http_dir, ec);
             if (ec)
             {
-                conn->write_queue.push(http_404_response());
+                conn->write_queue.push(http_404_response(conn->http_keep_alive));
                 if (!conn->write_pending)
                     flush_write_queue(conn);
-                conn->closing = true;
+                if (!conn->http_keep_alive)
+                    conn->closing = true;
+                else
+                    conn->proto = proto_unknown;
                 return;
             }
         }
@@ -357,39 +426,235 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (ec || resolved_str.size() < base_str.size() ||
             resolved_str.compare(0, base_str.size(), base_str) != 0)
         {
-            conn->write_queue.push(http_404_response());
+            conn->write_queue.push(http_404_response(conn->http_keep_alive));
             if (!conn->write_pending)
                 flush_write_queue(conn);
-            conn->closing = true;
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
             return;
         }
 
-        std::ifstream f(resolved, std::ios::binary);
-        if (!f.is_open())
+        // Open file and get size
+        int ffd = open(resolved.c_str(), O_RDONLY);
+        if (ffd < 0)
         {
-            conn->write_queue.push(http_404_response());
+            conn->write_queue.push(http_404_response(conn->http_keep_alive));
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
         }
-        else
+
+        struct stat st;
+        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
         {
-            std::string content((std::istreambuf_iterator<char>(f)),
-                                 std::istreambuf_iterator<char>());
-            std::string ext = resolved.extension().string();
-            for (auto& c : ext)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            uint32_t ext_hash = fnv1a(ext);
-            auto ct = http_content_type(ext);
-
-            if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
-                content = inject_ws_script(content);
-
-            conn->write_queue.push(
-                std::make_shared<const std::string>(build_http_response(ct, content)));
+            close(ffd);
+            conn->write_queue.push(http_404_response(conn->http_keep_alive));
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
         }
+
+        auto fsize = static_cast<size_t>(st.st_size);
+        char* fbuf = static_cast<char*>(malloc(fsize));
+        if (!fbuf)
+        {
+            close(ffd);
+            conn->write_queue.push(http_404_response(conn->http_keep_alive));
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
+        }
+
+        // Detect content type
+        std::string ext = resolved.extension().string();
+        for (auto& c : ext)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        uint32_t ext_hash = fnv1a(ext);
+
+        // Store state on connection for completion handler
+        conn->file_fd = ffd;
+        conn->file_buf = fbuf;
+        conn->file_size = fsize;
+        conn->file_content_type = std::string(http_content_type(ext));
+        conn->file_is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        conn->file_read_pending = true;
+
+        // Submit async read — req->fd = socket fd for CQE dispatch
+        conn->file_read_req = { op_file_read, conn->fd, fbuf, static_cast<uint32_t>(fsize), this };
+        m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0, &conn->file_read_req);
+    }
+}
+
+static std::string build_http_response_full(int status, std::string_view reason,
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    std::string_view body, bool keep_alive)
+{
+    std::string resp;
+    resp.reserve(256 + body.size());
+    resp.append("HTTP/1.1 ");
+    char status_buf[8];
+    auto [s_end, s_ec] = std::to_chars(status_buf, status_buf + sizeof(status_buf), status);
+    resp.append(status_buf, s_end - status_buf);
+    resp.append(" ");
+    resp.append(reason);
+    resp.append("\r\n");
+
+    // Add Content-Length if not already present
+    bool has_cl = false;
+    bool has_conn = false;
+    for (const auto& [k, v] : headers)
+    {
+        resp.append(k);
+        resp.append(": ");
+        resp.append(v);
+        resp.append("\r\n");
+        if (fnv1a_lower(k) == fnv1a("content-length")) has_cl = true;
+        if (fnv1a_lower(k) == fnv1a("connection")) has_conn = true;
     }
 
-    if (!conn->write_pending)
-        flush_write_queue(conn);
-    conn->closing = true;
+    if (!has_cl)
+    {
+        resp.append("Content-Length: ");
+        char len_buf[24];
+        auto [l_end, l_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
+        resp.append(len_buf, l_end - len_buf);
+        resp.append("\r\n");
+    }
+
+    if (!has_conn)
+    {
+        resp.append(keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
+    }
+
+    resp.append("\r\n");
+    resp.append(body);
+    return resp;
+}
+
+static std::string_view http_reason(int status)
+{
+    switch (status)
+    {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default:  return "Unknown";
+    }
+}
+
+void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
+{
+#ifndef SOCKETLEY_NO_LUA
+    // Try Lua on_http_request callback
+    if (lua() && lua()->has_on_http_request())
+    {
+        try
+        {
+            // Build Lua request table
+            sol::table lua_req = lua()->state().create_table();
+            lua_req["method"] = req.method;
+            lua_req["path"] = req.path;
+            lua_req["query"] = req.query;
+            lua_req["body"] = req.body;
+            lua_req["client_id"] = req.client_id;
+            lua_req["version"] = req.version;
+
+            sol::table lua_headers = lua()->state().create_table();
+            for (const auto& [k, v] : req.headers)
+                lua_headers[std::string(k)] = std::string(v);
+            lua_req["headers"] = lua_headers;
+
+            sol::object result = lua()->on_http_request()(lua_req);
+
+            if (result.is<sol::table>())
+            {
+                sol::table resp_tbl = result.as<sol::table>();
+                int status = resp_tbl.get_or("status", 200);
+                std::string body = resp_tbl.get_or<std::string>("body", "");
+                std::string_view reason = http_reason(status);
+
+                std::vector<std::pair<std::string, std::string>> resp_headers;
+                sol::optional<sol::table> h = resp_tbl["headers"];
+                if (h)
+                {
+                    h->for_each([&](sol::object key, sol::object val) {
+                        if (key.is<std::string>() && val.is<std::string>())
+                            resp_headers.emplace_back(key.as<std::string>(), val.as<std::string>());
+                    });
+                }
+
+                // Determine keep-alive: HTTP/1.1 defaults to keep-alive
+                bool keep_alive = (req.version.find("1.1") != std::string_view::npos);
+
+                auto response = build_http_response_full(status, reason, resp_headers, body, keep_alive);
+                conn->write_queue.push(std::make_shared<const std::string>(std::move(response)));
+                if (!conn->write_pending)
+                    flush_write_queue(conn);
+
+                conn->partial.erase(0, total_consumed);
+
+                if (!keep_alive)
+                    conn->closing = true;
+                else
+                    conn->proto = proto_unknown;  // Reset for next request (pipelining)
+
+                return;
+            }
+        }
+        catch (const std::exception&)
+        {
+            // Lua error — fall through to static/404
+        }
+    }
+#endif
+
+    // Determine keep-alive: HTTP/1.1 defaults to keep-alive
+    conn->http_keep_alive = (req.version.find("1.1") != std::string_view::npos);
+
+    // Fallback: serve static files if configured
+    if (!m_http_dir.empty())
+    {
+        std::string path_str(req.path);
+        conn->partial.erase(0, total_consumed);
+        serve_http(conn, path_str);
+    }
+    else
+    {
+        // No http_dir and no Lua callback — 404
+        conn->write_queue.push(http_404_response(conn->http_keep_alive));
+        if (!conn->write_pending)
+            flush_write_queue(conn);
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
+        conn->partial.erase(0, total_consumed);
+    }
 }
 
 size_t server_instance::get_connection_count() const
@@ -399,7 +664,7 @@ size_t server_instance::get_connection_count() const
     size_t upstream_connected = 0;
     for (const auto& [_, uc] : m_upstreams)
         if (uc->connected) ++upstream_connected;
-    return m_clients.size() + m_forwarded_clients.size() + upstream_connected;
+    return m_active_fds.size() + m_forwarded_clients.size() + upstream_connected;
 }
 
 bool server_instance::setup(event_loop& loop)
@@ -409,6 +674,16 @@ bool server_instance::setup(event_loop& loop)
     // CQEs could reference their io_request members safely.  Now that setup()
     // is starting a fresh run it is safe to destroy them.
     m_clients.clear();
+    m_active_fds.clear();
+    m_active_fds.reserve(256);  // Pre-allocate to avoid reallocs on first connections
+
+    // Pre-allocate the connection pool if empty (first run or after teardown)
+    if (m_conn_pool.empty())
+    {
+        m_conn_pool.reserve(CONN_POOL_INIT);
+        for (size_t i = 0; i < CONN_POOL_INIT; i++)
+            m_conn_pool.push_back(std::make_unique<server_connection>());
+    }
 
     m_loop = &loop;
 
@@ -468,6 +743,11 @@ bool server_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+    // TCP_DEFER_ACCEPT: kernel holds connection in SYN-RECV until data arrives,
+    // reducing wasted accept+read round-trips for idle SYN connections.
+    int defer_sec = 1;
+    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_sec, sizeof(defer_sec));
+
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -489,6 +769,8 @@ bool server_instance::setup(event_loop& loop)
 
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    m_send_zc = loop.send_zc_supported();
 
     // Use multishot accept if supported (kernel 5.19+)
     if (event_loop::supports_multishot_accept())
@@ -580,6 +862,8 @@ void server_instance::teardown(event_loop& loop)
         }
     }
 
+    m_active_fds.clear();
+
     for (auto& [fd, conn] : m_clients)
     {
         if (fd >= 0 && fd < MAX_FDS)
@@ -592,6 +876,11 @@ void server_instance::teardown(event_loop& loop)
         // This avoids the cancel-SQE fd-closed race described above.
         shutdown(fd, SHUT_RDWR);
         close(fd);
+
+        // Clean up any pending async file read
+        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
+        if (conn->file_buf) { free(conn->file_buf); conn->file_buf = nullptr; }
+        conn->file_read_pending = false;
 
         // Release shared_ptr message refs now so memory is freed promptly, but
         // keep the server_connection structs alive — their embedded io_request
@@ -665,7 +954,7 @@ void server_instance::teardown(event_loop& loop)
 void server_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (!req || !m_loop)
+    if (SOCKETLEY_UNLIKELY(!req || !m_loop))
         return;
 
     switch (req->type)
@@ -677,26 +966,36 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_recvmsg:
             handle_udp_read(cqe);
             break;
+        case op_file_read:
+        {
+            // Async file read completion — route via socket fd in req->fd
+            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
+                handle_file_read(cqe, req);
+            break;
+        }
         case op_read:
         case op_read_provided:
+        case op_recv_multishot:
         case op_write:
         case op_writev:
+        case op_send_zc:
+        case op_send_zc_notif:
         {
-            if (req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd])
+            // Fast path: client connection via O(1) array lookup
+            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
             {
-                // Client connection (fast path)
-                if (req->type == op_read || req->type == op_read_provided)
+                if (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot)
                     handle_read(cqe, req);
                 else
                     handle_write(cqe, req);
             }
             else
             {
-                // Check upstream connections
+                // Slow path: check upstream connections
                 auto uit = m_upstream_by_fd.find(req->fd);
                 if (uit != m_upstream_by_fd.end())
                 {
-                    if (req->type == op_read || req->type == op_read_provided)
+                    if (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot)
                         handle_upstream_read(cqe, uit->second);
                     else
                         handle_upstream_write(cqe, uit->second);
@@ -709,9 +1008,10 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             {
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(get_idle_timeout());
-                for (auto& [cfd, cconn] : m_clients)
+                for (int cfd : m_active_fds)
                 {
-                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    auto* cconn = m_conn_idx[cfd];
+                    if (cconn && !cconn->closing && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
@@ -750,21 +1050,35 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
     }
 }
 
+// Remove fd from active list using swap-erase (O(1) amortized)
+static inline void server_instance_remove_active_fd(std::vector<int>& fds, int fd)
+{
+    for (size_t i = 0; i < fds.size(); i++)
+    {
+        if (fds[i] == fd)
+        {
+            fds[i] = fds.back();
+            fds.pop_back();
+            return;
+        }
+    }
+}
+
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
 {
     int client_fd = cqe->res;
 
-    if (client_fd >= 0)
+    if (SOCKETLEY_LIKELY(client_fd >= 0))
     {
         // Reject fds beyond our O(1) lookup table — they'd become zombie connections
-        if (client_fd >= MAX_FDS)
+        if (SOCKETLEY_UNLIKELY(client_fd >= MAX_FDS))
         {
             close(client_fd);
             goto resubmit_accept;
         }
 
         // Max connections check
-        if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
+        if (SOCKETLEY_UNLIKELY(get_max_connections() > 0 && m_clients.size() >= get_max_connections()))
         {
             close(client_fd);
             goto resubmit_accept;
@@ -773,22 +1087,27 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         int opt = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        auto conn = std::make_unique<server_connection>();
-        conn->fd = client_fd;
+        // Larger socket receive buffer reduces kernel-to-user copies
+        int rcvbuf = 131072;  // 128KB
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        auto conn = pool_acquire(client_fd);
         conn->partial.reserve(8192);
-        conn->read_req = { op_read, client_fd, conn->read_buf, sizeof(conn->read_buf), this };
+        conn->read_req = { op_read, client_fd, conn->read_buf, server_connection::READ_BUF_SIZE, this };
         conn->write_req = { op_write, client_fd, nullptr, 0, this };
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
-        if (client_fd < MAX_FDS)
-            m_conn_idx[client_fd] = ptr;
+        m_conn_idx[client_fd] = ptr;
+        m_active_fds.push_back(client_fd);
 
-        ptr->last_activity = std::chrono::steady_clock::now();
+        auto accept_now = std::chrono::steady_clock::now();
+        ptr->last_activity = accept_now;
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
-        if (m_clients.size() > m_stat_peak_connections)
-            m_stat_peak_connections = static_cast<uint32_t>(m_clients.size());
+        auto current_size = static_cast<uint32_t>(m_clients.size());
+        if (current_size > m_stat_peak_connections)
+            m_stat_peak_connections = current_size;
 
         // Initialize rate limiting
         double rl = get_rate_limit();
@@ -796,7 +1115,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         {
             ptr->rl_max = rl;
             ptr->rl_tokens = rl;
-            ptr->rl_last = std::chrono::steady_clock::now();
+            ptr->rl_last = accept_now;
         }
 
         // Check per-IP auth failure rate (master mode only)
@@ -814,7 +1133,13 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
                 else if (it->second.failures >= 10)
                 {
                     if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-                    m_clients.erase(client_fd);
+                    server_instance_remove_active_fd(m_active_fds, client_fd);
+                    auto cit = m_clients.find(client_fd);
+                    if (cit != m_clients.end())
+                    {
+                        pool_release(std::move(cit->second));
+                        m_clients.erase(cit);
+                    }
                     shutdown(client_fd, SHUT_RDWR);
                     close(client_fd);
                     goto resubmit_accept;
@@ -823,10 +1148,16 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         }
 
         // on_auth fires before on_connect; a rejected client never triggers on_connect
-        if (!invoke_on_auth(client_fd))
+        if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
         {
             if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-            m_clients.erase(client_fd);
+            server_instance_remove_active_fd(m_active_fds, client_fd);
+            auto cit = m_clients.find(client_fd);
+            if (cit != m_clients.end())
+            {
+                pool_release(std::move(cit->second));
+                m_clients.erase(cit);
+            }
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
             goto resubmit_accept;
@@ -835,14 +1166,16 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         invoke_on_connect(client_fd);
 
         ptr->read_pending = true;
-        if (m_use_provided_bufs)
+        if (m_recv_multishot)
+            m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
+        else if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
-            m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+            m_loop->submit_read(client_fd, ptr->read_buf, server_connection::READ_BUF_SIZE, &ptr->read_req);
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
-    if (client_fd == -EMFILE || client_fd == -ENFILE)
+    if (SOCKETLEY_UNLIKELY(client_fd == -EMFILE || client_fd == -ENFILE))
     {
         m_accept_backoff_ts.tv_sec = 0;
         m_accept_backoff_ts.tv_nsec = 100000000LL;
@@ -877,14 +1210,21 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
     auto* conn = m_conn_idx[fd];
-    if (!conn)
+    if (SOCKETLEY_UNLIKELY(!conn))
         return;
 
-    conn->read_pending = false;  // Read operation completed
+    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
-    bool is_provided = (req->type == op_read_provided);
+    // For multishot recv, the read remains pending as long as MORE flag is set
+    if (!is_multishot_recv)
+        conn->read_pending = false;
+    else if (!multishot_more)
+        conn->read_pending = false;
 
-    if (cqe->res <= 0)
+    bool is_provided = (req->type == op_read_provided || is_multishot_recv);
+
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
@@ -897,14 +1237,14 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
             return;
         }
 
         // Connection closed or error
-        if (fd == m_master_fd)
+        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
             m_master_fd = -1;
-        if (conn->write_pending)
+        if (conn->write_pending || conn->file_read_pending)
         {
             conn->closing = true;
         }
@@ -913,8 +1253,14 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
+            server_instance_remove_active_fd(m_active_fds, fd);
             close(fd);
-            m_clients.erase(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
         }
         return;
     }
@@ -927,7 +1273,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // Extract buffer ID from CQE flags
         uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
         char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-        if (buf_ptr)
+        if (SOCKETLEY_LIKELY(buf_ptr != nullptr))
         {
             conn->partial.append(buf_ptr, cqe->res);
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
@@ -938,25 +1284,50 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->partial.append(conn->read_buf, cqe->res);
     }
 
-    if (conn->partial.size() > server_connection::MAX_PARTIAL_SIZE)
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
     {
         conn->closing = true;
         goto submit_next_read;
     }
 
-    // WebSocket auto-detection
-    if (conn->ws == ws_unknown)
+    // Multi-protocol auto-detection
+    if (conn->proto == proto_unknown)
     {
         if (conn->partial.size() < 4)
             goto submit_next_read;
-        if (conn->partial[0] == 'G' && conn->partial[1] == 'E' &&
-            conn->partial[2] == 'T' && conn->partial[3] == ' ')
-            conn->ws = ws_upgrading;
+
+        char c0 = conn->partial[0], c1 = conn->partial[1];
+        char c2 = conn->partial[2], c3 = conn->partial[3];
+
+        // RESP2 wire protocol: starts with '*N', '$N', or '+A-Za-z'
+        if ((c0 == '*' && c1 >= '0' && c1 <= '9') ||
+            (c0 == '$' && c1 >= '0' && c1 <= '9') ||
+            (c0 == '+' && ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z'))))
+        {
+            conn->proto = proto_resp;
+        }
+        // HTTP methods → either WS upgrade or plain HTTP
+        else if ((c0 == 'G' && c1 == 'E' && c2 == 'T' && c3 == ' ') ||
+                 (c0 == 'P' && c1 == 'O' && c2 == 'S' && c3 == 'T') ||
+                 (c0 == 'P' && c1 == 'U' && c2 == 'T' && c3 == ' ') ||
+                 (c0 == 'H' && c1 == 'E' && c2 == 'A' && c3 == 'D') ||
+                 (c0 == 'D' && c1 == 'E' && c2 == 'L' && c3 == 'E') ||
+                 (c0 == 'P' && c1 == 'A' && c2 == 'T' && c3 == 'C') ||
+                 (c0 == 'O' && c1 == 'P' && c2 == 'T' && c3 == 'I'))
+        {
+            // GET might be WS upgrade — defer to header parse
+            if (c0 == 'G')
+                conn->proto = proto_ws_upgrading;
+            else
+                conn->proto = proto_http;
+        }
         else
-            conn->ws = ws_tcp;
+        {
+            conn->proto = proto_tcp;
+        }
     }
 
-    if (conn->ws == ws_upgrading)
+    if (conn->proto == proto_ws_upgrading)
     {
         auto hdr_end = conn->partial.find("\r\n\r\n");
         if (hdr_end == std::string::npos)
@@ -1041,44 +1412,30 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
             if (!has_upgrade || ws_key_pos == std::string_view::npos)
             {
-                if (!m_http_dir.empty())
-                {
-                    // Extract request path from "GET /path HTTP/1.1"
-                    std::string_view req_line(conn->partial.data(),
-                        std::min(conn->partial.find("\r\n"), conn->partial.size()));
-                    auto sp1 = req_line.find(' ');
-                    auto sp2 = (sp1 != std::string_view::npos)
-                                ? req_line.find(' ', sp1 + 1) : std::string_view::npos;
-                    if (sp1 != std::string_view::npos && sp2 != std::string_view::npos)
-                    {
-                        std::string_view path = req_line.substr(sp1 + 1, sp2 - sp1 - 1);
-                        conn->partial.clear();
-                        serve_http(conn, path);
-                        goto submit_next_read;
-                    }
-                }
-                conn->ws = ws_tcp;
-                conn->partial.clear();
-                goto submit_next_read;
+                // Not a WebSocket upgrade — treat as HTTP request
+                conn->proto = proto_http;
+                // Fall through to proto_http handler below
             }
+            else
+            {
+                std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
 
-            std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
+                // Send 101 response
+                auto resp_msg = std::make_shared<std::string>();
+                resp_msg->reserve(160);
+                ws_handshake_response_into(*resp_msg, ws_key);
+                conn->write_queue.push(std::move(resp_msg));
+                if (!conn->write_pending)
+                    flush_write_queue(conn);
 
-            // Send 101 response
-            auto resp_msg = std::make_shared<std::string>();
-            resp_msg->reserve(160);
-            ws_handshake_response_into(*resp_msg, ws_key);
-            conn->write_queue.push(std::move(resp_msg));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
-
-            conn->ws = ws_active;
-            invoke_on_websocket(conn->fd);
-            conn->partial.erase(0, hdr_end + 4);
+                conn->proto = proto_ws;
+                invoke_on_websocket(conn->fd);
+                conn->partial.erase(0, hdr_end + 4);
+            }
         }
     }
 
-    if (conn->ws == ws_active)
+    if (conn->proto == proto_ws)
     {
         // Parse WebSocket frames (in-place unmask, zero-alloc parse)
         ws_frame_view frame;
@@ -1095,24 +1452,16 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                         process_message(conn, payload);
                     break;
                 case WS_OP_PING:
-                {
-                    auto pong = std::make_shared<std::string>();
-                    ws_frame_pong_into(*pong, payload);
-                    conn->write_queue.push(std::move(pong));
+                    conn->write_queue.push(ws_frame_pong_shared(payload));
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     break;
-                }
                 case WS_OP_CLOSE:
-                {
-                    auto close_resp = std::make_shared<std::string>();
-                    ws_frame_close_into(*close_resp);
-                    conn->write_queue.push(std::move(close_resp));
+                    conn->write_queue.push(ws_frame_close_shared());
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     conn->closing = true;
                     break;
-                }
                 default:
                     break;
             }
@@ -1128,7 +1477,135 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         goto submit_next_read;
     }
 
-    // ws_tcp: existing newline-delimited parsing
+    // proto_http: full HTTP request handling
+    if (conn->proto == proto_http)
+    {
+        // Wait for complete headers
+        auto hdr_end = conn->partial.find("\r\n\r\n");
+        if (hdr_end == std::string::npos)
+        {
+            if (conn->partial.size() > 16384)
+            {
+                conn->closing = true;
+                goto submit_next_read;
+            }
+            goto submit_next_read;
+        }
+
+        // Extract request line
+        std::string_view full(conn->partial.data(), conn->partial.size());
+        auto first_crlf = full.find("\r\n");
+        std::string_view req_line = full.substr(0, first_crlf);
+        auto sp1 = req_line.find(' ');
+        auto sp2 = (sp1 != std::string_view::npos)
+                    ? req_line.find(' ', sp1 + 1) : std::string_view::npos;
+
+        if (sp1 == std::string_view::npos || sp2 == std::string_view::npos)
+        {
+            conn->closing = true;
+            goto submit_next_read;
+        }
+
+        http_request hreq;
+        hreq.method = req_line.substr(0, sp1);
+        std::string_view raw_path = req_line.substr(sp1 + 1, sp2 - sp1 - 1);
+        hreq.version = req_line.substr(sp2 + 1);
+        hreq.client_id = fd;
+
+        // Split path and query string
+        auto qpos = raw_path.find('?');
+        if (qpos != std::string_view::npos)
+        {
+            hreq.path = raw_path.substr(0, qpos);
+            hreq.query = raw_path.substr(qpos + 1);
+        }
+        else
+        {
+            hreq.path = raw_path;
+        }
+
+        // Parse headers + detect Content-Length
+        size_t content_length = 0;
+        {
+            size_t line_start = first_crlf + 2;
+            while (line_start < hdr_end)
+            {
+                size_t line_end = full.find("\r\n", line_start);
+                if (line_end == std::string_view::npos || line_end > hdr_end) break;
+                std::string_view line = full.substr(line_start, line_end - line_start);
+                auto colon = line.find(':');
+                if (colon != std::string_view::npos)
+                {
+                    std::string_view name = line.substr(0, colon);
+                    size_t vs = colon + 1;
+                    while (vs < line.size() && line[vs] == ' ') ++vs;
+                    std::string_view value = line.substr(vs);
+                    hreq.headers.emplace_back(name, value);
+
+                    if (fnv1a_lower(name) == fnv1a("content-length"))
+                        std::from_chars(value.data(), value.data() + value.size(), content_length);
+                }
+                line_start = line_end + 2;
+            }
+        }
+
+        size_t total_expected = hdr_end + 4 + content_length;
+        if (conn->partial.size() < total_expected)
+            goto submit_next_read;  // Need more body data
+
+        hreq.body = full.substr(hdr_end + 4, content_length);
+
+        handle_http_request(conn, hreq, total_expected);
+        goto submit_next_read;
+    }
+
+    // proto_resp: RESP2 wire protocol (reuses resp_parser from cache)
+    if (conn->proto == proto_resp)
+    {
+        static constexpr int MAX_RESP_ARGS = 64;
+        std::string_view args[MAX_RESP_ARGS];
+        int argc = 0;
+        size_t consumed = 0;
+        size_t offset = 0;
+
+        while (offset < conn->partial.size())
+        {
+            std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
+            auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
+
+            if (result == resp::parse_result::incomplete) break;
+            if (result == resp::parse_result::error)
+            {
+                conn->closing = true;
+                break;
+            }
+
+            offset += consumed;
+            if (argc > 0)
+            {
+                // Build a single-line representation for process_message
+                std::string cmd;
+                cmd.reserve(consumed);
+                for (int i = 0; i < argc; i++)
+                {
+                    if (i > 0) cmd += ' ';
+                    cmd.append(args[i]);
+                }
+                process_message(conn, cmd);
+            }
+        }
+
+        if (offset > 0)
+        {
+            if (offset >= conn->partial.size())
+                conn->partial.clear();
+            else
+                conn->partial.erase(0, offset);
+        }
+        goto submit_next_read;
+    }
+
+    // proto_tcp: existing newline-delimited parsing
     {
         size_t scan_from = 0;
         size_t pos;
@@ -1155,24 +1632,37 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
 submit_next_read:
-    // Only submit next read if connection is not closing
-    if (m_loop && !conn->closing)
+    // Only submit next read if connection is not closing and no file read pending
+    if (SOCKETLEY_LIKELY(m_loop && !conn->closing))
     {
-        conn->read_pending = true;
-        if (m_use_provided_bufs)
-            m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        else
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        // Don't resubmit socket read while async file read is in progress
+        if (!conn->read_pending && !conn->file_read_pending)
+        {
+            conn->read_pending = true;
+            if (m_recv_multishot)
+                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+            else if (m_use_provided_bufs)
+                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+            else
+                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+        }
     }
-    else if (conn->closing && !conn->write_pending)
+    else if (conn->closing && !conn->write_pending && !conn->file_read_pending)
     {
-        // No write in flight and closing — clean up now.
+        // No write or file read in flight and closing — clean up now.
         // (If write_pending, handle_write will clean up when write completes.)
+        // (If file_read_pending, handle_file_read will clean up when read completes.)
         unroute_client(fd);
         invoke_on_disconnect(fd);
         if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+        server_instance_remove_active_fd(m_active_fds, fd);
         close(fd);
-        m_clients.erase(fd);
+        auto it = m_clients.find(fd);
+        if (it != m_clients.end())
+        {
+            pool_release(std::move(it->second));
+            m_clients.erase(it);
+        }
     }
 }
 
@@ -1192,9 +1682,9 @@ static bool constant_time_eq(std::string_view a, std::string_view b)
 
 static constexpr uint8_t MAX_AUTH_FAILURES = 5;
 
-static bool check_rate_limit(server_connection* conn)
+static inline __attribute__((always_inline)) bool check_rate_limit(server_connection* conn)
 {
-    if (conn->rl_max <= 0)
+    if (SOCKETLEY_LIKELY(conn->rl_max <= 0))
         return true;
 
     auto now = std::chrono::steady_clock::now();
@@ -1221,8 +1711,8 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     if (!check_global_rate_limit())
         return;
 
-    // Check if this client is routed to a sub-server
-    if (sender)
+    // Check if this client is routed to a sub-server (cached flag avoids map lookup)
+    if (sender && SOCKETLEY_UNLIKELY(sender->routed))
     {
         auto rit = m_routes.find(sender->fd);
         if (rit != m_routes.end())
@@ -1251,7 +1741,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         invoke_on_client_message(sender->fd, msg);
 
     // Cache command interception: "cache <cmd>" → execute against linked cache, respond to sender only
-    if (sender && msg.size() > 6 && msg.starts_with("cache "))
+    if (SOCKETLEY_UNLIKELY(sender && msg.size() > 6 && msg[0] == 'c' && msg.starts_with("cache ")))
     {
         auto cname = get_cache_name();
         if (!cname.empty() && get_runtime_manager())
@@ -1305,10 +1795,11 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             }
             else
             {
-                auto relay_msg = std::make_shared<std::string>();
-                relay_msg->reserve(msg.size() + 1);
-                relay_msg->append(msg);
-                relay_msg->push_back('\n');
+                std::string buf;
+                buf.reserve(msg.size() + 1);
+                buf.append(msg);
+                buf.push_back('\n');
+                auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                 broadcast(relay_msg, sender ? sender->fd : -1);
             }
             break;
@@ -1389,10 +1880,11 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
                 if (!(lua() && lua()->has_on_message()))
                 {
-                    auto relay_msg = std::make_shared<std::string>();
-                    relay_msg->reserve(msg.size() + 1);
-                    relay_msg->append(msg);
-                    relay_msg->push_back('\n');
+                    std::string buf;
+                    buf.reserve(msg.size() + 1);
+                    buf.append(msg);
+                    buf.push_back('\n');
+                    auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                     broadcast(relay_msg, sender->fd);
                 }
                 break;
@@ -1404,13 +1896,14 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             {
                 char fd_buf[16];
                 auto [fd_end, fd_ec] = std::to_chars(fd_buf, fd_buf + sizeof(fd_buf), sender->fd);
-                auto fwd_msg = std::make_shared<std::string>();
-                fwd_msg->reserve(msg.size() + 16);
-                fwd_msg->push_back('[');
-                fwd_msg->append(fd_buf, fd_end - fd_buf);
-                fwd_msg->append("] ", 2);
-                fwd_msg->append(msg.data(), msg.size());
-                fwd_msg->push_back('\n');
+                std::string buf;
+                buf.reserve(msg.size() + 16);
+                buf.push_back('[');
+                buf.append(fd_buf, fd_end - fd_buf);
+                buf.append("] ", 2);
+                buf.append(msg.data(), msg.size());
+                buf.push_back('\n');
+                auto fwd_msg = std::make_shared<const std::string>(std::move(buf));
                 send_to(m_conn_idx[m_master_fd], fwd_msg);
             }
             // Non-master messages are silently dropped (not broadcast)
@@ -1423,22 +1916,24 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
 void server_instance::lua_broadcast(std::string_view msg)
 {
-    if (!m_loop)
+    if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
     invoke_on_send(msg);
 
-    if (m_udp)
+    if (SOCKETLEY_UNLIKELY(m_udp))
     {
         udp_broadcast(msg, nullptr);
         return;
     }
 
-    auto full_msg = std::make_shared<std::string>();
-    full_msg->reserve(msg.size() + 1);
-    full_msg->append(msg);
-    if (full_msg->empty() || full_msg->back() != '\n')
-        full_msg->push_back('\n');
+    // Build newline-terminated message (single allocation via make_shared)
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n')
+        buf.push_back('\n');
+    auto full_msg = std::make_shared<const std::string>(std::move(buf));
     broadcast(full_msg, -1);  // -1 = don't exclude anyone
 
     // Also send to forwarded clients through their parent servers
@@ -1459,23 +1954,26 @@ void server_instance::lua_broadcast(std::string_view msg)
 
 void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd)
 {
-    if (!m_loop)
+    if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
     std::shared_ptr<const std::string> ws_msg; // Lazy WS frame creation
 
-    for (auto& [fd, conn] : m_clients)
+    // Iterate over flat active_fds vector (cache-friendly, no hash overhead)
+    for (size_t i = 0; i < m_active_fds.size(); i++)
     {
-        if (fd == exclude_fd || conn->closing)
+        int fd = m_active_fds[i];
+        auto* conn = m_conn_idx[fd];
+        if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
-        if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+        if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE))
         {
             conn->closing = true;
             continue;
         }
 
-        if (conn->ws == ws_active)
+        if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
         {
             if (!ws_msg)
             {
@@ -1483,62 +1981,57 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
                 std::string_view payload(*msg);
                 if (!payload.empty() && payload.back() == '\n')
                     payload.remove_suffix(1);
-                auto framed = std::make_shared<std::string>();
-                framed->reserve(2 + payload.size());
-                ws_frame_text_into(*framed, payload);
-                ws_msg = std::move(framed);
+                ws_msg = ws_frame_text_shared(payload);
             }
             conn->write_queue.push(ws_msg);
             if (!conn->write_pending)
-                flush_write_queue(conn.get());
+                flush_write_queue(conn);
         }
         else
         {
             conn->write_queue.push(msg);
             if (!conn->write_pending)
-                flush_write_queue(conn.get());
+                flush_write_queue(conn);
         }
     }
 }
 
 void server_instance::send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg)
 {
-    if (!m_loop || conn->closing)
+    if (SOCKETLEY_UNLIKELY(!m_loop || conn->closing))
         return;
 
-    if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+    if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE))
     {
         conn->closing = true;
         return;
     }
 
-    if (conn->ws == ws_active)
+    if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
         // Strip trailing newline for WS frame
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
-        auto framed = std::make_shared<std::string>();
-        framed->reserve(2 + payload.size());
-        ws_frame_text_into(*framed, payload);
-        conn->write_queue.push(std::move(framed));
+        conn->write_queue.push(ws_frame_text_shared(payload));
     }
     else
     {
         conn->write_queue.push(msg);
     }
 
-    if (!conn->write_pending)
+    if (SOCKETLEY_LIKELY(!conn->write_pending))
         flush_write_queue(conn);
 }
 
 void server_instance::flush_write_queue(server_connection* conn)
 {
-    if (!m_loop || conn->write_queue.empty())
+    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
         return;
 
     // Coalesce up to MAX_WRITE_BATCH messages into a single writev
     uint32_t count = 0;
+    size_t total_bytes = 0;
     while (!conn->write_queue.empty() && count < server_connection::MAX_WRITE_BATCH)
     {
         conn->write_batch[count] = std::move(conn->write_queue.front());
@@ -1546,6 +2039,7 @@ void server_instance::flush_write_queue(server_connection* conn)
 
         conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
         conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
+        total_bytes += conn->write_batch[count]->size();
         count++;
     }
 
@@ -1554,10 +2048,22 @@ void server_instance::flush_write_queue(server_connection* conn)
 
     if (count == 1)
     {
-        // Single message — use plain write (lower overhead than writev)
-        conn->write_req.type = op_write;
-        m_loop->submit_write(conn->fd, conn->write_batch[0]->data(),
-            static_cast<uint32_t>(conn->write_batch[0]->size()), &conn->write_req);
+        auto len = static_cast<uint32_t>(conn->write_batch[0]->size());
+
+        // Use zero-copy send only for very large buffers (>= 512KB);
+        // the NOTIF CQE round-trip kills throughput for smaller writes
+        if (m_send_zc && len >= (512u << 10))
+        {
+            conn->zc_notif_pending = true;
+            conn->write_req.type = op_send_zc;
+            m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+        }
+        else
+        {
+            // Single message — use plain write (lower overhead than writev)
+            conn->write_req.type = op_write;
+            m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+        }
     }
     else
     {
@@ -1570,50 +2076,271 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
     auto* conn = m_conn_idx[fd];
-    if (!conn)
+    if (SOCKETLEY_UNLIKELY(!conn))
         return;
+
+    // Zero-copy send notification: buffer is now safe to release
+    if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
+    {
+        conn->zc_notif_pending = false;
+        // Release batch references now that kernel is done with buffers
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].reset();
+        conn->write_batch_count = 0;
+
+        // Drain queue if we were waiting for NOTIF
+        if (!conn->write_queue.empty() && !conn->write_pending)
+            flush_write_queue(conn);
+        else if (conn->write_queue.empty() && !conn->write_pending &&
+                 conn->closing && !conn->read_pending && !conn->file_read_pending)
+        {
+            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+                m_master_fd = -1;
+            unroute_client(fd);
+            invoke_on_disconnect(fd);
+            m_conn_idx[fd] = nullptr;
+            server_instance_remove_active_fd(m_active_fds, fd);
+            close(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
+        }
+        return;
+    }
 
     conn->write_pending = false;
 
-    // Release batch references
-    for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].reset();
-    conn->write_batch_count = 0;
-
-    if (cqe->res <= 0)
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        if (fd == m_master_fd)
+        // Release batch refs on error
+        if (!conn->zc_notif_pending)
+        {
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].reset();
+            conn->write_batch_count = 0;
+        }
+        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
             m_master_fd = -1;
         conn->closing = true;
-        if (!conn->read_pending)
+        if (!conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending)
         {
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
+            server_instance_remove_active_fd(m_active_fds, fd);
             close(fd);
-            m_clients.erase(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
         }
         return;
     }
 
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
+    // Short write handling: resubmit remaining bytes
+    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    {
+        size_t total_submitted = 0;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            total_submitted += conn->write_iovs[i].iov_len;
+
+        size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted)
+        {
+            // Advance past fully-written iovecs
+            size_t remaining = written;
+            uint32_t first_iov = 0;
+            for (; first_iov < conn->write_batch_count; first_iov++)
+            {
+                if (remaining < conn->write_iovs[first_iov].iov_len)
+                {
+                    conn->write_iovs[first_iov].iov_base =
+                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
+                    conn->write_iovs[first_iov].iov_len -= remaining;
+                    break;
+                }
+                remaining -= conn->write_iovs[first_iov].iov_len;
+            }
+
+            // Shift remaining iovecs and batch refs to front
+            uint32_t new_count = conn->write_batch_count - first_iov;
+            if (first_iov > 0)
+            {
+                for (uint32_t i = 0; i < new_count; i++)
+                {
+                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
+                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+                }
+                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+                    conn->write_batch[i].reset();
+            }
+            conn->write_batch_count = new_count;
+
+            conn->write_pending = true;
+            if (new_count == 1)
+            {
+                conn->write_req.type = op_write;
+                m_loop->submit_write(conn->fd,
+                    static_cast<const char*>(conn->write_iovs[0].iov_base),
+                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                    &conn->write_req);
+            }
+            else
+            {
+                conn->write_req.type = op_writev;
+                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            return;
+        }
+    }
+
+    // Full write completed — release batch
+    if (!conn->zc_notif_pending)
+    {
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].reset();
+        conn->write_batch_count = 0;
+    }
+
     // Check if more messages to send
-    if (!conn->write_queue.empty())
+    if (SOCKETLEY_LIKELY(!conn->write_queue.empty() && !conn->zc_notif_pending))
     {
         flush_write_queue(conn);
     }
     else
     {
-        if (conn->closing && !conn->read_pending)
+        if (conn->closing && !conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending)
         {
-            if (fd == m_master_fd)
+            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
                 m_master_fd = -1;
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
+            server_instance_remove_active_fd(m_active_fds, fd);
             close(fd);
-            m_clients.erase(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
+        }
+    }
+}
+
+void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req)
+{
+    int fd = req->fd;  // socket fd
+    auto* conn = m_conn_idx[fd];
+    if (SOCKETLEY_UNLIKELY(!conn))
+        return;
+
+    conn->file_read_pending = false;
+
+    // Close the file fd — we're done with it
+    if (conn->file_fd >= 0)
+    {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+    }
+
+    // Client disconnected during file read — just clean up
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+    {
+        free(conn->file_buf);
+        conn->file_buf = nullptr;
+        conn->file_size = 0;
+        if (!conn->write_pending && !conn->read_pending)
+        {
+            unroute_client(fd);
+            invoke_on_disconnect(fd);
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            server_instance_remove_active_fd(m_active_fds, fd);
+            close(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
+        }
+        return;
+    }
+
+    // Read error — send 404
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
+    {
+        free(conn->file_buf);
+        conn->file_buf = nullptr;
+        conn->file_size = 0;
+        conn->write_queue.push(http_404_response(conn->http_keep_alive));
+        if (!conn->write_pending)
+            flush_write_queue(conn);
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+        {
+            conn->proto = proto_unknown;
+            if (!conn->read_pending)
+            {
+                conn->read_pending = true;
+                if (m_recv_multishot)
+                    m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+                else if (m_use_provided_bufs)
+                    m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+                else
+                    m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            }
+        }
+        return;
+    }
+
+    // Success: build response from file content
+    std::string_view file_content(conn->file_buf, static_cast<size_t>(cqe->res));
+    std::string body;
+    if (conn->file_is_html)
+        body = inject_ws_script(file_content);
+
+    std::string_view resp_body = conn->file_is_html
+        ? std::string_view(body)
+        : file_content;
+
+    conn->write_queue.push(
+        std::make_shared<const std::string>(
+            build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
+
+    // Free file buffer
+    free(conn->file_buf);
+    conn->file_buf = nullptr;
+    conn->file_size = 0;
+
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+
+    if (!conn->http_keep_alive)
+    {
+        conn->closing = true;
+    }
+    else
+    {
+        conn->proto = proto_unknown;
+        // Resubmit socket read for next HTTP request
+        if (!conn->read_pending)
+        {
+            conn->read_pending = true;
+            if (m_recv_multishot)
+                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+            else if (m_use_provided_bufs)
+                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+            else
+                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
         }
     }
 }
@@ -1739,7 +2466,7 @@ server_instance::ws_headers_result server_instance::lua_ws_headers(int client_fd
 {
     if (client_fd < 0 || client_fd >= MAX_FDS) return {};
     const auto* conn = m_conn_idx[client_fd];
-    if (!conn || conn->ws != ws_active) return {};
+    if (!conn || conn->proto != proto_ws) return {};
     return {true, conn->ws_cookie, conn->ws_origin, conn->ws_protocol, conn->ws_auth};
 }
 
@@ -1755,11 +2482,12 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
         if (conn->closing)
             return;
 
-        auto full_msg = std::make_shared<std::string>();
-        full_msg->reserve(msg.size() + 1);
-        full_msg->append(msg);
-        if (full_msg->empty() || full_msg->back() != '\n')
-            full_msg->push_back('\n');
+        std::string buf;
+        buf.reserve(msg.size() + 1);
+        buf.append(msg);
+        if (buf.empty() || buf.back() != '\n')
+            buf.push_back('\n');
+        auto full_msg = std::make_shared<const std::string>(std::move(buf));
         send_to(conn, full_msg);
         return;
     }
@@ -1813,6 +2541,11 @@ bool server_instance::route_client(int client_fd, std::string_view target_name)
 
     auto* sub = static_cast<server_instance*>(target);
     m_routes[client_fd] = std::string(target_name);
+
+    // Update cached route flag on connection
+    if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd])
+        m_conn_idx[client_fd]->routed = true;
+
     sub->m_forwarded_clients[client_fd] = std::string(get_name());
     sub->invoke_on_connect(client_fd);
     return true;
@@ -1822,6 +2555,10 @@ bool server_instance::unroute_client(int client_fd)
 {
     auto it = m_routes.find(client_fd);
     if (it == m_routes.end()) return false;
+
+    // Clear cached route flag on connection
+    if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd])
+        m_conn_idx[client_fd]->routed = false;
 
     auto* mgr = get_runtime_manager();
     if (mgr)
@@ -1860,14 +2597,15 @@ void server_instance::remove_forwarded_client(int client_fd)
 
 void server_instance::send_to_client(int client_fd, std::string_view msg)
 {
-    if (client_fd < 0 || client_fd >= MAX_FDS || !m_conn_idx[client_fd]) return;
+    if (SOCKETLEY_UNLIKELY(client_fd < 0 || client_fd >= MAX_FDS || !m_conn_idx[client_fd])) return;
     auto* conn = m_conn_idx[client_fd];
-    if (conn->closing) return;
+    if (SOCKETLEY_UNLIKELY(conn->closing)) return;
 
-    auto shared = std::make_shared<std::string>();
-    shared->reserve(msg.size() + 1);
-    shared->append(msg);
-    if (shared->empty() || shared->back() != '\n') shared->push_back('\n');
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
+    auto shared = std::make_shared<const std::string>(std::move(buf));
     send_to(conn, shared);
 }
 
@@ -1923,11 +2661,7 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
 
 std::vector<int> server_instance::lua_clients() const
 {
-    std::vector<int> result;
-    result.reserve(m_clients.size());
-    for (const auto& [fd, _] : m_clients)
-        result.push_back(fd);
-    return result;
+    return m_active_fds;
 }
 
 void server_instance::lua_multicast(const std::vector<int>& fds, std::string_view msg)
@@ -2221,21 +2955,23 @@ void server_instance::lua_upstream_send(int conn_id, std::string_view msg)
     if (it == m_upstreams.end() || !it->second->connected)
         return;
 
-    auto shared = std::make_shared<std::string>();
-    shared->reserve(msg.size() + 1);
-    shared->append(msg);
-    if (shared->empty() || shared->back() != '\n')
-        shared->push_back('\n');
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n')
+        buf.push_back('\n');
+    auto shared = std::make_shared<const std::string>(std::move(buf));
     upstream_send(it->second.get(), std::move(shared));
 }
 
 void server_instance::lua_upstream_broadcast(std::string_view msg)
 {
-    auto shared = std::make_shared<std::string>();
-    shared->reserve(msg.size() + 1);
-    shared->append(msg);
-    if (shared->empty() || shared->back() != '\n')
-        shared->push_back('\n');
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n')
+        buf.push_back('\n');
+    auto shared = std::make_shared<const std::string>(std::move(buf));
     for (auto& [cid, uc] : m_upstreams)
     {
         if (uc->connected && !uc->closing)

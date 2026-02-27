@@ -6,8 +6,22 @@ source "$(dirname "$0")/utils.sh"
 
 HTTP_PORT=19020
 K6_DIR="${SCRIPT_DIR}/k6"
-HTTP_ROOT="${K6_DIR}/http-root"
+HTTP_ROOT_SRC="${K6_DIR}/http-root"
+HTTP_ROOT="$HTTP_ROOT_SRC"
 RESULTS_FILE="${RESULTS_DIR}/k6_http_${TIMESTAMP}.json"
+
+# When running under systemd, the daemon has ProtectHome=yes and runs as the
+# socketley user, so it cannot access paths under /home/.  Copy the http-root
+# to /tmp/ where the daemon can reach it.  Called after generate_large_bin so
+# the copy includes all generated assets.
+prepare_http_root() {
+    if [[ "$USE_SYSTEMD" -eq 1 ]]; then
+        HTTP_ROOT="/tmp/socketley_bench_http_root"
+        rm -rf "$HTTP_ROOT"
+        cp -a "$HTTP_ROOT_SRC" "$HTTP_ROOT"
+        chmod -R a+rX "$HTTP_ROOT"
+    fi
+}
 
 echo "[" > "$RESULTS_FILE"
 FIRST_RESULT=true
@@ -20,9 +34,10 @@ append_result() {
     fi
 }
 
-# Generate large.bin if missing (~100 KB)
+# Generate large.bin if missing (~100 KB) — always into the source dir so
+# the systemd-mode copy picks it up.
 generate_large_bin() {
-    local target="${HTTP_ROOT}/large.bin"
+    local target="${HTTP_ROOT_SRC}/large.bin"
     if [[ ! -f "$target" ]]; then
         log_info "Generating large.bin (100 KB)..."
         dd if=/dev/urandom of="$target" bs=1024 count=100 2>/dev/null
@@ -103,6 +118,8 @@ test_http_disk() {
 
     log_section "Test: k6 HTTP Static Serving (disk)"
 
+    socketley_cmd stop bench_k6_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_http 2>/dev/null
+    wait_for_port_free $HTTP_PORT
     socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" -s
     wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -132,6 +149,8 @@ test_http_cached() {
 
     log_section "Test: k6 HTTP Static Serving (--http-cache)"
 
+    socketley_cmd stop bench_k6_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_http 2>/dev/null
+    wait_for_port_free $HTTP_PORT
     socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" --http-cache -s
     wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -161,12 +180,18 @@ run_k6_http_benchmarks() {
 
     check_k6 || return 1
     generate_large_bin
+    prepare_http_root
 
     test_http_disk
     sleep 1
     test_http_cached
 
     echo "]" >> "$RESULTS_FILE"
+
+    # Clean up temp http-root copy (systemd mode)
+    if [[ "$USE_SYSTEMD" -eq 1 ]] && [[ -d "/tmp/socketley_bench_http_root" ]]; then
+        rm -rf "/tmp/socketley_bench_http_root"
+    fi
 
     log_section "k6 HTTP Benchmark Complete"
     log_success "Results saved to: $RESULTS_FILE"

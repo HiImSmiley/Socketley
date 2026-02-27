@@ -353,6 +353,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
+        case fnv1a("dashboard"):     return cmd_dashboard(conn);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -2376,6 +2377,24 @@ int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& 
 
     m_cluster = m_owned_cluster.get();
     m_manager.set_cluster_discovery(m_cluster);
+    return 0;
+}
+
+void daemon_handler::set_metrics_port(uint16_t port)
+{
+    m_metrics_port = port;
+}
+
+int daemon_handler::cmd_dashboard(ipc_connection* conn)
+{
+    if (m_metrics_port == 0)
+    {
+        conn->write_buf = "metrics endpoint not configured\n"
+            "add metrics_port = 9100 to socketley.conf to enable the dashboard\n";
+        return 1;
+    }
+
+    conn->write_buf = "Dashboard: http://127.0.0.1:" + std::to_string(m_metrics_port) + "/\n";
     return 0;
 }
 

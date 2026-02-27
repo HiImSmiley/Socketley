@@ -11,6 +11,7 @@
 #include "../cli/command_hashing.h"
 #include "../cli/runtime_type_parser.h"
 #include <iostream>
+#include <algorithm>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -25,11 +26,13 @@ lua_context::lua_context()
 {
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
                          sol::lib::math, sol::lib::os, sol::lib::io);
-}
 
-lua_context::~lua_context()
-{
-    *m_alive = false;
+    // Remove dangerous os functions — keep os.time, os.clock, os.date, os.difftime
+    m_lua["os"]["execute"] = sol::nil;
+    m_lua["os"]["remove"]  = sol::nil;
+    m_lua["os"]["rename"]  = sol::nil;
+    m_lua["os"]["tmpname"] = sol::nil;
+    m_lua["os"]["exit"]    = sol::nil;
 }
 
 // ─── lua_timer: heap-allocated one-shot / repeating timer via op_timeout ───
@@ -38,22 +41,52 @@ struct lua_timer : io_handler
     std::shared_ptr<bool> alive;
     sol::function         fn;
     event_loop*           loop{};
+    lua_context*          ctx{};
     struct __kernel_timespec ts{};
     io_request            req{};
     bool                  repeat{false};
 
     void on_cqe(struct io_uring_cqe* cqe) override
     {
-        if (!*alive || cqe->res == -ECANCELED) { delete this; return; }
+        if (!*alive || cqe->res == -ECANCELED)
+        {
+            if (ctx) ctx->unregister_timer(this);
+            delete this;
+            return;
+        }
         try { fn(); } catch (const sol::error& e) {
             fprintf(stderr, "[lua] timer error: %s\n", e.what());
         }
         if (repeat && *alive)
             loop->submit_timeout(&ts, &req);
         else
+        {
+            if (ctx) ctx->unregister_timer(this);
             delete this;
+        }
     }
 };
+
+lua_context::~lua_context()
+{
+    // Clear all timer sol::function refs BEFORE the Lua state is destroyed.
+    // This prevents luaL_unref on a closed state when the timer CQE fires.
+    for (auto* t : m_active_timers)
+        static_cast<lua_timer*>(t)->fn = sol::nil;
+    m_active_timers.clear();
+
+    *m_alive = false;
+}
+
+void lua_context::unregister_timer(void* t)
+{
+    auto it = std::find(m_active_timers.begin(), m_active_timers.end(), t);
+    if (it != m_active_timers.end())
+    {
+        *it = m_active_timers.back();
+        m_active_timers.pop_back();
+    }
+}
 
 static const char* state_to_string(runtime_state s)
 {
@@ -107,6 +140,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_upstream           = m_lua["on_upstream"];
     m_on_upstream_connect   = m_lua["on_upstream_connect"];
     m_on_upstream_disconnect = m_lua["on_upstream_disconnect"];
+    m_on_http_request       = m_lua["on_http_request"];
 
     // Build callback bitmask for O(1) has_on_*() checks
     m_callback_mask = 0;
@@ -134,6 +168,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_upstream.valid())           m_callback_mask |= CB_ON_UPSTREAM;
     if (m_on_upstream_connect.valid())   m_callback_mask |= CB_ON_UPSTREAM_CONNECT;
     if (m_on_upstream_disconnect.valid()) m_callback_mask |= CB_ON_UPSTREAM_DISCONNECT;
+    if (m_on_http_request.valid())       m_callback_mask |= CB_ON_HTTP_REQUEST;
 
     return true;
 }
@@ -493,9 +528,11 @@ void lua_context::register_bindings(runtime_instance* owner)
         t->alive  = m_alive;
         t->fn     = std::move(fn);
         t->loop   = loop;
+        t->ctx    = this;
         t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
         t->req    = { op_timeout, -1, nullptr, 0, t };
         t->repeat = false;
+        m_active_timers.push_back(t);
         loop->submit_timeout(&t->ts, &t->req);
     };
 
@@ -507,9 +544,11 @@ void lua_context::register_bindings(runtime_instance* owner)
         t->alive  = m_alive;
         t->fn     = std::move(fn);
         t->loop   = loop;
+        t->ctx    = this;
         t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
         t->req    = { op_timeout, -1, nullptr, 0, t };
         t->repeat = true;
+        m_active_timers.push_back(t);
         loop->submit_timeout(&t->ts, &t->req);
     };
 

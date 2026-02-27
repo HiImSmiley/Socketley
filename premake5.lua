@@ -4,6 +4,22 @@ workspace "Socketley"
     platforms { "x64" }
     location "make"
 
+    -- Workspace-wide Release hardening (applies to ALL projects)
+    filter "configurations:Release"
+        optimize "Full"
+        buildoptions {
+            "-flto=auto",
+            "-fstack-protector-strong",
+            "-D_FORTIFY_SOURCE=2",
+            "-fvisibility=hidden"
+        }
+        linkoptions {
+            "-flto=auto",
+            "-Wl,-z,relro,-z,now",
+            "-Wl,--as-needed"
+        }
+    filter {}
+
 project "socketley"
     kind "ConsoleApp"
     language "C++"
@@ -43,7 +59,7 @@ project "socketley"
 
     filter "configurations:Release"
         defines { "NDEBUG", "RELEASE" }
-        optimize "On"
+        optimize "Full"
         staticruntime "Off"
     filter {}
 
@@ -95,7 +111,7 @@ project "socketley_sdk"
 
     filter "configurations:Release"
         defines { "NDEBUG", "RELEASE" }
-        optimize "On"
+        optimize "Full"
         staticruntime "Off"
     filter {}
 
@@ -145,7 +161,7 @@ project "socketley_sdk_nolua"
 
     filter "configurations:Release"
         defines { "NDEBUG", "RELEASE" }
-        optimize "On"
+        optimize "Full"
         staticruntime "Off"
     filter {}
 
@@ -181,7 +197,7 @@ project "test_command_hashing"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -220,7 +236,7 @@ project "test_cache_store"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -253,7 +269,7 @@ project "test_resp_parser"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -286,7 +302,7 @@ project "test_name_resolver"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -326,7 +342,7 @@ project "test_managed_runtime"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -361,7 +377,7 @@ project "test_ws_parser"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -391,7 +407,7 @@ project "test_sdk_control"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -423,7 +439,7 @@ project "socketley_bench"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -462,7 +478,7 @@ project "test_sdk_engine"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -492,7 +508,7 @@ project "test_sdk_ws_client"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"
@@ -522,7 +538,7 @@ project "test_sdk_cache_client"
 
     filter "configurations:Release"
         defines { "NDEBUG" }
-        optimize "On"
+        optimize "Full"
     filter {}
 
     filter "configurations:Sanitize"

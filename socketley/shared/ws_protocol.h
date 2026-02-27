@@ -3,19 +3,43 @@
 #include <string_view>
 #include <cstdint>
 #include <cstring>
-#include <openssl/sha.h>
+#include <memory>
 #include <openssl/evp.h>
 
+// SSE2 is baseline for x86-64; AVX2 is optional
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define WS_HAS_SSE2 1
+#if defined(__AVX2__)
+#define WS_HAS_AVX2 1
+#else
+#define WS_HAS_AVX2 0
+#endif
+#else
+#define WS_HAS_SSE2 0
+#define WS_HAS_AVX2 0
+#endif
+
 // WebSocket frame opcodes
-constexpr uint8_t WS_OP_TEXT  = 0x1;
-constexpr uint8_t WS_OP_CLOSE = 0x8;
-constexpr uint8_t WS_OP_PING  = 0x9;
-constexpr uint8_t WS_OP_PONG  = 0xA;
+constexpr uint8_t WS_OP_CONT   = 0x0;
+constexpr uint8_t WS_OP_TEXT   = 0x1;
+constexpr uint8_t WS_OP_BINARY = 0x2;
+constexpr uint8_t WS_OP_CLOSE  = 0x8;
+constexpr uint8_t WS_OP_PING   = 0x9;
+constexpr uint8_t WS_OP_PONG   = 0xA;
 
 // Max payload size (16 MB) to prevent memory exhaustion
 constexpr uint64_t WS_MAX_PAYLOAD = 16 * 1024 * 1024;
 
 static constexpr const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// Pre-computed close frame (1000 normal closure) -- 4 bytes, never changes
+static constexpr char WS_CLOSE_FRAME_DATA[4] = {
+    static_cast<char>(0x80 | WS_OP_CLOSE), // FIN + close
+    2,                                       // payload = 2 bytes
+    static_cast<char>(0x03),                 // 1000 >> 8
+    static_cast<char>(0xE8)                  // 1000 & 0xFF
+};
 
 struct ws_frame
 {
@@ -24,21 +48,131 @@ struct ws_frame
     size_t consumed;
 };
 
-// Compute Sec-WebSocket-Accept from client key
+// ─── SIMD / widened XOR unmask helpers ───
+
+// Unmask payload in-place using the fastest available method.
+// mask32 is the 4-byte mask key as a uint32_t (native byte order).
+inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
+{
+    const uint8_t* mask_bytes = reinterpret_cast<const uint8_t*>(&mask32);
+
+#if WS_HAS_AVX2
+    // AVX2 path: 32 bytes per iteration
+    if (len >= 32)
+    {
+        // Broadcast 4-byte mask to 32 bytes
+        __m256i mask_vec = _mm256_set1_epi32(static_cast<int>(mask32));
+        size_t i = 0;
+        for (; i + 32 <= len; i += 32)
+        {
+            __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(payload + i));
+            data = _mm256_xor_si256(data, mask_vec);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(payload + i), data);
+        }
+        // Handle 16-byte remainder with SSE2
+        for (; i + 16 <= len; i += 16)
+        {
+            __m128i mask128 = _mm_set1_epi32(static_cast<int>(mask32));
+            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(payload + i));
+            data = _mm_xor_si128(data, mask128);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(payload + i), data);
+        }
+        // Handle 8-byte remainder with uint64_t
+        uint64_t mask64 = (static_cast<uint64_t>(mask32) << 32) | mask32;
+        for (; i + 8 <= len; i += 8)
+        {
+            uint64_t chunk;
+            std::memcpy(&chunk, payload + i, 8);
+            chunk ^= mask64;
+            std::memcpy(payload + i, &chunk, 8);
+        }
+        // Tail bytes
+        for (; i < len; i++)
+            payload[i] ^= mask_bytes[i & 3];
+        return;
+    }
+#endif
+
+#if WS_HAS_SSE2
+    // SSE2 path: 16 bytes per iteration
+    if (len >= 16)
+    {
+        __m128i mask_vec = _mm_set1_epi32(static_cast<int>(mask32));
+        size_t i = 0;
+        for (; i + 16 <= len; i += 16)
+        {
+            __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(payload + i));
+            data = _mm_xor_si128(data, mask_vec);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(payload + i), data);
+        }
+        // Handle 8-byte remainder with uint64_t
+        uint64_t mask64 = (static_cast<uint64_t>(mask32) << 32) | mask32;
+        for (; i + 8 <= len; i += 8)
+        {
+            uint64_t chunk;
+            std::memcpy(&chunk, payload + i, 8);
+            chunk ^= mask64;
+            std::memcpy(payload + i, &chunk, 8);
+        }
+        // Tail bytes
+        for (; i < len; i++)
+            payload[i] ^= mask_bytes[i & 3];
+        return;
+    }
+#endif
+
+    // Scalar fallback: uint64_t-widened XOR
+    uint64_t mask64 = (static_cast<uint64_t>(mask32) << 32) | mask32;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8)
+    {
+        uint64_t chunk;
+        std::memcpy(&chunk, payload + i, 8);
+        chunk ^= mask64;
+        std::memcpy(payload + i, &chunk, 8);
+    }
+    for (; i < len; i++)
+        payload[i] ^= mask_bytes[i & 3];
+}
+
+// ─── SHA-1 for WS accept key (EVP API, no deprecated calls) ───
+
+// Compute Sec-WebSocket-Accept from client key.
+// Uses EVP_Digest (non-deprecated single-call API) + stack buffer.
+// RFC 6455 keys are always 24 bytes, but we handle up to 88 bytes safely.
 inline std::string ws_accept_key(std::string_view client_key)
 {
+    // Stack fast path (covers all valid WS keys: 24 + 36 = 60 bytes)
+    constexpr size_t STACK_LIMIT = 92; // 128 - 36 GUID = 92 max key
+    if (client_key.size() <= STACK_LIMIT)
+    {
+        char combined[128];
+        std::memcpy(combined, client_key.data(), client_key.size());
+        std::memcpy(combined + client_key.size(), WS_GUID, 36);
+
+        unsigned char sha1_hash[EVP_MAX_MD_SIZE];
+        unsigned int hash_len = 0;
+        EVP_Digest(combined, client_key.size() + 36, sha1_hash, &hash_len,
+                   EVP_sha1(), nullptr);
+
+        char b64[32];
+        EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
+        return std::string(b64);
+    }
+
+    // Heap fallback for oversized keys (shouldn't happen per RFC)
     std::string combined;
     combined.reserve(client_key.size() + 36);
     combined.append(client_key);
-    combined.append(WS_GUID);
+    combined.append(WS_GUID, 36);
 
-    unsigned char sha1_hash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char*>(combined.data()),
-         combined.size(), sha1_hash);
+    unsigned char sha1_hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+    EVP_Digest(combined.data(), combined.size(), sha1_hash, &hash_len,
+               EVP_sha1(), nullptr);
 
-    // Base64 encode (SHA1 = 20 bytes -> 28 chars base64 + null)
     char b64[32];
-    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, SHA_DIGEST_LENGTH);
+    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
     return std::string(b64);
 }
 
@@ -57,38 +191,44 @@ inline std::string ws_handshake_response(std::string_view client_key)
     return resp;
 }
 
-// Create text frame (server->client, unmasked)
-inline std::string ws_frame_text(std::string_view payload)
-{
-    std::string frame;
-    size_t len = payload.size();
+// ─── Frame encoding (stack-buffer headers, memcpy payload) ───
 
-    if (len <= 125)
+// Write WS frame header into hdr[]. Returns header length (2, 4, or 10).
+// opcode should already include FIN bit (e.g. 0x81 for FIN+text).
+inline int ws_write_header(char* hdr, uint8_t opcode_with_fin, size_t payload_len)
+{
+    hdr[0] = static_cast<char>(opcode_with_fin);
+    if (payload_len <= 125)
     {
-        frame.resize(2 + len);
-        frame[0] = static_cast<char>(0x81); // FIN + text
-        frame[1] = static_cast<char>(len);
-        std::memcpy(&frame[2], payload.data(), len);
+        hdr[1] = static_cast<char>(payload_len);
+        return 2;
     }
-    else if (len <= 65535)
+    else if (payload_len <= 65535)
     {
-        frame.resize(4 + len);
-        frame[0] = static_cast<char>(0x81);
-        frame[1] = static_cast<char>(126);
-        frame[2] = static_cast<char>((len >> 8) & 0xFF);
-        frame[3] = static_cast<char>(len & 0xFF);
-        std::memcpy(&frame[4], payload.data(), len);
+        hdr[1] = static_cast<char>(126);
+        hdr[2] = static_cast<char>((payload_len >> 8) & 0xFF);
+        hdr[3] = static_cast<char>(payload_len & 0xFF);
+        return 4;
     }
     else
     {
-        frame.resize(10 + len);
-        frame[0] = static_cast<char>(0x81);
-        frame[1] = static_cast<char>(127);
+        hdr[1] = static_cast<char>(127);
         for (int i = 0; i < 8; i++)
-            frame[2 + i] = static_cast<char>((len >> (56 - 8 * i)) & 0xFF);
-        std::memcpy(&frame[10], payload.data(), len);
+            hdr[2 + i] = static_cast<char>((payload_len >> (56 - 8 * i)) & 0xFF);
+        return 10;
     }
+}
 
+// Create text frame (server->client, unmasked)
+inline std::string ws_frame_text(std::string_view payload)
+{
+    char hdr[14]; // max WS header = 14 bytes (10 + 4 mask, but server doesn't mask)
+    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+
+    std::string frame;
+    frame.resize(static_cast<size_t>(hdr_len) + payload.size());
+    std::memcpy(frame.data(), hdr, static_cast<size_t>(hdr_len));
+    std::memcpy(frame.data() + hdr_len, payload.data(), payload.size());
     return frame;
 }
 
@@ -100,7 +240,7 @@ inline std::string ws_frame_pong(std::string_view payload)
         payload = payload.substr(0, 125);
     std::string frame;
     frame.resize(2 + payload.size());
-    frame[0] = static_cast<char>(0x80 | WS_OP_PONG); // FIN + pong
+    frame[0] = static_cast<char>(0x80 | WS_OP_PONG);
     frame[1] = static_cast<char>(payload.size());
     if (!payload.empty())
         std::memcpy(&frame[2], payload.data(), payload.size());
@@ -110,13 +250,10 @@ inline std::string ws_frame_pong(std::string_view payload)
 // Create close frame with 1000 (normal closure) status code
 inline std::string ws_frame_close()
 {
-    std::string frame(4, '\0');
-    frame[0] = static_cast<char>(0x80 | WS_OP_CLOSE); // FIN + close
-    frame[1] = 2;                                       // payload = 2 bytes (status code)
-    frame[2] = static_cast<char>(0x03);                 // 1000 >> 8
-    frame[3] = static_cast<char>(0xE8);                 // 1000 & 0xFF
-    return frame;
+    return std::string(WS_CLOSE_FRAME_DATA, 4);
 }
+
+// ─── Frame parsing ───
 
 // Parse one frame from buffer. Returns false if incomplete.
 // Handles masked client frames (RFC 6455 requires clients to mask).
@@ -153,11 +290,11 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     if (payload_len > WS_MAX_PAYLOAD)
         return false;
 
-    // Reject control frames with payload > 125 (RFC 6455 §5.5)
+    // Reject control frames with payload > 125 (RFC 6455 5.5)
     if (out.opcode >= 0x8 && payload_len > 125)
         return false;
 
-    // Reject fragmented frames (FIN=0) — we don't support reassembly
+    // Reject fragmented frames (FIN=0) -- we don't support reassembly
     if (!fin)
         return false;
 
@@ -166,15 +303,16 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     if (len < total)
         return false;
 
-    const uint8_t* mask_key = masked ?
-        reinterpret_cast<const uint8_t*>(data + header_size) : nullptr;
     const char* payload_start = data + header_size + mask_size;
 
     out.payload.resize(payload_len);
     if (masked)
     {
-        for (uint64_t i = 0; i < payload_len; i++)
-            out.payload[i] = payload_start[i] ^ mask_key[i & 3];
+        // Copy then unmask in-place using widened/SIMD XOR
+        std::memcpy(out.payload.data(), payload_start, payload_len);
+        uint32_t mask32;
+        std::memcpy(&mask32, data + header_size, 4);
+        ws_unmask_payload(out.payload.data(), payload_len, mask32);
     }
     else
     {
@@ -185,7 +323,7 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     return true;
 }
 
-// Zero-alloc frame view — points into the (now unmasked) input buffer
+// Zero-alloc frame view -- points into the (now unmasked) input buffer
 struct ws_frame_view
 {
     uint8_t opcode;
@@ -194,8 +332,8 @@ struct ws_frame_view
     size_t consumed;
 };
 
-// In-place unmask parse — modifies data buffer, sets view pointers into it.
-// Uses uint64_t-widened XOR for ~4-8x fewer mask iterations.
+// In-place unmask parse -- modifies data buffer, sets view pointers into it.
+// Uses SIMD (AVX2/SSE2) or uint64_t-widened XOR for fast unmasking.
 inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
 {
     if (len < 2)
@@ -244,23 +382,9 @@ inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
 
     if (masked)
     {
-        const uint8_t* mask_key = reinterpret_cast<const uint8_t*>(data + header_size);
-
-        // Replicate 4-byte mask to 8 bytes for widened XOR
         uint32_t mask32;
-        std::memcpy(&mask32, mask_key, 4);
-        uint64_t mask64 = (static_cast<uint64_t>(mask32) << 32) | mask32;
-
-        size_t i = 0;
-        for (; i + 8 <= payload_len; i += 8)
-        {
-            uint64_t chunk;
-            std::memcpy(&chunk, payload_start + i, 8);
-            chunk ^= mask64;
-            std::memcpy(payload_start + i, &chunk, 8);
-        }
-        for (; i < payload_len; i++)
-            payload_start[i] ^= mask_key[i & 3];
+        std::memcpy(&mask32, data + header_size, 4);
+        ws_unmask_payload(payload_start, payload_len, mask32);
     }
 
     out.payload_ptr = payload_start;
@@ -269,38 +393,18 @@ inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
     return true;
 }
 
+// ─── Append-to-buffer variants (zero intermediate allocation) ───
+
 // Append text frame directly into buf (no intermediate allocation)
 inline void ws_frame_text_into(std::string& buf, std::string_view payload)
 {
-    size_t len = payload.size();
-    if (len <= 125)
-    {
-        size_t off = buf.size();
-        buf.resize(off + 2 + len);
-        buf[off]     = static_cast<char>(0x81);
-        buf[off + 1] = static_cast<char>(len);
-        std::memcpy(&buf[off + 2], payload.data(), len);
-    }
-    else if (len <= 65535)
-    {
-        size_t off = buf.size();
-        buf.resize(off + 4 + len);
-        buf[off]     = static_cast<char>(0x81);
-        buf[off + 1] = static_cast<char>(126);
-        buf[off + 2] = static_cast<char>((len >> 8) & 0xFF);
-        buf[off + 3] = static_cast<char>(len & 0xFF);
-        std::memcpy(&buf[off + 4], payload.data(), len);
-    }
-    else
-    {
-        size_t off = buf.size();
-        buf.resize(off + 10 + len);
-        buf[off]     = static_cast<char>(0x81);
-        buf[off + 1] = static_cast<char>(127);
-        for (int i = 0; i < 8; i++)
-            buf[off + 2 + i] = static_cast<char>((len >> (56 - 8 * i)) & 0xFF);
-        std::memcpy(&buf[off + 10], payload.data(), len);
-    }
+    char hdr[14];
+    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+
+    size_t off = buf.size();
+    buf.resize(off + static_cast<size_t>(hdr_len) + payload.size());
+    std::memcpy(&buf[off], hdr, static_cast<size_t>(hdr_len));
+    std::memcpy(&buf[off + hdr_len], payload.data(), payload.size());
 }
 
 // Append pong frame directly into buf
@@ -320,28 +424,38 @@ inline void ws_frame_pong_into(std::string& buf, std::string_view payload)
 inline void ws_frame_close_into(std::string& buf)
 {
     size_t off = buf.size();
-    buf.resize(off + 4, '\0');
-    buf[off]     = static_cast<char>(0x80 | WS_OP_CLOSE);
-    buf[off + 1] = 2;
-    buf[off + 2] = static_cast<char>(0x03);
-    buf[off + 3] = static_cast<char>(0xE8);
+    buf.resize(off + 4);
+    std::memcpy(&buf[off], WS_CLOSE_FRAME_DATA, 4);
 }
 
-// Compute Sec-WebSocket-Accept and append to buf (no intermediate string)
+// Compute Sec-WebSocket-Accept and append to buf (no intermediate string).
+// Uses EVP_Digest (single-call, non-deprecated) instead of SHA_CTX.
 inline void ws_accept_key_into(std::string& buf, std::string_view client_key)
 {
-    unsigned char sha1_hash[SHA_DIGEST_LENGTH];
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    SHA_CTX sha_ctx;
-    SHA1_Init(&sha_ctx);
-    SHA1_Update(&sha_ctx, client_key.data(), client_key.size());
-    SHA1_Update(&sha_ctx, WS_GUID, 36);
-    SHA1_Final(sha1_hash, &sha_ctx);
-#pragma GCC diagnostic pop
+    constexpr size_t STACK_LIMIT = 92;
+    unsigned char sha1_hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    if (client_key.size() <= STACK_LIMIT)
+    {
+        char combined[128];
+        std::memcpy(combined, client_key.data(), client_key.size());
+        std::memcpy(combined + client_key.size(), WS_GUID, 36);
+        EVP_Digest(combined, client_key.size() + 36, sha1_hash, &hash_len,
+                   EVP_sha1(), nullptr);
+    }
+    else
+    {
+        std::string combined;
+        combined.reserve(client_key.size() + 36);
+        combined.append(client_key);
+        combined.append(WS_GUID, 36);
+        EVP_Digest(combined.data(), combined.size(), sha1_hash, &hash_len,
+                   EVP_sha1(), nullptr);
+    }
 
     char b64[32];
-    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, SHA_DIGEST_LENGTH);
+    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
     buf.append(b64);
 }
 
@@ -354,4 +468,41 @@ inline void ws_handshake_response_into(std::string& buf, std::string_view client
            "Sec-WebSocket-Accept: ";
     ws_accept_key_into(buf, client_key);
     buf += "\r\n\r\n";
+}
+
+// ─── Broadcast helpers (encode once, share across all clients) ───
+
+// Create a pre-encoded WS text frame as a shared_ptr for broadcast.
+// Encodes the frame once; all recipients share the same buffer (zero-copy on send).
+inline std::shared_ptr<const std::string> ws_frame_text_shared(std::string_view payload)
+{
+    char hdr[14];
+    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+
+    auto frame = std::make_shared<std::string>();
+    frame->resize(static_cast<size_t>(hdr_len) + payload.size());
+    std::memcpy(frame->data(), hdr, static_cast<size_t>(hdr_len));
+    std::memcpy(frame->data() + hdr_len, payload.data(), payload.size());
+    return frame;
+}
+
+// Create a pre-encoded WS pong frame as a shared_ptr
+inline std::shared_ptr<const std::string> ws_frame_pong_shared(std::string_view payload)
+{
+    if (payload.size() > 125)
+        payload = payload.substr(0, 125);
+    auto frame = std::make_shared<std::string>();
+    frame->resize(2 + payload.size());
+    (*frame)[0] = static_cast<char>(0x80 | WS_OP_PONG);
+    (*frame)[1] = static_cast<char>(payload.size());
+    if (!payload.empty())
+        std::memcpy(frame->data() + 2, payload.data(), payload.size());
+    return frame;
+}
+
+// Pre-computed close frame shared_ptr (singleton, never reallocated)
+inline const std::shared_ptr<const std::string>& ws_frame_close_shared()
+{
+    static const auto frame = std::make_shared<const std::string>(WS_CLOSE_FRAME_DATA, 4);
+    return frame;
 }

@@ -135,6 +135,11 @@ static int tcp_connect(const char *host, int port)
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+    /* 10-second receive timeout prevents benchmark from hanging
+     * if the server stops sending responses */
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -462,6 +467,13 @@ static struct run_result bench_server_burst(struct bench_config *cfg)
 
     double connect_s = ns_to_s(connected - start);
     r.throughput = r.success / connect_s;
+
+    /* Let the server drain EOF CQEs from the closed connections before the
+       next run starts.  Without this, the server's io_uring event loop is
+       still processing teardowns when the next burst begins, and accept
+       latency jumps from ~10µs to ~215µs (27x slower). */
+    struct timespec drain = { .tv_sec = 1, .tv_nsec = 0 };
+    nanosleep(&drain, NULL);
 
     return r;
 }
@@ -981,14 +993,22 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     struct run_result r = {0};
     lat_init(&r.latencies, cfg->num_ops);
 
-    int fd = tcp_connect(cfg->host, cfg->port);
-    if (fd < 0) { r.failed = cfg->num_ops; return r; }
-
-    if (!ws_upgrade(fd, cfg->host, cfg->port)) {
-        close(fd);
-        r.failed = cfg->num_ops;
-        return r;
+    /* Connect + WS upgrade with retry.  After the previous run closes a
+       connection that had thousands of in-flight echo writes, the server's
+       io_uring ring is flooded with write-error CQEs.  The accept/read for
+       the next connection may be delayed or lost (CQ overflow), so retry
+       the handshake a few times with a brief pause. */
+    int fd = -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        fd = tcp_connect(cfg->host, cfg->port);
+        if (fd >= 0 && ws_upgrade(fd, cfg->host, cfg->port))
+            break;
+        if (fd >= 0) close(fd);
+        fd = -1;
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
+        nanosleep(&pause, NULL);
     }
+    if (fd < 0) { r.failed = cfg->num_ops; return r; }
 
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 64;
     char *payload = (char *)malloc(msize);
@@ -1023,6 +1043,10 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     double elapsed = ns_to_s(end - start);
     r.throughput = r.success / elapsed;
     r.throughput_mb = (r.success * (double)(frame_len)) / elapsed / (1024.0 * 1024.0);
+
+    /* Let the server drain echo-error CQEs before the next run. */
+    struct timespec drain = { .tv_sec = 0, .tv_nsec = 500000000 }; /* 500 ms */
+    nanosleep(&drain, NULL);
 
     return r;
 }

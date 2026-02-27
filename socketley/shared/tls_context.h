@@ -15,13 +15,23 @@ public:
     ~tls_context();
 
     // Initialize as server (accept connections)
-    bool init_server(std::string_view cert_path, std::string_view key_path);
+    // If client_ca is non-empty, enables mTLS (mutual TLS): clients must present a valid cert
+    bool init_server(std::string_view cert_path, std::string_view key_path,
+                     std::string_view client_ca = {});
 
     // Initialize as client (connect to server)
-    bool init_client(std::string_view ca_path = {});
+    // If client_cert/client_key are non-empty, presents a client certificate (for mTLS)
+    bool init_client(std::string_view ca_path = {},
+                     std::string_view client_cert = {},
+                     std::string_view client_key = {});
 
-    // Create a new SSL connection from this context
+    // Create a new SSL connection from this context (use create_ssl_server/client instead)
     SSL* create_ssl() const;
+
+    // Create SSL in server mode (calls SSL_set_accept_state)
+    SSL* create_ssl_server() const;
+    // Create SSL in client mode (calls SSL_set_connect_state)
+    SSL* create_ssl_client() const;
 
     // Accept a TLS handshake on an SSL object
     // Returns: 1 = complete, 0 = want more data, -1 = error

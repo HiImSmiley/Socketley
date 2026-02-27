@@ -11,9 +11,11 @@
 
 bool cache_store::has_type_conflict_for_string(std::string_view key) const
 {
-    if (!m_lists.empty() && m_lists.count(key)) return true;
-    if (!m_sets.empty() && m_sets.count(key)) return true;
-    if (!m_hashes.empty() && m_hashes.count(key)) return true;
+    // In typical workloads, lists/sets/hashes are empty or the key
+    // doesn't conflict. The empty() checks are O(1) fast-paths.
+    if (__builtin_expect(!m_lists.empty() && m_lists.count(key), 0)) return true;
+    if (__builtin_expect(!m_sets.empty() && m_sets.count(key), 0)) return true;
+    if (__builtin_expect(!m_hashes.empty() && m_hashes.count(key), 0)) return true;
     return false;
 }
 
@@ -45,19 +47,24 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
 
 bool cache_store::set(std::string_view key, std::string_view value)
 {
-    if (has_type_conflict_for_string(key))
-        return false;
-
-    if (auto it = m_data.find(key); it != m_data.end())
+    // Fast-path: key already exists as string (most common in benchmarks).
+    // Check m_data first — this avoids the type-conflict cross-map lookups.
+    auto it = m_data.find(key);
+    if (__builtin_expect(it != m_data.end(), 1))
     {
         track_sub(it->second.size());
-        it->second = value;
+        // Use assign() instead of operator= to potentially reuse existing allocation
+        it->second.assign(value.data(), value.size());
         track_add(value.size());
         touch_lru(key);
         return true;
     }
 
-    if (!check_memory(key.size() + value.size()))
+    // Slow path: new key — check type conflicts
+    if (__builtin_expect(has_type_conflict_for_string(key), 0))
+        return false;
+
+    if (__builtin_expect(!check_memory(key.size() + value.size()), 0))
         return false;
 
     m_data.emplace(std::string(key), std::string(value));
@@ -79,9 +86,55 @@ bool cache_store::get(std::string_view key, std::string& out) const
 const std::string* cache_store::get_ptr(std::string_view key) const
 {
     auto it = m_data.find(key);
-    if (it == m_data.end())
+    if (__builtin_expect(it == m_data.end(), 0))
         return nullptr;
+    // Prefetch the value string data — it's likely about to be read by encode_bulk_into
+    __builtin_prefetch(it->second.data(), 0, 1);
     const_cast<cache_store*>(this)->touch_lru(key);
+    return &it->second;
+}
+
+const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
+{
+    // Combined expiry check + get in minimal hash probes.
+    // For the common case (no expiry set, key exists), this does:
+    //   1. m_expiry.empty() check (O(1))
+    //   2. single m_data.find() probe
+    // Instead of check_expiry() + get_ptr() which does two m_data.find() probes.
+
+    if (__builtin_expect(!m_expiry.empty(), 0))
+    {
+        auto eit = m_expiry.find(key);
+        if (eit != m_expiry.end())
+        {
+            if (std::chrono::steady_clock::now() >= eit->second)
+            {
+                // Expired — remove
+                m_expiry.erase(eit);
+                auto sit = m_data.find(key);
+                if (sit != m_data.end())
+                {
+                    track_sub(sit->second.size());
+                    m_data.erase(sit);
+                }
+                else
+                {
+                    // Could be in lists/sets/hashes — clean up
+                    if (auto lit = m_lists.find(key); lit != m_lists.end()) m_lists.erase(lit);
+                    else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end()) m_sets.erase(eit2);
+                    else if (auto hit = m_hashes.find(key); hit != m_hashes.end()) m_hashes.erase(hit);
+                }
+                return nullptr;
+            }
+        }
+    }
+
+    auto it = m_data.find(key);
+    if (__builtin_expect(it == m_data.end(), 0))
+        return nullptr;
+    // Prefetch the value string data for encode_bulk_into
+    __builtin_prefetch(it->second.data(), 0, 1);
+    touch_lru(key);
     return &it->second;
 }
 
@@ -419,19 +472,20 @@ bool cache_store::persist(std::string_view key)
 
 void cache_store::check_expiry(std::string_view key)
 {
-    if (m_expiry.empty())
+    // Fast early-out: most workloads have no TTLs at all
+    if (__builtin_expect(m_expiry.empty(), 1))
         return;
 
     auto it = m_expiry.find(key);
-    if (it == m_expiry.end())
+    if (__builtin_expect(it == m_expiry.end(), 1))
         return;
 
-    if (std::chrono::steady_clock::now() < it->second)
+    if (__builtin_expect(std::chrono::steady_clock::now() < it->second, 1))
         return;
 
     // Expired — remove from all containers
     m_expiry.erase(it);
-    if (auto sit = m_data.find(key); sit != m_data.end()) { m_data.erase(sit); return; }
+    if (auto sit = m_data.find(key); sit != m_data.end()) { track_sub(sit->second.size()); m_data.erase(sit); return; }
     if (auto lit = m_lists.find(key); lit != m_lists.end()) { m_lists.erase(lit); return; }
     if (auto eit = m_sets.find(key); eit != m_sets.end()) { m_sets.erase(eit); return; }
     if (auto hit = m_hashes.find(key); hit != m_hashes.end()) { m_hashes.erase(hit); return; }
@@ -439,23 +493,19 @@ void cache_store::check_expiry(std::string_view key)
 
 std::vector<std::string> cache_store::sweep_expired()
 {
-    std::vector<std::string> expired_names;
-    if (m_expiry.empty())
-        return expired_names;
+    std::vector<std::string> expired;
+    if (__builtin_expect(m_expiry.empty(), 1))
+        return expired;
 
     auto now = std::chrono::steady_clock::now();
-    std::vector<std::string> expired;
     for (const auto& [key, tp] : m_expiry)
     {
         if (now >= tp)
             expired.push_back(key);
     }
     for (const auto& key : expired)
-    {
-        expired_names.push_back(key);
         del(key);
-    }
-    return expired_names;
+    return expired;
 }
 
 bool cache_store::set_expiry_ms(std::string_view key, int64_t ms)
@@ -636,10 +686,12 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
 
 bool cache_store::del(std::string_view key)
 {
-    m_expiry.erase(std::string(key));
+    // Use transparent find + erase-by-iterator to avoid allocating std::string(key)
+    if (auto eit = m_expiry.find(key); eit != m_expiry.end())
+        m_expiry.erase(eit);
 
-    // Remove from LRU
-    if (auto lit = m_lru_map.find(std::string(key)); lit != m_lru_map.end())
+    // Remove from LRU (transparent find avoids string allocation)
+    if (auto lit = m_lru_map.find(key); lit != m_lru_map.end())
     {
         m_lru_order.erase(lit->second);
         m_lru_map.erase(lit);
@@ -685,7 +737,8 @@ uint32_t cache_store::size() const
 
 bool cache_store::exists(std::string_view key) const
 {
-    if (m_data.count(key)) return true;
+    // Check m_data first — most keys are strings in typical workloads
+    if (__builtin_expect(m_data.count(key) != 0, 1)) return true;
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
@@ -1006,36 +1059,24 @@ void cache_store::set_eviction(eviction_policy policy)
     m_eviction = policy;
 }
 
-void cache_store::track_add(size_t bytes)
-{
-    m_current_memory += bytes;
-}
-
-void cache_store::track_sub(size_t bytes)
-{
-    if (bytes > m_current_memory)
-        m_current_memory = 0;
-    else
-        m_current_memory -= bytes;
-}
-
 void cache_store::touch_lru(std::string_view key)
 {
-    if (m_max_memory == 0)
+    if (__builtin_expect(m_max_memory == 0, 1))
         return;  // No memory limit, skip LRU tracking
 
-    std::string k(key);
-    auto it = m_lru_map.find(k);
+    // Use transparent lookup (string_view) to avoid string allocation on find()
+    auto it = m_lru_map.find(key);
     if (it != m_lru_map.end())
     {
         m_lru_order.erase(it->second);
-        m_lru_order.push_back(k);
+        m_lru_order.push_back(std::string(key));
         it->second = std::prev(m_lru_order.end());
     }
     else
     {
+        std::string k(key);
         m_lru_order.push_back(k);
-        m_lru_map[k] = std::prev(m_lru_order.end());
+        m_lru_map[std::move(k)] = std::prev(m_lru_order.end());
     }
 }
 
@@ -1124,17 +1165,6 @@ bool cache_store::try_evict(size_t needed)
     }
 
     return m_current_memory + needed <= m_max_memory;
-}
-
-bool cache_store::check_memory(size_t needed)
-{
-    if (m_max_memory == 0)
-        return true;  // No limit
-
-    if (m_current_memory + needed <= m_max_memory)
-        return true;
-
-    return try_evict(needed);
 }
 
 // ─── Pub/Sub ───

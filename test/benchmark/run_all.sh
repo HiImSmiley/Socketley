@@ -286,6 +286,7 @@ case "${1:-}" in
         check_dependencies || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_server.sh"
         ;;
     --cache-only)
@@ -293,6 +294,7 @@ case "${1:-}" in
         check_dependencies || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_cache.sh"
         ;;
     --proxy-only)
@@ -300,6 +302,7 @@ case "${1:-}" in
         check_dependencies || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_proxy.sh"
         ;;
     --websocket-only)
@@ -307,6 +310,7 @@ case "${1:-}" in
         check_dependencies || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_websocket.sh"
         ;;
     --k6-only)
@@ -315,6 +319,7 @@ case "${1:-}" in
         check_k6 || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_k6_http.sh"
         cleanup_runtimes
         sleep 2
@@ -326,6 +331,7 @@ case "${1:-}" in
         check_k6 || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_k6_http.sh"
         ;;
     --k6-ws-only)
@@ -334,6 +340,7 @@ case "${1:-}" in
         check_k6 || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_k6_ws.sh"
         ;;
     --cache-resp-only)
@@ -341,6 +348,7 @@ case "${1:-}" in
         check_dependencies || exit 1
         setup_cleanup_trap
         start_daemon || exit 1
+        export SOCKETLEY_BENCH_PARENT=1
         bash "$(dirname "$0")/bench_cache_resp.sh" "${2:-3}"
         ;;
     --help|-h)
