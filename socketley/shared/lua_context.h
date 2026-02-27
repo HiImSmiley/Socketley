@@ -53,6 +53,7 @@ public:
         CB_ON_UPSTREAM           = 1u << 21,
         CB_ON_UPSTREAM_CONNECT   = 1u << 22,
         CB_ON_UPSTREAM_DISCONNECT = 1u << 23,
+        CB_ON_HTTP_REQUEST       = 1u << 24,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -80,6 +81,7 @@ public:
     bool has_on_upstream()           const { return m_callback_mask & CB_ON_UPSTREAM; }
     bool has_on_upstream_connect()   const { return m_callback_mask & CB_ON_UPSTREAM_CONNECT; }
     bool has_on_upstream_disconnect() const { return m_callback_mask & CB_ON_UPSTREAM_DISCONNECT; }
+    bool has_on_http_request()       const { return m_callback_mask & CB_ON_HTTP_REQUEST; }
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -106,6 +108,7 @@ public:
     sol::function& on_upstream()           { return m_on_upstream; }
     sol::function& on_upstream_connect()   { return m_on_upstream_connect; }
     sol::function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
+    sol::function& on_http_request()       { return m_on_http_request; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
@@ -143,11 +146,19 @@ private:
     sol::function m_on_upstream;
     sol::function m_on_upstream_connect;
     sol::function m_on_upstream_disconnect;
+    sol::function m_on_http_request;
     uint32_t m_tick_ms{0};
     uint32_t m_callback_mask{0};
 
     // Timer lifetime guard — set to false in destructor; timers check before firing
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
+
+    // Active timers — tracked so we can clear sol::function refs before Lua state closes
+    std::vector<void*> m_active_timers;
+
+public:
+    void unregister_timer(void* t);
+private:
 
     // Cross-runtime pub/sub: key = cache_name + '\0' + channel
     std::unordered_map<std::string, std::vector<sol::function>> m_subscriptions;
@@ -195,6 +206,7 @@ public:
     bool has_on_upstream()           const { return false; }
     bool has_on_upstream_connect()   const { return false; }
     bool has_on_upstream_disconnect() const { return false; }
+    bool has_on_http_request()       const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,

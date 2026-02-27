@@ -42,6 +42,7 @@ public:
 
     void set_state_persistence(state_persistence* sp);
     void set_cluster_discovery(cluster_discovery* cd);
+    void set_metrics_port(uint16_t port);
 
     static std::string socket_path;
 
@@ -75,6 +76,7 @@ private:
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
+    int cmd_dashboard(ipc_connection* conn);
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 
@@ -94,6 +96,7 @@ private:
     cluster_discovery* m_cluster = nullptr;
     std::unique_ptr<cluster_discovery> m_owned_cluster;
     std::string m_daemon_name;
+    uint16_t m_metrics_port{0};
 
     // Deferred deletion: runtimes are held here for one event loop tick after cmd_remove so
     // that any in-flight io_uring CQEs referencing their io_request members can be processed

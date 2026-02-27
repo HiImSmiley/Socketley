@@ -28,10 +28,7 @@ static void signal_handler(int)
     if (g_signal_write_fd >= 0)
     {
         char c = 1;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-        write(g_signal_write_fd, &c, 1);
-#pragma GCC diagnostic pop
+        if (write(g_signal_write_fd, &c, 1) < 0) {}
     }
 }
 
@@ -213,6 +210,29 @@ static void restore_runtimes(state_persistence& persistence,
                 prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
                 for (const auto& b : cfg.backends)
                     prx->add_backend(b);
+                // Restore mesh config
+                if (cfg.health_check > 0)
+                    prx->set_health_check(static_cast<mesh_config::health_type>(cfg.health_check));
+                if (cfg.health_interval != 5)
+                    prx->set_health_interval(cfg.health_interval);
+                if (!cfg.health_path.empty())
+                    prx->set_health_path(cfg.health_path);
+                if (cfg.health_threshold != 3)
+                    prx->set_health_threshold(cfg.health_threshold);
+                if (cfg.circuit_threshold != 5)
+                    prx->set_circuit_threshold(cfg.circuit_threshold);
+                if (cfg.circuit_timeout != 30)
+                    prx->set_circuit_timeout(cfg.circuit_timeout);
+                if (cfg.retry_count > 0)
+                    prx->set_retry_count(cfg.retry_count);
+                if (cfg.retry_all)
+                    prx->set_retry_all(true);
+                if (!cfg.mesh_client_ca.empty())
+                    prx->set_mesh_client_ca(cfg.mesh_client_ca);
+                if (!cfg.mesh_client_cert.empty())
+                    prx->set_mesh_client_cert(cfg.mesh_client_cert);
+                if (!cfg.mesh_client_key.empty())
+                    prx->set_mesh_client_key(cfg.mesh_client_key);
                 break;
             }
             case runtime_cache:
@@ -285,6 +305,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         else
             LOG_WARN("failed to start metrics endpoint");
     }
+    handler.set_metrics_port(metrics_port);
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);

@@ -7,26 +7,40 @@
 #include <vector>
 #include <netinet/in.h>
 #include <sys/uio.h>
+#include <unistd.h>
+#include <cstdlib>
 #include <filesystem>
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
 #include <linux/time_types.h>
 
+// Branch prediction hints for hot-path optimization
+#define SOCKETLEY_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define SOCKETLEY_UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 class runtime_manager;
 
-enum ws_state : uint8_t { ws_unknown = 0, ws_tcp = 1, ws_upgrading = 2, ws_active = 3 };
+enum proto_state : uint8_t {
+    proto_unknown     = 0,
+    proto_tcp         = 1,  // newline-delimited text
+    proto_http        = 2,  // HTTP request (not WS upgrade)
+    proto_ws_upgrading = 3,
+    proto_ws          = 4,  // active WebSocket
+    proto_resp        = 5   // RESP2 wire protocol
+};
 
 struct server_connection
 {
-    static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_BATCH = 32;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+    static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
-    int fd;
+    int fd{-1};
     io_request read_req;
     io_request write_req;
-    char read_buf[4096];
+    char read_buf[READ_BUF_SIZE];
     std::string partial;
     std::queue<std::shared_ptr<const std::string>> write_queue;
 
@@ -38,9 +52,23 @@ struct server_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+    bool zc_notif_pending{false};
 
-    // WebSocket auto-detect state
-    ws_state ws{ws_unknown};
+    // Async file read state (HTTP static file serving)
+    io_request file_read_req;
+    int file_fd{-1};
+    char* file_buf{nullptr};
+    size_t file_size{0};
+    std::string file_content_type;
+    bool file_is_html{false};
+    bool file_read_pending{false};
+    bool http_keep_alive{false};
+
+    // Protocol auto-detect state
+    proto_state proto{proto_unknown};
+
+    // Cached route: avoids m_routes map lookup per message
+    bool routed{false};
 
     // WebSocket handshake headers (non-empty only for ws_active connections)
     std::string ws_cookie;
@@ -61,6 +89,51 @@ struct server_connection
 
     // Per-connection metadata (freed automatically on disconnect)
     std::unordered_map<std::string, std::string> meta;
+
+    // Connection pool support: reset to initial state for reuse
+    void reset(int new_fd)
+    {
+        fd = new_fd;
+        read_req = {};
+        write_req = {};
+        while (!write_queue.empty()) write_queue.pop();
+        for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
+        write_batch_count = 0;
+        read_pending = false;
+        write_pending = false;
+        closing = false;
+        zc_notif_pending = false;
+        if (file_fd >= 0) { close(file_fd); file_fd = -1; }
+        if (file_buf) { free(file_buf); file_buf = nullptr; }
+        file_read_req = {};
+        file_size = 0;
+        file_content_type.clear();
+        file_is_html = false;
+        file_read_pending = false;
+        http_keep_alive = false;
+        proto = proto_unknown;
+        routed = false;
+        ws_cookie.clear();
+        ws_origin.clear();
+        ws_protocol.clear();
+        ws_auth.clear();
+        rl_tokens = 0.0;
+        rl_max = 0.0;
+        auth_failures = 0;
+        partial.clear();
+        meta.clear();
+    }
+};
+
+struct http_request
+{
+    std::string_view method;
+    std::string_view path;
+    std::string_view version;
+    std::string_view body;
+    std::string_view query;  // everything after '?'
+    std::vector<std::pair<std::string_view, std::string_view>> headers;
+    int client_id{-1};
 };
 
 enum server_mode : uint8_t
@@ -80,16 +153,17 @@ struct upstream_target
 
 struct upstream_connection
 {
-    static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_BATCH = 32;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+    static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
     int conn_id;                  // 1-based Lua-facing ID (stable across reconnects)
     int fd{-1};
     upstream_target target;
     io_request read_req;
     io_request write_req;
-    char read_buf[4096];
+    char read_buf[READ_BUF_SIZE];
     std::string partial;
     std::queue<std::shared_ptr<const std::string>> write_queue;
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
@@ -189,10 +263,12 @@ private:
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
+    void handle_file_read(struct io_uring_cqe* cqe, io_request* req);
     void invoke_on_websocket(int fd);
 
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
     void serve_http(server_connection* conn, std::string_view path);
+    void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
 
     // Upstream helpers
     bool upstream_try_connect(upstream_connection* uc);
@@ -241,6 +317,10 @@ private:
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
     static constexpr int MAX_FDS = 8192;
     server_connection* m_conn_idx[MAX_FDS]{};
+
+    // Active fd tracking for O(1) broadcast iteration (no map overhead)
+    std::vector<int> m_active_fds;
+
     bool m_multishot_active{false};
 
     uint64_t m_message_counter = 0;
@@ -253,11 +333,22 @@ private:
     // Stats
     uint32_t m_stat_peak_connections{0};
 
+    // Connection pool: pre-allocated connections for reuse (avoids malloc per accept)
+    static constexpr size_t CONN_POOL_INIT = 64;
+    std::vector<std::unique_ptr<server_connection>> m_conn_pool;
+
+    // Acquire a connection from the pool (or allocate if empty)
+    std::unique_ptr<server_connection> pool_acquire(int fd);
+    // Return a connection to the pool for reuse
+    void pool_release(std::unique_ptr<server_connection> conn);
+
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 1;
     static constexpr uint32_t BUF_COUNT = 1024;
-    static constexpr uint32_t BUF_SIZE = 4096;
+    static constexpr uint32_t BUF_SIZE = 16384;
     bool m_use_provided_bufs{false};
+    bool m_recv_multishot{false};
+    bool m_send_zc{false};
 
     // UDP mode
     static constexpr size_t MAX_UDP_PEERS = 10000;

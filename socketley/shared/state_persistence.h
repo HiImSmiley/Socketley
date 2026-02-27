@@ -68,6 +68,19 @@ struct runtime_config
     uint8_t strategy = 0;   // proxy_strategy
     std::vector<std::string> backends;
 
+    // Proxy service mesh
+    uint8_t health_check = 0;    // mesh_config::health_type
+    int health_interval = 5;
+    std::string health_path;
+    int health_threshold = 3;
+    int circuit_threshold = 5;
+    int circuit_timeout = 30;
+    int retry_count = 0;
+    bool retry_all = false;
+    std::string mesh_client_ca;
+    std::string mesh_client_cert;
+    std::string mesh_client_key;
+
     // Cache
     std::string persistent_path;
     uint8_t cache_mode = 1;  // cache_mode (default readwrite)

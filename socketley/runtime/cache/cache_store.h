@@ -55,10 +55,21 @@ enum eviction_policy : uint8_t
 class cache_store
 {
 public:
+    cache_store()
+    {
+        // Pre-allocate hash buckets to avoid rehashing during initial load.
+        // 1024 is a reasonable starting point for most workloads.
+        m_data.reserve(1024);
+    }
+
     // --- Strings (existing) ---
     bool set(std::string_view key, std::string_view value);
     bool get(std::string_view key, std::string& out) const;
     const std::string* get_ptr(std::string_view key) const;
+
+    // Combined check_expiry + get_ptr in a single hash probe sequence.
+    // Avoids the cost of two separate lookups on the hot GET path.
+    const std::string* check_expiry_and_get_ptr(std::string_view key);
 
     // --- Lists ---
     bool lpush(std::string_view key, std::string_view val);
@@ -129,7 +140,15 @@ public:
     size_t get_memory_used() const { return m_current_memory; }
     void set_eviction(eviction_policy policy);
     eviction_policy get_eviction() const { return m_eviction; }
-    bool check_memory(size_t needed);  // returns false if OOM and evict_none
+    // Inline fast-path: most configs have no memory limit
+    bool check_memory(size_t needed)
+    {
+        if (__builtin_expect(m_max_memory == 0, 1))
+            return true;
+        if (__builtin_expect(m_current_memory + needed <= m_max_memory, 1))
+            return true;
+        return try_evict(needed);
+    }
 
     // --- Pub/Sub ---
     void subscribe(int fd, std::string_view channel);
@@ -150,8 +169,16 @@ private:
 
     void touch_lru(std::string_view key);
     bool try_evict(size_t needed);
-    void track_add(size_t bytes);
-    void track_sub(size_t bytes);
+
+    // Inline memory tracking — called on every set/del, must be fast
+    void track_add(size_t bytes) { m_current_memory += bytes; }
+    void track_sub(size_t bytes)
+    {
+        if (__builtin_expect(bytes > m_current_memory, 0))
+            m_current_memory = 0;
+        else
+            m_current_memory -= bytes;
+    }
 
     string_map m_data;
     list_map m_lists;

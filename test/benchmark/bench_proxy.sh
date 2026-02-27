@@ -21,6 +21,16 @@ append_result() {
     fi
 }
 
+ensure_clean() {
+    socketley_cmd stop bench_proxy 2>/dev/null
+    socketley_cmd stop backend1 2>/dev/null
+    socketley_cmd stop named_backend 2>/dev/null
+    sleep 0.5
+    socketley_cmd remove bench_proxy 2>/dev/null
+    socketley_cmd remove backend1 2>/dev/null
+    socketley_cmd remove named_backend 2>/dev/null
+}
+
 # Simple HTTP request via bash /dev/tcp
 http_request() {
     local port=$1
@@ -57,12 +67,13 @@ test_http_single_backend() {
 
     log_section "Test: HTTP Proxy Single Backend ($num_requests requests)"
 
+    ensure_clean
     local backend_pid
     backend_pid=$(start_python_http_backend $BACKEND_PORT_1)
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed to start"; kill "$backend_pid" 2>/dev/null; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT --backend 127.0.0.1:$BACKEND_PORT_1 --protocol http -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid" 2>/dev/null; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid" 2>/dev/null; ensure_clean; return 1; }
     sleep 0.5
 
     local latencies_file=$(mktemp)
@@ -132,6 +143,7 @@ test_http_load_balancing() {
 
     log_section "Test: HTTP Proxy Load Balancing ($num_requests requests, 2 backends)"
 
+    ensure_clean
     local backend_pid1 backend_pid2
     backend_pid1=$(start_python_http_backend $BACKEND_PORT_1)
     backend_pid2=$(start_python_http_backend $BACKEND_PORT_2)
@@ -141,7 +153,7 @@ test_http_load_balancing() {
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend 127.0.0.1:$BACKEND_PORT_1,127.0.0.1:$BACKEND_PORT_2 \
         --strategy round-robin --protocol http -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid1" "$backend_pid2" 2>/dev/null; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid1" "$backend_pid2" 2>/dev/null; ensure_clean; return 1; }
     sleep 0.5
 
     local success=0
@@ -198,12 +210,13 @@ test_tcp_throughput() {
 
     log_section "Test: TCP Proxy Throughput ($num_messages msgs, ${message_size}B)"
 
+    ensure_clean
     socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend 127.0.0.1:$BACKEND_PORT_1 --protocol tcp -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -226,12 +239,13 @@ test_concurrent_proxy_connections() {
 
     log_section "Test: Concurrent Proxy Connections ($num_clients clients)"
 
+    ensure_clean
     socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend 127.0.0.1:$BACKEND_PORT_1 --protocol tcp -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -253,12 +267,13 @@ test_proxy_overhead() {
 
     log_section "Test: Proxy Overhead (Direct vs Proxied)"
 
+    ensure_clean
     socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend 127.0.0.1:$BACKEND_PORT_1 --protocol tcp -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -280,12 +295,13 @@ test_runtime_name_backend() {
 
     log_section "Test: Backend by Runtime Name ($num_requests requests)"
 
+    ensure_clean
     socketley_cmd create server named_backend -p $BACKEND_PORT_1 --mode in -s
-    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; return 1; }
+    wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
         --backend named_backend --protocol tcp -s
-    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; return 1; }
+    wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result

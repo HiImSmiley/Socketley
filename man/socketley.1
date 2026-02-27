@@ -84,6 +84,9 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .I name
 .br
 .B socketley
+.B dashboard
+.br
+.B socketley
 .B \-\-lua
 .I lua_file
 .SH DESCRIPTION
@@ -91,6 +94,14 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 is a high-performance Linux daemon and CLI that manages network runtimes
 (servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
 with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
+.PP
+The io_uring event loop automatically takes advantage of advanced kernel
+features when available: multishot receive (one SQE services many reads),
+zero-copy send (SEND_ZC \(em data goes straight from userspace to the NIC
+without a kernel copy), and registered file descriptors (skip per-op
+.BR fget / fput
+overhead). Each feature is probed at startup and falls back transparently
+to standard ops on older kernels, so no configuration is needed.
 .SH COMMANDS
 .TP
 .B daemon
@@ -352,6 +363,18 @@ _
 protocol	string	"http" or "tcp" \fB(requires restart)\fR
 strategy	string	"round-robin", "random", or "lua"
 backends	array	List of backend addresses ["ip:port", "@group", ...]
+health_check	string	"tcp" or "http" (empty = disabled)
+health_interval	number	Health check interval in seconds (default 5)
+health_path	string	HTTP health check path (default "/health")
+health_threshold	number	Failures to mark unhealthy (default 3)
+circuit_threshold	number	Errors to open circuit (default 5)
+circuit_timeout	number	Seconds before half-open (default 30)
+retry	number	Retry count (0 = disabled)
+retry_all	bool	Also retry non-idempotent methods
+client_ca	string	CA cert path for frontend mTLS
+client_cert	string	Client cert path for backend mTLS
+client_key	string	Client key path for backend mTLS
+sidecar	bool	Enable sidecar defaults
 .TE
 .PP
 .B Cache fields:
@@ -380,6 +403,17 @@ eviction	string	"noeviction", "allkeys-lru", "allkeys-random"
     "rate_limit": 1000,
     "mode": "inout"
 }
+.fi
+.TP
+.B dashboard
+Print the URL of the built-in web dashboard. Requires
+.B config.metrics_port
+to be set in the daemon configuration file (see
+.BR "Daemon Configuration" ).
+The dashboard provides a live-updating view of all runtimes, connections,
+and throughput. Example output:
+.nf
+Dashboard: http://localhost:9100/
 .fi
 .TP
 .B ls
@@ -616,11 +650,36 @@ Link this server to an existing cache runtime. Clients can then send
 which are executed against the linked cache and the response returned to
 the sender only. Normal messages are still processed according to the
 server's mode.
-.SS WebSocket Support
-Servers automatically detect WebSocket upgrade requests on each connection.
-When a client sends an HTTP GET with "Upgrade: websocket", the server completes
-the handshake and transparently frames/deframes messages. Raw TCP and WebSocket
-clients coexist on the same port. No flag is needed.
+.SS Multi-Protocol Auto-Detection
+Server connections automatically detect the protocol from the first bytes
+received. No flags are needed \(em all four protocols coexist on the same
+port:
+.TP
+.B TCP (newline-delimited text)
+Default. Lines terminated by
+.B \\en
+are delivered as messages.
+.TP
+.B HTTP
+Detected when the first bytes are a valid HTTP method (GET, POST, etc.).
+Requests are handled by the
+.B on_http_request
+Lua callback if defined, or by the static file server if
+.B \-\-http
+is set, or responded with 404 otherwise. HTTP/1.1 keep-alive is supported.
+.TP
+.B WebSocket
+Detected when an HTTP request contains
+.BR "Upgrade: websocket" .
+The server completes the RFC 6455 handshake and transparently frames/deframes
+messages. The
+.B on_websocket
+callback fires after the upgrade.
+.TP
+.B RESP (Redis protocol)
+Detected when the first byte is
+.BR * .
+Useful for cache-linked servers or custom RESP-based protocols.
 .PP
 Browser example:
 .nf
@@ -694,6 +753,99 @@ Load balancing strategy:
 Default port: 8080
 .PP
 HTTP mode: Requests to /<proxy-name>/* are forwarded with prefix stripped.
+.SS Health Check Flags
+.TP
+.BI "\-\-health\-check " "[tcp|http]"
+Enable active health checks for backends. In
+.B tcp
+mode, the proxy opens a TCP connection to each backend at the configured
+interval \(em success means the port is listening. In
+.B http
+mode, the proxy sends an HTTP GET to
+.B \-\-health\-path
+and considers the backend healthy on a 2xx response.
+Unhealthy backends are removed from the load balancer pool until they
+recover.
+.TP
+.BI "\-\-health\-interval " "seconds"
+Interval between health checks in seconds. Default: 5.
+.TP
+.BI "\-\-health\-path " "path"
+HTTP health check path. Default:
+.BR /health .
+Only used when
+.B \-\-health\-check
+is set to
+.BR http .
+.TP
+.BI "\-\-health\-threshold " "n"
+Number of consecutive health check failures before a backend is marked
+unhealthy. Default: 3. A single successful check restores the backend.
+.SS Circuit Breaker Flags
+.TP
+.BI "\-\-circuit\-threshold " "n"
+Number of consecutive backend errors (connection refused, timeout, 5xx)
+that trips the circuit breaker to the
+.B open
+state. While open, all requests to that backend fail immediately without
+attempting a connection. Default: 5.
+.TP
+.BI "\-\-circuit\-timeout " "seconds"
+Seconds before an open circuit transitions to
+.BR half-open .
+In half-open state, a single probe request is allowed through \(em if it
+succeeds, the circuit closes (fully healthy); if it fails, the circuit
+re-opens. Default: 30.
+.SS Retry Flags
+.TP
+.BI "\-\-retry " "n"
+Retry failed requests up to
+.I n
+times on the next backend in the pool (0 = disabled, default). Only
+idempotent HTTP methods (GET, HEAD, PUT, DELETE, OPTIONS) are retried
+unless
+.B \-\-retry\-all
+is set. For TCP mode, any failed connection attempt is retried.
+.TP
+.B \-\-retry\-all
+Also retry non-idempotent methods (POST, PATCH). Use with caution \(em
+the request body is replayed to the next backend, which may cause
+duplicate side effects.
+.SS mTLS Flags
+.TP
+.BI "\-\-client\-ca " "path"
+CA certificate used to verify client certificates on the proxy's
+frontend listener (server-side mTLS). Clients that do not present a
+valid certificate signed by this CA are rejected during the TLS
+handshake. Requires
+.BR \-\-tls .
+.TP
+.BI "\-\-client\-cert " "path"
+Client certificate presented to backends when connecting (backend mTLS).
+Used together with
+.BR \-\-client\-key .
+.TP
+.BI "\-\-client\-key " "path"
+Private key for the client certificate.
+.SS Sidecar Mode
+.TP
+.B \-\-sidecar
+Convenience shorthand that enables a service-mesh-ready configuration
+in a single flag. Equivalent to:
+.nf
+\-\-health\-check tcp \-\-circuit\-threshold 5 \-\-circuit\-timeout 30 \-\-retry 2 \-\-drain
+.fi
+.IP
+Individual flags can still be specified alongside
+.B \-\-sidecar
+to override the defaults (e.g.
+.BR "\-\-sidecar \-\-health\-check http \-\-health\-path /ready" ).
+.PP
+Example:
+.nf
+socketley create proxy myapp \-\-sidecar \-\-backend 127.0.0.1:3000 \\
+    -p 8080 \-\-tls \-\-health\-check tcp -s
+.fi
 .SH CACHE FLAGS
 .TP
 .BI "\-\-persistent " "file"
@@ -1119,6 +1271,53 @@ HTTP upgrade request:
 Only keys present in the request are set; absent headers are nil.
 This callback never fires for plain TCP clients.
 .TP
+.B on_http_request(req) \(-> table
+Server only. Called when an HTTP request is received (auto-detected from the
+first bytes; see
+.BR "Multi-Protocol Auto-Detection" ).
+The
+.I req
+argument is a table with the following fields:
+.nf
+method      string   HTTP method ("GET", "POST", etc.)
+path        string   Request path (e.g. "/api/users")
+query       string   Query string without leading ? (empty if none)
+body        string   Request body (empty for GET)
+client_id   number   File descriptor of the client
+version     string   HTTP version (e.g. "1.1")
+headers     table    Request headers {["Host"]="...", ...}
+.fi
+.IP
+Return a table with the HTTP response:
+.nf
+{
+    status  = 200,                              -- HTTP status code
+    headers = {["Content-Type"] = "text/html"}, -- response headers
+    body    = "<h1>Hello</h1>"                  -- response body
+}
+.fi
+.IP
+If no
+.B on_http_request
+callback is defined, the server falls back to static file serving
+.RB ( \-\-http )
+or returns 404. Supports HTTP/1.1 keep-alive \(em the connection is reused
+for subsequent requests.
+.IP
+Example:
+.nf
+function on_http_request(req)
+    if req.method == "GET" and req.path == "/health" then
+        return {status = 200, body = "ok"}
+    end
+    return {
+        status  = 200,
+        headers = {["Content-Type"] = "application/json"},
+        body    = '{"method": "' .. req.method .. '", "path": "' .. req.path .. '"}'
+    }
+end
+.fi
+.TP
 .B on_tick(dt)
 Called at a configurable interval while the runtime is running.
 .I dt
@@ -1410,6 +1609,117 @@ function on_start()
                   .. stats.running .. " running runtimes")
 end
 .fi
+.SH DASHBOARD
+When
+.B config.metrics_port
+is set in the daemon configuration file, the metrics endpoint serves
+multiple routes:
+.TP
+.B GET /
+Live web dashboard. Auto-refreshes every 2 seconds. Shows all runtimes,
+connection counts, throughput, and uptime in a browser-friendly view.
+.TP
+.B GET /metrics
+Prometheus exposition format (existing). Suitable for scraping by
+Prometheus, Grafana Agent, or similar monitoring stacks.
+.TP
+.B GET /api/overview
+JSON object with high-level daemon statistics:
+.nf
+{
+    "runtimes": 5,
+    "connections": 142,
+    "uptime_seconds": 86400,
+    "throughput_in": 12345678,
+    "throughput_out": 9876543
+}
+.fi
+.TP
+.B GET /api/runtimes
+JSON array of all runtimes with name, type, port, state, connections,
+and message/byte counters.
+.TP
+.BI "GET /api/runtime/" name
+JSON object for a single runtime identified by
+.IR name .
+Returns 404 if the runtime does not exist.
+.PP
+The
+.B dashboard
+CLI command prints the dashboard URL:
+.nf
+$ socketley dashboard
+Dashboard: http://localhost:9100/
+.fi
+.SH SERVICE MESH
+The proxy runtime includes service-mesh primitives that can be composed
+to build sidecar proxies, API gateways, or resilient service-to-service
+communication layers.
+.SS Health Checks
+Active health checking probes backends at a regular interval
+.RB ( \-\-health\-interval )
+using either a TCP connect or an HTTP GET
+.RB ( \-\-health\-check ).
+A backend is marked unhealthy after
+.B \-\-health\-threshold
+consecutive failures and is excluded from the load balancer pool.
+A single successful check restores the backend.
+.SS Circuit Breaker
+The circuit breaker prevents cascading failures by tracking consecutive
+errors per backend. It has three states:
+.TP
+.B closed
+Normal operation. Requests are forwarded to the backend. Errors are
+counted.
+.TP
+.B open
+Triggered when errors reach
+.BR \-\-circuit\-threshold .
+All requests fail immediately without attempting a connection. After
+.B \-\-circuit\-timeout
+seconds, the circuit moves to half-open.
+.TP
+.B half-open
+A single probe request is allowed through. If it succeeds, the circuit
+returns to
+.BR closed .
+If it fails, the circuit re-opens.
+.SS Retries
+When
+.B \-\-retry
+is set, failed requests are automatically retried on the next backend
+in the load balancer pool. By default only idempotent methods are
+retried; use
+.B \-\-retry\-all
+to include POST and PATCH.
+.SS mTLS
+Mutual TLS can be configured on both sides of the proxy:
+.IP \(bu 2
+.B Frontend (client-facing):
+Use
+.B \-\-client\-ca
+to require and verify client certificates.
+.IP \(bu 2
+.B Backend (upstream):
+Use
+.B \-\-client\-cert
+and
+.B \-\-client\-key
+to present a client certificate when connecting to backends.
+.SS Sidecar Deployment
+The
+.B \-\-sidecar
+flag enables a production-ready default set: TCP health checks, circuit
+breaker (threshold 5, timeout 30s), 2 retries, and graceful drain. Deploy
+alongside your application:
+.nf
+socketley create proxy myapp \-\-sidecar \\
+    \-\-backend 127.0.0.1:3000 -p 8080 \-\-tls -s
+.fi
+.PP
+The proxy listens on port 8080 and forwards to the local application on
+port 3000. Unhealthy backends are automatically removed, and the circuit
+breaker prevents thundering-herd retries during outages.
 .SH RUNTIME STATES
 .TP
 .B created
@@ -1647,6 +1957,61 @@ socketley create proxy gw2 -p 8081 \\
     --backend @api,10.0.0.5:9000 -s
 .fi
 .PP
+Lua HTTP worker (auto-detected, no flags needed):
+.PP
+.nf
+socketley create server api -p 9000 --lua handler.lua -s
+# handler.lua:
+# function on_http_request(req)
+#     return {status=200, headers={["Content-Type"]="application/json"},
+#             body='{"hello":"world"}'}
+# end
+# curl http://localhost:9000/api
+.fi
+.PP
+Sidecar proxy with health checks and circuit breaker:
+.PP
+.nf
+socketley create proxy sidecar -p 8080 \-\-sidecar \\
+    \-\-backend 127.0.0.1:3000 \-\-tls -s
+.fi
+.PP
+Proxy with HTTP health checks and retries:
+.PP
+.nf
+socketley create proxy gateway -p 8080 \\
+    \-\-backend 10.0.0.1:9000,10.0.0.2:9000 \\
+    \-\-health\-check http \-\-health\-path /ready \\
+    \-\-health\-interval 10 \-\-health\-threshold 5 \\
+    \-\-retry 3 \-\-circuit\-threshold 10 -s
+.fi
+.PP
+Proxy with mTLS (both frontend and backend):
+.PP
+.nf
+socketley create proxy secure \-p 8443 \\
+    \-\-tls \-\-cert proxy.pem \-\-key proxy\-key.pem \\
+    \-\-client\-ca trusted\-clients.pem \\
+    \-\-client\-cert backend\-client.pem \-\-client\-key backend\-client\-key.pem \\
+    \-\-backend 10.0.0.1:9000 -s
+.fi
+.PP
+Open the live dashboard:
+.PP
+.nf
+socketley dashboard
+# Dashboard: http://localhost:9100/
+# Open in browser for live runtime view
+.fi
+.PP
+Query dashboard API:
+.PP
+.nf
+curl http://localhost:9100/api/overview
+curl http://localhost:9100/api/runtimes
+curl http://localhost:9100/api/runtime/myserver
+.fi
+.PP
 Load complex configuration:
 .PP
 .nf
@@ -1813,9 +2178,15 @@ config = {
 .PP
 When
 .B metrics_port
-is set, the daemon starts an HTTP endpoint that serves Prometheus exposition
-format metrics at
-.BR "GET /metrics" .
+is set, the daemon starts an HTTP endpoint that serves a live web dashboard
+at
+.BR "GET /" ,
+Prometheus exposition format metrics at
+.BR "GET /metrics" ,
+and JSON API endpoints at
+.BR "/api/overview" ", " "/api/runtimes" ", and " "/api/runtime/<name>"
+(see
+.BR DASHBOARD ).
 Metrics include: runtimes total/running, connections total/active,
 messages total, bytes in/out, and per-runtime breakdowns.
 .SH C++ SDK

@@ -8,6 +8,8 @@
 
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 
@@ -408,6 +410,18 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.strategy = static_cast<uint8_t>(prx->get_strategy());
             for (const auto& b : prx->get_backends())
                 cfg.backends.push_back(b.address);
+            const auto& mesh = prx->get_mesh_config();
+            cfg.health_check = static_cast<uint8_t>(mesh.health_check);
+            cfg.health_interval = mesh.health_interval;
+            cfg.health_path = mesh.health_path;
+            cfg.health_threshold = mesh.health_threshold;
+            cfg.circuit_threshold = mesh.circuit_threshold;
+            cfg.circuit_timeout = mesh.circuit_timeout;
+            cfg.retry_count = mesh.retry_count;
+            cfg.retry_all = mesh.retry_all;
+            cfg.mesh_client_ca = mesh.client_ca;
+            cfg.mesh_client_cert = mesh.client_cert;
+            cfg.mesh_client_key = mesh.client_key;
             break;
         }
         case runtime_cache:
@@ -537,6 +551,28 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 }
                 out << "],\n";
             }
+            if (cfg.health_check > 0)
+                out << "    \"health_check\": " << static_cast<int>(cfg.health_check) << ",\n";
+            if (cfg.health_interval != 5)
+                out << "    \"health_interval\": " << cfg.health_interval << ",\n";
+            if (!cfg.health_path.empty() && cfg.health_path != "/health")
+                out << "    \"health_path\": \"" << json_escape(cfg.health_path) << "\",\n";
+            if (cfg.health_threshold != 3)
+                out << "    \"health_threshold\": " << cfg.health_threshold << ",\n";
+            if (cfg.circuit_threshold != 5)
+                out << "    \"circuit_threshold\": " << cfg.circuit_threshold << ",\n";
+            if (cfg.circuit_timeout != 30)
+                out << "    \"circuit_timeout\": " << cfg.circuit_timeout << ",\n";
+            if (cfg.retry_count > 0)
+                out << "    \"retry_count\": " << cfg.retry_count << ",\n";
+            if (cfg.retry_all)
+                out << "    \"retry_all\": true,\n";
+            if (!cfg.mesh_client_ca.empty())
+                out << "    \"mesh_client_ca\": \"" << json_escape(cfg.mesh_client_ca) << "\",\n";
+            if (!cfg.mesh_client_cert.empty())
+                out << "    \"mesh_client_cert\": \"" << json_escape(cfg.mesh_client_cert) << "\",\n";
+            if (!cfg.mesh_client_key.empty())
+                out << "    \"mesh_client_key\": \"" << json_escape(cfg.mesh_client_key) << "\",\n";
             break;
         case runtime_cache:
             if (!cfg.persistent_path.empty())
@@ -620,6 +656,17 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.protocol = str_to_proxy_protocol(json_get_string(json, "protocol"));
             cfg.strategy = str_to_proxy_strategy(json_get_string(json, "strategy"));
             cfg.backends = json_get_array(json, "backends");
+            cfg.health_check = static_cast<uint8_t>(json_get_int(json, "health_check"));
+            { auto v = json_get_int(json, "health_interval"); if (v > 0) cfg.health_interval = v; }
+            { auto s = json_get_string(json, "health_path"); if (!s.empty()) cfg.health_path = s; }
+            { auto v = json_get_int(json, "health_threshold"); if (v > 0) cfg.health_threshold = v; }
+            { auto v = json_get_int(json, "circuit_threshold"); if (v > 0) cfg.circuit_threshold = v; }
+            { auto v = json_get_int(json, "circuit_timeout"); if (v > 0) cfg.circuit_timeout = v; }
+            cfg.retry_count = json_get_int(json, "retry_count");
+            cfg.retry_all = json_get_bool(json, "retry_all");
+            cfg.mesh_client_ca = json_get_string(json, "mesh_client_ca");
+            cfg.mesh_client_cert = json_get_string(json, "mesh_client_cert");
+            cfg.mesh_client_key = json_get_string(json, "mesh_client_key");
             break;
         case runtime_cache:
             cfg.persistent_path = json_get_string(json, "persistent_path");
@@ -648,6 +695,13 @@ bool state_persistence::write_json(const runtime_config& cfg) const
         return false;
 
     f << json;
+    f.flush();
+
+    // fsync before rename to guarantee data is on disk — prevents
+    // partial/empty state files on power loss or kernel crash
+    int fd = ::open(tmp_path.c_str(), O_RDONLY);
+    if (fd >= 0) { if (fsync(fd) < 0) {} ::close(fd); }
+
     f.close();
 
     if (f.fail())

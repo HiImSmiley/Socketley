@@ -5,6 +5,7 @@
 #include <cstring>
 #include <charconv>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <algorithm>
@@ -20,7 +21,10 @@ client_instance::client_instance(std::string_view name)
 client_instance::~client_instance()
 {
     if (m_conn.fd >= 0)
+    {
+        shutdown(m_conn.fd, SHUT_RDWR);
         close(m_conn.fd);
+    }
 }
 
 void client_instance::set_mode(client_mode mode)
@@ -80,18 +84,27 @@ bool client_instance::try_connect()
         setsockopt(m_conn.fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     }
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
+    // Resolve hostname (supports both IPs and DNS names like Docker hostnames)
+    char port_str[8];
+    auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), port);
+    *pend = '\0';
 
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0)
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = m_udp ? SOCK_DGRAM : SOCK_STREAM;
+
+    struct addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result)
     {
         close(m_conn.fd);
         m_conn.fd = -1;
         return false;
     }
 
-    if (connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0 && errno != EINPROGRESS)
+    int connect_ret = connect(m_conn.fd, result->ai_addr, result->ai_addrlen);
+    freeaddrinfo(result);
+
+    if (connect_ret < 0 && errno != EINPROGRESS)
     {
         close(m_conn.fd);
         m_conn.fd = -1;
@@ -170,6 +183,7 @@ void client_instance::teardown(event_loop& loop)
 {
     if (m_conn.fd >= 0)
     {
+        shutdown(m_conn.fd, SHUT_RDWR);
         close(m_conn.fd);
         m_conn.fd = -1;
     }
@@ -233,6 +247,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         else
         {
             invoke_on_disconnect(m_conn.fd);
+            shutdown(m_conn.fd, SHUT_RDWR);
             close(m_conn.fd);
             m_conn.fd = -1;
             m_connected = false;
@@ -350,6 +365,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
         if (!m_conn.read_pending)
         {
             invoke_on_disconnect(m_conn.fd);
+            shutdown(m_conn.fd, SHUT_RDWR);
             close(m_conn.fd);
             m_conn.fd = -1;
             m_connected = false;
@@ -363,9 +379,11 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     if (m_conn.closing && !m_conn.read_pending)
     {
         invoke_on_disconnect(m_conn.fd);
+        shutdown(m_conn.fd, SHUT_RDWR);
         close(m_conn.fd);
         m_conn.fd = -1;
         m_connected = false;
+        schedule_reconnect();
     }
 }
 

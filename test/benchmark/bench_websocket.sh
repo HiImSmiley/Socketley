@@ -18,6 +18,12 @@ append_result() {
     fi
 }
 
+ensure_clean() {
+    socketley_cmd stop bench_ws 2>/dev/null
+    sleep 0.5
+    socketley_cmd remove bench_ws 2>/dev/null
+}
+
 # Test 1: WebSocket handshake throughput
 test_ws_handshake() {
     local num_ops=${1:-500}
@@ -25,9 +31,10 @@ test_ws_handshake() {
 
     log_section "Test: WebSocket Handshake Throughput ($num_ops handshakes)"
 
+    ensure_clean
     wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
-    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -47,9 +54,10 @@ test_ws_echo() {
 
     log_section "Test: WebSocket Echo RTT ($num_ops msgs, ${msg_size}B)"
 
+    ensure_clean
     wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
-    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -69,9 +77,10 @@ test_ws_concurrent() {
 
     log_section "Test: Concurrent WebSocket ($num_clients clients, $ops_per_client ops each)"
 
+    ensure_clean
     wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
-    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     append_result
@@ -90,9 +99,10 @@ test_ws_tcp_coexistence() {
 
     log_section "Test: WS + TCP Coexistence ($num_ops mixed connections)"
 
+    ensure_clean
     wait_for_port_free $WS_PORT
     socketley_cmd create server bench_ws -p $WS_PORT -s
-    wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
+    wait_for_port $WS_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
     local results_dir=$(mktemp -d)

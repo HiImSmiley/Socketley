@@ -221,9 +221,12 @@ run_cache_resp_benchmarks() {
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
 
     # Start socketley cache with RESP protocol
+    socketley_cmd stop bench_cache_resp 2>/dev/null
+    sleep 0.5
+    socketley_cmd remove bench_cache_resp 2>/dev/null
     wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache_resp -p $CACHE_PORT --resp -s
-    wait_for_port $CACHE_PORT || { log_error "Cache (RESP) failed to start"; return 1; }
+    wait_for_port $CACHE_PORT || { log_error "Cache (RESP) failed to start"; socketley_cmd stop bench_cache_resp 2>/dev/null; sleep 0.5; socketley_cmd remove bench_cache_resp 2>/dev/null; return 1; }
     sleep 0.5
 
     # ── P=1 ──

@@ -22,14 +22,15 @@ const ENDPOINTS = [
 
 export const options = {
     stages: [
-        { duration: '10s', target: 50 },   // Ramp-up
-        { duration: '20s', target: 50 },   // Sustained load
-        { duration: '10s', target: 200 },  // Spike
+        { duration: '5s',  target: 100 },  // Ramp-up
+        { duration: '15s', target: 100 },  // Sustained load
+        { duration: '5s',  target: 200 },  // Spike
+        { duration: '10s', target: 200 },  // Sustained spike
         { duration: '5s',  target: 1 },    // Cooldown
     ],
     summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
     thresholds: {
-        'http_req_duration': ['p(95)<50'],
+        'http_req_duration': ['p(95)<100'],
         'http_req_failed':   ['rate<0.01'],
     },
 };

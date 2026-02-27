@@ -113,6 +113,8 @@ bool cache_instance::setup(event_loop& loop)
         connect_to_master();
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    m_send_zc = loop.send_zc_supported();
 
     if (event_loop::supports_multishot_accept())
     {
@@ -229,7 +231,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 
     // Check if this is a read from master (replication)
     if (req->fd == m_master_fd && m_master_fd >= 0 &&
-        (req->type == op_read || req->type == op_read_provided))
+        (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot))
     {
         handle_master_read(cqe);
         return;
@@ -243,10 +245,13 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             break;
         case op_read:
         case op_read_provided:
+        case op_recv_multishot:
             handle_read(cqe, req);
             break;
         case op_write:
         case op_writev:
+        case op_send_zc:
+        case op_send_zc_notif:
             handle_write(cqe, req);
             break;
         case op_timeout:
@@ -329,7 +334,9 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         ptr->last_activity = std::chrono::steady_clock::now();
 
         ptr->read_pending = true;
-        if (m_use_provided_bufs)
+        if (m_recv_multishot)
+            m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
+        else if (m_use_provided_bufs)
             m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
         else
             m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
@@ -367,14 +374,22 @@ cache_resubmit_accept:
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
+    if (__builtin_expect(fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd], 0))
         return;
     auto* conn = m_conn_idx[fd];
-    conn->read_pending = false;
 
-    bool is_provided = (req->type == op_read_provided);
+    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
-    if (cqe->res <= 0)
+    // For multishot recv, the read remains pending as long as MORE flag is set
+    if (!is_multishot_recv)
+        conn->read_pending = false;
+    else if (!multishot_more)
+        conn->read_pending = false;
+
+    bool is_provided = (req->type == op_read_provided || is_multishot_recv);
+
+    if (__builtin_expect(cqe->res <= 0, 0))
     {
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
@@ -406,7 +421,9 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    conn->last_activity = std::chrono::steady_clock::now();
+    // Only update last_activity when idle timeout is configured (avoids clock_gettime syscall)
+    if (__builtin_expect(get_idle_timeout() > 0, 0))
+        conn->last_activity = std::chrono::steady_clock::now();
 
     if (is_provided)
     {
@@ -471,11 +488,16 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (m_loop && !conn->closing)
     {
-        conn->read_pending = true;
-        if (m_use_provided_bufs)
-            m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        else
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        if (!conn->read_pending)
+        {
+            conn->read_pending = true;
+            if (m_recv_multishot)
+                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+            else if (m_use_provided_bufs)
+                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+            else
+                m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        }
     }
 }
 
@@ -485,17 +507,40 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
         return;
     auto* conn = m_conn_idx[fd];
-    conn->write_pending = false;
 
-    // Release batch buffers
-    for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i] = {};
-    conn->write_batch_count = 0;
+    // Zero-copy send notification: buffer is now safe to release
+    if (cqe->flags & IORING_CQE_F_NOTIF)
+    {
+        conn->zc_notif_pending = false;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
+
+        // Drain queue if we were waiting for NOTIF
+        if (!conn->write_queue.empty() && !conn->write_pending)
+            flush_write_queue(conn);
+        else if (conn->write_queue.empty() && !conn->write_pending &&
+                 conn->closing && !conn->read_pending)
+        {
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            close(fd);
+            m_clients.erase(fd);
+        }
+        return;
+    }
+
+    conn->write_pending = false;
 
     if (cqe->res <= 0)
     {
+        if (!conn->zc_notif_pending)
+        {
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].clear();
+            conn->write_batch_count = 0;
+        }
         conn->closing = true;
-        if (!conn->read_pending)
+        if (!conn->read_pending && !conn->zc_notif_pending)
         {
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
@@ -504,14 +549,77 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    // Short write handling: resubmit remaining bytes
+    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    {
+        size_t total_submitted = 0;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            total_submitted += conn->write_iovs[i].iov_len;
+
+        size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted)
+        {
+            size_t remaining = written;
+            uint32_t first_iov = 0;
+            for (; first_iov < conn->write_batch_count; first_iov++)
+            {
+                if (remaining < conn->write_iovs[first_iov].iov_len)
+                {
+                    conn->write_iovs[first_iov].iov_base =
+                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
+                    conn->write_iovs[first_iov].iov_len -= remaining;
+                    break;
+                }
+                remaining -= conn->write_iovs[first_iov].iov_len;
+            }
+
+            uint32_t new_count = conn->write_batch_count - first_iov;
+            if (first_iov > 0)
+            {
+                for (uint32_t i = 0; i < new_count; i++)
+                {
+                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
+                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+                }
+                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+                    conn->write_batch[i].clear();
+            }
+            conn->write_batch_count = new_count;
+
+            conn->write_pending = true;
+            if (new_count == 1)
+            {
+                conn->write_req.type = op_write;
+                m_loop->submit_write(conn->fd,
+                    static_cast<const char*>(conn->write_iovs[0].iov_base),
+                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                    &conn->write_req);
+            }
+            else
+            {
+                conn->write_req.type = op_writev;
+                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            return;
+        }
+    }
+
+    // Full write completed — release batch
+    if (!conn->zc_notif_pending)
+    {
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
+    }
+
     // Flush remaining queued messages
-    if (!conn->write_queue.empty())
+    if (!conn->write_queue.empty() && !conn->zc_notif_pending)
     {
         flush_write_queue(conn);
     }
     else
     {
-        if (conn->closing && !conn->read_pending)
+        if (conn->closing && !conn->read_pending && !conn->zc_notif_pending)
         {
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
@@ -548,18 +656,18 @@ static inline void append_int_nl(std::string& buf, int64_t v)
 
 void cache_instance::process_command(client_connection* conn, std::string_view line)
 {
-    if (line.empty())
+    if (__builtin_expect(line.empty(), 0))
         return;
 
     // Global rate limit check (across all connections)
-    if (!check_global_rate_limit())
+    if (__builtin_expect(!check_global_rate_limit(), 0))
     {
         conn->response_buf.append("error: rate limited\n", 20);
         return;
     }
 
-    // Rate limit check
-    if (conn->rl_max > 0)
+    // Rate limit check (usually disabled)
+    if (__builtin_expect(conn->rl_max > 0, 0))
     {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - conn->rl_last).count();
@@ -634,8 +742,8 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("get"):
         {
-            m_store.check_expiry(args);
-            const std::string* val = m_store.get_ptr(args);
+            // Combined check_expiry + get_ptr — one hash probe instead of two
+            const std::string* val = m_store.check_expiry_and_get_ptr(args);
             if (val)
             {
                 m_stat_get_hits++;
@@ -1519,12 +1627,38 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
 void cache_instance::flush_responses(client_connection* conn)
 {
-    if (conn->response_buf.empty() || !m_loop || conn->closing)
+    if (__builtin_expect(conn->response_buf.empty() || !m_loop || conn->closing, 0))
         return;
 
-    if (conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE)
+    if (__builtin_expect(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE, 0))
     {
         conn->closing = true;
+        return;
+    }
+
+    // Fast-path: if no write is pending and queue is empty, submit directly
+    // from response_buf without the queue round-trip (saves move + pop)
+    if (__builtin_expect(!conn->write_pending && conn->write_queue.empty() && !conn->zc_notif_pending, 1))
+    {
+        conn->write_batch[0] = std::move(conn->response_buf);
+        conn->response_buf.reserve(4096);
+        conn->write_iovs[0].iov_base = conn->write_batch[0].data();
+        conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
+        conn->write_batch_count = 1;
+        conn->write_pending = true;
+
+        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+        if (m_send_zc && len >= (512u << 10))
+        {
+            conn->zc_notif_pending = true;
+            conn->write_req.type = op_send_zc;
+            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+        }
+        else
+        {
+            conn->write_req.type = op_write;
+            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+        }
         return;
     }
 
@@ -1537,10 +1671,11 @@ void cache_instance::flush_responses(client_connection* conn)
 
 void cache_instance::flush_write_queue(client_connection* conn)
 {
-    if (!m_loop || conn->write_queue.empty())
+    if (!m_loop || conn->write_queue.empty() || conn->zc_notif_pending)
         return;
 
     uint32_t count = 0;
+    size_t total_bytes = 0;
     while (!conn->write_queue.empty() && count < client_connection::MAX_WRITE_BATCH)
     {
         conn->write_batch[count] = std::move(conn->write_queue.front());
@@ -1548,6 +1683,7 @@ void cache_instance::flush_write_queue(client_connection* conn)
 
         conn->write_iovs[count].iov_base = conn->write_batch[count].data();
         conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
+        total_bytes += conn->write_batch[count].size();
         count++;
     }
 
@@ -1556,9 +1692,21 @@ void cache_instance::flush_write_queue(client_connection* conn)
 
     if (count == 1)
     {
-        conn->write_req.type = op_write;
-        m_loop->submit_write(conn->fd, conn->write_batch[0].data(),
-            static_cast<uint32_t>(conn->write_batch[0].size()), &conn->write_req);
+        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+
+        // Use zero-copy send only for very large buffers (>= 512KB);
+        // the NOTIF CQE round-trip kills throughput for smaller writes
+        if (m_send_zc && len >= (512u << 10))
+        {
+            conn->zc_notif_pending = true;
+            conn->write_req.type = op_send_zc;
+            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+        }
+        else
+        {
+            conn->write_req.type = op_write;
+            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+        }
     }
     else
     {
@@ -1842,6 +1990,13 @@ void cache_instance::process_resp(client_connection* conn)
 
         if (argc > 0)
             process_resp_command(conn, args, argc);
+
+        // Cap response_buf at 1 MiB during large pipelines to prevent OOM
+        if (conn->response_buf.size() > (1 << 20))
+        {
+            flush_responses(conn);
+            conn->response_buf.reserve(4096);
+        }
     }
 
     // Single erase for entire batch — O(remaining) not O(n * commands)
@@ -1856,18 +2011,18 @@ void cache_instance::process_resp(client_connection* conn)
 
 void cache_instance::process_resp_command(client_connection* conn, std::string_view* args, int argc)
 {
-    if (argc == 0)
+    if (__builtin_expect(argc == 0, 0))
         return;
 
     // Global rate limit check (across all connections)
-    if (!check_global_rate_limit())
+    if (__builtin_expect(!check_global_rate_limit(), 0))
     {
         resp::encode_error_into(conn->response_buf, "rate limited");
         return;
     }
 
-    // Rate limit check
-    if (conn->rl_max > 0)
+    // Rate limit check (usually disabled — rl_max == 0)
+    if (__builtin_expect(conn->rl_max > 0, 0))
     {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - conn->rl_last).count();
@@ -1893,8 +2048,32 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
     {
         case fnv1a("set"):
         {
-            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (__builtin_expect(argc < 3, 0)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (__builtin_expect(m_mode == cache_mode_readonly, 0)) { resp::encode_error_into(rb, "readonly mode"); return; }
+
+            // Fast-path: plain SET key value (argc == 3, no options)
+            // This is the overwhelmingly common case in benchmarks
+            if (__builtin_expect(argc == 3, 1))
+            {
+                m_store.check_expiry(args[1]);
+                if (__builtin_expect(!m_store.set(args[1], args[2]), 0))
+                {
+                    resp::encode_error_into(rb, "type conflict");
+                    break;
+                }
+                rb.append(resp::RESP_OK, 5);
+#ifndef SOCKETLEY_NO_LUA
+                if (__builtin_expect(lua() && lua()->has_on_write(), 0))
+                {
+                    try { lua()->on_write()(args[1], args[2], 0); }
+                    catch (const sol::error& e)
+                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                }
+#endif
+                break;
+            }
+
+            // Slow path: SET with NX/XX/EX/PX options
             bool nx = false, xx = false;
             int ex_sec = 0;
             int64_t px_ms = 0;
@@ -1945,10 +2124,10 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         }
         case fnv1a("get"):
         {
-            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
-            const std::string* val = m_store.get_ptr(args[1]);
-            if (val)
+            if (__builtin_expect(argc < 2, 0)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            // Combined expiry check + lookup — one hash probe instead of two
+            const std::string* val = m_store.check_expiry_and_get_ptr(args[1]);
+            if (__builtin_expect(val != nullptr, 1))
             {
                 m_stat_get_hits++;
                 resp::encode_bulk_into(rb, *val);
@@ -1956,7 +2135,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             else
             {
 #ifndef SOCKETLEY_NO_LUA
-                if (lua() && lua()->has_on_miss())
+                if (__builtin_expect(lua() && lua()->has_on_miss(), 0))
                 {
                     try
                     {
@@ -1979,7 +2158,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 }
 #endif
                 m_stat_get_misses++;
-                resp::encode_null_into(rb);
+                rb.append(resp::RESP_NULL, 5);
             }
             break;
         }
@@ -2149,10 +2328,10 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         }
         case fnv1a("ping"):
         {
-            if (argc > 1)
-                resp::encode_bulk_into(rb, args[1]);
+            if (__builtin_expect(argc <= 1, 1))
+                rb.append(resp::RESP_PONG, 7);
             else
-                resp::encode_simple_into(rb, "PONG");
+                resp::encode_bulk_into(rb, args[1]);
             break;
         }
         case fnv1a("dbsize"):
@@ -2573,16 +2752,9 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
 
     if (subs && !subs->empty())
     {
-        // Build the message for RESP subscribers
-        std::string msg_line;
-        msg_line.reserve(8 + channel.size() + 1 + message.size() + 1);
-        msg_line.append("message ");
-        msg_line.append(channel.data(), channel.size());
-        msg_line.push_back(' ');
-        msg_line.append(message.data(), message.size());
-        msg_line.push_back('\n');
-
-        auto shared_msg = std::make_shared<const std::string>(std::move(msg_line));
+        // Lazily built per-format messages (avoid building both if only one type exists)
+        std::string text_msg;
+        std::string resp_msg;
 
         for (int fd : *subs)
         {
@@ -2599,7 +2771,32 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 continue;
             }
 
-            sub_conn->write_queue.push(*shared_msg);
+            if (sub_conn->resp_mode)
+            {
+                if (resp_msg.empty())
+                {
+                    // RESP pub/sub: *3\r\n$7\r\nmessage\r\n$<chanlen>\r\n<chan>\r\n$<msglen>\r\n<msg>\r\n
+                    resp_msg.reserve(32 + channel.size() + message.size());
+                    resp_msg.append("*3\r\n$7\r\nmessage\r\n");
+                    resp::encode_bulk_into(resp_msg, channel);
+                    resp::encode_bulk_into(resp_msg, message);
+                }
+                sub_conn->write_queue.push(resp_msg);
+            }
+            else
+            {
+                if (text_msg.empty())
+                {
+                    text_msg.reserve(8 + channel.size() + 1 + message.size() + 1);
+                    text_msg.append("message ");
+                    text_msg.append(channel.data(), channel.size());
+                    text_msg.push_back(' ');
+                    text_msg.append(message.data(), message.size());
+                    text_msg.push_back('\n');
+                }
+                sub_conn->write_queue.push(text_msg);
+            }
+
             if (!sub_conn->write_pending)
                 flush_write_queue(sub_conn);
             count++;

@@ -471,6 +471,169 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             }
             return 0;
         }
+        case fnv1a("--health-check"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-check requires tcp or http\n";
+                return 1;
+            }
+            ++i;
+            switch (pa.hashes[i])
+            {
+                case fnv1a("tcp"):
+                    proxy->set_health_check(mesh_config::health_tcp);
+                    break;
+                case fnv1a("http"):
+                    proxy->set_health_check(mesh_config::health_http);
+                    break;
+                default:
+                    std::cout << "unknown health-check type: " << pa.args[i] << "\n";
+                    return 1;
+            }
+            return 0;
+        }
+        case fnv1a("--health-interval"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-interval requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid health-interval value\n";
+                return 1;
+            }
+            proxy->set_health_interval(val);
+            return 0;
+        }
+        case fnv1a("--health-path"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-path requires a value\n";
+                return 1;
+            }
+            proxy->set_health_path(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--health-threshold"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-threshold requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid health-threshold value\n";
+                return 1;
+            }
+            proxy->set_health_threshold(val);
+            return 0;
+        }
+        case fnv1a("--circuit-threshold"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--circuit-threshold requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid circuit-threshold value\n";
+                return 1;
+            }
+            proxy->set_circuit_threshold(val);
+            return 0;
+        }
+        case fnv1a("--circuit-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--circuit-timeout requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid circuit-timeout value\n";
+                return 1;
+            }
+            proxy->set_circuit_timeout(val);
+            return 0;
+        }
+        case fnv1a("--retry"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--retry requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val < 0)
+            {
+                std::cout << "invalid retry value\n";
+                return 1;
+            }
+            proxy->set_retry_count(val);
+            return 0;
+        }
+        case fnv1a("--retry-all"):
+            proxy->set_retry_all(true);
+            return 0;
+        case fnv1a("--client-ca"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--client-ca requires a file path\n";
+                return 1;
+            }
+            proxy->set_mesh_client_ca(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--client-cert"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--client-cert requires a file path\n";
+                return 1;
+            }
+            proxy->set_mesh_client_cert(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--client-key"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--client-key requires a file path\n";
+                return 1;
+            }
+            proxy->set_mesh_client_key(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--sidecar"):
+            // Sidecar mode: shorthand for health-check tcp + circuit + retry + drain
+            proxy->set_health_check(mesh_config::health_tcp);
+            proxy->set_circuit_threshold(5);
+            proxy->set_circuit_timeout(30);
+            proxy->set_retry_count(2);
+            proxy->set_drain(true);
+            return 0;
         default:
             return -1;
     }
@@ -900,6 +1063,131 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
             }
             return 0;
         }
+        case fnv1a("--health-check"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-check requires tcp or http\n";
+                return 1;
+            }
+            ++i;
+            switch (pa.hashes[i])
+            {
+                case fnv1a("tcp"):
+                    proxy->set_health_check(mesh_config::health_tcp);
+                    break;
+                case fnv1a("http"):
+                    proxy->set_health_check(mesh_config::health_http);
+                    break;
+                default:
+                    std::cout << "unknown health-check type: " << pa.args[i] << "\n";
+                    return 1;
+            }
+            return 0;
+        }
+        case fnv1a("--health-interval"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-interval requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid health-interval value\n";
+                return 1;
+            }
+            proxy->set_health_interval(val);
+            return 0;
+        }
+        case fnv1a("--health-path"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-path requires a value\n";
+                return 1;
+            }
+            proxy->set_health_path(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--health-threshold"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--health-threshold requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid health-threshold value\n";
+                return 1;
+            }
+            proxy->set_health_threshold(val);
+            return 0;
+        }
+        case fnv1a("--circuit-threshold"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--circuit-threshold requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid circuit-threshold value\n";
+                return 1;
+            }
+            proxy->set_circuit_threshold(val);
+            return 0;
+        }
+        case fnv1a("--circuit-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--circuit-timeout requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val <= 0)
+            {
+                std::cout << "invalid circuit-timeout value\n";
+                return 1;
+            }
+            proxy->set_circuit_timeout(val);
+            return 0;
+        }
+        case fnv1a("--retry"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--retry requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val < 0)
+            {
+                std::cout << "invalid retry value\n";
+                return 1;
+            }
+            proxy->set_retry_count(val);
+            return 0;
+        }
+        case fnv1a("--retry-all"):
+            proxy->set_retry_all(true);
+            return 0;
         default:
             return -1;
     }

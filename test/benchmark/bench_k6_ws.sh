@@ -23,8 +23,14 @@ append_result() {
 # Write echo Lua script
 write_echo_lua() {
     cat > "$LUA_ECHO" << 'LUAEOF'
-function on_message(id, msg)
+function on_client_message(id, msg)
     self.send(id, msg)
+end
+
+-- Suppress default mode_inout broadcast (without this, every message is
+-- echoed back to the sender AND broadcast to all other clients, causing
+-- O(n^2) write amplification that starves the accept path under load).
+function on_message(msg)
 end
 LUAEOF
 }
@@ -110,6 +116,8 @@ test_ws_echo() {
 
     write_echo_lua
 
+    socketley_cmd stop bench_k6_ws 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_ws 2>/dev/null
+    wait_for_port_free $WS_PORT
     socketley_cmd create server bench_k6_ws -p $WS_PORT --lua "$LUA_ECHO" -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
@@ -118,8 +126,6 @@ test_ws_echo() {
     k6 run \
         --summary-export "$k6_export" \
         --env WS_URL="ws://localhost:${WS_PORT}" \
-        --env MSGS_PER_VU=50 \
-        --env MSG_INTERVAL_MS=20 \
         --quiet \
         "${K6_DIR}/ws_bench.js" 2>&1
 

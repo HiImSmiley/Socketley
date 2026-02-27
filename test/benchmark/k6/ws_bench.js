@@ -11,14 +11,15 @@ const wsRTT = new Trend('ws_rtt', true);
 const wsErrorRate = new Rate('ws_error_rate');
 
 const WS_URL = __ENV.WS_URL || 'ws://localhost:19021';
-const MSGS_PER_VU = parseInt(__ENV.MSGS_PER_VU || '50');
-const MSG_INTERVAL_MS = parseInt(__ENV.MSG_INTERVAL_MS || '20');
+const MSGS_PER_VU = parseInt(__ENV.MSGS_PER_VU || '200');
+const MSG_INTERVAL_MS = parseInt(__ENV.MSG_INTERVAL_MS || '1');
 
 export const options = {
     stages: [
-        { duration: '10s', target: 50 },   // Ramp-up
-        { duration: '20s', target: 50 },   // Sustained
-        { duration: '10s', target: 200 },  // High concurrency
+        { duration: '5s',  target: 50 },   // Ramp-up
+        { duration: '15s', target: 50 },   // Sustained
+        { duration: '5s',  target: 200 },  // High concurrency
+        { duration: '10s', target: 200 },  // Sustained spike
         { duration: '5s',  target: 1 },    // Cooldown
     ],
     summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
@@ -38,7 +39,7 @@ export default function () {
             wsConnections.add(1);
             wsErrorRate.add(0);
 
-            // Send timestamped messages in a loop
+            // Send timestamped messages in a tight loop
             let done = false;
             socket.setInterval(function () {
                 if (done) return;

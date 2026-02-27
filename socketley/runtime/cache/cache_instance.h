@@ -34,6 +34,7 @@ struct client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+    bool zc_notif_pending{false};
 
     // RESP protocol mode (auto-detected or forced)
     bool resp_mode{false};
@@ -229,6 +230,8 @@ private:
     static constexpr uint32_t BUF_COUNT = 512;
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
+    bool m_recv_multishot{false};
+    bool m_send_zc{false};
 
     // Periodic TTL sweep timer
     io_request m_ttl_req{};
