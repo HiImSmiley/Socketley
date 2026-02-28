@@ -379,7 +379,7 @@ std::string metrics_endpoint::build_json_overview() const
 
     std::string j;
     j.reserve(512);
-    j += "{\"version\":\"1.0.7\",\"uptime_seconds\":";
+    j += "{\"version\":\"1.0.8\",\"uptime_seconds\":";
     json_append_uint(j, static_cast<uint64_t>(uptime));
     j += ",\"runtimes_total\":";
     json_append_uint(j, runtimes_total);
