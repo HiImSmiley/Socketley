@@ -186,14 +186,18 @@ cli_commands() {
     echo -e "  ${CYAN}socketley restart api -p 9001${NC}  # restart with new port"
     echo ""
 
-    echo -e "${BOLD}ls [--json|-j]${NC}"
-    echo "  List all runtimes (Docker-style: ID, NAME, TYPE, PORT, CONN, STATUS, CREATED)"
-    echo "  --json: Output as JSON array for scripting"
+    echo -e "${BOLD}ls [--json|-j|--format json] [--silent|-s] [columns...]${NC}"
+    echo "  List all runtimes (Docker-style: ID, NAME, TYPE, PORT, CONN, STATUS, CREATED, GROUP)"
+    echo "  --json / --format json: Output as JSON array for scripting"
+    echo "  --silent / -s: Print only runtime names (one per line)"
+    echo "  Column selectors: --id --name --type --port --status --conn --owner --created --group"
+    echo -e "  ${CYAN}socketley ls --name --port --status${NC}  # show only selected columns"
     echo ""
 
-    echo -e "${BOLD}ps [--json|-j]${NC}"
-    echo "  List running runtimes (same format as ls)"
-    echo "  --json: Output as JSON array for scripting"
+    echo -e "${BOLD}ps [--json|-j|--format json] [columns...]${NC}"
+    echo "  List running runtimes (same format as ls, includes uptime)"
+    echo "  --json / --format json: Output as JSON array for scripting"
+    echo "  Column selectors: --id --name --type --port --uptime --conn --owner --created"
     echo ""
 
     echo -e "${BOLD}stats <name|pattern>...${NC}"
@@ -228,6 +232,13 @@ cli_commands() {
     echo -e "  ${CYAN}socketley edit myserver${NC}           # Opens config in \$EDITOR"
     echo -e "  ${CYAN}socketley edit myserver -r${NC}        # Opens editor, auto-reloads Lua"
     echo -e "  ${CYAN}socketley edit myserver -p 9001${NC}   # Direct flag-based edit"
+    echo ""
+
+    echo -e "${BOLD}import <name> <json>${NC}"
+    echo "  Update a runtime's configuration from a JSON string"
+    echo "  Same fields as the interactive editor. Read-only fields are ignored."
+    echo "  Port/TLS/protocol/UDP cannot be changed while running."
+    echo -e "  ${CYAN}socketley import myserver '{\"port\":9001,\"rate_limit\":500}'${NC}"
     echo ""
 
     echo -e "${BOLD}owner <name>${NC}"
@@ -1279,8 +1290,8 @@ installation_help() {
     echo ""
 
     echo -e "${BOLD}Build Debian Package:${NC}"
-    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.7${NC}"
-    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.7_amd64.deb${NC}"
+    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.8${NC}"
+    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.8_amd64.deb${NC}"
     echo ""
 
     echo -e "${BOLD}Daemon Configuration (config.lua):${NC}"

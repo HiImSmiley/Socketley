@@ -389,10 +389,14 @@ socketley create proxy gw -p 8080 --backend @api -s</code></pre>
   <div class="cli-name">socketley edit &lt;name&gt; [flags]</div>
   <div class="cli-desc">Modify a runtime's config. With flags: apply directly (<code>socketley edit myapp -p 9001</code>). Without flags: opens <code>$EDITOR</code> for interactive editing. Add <code>-r</code> to auto-reload-lua after saving.</div>
 </div>
+<div class="cli-card">
+  <div class="cli-name">socketley import &lt;name&gt; &lt;json&gt;</div>
+  <div class="cli-desc">Update a runtime's configuration from a JSON string. Same fields as the interactive editor. Read-only fields are ignored. Port/TLS/protocol/UDP cannot be changed while running.</div>
+</div>
 
 <div class="cli-card" id="cmd-ls-ps">
   <div class="cli-name">socketley ls / ps / owner &lt;name&gt;</div>
-  <div class="cli-desc"><code>ls</code> = list all runtimes (running and stopped), <code>ps</code> = running only, <code>owner</code> = show parent/child relationships for Lua-created runtimes.</div>
+  <div class="cli-desc"><code>ls</code> = list all runtimes (running and stopped), <code>ps</code> = running only, <code>owner</code> = show parent/child relationships for Lua-created runtimes. Use <code>--json</code>, <code>-j</code>, or <code>--format json</code> for JSON output. Use <code>--silent</code> / <code>-s</code> to print only names. Column selectors: <code>--id</code>, <code>--name</code>, <code>--type</code>, <code>--port</code>, <code>--status</code>, <code>--conn</code>, <code>--owner</code>, <code>--created</code>, <code>--group</code>.</div>
 </div>
 <pre><code>ID        NAME            TYPE    PORT    CONN  OWNED BY    STATUS              CREATED
 a1b2c3    api-server      server  9000    3     -           Up 2 hours          3 hours ago
