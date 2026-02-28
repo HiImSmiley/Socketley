@@ -84,8 +84,11 @@ run_bench_median() {
 
     for ((i = 1; i <= runs; i++)); do
         local f="$TMPDIR_BENCH/${label}_p${pipeline}_run${i}.txt"
-        redis-benchmark -p "$port" -c $CLIENTS -n "$requests" -P "$pipeline" \
+        timeout "$BENCH_TIMEOUT_REDIS" redis-benchmark -p "$port" -c $CLIENTS -n "$requests" -P "$pipeline" \
             -t "$TESTS" -r 100000 -q --precision 3 2>/dev/null | sed 's/.*\r//' > "$f"
+        if [[ ${PIPESTATUS[0]} -eq 124 ]]; then
+            log_bench "TIMEOUT" "redis-benchmark $label P=$pipeline run $i"
+        fi
         files+=("$f")
         [[ $runs -gt 1 ]] && log_info "  Run $i/$runs done" >&2
     done
@@ -232,11 +235,15 @@ run_cache_resp_benchmarks() {
     # ── P=1 ──
     log_section "Pipeline Depth = 1 ($CLIENTS clients, $(( P1_REQUESTS / 1000 ))K ops)"
 
+    log_bench "START" "cache_resp_socketley_p1"
     log_info "Benchmarking Socketley (P=1)..."
     local s_p1=$(run_bench_median "socketley" $CACHE_PORT 1 $P1_REQUESTS $RUNS)
+    log_bench "DONE" "cache_resp_socketley_p1"
 
+    log_bench "START" "cache_resp_redis_p1"
     log_info "Benchmarking Redis (P=1)..."
     local r_p1=$(run_bench_median "redis" $REDIS_PORT 1 $P1_REQUESTS $RUNS)
+    log_bench "DONE" "cache_resp_redis_p1"
 
     print_comparison "Results: Pipeline Depth = 1" "$s_p1" "$r_p1"
     print_latency "Latency (P=1)" "$s_p1" "$r_p1"
@@ -244,15 +251,20 @@ run_cache_resp_benchmarks() {
 
     # Flush between runs
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
+    fresh_daemon
 
     # ── P=100 ──
     log_section "Pipeline Depth = 100 ($CLIENTS clients, $(( P100_REQUESTS / 1000 ))K ops)"
 
+    log_bench "START" "cache_resp_socketley_p100"
     log_info "Benchmarking Socketley (P=100)..."
     local s_p100=$(run_bench_median "socketley" $CACHE_PORT 100 $P100_REQUESTS $RUNS)
+    log_bench "DONE" "cache_resp_socketley_p100"
 
+    log_bench "START" "cache_resp_redis_p100"
     log_info "Benchmarking Redis (P=100)..."
     local r_p100=$(run_bench_median "redis" $REDIS_PORT 100 $P100_REQUESTS $RUNS)
+    log_bench "DONE" "cache_resp_redis_p100"
 
     print_comparison "Results: Pipeline Depth = 100" "$s_p100" "$r_p100"
     print_latency "Latency (P=100)" "$s_p100" "$r_p100"

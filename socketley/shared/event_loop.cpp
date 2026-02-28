@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <sched.h>
 
+
 event_loop::event_loop(uint32_t queue_depth)
     : m_running(false), m_queue_depth(queue_depth), m_pending_submissions(0)
 {
@@ -55,7 +56,7 @@ void event_loop::setup_signal_pipe()
     if (pipe2(m_signal_pipe, O_NONBLOCK | O_CLOEXEC) < 0)
         return;
 
-    m_signal_req = { op_read, m_signal_pipe[0], &m_signal_buf, 1, nullptr };
+    m_signal_req = { nullptr, &m_signal_buf, m_signal_pipe[0], 1, op_read };
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
     if (sqe)
@@ -68,12 +69,15 @@ void event_loop::setup_signal_pipe()
 
 // Centralized SQE acquisition: get an SQE, flushing if the ring is full.
 // The fast path (SQE available) is branch-predicted; the flush path is cold.
+// After flush, retry once — if still null the SQ is genuinely full (shouldn't
+// happen at our queue depths, but defensive).
 inline struct io_uring_sqe* event_loop::get_sqe()
 {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
     if (__builtin_expect(!sqe, 0))
     {
-        flush();
+        io_uring_submit(&m_ring);
+        m_pending_submissions = 0;
         sqe = io_uring_get_sqe(&m_ring);
     }
     return sqe;
@@ -103,12 +107,29 @@ bool event_loop::init()
         }
     }
 
-    // Priority 2: Plain mode
+    // Priority 2: SINGLE_ISSUER + DEFER_TASKRUN (defers task_work to
+    // io_uring_enter, avoiding async interrupts; needs kernel 6.1+)
+    if (!initialized)
+    {
+        struct io_uring_params p2{};
+        p2.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
+                 | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
+        p2.flags |= IORING_SETUP_CQSIZE;
+        p2.cq_entries = m_queue_depth * 4;
+        if (io_uring_queue_init_params(m_queue_depth, &m_ring, &p2) == 0)
+            initialized = true;
+    }
+
+    // Priority 3: Plain mode
     if (!initialized)
     {
         if (io_uring_queue_init(m_queue_depth, &m_ring, 0) < 0)
             return false;
     }
+
+    // Register the ring fd itself: eliminates an fget/fput per io_uring
+    // syscall (submit, wait, enter).  ~1-3% throughput improvement.
+    io_uring_register_ring_fd(&m_ring);
 
     m_multishot_supported = supports_multishot_accept();
 
@@ -172,10 +193,14 @@ void event_loop::run()
         // landed (common at high throughput), skip the blocking wait entirely.
         if (m_pending_submissions > 0)
         {
-            io_uring_submit_and_wait(&m_ring, 1);
+            if (__builtin_expect(m_sqpoll_enabled, 1))
+                io_uring_submit(&m_ring);  // SQPOLL: tail update only, no syscall
+            else
+                io_uring_submit_and_wait(&m_ring, 1);
             m_pending_submissions = 0;
         }
-        else if (io_uring_peek_cqe(&m_ring, &cqe) != 0)
+
+        if (io_uring_peek_cqe(&m_ring, &cqe) != 0)
         {
             // Ring is empty: block until at least one CQE arrives
             if (io_uring_wait_cqe(&m_ring, &cqe) < 0)
@@ -194,12 +219,6 @@ void event_loop::run()
             count++;
 
             auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-
-            // Prefetch the NEXT CQE's user_data to hide cache-miss latency.
-            // The CQE ring is contiguous in memory, so cqe+1 is valid as long
-            // as it's within the ring (the macro handles wrapping).
-            if (auto* next_req = static_cast<io_request*>(io_uring_cqe_get_data(cqe + 1)))
-                __builtin_prefetch(next_req, 0, 1);
 
             if (__builtin_expect(req == &m_signal_req, 0))
             {
@@ -470,6 +489,13 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
         if (madvise(base, alloc_size, MADV_HUGEPAGE) < 0) {}
     }
 
+    // Touch all pages to prefault them
+    for (size_t i = 0; i < alloc_size; i += 4096)
+    {
+        volatile char touch = base[i];
+        (void)touch;
+    }
+
     // Register all buffers
     for (uint32_t i = 0; i < buf_count; i++)
     {
@@ -526,6 +552,24 @@ void event_loop::return_buf(uint16_t group_id, uint16_t buf_id)
     io_uring_buf_ring_advance(pool.ring, 1);
 }
 
+void event_loop::return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count)
+{
+    if (__builtin_expect(group_id >= MAX_BUF_GROUPS, 0))
+        return;
+    auto& pool = m_buf_rings[group_id];
+    if (__builtin_expect(!pool.ring, 0))
+        return;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint16_t bid = buf_ids[i];
+        io_uring_buf_ring_add(pool.ring,
+            pool.base + (static_cast<size_t>(bid) * pool.buf_size),
+            pool.buf_size, bid,
+            io_uring_buf_ring_mask(pool.buf_count), 0);
+    }
+    io_uring_buf_ring_advance(pool.ring, count);
+}
+
 bool event_loop::has_buf_ring(uint16_t group_id) const
 {
     return group_id < MAX_BUF_GROUPS && m_buf_rings[group_id].ring != nullptr;
@@ -562,7 +606,7 @@ void event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_reques
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return;
 
-    io_uring_prep_send_zc(sqe, fd, buf, len, 0, 0);
+    io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
     m_pending_submissions++;

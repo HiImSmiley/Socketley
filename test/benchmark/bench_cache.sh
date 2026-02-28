@@ -27,7 +27,7 @@ ensure_clean() {
 
 # Send a single one-off command and return its response.
 cache_cmd() {
-    printf '%s\n' "$1" | nc -q1 localhost $CACHE_PORT 2>/dev/null
+    printf '%s\n' "$1" | timeout "$BENCH_TIMEOUT_NC" nc -q1 localhost $CACHE_PORT 2>/dev/null
 }
 
 # Test 1: SET throughput
@@ -45,8 +45,8 @@ test_set_throughput() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j cache set 127.0.0.1 $CACHE_PORT $num_ops $value_size >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" cache set 127.0.0.1 $CACHE_PORT $num_ops $value_size
+    bench_run -j cache set 127.0.0.1 $CACHE_PORT $num_ops $value_size >> "$RESULTS_FILE"
+    bench_run cache set 127.0.0.1 $CACHE_PORT $num_ops $value_size
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -67,8 +67,8 @@ test_get_throughput() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j cache get 127.0.0.1 $CACHE_PORT $num_ops >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" cache get 127.0.0.1 $CACHE_PORT $num_ops
+    bench_run -j cache get 127.0.0.1 $CACHE_PORT $num_ops >> "$RESULTS_FILE"
+    bench_run cache get 127.0.0.1 $CACHE_PORT $num_ops
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -89,8 +89,8 @@ test_mixed_workload() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j cache mixed 127.0.0.1 $CACHE_PORT $num_ops >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" cache mixed 127.0.0.1 $CACHE_PORT $num_ops
+    bench_run -j cache mixed 127.0.0.1 $CACHE_PORT $num_ops >> "$RESULTS_FILE"
+    bench_run cache mixed 127.0.0.1 $CACHE_PORT $num_ops
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -112,8 +112,8 @@ test_concurrent_access() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j cache concurrent 127.0.0.1 $CACHE_PORT $num_clients $ops_per_client >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" cache concurrent 127.0.0.1 $CACHE_PORT $num_clients $ops_per_client
+    bench_run -j cache concurrent 127.0.0.1 $CACHE_PORT $num_clients $ops_per_client >> "$RESULTS_FILE"
+    bench_run cache concurrent 127.0.0.1 $CACHE_PORT $num_clients $ops_per_client
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -141,7 +141,7 @@ test_persistence() {
     log_info "Populating $num_keys keys..."
     awk -v n=$num_keys -v v="$value" \
         'BEGIN{ for(i=1;i<=n;i++) printf "SET key%d %s\n",i,v }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     sleep 0.1
 
     # FLUSH
@@ -202,8 +202,8 @@ test_large_values() {
         sleep 0.5
 
         append_result
-        "$SOCKETLEY_BENCH" -j -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size >> "$RESULTS_FILE"
-        "$SOCKETLEY_BENCH" -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size
+        bench_run -j -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size >> "$RESULTS_FILE"
+        bench_run -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size
 
         socketley_cmd stop bench_cache
         sleep 0.5
@@ -227,7 +227,7 @@ test_list_throughput() {
     # LPUSH
     local start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "LPUSH benchlist item%d\n",i }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local lpush_time=$((end_time - start_time))
     local lpush_ops=$(echo "scale=2; $num_ops * 1000 / $lpush_time" | bc)
@@ -236,7 +236,7 @@ test_list_throughput() {
     # LPOP
     start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "LPOP benchlist\n" }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local lpop_time=$((end_time - start_time))
     local lpop_ops=$(echo "scale=2; $num_ops * 1000 / $lpop_time" | bc)
@@ -269,7 +269,7 @@ test_set_ds_throughput() {
     # SADD
     local start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "SADD benchset member%d\n",i }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local sadd_time=$((end_time - start_time))
     local sadd_ops=$(echo "scale=2; $num_ops * 1000 / $sadd_time" | bc)
@@ -278,7 +278,7 @@ test_set_ds_throughput() {
     # SISMEMBER
     start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "SISMEMBER benchset member%d\n",int(rand()*n)+1 }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local sismember_time=$((end_time - start_time))
     local sismember_ops=$(echo "scale=2; $num_ops * 1000 / $sismember_time" | bc)
@@ -311,7 +311,7 @@ test_hash_throughput() {
     # HSET
     local start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "HSET benchhash field%d value%d\n",i,i }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local hset_time=$((end_time - start_time))
     local hset_ops=$(echo "scale=2; $num_ops * 1000 / $hset_time" | bc)
@@ -320,7 +320,7 @@ test_hash_throughput() {
     # HGET
     start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "HGET benchhash field%d\n",int(rand()*n)+1 }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local hget_time=$((end_time - start_time))
     local hget_ops=$(echo "scale=2; $num_ops * 1000 / $hget_time" | bc)
@@ -352,13 +352,13 @@ test_ttl_throughput() {
 
     # Populate keys
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "SET ttlkey%d val%d\n",i,i }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     sleep 0.1
 
     # EXPIRE
     local start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ for(i=1;i<=n;i++) printf "EXPIRE ttlkey%d 3600\n",i }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     local end_time=$(get_time_ms)
     local expire_time=$((end_time - start_time))
     local expire_ops=$(echo "scale=2; $num_ops * 1000 / $expire_time" | bc)
@@ -367,7 +367,7 @@ test_ttl_throughput() {
     # TTL
     start_time=$(get_time_ms)
     awk -v n=$num_ops 'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "TTL ttlkey%d\n",int(rand()*n)+1 }' \
-        | nc -q0 localhost $CACHE_PORT >/dev/null 2>&1
+        | bench_nc $CACHE_PORT >/dev/null 2>&1
     end_time=$(get_time_ms)
     local ttl_time=$((end_time - start_time))
     local ttl_ops=$(echo "scale=2; $num_ops * 1000 / $ttl_time" | bc)
@@ -390,16 +390,54 @@ run_cache_benchmarks() {
 
     ensure_socketley_bench || return 1
 
+    log_bench "START" "cache_set_throughput"
     test_set_throughput     10000 64
+    log_bench "DONE" "cache_set_throughput"
+    fresh_daemon
+
+    log_bench "START" "cache_get_throughput"
     test_get_throughput     10000
+    log_bench "DONE" "cache_get_throughput"
+    fresh_daemon
+
+    log_bench "START" "cache_mixed_workload"
     test_mixed_workload     10000
+    log_bench "DONE" "cache_mixed_workload"
+    fresh_daemon
+
+    log_bench "START" "cache_concurrent_access"
     test_concurrent_access  20 2000
+    log_bench "DONE" "cache_concurrent_access"
+    fresh_daemon
+
+    log_bench "START" "cache_persistence"
     test_persistence        10000
+    log_bench "DONE" "cache_persistence"
+    fresh_daemon
+
+    log_bench "START" "cache_large_values"
     test_large_values
+    log_bench "DONE" "cache_large_values"
+    fresh_daemon
+
+    log_bench "START" "cache_list_throughput"
     test_list_throughput    5000
+    log_bench "DONE" "cache_list_throughput"
+    fresh_daemon
+
+    log_bench "START" "cache_set_ds_throughput"
     test_set_ds_throughput  5000
+    log_bench "DONE" "cache_set_ds_throughput"
+    fresh_daemon
+
+    log_bench "START" "cache_hash_throughput"
     test_hash_throughput    5000
+    log_bench "DONE" "cache_hash_throughput"
+    fresh_daemon
+
+    log_bench "START" "cache_ttl_throughput"
     test_ttl_throughput     5000
+    log_bench "DONE" "cache_ttl_throughput"
 
     echo "]" >> "$RESULTS_FILE"
 

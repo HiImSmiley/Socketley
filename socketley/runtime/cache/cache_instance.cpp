@@ -22,7 +22,7 @@ cache_instance::cache_instance(std::string_view name)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { op_accept, -1, nullptr, 0, this };
+    m_accept_req = { this, nullptr, -1, 0, op_accept };
 }
 
 cache_instance::~cache_instance()
@@ -86,6 +86,10 @@ bool cache_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+    int rcvbuf = 131072;
+    setsockopt(m_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(m_listen_fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -107,6 +111,12 @@ bool cache_instance::setup(event_loop& loop)
 
     if (!m_persistent_path.empty())
         m_store.load(m_persistent_path);
+
+    // Cache config values to avoid virtual calls on hot paths
+    m_idle_timeout_cached = get_idle_timeout();
+    m_max_conns_cached = get_max_connections();
+    m_rate_limit_cached = get_rate_limit();
+    m_has_ttl_keys = false;
 
     // Connect to master if follower
     if (m_repl_role == repl_follower && !m_replicate_target.empty())
@@ -131,14 +141,14 @@ bool cache_instance::setup(event_loop& loop)
 
     // Start periodic TTL sweep (100 ms)
     m_ttl_ts = {0, 100'000'000};
-    m_ttl_req = {op_timeout, -1, nullptr, 0, this};
+    m_ttl_req = {this, nullptr, -1, 0, op_timeout};
     loop.submit_timeout(&m_ttl_ts, &m_ttl_req);
 
-    if (get_idle_timeout() > 0)
+    if (m_idle_timeout_cached > 0)
     {
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
     }
 
@@ -213,6 +223,11 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     // Periodic TTL sweep timer
     if (req == &m_ttl_req)
     {
+        if (!m_has_ttl_keys)
+        {
+            m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
+            return;
+        }
         auto expired_keys = m_store.sweep_expired();
 #ifndef SOCKETLEY_NO_LUA
         if (lua() && lua()->has_on_expire() && !expired_keys.empty())
@@ -258,7 +273,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             if (req == &m_idle_sweep_req)
             {
                 auto now = std::chrono::steady_clock::now();
-                auto timeout = std::chrono::seconds(get_idle_timeout());
+                auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (auto& [cfd, cconn] : m_clients)
                 {
                     if (!cconn->closing && (now - cconn->last_activity) > timeout)
@@ -299,7 +314,7 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             goto cache_resubmit_accept;
         }
 
-        if (get_max_connections() > 0 && m_clients.size() >= get_max_connections())
+        if (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)
         {
             close(client_fd);
             goto cache_resubmit_accept;
@@ -314,8 +329,8 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         conn->fd = client_fd;
         conn->partial.reserve(4096);
         conn->response_buf.reserve(4096);
-        conn->read_req = { op_read, client_fd, conn->read_buf, sizeof(conn->read_buf), this };
-        conn->write_req = { op_write, client_fd, nullptr, 0, this };
+        conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+        conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
@@ -323,11 +338,10 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             m_conn_idx[client_fd] = ptr;
 
         // Initialize rate limiting
-        double rl = get_rate_limit();
-        if (rl > 0)
+        if (m_rate_limit_cached > 0)
         {
-            ptr->rl_max = rl;
-            ptr->rl_tokens = rl;
+            ptr->rl_max = m_rate_limit_cached;
+            ptr->rl_tokens = m_rate_limit_cached;
             ptr->rl_last = std::chrono::steady_clock::now();
         }
 
@@ -347,7 +361,7 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
     {
         m_accept_backoff_ts.tv_sec = 0;
         m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
         return;
     }
@@ -422,7 +436,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Only update last_activity when idle timeout is configured (avoids clock_gettime syscall)
-    if (__builtin_expect(get_idle_timeout() > 0, 0))
+    if (__builtin_expect(m_idle_timeout_cached > 0, 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
     if (is_provided)
@@ -765,7 +779,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                             sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
                             if (ttl_opt) ttl = *ttl_opt;
                             m_store.set(args, *fetched);
-                            if (ttl > 0) m_store.set_expiry(args, ttl);
+                            if (ttl > 0) { m_store.set_expiry(args, ttl); m_has_ttl_keys = true; }
                             m_stat_get_hits++;
                             rb.append(*fetched);
                             rb.push_back('\n');
@@ -1331,7 +1345,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("error: invalid seconds\n", 23);
                 return;
             }
-            rb.append(m_store.set_expiry(key, seconds) ? "ok\n" : "nil\n");
+            if (m_store.set_expiry(key, seconds))
+            {
+                m_has_ttl_keys = true;
+                rb.append("ok\n", 3);
+            }
+            else
+                rb.append("nil\n", 4);
             break;
         }
         case fnv1a("ttl"):
@@ -1383,6 +1403,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             m_store.check_expiry(key);
             if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
             m_store.set_expiry(key, sec);
+            m_has_ttl_keys = true;
             rb.append("ok\n", 3);
             replicate_command(line);
 #ifndef SOCKETLEY_NO_LUA
@@ -1409,6 +1430,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             m_store.check_expiry(key);
             if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
             m_store.set_expiry_ms(key, ms);
+            m_has_ttl_keys = true;
             rb.append("ok\n", 3);
             replicate_command(line);
 #ifndef SOCKETLEY_NO_LUA
@@ -1431,7 +1453,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 auto [p, e] = std::from_chars(ms_str.data(), ms_str.data() + ms_str.size(), ms);
                 if (e != std::errc{} || ms <= 0) { rb.append("error: invalid ms\n", 18); return; }
             }
-            rb.append(m_store.set_expiry_ms(key, ms) ? "1\n" : "0\n");
+            if (m_store.set_expiry_ms(key, ms))
+            {
+                m_has_ttl_keys = true;
+                rb.append("1\n", 2);
+            }
+            else
+                rb.append("0\n", 2);
             break;
         }
         case fnv1a("pttl"):
@@ -1455,7 +1483,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(key); rb.append("1\n", 2); }
-                else rb.append(m_store.set_expiry(key, static_cast<int>(remaining)) ? "1\n" : "0\n");
+                else if (m_store.set_expiry(key, static_cast<int>(remaining)))
+                { m_has_ttl_keys = true; rb.append("1\n", 2); }
+                else rb.append("0\n", 2);
             }
             break;
         }
@@ -1474,7 +1504,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining_ms = unix_ms - now_ms;
                 if (remaining_ms <= 0) { m_store.del(key); rb.append("1\n", 2); }
-                else rb.append(m_store.set_expiry_ms(key, remaining_ms) ? "1\n" : "0\n");
+                else if (m_store.set_expiry_ms(key, remaining_ms))
+                { m_has_ttl_keys = true; rb.append("1\n", 2); }
+                else rb.append("0\n", 2);
             }
             break;
         }
@@ -1914,7 +1946,12 @@ bool cache_instance::lua_expire(std::string_view key, int seconds)
 {
     if (m_mode == cache_mode_readonly)
         return false;
-    return m_store.set_expiry(key, seconds);
+    if (m_store.set_expiry(key, seconds))
+    {
+        m_has_ttl_keys = true;
+        return true;
+    }
+    return false;
 }
 
 int cache_instance::lua_ttl(std::string_view key)
@@ -2109,8 +2146,8 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 resp::encode_error_into(rb, "type conflict");
                 break;
             }
-            if (ex_sec > 0) m_store.set_expiry(args[1], ex_sec);
-            else if (px_ms > 0) m_store.set_expiry_ms(args[1], px_ms);
+            if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); m_has_ttl_keys = true; }
+            else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); m_has_ttl_keys = true; }
             resp::encode_ok_into(rb);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
@@ -2147,7 +2184,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                             sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
                             if (ttl_opt) ttl = *ttl_opt;
                             m_store.set(args[1], *fetched);
-                            if (ttl > 0) m_store.set_expiry(args[1], ttl);
+                            if (ttl > 0) { m_store.set_expiry(args[1], ttl); m_has_ttl_keys = true; }
                             m_stat_get_hits++;
                             resp::encode_bulk_into(rb, *fetched);
                             break;
@@ -2552,7 +2589,13 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int sec = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), sec);
             if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
-            resp::encode_integer_into(rb, m_store.set_expiry(args[1], sec) ? 1 : 0);
+            if (m_store.set_expiry(args[1], sec))
+            {
+                m_has_ttl_keys = true;
+                resp::encode_integer_into(rb, 1);
+            }
+            else
+                resp::encode_integer_into(rb, 0);
             break;
         }
         case fnv1a("ttl"):
@@ -2595,6 +2638,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             m_store.check_expiry(args[1]);
             if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             m_store.set_expiry(args[1], sec);
+            m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
@@ -2616,6 +2660,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             m_store.check_expiry(args[1]);
             if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             m_store.set_expiry_ms(args[1], ms);
+            m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
@@ -2634,7 +2679,13 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int64_t ms = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), ms);
             if (e != std::errc{} || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time"); return; }
-            resp::encode_integer_into(rb, m_store.set_expiry_ms(args[1], ms) ? 1 : 0);
+            if (m_store.set_expiry_ms(args[1], ms))
+            {
+                m_has_ttl_keys = true;
+                resp::encode_integer_into(rb, 1);
+            }
+            else
+                resp::encode_integer_into(rb, 0);
             break;
         }
         case fnv1a("pttl"):
@@ -2656,7 +2707,9 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(args[1]); resp::encode_integer_into(rb, 1); }
-                else resp::encode_integer_into(rb, m_store.set_expiry(args[1], static_cast<int>(remaining)) ? 1 : 0);
+                else if (m_store.set_expiry(args[1], static_cast<int>(remaining)))
+                { m_has_ttl_keys = true; resp::encode_integer_into(rb, 1); }
+                else resp::encode_integer_into(rb, 0);
             }
             break;
         }
@@ -2672,7 +2725,9 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining_ms = unix_ms - now_ms;
                 if (remaining_ms <= 0) { m_store.del(args[1]); resp::encode_integer_into(rb, 1); }
-                else resp::encode_integer_into(rb, m_store.set_expiry_ms(args[1], remaining_ms) ? 1 : 0);
+                else if (m_store.set_expiry_ms(args[1], remaining_ms))
+                { m_has_ttl_keys = true; resp::encode_integer_into(rb, 1); }
+                else resp::encode_integer_into(rb, 0);
             }
             break;
         }
@@ -2982,7 +3037,7 @@ bool cache_instance::connect_to_master()
     m_master_fd = fd;
 
     // Submit read for master data
-    m_master_read_req = { op_read, fd, m_master_read_buf, sizeof(m_master_read_buf), this };
+    m_master_read_req = { this, m_master_read_buf, fd, sizeof(m_master_read_buf), op_read };
     if (m_loop)
         m_loop->submit_read(fd, m_master_read_buf, sizeof(m_master_read_buf), &m_master_read_req);
 

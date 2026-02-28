@@ -25,7 +25,8 @@
 lua_context::lua_context()
 {
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
-                         sol::lib::math, sol::lib::os, sol::lib::io);
+                         sol::lib::math, sol::lib::os, sol::lib::io,
+                         sol::lib::package);
 
     // Remove dangerous os functions — keep os.time, os.clock, os.date, os.difftime
     m_lua["os"]["execute"] = sol::nil;
@@ -45,24 +46,26 @@ struct lua_timer : io_handler
     struct __kernel_timespec ts{};
     io_request            req{};
     bool                  repeat{false};
+    bool                  cancelled{false};
+    int                   timer_id{0};
 
     void on_cqe(struct io_uring_cqe* cqe) override
     {
-        if (!*alive || cqe->res == -ECANCELED)
+        if (!*alive || cqe->res == -ECANCELED || cancelled)
         {
-            if (ctx) ctx->unregister_timer(this);
-            delete this;
+            if (ctx) { ctx->unregister_timer(this); ctx->timer_pool_release(this); }
+            else delete this;
             return;
         }
         try { fn(); } catch (const sol::error& e) {
             fprintf(stderr, "[lua] timer error: %s\n", e.what());
         }
-        if (repeat && *alive)
+        if (repeat && *alive && !cancelled)
             loop->submit_timeout(&ts, &req);
         else
         {
-            if (ctx) ctx->unregister_timer(this);
-            delete this;
+            if (ctx) { ctx->unregister_timer(this); ctx->timer_pool_release(this); }
+            else delete this;
         }
     }
 };
@@ -75,17 +78,46 @@ lua_context::~lua_context()
         static_cast<lua_timer*>(t)->fn = sol::nil;
     m_active_timers.clear();
 
+    // Free all pooled timers
+    for (auto* t : m_timer_pool)
+        delete static_cast<lua_timer*>(t);
+    m_timer_pool.clear();
+
     *m_alive = false;
 }
 
 void lua_context::unregister_timer(void* t)
 {
+    auto* timer = static_cast<lua_timer*>(t);
+    if (timer->timer_id > 0)
+        m_timer_map.erase(timer->timer_id);
+
     auto it = std::find(m_active_timers.begin(), m_active_timers.end(), t);
     if (it != m_active_timers.end())
     {
         *it = m_active_timers.back();
         m_active_timers.pop_back();
     }
+}
+
+void* lua_context::timer_pool_acquire()
+{
+    if (!m_timer_pool.empty())
+    {
+        auto* t = m_timer_pool.back();
+        m_timer_pool.pop_back();
+        return t;
+    }
+    return new lua_timer{};
+}
+
+void lua_context::timer_pool_release(void* t)
+{
+    auto* timer = static_cast<lua_timer*>(t);
+    timer->fn = sol::nil;
+    timer->cancelled = false;
+    timer->timer_id = 0;
+    m_timer_pool.push_back(t);
 }
 
 static const char* state_to_string(runtime_state s)
@@ -103,6 +135,25 @@ static const char* state_to_string(runtime_state s)
 bool lua_context::load_script(std::string_view path, runtime_instance* owner)
 {
     register_bindings(owner);
+
+    // Set package.path so require() resolves modules relative to the script's directory
+    {
+        std::string script_dir(path);
+        auto slash = script_dir.rfind('/');
+        if (slash != std::string::npos)
+            script_dir.resize(slash);
+        else
+            script_dir = ".";
+
+        sol::optional<std::string> current_path = m_lua["package"]["path"];
+        std::string new_path = script_dir + "/?.lua;" + script_dir + "/?/init.lua";
+        if (current_path && !current_path->empty())
+        {
+            new_path += ';';
+            new_path += *current_path;
+        }
+        m_lua["package"]["path"] = new_path;
+    }
 
     auto result = m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
     if (!result.valid())
@@ -175,12 +226,13 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
 
 void lua_context::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    std::string key;
-    key.reserve(cache_name.size() + 1 + channel.size());
-    key.append(cache_name);
-    key.push_back('\0');
-    key.append(channel);
-    auto it = m_subscriptions.find(key);
+    thread_local std::string key_buf;
+    key_buf.clear();
+    key_buf.reserve(cache_name.size() + 1 + channel.size());
+    key_buf.append(cache_name);
+    key_buf.push_back('\0');
+    key_buf.append(channel);
+    auto it = m_subscriptions.find(key_buf);
     if (it == m_subscriptions.end()) return;
     for (auto& fn : it->second)
     {
@@ -257,8 +309,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     struct addrinfo hints{}, *addrs = nullptr;
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    std::string port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &addrs) != 0 || !addrs) {
+    char port_buf[8];
+    auto port_res = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+    *port_res.ptr = '\0';
+    if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs) {
         result["error"] = "DNS resolution failed for: " + host;
         return result;
     }
@@ -283,19 +337,35 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     // Build HTTP/1.0 request
     std::string req;
     req.reserve(256 + body.size());
-    req += method + " " + path + " HTTP/1.0\r\n";
-    req += "Host: " + host + "\r\n";
+    req.append(method);
+    req.append(" ");
+    req.append(path);
+    req.append(" HTTP/1.0\r\n");
+    req.append("Host: ");
+    req.append(host);
+    req.append("\r\n");
     if (!body.empty())
-        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    {
+        char cl_buf[24];
+        auto cl_res = std::to_chars(cl_buf, cl_buf + sizeof(cl_buf), body.size());
+        req.append("Content-Length: ");
+        req.append(cl_buf, static_cast<size_t>(cl_res.ptr - cl_buf));
+        req.append("\r\n");
+    }
     sol::optional<sol::table> hdrs = opts["headers"];
     if (hdrs) {
         (*hdrs).for_each([&](sol::object k, sol::object v) {
             if (k.is<std::string>() && v.is<std::string>())
-                req += k.as<std::string>() + ": " + v.as<std::string>() + "\r\n";
+            {
+                req.append(k.as<std::string>());
+                req.append(": ");
+                req.append(v.as<std::string>());
+                req.append("\r\n");
+            }
         });
     }
-    req += "Connection: close\r\n\r\n";
-    req += body;
+    req.append("Connection: close\r\n\r\n");
+    req.append(body);
 
     // Send + receive
     std::string response;
@@ -368,6 +438,276 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     result["body"]   = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
     result["ok"]     = (status >= 200 && status < 300);
     return result;
+}
+
+// ─── JSON encode/decode for Lua ───────────────────────────────────────────────
+
+static void json_encode_value(std::string& out, const sol::object& val);
+
+static void json_encode_string(std::string& out, const std::string& s)
+{
+    out += '"';
+    for (char c : s)
+    {
+        switch (c)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char hex[8];
+                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
+                    out += hex;
+                }
+                else
+                    out += c;
+        }
+    }
+    out += '"';
+}
+
+static bool is_array_table(const sol::table& t)
+{
+    int expected = 1;
+    for (const auto& kv : t)
+    {
+        if (kv.first.get_type() != sol::type::number)
+            return false;
+        double d = kv.first.as<double>();
+        if (d != expected)
+            return false;
+        ++expected;
+    }
+    return expected > 1;
+}
+
+static void json_encode_value(std::string& out, const sol::object& val)
+{
+    switch (val.get_type())
+    {
+        case sol::type::nil:
+        case sol::type::none:
+            out += "null";
+            break;
+        case sol::type::boolean:
+            out += val.as<bool>() ? "true" : "false";
+            break;
+        case sol::type::number:
+        {
+            double d = val.as<double>();
+            auto i = static_cast<int64_t>(d);
+            if (d == i && d >= -1e15 && d <= 1e15)
+            {
+                char buf[24];
+                auto r = std::to_chars(buf, buf + sizeof(buf), i);
+                out.append(buf, static_cast<size_t>(r.ptr - buf));
+            }
+            else
+            {
+                char buf[32];
+                int n = snprintf(buf, sizeof(buf), "%.14g", d);
+                out.append(buf, static_cast<size_t>(n));
+            }
+            break;
+        }
+        case sol::type::string:
+            json_encode_string(out, val.as<std::string>());
+            break;
+        case sol::type::table:
+        {
+            sol::table t = val.as<sol::table>();
+            if (is_array_table(t))
+            {
+                out += '[';
+                bool first = true;
+                for (const auto& kv : t)
+                {
+                    if (!first) out += ',';
+                    first = false;
+                    json_encode_value(out, kv.second);
+                }
+                out += ']';
+            }
+            else
+            {
+                out += '{';
+                bool first = true;
+                for (const auto& kv : t)
+                {
+                    if (!first) out += ',';
+                    first = false;
+                    json_encode_string(out, kv.first.as<std::string>());
+                    out += ':';
+                    json_encode_value(out, kv.second);
+                }
+                out += '}';
+            }
+            break;
+        }
+        default:
+            out += "null";
+            break;
+    }
+}
+
+static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end);
+
+static void json_skip_ws(const char*& p, const char* end)
+{
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        ++p;
+}
+
+static std::string json_decode_string(const char*& p, const char* end)
+{
+    if (p >= end || *p != '"') return {};
+    ++p;
+    std::string result;
+    while (p < end && *p != '"')
+    {
+        if (*p == '\\' && p + 1 < end)
+        {
+            ++p;
+            switch (*p)
+            {
+                case '"':  result += '"';  break;
+                case '\\': result += '\\'; break;
+                case '/':  result += '/';  break;
+                case 'n':  result += '\n'; break;
+                case 'r':  result += '\r'; break;
+                case 't':  result += '\t'; break;
+                case 'b':  result += '\b'; break;
+                case 'f':  result += '\f'; break;
+                case 'u':
+                {
+                    if (p + 4 < end)
+                    {
+                        unsigned cp = 0;
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            ++p;
+                            cp <<= 4;
+                            if (*p >= '0' && *p <= '9')      cp |= static_cast<unsigned>(*p - '0');
+                            else if (*p >= 'a' && *p <= 'f') cp |= static_cast<unsigned>(*p - 'a' + 10);
+                            else if (*p >= 'A' && *p <= 'F') cp |= static_cast<unsigned>(*p - 'A' + 10);
+                        }
+                        if (cp < 0x80)
+                            result += static_cast<char>(cp);
+                        else if (cp < 0x800)
+                        {
+                            result += static_cast<char>(0xC0 | (cp >> 6));
+                            result += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                        else
+                        {
+                            result += static_cast<char>(0xE0 | (cp >> 12));
+                            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            result += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    break;
+                }
+                default: result += *p; break;
+            }
+        }
+        else
+            result += *p;
+        ++p;
+    }
+    if (p < end) ++p;
+    return result;
+}
+
+static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end)
+{
+    json_skip_ws(p, end);
+    if (p >= end) return sol::nil;
+
+    switch (*p)
+    {
+        case '"':
+            return sol::make_object(lua, json_decode_string(p, end));
+        case '{':
+        {
+            ++p;
+            sol::table t = lua.create_table();
+            json_skip_ws(p, end);
+            if (p < end && *p == '}') { ++p; return t; }
+            while (p < end)
+            {
+                json_skip_ws(p, end);
+                auto key = json_decode_string(p, end);
+                json_skip_ws(p, end);
+                if (p < end && *p == ':') ++p;
+                auto val = json_decode_value(lua, p, end);
+                t[key] = val;
+                json_skip_ws(p, end);
+                if (p < end && *p == ',') ++p;
+                else break;
+            }
+            if (p < end && *p == '}') ++p;
+            return t;
+        }
+        case '[':
+        {
+            ++p;
+            sol::table t = lua.create_table();
+            json_skip_ws(p, end);
+            if (p < end && *p == ']') { ++p; return t; }
+            int idx = 1;
+            while (p < end)
+            {
+                t[idx++] = json_decode_value(lua, p, end);
+                json_skip_ws(p, end);
+                if (p < end && *p == ',') ++p;
+                else break;
+            }
+            if (p < end && *p == ']') ++p;
+            return t;
+        }
+        case 't':
+            if (end - p >= 4 && p[1] == 'r' && p[2] == 'u' && p[3] == 'e')
+            { p += 4; return sol::make_object(lua, true); }
+            return sol::nil;
+        case 'f':
+            if (end - p >= 5 && p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e')
+            { p += 5; return sol::make_object(lua, false); }
+            return sol::nil;
+        case 'n':
+            if (end - p >= 4 && p[1] == 'u' && p[2] == 'l' && p[3] == 'l')
+            { p += 4; return sol::nil; }
+            return sol::nil;
+        default:
+        {
+            const char* start = p;
+            if (*p == '-') ++p;
+            while (p < end && *p >= '0' && *p <= '9') ++p;
+            bool is_float = false;
+            if (p < end && *p == '.')
+            { is_float = true; ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
+            if (p < end && (*p == 'e' || *p == 'E'))
+            { is_float = true; ++p; if (p < end && (*p == '+' || *p == '-')) ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
+            if (p == start) return sol::nil;
+
+            if (is_float)
+            {
+                std::string num_str(start, static_cast<size_t>(p - start));
+                double d = 0;
+                try { d = std::stod(num_str); } catch (...) {}
+                return sol::make_object(lua, d);
+            }
+            else
+            {
+                int64_t n = 0;
+                std::from_chars(start, p, n);
+                return sol::make_object(lua, static_cast<double>(n));
+            }
+        }
+    }
 }
 
 void lua_context::register_bindings(runtime_instance* owner)
@@ -520,36 +860,79 @@ void lua_context::register_bindings(runtime_instance* owner)
         return socketley_http_call(m_lua, opts);
     };
 
-    // socketley.set_timeout(ms, fn) — fires fn once after ms milliseconds
-    sk["set_timeout"] = [this, owner](int ms, sol::function fn) {
+    // socketley.set_timeout(ms, fn) → timer_id
+    sk["set_timeout"] = [this, owner](int ms, sol::function fn) -> int {
         auto* loop = owner->get_event_loop();
-        if (!loop || ms <= 0) return;
-        auto* t  = new lua_timer{};
+        if (!loop || ms <= 0) return 0;
+        auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
         t->alive  = m_alive;
         t->fn     = std::move(fn);
         t->loop   = loop;
         t->ctx    = this;
         t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
-        t->req    = { op_timeout, -1, nullptr, 0, t };
+        t->req    = { t, nullptr, -1, 0, op_timeout };
         t->repeat = false;
+        t->cancelled = false;
+        int id = ++m_next_timer_id;
+        t->timer_id = id;
         m_active_timers.push_back(t);
+        m_timer_map[id] = t;
         loop->submit_timeout(&t->ts, &t->req);
+        return id;
     };
 
-    // socketley.set_interval(ms, fn) — fires fn every ms milliseconds
-    sk["set_interval"] = [this, owner](int ms, sol::function fn) {
+    // socketley.set_interval(ms, fn) → timer_id
+    sk["set_interval"] = [this, owner](int ms, sol::function fn) -> int {
         auto* loop = owner->get_event_loop();
-        if (!loop || ms <= 0) return;
-        auto* t  = new lua_timer{};
+        if (!loop || ms <= 0) return 0;
+        auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
         t->alive  = m_alive;
         t->fn     = std::move(fn);
         t->loop   = loop;
         t->ctx    = this;
         t->ts     = { (long long)ms / 1000, ((long long)ms % 1000) * 1'000'000LL };
-        t->req    = { op_timeout, -1, nullptr, 0, t };
+        t->req    = { t, nullptr, -1, 0, op_timeout };
         t->repeat = true;
+        t->cancelled = false;
+        int id = ++m_next_timer_id;
+        t->timer_id = id;
         m_active_timers.push_back(t);
+        m_timer_map[id] = t;
         loop->submit_timeout(&t->ts, &t->req);
+        return id;
+    };
+
+    // socketley.clear_timeout(id) — cancel a pending timeout
+    sk["clear_timeout"] = [this](int id) {
+        auto it = m_timer_map.find(id);
+        if (it == m_timer_map.end()) return;
+        auto* t = static_cast<lua_timer*>(it->second);
+        t->cancelled = true;
+        t->repeat = false;
+    };
+
+    // socketley.clear_interval(id) — cancel a repeating interval
+    sk["clear_interval"] = [this](int id) {
+        auto it = m_timer_map.find(id);
+        if (it == m_timer_map.end()) return;
+        auto* t = static_cast<lua_timer*>(it->second);
+        t->cancelled = true;
+        t->repeat = false;
+    };
+
+    // socketley.json_encode(value) → JSON string
+    sk["json_encode"] = [](sol::object val) -> std::string {
+        std::string out;
+        out.reserve(256);
+        json_encode_value(out, val);
+        return out;
+    };
+
+    // socketley.json_decode(str) → Lua value
+    sk["json_decode"] = [this](std::string str) -> sol::object {
+        const char* p = str.data();
+        const char* end = p + str.size();
+        return json_decode_value(m_lua, p, end);
     };
 
     // socketley.subscribe(cache_name, channel, fn) — receive published messages

@@ -37,8 +37,8 @@ test_connection_rate() {
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
-    "$SOCKETLEY_BENCH" -j server conn 127.0.0.1 $SERVER_PORT $num_connections >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" server conn 127.0.0.1 $SERVER_PORT $num_connections
+    bench_run -j server conn 127.0.0.1 $SERVER_PORT $num_connections >> "$RESULTS_FILE"
+    bench_run server conn 127.0.0.1 $SERVER_PORT $num_connections
 
     socketley_cmd stop bench_srv
     sleep 0.5
@@ -58,8 +58,8 @@ test_burst_connections() {
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
-    "$SOCKETLEY_BENCH" -j server burst 127.0.0.1 $SERVER_PORT $count >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" server burst 127.0.0.1 $SERVER_PORT $count
+    bench_run -j server burst 127.0.0.1 $SERVER_PORT $count >> "$RESULTS_FILE"
+    bench_run server burst 127.0.0.1 $SERVER_PORT $count
 
     socketley_cmd stop bench_srv
     sleep 0.5
@@ -80,8 +80,8 @@ test_single_client_throughput() {
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
-    "$SOCKETLEY_BENCH" -j server msg 127.0.0.1 $SERVER_PORT $num_messages $message_size >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" server msg 127.0.0.1 $SERVER_PORT $num_messages $message_size
+    bench_run -j server msg 127.0.0.1 $SERVER_PORT $num_messages $message_size >> "$RESULTS_FILE"
+    bench_run server msg 127.0.0.1 $SERVER_PORT $num_messages $message_size
 
     socketley_cmd stop bench_srv
     sleep 0.5
@@ -102,8 +102,8 @@ test_concurrent_clients() {
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
-    "$SOCKETLEY_BENCH" -j server concurrent 127.0.0.1 $SERVER_PORT $num_clients $msgs_per_client >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" server concurrent 127.0.0.1 $SERVER_PORT $num_clients $msgs_per_client
+    bench_run -j server concurrent 127.0.0.1 $SERVER_PORT $num_clients $msgs_per_client >> "$RESULTS_FILE"
+    bench_run server concurrent 127.0.0.1 $SERVER_PORT $num_clients $msgs_per_client
 
     socketley_cmd stop bench_srv
     sleep 0.5
@@ -116,11 +116,29 @@ run_server_benchmarks() {
 
     ensure_socketley_bench || return 1
 
+    log_bench "START" "server_connection_rate"
     test_connection_rate     2000
+    log_bench "DONE" "server_connection_rate"
+    fresh_daemon
+
+    log_bench "START" "server_burst_connections"
     test_burst_connections   5000
+    log_bench "DONE" "server_burst_connections"
+    fresh_daemon
+
+    log_bench "START" "server_throughput_64B"
     test_single_client_throughput 100000 64
+    log_bench "DONE" "server_throughput_64B"
+    fresh_daemon
+
+    log_bench "START" "server_throughput_1024B"
     test_single_client_throughput 100000 1024
+    log_bench "DONE" "server_throughput_1024B"
+    fresh_daemon
+
+    log_bench "START" "server_concurrent_clients"
     test_concurrent_clients  100 500
+    log_bench "DONE" "server_concurrent_clients"
 
     echo "]" >> "$RESULTS_FILE"
 

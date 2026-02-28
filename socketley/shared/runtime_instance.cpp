@@ -7,6 +7,8 @@
 #include <ctime>
 #include <unistd.h>
 #include <cerrno>
+#include <sys/uio.h>
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <fcntl.h>
@@ -33,7 +35,7 @@ void runtime_instance::start_tick_timer()
     if (ms < 10) ms = 10;
     m_tick = new tick_handler();
     m_tick->rt = this;
-    m_tick->req = { op_timeout, -1, nullptr, 0, m_tick };
+    m_tick->req = { m_tick, nullptr, -1, 0, op_timeout };
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
     m_tick->last = std::chrono::steady_clock::now();
@@ -569,19 +571,37 @@ std::string_view runtime_instance::get_ca_path() const { return m_ca_path; }
 
 std::string runtime_instance::get_stats() const
 {
-    std::ostringstream out;
-    out << "name:" << m_name << "\n"
-        << "type:" << (m_type == runtime_server ? "server" :
-                      m_type == runtime_client ? "client" :
-                      m_type == runtime_proxy  ? "proxy"  :
-                      m_type == runtime_cache  ? "cache"  : "unknown") << "\n"
-        << "port:" << m_port << "\n"
-        << "connections:" << get_connection_count() << "\n"
-        << "total_connections:" << m_stat_total_connections.load(std::memory_order_relaxed) << "\n"
-        << "total_messages:" << m_stat_total_messages.load(std::memory_order_relaxed) << "\n"
-        << "bytes_in:" << m_stat_bytes_in.load(std::memory_order_relaxed) << "\n"
-        << "bytes_out:" << m_stat_bytes_out.load(std::memory_order_relaxed) << "\n";
-    return out.str();
+    std::string out;
+    out.reserve(256);
+
+    char buf[32];
+    auto append_u64 = [&](uint64_t v) {
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+        out.append(buf, static_cast<size_t>(ptr - buf));
+    };
+
+    out += "name:";
+    out += m_name;
+    out += "\ntype:";
+    out += (m_type == runtime_server ? "server" :
+            m_type == runtime_client ? "client" :
+            m_type == runtime_proxy  ? "proxy"  :
+            m_type == runtime_cache  ? "cache"  : "unknown");
+    out += "\nport:";
+    append_u64(m_port);
+    out += "\nconnections:";
+    append_u64(get_connection_count());
+    out += "\ntotal_connections:";
+    append_u64(m_stat_total_connections.load(std::memory_order_relaxed));
+    out += "\ntotal_messages:";
+    append_u64(m_stat_total_messages.load(std::memory_order_relaxed));
+    out += "\nbytes_in:";
+    append_u64(m_stat_bytes_in.load(std::memory_order_relaxed));
+    out += "\nbytes_out:";
+    append_u64(m_stat_bytes_out.load(std::memory_order_relaxed));
+    out += '\n';
+
+    return out;
 }
 
 // ─── Interactive mode ───
@@ -600,26 +620,32 @@ void runtime_instance::remove_interactive_fd(int fd)
 
 void runtime_instance::notify_interactive(std::string_view msg) const
 {
-    if (m_interactive_fds.empty())
-        return;
+    if (m_interactive_fds.empty()) return;
 
-    std::string line;
-    line.reserve(msg.size() + 1);
-    line.append(msg.data(), msg.size());
-    if (line.empty() || line.back() != '\n')
-        line += '\n';
+    // Fast path: message already ends with newline
+    bool has_newline = !msg.empty() && msg.back() == '\n';
+
+    const char newline = '\n';
+    struct iovec iov[2];
+    iov[0].iov_base = const_cast<char*>(msg.data());
+    iov[0].iov_len = msg.size();
+    iov[1].iov_base = const_cast<char*>(&newline);
+    iov[1].iov_len = 1;
+    int iovcnt = has_newline ? 1 : 2;
 
     for (size_t i = 0; i < m_interactive_fds.size(); )
     {
-        ssize_t n = ::write(m_interactive_fds[i], line.data(), line.size());
+        ssize_t n = ::writev(m_interactive_fds[i], iov, iovcnt);
         if (n < 0 && errno == EPIPE)
         {
-            // Remove dead fd (const_cast is safe since we own the vector)
             auto& fds = const_cast<std::vector<int>&>(m_interactive_fds);
-            fds.erase(fds.begin() + i);
+            fds[i] = fds.back();
+            fds.pop_back();
         }
         else
+        {
             ++i;
+        }
     }
 }
 

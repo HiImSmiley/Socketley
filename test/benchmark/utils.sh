@@ -12,8 +12,14 @@ NC='\033[0m' # No Color
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# Use system-installed binary if available (run as root), else dev binary
-if [[ -x "/usr/bin/socketley" ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+# Use system-installed binary if available (run as root), else dev binary.
+# Override with: SOCKETLEY_BIN=/path/to/socketley --dev
+if [[ "${BENCH_DEV:-0}" -eq 1 ]]; then
+    SOCKETLEY_BIN="${PROJECT_ROOT}/bin/Release/socketley"
+    IPC_SOCKET="/tmp/socketley.sock"
+    export SOCKETLEY_SOCKET="$IPC_SOCKET"
+    USE_SYSTEMD=0
+elif [[ -x "/usr/bin/socketley" ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     SOCKETLEY_BIN="/usr/bin/socketley"
     IPC_SOCKET="/run/socketley/socketley.sock"
     USE_SYSTEMD=1
@@ -31,6 +37,9 @@ mkdir -p "$RESULTS_DIR"
 
 # Generate timestamp for this run
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# --fresh flag: restart daemon between every test
+BENCH_FRESH_DAEMON="${BENCH_FRESH_DAEMON:-0}"
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -150,7 +159,7 @@ start_daemon() {
     fi
 }
 
-# Stop daemon
+# Stop daemon — multi-stage kill with verification
 stop_daemon() {
     if [[ "$USE_SYSTEMD" -eq 1 ]]; then
         systemctl stop socketley.service 2>/dev/null
@@ -162,25 +171,46 @@ stop_daemon() {
         local pid=$(cat "$DAEMON_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null
-            sleep 0.5
-            # Force kill if still running
-            kill -9 "$pid" 2>/dev/null
+            # Wait up to 3s for graceful exit
+            local i
+            for i in $(seq 1 30); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            # Force kill if still alive
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null
+                sleep 0.3
+            fi
+            # Final check
+            if kill -0 "$pid" 2>/dev/null; then
+                log_warn "Daemon PID $pid still alive after SIGKILL"
+            fi
         fi
         rm -f "$DAEMON_PID_FILE"
     fi
 
-    # Also kill by name as fallback
-    pkill -f "socketley daemon" 2>/dev/null
+    # Fallback: kill any socketley daemon processes by exact binary path
+    pkill -9 -f "${SOCKETLEY_BIN} daemon" 2>/dev/null || true
+    # Also match the bare binary name in case it was started differently
+    pkill -9 -x "$(basename "$SOCKETLEY_BIN")" 2>/dev/null || true
+    sleep 0.3
 
-    # Remove socket
+    # Verify no daemon is running
+    if pgrep -f "${SOCKETLEY_BIN} daemon" >/dev/null 2>&1; then
+        log_warn "Daemon process still exists after cleanup"
+    fi
+
+    # Remove socket and stale state
     rm -f "$IPC_SOCKET"
+    rm -rf /tmp/socketley-runtimes/* /var/lib/socketley/runtimes/* 2>/dev/null || true
 
     log_info "Daemon stopped"
 }
 
-# Execute socketley command
+# Execute socketley command (with 10s timeout to prevent hangs on dead daemon)
 socketley_cmd() {
-    "$SOCKETLEY_BIN" "$@" 2>&1
+    timeout 10 "$SOCKETLEY_BIN" "$@" 2>&1
 }
 
 # Cleanup all runtimes
@@ -329,16 +359,95 @@ ensure_socketley_bench() {
     return 0
 }
 
+# Kill all benchmark-related background processes
+cleanup_all() {
+    # Kill any python backends (used by proxy bench)
+    pkill -9 -f "python3.*socket.*listen" 2>/dev/null || true
+    # Kill any lingering nc processes from pipe benchmarks
+    pkill -9 -f "nc.*localhost.*1900" 2>/dev/null || true
+    # Kill any k6 processes
+    pkill -9 -f "k6 run" 2>/dev/null || true
+    # Kill any redis-benchmark
+    pkill -9 -f "redis-benchmark.*1900" 2>/dev/null || true
+    # Kill any socketley_bench
+    pkill -9 -f "socketley_bench" 2>/dev/null || true
+    # Clean up runtimes via IPC (best-effort, daemon might be dead)
+    cleanup_runtimes 2>/dev/null || true
+    log_bench "CLEANUP" "cleanup_all completed"
+}
+
 # Trap for cleanup on exit
 setup_cleanup_trap() {
     if [[ "${SOCKETLEY_BENCH_PARENT:-}" != "1" ]]; then
-        trap 'cleanup_runtimes; stop_daemon' EXIT INT TERM
+        trap 'cleanup_all; stop_daemon' EXIT INT TERM
     else
-        trap 'cleanup_runtimes' EXIT INT TERM
+        trap 'cleanup_all' EXIT INT TERM
     fi
 }
 
 # Check if daemon should be managed by this script
 should_manage_daemon() {
     [[ "${SOCKETLEY_BENCH_PARENT:-}" != "1" ]]
+}
+
+# Restart daemon fresh (stop → start). Called between tests when --fresh is set.
+fresh_daemon() {
+    if [[ "$BENCH_FRESH_DAEMON" -ne 1 ]]; then
+        return 0
+    fi
+    log_bench "FRESH" "restarting daemon"
+    stop_daemon
+    # Clear stale state so restored runtimes don't interfere
+    rm -rf /tmp/socketley-runtimes/* /var/lib/socketley/runtimes/* 2>/dev/null || true
+    sleep 0.5
+    start_daemon
+}
+
+# ─── Benchmark safeguards ─────────────────────────────────────────────────────
+
+# Bench log for tracking test progress — survives hangs
+BENCH_LOG="${RESULTS_DIR}/bench_${TIMESTAMP}.log"
+
+# Timeout constants (seconds) — hard cap 180s (3 min) per invocation
+BENCH_TIMEOUT_CMD=180         # per socketley_bench invocation
+BENCH_TIMEOUT_NC=180          # per nc pipeline
+BENCH_TIMEOUT_K6=180          # per k6 run
+BENCH_TIMEOUT_REDIS=180       # per redis-benchmark run
+BENCH_TIMEOUT_SCRIPT=180      # per bench_*.sh from run_all.sh
+
+# Log a timestamped benchmark event to the bench log file.
+# The log file is the primary record — always written regardless of
+# stdout/stderr redirection.  Also echoes to stderr when visible.
+log_bench() {
+    local tag=$1
+    shift
+    local ts
+    ts=$(date +"%H:%M:%S")
+    local msg="[$ts] [$tag] $*"
+    echo "$msg" >> "$BENCH_LOG" 2>/dev/null
+    case "$tag" in
+        TIMEOUT|FAIL) log_error "$msg" 2>/dev/null || true ;;
+        *)            log_info "$msg"  2>/dev/null || true ;;
+    esac
+}
+
+# Run socketley_bench with timeout — drop-in replacement for "$SOCKETLEY_BENCH"
+bench_run() {
+    timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" "$@"
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+        log_bench "TIMEOUT" "socketley_bench $*"
+    fi
+    return $rc
+}
+
+# Pipe stdin through nc with timeout (-q0 mode)
+bench_nc() {
+    local port=$1
+    timeout "$BENCH_TIMEOUT_NC" nc -q0 localhost "$port"
+    local rc=$?
+    if [[ $rc -eq 124 ]]; then
+        echo "[$(date +%H:%M:%S)] [TIMEOUT] nc -q0 localhost:$port" >> "$BENCH_LOG" 2>/dev/null
+    fi
+    return $rc
 }

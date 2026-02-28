@@ -83,21 +83,34 @@ test_http_single_backend() {
 
     local start_time=$(get_time_ms)
 
-    for i in $(seq 1 $num_requests); do
-        (
-            local t0=$(get_time_ms)
-            local response=$(http_request $PROXY_PORT "/bench_proxy/test")
-            local t1=$(get_time_ms)
-            if [[ -n "$response" ]]; then
-                echo "$((t1 - t0))" > "$results_dir/r_$i"
+    timeout "$BENCH_TIMEOUT_CMD" bash -c '
+        source "'"$(dirname "$0")"'/utils.sh"
+        PROXY_PORT='"$PROXY_PORT"'
+        results_dir="'"$results_dir"'"
+        num_requests='"$num_requests"'
+        batch='"$batch"'
+        for i in $(seq 1 $num_requests); do
+            (
+                t0=$(get_time_ms)
+                exec 99<>/dev/tcp/localhost/$PROXY_PORT 2>/dev/null || exit 1
+                printf "GET /bench_proxy/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&99
+                IFS= read -r -t 2 resp <&99
+                exec 99<&-
+                t1=$(get_time_ms)
+                if [[ -n "$resp" ]]; then
+                    echo "$((t1 - t0))" > "$results_dir/r_$i"
+                fi
+            ) &
+            if [[ $((i % batch)) -eq 0 ]]; then
+                wait
+                echo -ne "\r  Progress: $i / $num_requests"
             fi
-        ) &
-        if [[ $((i % batch)) -eq 0 ]]; then
-            wait
-            echo -ne "\r  Progress: $i / $num_requests"
-        fi
-    done
-    wait
+        done
+        wait
+    '
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "proxy_http_single_backend request loop"
+    fi
     echo ""
 
     for f in "$results_dir"/r_*; do
@@ -162,17 +175,29 @@ test_http_load_balancing() {
 
     local start_time=$(get_time_ms)
 
-    for i in $(seq 1 $num_requests); do
-        (
-            local response=$(http_request $PROXY_PORT "/bench_proxy/test")
-            [[ -n "$response" ]] && touch "$results_dir/ok_$i"
-        ) &
-        if [[ $((i % batch)) -eq 0 ]]; then
-            wait
-            echo -ne "\r  Progress: $i / $num_requests"
-        fi
-    done
-    wait
+    timeout "$BENCH_TIMEOUT_CMD" bash -c '
+        PROXY_PORT='"$PROXY_PORT"'
+        results_dir="'"$results_dir"'"
+        num_requests='"$num_requests"'
+        batch='"$batch"'
+        for i in $(seq 1 $num_requests); do
+            (
+                exec 99<>/dev/tcp/localhost/$PROXY_PORT 2>/dev/null || exit 1
+                printf "GET /bench_proxy/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&99
+                IFS= read -r -t 2 resp <&99
+                exec 99<&-
+                [[ -n "$resp" ]] && touch "$results_dir/ok_$i"
+            ) &
+            if [[ $((i % batch)) -eq 0 ]]; then
+                wait
+                echo -ne "\r  Progress: $i / $num_requests"
+            fi
+        done
+        wait
+    '
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "proxy_http_load_balancing request loop"
+    fi
     echo ""
 
     success=$(ls "$results_dir" | wc -l)
@@ -220,8 +245,8 @@ test_tcp_throughput() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j proxy tcp 127.0.0.1 $PROXY_PORT $num_messages $message_size >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" proxy tcp 127.0.0.1 $PROXY_PORT $num_messages $message_size
+    bench_run -j proxy tcp 127.0.0.1 $PROXY_PORT $num_messages $message_size >> "$RESULTS_FILE"
+    bench_run proxy tcp 127.0.0.1 $PROXY_PORT $num_messages $message_size
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
@@ -249,8 +274,8 @@ test_concurrent_proxy_connections() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j proxy concurrent 127.0.0.1 $PROXY_PORT $num_clients $requests_per_client >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" proxy concurrent 127.0.0.1 $PROXY_PORT $num_clients $requests_per_client
+    bench_run -j proxy concurrent 127.0.0.1 $PROXY_PORT $num_clients $requests_per_client >> "$RESULTS_FILE"
+    bench_run proxy concurrent 127.0.0.1 $PROXY_PORT $num_clients $requests_per_client
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
@@ -277,8 +302,8 @@ test_proxy_overhead() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1 >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1
+    bench_run -j proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1 >> "$RESULTS_FILE"
+    bench_run proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
@@ -305,8 +330,8 @@ test_runtime_name_backend() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j proxy tcp 127.0.0.1 $PROXY_PORT $num_requests 128 >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" proxy tcp 127.0.0.1 $PROXY_PORT $num_requests 128
+    bench_run -j proxy tcp 127.0.0.1 $PROXY_PORT $num_requests 128 >> "$RESULTS_FILE"
+    bench_run proxy tcp 127.0.0.1 $PROXY_PORT $num_requests 128
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop named_backend
@@ -322,12 +347,34 @@ run_proxy_benchmarks() {
 
     ensure_socketley_bench || return 1
 
+    log_bench "START" "proxy_http_single_backend"
     test_http_single_backend 2000
+    log_bench "DONE" "proxy_http_single_backend"
+    fresh_daemon
+
+    log_bench "START" "proxy_http_load_balancing"
     test_http_load_balancing 2000
+    log_bench "DONE" "proxy_http_load_balancing"
+    fresh_daemon
+
+    log_bench "START" "proxy_tcp_throughput"
     test_tcp_throughput 3000 128
+    log_bench "DONE" "proxy_tcp_throughput"
+    fresh_daemon
+
+    log_bench "START" "proxy_concurrent_connections"
     test_concurrent_proxy_connections 20 100
+    log_bench "DONE" "proxy_concurrent_connections"
+    fresh_daemon
+
+    log_bench "START" "proxy_overhead"
     test_proxy_overhead 500
+    log_bench "DONE" "proxy_overhead"
+    fresh_daemon
+
+    log_bench "START" "proxy_runtime_name_backend"
     test_runtime_name_backend 500
+    log_bench "DONE" "proxy_runtime_name_backend"
 
     echo "]" >> "$RESULTS_FILE"
 

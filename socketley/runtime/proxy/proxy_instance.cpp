@@ -28,7 +28,7 @@ proxy_instance::proxy_instance(std::string_view name)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { op_accept, -1, nullptr, 0, this };
+    m_accept_req = { this, nullptr, -1, 0, op_accept };
 }
 
 proxy_instance::~proxy_instance()
@@ -45,6 +45,120 @@ proxy_instance::~proxy_instance()
                 close(pb.fd);
         }
     }
+}
+
+void proxy_client_connection::reset(int new_fd)
+{
+    fd = new_fd;
+    read_pending = false;
+    write_pending = false;
+    closing = false;
+    zc_notif_pending = false;
+    splice_active = false;
+    splice_in_pending = false;
+    splice_out_pending = false;
+    header_parsed = false;
+    backend_fd = -1;
+    write_batch_count = 0;
+    read_req = {};
+    write_req = {};
+    splice_in_req = {};
+    splice_out_req = {};
+    partial.clear();
+    while (!write_queue.empty()) write_queue.pop();
+    for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
+    if (pipe_to_backend[0] >= 0) { close(pipe_to_backend[0]); pipe_to_backend[0] = -1; }
+    if (pipe_to_backend[1] >= 0) { close(pipe_to_backend[1]); pipe_to_backend[1] = -1; }
+    method.clear();
+    path.clear();
+    version.clear();
+    last_activity = {};
+    retries_remaining = 0;
+    backend_idx = 0;
+    saved_request.clear();
+}
+
+void proxy_backend_connection::reset(int new_fd)
+{
+    fd = new_fd;
+    read_pending = false;
+    write_pending = false;
+    closing = false;
+    zc_notif_pending = false;
+    splice_active = false;
+    splice_in_pending = false;
+    splice_out_pending = false;
+    client_fd = -1;
+    write_batch_count = 0;
+    read_req = {};
+    write_req = {};
+    splice_in_req = {};
+    splice_out_req = {};
+    partial.clear();
+    while (!write_queue.empty()) write_queue.pop();
+    for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
+    if (pipe_to_client[0] >= 0) { close(pipe_to_client[0]); pipe_to_client[0] = -1; }
+    if (pipe_to_client[1] >= 0) { close(pipe_to_client[1]); pipe_to_client[1] = -1; }
+}
+
+std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int fd)
+{
+    std::unique_ptr<proxy_client_connection> conn;
+    if (PROXY_LIKELY(!m_client_pool.empty()))
+    {
+        conn = std::move(m_client_pool.back());
+        m_client_pool.pop_back();
+        conn->reset(fd);
+    }
+    else
+    {
+        conn = std::make_unique<proxy_client_connection>();
+        conn->fd = fd;
+    }
+    return conn;
+}
+
+void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection> conn)
+{
+    conn->partial.clear();
+    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
+    if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
+    if (conn->pipe_to_backend[1] >= 0) { close(conn->pipe_to_backend[1]); conn->pipe_to_backend[1] = -1; }
+    conn->method.clear();
+    conn->path.clear();
+    conn->version.clear();
+    conn->saved_request.clear();
+    m_client_pool.push_back(std::move(conn));
+}
+
+std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(int fd)
+{
+    std::unique_ptr<proxy_backend_connection> conn;
+    if (PROXY_LIKELY(!m_backend_struct_pool.empty()))
+    {
+        conn = std::move(m_backend_struct_pool.back());
+        m_backend_struct_pool.pop_back();
+        conn->reset(fd);
+    }
+    else
+    {
+        conn = std::make_unique<proxy_backend_connection>();
+        conn->fd = fd;
+    }
+    return conn;
+}
+
+void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connection> conn)
+{
+    conn->partial.clear();
+    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
+    if (conn->pipe_to_client[0] >= 0) { close(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
+    if (conn->pipe_to_client[1] >= 0) { close(conn->pipe_to_client[1]); conn->pipe_to_client[1] = -1; }
+    m_backend_struct_pool.push_back(std::move(conn));
 }
 
 void proxy_instance::add_backend(std::string_view addr)
@@ -225,12 +339,20 @@ bool proxy_instance::setup(event_loop& loop)
         m_multishot_active = false;
     }
 
-    if (get_idle_timeout() > 0)
+    m_idle_timeout_cached = get_idle_timeout();
+    if (m_idle_timeout_cached > 0)
     {
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+    }
+
+    // Pre-allocate connection struct pools
+    if (m_client_pool.empty())
+    {
+        m_client_pool.reserve(CONN_POOL_INIT);
+        m_backend_struct_pool.reserve(CONN_POOL_INIT);
     }
 
     // Initialize per-backend health and circuit breaker state
@@ -248,7 +370,7 @@ bool proxy_instance::setup(event_loop& loop)
     {
         m_health_check_ts.tv_sec = m_mesh.health_interval;
         m_health_check_ts.tv_nsec = 0;
-        m_health_check_req = { op_timeout, -1, nullptr, 0, this };
+        m_health_check_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req);
     }
 
@@ -383,7 +505,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             if (req == &m_idle_sweep_req)
             {
                 auto now = std::chrono::steady_clock::now();
-                auto timeout = std::chrono::seconds(get_idle_timeout());
+                auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (auto& [cfd, cconn] : m_clients)
                 {
                     if (!cconn->closing && (now - cconn->last_activity) > timeout)
@@ -451,20 +573,20 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
 
-        auto conn = std::make_unique<proxy_client_connection>();
-        conn->fd = client_fd;
+        auto conn = client_pool_acquire(client_fd);
         conn->partial.reserve(PROXY_READ_BUF_SIZE);
-        conn->read_req = { op_read, client_fd, conn->read_buf, sizeof(conn->read_buf), this };
-        conn->write_req = { op_write, client_fd, nullptr, 0, this };
-        conn->splice_in_req = { op_splice, client_fd, nullptr, 0, this };
-        conn->splice_out_req = { op_splice, client_fd, nullptr, 0, this };
+        conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+        conn->write_req = { this, nullptr, client_fd, 0, op_write };
+        conn->splice_in_req = { this, nullptr, client_fd, 0, op_splice };
+        conn->splice_out_req = { this, nullptr, client_fd, 0, op_splice };
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
         m_conn_idx[client_fd].side = conn_client;
         m_conn_idx[client_fd].client = ptr;
 
-        ptr->last_activity = std::chrono::steady_clock::now();
+        if (m_idle_timeout_cached > 0)
+            ptr->last_activity = std::chrono::steady_clock::now();
 
         invoke_on_connect(client_fd);
 
@@ -482,7 +604,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
     {
         m_accept_backoff_ts.tv_sec = 0;
         m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
         return;
     }
@@ -571,7 +693,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
-    conn->last_activity = std::chrono::steady_clock::now();
+    if (PROXY_UNLIKELY(m_idle_timeout_cached > 0))
+        conn->last_activity = std::chrono::steady_clock::now();
 
     // Extract read data
     char* read_data;
@@ -621,7 +744,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
         if (PROXY_LIKELY(!conn->closing))
         {
-            if (!conn->read_pending)
+            // When splice is active, all subsequent data flows through the
+            // kernel-space splice pipeline — no userspace reads needed.
+            if (!conn->splice_active && !conn->read_pending)
                 submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
         }
         else if (!conn->write_pending)
@@ -926,23 +1051,21 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
 
             if (m_strategy == strategy_random)
             {
-                // Count available backends
+                // Build availability list in a single pass
+                size_t avail_indices[pool_size];
                 size_t avail_count = 0;
                 for (size_t i = 0; i < pool_size; i++)
-                    if (is_backend_available(i)) avail_count++;
+                {
+                    if (is_backend_available(i))
+                        avail_indices[avail_count++] = i;
+                }
 
                 if (avail_count == 0)
                     return nullptr;
 
                 std::uniform_int_distribution<size_t> dist(0, avail_count - 1);
-                size_t pick = dist(m_rng);
-                size_t k = 0;
-                for (size_t i = 0; i < pool_size; i++)
-                {
-                    if (!is_backend_available(i)) continue;
-                    if (k == pick) { selected_idx = i; found = true; break; }
-                    k++;
-                }
+                selected_idx = avail_indices[dist(m_rng)];
+                found = true;
             }
             else
             {
@@ -1102,10 +1225,10 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx)
             continue;
         }
 
-        // Check if still connected (non-blocking poll for hangup)
-        struct pollfd pfd{pb.fd, POLLIN | POLLHUP, 0};
-        int ret = poll(&pfd, 1, 0);
-        if (ret > 0 && (pfd.revents & (POLLHUP | POLLERR)))
+        // Check if still connected (getsockopt for socket error)
+        int err = 0;
+        socklen_t elen = sizeof(err);
+        if (getsockopt(pb.fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0)
         {
             close(pb.fd);
             continue;
@@ -1221,13 +1344,12 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     conn->backend_fd = bfd;
 
-    auto bconn = std::make_unique<proxy_backend_connection>();
-    bconn->fd = bfd;
+    auto bconn = backend_pool_acquire(bfd);
     bconn->client_fd = conn->fd;
-    bconn->read_req = { op_read, bfd, bconn->read_buf, sizeof(bconn->read_buf), this };
-    bconn->write_req = { op_write, bfd, nullptr, 0, this };
-    bconn->splice_in_req = { op_splice, bfd, nullptr, 0, this };
-    bconn->splice_out_req = { op_splice, bfd, nullptr, 0, this };
+    bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read };
+    bconn->write_req = { this, nullptr, bfd, 0, op_write };
+    bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
+    bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
 
     auto* ptr = bconn.get();
     m_backend_conns[bfd] = std::move(bconn);
@@ -1248,7 +1370,19 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         bool has_lua_hooks = false;
 #endif
         if (!has_lua_hooks)
+        {
             setup_splice_pipes(conn, ptr);
+            if (conn->splice_active)
+            {
+                // Start zero-copy splice forwarding.  The initial data chunk is
+                // forwarded via the regular write path (already queued by the
+                // caller).  Splice takes over for all SUBSEQUENT data — each
+                // splice read will block in-kernel until new data arrives on
+                // the socket, so there is no race with the queued write.
+                start_splice_forwarding(conn, ptr);
+                return true;  // Skip regular read — splice handles data transfer
+            }
+        }
     }
 
     ptr->read_pending = true;
@@ -1439,7 +1573,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
 
                 close(backend_fd);
                 m_conn_idx[backend_fd] = {};
-                m_backend_conns.erase(backend_fd);
+                auto bit = m_backend_conns.find(backend_fd);
+                if (bit != m_backend_conns.end())
+                {
+                    auto owned = std::move(bit->second);
+                    m_backend_conns.erase(bit);
+                    backend_pool_release(std::move(owned));
+                }
             }
         }
         // else: backend was already closed and erased.
@@ -1475,7 +1615,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
 
                         close(conn->backend_fd);
                         m_conn_idx[conn->backend_fd] = {};
-                        m_backend_conns.erase(conn->backend_fd);
+                        auto bit2 = m_backend_conns.find(conn->backend_fd);
+                        if (bit2 != m_backend_conns.end())
+                        {
+                            auto owned = std::move(bit2->second);
+                            m_backend_conns.erase(bit2);
+                            backend_pool_release(std::move(owned));
+                        }
                     }
                 }
                 // else: already closed and erased — do not close again.
@@ -1499,7 +1645,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
 
                 close(client_fd);
                 m_conn_idx[client_fd] = {};
-                m_clients.erase(client_fd);
+                auto cit = m_clients.find(client_fd);
+                if (cit != m_clients.end())
+                {
+                    auto owned = std::move(cit->second);
+                    m_clients.erase(cit);
+                    client_pool_release(std::move(owned));
+                }
             }
         }
         // else: client was already closed and erased.
@@ -1618,7 +1770,7 @@ void proxy_instance::health_check_sweep()
             {
                 // Wait briefly for connection (blocking poll with 1s timeout)
                 struct pollfd pfd{fd, POLLOUT, 0};
-                if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLOUT))
+                if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t elen = sizeof(err);
@@ -1638,7 +1790,7 @@ void proxy_instance::health_check_sweep()
                 struct pollfd pfd{fd, POLLIN, 0};
                 char buf[256];
                 bool got_2xx = false;
-                if (poll(&pfd, 1, 2000) > 0 && (pfd.revents & POLLIN))
+                if (poll(&pfd, 1, 200) > 0 && (pfd.revents & POLLIN))
                 {
                     ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
                     if (n > 12)
@@ -1746,7 +1898,13 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
             shutdown(conn->backend_fd, SHUT_RDWR);
             close(conn->backend_fd);
             m_conn_idx[conn->backend_fd] = {};
-            m_backend_conns.erase(conn->backend_fd);
+            auto rit = m_backend_conns.find(conn->backend_fd);
+            if (rit != m_backend_conns.end())
+            {
+                auto owned = std::move(rit->second);
+                m_backend_conns.erase(rit);
+                backend_pool_release(std::move(owned));
+            }
         }
         conn->backend_fd = -1;
 
@@ -1865,13 +2023,13 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         return;
 
     std::string hook_storage;
-    std::string_view effective = data;
+    bool hook_modified = false;
 
     if (m_cb_on_proxy_request)
     {
         auto result = m_cb_on_proxy_request(conn->fd, data);
         if (!result) return;  // nullopt = drop
-        if (!result->empty()) { hook_storage = std::move(*result); effective = hook_storage; }
+        if (!result->empty()) { hook_storage = std::move(*result); hook_modified = true; }
     }
 #ifndef SOCKETLEY_NO_LUA
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_request())
@@ -1881,7 +2039,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
             if (r.get_type() == sol::type::nil) return;   // drop
             if (r.is<std::string>()) {
                 hook_storage = r.as<std::string>();
-                effective = hook_storage;
+                hook_modified = true;
             }
         } catch (const sol::error& e) {
             fprintf(stderr, "[lua] on_proxy_request error: %s\n", e.what());
@@ -1895,7 +2053,10 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         return;
     }
 
-    bconn->write_queue.emplace(effective);
+    if (hook_modified)
+        bconn->write_queue.emplace(std::move(hook_storage));
+    else
+        bconn->write_queue.emplace(data);
 
     if (!bconn->write_pending)
         flush_backend_write_queue(bconn);
@@ -1918,13 +2079,13 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         return;
 
     std::string hook_storage;
-    std::string_view effective = data;
+    bool hook_modified = false;
 
     if (m_cb_on_proxy_response)
     {
         auto result = m_cb_on_proxy_response(conn->client_fd, data);
         if (!result) return;  // nullopt = drop
-        if (!result->empty()) { hook_storage = std::move(*result); effective = hook_storage; }
+        if (!result->empty()) { hook_storage = std::move(*result); hook_modified = true; }
     }
 #ifndef SOCKETLEY_NO_LUA
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
@@ -1934,7 +2095,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
             if (r.get_type() == sol::type::nil) return;   // drop
             if (r.is<std::string>()) {
                 hook_storage = r.as<std::string>();
-                effective = hook_storage;
+                hook_modified = true;
             }
         } catch (const sol::error& e) {
             fprintf(stderr, "[lua] on_proxy_response error: %s\n", e.what());
@@ -1948,7 +2109,10 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         return;
     }
 
-    cconn->write_queue.emplace(effective);
+    if (hook_modified)
+        cconn->write_queue.emplace(std::move(hook_storage));
+    else
+        cconn->write_queue.emplace(data);
 
     if (!cconn->write_pending)
         flush_client_write_queue(cconn);
@@ -2097,18 +2261,81 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
 
     conn->write_pending = false;
 
-    // Release batch references (unless ZC notif still pending)
+    if (PROXY_UNLIKELY(cqe->res <= 0))
+    {
+        if (PROXY_LIKELY(!conn->zc_notif_pending))
+        {
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].clear();
+            conn->write_batch_count = 0;
+        }
+        close_pair(fd, conn->backend_fd);
+        return;
+    }
+
+    // Short write handling: resubmit remaining bytes
+    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    {
+        size_t total_submitted = 0;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            total_submitted += conn->write_iovs[i].iov_len;
+
+        size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted)
+        {
+            // Advance past fully-written iovecs
+            size_t remaining = written;
+            uint32_t first_iov = 0;
+            for (; first_iov < conn->write_batch_count; first_iov++)
+            {
+                if (remaining < conn->write_iovs[first_iov].iov_len)
+                {
+                    conn->write_iovs[first_iov].iov_base =
+                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
+                    conn->write_iovs[first_iov].iov_len -= remaining;
+                    break;
+                }
+                remaining -= conn->write_iovs[first_iov].iov_len;
+            }
+
+            // Shift remaining iovecs and batch refs to front
+            uint32_t new_count = conn->write_batch_count - first_iov;
+            if (first_iov > 0)
+            {
+                for (uint32_t i = 0; i < new_count; i++)
+                {
+                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
+                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+                }
+                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+                    conn->write_batch[i].clear();
+            }
+            conn->write_batch_count = new_count;
+
+            conn->write_pending = true;
+            if (new_count == 1)
+            {
+                conn->write_req.type = op_write;
+                m_loop->submit_write(conn->fd,
+                    static_cast<const char*>(conn->write_iovs[0].iov_base),
+                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                    &conn->write_req);
+            }
+            else
+            {
+                conn->write_req.type = op_writev;
+                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            return;
+        }
+    }
+
+    // Full write completed — release batch
     if (PROXY_LIKELY(!conn->zc_notif_pending))
     {
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
-    }
-
-    if (PROXY_UNLIKELY(cqe->res <= 0))
-    {
-        close_pair(fd, conn->backend_fd);
-        return;
     }
 
     if (!conn->write_queue.empty() && !conn->zc_notif_pending)
@@ -2150,18 +2377,81 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
 
     conn->write_pending = false;
 
-    // Release batch references (unless ZC notif still pending)
+    if (PROXY_UNLIKELY(cqe->res <= 0))
+    {
+        if (PROXY_LIKELY(!conn->zc_notif_pending))
+        {
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].clear();
+            conn->write_batch_count = 0;
+        }
+        close_pair(conn->client_fd, fd);
+        return;
+    }
+
+    // Short write handling: resubmit remaining bytes
+    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    {
+        size_t total_submitted = 0;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            total_submitted += conn->write_iovs[i].iov_len;
+
+        size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted)
+        {
+            // Advance past fully-written iovecs
+            size_t remaining = written;
+            uint32_t first_iov = 0;
+            for (; first_iov < conn->write_batch_count; first_iov++)
+            {
+                if (remaining < conn->write_iovs[first_iov].iov_len)
+                {
+                    conn->write_iovs[first_iov].iov_base =
+                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
+                    conn->write_iovs[first_iov].iov_len -= remaining;
+                    break;
+                }
+                remaining -= conn->write_iovs[first_iov].iov_len;
+            }
+
+            // Shift remaining iovecs and batch refs to front
+            uint32_t new_count = conn->write_batch_count - first_iov;
+            if (first_iov > 0)
+            {
+                for (uint32_t i = 0; i < new_count; i++)
+                {
+                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
+                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+                }
+                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+                    conn->write_batch[i].clear();
+            }
+            conn->write_batch_count = new_count;
+
+            conn->write_pending = true;
+            if (new_count == 1)
+            {
+                conn->write_req.type = op_write;
+                m_loop->submit_write(conn->fd,
+                    static_cast<const char*>(conn->write_iovs[0].iov_base),
+                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                    &conn->write_req);
+            }
+            else
+            {
+                conn->write_req.type = op_writev;
+                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            return;
+        }
+    }
+
+    // Full write completed — release batch
     if (PROXY_LIKELY(!conn->zc_notif_pending))
     {
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
-    }
-
-    if (PROXY_UNLIKELY(cqe->res <= 0))
-    {
-        close_pair(conn->client_fd, fd);
-        return;
     }
 
     if (!conn->write_queue.empty() && !conn->zc_notif_pending)

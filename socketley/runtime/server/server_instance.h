@@ -30,29 +30,37 @@ enum proto_state : uint8_t {
     proto_resp        = 5   // RESP2 wire protocol
 };
 
-struct server_connection
+struct alignas(64) server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
+    // === HOT fields (CQE dispatch path) — first 2 cache lines ===
     int fd{-1};
+    bool read_pending{false};
+    bool write_pending{false};
+    bool closing{false};
+    bool zc_notif_pending{false};
+    proto_state proto{proto_unknown};
+    bool routed{false};
+    bool file_read_pending{false};
+    bool http_keep_alive{false};
+    uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
+    uint32_t write_batch_count{0};
     io_request read_req;
     io_request write_req;
-    char read_buf[READ_BUF_SIZE];
+
+    // === WARM fields (message processing path) ===
     std::string partial;
     std::queue<std::shared_ptr<const std::string>> write_queue;
 
     // writev batch: holds refs alive until CQE completes
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
-    uint32_t write_batch_count{0};
 
-    bool read_pending{false};
-    bool write_pending{false};
-    bool closing{false};
-    bool zc_notif_pending{false};
+    // === COLD fields (rarely accessed per-CQE) ===
 
     // Async file read state (HTTP static file serving)
     io_request file_read_req;
@@ -61,14 +69,6 @@ struct server_connection
     size_t file_size{0};
     std::string file_content_type;
     bool file_is_html{false};
-    bool file_read_pending{false};
-    bool http_keep_alive{false};
-
-    // Protocol auto-detect state
-    proto_state proto{proto_unknown};
-
-    // Cached route: avoids m_routes map lookup per message
-    bool routed{false};
 
     // WebSocket handshake headers (non-empty only for ws_active connections)
     std::string ws_cookie;
@@ -89,6 +89,9 @@ struct server_connection
 
     // Per-connection metadata (freed automatically on disconnect)
     std::unordered_map<std::string, std::string> meta;
+
+    // 16KB read buffer — at the very end to keep hot fields in first cache lines
+    char read_buf[READ_BUF_SIZE];
 
     // Connection pool support: reset to initial state for reuse
     void reset(int new_fd)
@@ -284,6 +287,7 @@ private:
 
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
+    void remove_active_fd(int fd);
     void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg);
     void flush_write_queue(server_connection* conn);
 
@@ -294,6 +298,9 @@ private:
 
     server_mode m_mode;
     bool m_udp{false};
+    uint32_t m_idle_timeout_cached{0};  // cached at setup() to avoid virtual call per CQE
+    uint32_t m_max_conns_cached{0};
+    double m_rate_limit_cached{0.0};
 
     // Master mode
     int m_master_fd{-1};
@@ -360,6 +367,7 @@ private:
     struct msghdr m_udp_recv_msg{};
     io_request m_udp_recv_req{};
     std::vector<udp_peer> m_udp_peers;
+    std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
 
     // Per-IP auth failure tracking
     struct auth_ip_record {

@@ -31,9 +31,9 @@ enum op_type : uint8_t
 
 struct io_request
 {
-    op_type type;
-    int fd;
-    char* buffer;
-    uint32_t length;
     io_handler* owner;
+    char* buffer;
+    int fd;
+    uint32_t length;
+    op_type type;
 };

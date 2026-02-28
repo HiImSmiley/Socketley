@@ -97,6 +97,14 @@ int cli_dispatch(int argc, char** argv)
 
     switch (fnv1a(cmd.data()))
     {
+        case fnv1a("--version"):
+        case fnv1a("-v"):
+        case fnv1a("version"):
+        {
+            std::cout << SOCKETLEY_VERSION << "\n";
+            return 0;
+        }
+
         case fnv1a("daemon"):
         {
             // Check for configuration flags (--name, --cluster)
@@ -200,6 +208,42 @@ int cli_dispatch(int argc, char** argv)
                 if (std::string_view(argv[i]) == "-i")
                     return cli_interactive(argc, argv);
             return cli_forward(argc, argv);
+        }
+        case fnv1a("restart"):
+        {
+            // restart = stop + start (preserving all flags)
+            if (argc < 3)
+            {
+                std::cerr << "usage: restart <name> [flags]\n";
+                return 1;
+            }
+            // Stop the runtime
+            std::string stop_cmd = std::string("stop ") + argv[2];
+            std::string stop_data;
+            int rc = ipc_send(stop_cmd, stop_data);
+            if (rc < 0)
+            {
+                std::cerr << "failed to connect to daemon\n";
+                return 2;
+            }
+            // Build start command with all original flags
+            std::string start_cmd;
+            start_cmd = "start";
+            for (int i = 2; i < argc; ++i)
+            {
+                start_cmd += ' ';
+                start_cmd += argv[i];
+            }
+            std::string start_data;
+            rc = ipc_send(start_cmd, start_data);
+            if (rc < 0)
+            {
+                std::cerr << "failed to connect to daemon\n";
+                return 2;
+            }
+            if (!start_data.empty())
+                std::cout << start_data;
+            return rc;
         }
         case fnv1a("ls"):
         case fnv1a("ps"):

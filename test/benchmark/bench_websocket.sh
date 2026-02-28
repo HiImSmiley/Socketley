@@ -38,8 +38,8 @@ test_ws_handshake() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j ws handshake 127.0.0.1 $WS_PORT $num_ops >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" ws handshake 127.0.0.1 $WS_PORT $num_ops
+    bench_run -j ws handshake 127.0.0.1 $WS_PORT $num_ops >> "$RESULTS_FILE"
+    bench_run ws handshake 127.0.0.1 $WS_PORT $num_ops
 
     socketley_cmd stop bench_ws
     sleep 0.5
@@ -61,8 +61,8 @@ test_ws_echo() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size
+    bench_run -j ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size >> "$RESULTS_FILE"
+    bench_run ws echo 127.0.0.1 $WS_PORT $num_ops $msg_size
 
     socketley_cmd stop bench_ws
     sleep 0.5
@@ -84,8 +84,8 @@ test_ws_concurrent() {
     sleep 0.5
 
     append_result
-    "$SOCKETLEY_BENCH" -j ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client >> "$RESULTS_FILE"
-    "$SOCKETLEY_BENCH" ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client
+    bench_run -j ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client >> "$RESULTS_FILE"
+    bench_run ws concurrent 127.0.0.1 $WS_PORT $num_clients $ops_per_client
 
     socketley_cmd stop bench_ws
     sleep 0.5
@@ -109,23 +109,32 @@ test_ws_tcp_coexistence() {
     local batch=20
     local start_time=$(get_time_ms)
 
-    for i in $(seq 1 $num_ops); do
-        (
-            if [[ $((i % 2)) -eq 0 ]]; then
-                local resp
-                exec 99<>/dev/tcp/localhost/$WS_PORT 2>/dev/null || exit 1
-                printf 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' >&99
-                IFS= read -r -t 1 resp <&99
-                exec 99<&-
-                echo "$resp" | grep -q "101" && echo "ws" > "$results_dir/r_$i"
-            else
-                echo "hello tcp $i" | nc -q0 localhost $WS_PORT >/dev/null 2>&1
-                echo "tcp" > "$results_dir/r_$i"
-            fi
-        ) &
-        [[ $((i % batch)) -eq 0 ]] && wait
-    done
-    wait
+    timeout "$BENCH_TIMEOUT_CMD" bash -c '
+        results_dir="'"$results_dir"'"
+        WS_PORT='"$WS_PORT"'
+        num_ops='"$num_ops"'
+        batch='"$batch"'
+        for i in $(seq 1 $num_ops); do
+            (
+                if [[ $((i % 2)) -eq 0 ]]; then
+                    resp=""
+                    exec 99<>/dev/tcp/localhost/$WS_PORT 2>/dev/null || exit 1
+                    printf "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" >&99
+                    IFS= read -r -t 1 resp <&99
+                    exec 99<&-
+                    echo "$resp" | grep -q "101" && echo "ws" > "$results_dir/r_$i"
+                else
+                    echo "hello tcp $i" | nc -q0 localhost $WS_PORT >/dev/null 2>&1
+                    echo "tcp" > "$results_dir/r_$i"
+                fi
+            ) &
+            [[ $((i % batch)) -eq 0 ]] && wait
+        done
+        wait
+    '
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "ws_tcp_coexistence loop"
+    fi
 
     local ws_success=$(grep -rl "^ws$" "$results_dir" 2>/dev/null | wc -l)
     local tcp_success=$(grep -rl "^tcp$" "$results_dir" 2>/dev/null | wc -l)
@@ -157,10 +166,24 @@ run_ws_benchmarks() {
 
     ensure_socketley_bench || return 1
 
+    log_bench "START" "ws_handshake_throughput"
     test_ws_handshake 200
+    log_bench "DONE" "ws_handshake_throughput"
+    fresh_daemon
+
+    log_bench "START" "ws_echo_rtt"
     test_ws_echo 5000 64
+    log_bench "DONE" "ws_echo_rtt"
+    fresh_daemon
+
+    log_bench "START" "ws_concurrent"
     test_ws_concurrent 20 25
+    log_bench "DONE" "ws_concurrent"
+    fresh_daemon
+
+    log_bench "START" "ws_tcp_coexistence"
     test_ws_tcp_coexistence 200
+    log_bench "DONE" "ws_tcp_coexistence"
 
     echo "]" >> "$RESULTS_FILE"
 

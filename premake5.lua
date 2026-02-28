@@ -11,7 +11,9 @@ workspace "Socketley"
             "-flto=auto",
             "-fstack-protector-strong",
             "-D_FORTIFY_SOURCE=2",
-            "-fvisibility=hidden"
+            "-fvisibility=hidden",
+            "-march=native",
+            "-mtune=native"
         }
         linkoptions {
             "-flto=auto",

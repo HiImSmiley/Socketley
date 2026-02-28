@@ -58,6 +58,7 @@ public:
     void submit_cancel_fd(int fd);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
+    void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);
     bool has_buf_ring(uint16_t group_id) const;
 
     // Multishot recv: single SQE generates multiple CQEs until error or cancel.

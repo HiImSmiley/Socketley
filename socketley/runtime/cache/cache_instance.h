@@ -236,4 +236,12 @@ private:
     // Periodic TTL sweep timer
     io_request m_ttl_req{};
     struct __kernel_timespec m_ttl_ts{};
+
+    // Cached config values (read once in setup, avoid virtual calls on hot path)
+    uint32_t m_idle_timeout_cached{0};
+    uint32_t m_max_conns_cached{0};
+    double m_rate_limit_cached{0.0};
+
+    // TTL sweep short-circuit: skip m_expiry scan when no TTL keys exist
+    bool m_has_ttl_keys{false};
 };

@@ -523,6 +523,7 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
 /* Concurrent server benchmark — threaded */
 struct server_concurrent_args {
     struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
     int                  thread_success;
 };
 
@@ -537,6 +538,9 @@ static void *server_concurrent_worker(void *arg)
     char *msg = (char *)malloc(cfg->msg_size + 1);
     memset(msg, 'Y', cfg->msg_size);
     msg[cfg->msg_size] = '\n';
+
+    /* All threads connected — wait for barrier before sending */
+    pthread_barrier_wait(a->barrier);
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -562,13 +566,19 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
     struct server_concurrent_args *args =
         (struct server_concurrent_args *)malloc(nc * sizeof(*args));
 
-    int64_t start = time_ns();
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1); /* nc workers + main thread */
 
     for (int i = 0; i < nc; i++) {
         args[i].cfg = cfg;
+        args[i].barrier = &barrier;
         args[i].thread_success = 0;
         pthread_create(&threads[i], NULL, server_concurrent_worker, &args[i]);
     }
+
+    /* Wait until all threads have connected, then start timing */
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
@@ -579,6 +589,7 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
     for (int i = 0; i < nc; i++)
         total += args[i].thread_success;
 
+    pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
@@ -696,6 +707,7 @@ static struct run_result bench_cache_mixed(struct bench_config *cfg)
 /* Concurrent cache — threaded pipeline clients */
 struct cache_concurrent_args {
     struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
     int                  client_id;
     int                  thread_success;
 };
@@ -724,6 +736,9 @@ static void *cache_concurrent_worker(void *arg)
         off += n;
     }
 
+    /* All threads connected + pipeline built — wait for barrier */
+    pthread_barrier_wait(a->barrier);
+
     a->thread_success = pipeline_execute(fd, buf, off, ops);
     close(fd);
     free(buf);
@@ -740,14 +755,19 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
     struct cache_concurrent_args *args =
         (struct cache_concurrent_args *)malloc(nc * sizeof(*args));
 
-    int64_t start = time_ns();
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
 
     for (int i = 0; i < nc; i++) {
         args[i].cfg = cfg;
+        args[i].barrier = &barrier;
         args[i].client_id = i;
         args[i].thread_success = 0;
         pthread_create(&threads[i], NULL, cache_concurrent_worker, &args[i]);
     }
+
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
@@ -758,6 +778,7 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
     for (int i = 0; i < nc; i++)
         total += args[i].thread_success;
 
+    pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
@@ -817,6 +838,7 @@ static struct run_result bench_proxy_tcp(struct bench_config *cfg)
 /* Concurrent proxy — threaded */
 struct proxy_concurrent_args {
     struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
     int                  thread_success;
 };
 
@@ -832,6 +854,9 @@ static void *proxy_concurrent_worker(void *arg)
     char *msg = (char *)malloc(msize + 1);
     memset(msg, 'P', msize);
     msg[msize] = '\n';
+
+    /* All threads connected — wait for barrier before sending */
+    pthread_barrier_wait(a->barrier);
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -855,13 +880,18 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
     struct proxy_concurrent_args *args =
         (struct proxy_concurrent_args *)malloc(nc * sizeof(*args));
 
-    int64_t start = time_ns();
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
 
     for (int i = 0; i < nc; i++) {
         args[i].cfg = cfg;
+        args[i].barrier = &barrier;
         args[i].thread_success = 0;
         pthread_create(&threads[i], NULL, proxy_concurrent_worker, &args[i]);
     }
+
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
@@ -872,6 +902,7 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
     for (int i = 0; i < nc; i++)
         total += args[i].thread_success;
 
+    pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
@@ -1054,6 +1085,7 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
 /* Concurrent WS — threaded handshakes */
 struct ws_concurrent_args {
     struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
     int                  thread_success;
 };
 
@@ -1061,6 +1093,9 @@ static void *ws_concurrent_worker(void *arg)
 {
     struct ws_concurrent_args *a = (struct ws_concurrent_args *)arg;
     struct bench_config *cfg = a->cfg;
+
+    /* Wait for all threads to be ready before starting handshake storm */
+    pthread_barrier_wait(a->barrier);
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -1085,13 +1120,18 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
     struct ws_concurrent_args *args =
         (struct ws_concurrent_args *)malloc(nc * sizeof(*args));
 
-    int64_t start = time_ns();
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
 
     for (int i = 0; i < nc; i++) {
         args[i].cfg = cfg;
+        args[i].barrier = &barrier;
         args[i].thread_success = 0;
         pthread_create(&threads[i], NULL, ws_concurrent_worker, &args[i]);
     }
+
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
@@ -1102,6 +1142,7 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
     for (int i = 0; i < nc; i++)
         total += args[i].thread_success;
 
+    pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 

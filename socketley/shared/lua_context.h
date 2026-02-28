@@ -162,6 +162,17 @@ private:
 
     // Cross-runtime pub/sub: key = cache_name + '\0' + channel
     std::unordered_map<std::string, std::vector<sol::function>> m_subscriptions;
+
+    // Timer cancellation: ID → timer* mapping
+    int m_next_timer_id{0};
+    std::unordered_map<int, void*> m_timer_map;
+
+    // Timer pool to avoid per-timer heap allocation
+    std::vector<void*> m_timer_pool;
+public:
+    void* timer_pool_acquire();
+    void timer_pool_release(void* t);
+private:
 };
 
 #else // SOCKETLEY_NO_LUA

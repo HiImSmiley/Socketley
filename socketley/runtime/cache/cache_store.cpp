@@ -67,7 +67,9 @@ bool cache_store::set(std::string_view key, std::string_view value)
     if (__builtin_expect(!check_memory(key.size() + value.size()), 0))
         return false;
 
-    m_data.emplace(std::string(key), std::string(value));
+    auto [it2, inserted] = m_data.try_emplace(std::string(key), std::string(value));
+    if (!inserted)
+        it2->second = std::string(value);
     track_add(key.size() + value.size());
     touch_lru(key);
     return true;

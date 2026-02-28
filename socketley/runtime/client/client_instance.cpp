@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <charconv>
+#include <chrono>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -84,6 +85,31 @@ bool client_instance::try_connect()
         setsockopt(m_conn.fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     }
 
+    // Try cached DNS result first (same host:port)
+    if (m_has_cached_addr && m_cached_host == host && m_cached_port == port)
+    {
+        int connect_ret = connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&m_cached_addr), sizeof(m_cached_addr));
+        if (connect_ret == 0 || errno == EINPROGRESS)
+            goto connected;
+
+        // Cached address failed — clear cache, fall through to fresh resolve
+        m_has_cached_addr = false;
+        m_cached_host.clear();
+        m_cached_port = 0;
+
+        // Need a new socket since connect() may have tainted the old one
+        close(m_conn.fd);
+        m_conn.fd = socket(AF_INET, m_udp ? (SOCK_DGRAM | SOCK_NONBLOCK) : (SOCK_STREAM | SOCK_NONBLOCK), 0);
+        if (m_conn.fd < 0)
+            return false;
+        if (!m_udp)
+        {
+            int opt2 = 1;
+            setsockopt(m_conn.fd, IPPROTO_TCP, TCP_NODELAY, &opt2, sizeof(opt2));
+        }
+    }
+
+    {
     // Resolve hostname (supports both IPs and DNS names like Docker hostnames)
     char port_str[8];
     auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), port);
@@ -102,6 +128,16 @@ bool client_instance::try_connect()
     }
 
     int connect_ret = connect(m_conn.fd, result->ai_addr, result->ai_addrlen);
+
+    // Cache the resolved address for future reconnects
+    if (result->ai_addrlen == sizeof(struct sockaddr_in))
+    {
+        std::memcpy(&m_cached_addr, result->ai_addr, sizeof(m_cached_addr));
+        m_cached_host = host;
+        m_cached_port = port;
+        m_has_cached_addr = true;
+    }
+
     freeaddrinfo(result);
 
     if (connect_ret < 0 && errno != EINPROGRESS)
@@ -110,19 +146,21 @@ bool client_instance::try_connect()
         m_conn.fd = -1;
         return false;
     }
+    }
 
+connected:
     m_connected = true;
     m_reconnect_attempt = 0;
     m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
     invoke_on_connect(m_conn.fd);
     m_conn.partial.clear();
-    m_conn.partial.reserve(8192);
+    m_conn.partial.reserve(65536);
     m_conn.closing = false;
     m_conn.read_pending = false;
     m_conn.write_pending = false;
 
-    m_conn.read_req = { op_read, m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), this };
-    m_conn.write_req = { op_write, m_conn.fd, nullptr, 0, this };
+    m_conn.read_req = { this, m_conn.read_buf, m_conn.fd, sizeof(m_conn.read_buf), op_read };
+    m_conn.write_req = { this, nullptr, m_conn.fd, 0, op_write };
 
     if (m_mode != client_mode_out)
     {
@@ -148,13 +186,14 @@ void client_instance::schedule_reconnect()
     // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
     int base_sec = 1 << std::min(m_reconnect_attempt, 4); // 1,2,4,8,16
     int delay_sec = std::min(base_sec, 30);
-    // Simple jitter: add 0-500ms
-    int jitter_ms = (m_reconnect_attempt * 137) % 500;
+    // Time-based jitter: 0-499ms (avoids thundering herd with deterministic values)
+    auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    int jitter_ms = static_cast<int>((ns ^ (ns >> 17)) % 500);
 
     m_timeout_ts.tv_sec = delay_sec;
     m_timeout_ts.tv_nsec = jitter_ms * 1000000LL;
 
-    m_timeout_req = { op_timeout, -1, nullptr, 0, this };
+    m_timeout_req = { this, nullptr, -1, 0, op_timeout };
     m_reconnect_pending = true;
     m_loop->submit_timeout(&m_timeout_ts, &m_timeout_req);
 }
@@ -181,6 +220,10 @@ bool client_instance::setup(event_loop& loop)
 
 void client_instance::teardown(event_loop& loop)
 {
+    // Drain write queue
+    while (!m_write_queue.empty())
+        m_write_queue.pop();
+
     if (m_conn.fd >= 0)
     {
         shutdown(m_conn.fd, SHUT_RDWR);
@@ -376,6 +419,17 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
 
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
+    // Flush queued writes before checking closing state
+    if (!m_write_queue.empty() && !m_conn.closing)
+    {
+        m_conn.write_buf = std::move(m_write_queue.front());
+        m_write_queue.pop();
+        m_conn.write_pending = true;
+        m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
+            static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
+        return;
+    }
+
     if (m_conn.closing && !m_conn.read_pending)
     {
         invoke_on_disconnect(m_conn.fd);
@@ -439,9 +493,18 @@ void client_instance::lua_send(std::string_view msg)
         return;
     }
 
-    // Build directly in write_buf to avoid intermediate string + copy
+    // Queue message if a write is already in flight
     if (m_conn.write_pending || m_conn.closing)
+    {
+        if (!m_conn.closing && m_write_queue.size() < MAX_WRITE_QUEUE)
+        {
+            std::string out(msg.data(), msg.size());
+            if (out.empty() || out.back() != '\n')
+                out.push_back('\n');
+            m_write_queue.push(std::move(out));
+        }
         return;
+    }
 
     m_conn.write_buf.assign(msg.data(), msg.size());
     if (m_conn.write_buf.empty() || m_conn.write_buf.back() != '\n')

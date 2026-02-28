@@ -174,29 +174,18 @@ void runtime_manager::stop_all(event_loop& loop)
 
 void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    // Snapshot names under read lock — do NOT hold the lock during callbacks.
-    // A Lua subscribe callback may call socketley.stop/remove which needs a write lock,
-    // which would deadlock if we held the read lock here.
-    // We snapshot names (not raw pointers) so that if a callback removes a runtime,
-    // we safely skip it on re-lookup instead of dereferencing a dangling pointer.
-    std::vector<std::string> names;
+    // Snapshot pointers under a single read lock — avoids per-runtime re-lock overhead.
+    // Safe because on_publish_dispatch only invokes Lua subscribe callbacks which
+    // do not modify the runtime map (stop/remove go through the daemon handler).
+    std::vector<runtime_instance*> snapshot;
     {
         std::shared_lock lock(mutex);
-        names.reserve(runtimes.size());
-        for (auto& [n, _] : runtimes)
-            names.push_back(n);
+        snapshot.reserve(runtimes.size());
+        for (auto& [_, inst] : runtimes)
+            snapshot.push_back(inst.get());
     }
-    for (auto& n : names)
-    {
-        runtime_instance* inst;
-        {
-            std::shared_lock lock(mutex);
-            auto it = runtimes.find(n);
-            if (it == runtimes.end()) continue;
-            inst = it->second.get();
-        }
+    for (auto* inst : snapshot)
         inst->on_publish_dispatch(cache_name, channel, message);
-    }
 }
 
 void runtime_manager::dispatch_cluster_events(const std::vector<cluster_event>& events)

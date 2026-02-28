@@ -125,11 +125,14 @@ test_http_disk() {
     sleep 0.5
 
     local k6_export="/tmp/k6_http_disk_${TIMESTAMP}.json"
-    k6 run \
+    timeout "$BENCH_TIMEOUT_K6" k6 run \
         --summary-export "$k6_export" \
         --env BASE_URL="http://localhost:${HTTP_PORT}" \
         --quiet \
         "${K6_DIR}/http_bench.js" 2>&1
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "k6 http disk"
+    fi
 
     if [[ -f "$k6_export" ]]; then
         parse_k6_summary "$k6_export" "$test_name" "disk"
@@ -156,11 +159,14 @@ test_http_cached() {
     sleep 0.5
 
     local k6_export="/tmp/k6_http_cached_${TIMESTAMP}.json"
-    k6 run \
+    timeout "$BENCH_TIMEOUT_K6" k6 run \
         --summary-export "$k6_export" \
         --env BASE_URL="http://localhost:${HTTP_PORT}" \
         --quiet \
         "${K6_DIR}/http_bench.js" 2>&1
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "k6 http cached"
+    fi
 
     if [[ -f "$k6_export" ]]; then
         parse_k6_summary "$k6_export" "$test_name" "cached"
@@ -182,9 +188,16 @@ run_k6_http_benchmarks() {
     generate_large_bin
     prepare_http_root
 
+    log_bench "START" "k6_http_disk"
     test_http_disk
+    log_bench "DONE" "k6_http_disk"
+    fresh_daemon
+
     sleep 1
+
+    log_bench "START" "k6_http_cached"
     test_http_cached
+    log_bench "DONE" "k6_http_cached"
 
     echo "]" >> "$RESULTS_FILE"
 
