@@ -84,25 +84,25 @@ All benchmarks: single-threaded, loopback TCP, Release build. Measured inside a 
 
 | Operation    | Socketley     | Redis 7.0     | Ratio  |
 |-------------|---------------|---------------|--------|
-| SET         | 182K ops/s    | 179K ops/s    | 1.0x   |
-| GET         | 186K ops/s    | 184K ops/s    | 1.0x   |
-| LPUSH       | 185K ops/s    | 189K ops/s    | 1.0x   |
-| LPOP        | 188K ops/s    | 189K ops/s    | 1.0x   |
-| SADD        | 190K ops/s    | 184K ops/s    | 1.0x   |
-| HSET        | 200K ops/s    | 180K ops/s    | **1.1x** |
+| SET         | 188K ops/s    | 156K ops/s    | **1.2x** |
+| GET         | 198K ops/s    | 172K ops/s    | **1.1x** |
+| LPUSH       | 203K ops/s    | 157K ops/s    | **1.3x** |
+| LPOP        | 197K ops/s    | 165K ops/s    | **1.2x** |
+| SADD        | 194K ops/s    | 153K ops/s    | **1.3x** |
+| HSET        | 188K ops/s    | 146K ops/s    | **1.3x** |
 
-At P=1, throughput is dominated by loopback round-trip latency (~0.14 ms), both servers are essentially equivalent.
+At P=1, throughput is dominated by loopback round-trip latency (~0.13 ms), both servers are essentially equivalent.
 
 **Pipeline depth = 100** (100 pipelined requests, 50 clients, 2M ops each):
 
 | Operation    | Socketley      | Redis 7.0     | Speedup   |
 |-------------|----------------|---------------|-----------|
-| SET         | **8.93M ops/s** | 3.14M ops/s  | **2.8x**  |
-| GET         | **10.2M ops/s** | 4.01M ops/s  | **2.5x**  |
-| LPUSH       | **8.20M ops/s** | 2.98M ops/s  | **2.8x**  |
-| LPOP        | **10.4M ops/s** | 2.68M ops/s  | **3.9x**  |
-| SADD        | **7.17M ops/s** | 3.67M ops/s  | **2.0x**  |
-| HSET        | **8.30M ops/s** | 3.00M ops/s  | **2.8x**  |
+| SET         | **8.51M ops/s** | 3.12M ops/s  | **2.7x**  |
+| GET         | **9.71M ops/s** | 3.78M ops/s  | **2.6x**  |
+| LPUSH       | **8.58M ops/s** | 2.78M ops/s  | **3.1x**  |
+| LPOP        | **10.4M ops/s** | 2.44M ops/s  | **4.3x**  |
+| SADD        | **7.72M ops/s** | 3.29M ops/s  | **2.3x**  |
+| HSET        | **9.09M ops/s** | 2.84M ops/s  | **3.2x**  |
 
 Socketley is **2-4x faster than Redis 7** at sustained pipelined throughput.
 
@@ -116,20 +116,20 @@ The advantage comes from:
 
 | Metric   | Socketley | Redis 7.0 |
 |----------|-----------|-----------|
-| p50 SET  | 0.30 ms   | 1.48 ms   |
-| p50 GET  | 0.25 ms   | 1.14 ms   |
-| p99 SET  | 0.82 ms   | 1.78 ms   |
-| p99 GET  | 0.38 ms   | 1.40 ms   |
+| p50 SET  | 0.29 ms   | 1.50 ms   |
+| p50 GET  | 0.26 ms   | 1.14 ms   |
+| p99 SET  | 0.58 ms   | 1.78 ms   |
+| p99 GET  | 0.34 ms   | 1.42 ms   |
 
 ### Server: Connection Rate & Message Throughput
 
 | Test                               | Result             |
 |------------------------------------|--------------------|
-| Connection rate (2000 conns)       | **75.7K conn/s**   |
-| Burst (5000 simultaneous)          | **91.9K conn/s**   |
-| Single client 64B msg throughput   | **474K msg/s** (29.4 MB/s) |
-| Single client 1KB msg throughput   | **530K msg/s** (518 MB/s)  |
-| 100 clients × 500 msgs (aggregate) | **3.32M msg/s**    |
+| Connection rate (2000 conns)       | **77.1K conn/s**   |
+| Burst (5000 simultaneous)          | **91.3K conn/s**   |
+| Single client 64B msg throughput   | **468K msg/s** (29.0 MB/s) |
+| Single client 1KB msg throughput   | **439K msg/s** (429 MB/s)  |
+| 100 clients × 500 msgs (aggregate) | **1.59M msg/s**    |
 
 5-run median, 10% warm-up, `clock_gettime(CLOCK_MONOTONIC)`. All on a single-threaded io_uring event loop with `IORING_SETUP_SQPOLL`.
 
@@ -137,17 +137,17 @@ The advantage comes from:
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
-| TCP message throughput (128B)     | **463K msg/s** (57 MB/s) |
-| 20 concurrent clients             | **1.07M msg/s**    |
-| Named-runtime backend resolution  | **844K msg/s**     |
+| TCP message throughput (128B)     | **595K msg/s** (73 MB/s) |
+| 20 concurrent clients             | **2.23M msg/s**    |
+| Named-runtime backend resolution  | **669K msg/s**     |
 
 ### WebSocket
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
-| Handshake throughput (200 ops)    | **30.8K handshake/s** |
-| Frame send throughput (64B)       | **581K frame/s** (38.8 MB/s) |
-| 20 concurrent clients             | **63.0K handshake/s** |
+| Handshake throughput (200 ops)    | **21.9K handshake/s** |
+| Frame send throughput (64B)       | **403K frame/s** (26.9 MB/s) |
+| 20 concurrent clients             | **69.5K handshake/s** |
 
 ## Quick Start
 
