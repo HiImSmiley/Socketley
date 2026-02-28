@@ -45,83 +45,86 @@ struct resolved_backend
 // amortize the per-syscall overhead across more data.
 static constexpr size_t PROXY_READ_BUF_SIZE = 65536;
 
-struct proxy_client_connection
+struct alignas(64) proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
+    // === HOT fields (CQE dispatch) — first 2 cache lines ===
     int fd;
-    io_request read_req;
-    io_request write_req;
-    // Stack-allocated 64KB read buffer — eliminates heap allocation per read
-    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
-    std::string partial;
-    int backend_fd = -1;
-    bool header_parsed = false;
-    std::string method;
-    std::string path;
-    std::string version;
-
-    std::queue<std::string> write_queue;
-    std::string write_batch[MAX_WRITE_BATCH];
-    struct iovec write_iovs[MAX_WRITE_BATCH];
-    uint32_t write_batch_count{0};
-
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
     bool zc_notif_pending{false};
-
-    // Splice-based zero-copy forwarding (TCP mode only).
-    // pipe_to_backend[0]=read, [1]=write: client_socket -> pipe -> backend_socket
-    int pipe_to_backend[2]{-1, -1};
-    io_request splice_in_req;   // client -> pipe_write
-    io_request splice_out_req;  // pipe_read -> backend
-    bool splice_active{false};  // splice mode enabled for this connection
-    bool splice_in_pending{false};
-    bool splice_out_pending{false};
-
-    // Idle connection tracking
-    std::chrono::steady_clock::time_point last_activity{};
-
-    // Retry tracking
-    int retries_remaining{0};
-    size_t backend_idx{0};      // index of currently selected backend
-    std::string saved_request;  // saved HTTP request for retries
-};
-
-struct proxy_backend_connection
-{
-    static constexpr size_t MAX_WRITE_BATCH = 16;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
-    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
-
-    int fd;
-    io_request read_req;
-    io_request write_req;
-    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
-    std::string partial;
-    int client_fd;
-
-    std::queue<std::string> write_queue;
-    std::string write_batch[MAX_WRITE_BATCH];
-    struct iovec write_iovs[MAX_WRITE_BATCH];
-    uint32_t write_batch_count{0};
-
-    bool read_pending{false};
-    bool write_pending{false};
-    bool closing{false};
-    bool zc_notif_pending{false};
-
-    // Splice-based zero-copy forwarding (TCP mode only).
-    // pipe_to_client[0]=read, [1]=write: backend_socket -> pipe -> client_socket
-    int pipe_to_client[2]{-1, -1};
-    io_request splice_in_req;   // backend -> pipe_write
-    io_request splice_out_req;  // pipe_read -> client
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    bool header_parsed{false};
+    int backend_fd{-1};
+    uint32_t write_batch_count{0};
+    io_request read_req;
+    io_request write_req;
+
+    // === WARM fields ===
+    io_request splice_in_req;
+    io_request splice_out_req;
+    std::string partial;
+    std::queue<std::string> write_queue;
+    std::string write_batch[MAX_WRITE_BATCH];
+    struct iovec write_iovs[MAX_WRITE_BATCH];
+
+    // === COLD fields ===
+    int pipe_to_backend[2]{-1, -1};
+    std::string method;
+    std::string path;
+    std::string version;
+    std::chrono::steady_clock::time_point last_activity{};
+    int retries_remaining{0};
+    size_t backend_idx{0};
+    std::string saved_request;
+
+    // 64KB read buffer — at the END to keep hot fields in first cache lines
+    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
+
+    void reset(int new_fd);
+};
+
+struct alignas(64) proxy_backend_connection
+{
+    static constexpr size_t MAX_WRITE_BATCH = 16;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+
+    // === HOT fields (CQE dispatch) — first 2 cache lines ===
+    int fd;
+    bool read_pending{false};
+    bool write_pending{false};
+    bool closing{false};
+    bool zc_notif_pending{false};
+    bool splice_active{false};
+    bool splice_in_pending{false};
+    bool splice_out_pending{false};
+    int client_fd;
+    uint32_t write_batch_count{0};
+    io_request read_req;
+    io_request write_req;
+
+    // === WARM fields ===
+    io_request splice_in_req;
+    io_request splice_out_req;
+    std::string partial;
+    std::queue<std::string> write_queue;
+    std::string write_batch[MAX_WRITE_BATCH];
+    struct iovec write_iovs[MAX_WRITE_BATCH];
+
+    // === COLD fields ===
+    int pipe_to_client[2]{-1, -1};
+
+    // 64KB read buffer — at the END to keep hot fields in first cache lines
+    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
+
+    void reset(int new_fd);
 };
 
 struct proxy_conn_entry
@@ -289,7 +292,7 @@ private:
     std::unordered_map<int, std::unique_ptr<proxy_client_connection>> m_clients;
     std::unordered_map<int, std::unique_ptr<proxy_backend_connection>> m_backend_conns;
 
-    static constexpr int MAX_FDS = 65536;
+    static constexpr int MAX_FDS = 8192;
     proxy_conn_entry m_conn_idx[MAX_FDS]{};
     backend_info m_scratch_backend{};
 
@@ -320,4 +323,17 @@ private:
     // C++ proxy intercept hooks
     proxy_hook m_cb_on_proxy_request;
     proxy_hook m_cb_on_proxy_response;
+
+    // Connection struct pools — reuse allocations to avoid malloc/free per connect/disconnect
+    static constexpr size_t CONN_POOL_INIT = 32;
+    std::vector<std::unique_ptr<proxy_client_connection>> m_client_pool;
+    std::vector<std::unique_ptr<proxy_backend_connection>> m_backend_struct_pool;
+
+    std::unique_ptr<proxy_client_connection> client_pool_acquire(int fd);
+    void client_pool_release(std::unique_ptr<proxy_client_connection> conn);
+    std::unique_ptr<proxy_backend_connection> backend_pool_acquire(int fd);
+    void backend_pool_release(std::unique_ptr<proxy_backend_connection> conn);
+
+    // Cached idle timeout to avoid virtual call per read
+    uint32_t m_idle_timeout_cached{0};
 };

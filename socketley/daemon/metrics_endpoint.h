@@ -3,6 +3,7 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <chrono>
 
 class runtime_manager;
 
@@ -27,4 +28,10 @@ private:
     std::atomic<bool> m_running{false};
     std::thread m_thread;
     std::chrono::steady_clock::time_point m_start_time{};
+
+    mutable std::string m_cached_metrics;
+    mutable std::string m_cached_json_overview;
+    mutable std::string m_cached_json_runtimes;
+    mutable std::chrono::steady_clock::time_point m_cache_time{};
+    static constexpr auto METRICS_CACHE_TTL = std::chrono::seconds(1);
 };

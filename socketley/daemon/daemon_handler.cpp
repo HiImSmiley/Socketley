@@ -33,7 +33,7 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { op_accept, -1, nullptr, 0, this };
+    m_accept_req = { this, nullptr, -1, 0, op_accept };
 }
 
 daemon_handler::~daemon_handler()
@@ -191,8 +191,8 @@ void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
     {
         auto conn = std::make_unique<ipc_connection>();
         conn->fd = client_fd;
-        conn->read_req = { op_read, client_fd, conn->read_buf, sizeof(conn->read_buf), this };
-        conn->write_req = { op_write, client_fd, nullptr, 0, this };
+        conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+        conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
@@ -585,7 +585,7 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     {
         m_cleanup_pending = true;
         m_cleanup_ts = {};   // {0, 0} — fires immediately
-        m_cleanup_req = { op_timeout, -1, nullptr, 0, this };
+        m_cleanup_req = { this, nullptr, -1, 0, op_timeout };
         m_loop.submit_timeout(&m_cleanup_ts, &m_cleanup_req);
     }
 
@@ -601,6 +601,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         return 0;
 
     bool silent = false;
+    bool json_format = false;
     bool col_id = false, col_name = false, col_type = false, col_port = false;
     bool col_status = false, col_conn = false, col_owner = false, col_created = false;
     bool col_group = false;
@@ -611,6 +612,8 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         {
             case fnv1a("-s"):
             case fnv1a("--silent"):  silent     = true; break;
+            case fnv1a("--json"):
+            case fnv1a("-j"):        json_format = true; break;
             case fnv1a("--id"):      col_id      = true; break;
             case fnv1a("--name"):    col_name    = true; break;
             case fnv1a("--type"):    col_type    = true; break;
@@ -621,10 +624,54 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--created"): col_created = true; break;
             case fnv1a("--group"):   col_group   = true; break;
         }
+        // Handle --format json
+        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
+        {
+            if (pa.hashes[i + 1] == fnv1a("json"))
+                json_format = true;
+            ++i;
+        }
     }
 
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_status || col_conn || col_owner || col_created || col_group;
+
+    if (json_format)
+    {
+        std::ostringstream out;
+        out << "[";
+        bool first = true;
+        for (const auto& [name, instance] : runtimes)
+        {
+            if (!first) out << ",";
+            first = false;
+            runtime_state state = instance->get_state();
+            const char* state_str;
+            switch (state)
+            {
+                case runtime_created: state_str = "created"; break;
+                case runtime_running: state_str = "running"; break;
+                case runtime_stopped: state_str = "stopped"; break;
+                case runtime_failed:  state_str = "failed";  break;
+                default:              state_str = "unknown"; break;
+            }
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            auto group = instance->get_group();
+            out << "{\"id\":\"" << instance->get_id()
+                << "\",\"name\":\"" << name
+                << "\",\"type\":\"" << type_to_string(instance->get_type())
+                << "\",\"port\":" << port
+                << ",\"status\":\"" << state_str
+                << "\",\"connections\":" << instance->get_connection_count()
+                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
+                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << "\"}";
+        }
+        out << "]\n";
+        conn->write_buf = out.str();
+        return 0;
+    }
 
     std::ostringstream out;
     out << std::left;
@@ -734,6 +781,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         return 0;
 
     bool silent = false;
+    bool json_format = false;
     bool col_id = false, col_name = false, col_type = false, col_port = false;
     bool col_uptime = false, col_conn = false, col_owner = false, col_created = false;
 
@@ -743,6 +791,8 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         {
             case fnv1a("-s"):
             case fnv1a("--silent"):  silent     = true; break;
+            case fnv1a("--json"):
+            case fnv1a("-j"):        json_format = true; break;
             case fnv1a("--id"):      col_id      = true; break;
             case fnv1a("--name"):    col_name    = true; break;
             case fnv1a("--type"):    col_type    = true; break;
@@ -753,10 +803,46 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
         }
+        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
+        {
+            if (pa.hashes[i + 1] == fnv1a("json"))
+                json_format = true;
+            ++i;
+        }
     }
 
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_uptime || col_conn || col_owner || col_created;
+
+    if (json_format)
+    {
+        std::ostringstream out;
+        out << "[";
+        bool first = true;
+        for (const auto& [name, instance] : runtimes)
+        {
+            if (instance->get_state() != runtime_running)
+                continue;
+            if (!first) out << ",";
+            first = false;
+            uint16_t port = instance->get_port();
+            auto owner = instance->get_owner();
+            auto group = instance->get_group();
+            out << "{\"id\":\"" << instance->get_id()
+                << "\",\"name\":\"" << name
+                << "\",\"type\":\"" << type_to_string(instance->get_type())
+                << "\",\"port\":" << port
+                << ",\"status\":\"running"
+                << "\",\"uptime\":\"" << format_uptime(instance->get_start_time())
+                << "\",\"connections\":" << instance->get_connection_count()
+                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
+                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << "\"}";
+        }
+        out << "]\n";
+        conn->write_buf = out.str();
+        return 0;
+    }
 
     std::ostringstream out;
     out << std::left;
@@ -2221,7 +2307,7 @@ void daemon_handler::start_health_timer()
 {
     if (m_health_pending)
         return;
-    m_health_req = { op_timeout, -1, nullptr, 0, this };
+    m_health_req = { this, nullptr, -1, 0, op_timeout };
     m_health_ts = { 2, 0 };  // 2 seconds
     m_loop.submit_timeout(&m_health_ts, &m_health_req);
     m_health_pending = true;

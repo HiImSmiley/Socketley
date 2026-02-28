@@ -8,6 +8,8 @@
 
 #include <fstream>
 #include <sstream>
+#include <charconv>
+#include <cstdio>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -34,6 +36,22 @@ std::string json_escape(std::string_view s)
         }
     }
     return out;
+}
+
+void json_escape_into(std::string& out, std::string_view s)
+{
+    for (char c : s)
+    {
+        switch (c)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
 }
 
 std::string json_unescape(std::string_view s)
@@ -181,51 +199,66 @@ uint8_t str_to_eviction(std::string_view s)
 }
 
 // Simple JSON value parser: extract string value for a key from JSON text
-std::string json_get_string(const std::string& json, const std::string& key)
+std::string json_get_string(const std::string& json, std::string_view key)
 {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return {};
-
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return {};
-
-    // Skip whitespace
-    pos = json.find_first_not_of(" \t\n\r", pos + 1);
-    if (pos == std::string::npos) return {};
-
-    if (json[pos] == '"')
+    // Search for "key" pattern without allocating a needle string
+    size_t pos = 0;
+    while (pos < json.size())
     {
-        ++pos;
-        std::string result;
-        while (pos < json.size() && json[pos] != '"')
-        {
-            if (json[pos] == '\\' && pos + 1 < json.size())
-            {
-                result += json[pos];
-                result += json[pos + 1];
-                pos += 2;
-            }
-            else
-            {
-                result += json[pos];
-                ++pos;
-            }
-        }
-        return json_unescape(result);
-    }
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) break;
 
-    // Not a string — extract until comma, ], or }
-    size_t end = json.find_first_of(",]}", pos);
-    if (end == std::string::npos) end = json.size();
-    std::string val = json.substr(pos, end - pos);
-    // Trim whitespace
-    while (!val.empty() && (val.back() == ' ' || val.back() == '\n' || val.back() == '\r' || val.back() == '\t'))
-        val.pop_back();
-    return val;
+        // Check if this quoted string matches the key
+        if (pos + 1 + key.size() + 1 <= json.size() &&
+            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
+            json[pos + 1 + key.size()] == '"')
+        {
+            // Found the key — skip past closing quote
+            size_t after_key = pos + 1 + key.size() + 1;
+
+            size_t colon = json.find(':', after_key);
+            if (colon == std::string::npos) break;
+
+            // Skip whitespace
+            size_t vpos = json.find_first_not_of(" \t\n\r", colon + 1);
+            if (vpos == std::string::npos) break;
+
+            if (json[vpos] == '"')
+            {
+                ++vpos;
+                std::string result;
+                while (vpos < json.size() && json[vpos] != '"')
+                {
+                    if (json[vpos] == '\\' && vpos + 1 < json.size())
+                    {
+                        result += json[vpos];
+                        result += json[vpos + 1];
+                        vpos += 2;
+                    }
+                    else
+                    {
+                        result += json[vpos];
+                        ++vpos;
+                    }
+                }
+                return json_unescape(result);
+            }
+
+            // Not a string — extract until comma, ], or }
+            size_t end = json.find_first_of(",]}", vpos);
+            if (end == std::string::npos) end = json.size();
+            std::string val = json.substr(vpos, end - vpos);
+            // Trim whitespace
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\n' || val.back() == '\r' || val.back() == '\t'))
+                val.pop_back();
+            return val;
+        }
+        pos++;
+    }
+    return {};
 }
 
-bool json_get_bool(const std::string& json, const std::string& key, bool default_val = false)
+bool json_get_bool(const std::string& json, std::string_view key, bool default_val = false)
 {
     std::string v = json_get_string(json, key);
     if (v == "true")  return true;
@@ -233,42 +266,58 @@ bool json_get_bool(const std::string& json, const std::string& key, bool default
     return default_val;
 }
 
-int json_get_int(const std::string& json, const std::string& key, int default_val = 0)
+int json_get_int(const std::string& json, std::string_view key, int default_val = 0)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
     try { return std::stoi(v); } catch (...) { return default_val; }
 }
 
-uint32_t json_get_uint32(const std::string& json, const std::string& key, uint32_t default_val = 0)
+uint32_t json_get_uint32(const std::string& json, std::string_view key, uint32_t default_val = 0)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
     try { return static_cast<uint32_t>(std::stoul(v)); } catch (...) { return default_val; }
 }
 
-double json_get_double(const std::string& json, const std::string& key, double default_val = 0.0)
+double json_get_double(const std::string& json, std::string_view key, double default_val = 0.0)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
     try { return std::stod(v); } catch (...) { return default_val; }
 }
 
-size_t json_get_size(const std::string& json, const std::string& key, size_t default_val = 0)
+size_t json_get_size(const std::string& json, std::string_view key, size_t default_val = 0)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
     try { return static_cast<size_t>(std::stoull(v)); } catch (...) { return default_val; }
 }
 
-std::vector<std::string> json_get_array(const std::string& json, const std::string& key)
+std::vector<std::string> json_get_array(const std::string& json, std::string_view key)
 {
     std::vector<std::string> result;
-    std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return result;
 
-    pos = json.find('[', pos + needle.size());
+    // Search for "key" pattern without allocating a needle string
+    size_t pos = 0;
+    bool found = false;
+    while (pos < json.size())
+    {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return result;
+        if (pos + 1 + key.size() + 1 <= json.size() &&
+            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
+            json[pos + 1 + key.size()] == '"')
+        {
+            pos = pos + 1 + key.size() + 1;
+            found = true;
+            break;
+        }
+        pos++;
+    }
+    if (!found) return result;
+
+    pos = json.find('[', pos);
     if (pos == std::string::npos) return result;
     ++pos;
 
@@ -443,161 +492,209 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
 std::string state_persistence::format_json_pretty(const runtime_config& cfg) const
 {
     using namespace sp_detail;
-    std::ostringstream out;
-    out << "{\n";
-    out << "    \"name\": \"" << json_escape(cfg.name) << "\",\n";
-    out << "    \"id\": \"" << json_escape(cfg.id) << "\",\n";
-    out << "    \"type\": \"" << type_str(cfg.type) << "\",\n";
-    out << "    \"port\": " << cfg.port << ",\n";
-    out << "    \"was_running\": " << (cfg.was_running ? "true" : "false") << ",\n";
+
+    // Helper lambdas for direct string building
+    std::string j;
+    j.reserve(1024);
+
+    auto append_int = [&](auto v) {
+        char buf[24];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+        j.append(buf, end - buf);
+    };
+
+    auto append_str_field = [&](const char* key, std::string_view val) {
+        j += "    \"";
+        j += key;
+        j += "\": \"";
+        json_escape_into(j, val);
+        j += "\",\n";
+    };
+
+    auto append_bool_field = [&](const char* key, bool val) {
+        j += "    \"";
+        j += key;
+        j += "\": ";
+        j += val ? "true" : "false";
+        j += ",\n";
+    };
+
+    auto append_int_field = [&](const char* key, auto val) {
+        j += "    \"";
+        j += key;
+        j += "\": ";
+        append_int(val);
+        j += ",\n";
+    };
+
+    auto append_double_field = [&](const char* key, double val) {
+        // Use snprintf for doubles to match ostringstream default formatting
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%g", val);
+        j += "    \"";
+        j += key;
+        j += "\": ";
+        j.append(buf, static_cast<size_t>(n));
+        j += ",\n";
+    };
+
+    j += "{\n";
+    append_str_field("name", cfg.name);
+    append_str_field("id", cfg.id);
+    append_str_field("type", type_str(cfg.type));
+    append_int_field("port", cfg.port);
+    append_bool_field("was_running", cfg.was_running);
 
     // Common fields (only write non-default)
     if (!cfg.log_file.empty())
-        out << "    \"log_file\": \"" << json_escape(cfg.log_file) << "\",\n";
+        append_str_field("log_file", cfg.log_file);
     if (!cfg.write_file.empty())
-        out << "    \"write_file\": \"" << json_escape(cfg.write_file) << "\",\n";
+        append_str_field("write_file", cfg.write_file);
     if (!cfg.lua_script.empty())
-        out << "    \"lua_script\": \"" << json_escape(cfg.lua_script) << "\",\n";
+        append_str_field("lua_script", cfg.lua_script);
     if (cfg.bash_output)
-        out << "    \"bash_output\": true,\n";
+        append_bool_field("bash_output", true);
     if (cfg.bash_prefix)
-        out << "    \"bash_prefix\": true,\n";
+        append_bool_field("bash_prefix", true);
     if (cfg.bash_timestamp)
-        out << "    \"bash_timestamp\": true,\n";
+        append_bool_field("bash_timestamp", true);
     if (cfg.max_connections > 0)
-        out << "    \"max_connections\": " << cfg.max_connections << ",\n";
+        append_int_field("max_connections", cfg.max_connections);
     if (cfg.rate_limit > 0.0)
-        out << "    \"rate_limit\": " << cfg.rate_limit << ",\n";
+        append_double_field("rate_limit", cfg.rate_limit);
     if (cfg.global_rate_limit > 0.0)
-        out << "    \"global_rate_limit\": " << cfg.global_rate_limit << ",\n";
+        append_double_field("global_rate_limit", cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)
-        out << "    \"idle_timeout\": " << cfg.idle_timeout << ",\n";
+        append_int_field("idle_timeout", cfg.idle_timeout);
     if (cfg.drain)
-        out << "    \"drain\": true,\n";
+        append_bool_field("drain", true);
     if (cfg.reconnect >= 0)
-        out << "    \"reconnect\": " << cfg.reconnect << ",\n";
+        append_int_field("reconnect", cfg.reconnect);
     if (cfg.tls)
-        out << "    \"tls\": true,\n";
+        append_bool_field("tls", true);
     if (!cfg.cert_path.empty())
-        out << "    \"cert_path\": \"" << json_escape(cfg.cert_path) << "\",\n";
+        append_str_field("cert_path", cfg.cert_path);
     if (!cfg.key_path.empty())
-        out << "    \"key_path\": \"" << json_escape(cfg.key_path) << "\",\n";
+        append_str_field("key_path", cfg.key_path);
     if (!cfg.ca_path.empty())
-        out << "    \"ca_path\": \"" << json_escape(cfg.ca_path) << "\",\n";
+        append_str_field("ca_path", cfg.ca_path);
     if (!cfg.target.empty())
-        out << "    \"target\": \"" << json_escape(cfg.target) << "\",\n";
+        append_str_field("target", cfg.target);
     if (!cfg.cache_name.empty())
-        out << "    \"cache_name\": \"" << json_escape(cfg.cache_name) << "\",\n";
+        append_str_field("cache_name", cfg.cache_name);
     if (!cfg.group.empty())
-        out << "    \"group\": \"" << json_escape(cfg.group) << "\",\n";
+        append_str_field("group", cfg.group);
     if (!cfg.owner.empty())
-        out << "    \"owner\": \"" << json_escape(cfg.owner) << "\",\n";
+        append_str_field("owner", cfg.owner);
     if (cfg.child_policy != 0)
-        out << "    \"child_policy\": " << cfg.child_policy << ",\n";
+        append_int_field("child_policy", cfg.child_policy);
     if (cfg.external_runtime)
     {
-        out << "    \"external_runtime\": true,\n";
+        append_bool_field("external_runtime", true);
         if (cfg.managed)
         {
-            out << "    \"managed\": true,\n";
+            append_bool_field("managed", true);
             if (!cfg.exec_path.empty())
-                out << "    \"exec_path\": \"" << json_escape(cfg.exec_path) << "\",\n";
+                append_str_field("exec_path", cfg.exec_path);
         }
         if (cfg.pid > 0)
-            out << "    \"pid\": " << cfg.pid << ",\n";
+            append_int_field("pid", cfg.pid);
     }
 
     // Type-specific
     switch (cfg.type)
     {
         case runtime_server:
-            out << "    \"mode\": \"" << server_mode_str(cfg.mode) << "\",\n";
+            append_str_field("mode", server_mode_str(cfg.mode));
             if (cfg.udp)
-                out << "    \"udp\": true,\n";
+                append_bool_field("udp", true);
             if (!cfg.master_pw.empty())
-                out << "    \"master_pw\": \"" << json_escape(cfg.master_pw) << "\",\n";
+                append_str_field("master_pw", cfg.master_pw);
             if (cfg.master_forward)
-                out << "    \"master_forward\": true,\n";
+                append_bool_field("master_forward", true);
             if (!cfg.http_dir.empty())
-                out << "    \"http_dir\": \"" << json_escape(cfg.http_dir) << "\",\n";
+                append_str_field("http_dir", cfg.http_dir);
             if (cfg.http_cache)
-                out << "    \"http_cache\": true,\n";
+                append_bool_field("http_cache", true);
             if (!cfg.upstreams.empty())
             {
-                out << "    \"upstreams\": [";
+                j += "    \"upstreams\": [";
                 for (size_t i = 0; i < cfg.upstreams.size(); ++i)
                 {
-                    if (i > 0) out << ", ";
-                    out << "\"" << json_escape(cfg.upstreams[i]) << "\"";
+                    if (i > 0) j += ", ";
+                    j += "\"";
+                    json_escape_into(j, cfg.upstreams[i]);
+                    j += "\"";
                 }
-                out << "],\n";
+                j += "],\n";
             }
             break;
         case runtime_client:
-            out << "    \"mode\": \"" << server_mode_str(cfg.mode) << "\",\n";
+            append_str_field("mode", server_mode_str(cfg.mode));
             if (cfg.udp)
-                out << "    \"udp\": true,\n";
+                append_bool_field("udp", true);
             break;
         case runtime_proxy:
-            out << "    \"protocol\": \"" << proxy_protocol_str(cfg.protocol) << "\",\n";
-            out << "    \"strategy\": \"" << proxy_strategy_str(cfg.strategy) << "\",\n";
+            append_str_field("protocol", proxy_protocol_str(cfg.protocol));
+            append_str_field("strategy", proxy_strategy_str(cfg.strategy));
             if (!cfg.backends.empty())
             {
-                out << "    \"backends\": [";
+                j += "    \"backends\": [";
                 for (size_t i = 0; i < cfg.backends.size(); ++i)
                 {
-                    if (i > 0) out << ", ";
-                    out << "\"" << json_escape(cfg.backends[i]) << "\"";
+                    if (i > 0) j += ", ";
+                    j += "\"";
+                    json_escape_into(j, cfg.backends[i]);
+                    j += "\"";
                 }
-                out << "],\n";
+                j += "],\n";
             }
             if (cfg.health_check > 0)
-                out << "    \"health_check\": " << static_cast<int>(cfg.health_check) << ",\n";
+                append_int_field("health_check", static_cast<int>(cfg.health_check));
             if (cfg.health_interval != 5)
-                out << "    \"health_interval\": " << cfg.health_interval << ",\n";
+                append_int_field("health_interval", cfg.health_interval);
             if (!cfg.health_path.empty() && cfg.health_path != "/health")
-                out << "    \"health_path\": \"" << json_escape(cfg.health_path) << "\",\n";
+                append_str_field("health_path", cfg.health_path);
             if (cfg.health_threshold != 3)
-                out << "    \"health_threshold\": " << cfg.health_threshold << ",\n";
+                append_int_field("health_threshold", cfg.health_threshold);
             if (cfg.circuit_threshold != 5)
-                out << "    \"circuit_threshold\": " << cfg.circuit_threshold << ",\n";
+                append_int_field("circuit_threshold", cfg.circuit_threshold);
             if (cfg.circuit_timeout != 30)
-                out << "    \"circuit_timeout\": " << cfg.circuit_timeout << ",\n";
+                append_int_field("circuit_timeout", cfg.circuit_timeout);
             if (cfg.retry_count > 0)
-                out << "    \"retry_count\": " << cfg.retry_count << ",\n";
+                append_int_field("retry_count", cfg.retry_count);
             if (cfg.retry_all)
-                out << "    \"retry_all\": true,\n";
+                append_bool_field("retry_all", true);
             if (!cfg.mesh_client_ca.empty())
-                out << "    \"mesh_client_ca\": \"" << json_escape(cfg.mesh_client_ca) << "\",\n";
+                append_str_field("mesh_client_ca", cfg.mesh_client_ca);
             if (!cfg.mesh_client_cert.empty())
-                out << "    \"mesh_client_cert\": \"" << json_escape(cfg.mesh_client_cert) << "\",\n";
+                append_str_field("mesh_client_cert", cfg.mesh_client_cert);
             if (!cfg.mesh_client_key.empty())
-                out << "    \"mesh_client_key\": \"" << json_escape(cfg.mesh_client_key) << "\",\n";
+                append_str_field("mesh_client_key", cfg.mesh_client_key);
             break;
         case runtime_cache:
             if (!cfg.persistent_path.empty())
-                out << "    \"persistent_path\": \"" << json_escape(cfg.persistent_path) << "\",\n";
-            out << "    \"cache_mode\": \"" << cache_mode_str(cfg.cache_mode) << "\",\n";
+                append_str_field("persistent_path", cfg.persistent_path);
+            append_str_field("cache_mode", cache_mode_str(cfg.cache_mode));
             if (cfg.resp_forced)
-                out << "    \"resp_forced\": true,\n";
+                append_bool_field("resp_forced", true);
             if (!cfg.replicate_target.empty())
-                out << "    \"replicate_target\": \"" << json_escape(cfg.replicate_target) << "\",\n";
+                append_str_field("replicate_target", cfg.replicate_target);
             if (cfg.max_memory > 0)
-                out << "    \"max_memory\": " << cfg.max_memory << ",\n";
-            out << "    \"eviction\": \"" << eviction_str(cfg.eviction) << "\",\n";
+                append_int_field("max_memory", cfg.max_memory);
+            append_str_field("eviction", eviction_str(cfg.eviction));
             break;
     }
 
     // Remove trailing comma+newline and close
-    std::string json = out.str();
-    if (json.size() >= 2 && json[json.size()-2] == ',' && json[json.size()-1] == '\n')
+    if (j.size() >= 2 && j[j.size()-2] == ',' && j[j.size()-1] == '\n')
     {
-        json[json.size()-2] = '\n';
-        json.pop_back();
+        j[j.size()-2] = '\n';
+        j.pop_back();
     }
-    json += "}\n";
+    j += "}\n";
 
-    return json;
+    return j;
 }
 
 bool state_persistence::parse_json_string(const std::string& json, runtime_config& cfg) const

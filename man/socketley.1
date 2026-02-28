@@ -74,10 +74,17 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .RB [ \-r | \-\-reload ]
 .br
 .B socketley
+.B restart
+.IR name | pattern ...
+.RI [ flags ]
+.br
+.B socketley
 .B ls
+.RB [ \-\-json | \-j ]
 .br
 .B socketley
 .B ps
+.RB [ \-\-json | \-j ]
 .br
 .B socketley
 .B owner
@@ -85,6 +92,9 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .br
 .B socketley
 .B dashboard
+.br
+.B socketley
+.B version | \-\-version | \-v
 .br
 .B socketley
 .B \-\-lua
@@ -254,6 +264,16 @@ patterns, or a mix. With
 .BR * ,
 shows stats for all runtimes.
 .TP
+.BI "restart " "name " "[flags]"
+Stop and start a runtime in one step, preserving all flags.
+Equivalent to
+.B stop
+followed by
+.B start
+with the same arguments. Any additional flags are passed to the
+.B start
+command.
+.TP
 .BI "reload " "name|pattern" "..."
 Restart one or more running runtimes (stop + start). Accepts multiple
 names, glob patterns, or a mix. Non-running runtimes are skipped.
@@ -416,13 +436,15 @@ and throughput. Example output:
 Dashboard: http://localhost:9100/
 .fi
 .TP
-.B ls
+.B ls \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR]
 List all runtimes (all states). Docker-style output with columns:
 ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED.
+With \fB\-\-json\fR, outputs a JSON array of runtime objects.
 .TP
-.B ps
+.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR]
 List only running runtimes. Same format as
 .BR ls .
+With \fB\-\-json\fR, outputs a JSON array (includes uptime field).
 .TP
 .BI "owner " "name"
 Show ownership info for a runtime: parent name, children list, and
@@ -455,6 +477,9 @@ Show cluster summary: daemon counts, runtime totals, group membership.
 .B watch
 Continuously refresh the cluster view every 2 seconds (Ctrl+C to stop).
 .RE
+.TP
+.B version \fR| \fB\-\-version\fR | \fB\-v\fR
+Print the socketley version number and exit.
 .TP
 .BI "\-\-lua " "lua_file"
 Load Lua orchestration configuration. Optionally configures daemon name
@@ -1175,6 +1200,17 @@ echo "subscribe news" | nc localhost 9000
 .fi
 .SH LUA CONFIGURATION
 Lua scripts can define multiple runtimes and attach callbacks.
+.PP
+.B Module loading:
+The Lua
+.B require()
+function resolves modules relative to the script's directory.
+For a script at
+.IR /home/user/handler.lua ,
+.B require("utils")
+loads
+.IR /home/user/utils.lua .
+The default Lua package path is appended, so standard modules still work.
 .SS Configuration File Format
 .nf
 \-\- Optional: configure daemon name and cluster directory
@@ -1427,23 +1463,40 @@ self.owner_broadcast(msg)          -- Broadcast to all owner's clients
 .B socketley.log(msg)
 Output log message with [lua] prefix.
 .TP
-.B socketley.set_timeout(ms, fn)
+.B socketley.set_timeout(ms, fn) \(-> timer_id
 Fire
 .I fn
 once after
 .I ms
 milliseconds using an io_uring timeout SQE.
-Shares the event loop with the runtime — no extra threads.
+Returns an integer timer ID that can be passed to
+.BR socketley.clear_timeout() .
+Shares the event loop with the runtime \(em no extra threads.
 .TP
-.B socketley.set_interval(ms, fn)
+.B socketley.set_interval(ms, fn) \(-> timer_id
 Fire
 .I fn
 every
 .I ms
-milliseconds.
-Cancel by calling from within
-.BR on_stop ,
-where the context will be destroyed and the timer freed safely.
+milliseconds. Returns an integer timer ID that can be passed to
+.BR socketley.clear_interval() .
+.TP
+.B socketley.clear_timeout(timer_id)
+Cancel a pending timeout. The timer will not fire. Safe to call with
+an already-expired or invalid ID (no-op).
+.TP
+.B socketley.clear_interval(timer_id)
+Cancel a repeating interval. The timer stops after the current cycle
+completes. Safe to call with an already-expired or invalid ID (no-op).
+.TP
+.B socketley.json_encode(value) \(-> string
+Encode a Lua value (table, string, number, boolean, nil) as a JSON string.
+Tables with consecutive integer keys starting at 1 are encoded as JSON
+arrays; all others as objects.
+.TP
+.B socketley.json_decode(str) \(-> value
+Decode a JSON string into a Lua value. Objects become tables with string
+keys, arrays become tables with integer keys (1-based). Null becomes nil.
 .TP
 .B socketley.subscribe(cache_name, channel, fn)
 Register
@@ -2118,8 +2171,8 @@ sudo systemctl start socketley
 .fi
 .SS Debian Package
 .nf
-bash packaging/build-deb.sh 1.0.6
-sudo dpkg -i socketley_1.0.6_amd64.deb
+bash packaging/build-deb.sh 1.0.7
+sudo dpkg -i socketley_1.0.7_amd64.deb
 sudo systemctl start socketley
 .fi
 .SS Uninstall

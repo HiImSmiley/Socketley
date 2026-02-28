@@ -222,6 +222,10 @@ SSL* tls_context::create_ssl() const
 
     SSL_set_bio(ssl, rbio, wbio);
 
+    // Limit BIO buffering to 512KB to prevent memory exhaustion on failed handshakes
+    BIO_set_mem_eof_return(rbio, 0);
+    BIO_set_mem_eof_return(wbio, 0);
+
     return ssl;
 #else
     return nullptr;

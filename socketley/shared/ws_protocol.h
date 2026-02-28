@@ -20,6 +20,13 @@
 #define WS_HAS_AVX2 0
 #endif
 
+// Cached EVP_sha1() -- avoids repeated lookup on every WS handshake
+inline const EVP_MD* ws_sha1_md()
+{
+    static const EVP_MD* md = EVP_sha1();
+    return md;
+}
+
 // WebSocket frame opcodes
 constexpr uint8_t WS_OP_CONT   = 0x0;
 constexpr uint8_t WS_OP_TEXT   = 0x1;
@@ -86,7 +93,16 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
             chunk ^= mask64;
             std::memcpy(payload + i, &chunk, 8);
         }
-        // Tail bytes
+        // 4-byte tail
+        if (i + 4 <= len)
+        {
+            uint32_t chunk;
+            std::memcpy(&chunk, payload + i, 4);
+            chunk ^= mask32;
+            std::memcpy(payload + i, &chunk, 4);
+            i += 4;
+        }
+        // Byte-by-byte remainder
         for (; i < len; i++)
             payload[i] ^= mask_bytes[i & 3];
         return;
@@ -114,7 +130,16 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
             chunk ^= mask64;
             std::memcpy(payload + i, &chunk, 8);
         }
-        // Tail bytes
+        // 4-byte tail
+        if (i + 4 <= len)
+        {
+            uint32_t chunk;
+            std::memcpy(&chunk, payload + i, 4);
+            chunk ^= mask32;
+            std::memcpy(payload + i, &chunk, 4);
+            i += 4;
+        }
+        // Byte-by-byte remainder
         for (; i < len; i++)
             payload[i] ^= mask_bytes[i & 3];
         return;
@@ -131,6 +156,16 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
         chunk ^= mask64;
         std::memcpy(payload + i, &chunk, 8);
     }
+    // 4-byte tail
+    if (i + 4 <= len)
+    {
+        uint32_t chunk;
+        std::memcpy(&chunk, payload + i, 4);
+        chunk ^= mask32;
+        std::memcpy(payload + i, &chunk, 4);
+        i += 4;
+    }
+    // Byte-by-byte remainder
     for (; i < len; i++)
         payload[i] ^= mask_bytes[i & 3];
 }
@@ -153,7 +188,7 @@ inline std::string ws_accept_key(std::string_view client_key)
         unsigned char sha1_hash[EVP_MAX_MD_SIZE];
         unsigned int hash_len = 0;
         EVP_Digest(combined, client_key.size() + 36, sha1_hash, &hash_len,
-                   EVP_sha1(), nullptr);
+                   ws_sha1_md(), nullptr);
 
         char b64[32];
         EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
@@ -169,24 +204,26 @@ inline std::string ws_accept_key(std::string_view client_key)
     unsigned char sha1_hash[EVP_MAX_MD_SIZE];
     unsigned int hash_len = 0;
     EVP_Digest(combined.data(), combined.size(), sha1_hash, &hash_len,
-               EVP_sha1(), nullptr);
+               ws_sha1_md(), nullptr);
 
     char b64[32];
     EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
     return std::string(b64);
 }
 
+// Forward declaration — defined below, after frame encoding
+inline void ws_accept_key_into(std::string& buf, std::string_view client_key);
+
 // Build 101 Switching Protocols response
 inline std::string ws_handshake_response(std::string_view client_key)
 {
-    std::string accept = ws_accept_key(client_key);
     std::string resp;
-    resp.reserve(160 + accept.size());
+    resp.reserve(200);
     resp += "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Accept: ";
-    resp += accept;
+    ws_accept_key_into(resp, client_key);
     resp += "\r\n\r\n";
     return resp;
 }
@@ -226,9 +263,9 @@ inline std::string ws_frame_text(std::string_view payload)
     int hdr_len = ws_write_header(hdr, 0x81, payload.size());
 
     std::string frame;
-    frame.resize(static_cast<size_t>(hdr_len) + payload.size());
-    std::memcpy(frame.data(), hdr, static_cast<size_t>(hdr_len));
-    std::memcpy(frame.data() + hdr_len, payload.data(), payload.size());
+    frame.reserve(static_cast<size_t>(hdr_len) + payload.size());
+    frame.append(hdr, static_cast<size_t>(hdr_len));
+    frame.append(payload);
     return frame;
 }
 
@@ -255,9 +292,18 @@ inline std::string ws_frame_close()
 
 // ─── Frame parsing ───
 
-// Parse one frame from buffer. Returns false if incomplete.
-// Handles masked client frames (RFC 6455 requires clients to mask).
-inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
+// Parsed WS header (shared between ws_parse_frame and ws_parse_frame_inplace)
+struct ws_header
+{
+    uint8_t opcode;
+    bool fin;
+    bool masked;
+    uint64_t payload_len;
+    size_t header_size;
+};
+
+// Parse WS frame header. Returns false if buffer is too short or frame is invalid.
+inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
 {
     if (len < 2)
         return false;
@@ -265,58 +311,72 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     uint8_t b0 = static_cast<uint8_t>(data[0]);
     uint8_t b1 = static_cast<uint8_t>(data[1]);
 
-    out.opcode = b0 & 0x0F;
-    bool fin = (b0 & 0x80) != 0;
-    bool masked = (b1 & 0x80) != 0;
-    uint64_t payload_len = b1 & 0x7F;
-    size_t header_size = 2;
+    hdr.opcode = b0 & 0x0F;
+    hdr.fin = (b0 & 0x80) != 0;
+    hdr.masked = (b1 & 0x80) != 0;
+    hdr.payload_len = b1 & 0x7F;
+    hdr.header_size = 2;
 
-    if (payload_len == 126)
+    if (hdr.payload_len == 126)
     {
         if (len < 4) return false;
-        payload_len = (static_cast<uint64_t>(static_cast<uint8_t>(data[2])) << 8) |
-                       static_cast<uint64_t>(static_cast<uint8_t>(data[3]));
-        header_size = 4;
+        hdr.payload_len = (static_cast<uint64_t>(static_cast<uint8_t>(data[2])) << 8) |
+                           static_cast<uint64_t>(static_cast<uint8_t>(data[3]));
+        hdr.header_size = 4;
     }
-    else if (payload_len == 127)
+    else if (hdr.payload_len == 127)
     {
         if (len < 10) return false;
-        payload_len = 0;
+        hdr.payload_len = 0;
         for (int i = 0; i < 8; i++)
-            payload_len = (payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
-        header_size = 10;
+            hdr.payload_len = (hdr.payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
+        hdr.header_size = 10;
     }
 
-    if (payload_len > WS_MAX_PAYLOAD)
+    if (hdr.payload_len > WS_MAX_PAYLOAD)
         return false;
 
     // Reject control frames with payload > 125 (RFC 6455 5.5)
-    if (out.opcode >= 0x8 && payload_len > 125)
+    if (hdr.opcode >= 0x8 && hdr.payload_len > 125)
         return false;
 
     // Reject fragmented frames (FIN=0) -- we don't support reassembly
-    if (!fin)
+    if (!hdr.fin)
         return false;
 
-    size_t mask_size = masked ? 4 : 0;
-    size_t total = header_size + mask_size + payload_len;
+    size_t mask_size = hdr.masked ? 4 : 0;
+    size_t total = hdr.header_size + mask_size + hdr.payload_len;
     if (len < total)
         return false;
 
-    const char* payload_start = data + header_size + mask_size;
+    return true;
+}
 
-    out.payload.resize(payload_len);
-    if (masked)
+// Parse one frame from buffer. Returns false if incomplete.
+// Handles masked client frames (RFC 6455 requires clients to mask).
+inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
+{
+    ws_header hdr;
+    if (!ws_parse_header(data, len, hdr))
+        return false;
+
+    out.opcode = hdr.opcode;
+    size_t mask_size = hdr.masked ? 4 : 0;
+    size_t total = hdr.header_size + mask_size + hdr.payload_len;
+    const char* payload_start = data + hdr.header_size + mask_size;
+
+    out.payload.resize(hdr.payload_len);
+    if (hdr.masked)
     {
         // Copy then unmask in-place using widened/SIMD XOR
-        std::memcpy(out.payload.data(), payload_start, payload_len);
+        std::memcpy(out.payload.data(), payload_start, hdr.payload_len);
         uint32_t mask32;
-        std::memcpy(&mask32, data + header_size, 4);
-        ws_unmask_payload(out.payload.data(), payload_len, mask32);
+        std::memcpy(&mask32, data + hdr.header_size, 4);
+        ws_unmask_payload(out.payload.data(), hdr.payload_len, mask32);
     }
     else
     {
-        std::memcpy(out.payload.data(), payload_start, payload_len);
+        std::memcpy(out.payload.data(), payload_start, hdr.payload_len);
     }
 
     out.consumed = total;
@@ -336,59 +396,24 @@ struct ws_frame_view
 // Uses SIMD (AVX2/SSE2) or uint64_t-widened XOR for fast unmasking.
 inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
 {
-    if (len < 2)
+    ws_header hdr;
+    if (!ws_parse_header(data, len, hdr))
         return false;
 
-    uint8_t b0 = static_cast<uint8_t>(data[0]);
-    uint8_t b1 = static_cast<uint8_t>(data[1]);
+    out.opcode = hdr.opcode;
+    size_t mask_size = hdr.masked ? 4 : 0;
+    size_t total = hdr.header_size + mask_size + hdr.payload_len;
+    char* payload_start = data + hdr.header_size + mask_size;
 
-    out.opcode = b0 & 0x0F;
-    bool fin = (b0 & 0x80) != 0;
-    bool masked = (b1 & 0x80) != 0;
-    uint64_t payload_len = b1 & 0x7F;
-    size_t header_size = 2;
-
-    if (payload_len == 126)
-    {
-        if (len < 4) return false;
-        payload_len = (static_cast<uint64_t>(static_cast<uint8_t>(data[2])) << 8) |
-                       static_cast<uint64_t>(static_cast<uint8_t>(data[3]));
-        header_size = 4;
-    }
-    else if (payload_len == 127)
-    {
-        if (len < 10) return false;
-        payload_len = 0;
-        for (int i = 0; i < 8; i++)
-            payload_len = (payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
-        header_size = 10;
-    }
-
-    if (payload_len > WS_MAX_PAYLOAD)
-        return false;
-
-    if (out.opcode >= 0x8 && payload_len > 125)
-        return false;
-
-    if (!fin)
-        return false;
-
-    size_t mask_size = masked ? 4 : 0;
-    size_t total = header_size + mask_size + payload_len;
-    if (len < total)
-        return false;
-
-    char* payload_start = data + header_size + mask_size;
-
-    if (masked)
+    if (hdr.masked)
     {
         uint32_t mask32;
-        std::memcpy(&mask32, data + header_size, 4);
-        ws_unmask_payload(payload_start, payload_len, mask32);
+        std::memcpy(&mask32, data + hdr.header_size, 4);
+        ws_unmask_payload(payload_start, hdr.payload_len, mask32);
     }
 
     out.payload_ptr = payload_start;
-    out.payload_len = payload_len;
+    out.payload_len = hdr.payload_len;
     out.consumed = total;
     return true;
 }
@@ -442,7 +467,7 @@ inline void ws_accept_key_into(std::string& buf, std::string_view client_key)
         std::memcpy(combined, client_key.data(), client_key.size());
         std::memcpy(combined + client_key.size(), WS_GUID, 36);
         EVP_Digest(combined, client_key.size() + 36, sha1_hash, &hash_len,
-                   EVP_sha1(), nullptr);
+                   ws_sha1_md(), nullptr);
     }
     else
     {
@@ -451,7 +476,7 @@ inline void ws_accept_key_into(std::string& buf, std::string_view client_key)
         combined.append(client_key);
         combined.append(WS_GUID, 36);
         EVP_Digest(combined.data(), combined.size(), sha1_hash, &hash_len,
-                   EVP_sha1(), nullptr);
+                   ws_sha1_md(), nullptr);
     }
 
     char b64[32];

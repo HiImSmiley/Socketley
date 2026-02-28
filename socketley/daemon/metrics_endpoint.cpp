@@ -6,10 +6,10 @@
 #include <unistd.h>
 #include <cstring>
 #include <charconv>
-#include <sstream>
 #include <shared_mutex>
 #include <thread>
 #include <chrono>
+#include <vector>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
@@ -124,18 +124,47 @@ void metrics_endpoint::serve_loop()
                 }
                 else if (path == "/metrics")
                 {
-                    std::string body = build_metrics();
-                    send_http_response(client_fd, "text/plain; version=0.0.4; charset=utf-8", body);
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
+                    {
+                        m_cached_metrics = build_metrics();
+                        m_cached_json_overview.clear();
+                        m_cached_json_runtimes.clear();
+                        m_cache_time = now;
+                    }
+                    send_http_response(client_fd, "text/plain; version=0.0.4; charset=utf-8", m_cached_metrics);
                 }
                 else if (path == "/api/overview")
                 {
-                    std::string body = build_json_overview();
-                    send_http_response(client_fd, "application/json", body);
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
+                    {
+                        m_cached_json_overview = build_json_overview();
+                        m_cached_metrics.clear();
+                        m_cached_json_runtimes.clear();
+                        m_cache_time = now;
+                    }
+                    else if (m_cached_json_overview.empty())
+                    {
+                        m_cached_json_overview = build_json_overview();
+                    }
+                    send_http_response(client_fd, "application/json", m_cached_json_overview);
                 }
                 else if (path == "/api/runtimes")
                 {
-                    std::string body = build_json_runtimes();
-                    send_http_response(client_fd, "application/json", body);
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
+                    {
+                        m_cached_json_runtimes = build_json_runtimes();
+                        m_cached_metrics.clear();
+                        m_cached_json_overview.clear();
+                        m_cache_time = now;
+                    }
+                    else if (m_cached_json_runtimes.empty())
+                    {
+                        m_cached_json_runtimes = build_json_runtimes();
+                    }
+                    send_http_response(client_fd, "application/json", m_cached_json_runtimes);
                 }
                 else if (path.starts_with("/api/runtime/"))
                 {
@@ -157,73 +186,116 @@ void metrics_endpoint::serve_loop()
     }
 }
 
+// Escape a JSON string value (minimal: just quotes and backslashes)
+static void json_escape_into(std::string& out, std::string_view s)
+{
+    for (char c : s)
+    {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else out += c;
+    }
+}
+
+static void json_append_uint(std::string& out, uint64_t v)
+{
+    char buf[24];
+    auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, end - buf);
+}
+
 std::string metrics_endpoint::build_metrics() const
 {
-    std::ostringstream out;
+    // Snapshot runtime data under lock
+    struct runtime_snapshot {
+        std::string name;
+        runtime_type type;
+        runtime_state state;
+        uint64_t total_connections, total_messages, bytes_in, bytes_out;
+        size_t active_connections;
+    };
+    std::vector<runtime_snapshot> snapshots;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        const auto& runtimes = m_manager.list();
+        snapshots.reserve(runtimes.size());
+        for (const auto& [name, rt] : runtimes)
+        {
+            snapshots.push_back({name, rt->get_type(), rt->get_state(),
+                rt->m_stat_total_connections.load(std::memory_order_relaxed),
+                rt->m_stat_total_messages.load(std::memory_order_relaxed),
+                rt->m_stat_bytes_in.load(std::memory_order_relaxed),
+                rt->m_stat_bytes_out.load(std::memory_order_relaxed),
+                rt->get_connection_count()});
+        }
+    }
 
-    // Collect stats from all runtimes under shared lock
-    std::shared_lock lock(m_manager.mutex);
-    const auto& runtimes = m_manager.list();
-
+    // Now build metrics string without holding lock
     uint64_t total_connections = 0;
     uint64_t total_messages = 0;
     uint64_t total_bytes_in = 0;
     uint64_t total_bytes_out = 0;
     uint64_t active_connections = 0;
     int running_count = 0;
-    int total_count = static_cast<int>(runtimes.size());
+    int total_count = static_cast<int>(snapshots.size());
 
-    for (const auto& [name, rt] : runtimes)
+    for (const auto& s : snapshots)
     {
-        total_connections += rt->m_stat_total_connections.load(std::memory_order_relaxed);
-        total_messages += rt->m_stat_total_messages.load(std::memory_order_relaxed);
-        total_bytes_in += rt->m_stat_bytes_in.load(std::memory_order_relaxed);
-        total_bytes_out += rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-        active_connections += rt->get_connection_count();
+        total_connections += s.total_connections;
+        total_messages += s.total_messages;
+        total_bytes_in += s.bytes_in;
+        total_bytes_out += s.bytes_out;
+        active_connections += s.active_connections;
 
-        if (rt->get_state() == runtime_running)
+        if (s.state == runtime_running)
             running_count++;
     }
 
+    std::string out;
+    out.reserve(2048 + snapshots.size() * 256);
+
     // Prometheus exposition format
-    out << "# HELP socketley_runtimes_total Total number of runtimes.\n"
-        << "# TYPE socketley_runtimes_total gauge\n"
-        << "socketley_runtimes_total " << total_count << "\n\n";
-
-    out << "# HELP socketley_runtimes_running Number of running runtimes.\n"
-        << "# TYPE socketley_runtimes_running gauge\n"
-        << "socketley_runtimes_running " << running_count << "\n\n";
-
-    out << "# HELP socketley_connections_total Total connections accepted.\n"
-        << "# TYPE socketley_connections_total counter\n"
-        << "socketley_connections_total " << total_connections << "\n\n";
-
-    out << "# HELP socketley_connections_active Current active connections.\n"
-        << "# TYPE socketley_connections_active gauge\n"
-        << "socketley_connections_active " << active_connections << "\n\n";
-
-    out << "# HELP socketley_messages_total Total messages processed.\n"
-        << "# TYPE socketley_messages_total counter\n"
-        << "socketley_messages_total " << total_messages << "\n\n";
-
-    out << "# HELP socketley_bytes_received_total Total bytes received.\n"
-        << "# TYPE socketley_bytes_received_total counter\n"
-        << "socketley_bytes_received_total " << total_bytes_in << "\n\n";
-
-    out << "# HELP socketley_bytes_sent_total Total bytes sent.\n"
-        << "# TYPE socketley_bytes_sent_total counter\n"
-        << "socketley_bytes_sent_total " << total_bytes_out << "\n\n";
+    out += "# HELP socketley_runtimes_total Total number of runtimes.\n"
+           "# TYPE socketley_runtimes_total gauge\n"
+           "socketley_runtimes_total ";
+    json_append_uint(out, static_cast<uint64_t>(total_count));
+    out += "\n\n# HELP socketley_runtimes_running Number of running runtimes.\n"
+           "# TYPE socketley_runtimes_running gauge\n"
+           "socketley_runtimes_running ";
+    json_append_uint(out, static_cast<uint64_t>(running_count));
+    out += "\n\n# HELP socketley_connections_total Total connections accepted.\n"
+           "# TYPE socketley_connections_total counter\n"
+           "socketley_connections_total ";
+    json_append_uint(out, total_connections);
+    out += "\n\n# HELP socketley_connections_active Current active connections.\n"
+           "# TYPE socketley_connections_active gauge\n"
+           "socketley_connections_active ";
+    json_append_uint(out, active_connections);
+    out += "\n\n# HELP socketley_messages_total Total messages processed.\n"
+           "# TYPE socketley_messages_total counter\n"
+           "socketley_messages_total ";
+    json_append_uint(out, total_messages);
+    out += "\n\n# HELP socketley_bytes_received_total Total bytes received.\n"
+           "# TYPE socketley_bytes_received_total counter\n"
+           "socketley_bytes_received_total ";
+    json_append_uint(out, total_bytes_in);
+    out += "\n\n# HELP socketley_bytes_sent_total Total bytes sent.\n"
+           "# TYPE socketley_bytes_sent_total counter\n"
+           "socketley_bytes_sent_total ";
+    json_append_uint(out, total_bytes_out);
+    out += "\n\n";
 
     // Per-runtime metrics
-    out << "# HELP socketley_runtime_connections Active connections per runtime.\n"
-        << "# TYPE socketley_runtime_connections gauge\n";
-    for (const auto& [name, rt] : runtimes)
+    out += "# HELP socketley_runtime_connections Active connections per runtime.\n"
+           "# TYPE socketley_runtime_connections gauge\n";
+    for (const auto& s : snapshots)
     {
-        if (rt->get_state() != runtime_running)
+        if (s.state != runtime_running)
             continue;
 
         const char* type_str = "unknown";
-        switch (rt->get_type())
+        switch (s.type)
         {
             case runtime_server: type_str = "server"; break;
             case runtime_client: type_str = "client"; break;
@@ -231,21 +303,28 @@ std::string metrics_endpoint::build_metrics() const
             case runtime_cache:  type_str = "cache";  break;
         }
 
-        out << "socketley_runtime_connections{name=\"" << name
-            << "\",type=\"" << type_str << "\"} "
-            << rt->get_connection_count() << "\n";
+        out += "socketley_runtime_connections{name=\"";
+        out += s.name;
+        out += "\",type=\"";
+        out += type_str;
+        out += "\"} ";
+        json_append_uint(out, static_cast<uint64_t>(s.active_connections));
+        out += "\n";
     }
-    out << "\n";
+    out += "\n";
 
-    out << "# HELP socketley_runtime_messages_total Total messages per runtime.\n"
-        << "# TYPE socketley_runtime_messages_total counter\n";
-    for (const auto& [name, rt] : runtimes)
+    out += "# HELP socketley_runtime_messages_total Total messages per runtime.\n"
+           "# TYPE socketley_runtime_messages_total counter\n";
+    for (const auto& s : snapshots)
     {
-        out << "socketley_runtime_messages_total{name=\"" << name << "\"} "
-            << rt->m_stat_total_messages.load(std::memory_order_relaxed) << "\n";
+        out += "socketley_runtime_messages_total{name=\"";
+        out += s.name;
+        out += "\"} ";
+        json_append_uint(out, s.total_messages);
+        out += "\n";
     }
 
-    return out.str();
+    return out;
 }
 
 static const char* runtime_type_str(runtime_type t)
@@ -272,43 +351,27 @@ static const char* runtime_state_str(runtime_state s)
     }
 }
 
-// Escape a JSON string value (minimal: just quotes and backslashes)
-static void json_escape_into(std::string& out, std::string_view s)
-{
-    for (char c : s)
-    {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else out += c;
-    }
-}
-
-static void json_append_uint(std::string& out, uint64_t v)
-{
-    char buf[24];
-    auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-    out.append(buf, end - buf);
-}
-
 std::string metrics_endpoint::build_json_overview() const
 {
-    std::shared_lock lock(m_manager.mutex);
-    const auto& runtimes = m_manager.list();
-
+    // Snapshot under lock
     uint64_t total_connections = 0, total_messages = 0;
     uint64_t total_bytes_in = 0, total_bytes_out = 0;
     uint64_t active_connections = 0;
     int running_count = 0;
-
-    for (const auto& [name, rt] : runtimes)
+    size_t runtimes_total = 0;
     {
-        total_connections += rt->m_stat_total_connections.load(std::memory_order_relaxed);
-        total_messages += rt->m_stat_total_messages.load(std::memory_order_relaxed);
-        total_bytes_in += rt->m_stat_bytes_in.load(std::memory_order_relaxed);
-        total_bytes_out += rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-        active_connections += rt->get_connection_count();
-        if (rt->get_state() == runtime_running) running_count++;
+        std::shared_lock lock(m_manager.mutex);
+        const auto& runtimes = m_manager.list();
+        runtimes_total = runtimes.size();
+        for (const auto& [name, rt] : runtimes)
+        {
+            total_connections += rt->m_stat_total_connections.load(std::memory_order_relaxed);
+            total_messages += rt->m_stat_total_messages.load(std::memory_order_relaxed);
+            total_bytes_in += rt->m_stat_bytes_in.load(std::memory_order_relaxed);
+            total_bytes_out += rt->m_stat_bytes_out.load(std::memory_order_relaxed);
+            active_connections += rt->get_connection_count();
+            if (rt->get_state() == runtime_running) running_count++;
+        }
     }
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
@@ -316,10 +379,10 @@ std::string metrics_endpoint::build_json_overview() const
 
     std::string j;
     j.reserve(512);
-    j += "{\"version\":\"1.0.6\",\"uptime_seconds\":";
+    j += "{\"version\":\"1.0.7\",\"uptime_seconds\":";
     json_append_uint(j, static_cast<uint64_t>(uptime));
     j += ",\"runtimes_total\":";
-    json_append_uint(j, runtimes.size());
+    json_append_uint(j, runtimes_total);
     j += ",\"runtimes_running\":";
     json_append_uint(j, static_cast<uint64_t>(running_count));
     j += ",\"connections_total\":";
@@ -338,37 +401,60 @@ std::string metrics_endpoint::build_json_overview() const
 
 std::string metrics_endpoint::build_json_runtimes() const
 {
-    std::shared_lock lock(m_manager.mutex);
-    const auto& runtimes = m_manager.list();
+    // Snapshot runtime data under lock
+    struct runtimes_snapshot {
+        std::string name;
+        runtime_type type;
+        runtime_state state;
+        uint16_t port;
+        uint64_t total_connections, total_messages, bytes_in, bytes_out;
+        size_t active_connections;
+    };
+    std::vector<runtimes_snapshot> snapshots;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        const auto& runtimes = m_manager.list();
+        snapshots.reserve(runtimes.size());
+        for (const auto& [name, rt] : runtimes)
+        {
+            snapshots.push_back({name, rt->get_type(), rt->get_state(),
+                rt->get_port(),
+                rt->m_stat_total_connections.load(std::memory_order_relaxed),
+                rt->m_stat_total_messages.load(std::memory_order_relaxed),
+                rt->m_stat_bytes_in.load(std::memory_order_relaxed),
+                rt->m_stat_bytes_out.load(std::memory_order_relaxed),
+                rt->get_connection_count()});
+        }
+    }
 
     std::string j;
-    j.reserve(runtimes.size() * 256);
+    j.reserve(snapshots.size() * 256);
     j += "[";
 
     bool first = true;
-    for (const auto& [name, rt] : runtimes)
+    for (const auto& s : snapshots)
     {
         if (!first) j += ",";
         first = false;
 
         j += "{\"name\":\"";
-        json_escape_into(j, name);
+        json_escape_into(j, s.name);
         j += "\",\"type\":\"";
-        j += runtime_type_str(rt->get_type());
+        j += runtime_type_str(s.type);
         j += "\",\"state\":\"";
-        j += runtime_state_str(rt->get_state());
+        j += runtime_state_str(s.state);
         j += "\",\"port\":";
-        json_append_uint(j, rt->get_port());
+        json_append_uint(j, s.port);
         j += ",\"connections\":";
-        json_append_uint(j, rt->get_connection_count());
+        json_append_uint(j, static_cast<uint64_t>(s.active_connections));
         j += ",\"messages_total\":";
-        json_append_uint(j, rt->m_stat_total_messages.load(std::memory_order_relaxed));
+        json_append_uint(j, s.total_messages);
         j += ",\"connections_total\":";
-        json_append_uint(j, rt->m_stat_total_connections.load(std::memory_order_relaxed));
+        json_append_uint(j, s.total_connections);
         j += ",\"bytes_in\":";
-        json_append_uint(j, rt->m_stat_bytes_in.load(std::memory_order_relaxed));
+        json_append_uint(j, s.bytes_in);
         j += ",\"bytes_out\":";
-        json_append_uint(j, rt->m_stat_bytes_out.load(std::memory_order_relaxed));
+        json_append_uint(j, s.bytes_out);
         j += "}";
     }
 

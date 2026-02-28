@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <queue>
 #include <netinet/in.h>
 #include <linux/time_types.h>
 
@@ -67,11 +68,21 @@ private:
     event_loop* m_loop;
     bool m_connected;
 
+    // Write queue (prevents silent message loss when write_pending)
+    std::queue<std::string> m_write_queue;
+    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+
     // Reconnect state
     int m_reconnect_attempt{0};
     bool m_reconnect_pending{false};
     io_request m_timeout_req{};
     struct __kernel_timespec m_timeout_ts{};
+
+    // DNS cache (avoids getaddrinfo on every reconnect)
+    struct sockaddr_in m_cached_addr{};
+    bool m_has_cached_addr{false};
+    std::string m_cached_host;
+    uint16_t m_cached_port{0};
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 4;

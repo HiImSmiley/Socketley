@@ -123,11 +123,14 @@ test_ws_echo() {
     sleep 0.5
 
     local k6_export="/tmp/k6_ws_echo_${TIMESTAMP}.json"
-    k6 run \
+    timeout "$BENCH_TIMEOUT_K6" k6 run \
         --summary-export "$k6_export" \
         --env WS_URL="ws://localhost:${WS_PORT}" \
         --quiet \
         "${K6_DIR}/ws_bench.js" 2>&1
+    if [[ $? -eq 124 ]]; then
+        log_bench "TIMEOUT" "k6 ws echo"
+    fi
 
     if [[ -f "$k6_export" ]]; then
         parse_k6_ws_summary "$k6_export" "$test_name"
@@ -147,7 +150,9 @@ run_k6_ws_benchmarks() {
 
     check_k6 || return 1
 
+    log_bench "START" "k6_ws_echo"
     test_ws_echo
+    log_bench "DONE" "k6_ws_echo"
 
     echo "]" >> "$RESULTS_FILE"
 

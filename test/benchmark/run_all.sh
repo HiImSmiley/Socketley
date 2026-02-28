@@ -2,9 +2,35 @@
 # Socketley Complete Benchmark Suite
 # Runs all benchmarks and generates a summary report
 
-set -e
+set -eE
+
+# Pre-parse flags before sourcing utils.sh so BENCH_DEV is set first
+for _arg in "$@"; do
+    case "$_arg" in
+        --fresh) export BENCH_FRESH_DAEMON=1 ;;
+        --dev)   export BENCH_DEV=1 ;;
+    esac
+done
 
 source "$(dirname "$0")/utils.sh"
+
+# Run a bench script with timeout + logging. Does NOT propagate timeout exit code
+# (set -e would abort run_all.sh otherwise).
+run_bench_script() {
+    local script=$1
+    local name
+    name=$(basename "$script")
+    log_bench "SCRIPT_START" "$name"
+    timeout "$BENCH_TIMEOUT_SCRIPT" bash "$script" || {
+        local rc=$?
+        if [[ $rc -eq 124 ]]; then
+            log_bench "TIMEOUT" "$name (killed after ${BENCH_TIMEOUT_SCRIPT}s)"
+        else
+            log_bench "FAIL" "$name (exit code $rc)"
+        fi
+    }
+    log_bench "SCRIPT_DONE" "$name"
+}
 
 SUMMARY_FILE="${RESULTS_DIR}/summary_${TIMESTAMP}.md"
 
@@ -67,45 +93,24 @@ run_benchmarks() {
     # Export flag so subscripts don't manage daemon
     export SOCKETLEY_BENCH_PARENT=1
 
-    # Server benchmarks
-    log_section "Running Server Benchmarks"
-    bash "$script_dir/bench_server.sh"
+    run_bench_script "$script_dir/bench_server.sh"
+    cleanup_runtimes; sleep 2
 
-    cleanup_runtimes
-    sleep 2
+    run_bench_script "$script_dir/bench_cache.sh"
+    cleanup_runtimes; sleep 2
 
-    # Cache benchmarks
-    log_section "Running Cache Benchmarks"
-    bash "$script_dir/bench_cache.sh"
+    run_bench_script "$script_dir/bench_proxy.sh"
+    cleanup_runtimes; sleep 2
 
-    cleanup_runtimes
-    sleep 2
-
-    # Proxy benchmarks
-    log_section "Running Proxy Benchmarks"
-    bash "$script_dir/bench_proxy.sh"
-
-    cleanup_runtimes
-    sleep 2
-
-    # WebSocket benchmarks
-    log_section "Running WebSocket Benchmarks"
-    bash "$script_dir/bench_websocket.sh"
-
-    cleanup_runtimes
-    sleep 2
+    run_bench_script "$script_dir/bench_websocket.sh"
+    cleanup_runtimes; sleep 2
 
     # k6 benchmarks (optional — skip if k6 not installed)
     if check_k6 2>/dev/null; then
-        log_section "Running k6 HTTP Benchmarks"
-        bash "$script_dir/bench_k6_http.sh"
+        run_bench_script "$script_dir/bench_k6_http.sh"
+        cleanup_runtimes; sleep 2
 
-        cleanup_runtimes
-        sleep 2
-
-        log_section "Running k6 WebSocket Benchmarks"
-        bash "$script_dir/bench_k6_ws.sh"
-
+        run_bench_script "$script_dir/bench_k6_ws.sh"
         cleanup_runtimes
     else
         log_warn "Skipping k6 benchmarks (k6 not installed)"
@@ -279,6 +284,20 @@ main() {
     log_success "Total benchmark time: $(format_duration $total_time)"
 }
 
+# Parse --fresh / --dev from any position and strip them from args
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --fresh) export BENCH_FRESH_DAEMON=1 ;;
+        --dev)   export BENCH_DEV=1 ;;
+        *)       ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]}"
+
+[[ "$BENCH_FRESH_DAEMON" -eq 1 ]] && log_info "Fresh-daemon mode: daemon will restart between each test"
+[[ "${BENCH_DEV:-0}" -eq 1 ]] && log_info "Dev mode: using ${PROJECT_ROOT}/bin/Release/socketley"
+
 # Handle command line arguments
 case "${1:-}" in
     --server-only)
@@ -287,7 +306,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_server.sh"
+        run_bench_script "$(dirname "$0")/bench_server.sh"
         ;;
     --cache-only)
         check_binary || exit 1
@@ -295,7 +314,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_cache.sh"
+        run_bench_script "$(dirname "$0")/bench_cache.sh"
         ;;
     --proxy-only)
         check_binary || exit 1
@@ -303,7 +322,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_proxy.sh"
+        run_bench_script "$(dirname "$0")/bench_proxy.sh"
         ;;
     --websocket-only)
         check_binary || exit 1
@@ -311,7 +330,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_websocket.sh"
+        run_bench_script "$(dirname "$0")/bench_websocket.sh"
         ;;
     --k6-only)
         check_binary || exit 1
@@ -320,10 +339,10 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_k6_http.sh"
+        run_bench_script "$(dirname "$0")/bench_k6_http.sh"
         cleanup_runtimes
         sleep 2
-        bash "$(dirname "$0")/bench_k6_ws.sh"
+        run_bench_script "$(dirname "$0")/bench_k6_ws.sh"
         ;;
     --k6-http-only)
         check_binary || exit 1
@@ -332,7 +351,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_k6_http.sh"
+        run_bench_script "$(dirname "$0")/bench_k6_http.sh"
         ;;
     --k6-ws-only)
         check_binary || exit 1
@@ -341,7 +360,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_k6_ws.sh"
+        run_bench_script "$(dirname "$0")/bench_k6_ws.sh"
         ;;
     --cache-resp-only)
         check_binary || exit 1
@@ -349,7 +368,7 @@ case "${1:-}" in
         setup_cleanup_trap
         start_daemon || exit 1
         export SOCKETLEY_BENCH_PARENT=1
-        bash "$(dirname "$0")/bench_cache_resp.sh" "${2:-3}"
+        run_bench_script "$(dirname "$0")/bench_cache_resp.sh"
         ;;
     --help|-h)
         echo "Usage: $0 [options]"
@@ -363,10 +382,12 @@ case "${1:-}" in
         echo "  --k6-http-only   Run only k6 HTTP benchmarks"
         echo "  --k6-ws-only     Run only k6 WebSocket benchmarks"
         echo "  --cache-resp-only Run cache vs Redis (RESP2, redis-benchmark)"
+        echo "  --fresh          Restart daemon between each test"
+        echo "  --dev            Use dev binary (bin/Release/) instead of system"
         echo "  --help           Show this help"
         echo ""
         echo "Without options, runs the complete benchmark suite."
-        echo "k6 benchmarks require k6 to be installed (https://grafana.com/docs/k6/latest/set-up/install-k6/)."
+        echo "Flags can be combined: $0 --server-only --fresh"
         ;;
     *)
         main

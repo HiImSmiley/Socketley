@@ -235,7 +235,7 @@ void cluster_discovery::schedule_timer()
 
     m_timer_ts.tv_sec = PUBLISH_INTERVAL_SEC;
     m_timer_ts.tv_nsec = 0;
-    m_timer_req = { op_timeout, -1, nullptr, 0, this };
+    m_timer_req = { this, nullptr, -1, 0, op_timeout };
     m_loop->submit_timeout(&m_timer_ts, &m_timer_req);
 }
 

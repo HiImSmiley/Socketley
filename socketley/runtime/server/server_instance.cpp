@@ -27,7 +27,7 @@ server_instance::server_instance(std::string_view name)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { op_accept, -1, nullptr, 0, this };
+    m_accept_req = { this, nullptr, -1, 0, op_accept };
 }
 
 server_instance::~server_instance()
@@ -57,26 +57,21 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
 
 void server_instance::pool_release(std::unique_ptr<server_connection> conn)
 {
-    // Reset heavy state to free memory, then return to pool
+    // Reset heavy state but keep allocations for reuse (no shrink_to_fit —
+    // the next connection will likely need the same buffer sizes).
     conn->partial.clear();
-    conn->partial.shrink_to_fit();
     conn->meta.clear();
     while (!conn->write_queue.empty()) conn->write_queue.pop();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
-    conn->ws_cookie.shrink_to_fit();
     conn->ws_origin.clear();
-    conn->ws_origin.shrink_to_fit();
     conn->ws_protocol.clear();
-    conn->ws_protocol.shrink_to_fit();
     conn->ws_auth.clear();
-    conn->ws_auth.shrink_to_fit();
     if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
     if (conn->file_buf) { free(conn->file_buf); conn->file_buf = nullptr; }
     conn->file_size = 0;
     conn->file_content_type.clear();
-    conn->file_content_type.shrink_to_fit();
     conn->file_is_html = false;
     conn->file_read_pending = false;
     conn->http_keep_alive = false;
@@ -378,7 +373,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     // Strip query string
     auto qpos = url_path.find('?');
     if (qpos != std::string::npos)
-        url_path.erase(qpos);
+        url_path = url_path.substr(0, qpos);
 
     if (m_http_cache_enabled && !m_http_cache.empty())
     {
@@ -494,7 +489,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         conn->file_read_pending = true;
 
         // Submit async read — req->fd = socket fd for CQE dispatch
-        conn->file_read_req = { op_file_read, conn->fd, fbuf, static_cast<uint32_t>(fsize), this };
+        conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read };
         m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0, &conn->file_read_req);
     }
 }
@@ -677,15 +672,21 @@ bool server_instance::setup(event_loop& loop)
     m_active_fds.clear();
     m_active_fds.reserve(256);  // Pre-allocate to avoid reallocs on first connections
 
+    m_loop = &loop;
+
+    // Cache config getters once at setup to avoid virtual calls on the hot path
+    m_idle_timeout_cached = get_idle_timeout();
+    m_max_conns_cached = get_max_connections();
+    m_rate_limit_cached = get_rate_limit();
+
     // Pre-allocate the connection pool if empty (first run or after teardown)
     if (m_conn_pool.empty())
     {
-        m_conn_pool.reserve(CONN_POOL_INIT);
-        for (size_t i = 0; i < CONN_POOL_INIT; i++)
+        uint32_t pool_size = std::max(512u, m_max_conns_cached > 0 ? m_max_conns_cached / 4 : 512u);
+        m_conn_pool.reserve(pool_size);
+        for (uint32_t i = 0; i < pool_size && i < 2048; i++)
             m_conn_pool.push_back(std::make_unique<server_connection>());
     }
-
-    m_loop = &loop;
 
     // Internal-only server (port=0, used for Lua-managed sub-servers)
     if (get_port() == 0 && !get_owner().empty())
@@ -727,7 +728,7 @@ bool server_instance::setup(event_loop& loop)
         m_udp_recv_msg.msg_iov = &m_udp_recv_iov;
         m_udp_recv_msg.msg_iovlen = 1;
 
-        m_udp_recv_req = { op_recvmsg, m_udp_fd, nullptr, 0, this };
+        m_udp_recv_req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
         loop.submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
 
         return true;
@@ -743,10 +744,6 @@ bool server_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // TCP_DEFER_ACCEPT: kernel holds connection in SYN-RECV until data arrives,
-    // reducing wasted accept+read round-trips for idle SYN connections.
-    int defer_sec = 1;
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_sec, sizeof(defer_sec));
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -790,11 +787,11 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
-    if (get_idle_timeout() > 0)
+    if (m_idle_timeout_cached > 0)
     {
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { op_timeout, -1, nullptr, 0, this };
+        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
     }
 
@@ -827,6 +824,7 @@ void server_instance::teardown(event_loop& loop)
             m_udp_fd = -1;
         }
         m_udp_peers.clear();
+        m_udp_peer_idx.clear();
         m_loop = nullptr;
         return;
     }
@@ -1007,7 +1005,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             if (req == &m_idle_sweep_req)
             {
                 auto now = std::chrono::steady_clock::now();
-                auto timeout = std::chrono::seconds(get_idle_timeout());
+                auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (int cfd : m_active_fds)
                 {
                     auto* cconn = m_conn_idx[cfd];
@@ -1050,18 +1048,19 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
     }
 }
 
-// Remove fd from active list using swap-erase (O(1) amortized)
-static inline void server_instance_remove_active_fd(std::vector<int>& fds, int fd)
+// O(1) removal from active_fds using the index stored in the connection.
+// The swapped-in element's connection gets its index updated.
+inline void server_instance::remove_active_fd(int fd)
 {
-    for (size_t i = 0; i < fds.size(); i++)
-    {
-        if (fds[i] == fd)
-        {
-            fds[i] = fds.back();
-            fds.pop_back();
-            return;
-        }
-    }
+    auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+    if (!conn) return;
+    uint32_t idx = conn->active_idx;
+    if (idx >= m_active_fds.size()) return;
+    int back_fd = m_active_fds.back();
+    m_active_fds[idx] = back_fd;
+    m_active_fds.pop_back();
+    if (back_fd != fd && back_fd >= 0 && back_fd < MAX_FDS && m_conn_idx[back_fd])
+        m_conn_idx[back_fd]->active_idx = idx;
 }
 
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
@@ -1078,7 +1077,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         }
 
         // Max connections check
-        if (SOCKETLEY_UNLIKELY(get_max_connections() > 0 && m_clients.size() >= get_max_connections()))
+        if (SOCKETLEY_UNLIKELY(m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached))
         {
             close(client_fd);
             goto resubmit_accept;
@@ -1093,16 +1092,17 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
         auto conn = pool_acquire(client_fd);
         conn->partial.reserve(8192);
-        conn->read_req = { op_read, client_fd, conn->read_buf, server_connection::READ_BUF_SIZE, this };
-        conn->write_req = { op_write, client_fd, nullptr, 0, this };
+        conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE, op_read };
+        conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
         m_conn_idx[client_fd] = ptr;
+        ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
         m_active_fds.push_back(client_fd);
 
-        auto accept_now = std::chrono::steady_clock::now();
-        ptr->last_activity = accept_now;
+        if (m_idle_timeout_cached > 0)
+            ptr->last_activity = std::chrono::steady_clock::now();
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
         auto current_size = static_cast<uint32_t>(m_clients.size());
@@ -1110,18 +1110,23 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             m_stat_peak_connections = current_size;
 
         // Initialize rate limiting
-        double rl = get_rate_limit();
-        if (rl > 0)
+        if (m_rate_limit_cached > 0)
         {
-            ptr->rl_max = rl;
-            ptr->rl_tokens = rl;
-            ptr->rl_last = accept_now;
+            ptr->rl_max = m_rate_limit_cached;
+            ptr->rl_tokens = m_rate_limit_cached;
+            ptr->rl_last = std::chrono::steady_clock::now();
         }
 
         // Check per-IP auth failure rate (master mode only)
+        // Use getpeername() instead of m_accept_addr because multishot accept
+        // passes nullptr for addr — m_accept_addr is never populated per-connection.
         if (!m_master_pw.empty())
         {
-            uint32_t ip = m_accept_addr.sin_addr.s_addr;
+            struct sockaddr_in peer{};
+            socklen_t peer_len = sizeof(peer);
+            uint32_t ip = 0;
+            if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0)
+                ip = peer.sin_addr.s_addr;
             auto it = m_auth_ip_failures.find(ip);
             if (it != m_auth_ip_failures.end())
             {
@@ -1133,7 +1138,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
                 else if (it->second.failures >= 10)
                 {
                     if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-                    server_instance_remove_active_fd(m_active_fds, client_fd);
+                    remove_active_fd(client_fd);
                     auto cit = m_clients.find(client_fd);
                     if (cit != m_clients.end())
                     {
@@ -1151,7 +1156,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
         {
             if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, client_fd);
+            remove_active_fd(client_fd);
             auto cit = m_clients.find(client_fd);
             if (cit != m_clients.end())
             {
@@ -1179,7 +1184,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
     {
         m_accept_backoff_ts.tv_sec = 0;
         m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { op_timeout, -1, nullptr, 0, this };
+        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
         return;
     }
@@ -1253,7 +1258,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, fd);
+            remove_active_fd(fd);
             close(fd);
             auto it = m_clients.find(fd);
             if (it != m_clients.end())
@@ -1265,7 +1270,8 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    conn->last_activity = std::chrono::steady_clock::now();
+    if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
+        conn->last_activity = std::chrono::steady_clock::now();
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     if (is_provided)
@@ -1655,7 +1661,7 @@ submit_next_read:
         unroute_client(fd);
         invoke_on_disconnect(fd);
         if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-        server_instance_remove_active_fd(m_active_fds, fd);
+        remove_active_fd(fd);
         close(fd);
         auto it = m_clients.find(fd);
         if (it != m_clients.end())
@@ -2099,7 +2105,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, fd);
+            remove_active_fd(fd);
             close(fd);
             auto it = m_clients.find(fd);
             if (it != m_clients.end())
@@ -2130,7 +2136,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, fd);
+            remove_active_fd(fd);
             close(fd);
             auto it = m_clients.find(fd);
             if (it != m_clients.end())
@@ -2223,7 +2229,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             unroute_client(fd);
             invoke_on_disconnect(fd);
             m_conn_idx[fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, fd);
+            remove_active_fd(fd);
             close(fd);
             auto it = m_clients.find(fd);
             if (it != m_clients.end())
@@ -2262,7 +2268,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
             unroute_client(fd);
             invoke_on_disconnect(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            server_instance_remove_active_fd(m_active_fds, fd);
+            remove_active_fd(fd);
             close(fd);
             auto it = m_clients.find(fd);
             if (it != m_clients.end())
@@ -2643,18 +2649,19 @@ bool server_instance::owner_broadcast(std::string_view msg)
 
 int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
 {
-    for (size_t i = 0; i < m_udp_peers.size(); i++)
-    {
-        if (m_udp_peers[i].addr.sin_addr.s_addr == addr.sin_addr.s_addr &&
-            m_udp_peers[i].addr.sin_port == addr.sin_port)
-            return static_cast<int>(i);
-    }
+    uint64_t key = (static_cast<uint64_t>(addr.sin_addr.s_addr) << 16) |
+                    static_cast<uint64_t>(addr.sin_port);
+    auto it = m_udp_peer_idx.find(key);
+    if (it != m_udp_peer_idx.end())
+        return it->second;
 
     if (m_udp_peers.size() >= MAX_UDP_PEERS)
         return -1;
 
+    int idx = static_cast<int>(m_udp_peers.size());
     m_udp_peers.push_back({addr});
-    return static_cast<int>(m_udp_peers.size() - 1);
+    m_udp_peer_idx[key] = idx;
+    return idx;
 }
 
 // ─── Lua client enumeration ───
@@ -2750,8 +2757,8 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
 
     m_upstream_by_fd[fd] = uc;
 
-    uc->read_req = { op_read, fd, uc->read_buf, sizeof(uc->read_buf), this };
-    uc->write_req = { op_write, fd, nullptr, 0, this };
+    uc->read_req = { this, uc->read_buf, fd, sizeof(uc->read_buf), op_read };
+    uc->write_req = { this, nullptr, fd, 0, op_write };
 
     // Submit first read
     uc->read_pending = true;
@@ -2775,7 +2782,7 @@ void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
 
     uc->timeout_ts.tv_sec = delay_sec;
     uc->timeout_ts.tv_nsec = jitter_ms * 1000000LL;
-    uc->timeout_req = { op_timeout, -1, nullptr, 0, this };
+    uc->timeout_req = { this, nullptr, -1, 0, op_timeout };
     m_loop->submit_timeout(&uc->timeout_ts, &uc->timeout_req);
 }
 
