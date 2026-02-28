@@ -340,6 +340,7 @@ bool proxy_instance::setup(event_loop& loop)
     }
 
     m_idle_timeout_cached = get_idle_timeout();
+    m_max_conns_cached = get_max_connections();
     if (m_idle_timeout_cached > 0)
     {
         m_idle_sweep_ts.tv_sec = 30;
@@ -563,7 +564,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
     if (PROXY_LIKELY(client_fd >= 0))
     {
         if (PROXY_UNLIKELY(client_fd >= MAX_FDS ||
-            (get_max_connections() > 0 && m_clients.size() >= get_max_connections())))
+            (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)))
         {
             close(client_fd);
             goto proxy_resubmit_accept;
