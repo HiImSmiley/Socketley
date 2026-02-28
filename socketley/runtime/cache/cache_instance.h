@@ -47,6 +47,24 @@ struct client_connection
 
     // Idle connection tracking
     std::chrono::steady_clock::time_point last_activity{};
+
+    void reset(int new_fd)
+    {
+        fd = new_fd;
+        partial.clear();
+        response_buf.clear();
+        while (!write_queue.empty()) write_queue.pop();
+        for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].clear();
+        write_batch_count = 0;
+        read_pending = false;
+        write_pending = false;
+        closing = false;
+        zc_notif_pending = false;
+        resp_mode = false;
+        resp_detected = false;
+        rl_tokens = 0.0;
+        rl_max = 0.0;
+    }
 };
 
 enum cache_mode : uint8_t
@@ -244,4 +262,10 @@ private:
 
     // TTL sweep short-circuit: skip m_expiry scan when no TTL keys exist
     bool m_has_ttl_keys{false};
+
+    // Connection struct pool — reuse allocations to avoid malloc/free per connect/disconnect
+    static constexpr size_t CONN_POOL_INIT = 32;
+    std::vector<std::unique_ptr<client_connection>> m_conn_pool;
+    std::unique_ptr<client_connection> pool_acquire(int fd);
+    void pool_release(std::unique_ptr<client_connection> conn);
 };

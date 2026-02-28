@@ -334,6 +334,7 @@ private:
     std::unique_ptr<proxy_backend_connection> backend_pool_acquire(int fd);
     void backend_pool_release(std::unique_ptr<proxy_backend_connection> conn);
 
-    // Cached idle timeout to avoid virtual call per read
+    // Cached config to avoid virtual calls on hot path
     uint32_t m_idle_timeout_cached{0};
+    uint32_t m_max_conns_cached{0};
 };

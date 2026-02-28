@@ -113,18 +113,42 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
             {
                 // Expired — remove
                 m_expiry.erase(eit);
+                // Remove from LRU
+                if (auto lru_it = m_lru_map.find(key); lru_it != m_lru_map.end())
+                {
+                    m_lru_order.erase(lru_it->second);
+                    m_lru_map.erase(lru_it);
+                }
                 auto sit = m_data.find(key);
                 if (sit != m_data.end())
                 {
-                    track_sub(sit->second.size());
+                    track_sub(sit->first.size() + sit->second.size());
                     m_data.erase(sit);
                 }
                 else
                 {
-                    // Could be in lists/sets/hashes — clean up
-                    if (auto lit = m_lists.find(key); lit != m_lists.end()) m_lists.erase(lit);
-                    else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end()) m_sets.erase(eit2);
-                    else if (auto hit = m_hashes.find(key); hit != m_hashes.end()) m_hashes.erase(hit);
+                    // Could be in lists/sets/hashes — clean up with memory tracking
+                    if (auto lit = m_lists.find(key); lit != m_lists.end())
+                    {
+                        size_t mem = lit->first.size();
+                        for (const auto& e : lit->second) mem += e.size();
+                        track_sub(mem);
+                        m_lists.erase(lit);
+                    }
+                    else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end())
+                    {
+                        size_t mem = eit2->first.size();
+                        for (const auto& e : eit2->second) mem += e.size();
+                        track_sub(mem);
+                        m_sets.erase(eit2);
+                    }
+                    else if (auto hit = m_hashes.find(key); hit != m_hashes.end())
+                    {
+                        size_t mem = hit->first.size();
+                        for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
+                        track_sub(mem);
+                        m_hashes.erase(hit);
+                    }
                 }
                 return nullptr;
             }
@@ -487,10 +511,43 @@ void cache_store::check_expiry(std::string_view key)
 
     // Expired — remove from all containers
     m_expiry.erase(it);
-    if (auto sit = m_data.find(key); sit != m_data.end()) { track_sub(sit->second.size()); m_data.erase(sit); return; }
-    if (auto lit = m_lists.find(key); lit != m_lists.end()) { m_lists.erase(lit); return; }
-    if (auto eit = m_sets.find(key); eit != m_sets.end()) { m_sets.erase(eit); return; }
-    if (auto hit = m_hashes.find(key); hit != m_hashes.end()) { m_hashes.erase(hit); return; }
+    // Remove from LRU
+    if (auto lit = m_lru_map.find(key); lit != m_lru_map.end())
+    {
+        m_lru_order.erase(lit->second);
+        m_lru_map.erase(lit);
+    }
+
+    if (auto sit = m_data.find(key); sit != m_data.end())
+    {
+        track_sub(sit->first.size() + sit->second.size());
+        m_data.erase(sit);
+        return;
+    }
+    if (auto lit = m_lists.find(key); lit != m_lists.end())
+    {
+        size_t mem = lit->first.size();
+        for (const auto& e : lit->second) mem += e.size();
+        track_sub(mem);
+        m_lists.erase(lit);
+        return;
+    }
+    if (auto eit = m_sets.find(key); eit != m_sets.end())
+    {
+        size_t mem = eit->first.size();
+        for (const auto& e : eit->second) mem += e.size();
+        track_sub(mem);
+        m_sets.erase(eit);
+        return;
+    }
+    if (auto hit = m_hashes.find(key); hit != m_hashes.end())
+    {
+        size_t mem = hit->first.size();
+        for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
+        track_sub(mem);
+        m_hashes.erase(hit);
+        return;
+    }
 }
 
 std::vector<std::string> cache_store::sweep_expired()

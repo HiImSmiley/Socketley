@@ -31,6 +31,34 @@ cache_instance::~cache_instance()
         close(m_listen_fd);
 }
 
+std::unique_ptr<client_connection> cache_instance::pool_acquire(int fd)
+{
+    std::unique_ptr<client_connection> conn;
+    if (!m_conn_pool.empty())
+    {
+        conn = std::move(m_conn_pool.back());
+        m_conn_pool.pop_back();
+        conn->reset(fd);
+    }
+    else
+    {
+        conn = std::make_unique<client_connection>();
+        conn->fd = fd;
+    }
+    return conn;
+}
+
+void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
+{
+    conn->partial.clear();
+    conn->response_buf.clear();
+    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
+    conn->fd = -1;
+    m_conn_pool.push_back(std::move(conn));
+}
+
 void cache_instance::set_persistent(std::string_view path)
 {
     // Validate parent directory exists
@@ -70,6 +98,14 @@ bool cache_instance::setup(event_loop& loop)
 {
     // Clear connections from a previous stop() — safe to free now.
     m_clients.clear();
+
+    // Pre-allocate connection pool
+    if (m_conn_pool.empty())
+    {
+        m_conn_pool.reserve(CONN_POOL_INIT);
+        for (size_t i = 0; i < CONN_POOL_INIT; i++)
+            m_conn_pool.push_back(std::make_unique<client_connection>());
+    }
 
     m_loop = &loop;
 
@@ -186,6 +222,7 @@ void cache_instance::teardown(event_loop& loop)
         }
     }
 
+    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
     for (auto& [fd, conn] : m_clients)
     {
         shutdown(fd, SHUT_RDWR);
@@ -229,6 +266,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             return;
         }
         auto expired_keys = m_store.sweep_expired();
+        m_stat_keys_expired += expired_keys.size();
 #ifndef SOCKETLEY_NO_LUA
         if (lua() && lua()->has_on_expire() && !expired_keys.empty())
         {
@@ -325,8 +363,7 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
 
-        auto conn = std::make_unique<client_connection>();
-        conn->fd = client_fd;
+        auto conn = pool_acquire(client_fd);
         conn->partial.reserve(4096);
         conn->response_buf.reserve(4096);
         conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
@@ -430,7 +467,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         {
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            m_clients.erase(fd);
+            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
         }
         return;
     }
@@ -457,6 +494,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
     {
         conn->closing = true;
+        if (!conn->write_pending)
+        {
+            m_store.unsubscribe_all(fd);
+            close(fd);
+            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+        }
         return;
     }
 
@@ -538,7 +582,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         {
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             close(fd);
-            m_clients.erase(fd);
+            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
         }
         return;
     }
@@ -558,7 +602,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         {
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            m_clients.erase(fd);
+            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
         }
         return;
     }
@@ -637,7 +681,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         {
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            m_clients.erase(fd);
+            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
         }
     }
 }
@@ -2078,6 +2122,17 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
     m_stat_commands++;
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
 
+    // Helper: build text command from RESP args for replication
+    auto repl = [&](std::string_view* a, int n) {
+        if (m_repl_role != repl_leader || m_follower_fds.empty()) return;
+        std::string cmd;
+        for (int i = 0; i < n; i++) {
+            if (i > 0) cmd += ' ';
+            cmd.append(a[i].data(), a[i].size());
+        }
+        replicate_command(cmd);
+    };
+
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
@@ -2099,6 +2154,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     break;
                 }
                 rb.append(resp::RESP_OK, 5);
+                repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
                 if (__builtin_expect(lua() && lua()->has_on_write(), 0))
                 {
@@ -2149,6 +2205,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); m_has_ttl_keys = true; }
             else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); m_has_ttl_keys = true; }
             resp::encode_ok_into(rb);
+            repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
@@ -2220,6 +2277,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #endif
                 }
             }
+            if (deleted > 0) repl(args, argc);
             resp::encode_integer_into(rb, deleted);
             break;
         }
@@ -2238,7 +2296,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.incr(args[1], 1, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
             else
-                resp::encode_integer_into(rb, result);
+            { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
         }
         case fnv1a("decr"):
@@ -2249,7 +2307,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.incr(args[1], -1, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
             else
-                resp::encode_integer_into(rb, result);
+            { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
         }
         case fnv1a("incrby"):
@@ -2263,7 +2321,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.incr(args[1], delta, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
             else
-                resp::encode_integer_into(rb, result);
+            { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
         }
         case fnv1a("decrby"):
@@ -2277,7 +2335,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (!m_store.incr(args[1], -delta, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
             else
-                resp::encode_integer_into(rb, result);
+            { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
         }
         case fnv1a("append"):
@@ -2288,7 +2346,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (newlen == std::string::npos)
                 resp::encode_error_into(rb, "WRONGTYPE");
             else
-                resp::encode_integer_into(rb, static_cast<int64_t>(newlen));
+            { resp::encode_integer_into(rb, static_cast<int64_t>(newlen)); repl(args, argc); }
             break;
         }
         case fnv1a("strlen"):
@@ -2307,10 +2365,12 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             std::string oldval;
             if (!m_store.getset(args[1], args[2], oldval))
                 resp::encode_error_into(rb, "WRONGTYPE");
-            else if (!had_key)
-                resp::encode_null_into(rb);
             else
-                resp::encode_bulk_into(rb, oldval);
+            {
+                if (!had_key) resp::encode_null_into(rb);
+                else resp::encode_bulk_into(rb, oldval);
+                repl(args, argc);
+            }
             break;
         }
         case fnv1a("mget"):
@@ -2344,6 +2404,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #endif
             }
             resp::encode_ok_into(rb);
+            repl(args, argc);
             break;
         }
         case fnv1a("type"):
@@ -2390,6 +2451,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 }
             }
             resp::encode_integer_into(rb, m_store.llen(args[1]));
+            repl(args, argc);
             break;
         }
         case fnv1a("rpush"):
@@ -2406,6 +2468,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 }
             }
             resp::encode_integer_into(rb, m_store.llen(args[1]));
+            repl(args, argc);
             break;
         }
         case fnv1a("lpop"):
@@ -2414,7 +2477,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             std::string val;
-            if (m_store.lpop(args[1], val)) resp::encode_bulk_into(rb, val);
+            if (m_store.lpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
             else resp::encode_null_into(rb);
             break;
         }
@@ -2424,7 +2487,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             m_store.check_expiry(args[1]);
             std::string val;
-            if (m_store.rpop(args[1], val)) resp::encode_bulk_into(rb, val);
+            if (m_store.rpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
             else resp::encode_null_into(rb);
             break;
         }
@@ -2480,6 +2543,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 if (r < 0) { resp::encode_error_into(rb, "type conflict"); return; }
                 added += r;
             }
+            if (added > 0) repl(args, argc);
             resp::encode_integer_into(rb, added);
             break;
         }
@@ -2491,6 +2555,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int removed = 0;
             for (int i = 2; i < argc; i++)
                 if (m_store.srem(args[1], args[i])) removed++;
+            if (removed > 0) repl(args, argc);
             resp::encode_integer_into(rb, removed);
             break;
         }
@@ -2538,6 +2603,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 }
                 added++;
             }
+            repl(args, argc);
             resp::encode_integer_into(rb, added);
             break;
         }
@@ -2558,6 +2624,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int removed = 0;
             for (int i = 2; i < argc; i++)
                 if (m_store.hdel(args[1], args[i])) removed++;
+            if (removed > 0) repl(args, argc);
             resp::encode_integer_into(rb, removed);
             break;
         }
@@ -2592,6 +2659,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_store.set_expiry(args[1], sec))
             {
                 m_has_ttl_keys = true;
+                repl(args, argc);
                 resp::encode_integer_into(rb, 1);
             }
             else
@@ -2609,7 +2677,10 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            resp::encode_integer_into(rb, m_store.persist(args[1]) ? 1 : 0);
+            if (m_store.persist(args[1]))
+            { repl(args, argc); resp::encode_integer_into(rb, 1); }
+            else
+                resp::encode_integer_into(rb, 0);
             break;
         }
         case fnv1a("setnx"):
@@ -2617,6 +2688,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             bool did_set = m_store.setnx(args[1], args[2]);
+            if (did_set) repl(args, argc);
             resp::encode_integer_into(rb, did_set ? 1 : 0);
 #ifndef SOCKETLEY_NO_LUA
             if (did_set && lua() && lua()->has_on_write())
@@ -2640,6 +2712,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             m_store.set_expiry(args[1], sec);
             m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
+            repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
@@ -2662,6 +2735,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             m_store.set_expiry_ms(args[1], ms);
             m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
+            repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
@@ -2682,6 +2756,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_store.set_expiry_ms(args[1], ms))
             {
                 m_has_ttl_keys = true;
+                repl(args, argc);
                 resp::encode_integer_into(rb, 1);
             }
             else
@@ -2706,9 +2781,9 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
-                if (remaining <= 0) { m_store.del(args[1]); resp::encode_integer_into(rb, 1); }
+                if (remaining <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else if (m_store.set_expiry(args[1], static_cast<int>(remaining)))
-                { m_has_ttl_keys = true; resp::encode_integer_into(rb, 1); }
+                { m_has_ttl_keys = true; repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else resp::encode_integer_into(rb, 0);
             }
             break;
@@ -2724,9 +2799,9 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining_ms = unix_ms - now_ms;
-                if (remaining_ms <= 0) { m_store.del(args[1]); resp::encode_integer_into(rb, 1); }
+                if (remaining_ms <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else if (m_store.set_expiry_ms(args[1], remaining_ms))
-                { m_has_ttl_keys = true; resp::encode_integer_into(rb, 1); }
+                { m_has_ttl_keys = true; repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else resp::encode_integer_into(rb, 0);
             }
             break;
@@ -2929,7 +3004,7 @@ void cache_instance::replicate_command(std::string_view cmd)
 
     for (auto it = m_follower_fds.begin(); it != m_follower_fds.end(); )
     {
-        ssize_t sent = ::write(*it, line.data(), line.size());
+        ssize_t sent = ::send(*it, line.data(), line.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
         if (sent <= 0)
         {
             close(*it);

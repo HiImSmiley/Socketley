@@ -2250,16 +2250,10 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
 
     conn->file_read_pending = false;
 
-    // Close the file fd — we're done with it
-    if (conn->file_fd >= 0)
-    {
-        close(conn->file_fd);
-        conn->file_fd = -1;
-    }
-
     // Client disconnected during file read — just clean up
     if (SOCKETLEY_UNLIKELY(conn->closing))
     {
+        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
@@ -2283,6 +2277,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // Read error — send 404
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
+        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
@@ -2308,7 +2303,14 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         return;
     }
 
-    // Success: build response from file content
+    // Close the file fd — we're done with it
+    if (conn->file_fd >= 0)
+    {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+    }
+
+    // Use actual bytes read (handles short reads — Content-Length matches actual data)
     std::string_view file_content(conn->file_buf, static_cast<size_t>(cqe->res));
     std::string body;
     if (conn->file_is_html)
