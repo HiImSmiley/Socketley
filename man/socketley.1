@@ -311,6 +311,15 @@ After saving, changes are validated and applied.
 Interactive editor mode with auto-reload. After saving changes, the
 runtime's Lua script is automatically hot-reloaded. Alias:
 .BR \-\-reload .
+.TP
+.BI "import " "name " "json"
+Update a runtime's configuration from a JSON string. Accepts the same
+fields as the interactive editor (see below). Fields marked
+.B (read-only)
+are ignored. Fields marked
+.B (requires restart)
+cannot be changed while the runtime is running.
+Port, TLS, protocol, and UDP settings cannot be changed while running.
 .SS Edit: JSON Configuration Fields
 The interactive editor opens a JSON file with the following fields.
 Fields marked
@@ -436,15 +445,42 @@ and throughput. Example output:
 Dashboard: http://localhost:9100/
 .fi
 .TP
-.B ls \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR]
+.B ls \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fB\-\-silent\fR | \fB\-s\fR] [\fIcolumns\fR]
 List all runtimes (all states). Docker-style output with columns:
-ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED.
-With \fB\-\-json\fR, outputs a JSON array of runtime objects.
+ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED, GROUP.
+With \fB\-\-json\fR or \fB\-\-format json\fR, outputs a JSON array of runtime objects.
+With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
+.RS
+.PP
+.B Column selectors
+\(em pass one or more to show only those columns:
+.BR \-\-id ,
+.BR \-\-name ,
+.BR \-\-type ,
+.BR \-\-port ,
+.BR \-\-status ,
+.BR \-\-conn ,
+.BR \-\-owner ,
+.BR \-\-created ,
+.BR \-\-group .
+.RE
 .TP
-.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR]
+.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fIcolumns\fR]
 List only running runtimes. Same format as
 .BR ls .
 With \fB\-\-json\fR, outputs a JSON array (includes uptime field).
+.RS
+.PP
+.B Column selectors:
+.BR \-\-id ,
+.BR \-\-name ,
+.BR \-\-type ,
+.BR \-\-port ,
+.BR \-\-uptime ,
+.BR \-\-conn ,
+.BR \-\-owner ,
+.BR \-\-created .
+.RE
 .TP
 .BI "owner " "name"
 Show ownership info for a runtime: parent name, children list, and
@@ -2171,8 +2207,8 @@ sudo systemctl start socketley
 .fi
 .SS Debian Package
 .nf
-bash packaging/build-deb.sh 1.0.7
-sudo dpkg -i socketley_1.0.7_amd64.deb
+bash packaging/build-deb.sh 1.0.8
+sudo dpkg -i socketley_1.0.8_amd64.deb
 sudo systemctl start socketley
 .fi
 .SS Uninstall
