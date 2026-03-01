@@ -636,6 +636,16 @@ void event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t
     m_pending_submissions++;
 }
 
+void event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    io_uring_prep_connect(sqe, fd, addr, len);
+    io_uring_sqe_set_data(sqe, req);
+    m_pending_submissions++;
+}
+
 bool event_loop::register_files(const int* fds, uint32_t count)
 {
     if (m_files_registered)

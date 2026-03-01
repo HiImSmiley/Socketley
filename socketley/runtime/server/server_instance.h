@@ -15,10 +15,6 @@
 #include "../../shared/event_loop_definitions.h"
 #include <linux/time_types.h>
 
-// Branch prediction hints for hot-path optimization
-#define SOCKETLEY_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define SOCKETLEY_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
 class runtime_manager;
 
 enum proto_state : uint8_t {

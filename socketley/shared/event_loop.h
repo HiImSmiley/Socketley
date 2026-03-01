@@ -91,6 +91,10 @@ public:
     // req->fd should be set to the *socket* fd for CQE dispatch routing.
     void submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req);
 
+    // Async connect: non-blocking connect via io_uring.
+    // CQE res is 0 on success, negative errno on failure.
+    void submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
+
     // Flush all pending submissions (single syscall)
     void flush();
 

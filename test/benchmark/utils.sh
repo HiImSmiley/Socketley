@@ -135,7 +135,10 @@ start_daemon() {
         fi
     fi
 
-    # Kill any existing daemon
+    # In dev mode, stop the systemd service if it's running to avoid port conflicts
+    systemctl stop socketley.service 2>/dev/null || true
+
+    # Kill any existing dev daemon
     stop_daemon 2>/dev/null
 
     log_info "Starting socketley daemon..."
@@ -190,20 +193,18 @@ stop_daemon() {
         rm -f "$DAEMON_PID_FILE"
     fi
 
-    # Fallback: kill any socketley daemon processes by exact binary path
+    # Fallback: kill any daemon processes matching our exact binary path.
+    # Do NOT use pkill -x "socketley" — that kills the systemd-managed daemon too.
     pkill -9 -f "${SOCKETLEY_BIN} daemon" 2>/dev/null || true
-    # Also match the bare binary name in case it was started differently
-    pkill -9 -x "$(basename "$SOCKETLEY_BIN")" 2>/dev/null || true
     sleep 0.3
 
-    # Verify no daemon is running
+    # Verify no daemon is running (our binary only)
     if pgrep -f "${SOCKETLEY_BIN} daemon" >/dev/null 2>&1; then
         log_warn "Daemon process still exists after cleanup"
     fi
 
     # Remove socket and stale state
     rm -f "$IPC_SOCKET"
-    rm -rf /tmp/socketley-runtimes/* /var/lib/socketley/runtimes/* 2>/dev/null || true
 
     log_info "Daemon stopped"
 }
@@ -211,6 +212,16 @@ stop_daemon() {
 # Execute socketley command (with 10s timeout to prevent hangs on dead daemon)
 socketley_cmd() {
     timeout 10 "$SOCKETLEY_BIN" "$@" 2>&1
+}
+
+# Restart daemon — full stop + start for clean state between benchmark suites.
+restart_daemon() {
+    log_info "Restarting daemon for clean state..."
+    cleanup_runtimes 2>/dev/null || true
+    sleep 0.5
+    stop_daemon 2>/dev/null || true
+    sleep 1
+    start_daemon || { log_warn "Daemon failed to restart"; return 1; }
 }
 
 # Cleanup all runtimes
