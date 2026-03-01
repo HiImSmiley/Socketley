@@ -812,7 +812,7 @@ static struct run_result bench_proxy_tcp(struct bench_config *cfg)
 
     for (int i = 0; i < cfg->num_ops; i++) {
         int64_t t0 = time_ns();
-        ssize_t n = write(fd, msg, msize + 1);
+        ssize_t n = send_all(fd, msg, msize + 1);
         int64_t t1 = time_ns();
 
         if (n == msize + 1) {
@@ -860,7 +860,7 @@ static void *proxy_concurrent_worker(void *arg)
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
-        ssize_t n = write(fd, msg, msize + 1);
+        ssize_t n = send_all(fd, msg, msize + 1);
         if (n == msize + 1) local++;
     }
 
@@ -930,7 +930,7 @@ static void bench_proxy_overhead(struct bench_config *cfg)
             int success = 0;
             int64_t start = time_ns();
             for (int i = 0; i < cfg->num_ops; i++) {
-                ssize_t n = write(fd, msg, msize + 1);
+                ssize_t n = send_all(fd, msg, msize + 1);
                 if (n == msize + 1) success++;
             }
             int64_t end = time_ns();
@@ -946,7 +946,7 @@ static void bench_proxy_overhead(struct bench_config *cfg)
             int success = 0;
             int64_t start = time_ns();
             for (int i = 0; i < cfg->num_ops; i++) {
-                ssize_t n = write(fd, msg, msize + 1);
+                ssize_t n = send_all(fd, msg, msize + 1);
                 if (n == msize + 1) success++;
             }
             int64_t end = time_ns();

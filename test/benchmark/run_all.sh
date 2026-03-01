@@ -2,7 +2,10 @@
 # Socketley Complete Benchmark Suite
 # Runs all benchmarks and generates a summary report
 
-set -eE
+# Note: do NOT use set -eE here — daemon lifecycle management (stop/start
+# between suites) involves commands that may return non-zero legitimately
+# (pkill on dead processes, rm on missing files). Individual benchmark
+# errors are already handled by run_bench_script's || block.
 
 # Pre-parse flags before sourcing utils.sh so BENCH_DEV is set first
 for _arg in "$@"; do
@@ -94,21 +97,21 @@ run_benchmarks() {
     export SOCKETLEY_BENCH_PARENT=1
 
     run_bench_script "$script_dir/bench_server.sh"
-    cleanup_runtimes; sleep 2
+    restart_daemon
 
     run_bench_script "$script_dir/bench_cache.sh"
-    cleanup_runtimes; sleep 2
+    restart_daemon
 
     run_bench_script "$script_dir/bench_proxy.sh"
-    cleanup_runtimes; sleep 2
+    restart_daemon
 
     run_bench_script "$script_dir/bench_websocket.sh"
-    cleanup_runtimes; sleep 2
+    restart_daemon
 
     # k6 benchmarks (optional — skip if k6 not installed)
     if check_k6 2>/dev/null; then
         run_bench_script "$script_dir/bench_k6_http.sh"
-        cleanup_runtimes; sleep 2
+        restart_daemon
 
         run_bench_script "$script_dir/bench_k6_ws.sh"
         cleanup_runtimes

@@ -875,9 +875,14 @@ void server_instance::teardown(event_loop& loop)
         shutdown(fd, SHUT_RDWR);
         close(fd);
 
-        // Clean up any pending async file read
+        // Clean up any pending async file read.
+        // Do NOT free file_buf here — io_uring may still be writing to it
+        // (the SQE targets the file fd, not the socket fd, so shutdown() on
+        // the socket does not cancel it). The buffer stays alive until the
+        // server_connection is destroyed (on restart or remove).
+        // Null the req owner so the stale CQE is dropped by the event loop.
+        conn->file_read_req.owner = nullptr;
         if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
-        if (conn->file_buf) { free(conn->file_buf); conn->file_buf = nullptr; }
         conn->file_read_pending = false;
 
         // Release shared_ptr message refs now so memory is freed promptly, but

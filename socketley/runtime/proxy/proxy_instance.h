@@ -14,10 +14,6 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
 
-// Branch prediction hints for hot-path optimization
-#define PROXY_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define PROXY_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
 class runtime_manager;
 
 enum proxy_protocol : uint8_t { protocol_http = 0, protocol_tcp = 1 };
@@ -50,6 +46,7 @@ struct alignas(64) proxy_client_connection
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
+    static constexpr size_t MAX_HEADER_SIZE = 16384;
 
     // === HOT fields (CQE dispatch) — first 2 cache lines ===
     int fd;
@@ -61,6 +58,8 @@ struct alignas(64) proxy_client_connection
     bool splice_in_pending{false};
     bool splice_out_pending{false};
     bool header_parsed{false};
+    bool response_started{false};
+    bool client_conn_close{false};  // client sent Connection: close
     int backend_fd{-1};
     uint32_t write_batch_count{0};
     io_request read_req;
@@ -83,6 +82,12 @@ struct alignas(64) proxy_client_connection
     int retries_remaining{0};
     size_t backend_idx{0};
     std::string saved_request;
+
+    // Async connect state
+    bool connect_pending{false};
+    int connect_fd{-1};
+    io_request connect_req;
+    struct sockaddr_in connect_addr{};
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -120,6 +125,15 @@ struct alignas(64) proxy_backend_connection
 
     // === COLD fields ===
     int pipe_to_client[2]{-1, -1};
+
+    // HTTP response tracking for connection pooling
+    bool http_headers_parsed{false};
+    bool http_has_content_length{false};
+    bool http_conn_close{false};
+    bool http_chunked{false};
+    bool http_no_body{false};      // 204/304/1xx: no message body
+    uint16_t http_status_code{0};
+    size_t http_body_remaining{0};
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -177,6 +191,18 @@ struct mesh_config
     std::string client_key;      // proxy-side: client key for backend mTLS
 };
 
+// Async health check state per backend
+struct async_health_check
+{
+    int fd{-1};
+    size_t backend_idx{0};
+    enum phase : uint8_t { idle, connecting, writing, reading, done };
+    phase current{idle};
+    io_request req;
+    char buf[256];
+    std::string write_buf;
+};
+
 // Connection pool entry for backend reuse
 struct pooled_backend
 {
@@ -230,6 +256,13 @@ public:
     // Stats
     std::string get_stats() const override;
 
+    // Lua API
+    std::string lua_peer_ip(int client_fd);
+    void lua_close_client(int client_fd);
+    std::vector<std::string> lua_backends() const;
+    std::vector<std::pair<int, std::string>> lua_backend_health() const;
+    std::vector<int> lua_clients() const;
+
 private:
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_client_read(struct io_uring_cqe* cqe, io_request* req);
@@ -237,6 +270,8 @@ private:
     void handle_client_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_backend_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_splice(struct io_uring_cqe* cqe, io_request* req);
+    void handle_connect(struct io_uring_cqe* cqe, io_request* req);
+    void handle_health_cqe(struct io_uring_cqe* cqe, io_request* req);
 
     bool parse_http_request_line(proxy_client_connection* conn);
     std::string rewrite_http_request(proxy_client_connection* conn,
@@ -246,6 +281,10 @@ private:
     const backend_info* select_and_resolve_backend(proxy_client_connection* conn);
     bool connect_to_backend(proxy_client_connection* conn, const backend_info* target);
     void close_pair(int client_fd, int backend_fd);
+    inline void close_pair_close_backend(int backend_fd,
+                                          proxy_backend_connection* bconn,
+                                          proxy_client_connection* cconn);
+    void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
     void setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn);
     void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
 
@@ -289,10 +328,12 @@ private:
     io_request m_idle_sweep_req{};
     struct __kernel_timespec m_idle_sweep_ts{};
 
-    std::unordered_map<int, std::unique_ptr<proxy_client_connection>> m_clients;
-    std::unordered_map<int, std::unique_ptr<proxy_backend_connection>> m_backend_conns;
+    static constexpr int MAX_FDS = 65536;
+    std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];
+    std::unique_ptr<proxy_backend_connection> m_backend_slots[MAX_FDS];
+    size_t m_client_count{0};
+    size_t m_backend_count{0};
 
-    static constexpr int MAX_FDS = 8192;
     proxy_conn_entry m_conn_idx[MAX_FDS]{};
     backend_info m_scratch_backend{};
 
@@ -311,6 +352,8 @@ private:
     // Connection pool for backend reuse (avoids connect() per request)
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
+    // Backpressure: stop client reads when backend write queue reaches this
+    static constexpr size_t WRITE_QUEUE_BACKPRESSURE = 2048;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
 
     // Service mesh
@@ -319,6 +362,12 @@ private:
     std::vector<circuit_breaker> m_circuit_breakers;
     io_request m_health_check_req{};
     struct __kernel_timespec m_health_check_ts{};
+
+    // Async health checks
+    std::vector<async_health_check> m_health_checks;
+    bool m_health_checks_pending{false};
+    io_request m_health_timeout_req{};
+    struct __kernel_timespec m_health_timeout_ts{};
 
     // C++ proxy intercept hooks
     proxy_hook m_cb_on_proxy_request;
@@ -337,4 +386,10 @@ private:
     // Cached config to avoid virtual calls on hot path
     uint32_t m_idle_timeout_cached{0};
     uint32_t m_max_conns_cached{0};
+
+    // Peak connections high-water mark
+    size_t m_peak_connections{0};
+
+    // Max backends for fixed-size array in select_and_resolve_backend
+    static constexpr size_t MAX_BACKENDS = 256;
 };

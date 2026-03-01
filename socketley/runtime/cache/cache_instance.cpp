@@ -425,7 +425,7 @@ cache_resubmit_accept:
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
-    if (__builtin_expect(fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd], 0))
+    if (SOCKETLEY_UNLIKELY(fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]))
         return;
     auto* conn = m_conn_idx[fd];
 
@@ -440,7 +440,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     bool is_provided = (req->type == op_read_provided || is_multishot_recv);
 
-    if (__builtin_expect(cqe->res <= 0, 0))
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
@@ -473,7 +473,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Only update last_activity when idle timeout is configured (avoids clock_gettime syscall)
-    if (__builtin_expect(m_idle_timeout_cached > 0, 0))
+    if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
     if (is_provided)
@@ -714,18 +714,18 @@ static inline void append_int_nl(std::string& buf, int64_t v)
 
 void cache_instance::process_command(client_connection* conn, std::string_view line)
 {
-    if (__builtin_expect(line.empty(), 0))
+    if (SOCKETLEY_UNLIKELY(line.empty()))
         return;
 
     // Global rate limit check (across all connections)
-    if (__builtin_expect(!check_global_rate_limit(), 0))
+    if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
     {
         conn->response_buf.append("error: rate limited\n", 20);
         return;
     }
 
     // Rate limit check (usually disabled)
-    if (__builtin_expect(conn->rl_max > 0, 0))
+    if (SOCKETLEY_UNLIKELY(conn->rl_max > 0))
     {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - conn->rl_last).count();
@@ -1703,10 +1703,10 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
 void cache_instance::flush_responses(client_connection* conn)
 {
-    if (__builtin_expect(conn->response_buf.empty() || !m_loop || conn->closing, 0))
+    if (SOCKETLEY_UNLIKELY(conn->response_buf.empty() || !m_loop || conn->closing))
         return;
 
-    if (__builtin_expect(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE, 0))
+    if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE))
     {
         conn->closing = true;
         return;
@@ -1714,7 +1714,7 @@ void cache_instance::flush_responses(client_connection* conn)
 
     // Fast-path: if no write is pending and queue is empty, submit directly
     // from response_buf without the queue round-trip (saves move + pop)
-    if (__builtin_expect(!conn->write_pending && conn->write_queue.empty() && !conn->zc_notif_pending, 1))
+    if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() && !conn->zc_notif_pending))
     {
         conn->write_batch[0] = std::move(conn->response_buf);
         conn->response_buf.reserve(4096);
@@ -2092,18 +2092,18 @@ void cache_instance::process_resp(client_connection* conn)
 
 void cache_instance::process_resp_command(client_connection* conn, std::string_view* args, int argc)
 {
-    if (__builtin_expect(argc == 0, 0))
+    if (SOCKETLEY_UNLIKELY(argc == 0))
         return;
 
     // Global rate limit check (across all connections)
-    if (__builtin_expect(!check_global_rate_limit(), 0))
+    if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
     {
         resp::encode_error_into(conn->response_buf, "rate limited");
         return;
     }
 
     // Rate limit check (usually disabled — rl_max == 0)
-    if (__builtin_expect(conn->rl_max > 0, 0))
+    if (SOCKETLEY_UNLIKELY(conn->rl_max > 0))
     {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - conn->rl_last).count();
@@ -2140,15 +2140,15 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
     {
         case fnv1a("set"):
         {
-            if (__builtin_expect(argc < 3, 0)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (__builtin_expect(m_mode == cache_mode_readonly, 0)) { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (SOCKETLEY_UNLIKELY(argc < 3)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (SOCKETLEY_UNLIKELY(m_mode == cache_mode_readonly)) { resp::encode_error_into(rb, "readonly mode"); return; }
 
             // Fast-path: plain SET key value (argc == 3, no options)
             // This is the overwhelmingly common case in benchmarks
-            if (__builtin_expect(argc == 3, 1))
+            if (SOCKETLEY_LIKELY(argc == 3))
             {
                 m_store.check_expiry(args[1]);
-                if (__builtin_expect(!m_store.set(args[1], args[2]), 0))
+                if (SOCKETLEY_UNLIKELY(!m_store.set(args[1], args[2])))
                 {
                     resp::encode_error_into(rb, "type conflict");
                     break;
@@ -2156,7 +2156,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 rb.append(resp::RESP_OK, 5);
                 repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
-                if (__builtin_expect(lua() && lua()->has_on_write(), 0))
+                if (SOCKETLEY_UNLIKELY(lua() && lua()->has_on_write()))
                 {
                     try { lua()->on_write()(args[1], args[2], 0); }
                     catch (const sol::error& e)
@@ -2218,10 +2218,10 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         }
         case fnv1a("get"):
         {
-            if (__builtin_expect(argc < 2, 0)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (SOCKETLEY_UNLIKELY(argc < 2)) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             // Combined expiry check + lookup — one hash probe instead of two
             const std::string* val = m_store.check_expiry_and_get_ptr(args[1]);
-            if (__builtin_expect(val != nullptr, 1))
+            if (SOCKETLEY_LIKELY(val != nullptr))
             {
                 m_stat_get_hits++;
                 resp::encode_bulk_into(rb, *val);
@@ -2229,7 +2229,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             else
             {
 #ifndef SOCKETLEY_NO_LUA
-                if (__builtin_expect(lua() && lua()->has_on_miss(), 0))
+                if (SOCKETLEY_UNLIKELY(lua() && lua()->has_on_miss()))
                 {
                     try
                     {
@@ -2426,7 +2426,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         }
         case fnv1a("ping"):
         {
-            if (__builtin_expect(argc <= 1, 1))
+            if (SOCKETLEY_LIKELY(argc <= 1))
                 rb.append(resp::RESP_PONG, 7);
             else
                 resp::encode_bulk_into(rb, args[1]);

@@ -176,6 +176,11 @@ bool tls_context::init_client(std::string_view ca_path,
         }
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
     }
+    else
+    {
+        SSL_CTX_set_default_verify_paths(m_ctx);
+        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
+    }
 
     // mTLS client certificate (for connecting to backends that require client auth)
     if (!client_cert.empty() && !client_key.empty())

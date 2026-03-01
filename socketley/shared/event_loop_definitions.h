@@ -1,6 +1,14 @@
 #pragma once
 #include <cstdint>
 
+// Branch prediction hints for hot-path optimization
+#ifndef SOCKETLEY_LIKELY
+#define SOCKETLEY_LIKELY(x)   __builtin_expect(!!(x), 1)
+#endif
+#ifndef SOCKETLEY_UNLIKELY
+#define SOCKETLEY_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
 class io_handler
 {
 public:
@@ -26,7 +34,9 @@ enum op_type : uint8_t
     op_read_fixed_buf        = 13,    // read using registered buffer
     op_write_fixed_buf       = 14,    // write using registered buffer
     op_splice                = 15,    // splice between fds through pipe
-    op_file_read             = 16     // async file read via io_uring
+    op_file_read             = 16,    // async file read via io_uring
+    op_connect               = 17,    // async connect via io_uring
+    op_health_check          = 18     // async health check (connect/write/read phases)
 };
 
 struct io_request

@@ -8,6 +8,7 @@
 #include "cluster_discovery.h"
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
+#include "../runtime/proxy/proxy_instance.h"
 #include "../cli/command_hashing.h"
 #include "../cli/runtime_type_parser.h"
 #include <iostream>
@@ -1343,8 +1344,47 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
 
 void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self)
 {
+    auto* proxy = static_cast<proxy_instance*>(owner);
+
     self["connections"] = [owner]() -> size_t {
         return owner->get_connection_count();
+    };
+    self["protocol"] = proxy->get_protocol() == protocol_http ? "http" : "tcp";
+    self["peer_ip"] = [proxy](int client_id) -> std::string {
+        return proxy->lua_peer_ip(client_id);
+    };
+    self["close_client"] = [proxy](int client_id) {
+        proxy->lua_close_client(client_id);
+    };
+    self["clients"] = [proxy, this]() -> sol::table {
+        auto ids = proxy->lua_clients();
+        sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
+        for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
+        return t;
+    };
+    self["backends"] = [proxy, this]() -> sol::table {
+        auto addrs = proxy->lua_backends();
+        sol::table t = m_lua.create_table(static_cast<int>(addrs.size()), 0);
+        for (int i = 0; i < (int)addrs.size(); ++i) t[i + 1] = addrs[i];
+        return t;
+    };
+    self["backend_health"] = [proxy, this]() -> sol::table {
+        auto health = proxy->lua_backend_health();
+        sol::table t = m_lua.create_table(0, static_cast<int>(health.size()));
+        for (const auto& [idx, state] : health)
+            t[idx + 1] = state;
+        return t;
+    };
+    self["stats"] = [proxy, this]() -> sol::table {
+        sol::table t = m_lua.create_table(0, 6);
+        t["connections"] = proxy->get_connection_count();
+        t["bytes_in"] = proxy->m_stat_bytes_in.load(std::memory_order_relaxed);
+        t["bytes_out"] = proxy->m_stat_bytes_out.load(std::memory_order_relaxed);
+        t["total_connections"] = proxy->m_stat_total_connections.load(std::memory_order_relaxed);
+        t["total_messages"] = proxy->m_stat_total_messages.load(std::memory_order_relaxed);
+        auto addrs = proxy->lua_backends();
+        t["backend_count"] = addrs.size();
+        return t;
     };
 }
 
