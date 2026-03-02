@@ -1481,6 +1481,16 @@ self.ws_headers(client_id)         -- Get WS upgrade headers table (nil for TCP)
 self.clients()                     -- Return table of all connected client_ids
 self.multicast(ids, msg)           -- Send msg to a subset of clients (ids = table of client_ids)
 
+-- Server: named groups
+self.join_group(id, group)         -- Add client to a named group
+self.leave_group(id, group)        -- Remove client from a group
+self.group_send(group, msg)        -- Send msg to all clients in a group
+
+-- Server: zero-copy pipe pairing (bypasses Lua callbacks)
+self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly between them
+self.unpipe(id)                    -- Remove pipe pairing for a client
+socketley.pipe(src, src_fd, dst, dst_fd) -- Cross-runtime pipe (both must be servers)
+
 -- Server: per-connection metadata
 self.set_data(id, key, val)        -- Set string metadata on a connection (nil val deletes key)
 self.get_data(id, key)             -- Get metadata string or nil
@@ -2207,8 +2217,8 @@ sudo systemctl start socketley
 .fi
 .SS Debian Package
 .nf
-bash packaging/build-deb.sh 1.0.8
-sudo dpkg -i socketley_1.0.8_amd64.deb
+bash packaging/build-deb.sh 1.0.9
+sudo dpkg -i socketley_1.0.9_amd64.deb
 sudo systemctl start socketley
 .fi
 .SS Uninstall

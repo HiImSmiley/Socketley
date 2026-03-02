@@ -57,6 +57,19 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
 
 void server_instance::pool_release(std::unique_ptr<server_connection> conn)
 {
+    // Release fixed file slot before reuse
+    release_fixed_slot(conn.get());
+
+    // Unpipe: clear peer's back-pointer
+    if (conn->pipe_peer_fd >= 0)
+    {
+        auto* peer = (conn->pipe_peer_fd >= 0 && conn->pipe_peer_fd < MAX_FDS)
+            ? m_conn_idx[conn->pipe_peer_fd] : nullptr;
+        if (peer && peer->pipe_peer_fd == conn->fd)
+            peer->pipe_peer_fd = -1;
+        conn->pipe_peer_fd = -1;
+    }
+
     // Reset heavy state but keep allocations for reuse (no shrink_to_fit —
     // the next connection will likely need the same buffer sizes).
     conn->partial.clear();
@@ -251,6 +264,20 @@ static std::string build_http_response(std::string_view content_type, std::strin
     resp.append(len_buf, len_end - len_buf);
     resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     resp.append(body);
+    return resp;
+}
+
+static std::string build_http_headers_only(std::string_view content_type, size_t body_size, bool keep_alive)
+{
+    std::string resp;
+    resp.reserve(128);
+    resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
+    resp.append(content_type);
+    resp.append("\r\nContent-Length: ");
+    char len_buf[24];
+    auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body_size);
+    resp.append(len_buf, len_end - len_buf);
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     return resp;
 }
 
@@ -460,6 +487,35 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         }
 
         auto fsize = static_cast<size_t>(st.st_size);
+
+        // Detect content type
+        std::string ext = resolved.extension().string();
+        for (auto& c : ext)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        uint32_t ext_hash = fnv1a(ext);
+        bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        auto ct = http_content_type(ext);
+
+        // Splice path: zero-copy file→pipe→socket for non-HTML files
+        if (!is_html && !m_splice_busy && m_splice_pipe[0] >= 0)
+        {
+            conn->splice_file_fd = ffd;
+            conn->splice_remaining = fsize;
+            conn->splice_pipe_pending = 0;
+            conn->splice_pending = true;
+            conn->file_content_type = std::string(ct);
+            m_splice_busy = true;
+
+            // Send HTTP headers via normal write path; splice starts after headers are sent
+            conn->write_queue.push(
+                std::make_shared<const std::string>(
+                    build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+            return;
+        }
+
+        // Fallback: malloc + async read (HTML files or splice busy)
         char* fbuf = static_cast<char*>(malloc(fsize));
         if (!fbuf)
         {
@@ -474,18 +530,12 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             return;
         }
 
-        // Detect content type
-        std::string ext = resolved.extension().string();
-        for (auto& c : ext)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        uint32_t ext_hash = fnv1a(ext);
-
         // Store state on connection for completion handler
         conn->file_fd = ffd;
         conn->file_buf = fbuf;
         conn->file_size = fsize;
-        conn->file_content_type = std::string(http_content_type(ext));
-        conn->file_is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        conn->file_content_type = std::string(ct);
+        conn->file_is_html = is_html;
         conn->file_read_pending = true;
 
         // Submit async read — req->fd = socket fd for CQE dispatch
@@ -744,6 +794,10 @@ bool server_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data,
+    // eliminating the empty-accept + read round-trip on the hot path
+    int defer_secs = 1;
+    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -770,6 +824,11 @@ bool server_instance::setup(event_loop& loop)
     m_send_zc = loop.send_zc_supported();
 
     // Use multishot accept if supported (kernel 5.19+)
+    // Note: direct-descriptor accept (kernel 6.0+) is NOT used because
+    // cqe->res returns a fixed file index, not a real fd — setsockopt,
+    // getpeername, and other syscalls require a real fd.  Instead, we
+    // register the accepted fd into the fixed file table post-accept.
+    m_direct_accept = false;
     if (event_loop::supports_multishot_accept())
     {
         m_accept_req.type = op_multishot_accept;
@@ -794,6 +853,16 @@ bool server_instance::setup(event_loop& loop)
         m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
         m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
     }
+
+    // Create splice pipe for zero-copy HTTP file serving
+    if (m_splice_pipe[0] < 0 && !m_http_dir.empty())
+    {
+        if (pipe2(m_splice_pipe, O_NONBLOCK) == 0)
+            fcntl(m_splice_pipe[0], F_SETPIPE_SZ, 1048576);  // 1MB pipe buffer
+        else
+            m_splice_pipe[0] = m_splice_pipe[1] = -1;
+    }
+    m_splice_busy = false;
 
     // Connect to upstreams
     // Clear stale upstream connections from a previous stop (deferred for CQE safety)
@@ -867,6 +936,9 @@ void server_instance::teardown(event_loop& loop)
         if (fd >= 0 && fd < MAX_FDS)
             m_conn_idx[fd] = nullptr;
 
+        // Release fixed file slot before closing
+        release_fixed_slot(conn.get());
+
         // Shutdown the connection before closing it.  Like for the listen fd,
         // shutdown() completes any pending io_uring read/write ops synchronously
         // (the kernel wakes up the socket wait queue, completing the ops and
@@ -884,6 +956,14 @@ void server_instance::teardown(event_loop& loop)
         conn->file_read_req.owner = nullptr;
         if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
         conn->file_read_pending = false;
+
+        // Clean up splice state
+        conn->splice_in_req.owner = nullptr;
+        conn->splice_out_req.owner = nullptr;
+        if (conn->splice_file_fd >= 0) { close(conn->splice_file_fd); conn->splice_file_fd = -1; }
+        conn->splice_remaining = 0;
+        conn->splice_pipe_pending = 0;
+        conn->splice_pending = false;
 
         // Release shared_ptr message refs now so memory is freed promptly, but
         // keep the server_connection structs alive — their embedded io_request
@@ -923,6 +1003,11 @@ void server_instance::teardown(event_loop& loop)
     // Do NOT call m_clients.clear() here.  The server_connection objects must
     // stay alive until the server_instance itself is destroyed (see setup() for
     // when they are freed on a restart, or the destructor for the remove case).
+    // Close splice pipe
+    if (m_splice_pipe[0] >= 0) { close(m_splice_pipe[0]); m_splice_pipe[0] = -1; }
+    if (m_splice_pipe[1] >= 0) { close(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
+    m_splice_busy = false;
+
     m_idle_sweep_req.owner = nullptr;
     m_loop = nullptr;
     m_multishot_active = false;
@@ -944,6 +1029,7 @@ void server_instance::teardown(event_loop& loop)
     }
     m_forwarded_clients.clear();
     m_routes.clear();
+    m_groups.clear();
 
     // Zeroize password memory
     if (!m_master_pw.empty())
@@ -974,6 +1060,20 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             // Async file read completion — route via socket fd in req->fd
             if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
                 handle_file_read(cqe, req);
+            break;
+        }
+        case op_splice:
+        {
+            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
+            {
+                auto* conn = m_conn_idx[req->fd];
+                if (req == &conn->splice_in_req)
+                    handle_splice_in(cqe, conn);
+                else
+                    handle_splice_out(cqe, conn);
+            }
+            else
+                m_splice_busy = false;  // orphan CQE — release pipe
             break;
         }
         case op_read:
@@ -1068,6 +1168,39 @@ inline void server_instance::remove_active_fd(int fd)
         m_conn_idx[back_fd]->active_idx = idx;
 }
 
+inline void server_instance::submit_conn_read(server_connection* conn)
+{
+    conn->read_pending = true;
+    if (conn->direct_fd)
+    {
+        if (m_recv_multishot)
+            m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        else if (m_use_provided_bufs)
+            m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        else
+            m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+    }
+    else
+    {
+        if (m_recv_multishot)
+            m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
+        else if (m_use_provided_bufs)
+            m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
+        else
+            m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+    }
+}
+
+inline void server_instance::release_fixed_slot(server_connection* conn)
+{
+    if (conn->direct_fd && conn->fixed_idx >= 0)
+    {
+        m_loop->free_fixed_file_slot(static_cast<uint32_t>(conn->fixed_idx));
+        conn->fixed_idx = -1;
+        conn->direct_fd = false;
+    }
+}
+
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
 {
     int client_fd = cqe->res;
@@ -1099,6 +1232,14 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         conn->partial.reserve(8192);
         conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE, op_read };
         conn->write_req = { this, nullptr, client_fd, 0, op_write };
+
+        // Register fd in fixed file table for fget/fput-free I/O
+        int slot = m_loop->alloc_fixed_file_slot();
+        if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+        {
+            conn->fixed_idx = slot;
+            conn->direct_fd = true;
+        }
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
@@ -1175,13 +1316,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
         invoke_on_connect(client_fd);
 
-        ptr->read_pending = true;
-        if (m_recv_multishot)
-            m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
-        else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
-        else
-            m_loop->submit_read(client_fd, ptr->read_buf, server_connection::READ_BUF_SIZE, &ptr->read_req);
+        submit_conn_read(ptr);
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
@@ -1202,7 +1337,9 @@ resubmit_accept:
         if (!(cqe->flags & IORING_CQE_F_MORE))
         {
             if (m_listen_fd >= 0)
+            {
                 m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+            }
         }
     }
     else
@@ -1247,14 +1384,18 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
-            m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            if (conn->direct_fd)
+                m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            else
+                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
             return;
         }
 
         // Connection closed or error
         if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
             m_master_fd = -1;
-        if (conn->write_pending || conn->file_read_pending)
+        if (conn->write_pending || conn->file_read_pending
+            || conn->splice_remaining || conn->splice_pending)
         {
             conn->closing = true;
         }
@@ -1262,6 +1403,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         {
             unroute_client(fd);
             invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
             m_conn_idx[fd] = nullptr;
             remove_active_fd(fd);
             close(fd);
@@ -1448,37 +1590,76 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (conn->proto == proto_ws)
     {
-        // Parse WebSocket frames (in-place unmask, zero-alloc parse)
+        // Parse WebSocket frames with fragment reassembly (RFC 6455 §5.4)
+        // Fragments are compacted in-place at partial[0..ws_frag_len) — zero heap allocs.
         ws_frame_view frame;
-        size_t offset = 0;
+        size_t offset = conn->ws_frag_len; // skip accumulated fragment payloads
         while (ws_parse_frame_inplace(conn->partial.data() + offset,
                                        conn->partial.size() - offset, frame))
         {
-            std::string_view payload(frame.payload_ptr, frame.payload_len);
             offset += frame.consumed;
-            switch (frame.opcode)
+
+            // Control frames (opcode >= 0x8): process immediately, even mid-fragment
+            if (frame.opcode >= 0x8)
             {
-                case WS_OP_TEXT:
-                    if (!payload.empty())
-                        process_message(conn, payload);
-                    break;
-                case WS_OP_PING:
+                std::string_view payload(frame.payload_ptr, frame.payload_len);
+                if (frame.opcode == WS_OP_PING)
+                {
                     conn->write_queue.push(ws_frame_pong_shared(payload));
                     if (!conn->write_pending)
                         flush_write_queue(conn);
-                    break;
-                case WS_OP_CLOSE:
+                }
+                else if (frame.opcode == WS_OP_CLOSE)
+                {
                     conn->write_queue.push(ws_frame_close_shared());
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     conn->closing = true;
-                    break;
-                default:
-                    break;
+                }
+                continue;
+            }
+
+            // Data frame: compact payload into partial[ws_frag_len..]
+            if (frame.payload_len > 0)
+            {
+                std::memmove(conn->partial.data() + conn->ws_frag_len,
+                             frame.payload_ptr, frame.payload_len);
+            }
+
+            if (!frame.fin)
+            {
+                // Non-final fragment: record opcode from first fragment, accumulate
+                if (conn->ws_frag_len == 0)
+                    conn->ws_frag_opcode = frame.opcode;
+                conn->ws_frag_len += frame.payload_len;
+            }
+            else if (conn->ws_frag_len > 0)
+            {
+                // Final fragment of a fragmented message — deliver complete reassembled payload
+                conn->ws_frag_len += frame.payload_len;
+                std::string_view msg(conn->partial.data(), conn->ws_frag_len);
+                if (!msg.empty())
+                    process_message(conn, msg);
+                conn->ws_frag_len = 0;
+                conn->ws_frag_opcode = 0;
+            }
+            else
+            {
+                // Unfragmented frame (FIN=1, no prior fragments) — fast path
+                std::string_view payload(frame.payload_ptr, frame.payload_len);
+                if (!payload.empty())
+                    process_message(conn, payload);
             }
         }
-        // Single erase at end instead of per-frame
-        if (offset > 0)
+        // Batch erase consumed data
+        if (conn->ws_frag_len > 0)
+        {
+            // Mid-fragment across reads: keep accumulated payloads at [0..ws_frag_len),
+            // erase only the consumed headers between ws_frag_len and offset
+            if (offset > conn->ws_frag_len)
+                conn->partial.erase(conn->ws_frag_len, offset - conn->ws_frag_len);
+        }
+        else if (offset > 0)
         {
             if (offset >= conn->partial.size())
                 conn->partial.clear();
@@ -1648,21 +1829,15 @@ submit_next_read:
     {
         // Don't resubmit socket read while async file read is in progress
         if (!conn->read_pending && !conn->file_read_pending)
-        {
-            conn->read_pending = true;
-            if (m_recv_multishot)
-                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-            else if (m_use_provided_bufs)
-                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-            else
-                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
-        }
+            submit_conn_read(conn);
     }
-    else if (conn->closing && !conn->write_pending && !conn->file_read_pending)
+    else if (conn->closing && !conn->write_pending && !conn->file_read_pending
+             && !conn->splice_remaining && !conn->splice_pending)
     {
-        // No write or file read in flight and closing — clean up now.
+        // No write, file read, or splice in flight and closing — clean up now.
         // (If write_pending, handle_write will clean up when write completes.)
         // (If file_read_pending, handle_file_read will clean up when read completes.)
+        // (If splice_remaining, handle_splice_out will clean up when splice completes.)
         unroute_client(fd);
         invoke_on_disconnect(fd);
         if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
@@ -1721,6 +1896,19 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     // Global rate limit check (across all connections)
     if (!check_global_rate_limit())
         return;
+
+    // Zero-copy pipe: forward directly to peer, bypassing Lua callbacks
+    if (sender && SOCKETLEY_UNLIKELY(sender->pipe_peer_fd >= 0))
+    {
+        auto* peer = (sender->pipe_peer_fd < MAX_FDS)
+            ? m_conn_idx[sender->pipe_peer_fd] : nullptr;
+        if (peer && !peer->closing)
+        {
+            auto shared_msg = std::make_shared<const std::string>(msg);
+            send_to(peer, shared_msg);
+        }
+        return;
+    }
 
     // Check if this client is routed to a sub-server (cached flag avoids map lookup)
     if (sender && SOCKETLEY_UNLIKELY(sender->routed))
@@ -2067,19 +2255,28 @@ void server_instance::flush_write_queue(server_connection* conn)
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
-            m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+            else
+                m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
         }
         else
         {
             // Single message — use plain write (lower overhead than writev)
             conn->write_req.type = op_write;
-            m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+            else
+                m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
         }
     }
     else
     {
         conn->write_req.type = op_writev;
-        m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+        if (conn->direct_fd)
+            m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, count, &conn->write_req);
+        else
+            m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
     }
 }
 
@@ -2103,12 +2300,14 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->write_queue.empty() && !conn->write_pending)
             flush_write_queue(conn);
         else if (conn->write_queue.empty() && !conn->write_pending &&
-                 conn->closing && !conn->read_pending && !conn->file_read_pending)
+                 conn->closing && !conn->read_pending && !conn->file_read_pending
+                 && !conn->splice_remaining && !conn->splice_pending)
         {
             if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
                 m_master_fd = -1;
             unroute_client(fd);
             invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
             m_conn_idx[fd] = nullptr;
             remove_active_fd(fd);
             close(fd);
@@ -2136,10 +2335,14 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
             m_master_fd = -1;
         conn->closing = true;
-        if (!conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending)
+        if (conn->splice_pending || conn->splice_remaining)
+            splice_cleanup(conn);
+        if (!conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending
+            && !conn->splice_remaining && !conn->splice_pending)
         {
             unroute_client(fd);
             invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
             m_conn_idx[fd] = nullptr;
             remove_active_fd(fd);
             close(fd);
@@ -2198,15 +2401,24 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
-                m_loop->submit_write(conn->fd,
-                    static_cast<const char*>(conn->write_iovs[0].iov_base),
-                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
-                    &conn->write_req);
+                if (conn->direct_fd)
+                    m_loop->submit_write_fixed_file(conn->fixed_idx,
+                        static_cast<const char*>(conn->write_iovs[0].iov_base),
+                        static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                        &conn->write_req);
+                else
+                    m_loop->submit_write(conn->fd,
+                        static_cast<const char*>(conn->write_iovs[0].iov_base),
+                        static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                        &conn->write_req);
             }
             else
             {
                 conn->write_req.type = op_writev;
-                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                if (conn->direct_fd)
+                    m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, new_count, &conn->write_req);
+                else
+                    m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
             }
             return;
         }
@@ -2225,14 +2437,26 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     {
         flush_write_queue(conn);
     }
+    else if (SOCKETLEY_UNLIKELY(conn->splice_pending && m_splice_pipe[0] >= 0 && !conn->closing))
+    {
+        // Headers sent — start file→pipe splice
+        conn->splice_pending = false;
+        uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
+        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice };
+        m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
+    }
     else
     {
-        if (conn->closing && !conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending)
+        if (conn->closing && !conn->read_pending && !conn->zc_notif_pending
+            && !conn->file_read_pending && !conn->splice_remaining && !conn->splice_pending)
         {
+            if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0))
+                splice_cleanup(conn);
             if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
                 m_master_fd = -1;
             unroute_client(fd);
             invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
             m_conn_idx[fd] = nullptr;
             remove_active_fd(fd);
             close(fd);
@@ -2295,15 +2519,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         {
             conn->proto = proto_unknown;
             if (!conn->read_pending)
-            {
-                conn->read_pending = true;
-                if (m_recv_multishot)
-                    m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-                else if (m_use_provided_bufs)
-                    m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-                else
-                    m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
-            }
+                submit_conn_read(conn);
         }
         return;
     }
@@ -2346,15 +2562,127 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         conn->proto = proto_unknown;
         // Resubmit socket read for next HTTP request
         if (!conn->read_pending)
+            submit_conn_read(conn);
+    }
+}
+
+void server_instance::splice_cleanup(server_connection* conn)
+{
+    if (conn->splice_file_fd >= 0)
+    {
+        close(conn->splice_file_fd);
+        conn->splice_file_fd = -1;
+    }
+    conn->splice_remaining = 0;
+    conn->splice_pipe_pending = 0;
+    conn->splice_pending = false;
+    m_splice_busy = false;
+
+    // Drain any residual data in pipe to prevent corruption for next user
+    if (m_splice_pipe[0] >= 0)
+    {
+        char drain[4096];
+        while (read(m_splice_pipe[0], drain, sizeof(drain)) > 0) {}
+    }
+}
+
+void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn)
+{
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
+    {
+        splice_cleanup(conn);
+        if (conn->closing && !conn->read_pending && !conn->write_pending
+            && !conn->zc_notif_pending && !conn->file_read_pending)
         {
-            conn->read_pending = true;
-            if (m_recv_multishot)
-                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-            else if (m_use_provided_bufs)
-                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-            else
-                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            int fd = conn->fd;
+            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+                m_master_fd = -1;
+            unroute_client(fd);
+            invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
+            m_conn_idx[fd] = nullptr;
+            remove_active_fd(fd);
+            close(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
         }
+        return;
+    }
+
+    auto bytes_in = static_cast<size_t>(cqe->res);
+    conn->splice_remaining -= bytes_in;
+    conn->splice_pipe_pending = static_cast<uint32_t>(bytes_in);
+
+    // Submit pipe→socket splice
+    conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice };
+    m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+}
+
+void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn)
+{
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
+    {
+        splice_cleanup(conn);
+        if (conn->closing && !conn->read_pending && !conn->write_pending
+            && !conn->zc_notif_pending && !conn->file_read_pending)
+        {
+            int fd = conn->fd;
+            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+                m_master_fd = -1;
+            unroute_client(fd);
+            invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
+            m_conn_idx[fd] = nullptr;
+            remove_active_fd(fd);
+            close(fd);
+            auto it = m_clients.find(fd);
+            if (it != m_clients.end())
+            {
+                pool_release(std::move(it->second));
+                m_clients.erase(it);
+            }
+        }
+        return;
+    }
+
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
+    auto bytes_out = static_cast<uint32_t>(cqe->res);
+    conn->splice_pipe_pending -= bytes_out;
+
+    if (conn->splice_pipe_pending > 0)
+    {
+        // Short write to socket — resubmit remaining pipe→socket
+        conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice };
+        m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+        return;
+    }
+
+    if (conn->splice_remaining > 0)
+    {
+        // More file data to transfer — submit next file→pipe chunk
+        uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
+        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice };
+        m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
+        return;
+    }
+
+    // Splice complete — clean up and handle keep-alive
+    splice_cleanup(conn);
+
+    if (!conn->http_keep_alive)
+    {
+        conn->closing = true;
+    }
+    else
+    {
+        conn->proto = proto_unknown;
+        if (!conn->read_pending)
+            submit_conn_read(conn);
     }
 }
 
@@ -2711,6 +3039,117 @@ std::string server_instance::lua_get_data(int fd, std::string_view key) const
     const auto& m = m_conn_idx[fd]->meta;
     auto it = m.find(std::string(key));
     return (it != m.end()) ? it->second : "";
+}
+
+// ─── Multicast Groups ───
+
+void server_instance::remove_from_all_groups(int fd)
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    auto* conn = m_conn_idx[fd];
+    for (const auto& g : conn->groups)
+    {
+        auto it = m_groups.find(g);
+        if (it != m_groups.end())
+        {
+            auto& vec = it->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), fd), vec.end());
+            if (vec.empty())
+                m_groups.erase(it);
+        }
+    }
+    conn->groups.clear();
+}
+
+void server_instance::lua_join_group(int fd, std::string_view group)
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    auto* conn = m_conn_idx[fd];
+    std::string gname(group);
+
+    // Check if already in group
+    for (const auto& g : conn->groups)
+        if (g == gname) return;
+
+    conn->groups.push_back(gname);
+    m_groups[gname].push_back(fd);
+}
+
+void server_instance::lua_leave_group(int fd, std::string_view group)
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    auto* conn = m_conn_idx[fd];
+    std::string gname(group);
+
+    // Remove from conn's group list
+    conn->groups.erase(
+        std::remove(conn->groups.begin(), conn->groups.end(), gname),
+        conn->groups.end());
+
+    // Remove from global group
+    auto it = m_groups.find(gname);
+    if (it != m_groups.end())
+    {
+        auto& vec = it->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), fd), vec.end());
+        if (vec.empty())
+            m_groups.erase(it);
+    }
+}
+
+void server_instance::lua_group_send(std::string_view group, std::string_view msg)
+{
+    if (!m_loop) return;
+    auto it = m_groups.find(std::string(group));
+    if (it == m_groups.end()) return;
+
+    // Build newline-terminated message (single allocation, shared across all recipients)
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n')
+        buf.push_back('\n');
+    auto shared_msg = std::make_shared<const std::string>(std::move(buf));
+
+    for (int fd : it->second)
+    {
+        auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+        if (!conn || conn->closing) continue;
+        if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+        {
+            conn->closing = true;
+            continue;
+        }
+        send_to(conn, shared_msg);
+    }
+}
+
+void server_instance::lua_pipe(int fd_a, int fd_b)
+{
+    if (!m_loop || fd_a == fd_b) return;
+    auto* a = (fd_a >= 0 && fd_a < MAX_FDS) ? m_conn_idx[fd_a] : nullptr;
+    auto* b = (fd_b >= 0 && fd_b < MAX_FDS) ? m_conn_idx[fd_b] : nullptr;
+    if (!a || !b || a->closing || b->closing) return;
+
+    // Unpipe any existing pairings first
+    if (a->pipe_peer_fd >= 0) lua_unpipe(fd_a);
+    if (b->pipe_peer_fd >= 0) lua_unpipe(fd_b);
+
+    a->pipe_peer_fd = fd_b;
+    b->pipe_peer_fd = fd_a;
+}
+
+void server_instance::lua_unpipe(int fd)
+{
+    auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+    if (!conn || conn->pipe_peer_fd < 0) return;
+
+    int peer_fd = conn->pipe_peer_fd;
+    conn->pipe_peer_fd = -1;
+
+    auto* peer = (peer_fd >= 0 && peer_fd < MAX_FDS) ? m_conn_idx[peer_fd] : nullptr;
+    if (peer && peer->pipe_peer_fd == fd)
+        peer->pipe_peer_fd = -1;
 }
 
 // ─── Upstream Connections ───

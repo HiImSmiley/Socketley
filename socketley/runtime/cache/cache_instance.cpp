@@ -50,6 +50,13 @@ std::unique_ptr<client_connection> cache_instance::pool_acquire(int fd)
 
 void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
 {
+    // Release fixed file slot
+    if (conn->direct_fd && conn->fixed_idx >= 0 && m_loop)
+    {
+        m_loop->free_fixed_file_slot(static_cast<uint32_t>(conn->fixed_idx));
+        conn->fixed_idx = -1;
+        conn->direct_fd = false;
+    }
     conn->partial.clear();
     conn->response_buf.clear();
     while (!conn->write_queue.empty()) conn->write_queue.pop();
@@ -121,6 +128,10 @@ bool cache_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data
+    int defer_secs = 1;
+    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
 
     int rcvbuf = 131072;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -225,6 +236,13 @@ void cache_instance::teardown(event_loop& loop)
     std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
     for (auto& [fd, conn] : m_clients)
     {
+        // Release fixed file slot before closing
+        if (conn->direct_fd && conn->fixed_idx >= 0)
+        {
+            m_loop->free_fixed_file_slot(static_cast<uint32_t>(conn->fixed_idx));
+            conn->fixed_idx = -1;
+            conn->direct_fd = false;
+        }
         shutdown(fd, SHUT_RDWR);
         close(fd);
     }
@@ -369,6 +387,14 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
         conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
+        // Register fd in fixed file table for fget/fput-free I/O
+        int slot = m_loop->alloc_fixed_file_slot();
+        if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+        {
+            conn->fixed_idx = slot;
+            conn->direct_fd = true;
+        }
+
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
         if (client_fd < MAX_FDS)
@@ -385,12 +411,24 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         ptr->last_activity = std::chrono::steady_clock::now();
 
         ptr->read_pending = true;
-        if (m_recv_multishot)
-            m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
-        else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
+        if (ptr->direct_fd)
+        {
+            if (m_recv_multishot)
+                m_loop->submit_recv_multishot_fixed_file(ptr->fixed_idx, BUF_GROUP_ID, &ptr->read_req);
+            else if (m_use_provided_bufs)
+                m_loop->submit_read_provided_fixed_file(ptr->fixed_idx, BUF_GROUP_ID, &ptr->read_req);
+            else
+                m_loop->submit_read_fixed_file(ptr->fixed_idx, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        }
         else
-            m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        {
+            if (m_recv_multishot)
+                m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
+            else if (m_use_provided_bufs)
+                m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
+            else
+                m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        }
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
@@ -453,7 +491,10 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            if (conn->direct_fd)
+                m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            else
+                m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
             return;
         }
 
@@ -549,12 +590,24 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->read_pending)
         {
             conn->read_pending = true;
-            if (m_recv_multishot)
-                m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-            else if (m_use_provided_bufs)
-                m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+            if (conn->direct_fd)
+            {
+                if (m_recv_multishot)
+                    m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+                else if (m_use_provided_bufs)
+                    m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+                else
+                    m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            }
             else
-                m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            {
+                if (m_recv_multishot)
+                    m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+                else if (m_use_provided_bufs)
+                    m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+                else
+                    m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            }
         }
     }
 }
@@ -648,15 +701,24 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
-                m_loop->submit_write(conn->fd,
-                    static_cast<const char*>(conn->write_iovs[0].iov_base),
-                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
-                    &conn->write_req);
+                if (conn->direct_fd)
+                    m_loop->submit_write_fixed_file(conn->fixed_idx,
+                        static_cast<const char*>(conn->write_iovs[0].iov_base),
+                        static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                        &conn->write_req);
+                else
+                    m_loop->submit_write(conn->fd,
+                        static_cast<const char*>(conn->write_iovs[0].iov_base),
+                        static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+                        &conn->write_req);
             }
             else
             {
                 conn->write_req.type = op_writev;
-                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                if (conn->direct_fd)
+                    m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, new_count, &conn->write_req);
+                else
+                    m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
             }
             return;
         }
@@ -1776,18 +1838,27 @@ void cache_instance::flush_write_queue(client_connection* conn)
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
-            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            else
+                m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
-            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            else
+                m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
     }
     else
     {
         conn->write_req.type = op_writev;
-        m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+        if (conn->direct_fd)
+            m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, count, &conn->write_req);
+        else
+            m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
     }
 }
 

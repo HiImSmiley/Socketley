@@ -941,6 +941,27 @@ void lua_context::register_bindings(runtime_instance* owner)
         m_subscriptions[cache_name + '\0' + channel].push_back(std::move(fn));
     };
 
+    // socketley.pipe(src_name, src_fd, dst_name, dst_fd) — cross-runtime zero-copy pipe
+    sk["pipe"] = [owner](std::string src_name, int src_fd, std::string dst_name, int dst_fd) -> bool {
+        auto* mgr = owner->get_runtime_manager();
+        if (!mgr) return false;
+        // Same-runtime fast path
+        if (src_name == dst_name && src_name == owner->get_name())
+        {
+            if (owner->get_type() != runtime_server) return false;
+            static_cast<server_instance*>(owner)->lua_pipe(src_fd, dst_fd);
+            return true;
+        }
+        // Cross-runtime: both must be servers
+        auto* src_rt = mgr->get(src_name);
+        auto* dst_rt = mgr->get(dst_name);
+        if (!src_rt || !dst_rt) return false;
+        if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server) return false;
+        // For cross-runtime, use route_client which already handles forwarding
+        auto* src_srv = static_cast<server_instance*>(src_rt);
+        return src_srv->route_client(src_fd, dst_name);
+    };
+
     // ─── socketley.cluster.* — cluster introspection API ───
     sol::table cluster_tbl = m_lua.create_table();
 
@@ -1249,6 +1270,25 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
+    };
+
+    // Multicast groups
+    self["join_group"] = [owner](int fd, std::string group) {
+        static_cast<server_instance*>(owner)->lua_join_group(fd, group);
+    };
+    self["leave_group"] = [owner](int fd, std::string group) {
+        static_cast<server_instance*>(owner)->lua_leave_group(fd, group);
+    };
+    self["group_send"] = [owner](std::string group, std::string msg) {
+        static_cast<server_instance*>(owner)->lua_group_send(group, msg);
+    };
+
+    // Zero-copy pipe pairing
+    self["pipe"] = [owner](int fd_a, int fd_b) {
+        static_cast<server_instance*>(owner)->lua_pipe(fd_a, fd_b);
+    };
+    self["unpipe"] = [owner](int fd) {
+        static_cast<server_instance*>(owner)->lua_unpipe(fd);
     };
 }
 

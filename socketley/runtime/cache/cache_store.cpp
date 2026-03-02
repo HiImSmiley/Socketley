@@ -6,6 +6,8 @@
 #include <fnmatch.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 // ─── Type conflict checks (fast-path: empty() avoids hash lookups) ───
 
@@ -818,129 +820,338 @@ bool cache_store::save(std::string_view path) const
 bool cache_store::save_v2(std::string_view path) const
 {
     std::string tmp_path = std::string(path) + ".tmp";
-    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-    if (!file)
-        return false;
 
+    // Phase 1: Calculate total file size
+    size_t total_size = 4;  // MAGIC_V2
+
+    auto entry_overhead = [&](std::string_view key) -> size_t {
+        // type(1) + key_len(4) + key + expiry_flag(1) [+ remaining_ms(8)]
+        size_t sz = 1 + 4 + key.size() + 1;
+        auto eit = m_expiry.find(key);
+        if (eit != m_expiry.end()) sz += 8;
+        return sz;
+    };
+
+    auto string_size = [](std::string_view s) -> size_t { return 4 + s.size(); };
+
+    for (const auto& [key, value] : m_data)
+        total_size += entry_overhead(key) + string_size(value);
+
+    for (const auto& [key, deq] : m_lists)
+    {
+        total_size += entry_overhead(key) + 4;
+        for (const auto& elem : deq) total_size += string_size(elem);
+    }
+
+    for (const auto& [key, s] : m_sets)
+    {
+        total_size += entry_overhead(key) + 4;
+        for (const auto& member : s) total_size += string_size(member);
+    }
+
+    for (const auto& [key, h] : m_hashes)
+    {
+        total_size += entry_overhead(key) + 4;
+        for (const auto& [field, val] : h) total_size += string_size(field) + string_size(val);
+    }
+
+    // Phase 2: mmap temp file and serialize directly into mapped region
+    int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd_raw < 0) return false;
+
+    if (ftruncate(fd_raw, static_cast<off_t>(total_size)) < 0)
+    {
+        close(fd_raw);
+        return false;
+    }
+
+    void* map = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_raw, 0);
+    if (map == MAP_FAILED)
+    {
+        close(fd_raw);
+        return false;
+    }
+
+    char* p = static_cast<char*>(map);
     auto now = std::chrono::steady_clock::now();
 
-    file.write(MAGIC_V2, 4);
+    auto emit = [&](const void* src, size_t n) { std::memcpy(p, src, n); p += n; };
+    auto emit_u8  = [&](uint8_t v)  { *p++ = static_cast<char>(v); };
+    auto emit_u32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    auto emit_i64 = [&](int64_t v)  { std::memcpy(p, &v, 8); p += 8; };
 
-    auto write_key = [&](uint8_t type, std::string_view key) {
-        file.write(reinterpret_cast<const char*>(&type), 1);
-        uint32_t klen = static_cast<uint32_t>(key.size());
-        file.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
-        file.write(key.data(), klen);
+    auto emit_string = [&](std::string_view s) {
+        emit_u32(static_cast<uint32_t>(s.size()));
+        emit(s.data(), s.size());
     };
 
-    auto write_string = [&](std::string_view s) {
-        uint32_t len = static_cast<uint32_t>(s.size());
-        file.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        file.write(s.data(), len);
+    auto emit_key = [&](uint8_t type, std::string_view key) {
+        emit_u8(type);
+        emit_string(key);
     };
 
-    auto write_expiry = [&](std::string_view key) {
+    auto emit_expiry = [&](std::string_view key) {
         auto eit = m_expiry.find(key);
         if (eit == m_expiry.end())
         {
-            uint8_t has = 0;
-            file.write(reinterpret_cast<const char*>(&has), 1);
+            emit_u8(0);
         }
         else
         {
-            uint8_t has = 1;
-            file.write(reinterpret_cast<const char*>(&has), 1);
+            emit_u8(1);
             int64_t remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 eit->second - now).count();
             if (remaining_ms < 0) remaining_ms = 0;
-            file.write(reinterpret_cast<const char*>(&remaining_ms), sizeof(remaining_ms));
+            emit_i64(remaining_ms);
         }
     };
 
-    // Strings
+    emit(MAGIC_V2, 4);
+
     for (const auto& [key, value] : m_data)
     {
-        write_key(TYPE_STRING, key);
-        write_string(value);
-        write_expiry(key);
+        emit_key(TYPE_STRING, key);
+        emit_string(value);
+        emit_expiry(key);
     }
 
-    // Lists
     for (const auto& [key, deq] : m_lists)
     {
-        write_key(TYPE_LIST, key);
-        uint32_t count = static_cast<uint32_t>(deq.size());
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        for (const auto& elem : deq)
-            write_string(elem);
-        write_expiry(key);
+        emit_key(TYPE_LIST, key);
+        emit_u32(static_cast<uint32_t>(deq.size()));
+        for (const auto& elem : deq) emit_string(elem);
+        emit_expiry(key);
     }
 
-    // Sets
     for (const auto& [key, s] : m_sets)
     {
-        write_key(TYPE_SET, key);
-        uint32_t count = static_cast<uint32_t>(s.size());
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        for (const auto& member : s)
-            write_string(member);
-        write_expiry(key);
+        emit_key(TYPE_SET, key);
+        emit_u32(static_cast<uint32_t>(s.size()));
+        for (const auto& member : s) emit_string(member);
+        emit_expiry(key);
     }
 
-    // Hashes
     for (const auto& [key, h] : m_hashes)
     {
-        write_key(TYPE_HASH, key);
-        uint32_t count = static_cast<uint32_t>(h.size());
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        emit_key(TYPE_HASH, key);
+        emit_u32(static_cast<uint32_t>(h.size()));
         for (const auto& [field, val] : h)
         {
-            write_string(field);
-            write_string(val);
+            emit_string(field);
+            emit_string(val);
         }
-        write_expiry(key);
+        emit_expiry(key);
     }
 
-    if (!file.good())
-        return false;
-
-    file.flush();
-    file.close();
-
-    // fsync then atomic rename
-    int fd_raw = open(tmp_path.c_str(), O_RDONLY);
-    if (fd_raw >= 0)
-    {
-        fsync(fd_raw);
-        close(fd_raw);
-    }
+    if (msync(map, total_size, MS_SYNC) < 0) {}
+    munmap(map, total_size);
+    fsync(fd_raw);
+    close(fd_raw);
 
     return rename(tmp_path.c_str(), std::string(path).c_str()) == 0;
 }
 
 bool cache_store::load(std::string_view path)
 {
-    std::ifstream file(std::string(path), std::ios::binary);
-    if (!file)
+    // mmap path: zero-copy read from page cache
+    int fd_raw = open(std::string(path).c_str(), O_RDONLY);
+    if (fd_raw < 0)
         return false;
 
-    // Read first 4 bytes to detect format
+    struct stat st;
+    if (fstat(fd_raw, &st) < 0 || st.st_size < 4)
+    {
+        close(fd_raw);
+        return false;
+    }
+
+    auto file_size = static_cast<size_t>(st.st_size);
+    void* map = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd_raw, 0);
+    close(fd_raw);
+
+    if (map == MAP_FAILED)
+    {
+        // Fallback to ifstream
+        std::ifstream file(std::string(path), std::ios::binary);
+        if (!file) return false;
+        char header[4]{};
+        file.read(header, 4);
+        if (!file) return false;
+        if (std::memcmp(header, MAGIC_V2, 4) == 0)
+            return load_v2_stream(file);
+        uint32_t first_key_len;
+        std::memcpy(&first_key_len, header, sizeof(first_key_len));
+        return load_v1(file, first_key_len);
+    }
+
+    const char* data = static_cast<const char*>(map);
+
+    if (std::memcmp(data, MAGIC_V2, 4) == 0)
+    {
+        bool ok = load_v2(data + 4, file_size - 4);
+        munmap(map, file_size);
+        return ok;
+    }
+
+    // v1 format — fall back to stream parser
+    munmap(map, file_size);
+    std::ifstream file(std::string(path), std::ios::binary);
+    if (!file) return false;
     char header[4]{};
     file.read(header, 4);
-    if (!file)
-        return false;
-
-    if (std::memcmp(header, MAGIC_V2, 4) == 0)
-        return load_v2(file);
-
-    // v1 format: first 4 bytes were key_len
+    if (!file) return false;
     uint32_t first_key_len;
     std::memcpy(&first_key_len, header, sizeof(first_key_len));
     return load_v1(file, first_key_len);
 }
 
-bool cache_store::load_v2(std::ifstream& file)
+bool cache_store::load_v2(const char* data, size_t size)
 {
+    m_data.clear();
+    m_lists.clear();
+    m_sets.clear();
+    m_hashes.clear();
+    m_expiry.clear();
+    m_current_memory = 0;
+    m_lru_order.clear();
+    m_lru_map.clear();
+
+    auto now = std::chrono::steady_clock::now();
+    const char* p = data;
+    const char* end = data + size;
+
+    auto remaining = [&]() -> size_t { return static_cast<size_t>(end - p); };
+
+    auto read_u8 = [&](uint8_t& v) -> bool {
+        if (remaining() < 1) return false;
+        v = static_cast<uint8_t>(*p++);
+        return true;
+    };
+
+    auto read_u32 = [&](uint32_t& v) -> bool {
+        if (remaining() < 4) return false;
+        std::memcpy(&v, p, 4); p += 4;
+        return true;
+    };
+
+    auto read_i64 = [&](int64_t& v) -> bool {
+        if (remaining() < 8) return false;
+        std::memcpy(&v, p, 8); p += 8;
+        return true;
+    };
+
+    auto read_string = [&](std::string& out) -> bool {
+        uint32_t len = 0;
+        if (!read_u32(len)) return false;
+        if (remaining() < len) return false;
+        out.assign(p, len);
+        p += len;
+        return true;
+    };
+
+    auto read_expiry = [&](const std::string& key) {
+        uint8_t has = 0;
+        if (!read_u8(has)) return;
+        if (has)
+        {
+            int64_t remaining_ms = 0;
+            if (!read_i64(remaining_ms)) return;
+            if (remaining_ms > 0)
+                m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
+        }
+    };
+
+    while (p < end)
+    {
+        uint8_t type = 0;
+        if (!read_u8(type)) break;
+
+        std::string key;
+        if (!read_string(key)) break;
+
+        bool expired = false;
+
+        switch (type)
+        {
+            case TYPE_STRING:
+            {
+                std::string value;
+                if (!read_string(value)) return false;
+                uint8_t has = 0;
+                if (!read_u8(has)) return false;
+                if (has)
+                {
+                    int64_t remaining_ms = 0;
+                    if (!read_i64(remaining_ms)) return false;
+                    if (remaining_ms > 0)
+                        m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
+                    else
+                        expired = true;
+                }
+                if (!expired)
+                    m_data[std::move(key)] = std::move(value);
+                break;
+            }
+            case TYPE_LIST:
+            {
+                uint32_t count = 0;
+                if (!read_u32(count)) return false;
+                std::deque<std::string> deq;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    std::string elem;
+                    if (!read_string(elem)) return false;
+                    deq.push_back(std::move(elem));
+                }
+                read_expiry(key);
+                if (!m_expiry.count(key) || m_expiry[key] > now)
+                    m_lists[std::move(key)] = std::move(deq);
+                break;
+            }
+            case TYPE_SET:
+            {
+                uint32_t count = 0;
+                if (!read_u32(count)) return false;
+                set_inner s;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    std::string member;
+                    if (!read_string(member)) return false;
+                    s.insert(std::move(member));
+                }
+                read_expiry(key);
+                if (!m_expiry.count(key) || m_expiry[key] > now)
+                    m_sets[std::move(key)] = std::move(s);
+                break;
+            }
+            case TYPE_HASH:
+            {
+                uint32_t count = 0;
+                if (!read_u32(count)) return false;
+                hash_inner h;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    std::string field, val;
+                    if (!read_string(field)) return false;
+                    if (!read_string(val)) return false;
+                    h[std::move(field)] = std::move(val);
+                }
+                read_expiry(key);
+                if (!m_expiry.count(key) || m_expiry[key] > now)
+                    m_hashes[std::move(key)] = std::move(h);
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    return true;
+}
+
+bool cache_store::load_v2_stream(std::ifstream& file)
+{
+    // Legacy ifstream-based parser (fallback when mmap fails)
     m_data.clear();
     m_lists.clear();
     m_sets.clear();
@@ -970,7 +1181,6 @@ bool cache_store::load_v2(std::ifstream& file)
             file.read(reinterpret_cast<char*>(&remaining_ms), sizeof(remaining_ms));
             if (remaining_ms > 0)
                 m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
-            // If remaining_ms <= 0, key is already expired — don't restore
         }
     };
 
@@ -991,7 +1201,6 @@ bool cache_store::load_v2(std::ifstream& file)
             {
                 std::string value;
                 if (!read_string(value)) return false;
-                // Read expiry first to check if expired
                 uint8_t has = 0;
                 file.read(reinterpret_cast<char*>(&has), 1);
                 if (has)

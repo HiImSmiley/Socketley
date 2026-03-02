@@ -125,11 +125,11 @@ The advantage comes from:
 
 | Test                               | Result             |
 |------------------------------------|--------------------|
-| Connection rate (2000 conns)       | **77.1K conn/s**   |
-| Burst (5000 simultaneous)          | **91.3K conn/s**   |
-| Single client 64B msg throughput   | **468K msg/s** (29.0 MB/s) |
-| Single client 1KB msg throughput   | **439K msg/s** (429 MB/s)  |
-| 100 clients × 500 msgs (aggregate) | **1.59M msg/s**    |
+| Connection rate (2000 conns)       | **87.8K conn/s**   |
+| Burst (5000 simultaneous)          | **117.6K conn/s**  |
+| Single client 64B msg throughput   | **393K msg/s** (24.4 MB/s) |
+| Single client 1KB msg throughput   | **427K msg/s** (417 MB/s)  |
+| 100 clients × 500 msgs (aggregate) | **4.22M msg/s**    |
 
 5-run median, 10% warm-up, `clock_gettime(CLOCK_MONOTONIC)`. All on a single-threaded io_uring event loop with `IORING_SETUP_SQPOLL`.
 
@@ -137,17 +137,18 @@ The advantage comes from:
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
-| TCP message throughput (128B)     | **595K msg/s** (73 MB/s) |
-| 20 concurrent clients             | **2.23M msg/s**    |
-| Named-runtime backend resolution  | **669K msg/s**     |
+| TCP message throughput (128B)     | **471K msg/s** (58 MB/s) |
+| 20 concurrent clients             | **4.20M msg/s**    |
+| Named-runtime backend resolution  | **2.29M msg/s**    |
+| Proxy overhead vs direct          | **1.3%**           |
 
 ### WebSocket
 
 | Test                              | Result             |
 |-----------------------------------|--------------------|
-| Handshake throughput (200 ops)    | **21.9K handshake/s** |
-| Frame send throughput (64B)       | **403K frame/s** (26.9 MB/s) |
-| 20 concurrent clients             | **69.5K handshake/s** |
+| Handshake throughput (200 ops)    | **27.7K handshake/s** |
+| Frame send throughput (64B)       | **417K frame/s** (27.8 MB/s) |
+| 20 concurrent clients             | **67.6K handshake/s** |
 
 ## Quick Start
 
