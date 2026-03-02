@@ -98,6 +98,20 @@ bool event_loop::init()
         // periodic timer events (idle sweeps, Lua ticks) so the daemon doesn't
         // pin a CPU core at 100% when idle.
         params.sq_thread_idle = 100;
+        // Optional CPU affinity for the SQPOLL kernel thread.
+        // Pin to a dedicated core to avoid cross-core cache misses on the SQ.
+        // Set SOCKETLEY_SQPOLL_CPU=<N> in the environment before starting the daemon.
+        const char* sq_cpu_env = getenv("SOCKETLEY_SQPOLL_CPU");
+        if (sq_cpu_env)
+        {
+            char* end;
+            long cpu = strtol(sq_cpu_env, &end, 10);
+            if (end != sq_cpu_env && cpu >= 0)
+            {
+                params.flags |= IORING_SETUP_SQ_AFF;
+                params.sq_thread_cpu = static_cast<uint32_t>(cpu);
+            }
+        }
         // Oversized CQ: 4x SQ depth avoids CQ overflow under burst
         params.flags |= IORING_SETUP_CQSIZE;
         params.cq_entries = m_queue_depth * 4;
