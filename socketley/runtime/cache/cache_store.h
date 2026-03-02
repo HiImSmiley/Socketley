@@ -101,6 +101,7 @@ public:
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);
     std::vector<std::string> sweep_expired();  // removes expired keys, returns their names
+    bool has_expiry_keys() const { return !m_expiry.empty(); }
 
     // --- Millisecond-precision TTL ---
     bool set_expiry_ms(std::string_view key, int64_t ms);

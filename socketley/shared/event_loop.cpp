@@ -674,7 +674,10 @@ void event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     if (!sqe) return;
 
     // off_in = off_out = -1 for pipes/sockets (no seekable offset)
-    io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    // No SPLICE_F_NONBLOCK: io_uring handles the operation asynchronously, so the
+    // kernel waits for data internally. NONBLOCK would return EAGAIN immediately
+    // when the socket has no data, causing a tight re-submit loop in SQPOLL mode.
+    io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;
     m_pending_submissions++;
