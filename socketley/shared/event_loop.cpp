@@ -92,11 +92,12 @@ bool event_loop::init()
         struct io_uring_params params{};
         params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER
                      | IORING_SETUP_SUBMIT_ALL;
-        // Tuned sq_thread_idle: 2000ms keeps the SQPOLL thread alive longer during
-        // bursty traffic, avoiding the cost of waking it back up.  The SQPOLL thread
-        // consumes ~0 CPU when idle (it sleeps on a waitqueue), so a longer idle
-        // timeout is essentially free.
-        params.sq_thread_idle = 2000;
+        // sq_thread_idle: how long the SQPOLL kernel thread busy-polls before
+        // sleeping.  100ms is long enough to absorb request bursts without a
+        // wake-up syscall, but short enough to let the thread sleep between
+        // periodic timer events (idle sweeps, Lua ticks) so the daemon doesn't
+        // pin a CPU core at 100% when idle.
+        params.sq_thread_idle = 100;
         // Oversized CQ: 4x SQ depth avoids CQ overflow under burst
         params.flags |= IORING_SETUP_CQSIZE;
         params.cq_entries = m_queue_depth * 4;
