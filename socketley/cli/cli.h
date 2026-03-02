@@ -1,7 +1,7 @@
 #pragma once
 
 #ifndef SOCKETLEY_VERSION
-#define SOCKETLEY_VERSION "1.0.8"
+#define SOCKETLEY_VERSION "1.0.9"
 #endif
 
 int cli_dispatch(int argc, char** argv);

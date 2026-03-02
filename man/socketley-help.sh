@@ -551,6 +551,11 @@ lua_config() {
     echo "  self.broadcast(msg)         - Broadcast (server)"
     echo "  self.clients()              - Table of all connected client_ids (server)"
     echo "  self.multicast(ids, msg)    - Send msg to a subset of clients (server)"
+    echo "  self.pipe(id_a, id_b)       - Pair two clients for zero-copy forwarding (server)"
+    echo "  self.unpipe(id)             - Remove pipe pairing (server)"
+    echo "  self.join_group(id, group)  - Add client to a named group (server)"
+    echo "  self.leave_group(id, group) - Remove client from a group (server)"
+    echo "  self.group_send(group, msg) - Send to all clients in a group (server)"
     echo "  self.set_data(id, key, val) - Set metadata on a connection (server)"
     echo "  self.get_data(id, key)      - Get metadata string or nil (server)"
     echo "  self.disconnect(id)         - Terminate a client connection (server)"
@@ -1290,8 +1295,8 @@ installation_help() {
     echo ""
 
     echo -e "${BOLD}Build Debian Package:${NC}"
-    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.8${NC}"
-    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.8_amd64.deb${NC}"
+    echo -e "  ${CYAN}bash packaging/build-deb.sh 1.0.9${NC}"
+    echo -e "  ${CYAN}sudo dpkg -i socketley_1.0.9_amd64.deb${NC}"
     echo ""
 
     echo -e "${BOLD}Daemon Configuration (config.lua):${NC}"

@@ -164,7 +164,8 @@ private:
     bool has_type_conflict_for_hash(std::string_view key) const;
 
     bool save_v2(std::string_view path) const;
-    bool load_v2(std::ifstream& file);
+    bool load_v2(const char* data, size_t size);
+    bool load_v2_stream(std::ifstream& file);  // legacy fallback
     bool load_v1(std::ifstream& file, uint32_t first_key_len);
 
     void touch_lru(std::string_view key);

@@ -340,8 +340,8 @@ inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
     if (hdr.opcode >= 0x8 && hdr.payload_len > 125)
         return false;
 
-    // Reject fragmented frames (FIN=0) -- we don't support reassembly
-    if (!hdr.fin)
+    // Control frames (opcode >= 0x8) MUST NOT be fragmented (RFC 6455 §5.5)
+    if (hdr.opcode >= 0x8 && !hdr.fin)
         return false;
 
     size_t mask_size = hdr.masked ? 4 : 0;
@@ -387,6 +387,7 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
 struct ws_frame_view
 {
     uint8_t opcode;
+    bool fin;
     const char* payload_ptr;
     size_t payload_len;
     size_t consumed;
@@ -412,6 +413,7 @@ inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
         ws_unmask_payload(payload_start, hdr.payload_len, mask32);
     }
 
+    out.fin = hdr.fin;
     out.payload_ptr = payload_start;
     out.payload_len = hdr.payload_len;
     out.consumed = total;

@@ -409,6 +409,61 @@ void event_loop::submit_write_fixed_file(int fixed_idx, const char* buf, uint32_
     m_pending_submissions++;
 }
 
+void event_loop::submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    io_uring_prep_writev(sqe, fixed_idx, iovs, count, 0);
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe, req);
+    m_pending_submissions++;
+}
+
+void event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
+{
+    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+        return;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    io_uring_prep_recv_multishot(sqe, fixed_idx, nullptr, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
+    sqe->buf_group = group_id;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_recv_multishot;
+    m_pending_submissions++;
+}
+
+void event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
+{
+    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+        return;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    io_uring_prep_recv(sqe, fixed_idx, nullptr, m_buf_rings[group_id].buf_size, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
+    sqe->buf_group = group_id;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_read_provided;
+    m_pending_submissions++;
+}
+
+void event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    io_uring_prep_send_zc(sqe, fixed_idx, buf, len, MSG_NOSIGNAL, 0);
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_send_zc;
+    m_pending_submissions++;
+}
+
 // Registered buffers: the kernel pins these pages and skips
 // copy_from_user/copy_to_user on each I/O operation.
 bool event_loop::register_buffers(const struct iovec* iovs, uint32_t count)

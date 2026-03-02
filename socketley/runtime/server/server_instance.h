@@ -35,6 +35,8 @@ struct alignas(64) server_connection
 
     // === HOT fields (CQE dispatch path) — first 2 cache lines ===
     int fd{-1};
+    int fixed_idx{-1};       // io_uring fixed file table index (-1 = not registered)
+    bool direct_fd{false};   // true if fd came from direct-accept (fixed file index)
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
@@ -66,6 +68,14 @@ struct alignas(64) server_connection
     std::string file_content_type;
     bool file_is_html{false};
 
+    // Splice state for zero-copy file serving (non-HTML only)
+    io_request splice_in_req;
+    io_request splice_out_req;
+    int splice_file_fd{-1};
+    size_t splice_remaining{0};
+    uint32_t splice_pipe_pending{0};
+    bool splice_pending{false};
+
     // WebSocket handshake headers (non-empty only for ws_active connections)
     std::string ws_cookie;
     std::string ws_origin;
@@ -80,11 +90,21 @@ struct alignas(64) server_connection
     // Master auth attempt tracking
     uint8_t auth_failures{0};
 
+    // WebSocket fragment reassembly (zero-alloc, in-place compaction in partial)
+    size_t ws_frag_len{0};
+    uint8_t ws_frag_opcode{0};
+
     // Idle connection tracking
     std::chrono::steady_clock::time_point last_activity{};
 
+    // Pipe pairing: fd of peer connection for zero-copy forwarding (-1 = not piped)
+    int pipe_peer_fd{-1};
+
     // Per-connection metadata (freed automatically on disconnect)
     std::unordered_map<std::string, std::string> meta;
+
+    // Multicast group memberships (cleaned up on disconnect)
+    std::vector<std::string> groups;
 
     // 16KB read buffer — at the very end to keep hot fields in first cache lines
     char read_buf[READ_BUF_SIZE];
@@ -93,6 +113,8 @@ struct alignas(64) server_connection
     void reset(int new_fd)
     {
         fd = new_fd;
+        fixed_idx = -1;
+        direct_fd = false;
         read_req = {};
         write_req = {};
         while (!write_queue.empty()) write_queue.pop();
@@ -109,6 +131,12 @@ struct alignas(64) server_connection
         file_content_type.clear();
         file_is_html = false;
         file_read_pending = false;
+        splice_in_req = {};
+        splice_out_req = {};
+        if (splice_file_fd >= 0) { close(splice_file_fd); splice_file_fd = -1; }
+        splice_remaining = 0;
+        splice_pipe_pending = 0;
+        splice_pending = false;
         http_keep_alive = false;
         proto = proto_unknown;
         routed = false;
@@ -119,8 +147,12 @@ struct alignas(64) server_connection
         rl_tokens = 0.0;
         rl_max = 0.0;
         auth_failures = 0;
+        ws_frag_len = 0;
+        ws_frag_opcode = 0;
+        pipe_peer_fd = -1;
         partial.clear();
         meta.clear();
+        groups.clear();
     }
 };
 
@@ -210,6 +242,15 @@ public:
     void        lua_del_data(int fd, std::string_view key);
     std::string lua_get_data(int fd, std::string_view key) const;
 
+    // Multicast groups
+    void lua_join_group(int fd, std::string_view group);
+    void lua_leave_group(int fd, std::string_view group);
+    void lua_group_send(std::string_view group, std::string_view msg);
+
+    // Zero-copy pipe pairing (data forwarded directly, bypasses Lua callbacks)
+    void lua_pipe(int fd_a, int fd_b);
+    void lua_unpipe(int fd);
+
     struct ws_headers_result {
         bool is_websocket{false};
         std::string cookie, origin, protocol, auth;
@@ -263,6 +304,9 @@ private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_file_read(struct io_uring_cqe* cqe, io_request* req);
+    void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
+    void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
+    void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
@@ -286,6 +330,8 @@ private:
     void remove_active_fd(int fd);
     void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg);
     void flush_write_queue(server_connection* conn);
+    void submit_conn_read(server_connection* conn);
+    void release_fixed_slot(server_connection* conn);
 
     // UDP helpers
     void handle_udp_read(struct io_uring_cqe* cqe);
@@ -352,6 +398,7 @@ private:
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_send_zc{false};
+    bool m_direct_accept{false};
 
     // UDP mode
     static constexpr size_t MAX_UDP_PEERS = 10000;
@@ -378,6 +425,14 @@ private:
     bool m_http_cache_enabled{false};
     struct cached_file { std::shared_ptr<const std::string> response; };
     std::unordered_map<std::string, cached_file> m_http_cache;
+
+    // Splice pipe for zero-copy file serving (shared across connections, one at a time)
+    int m_splice_pipe[2]{-1, -1};
+    bool m_splice_busy{false};
+
+    // Multicast groups: group_name → list of fds in that group
+    std::unordered_map<std::string, std::vector<int>> m_groups;
+    void remove_from_all_groups(int fd);
 
     // Upstream connections
     std::vector<upstream_target> m_upstream_targets;

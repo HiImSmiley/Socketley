@@ -41,6 +41,10 @@ public:
     // Avoids fget/fput per I/O op (hot path).
     void submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);
     void submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
+    void submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req);
+    void submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+    void submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+    void submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
 
     // Registered buffers: eliminate copy_from_user/copy_to_user per I/O op.
     bool register_buffers(const struct iovec* iovs, uint32_t count);

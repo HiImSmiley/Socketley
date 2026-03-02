@@ -19,6 +19,8 @@ struct client_connection
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
+    int fixed_idx{-1};
+    bool direct_fd{false};
     io_request read_req;
     io_request write_req;
     char read_buf[4096];
@@ -51,6 +53,8 @@ struct client_connection
     void reset(int new_fd)
     {
         fd = new_fd;
+        fixed_idx = -1;
+        direct_fd = false;
         partial.clear();
         response_buf.clear();
         while (!write_queue.empty()) write_queue.pop();
