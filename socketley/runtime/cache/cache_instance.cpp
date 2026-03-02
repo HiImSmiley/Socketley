@@ -402,14 +402,15 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             m_conn_idx[client_fd] = ptr;
 
         // Initialize rate limiting
+        auto now_tp = std::chrono::steady_clock::now();
         if (m_rate_limit_cached > 0)
         {
             ptr->rl_max = m_rate_limit_cached;
             ptr->rl_tokens = m_rate_limit_cached;
-            ptr->rl_last = std::chrono::steady_clock::now();
+            ptr->rl_last = now_tp;
         }
 
-        ptr->last_activity = std::chrono::steady_clock::now();
+        ptr->last_activity = now_tp;
 
         ptr->read_pending = true;
         if (ptr->direct_fd)
@@ -1814,7 +1815,6 @@ void cache_instance::flush_write_queue(client_connection* conn)
         return;
 
     uint32_t count = 0;
-    size_t total_bytes = 0;
     while (!conn->write_queue.empty() && count < client_connection::MAX_WRITE_BATCH)
     {
         conn->write_batch[count] = std::move(conn->write_queue.front());
@@ -1822,7 +1822,6 @@ void cache_instance::flush_write_queue(client_connection* conn)
 
         conn->write_iovs[count].iov_base = conn->write_batch[count].data();
         conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
-        total_bytes += conn->write_batch[count].size();
         count++;
     }
 

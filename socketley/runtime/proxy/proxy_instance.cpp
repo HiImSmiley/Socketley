@@ -66,7 +66,7 @@ void proxy_client_connection::reset(int new_fd)
     splice_in_req = {};
     splice_out_req = {};
     partial.clear();
-    while (!write_queue.empty()) write_queue.pop();
+    write_queue = decltype(write_queue){};
     for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
     if (pipe_to_backend[0] >= 0) { close(pipe_to_backend[0]); pipe_to_backend[0] = -1; }
     if (pipe_to_backend[1] >= 0) { close(pipe_to_backend[1]); pipe_to_backend[1] = -1; }
@@ -100,7 +100,7 @@ void proxy_backend_connection::reset(int new_fd)
     splice_in_req = {};
     splice_out_req = {};
     partial.clear();
-    while (!write_queue.empty()) write_queue.pop();
+    write_queue = decltype(write_queue){};
     for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
     if (pipe_to_client[0] >= 0) { close(pipe_to_client[0]); pipe_to_client[0] = -1; }
     if (pipe_to_client[1] >= 0) { close(pipe_to_client[1]); pipe_to_client[1] = -1; }
@@ -133,7 +133,7 @@ std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int
 void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection> conn)
 {
     conn->partial.clear();
-    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    conn->write_queue = decltype(conn->write_queue){};
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
@@ -165,7 +165,7 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
 void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connection> conn)
 {
     conn->partial.clear();
-    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    conn->write_queue = decltype(conn->write_queue){};
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     if (conn->pipe_to_client[0] >= 0) { close(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
@@ -1803,6 +1803,12 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx)
             }
             continue;
         }
+
+        // Skip the liveness probe for recently-idle connections — probability
+        // of a FIN/RST arriving in the first 5s is very low, and the syscall
+        // is expensive on the hot path.
+        if ((now - pb.idle_since) < std::chrono::seconds(5))
+            return pb.fd;
 
         // Quick liveness probe: if the remote has sent a RST/FIN while pooled,
         // recv(MSG_PEEK|MSG_DONTWAIT) returns 0 (FIN) or -1/ECONNRESET.

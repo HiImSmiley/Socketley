@@ -2486,11 +2486,8 @@ int daemon_handler::cmd_dashboard(ipc_connection* conn)
 
 void daemon_handler::send_response(ipc_connection* conn, int exit_code)
 {
-    std::string response;
-    response += static_cast<char>(exit_code);
-    response += conn->write_buf;
-    response += '\0';
-    conn->write_buf = std::move(response);
+    conn->write_buf += '\0';
+    conn->write_buf.insert(0, 1, static_cast<char>(exit_code));
 
     conn->write_req.buffer = conn->write_buf.data();
     conn->write_req.length = static_cast<uint32_t>(conn->write_buf.size());

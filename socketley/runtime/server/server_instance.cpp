@@ -1247,8 +1247,10 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
         m_active_fds.push_back(client_fd);
 
+        auto now_tp = std::chrono::steady_clock::now();
+
         if (m_idle_timeout_cached > 0)
-            ptr->last_activity = std::chrono::steady_clock::now();
+            ptr->last_activity = now_tp;
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
         auto current_size = static_cast<uint32_t>(m_clients.size());
@@ -1260,7 +1262,7 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         {
             ptr->rl_max = m_rate_limit_cached;
             ptr->rl_tokens = m_rate_limit_cached;
-            ptr->rl_last = std::chrono::steady_clock::now();
+            ptr->rl_last = now_tp;
         }
 
         // Check per-IP auth failure rate (master mode only)
@@ -2230,7 +2232,6 @@ void server_instance::flush_write_queue(server_connection* conn)
 
     // Coalesce up to MAX_WRITE_BATCH messages into a single writev
     uint32_t count = 0;
-    size_t total_bytes = 0;
     while (!conn->write_queue.empty() && count < server_connection::MAX_WRITE_BATCH)
     {
         conn->write_batch[count] = std::move(conn->write_queue.front());
@@ -2238,7 +2239,6 @@ void server_instance::flush_write_queue(server_connection* conn)
 
         conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
         conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
-        total_bytes += conn->write_batch[count]->size();
         count++;
     }
 
