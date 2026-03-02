@@ -284,6 +284,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             return;
         }
         auto expired_keys = m_store.sweep_expired();
+        m_has_ttl_keys = m_store.has_expiry_keys();
         m_stat_keys_expired += expired_keys.size();
 #ifndef SOCKETLEY_NO_LUA
         if (lua() && lua()->has_on_expire() && !expired_keys.empty())
