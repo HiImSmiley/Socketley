@@ -210,6 +210,11 @@ inline result show(const std::string& name)
     return command("show " + name);
 }
 
+inline result restart(const std::string& name)
+{
+    return command("restart " + name);
+}
+
 inline result reload(const std::string& name)
 {
     return command("reload " + name);
@@ -223,6 +228,71 @@ inline result reload_lua(const std::string& name)
 inline result edit(const std::string& name, const std::string& flags)
 {
     return command("edit " + name + " " + flags);
+}
+
+inline result owner(const std::string& name)
+{
+    return command("owner " + name);
+}
+
+inline result version()
+{
+    return command("version");
+}
+
+inline result add(const std::string& path, const std::string& flags = "")
+{
+    std::string cmd = "add " + path;
+    if (!flags.empty())
+        cmd += " " + flags;
+    return command(cmd);
+}
+
+inline result daemon_name()
+{
+    return command("daemon-name");
+}
+
+inline result cluster_dir()
+{
+    return command("cluster-dir");
+}
+
+// ── Cluster ──────────────────────────────────────────────────────────
+
+inline result cluster_ls()
+{
+    return command("cluster ls");
+}
+
+inline result cluster_ps()
+{
+    return command("cluster ps");
+}
+
+inline result cluster_group(const std::string& group)
+{
+    return command("cluster group " + group);
+}
+
+inline result cluster_show(const std::string& name)
+{
+    return command("cluster show " + name);
+}
+
+inline result cluster_stats(const std::string& name)
+{
+    return command("cluster stats " + name);
+}
+
+inline result cluster_watch()
+{
+    return command("cluster watch");
+}
+
+inline result dashboard()
+{
+    return command("dashboard");
 }
 
 // ── Cache: strings ──────────────────────────────────────────────────
