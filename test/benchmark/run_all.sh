@@ -113,6 +113,16 @@ run_benchmarks() {
     run_bench_script "$script_dir/bench_cache.sh"
     restart_daemon
 
+    # Redis comparison: this is the headline claim in the README, so it belongs
+    # in the standard suite rather than being something one has to remember to
+    # run.  One repetition keeps it around 40s; use --cache-resp-only for the
+    # three-run median when the numbers actually matter.  It exits cleanly when
+    # redis-benchmark or a running Redis is missing.
+    export BENCH_RESP_RUNS=1
+    run_bench_script "$script_dir/bench_cache_resp.sh"
+    unset BENCH_RESP_RUNS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_proxy.sh"
     restart_daemon
 

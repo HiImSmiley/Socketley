@@ -12,7 +12,10 @@ RESULTS_FILE="${RESULTS_DIR}/cache_resp_${TIMESTAMP}.json"
 
 TESTS="SET,GET,LPUSH,LPOP,SADD,HSET"
 CLIENTS=50
-RUNS=${1:-3}
+# Positional argument wins, then the environment, then the default.  run_all.sh
+# lowers it so the Redis comparison fits inside a per-script timeout while still
+# running as part of the standard suite.
+RUNS=${1:-${BENCH_RESP_RUNS:-3}}
 
 P1_REQUESTS=200000
 P100_REQUESTS=2000000
