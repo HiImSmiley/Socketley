@@ -129,6 +129,9 @@ private:
     io_request m_signal_req{};
     uint64_t m_signal_buf{};
     bool m_multishot_supported{false};
+    // IORING_ACCEPT_POLL_FIRST needs kernel 6.11; probed rather than assumed,
+    // because an unknown ioprio bit makes the kernel refuse every accept.
+    bool m_accept_poll_first{false};
     bool m_sqpoll_enabled{false};
     bool m_send_zc_supported{false};
     bool m_recv_multishot_supported{false};

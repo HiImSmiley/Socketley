@@ -31,21 +31,83 @@ event_loop::~event_loop()
     if (m_eventfd >= 0) close(m_eventfd);
 }
 
-bool event_loop::supports_multishot_accept()
+// Submit one accept SQE built the way submit_multishot_accept() would, against
+// a throwaway listener, and report whether the kernel took it.
+//
+// Probing by opcode is not sufficient for either capability this decides.
+// IORING_OP_ACCEPT has existed since 5.5, but *multishot* accept only since
+// 5.19 and IORING_ACCEPT_POLL_FIRST only since 6.11 — and both live in
+// sqe->ioprio, which older kernels validate against the flags they know,
+// rejecting the whole submission with -EINVAL.
+//
+// Getting this wrong is not a graceful degradation.  The rejection completes
+// immediately without IORING_CQE_F_MORE, the accept handler treats a missing
+// F_MORE as "multishot ended, re-arm", and the re-armed SQE is rejected again:
+// a tight loop that pins roughly two cores per listener while the runtime
+// accepts nothing at all.  Measured on 6.17 with a bit no kernel knows, a cache
+// runtime answered no PING and the daemon sat at 193% CPU.
+//
+// An accept that arms successfully produces no completion while no client is
+// connecting, so "no CQE waiting straight after submit" is the success signal.
+static bool probe_accept_variant(bool multishot, bool poll_first)
 {
-    struct io_uring ring;
-    if (io_uring_queue_init(2, &ring, 0) < 0)
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
         return false;
 
-    struct io_uring_probe* probe = io_uring_get_probe_ring(&ring);
-    bool supported = false;
-    if (probe)
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;                       // any free port
+    if (bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0 ||
+        listen(listen_fd, 1) < 0)
     {
-        supported = io_uring_opcode_supported(probe, IORING_OP_ACCEPT);
-        io_uring_free_probe(probe);
+        close(listen_fd);
+        return false;
     }
+
+    struct io_uring ring;
+    if (io_uring_queue_init(4, &ring, 0) < 0)
+    {
+        close(listen_fd);
+        return false;
+    }
+
+    bool ok = false;
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (sqe)
+    {
+        if (multishot)
+            io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        else
+            io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        if (poll_first)
+            sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
+        io_uring_sqe_set_data(sqe, nullptr);
+
+        if (io_uring_submit(&ring) >= 0)
+        {
+            struct io_uring_cqe* cqe = nullptr;
+            if (io_uring_peek_cqe(&ring, &cqe) != 0)
+            {
+                ok = true;               // armed, nothing to report yet
+            }
+            else
+            {
+                ok = (cqe->res >= 0);    // an immediate result here means refusal
+                io_uring_cqe_seen(&ring, cqe);
+            }
+        }
+    }
+
     io_uring_queue_exit(&ring);
-    return supported;
+    close(listen_fd);
+    return ok;
+}
+
+bool event_loop::supports_multishot_accept()
+{
+    return probe_accept_variant(true, false);
 }
 
 void event_loop::setup_eventfd()
@@ -188,6 +250,9 @@ bool event_loop::init()
     io_uring_register_ring_fd(&m_ring);
 
     m_multishot_supported = supports_multishot_accept();
+    // Only worth probing when multishot itself works; the flag lives in the same
+    // ioprio field and is meaningless without it.
+    m_accept_poll_first = m_multishot_supported && probe_accept_variant(true, true);
 
     // Probe for advanced io_uring features
     {
@@ -348,7 +413,8 @@ void event_loop::submit_multishot_accept(int listen_fd, io_request* req)
     {
         // Multishot: one SQE handles ALL incoming connections
         io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
-        sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
+        if (m_accept_poll_first)
+            sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else
     {
@@ -370,12 +436,14 @@ void event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
         // cqe->res will contain the fixed file index, not an fd number.
         io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
         sqe->file_index = IORING_FILE_INDEX_ALLOC;
-        sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
+        if (m_accept_poll_first)
+            sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else if (m_multishot_supported)
     {
         io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
-        sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
+        if (m_accept_poll_first)
+            sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else
     {
