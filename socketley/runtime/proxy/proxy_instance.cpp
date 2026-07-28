@@ -1150,12 +1150,24 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             return;
         }
 
-        // Record circuit breaker error for the backend that failed
+        // Record a circuit breaker error only when the backend actually failed.
+        //
+        // res == 0 is a clean EOF, which a backend produces in the ordinary
+        // course of things: HTTP/1.0, Connection: close, or a keep-alive server
+        // reaching its idle timeout.  Counting those as failures took a
+        // perfectly healthy backend out of rotation after circuit_threshold
+        // requests — five by default.  A close is only a failure if it arrived
+        // before any of the response did, which response_started already tracks.
         if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
         {
             auto& ce = m_conn_idx[conn->client_fd];
             if (ce.side == conn_client)
-                record_backend_error(ce.client->backend_idx);
+            {
+                const bool backend_failed =
+                    (cqe->res < 0) || !ce.client->response_started;
+                if (backend_failed)
+                    record_backend_error(ce.client->backend_idx);
+            }
         }
 
         close_pair(conn->client_fd, fd);
@@ -2819,7 +2831,15 @@ void proxy_instance::record_backend_success(size_t backend_idx)
         // Half-open probe succeeded -> close circuit
         cb.current = circuit_breaker::closed;
         cb.error_count = 0;
+        return;
     }
+
+    // A success while closed clears the tally, making circuit_threshold mean
+    // "this many failures in a row".  Without this the count only ever rose,
+    // so the breaker measured a backend's lifetime error total rather than its
+    // current health and would eventually open on any backend that had ever
+    // failed, however long ago and however healthy since.
+    cb.error_count = 0;
 }
 
 bool proxy_instance::try_retry(proxy_client_connection* conn)
