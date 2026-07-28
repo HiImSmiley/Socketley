@@ -67,8 +67,14 @@ run_test "ws_parser" "$BIN_DIR/test_ws_parser"
 echo "--- Integration Tests ---"
 echo ""
 
-# Kill any existing daemon
-pkill -f "socketley daemon" 2>/dev/null || true
+# Kill any existing daemon of the binary this run is about to use.
+#
+# Matching on "socketley daemon" alone matches every socketley daemon on the
+# machine, including ones belonging to a different checkout — two suites running
+# from separate worktrees killed each other's daemon mid-test, and the resulting
+# failures pointed at whatever test happened to be running rather than at the
+# collision. The binary path is what distinguishes them.
+pkill -f "$SYS_BIN daemon" 2>/dev/null || true
 sleep 0.2
 rm -f "$SOCKETLEY_SOCKET"
 
