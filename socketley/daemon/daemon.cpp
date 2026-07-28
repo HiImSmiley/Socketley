@@ -27,8 +27,8 @@ static void signal_handler(int)
 {
     if (g_signal_write_fd >= 0)
     {
-        char c = 1;
-        if (write(g_signal_write_fd, &c, 1) < 0) {}
+        uint64_t val = 1;
+        if (write(g_signal_write_fd, &val, sizeof(val)) < 0) {}
     }
 }
 

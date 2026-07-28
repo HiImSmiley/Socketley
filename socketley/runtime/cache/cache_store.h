@@ -96,8 +96,8 @@ public:
     const hash_inner* hash_ptr(std::string_view key) const;
 
     // --- TTL / Expiry ---
-    bool set_expiry(std::string_view key, int seconds);
-    int get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
+    bool set_expiry(std::string_view key, int64_t seconds);
+    int64_t get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);
     std::vector<std::string> sweep_expired();  // removes expired keys, returns their names
@@ -150,6 +150,11 @@ public:
             return true;
         return try_evict(needed);
     }
+
+    // --- Replication dump ---
+    // Serialize all data as text commands (SET/LPUSH/SADD/HSET) into buf.
+    // Used for initial full sync when a follower connects.
+    void dump_commands(std::string& buf) const;
 
     // --- Pub/Sub ---
     void subscribe(int fd, std::string_view channel);

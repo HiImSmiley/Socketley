@@ -209,7 +209,7 @@ public:
 
     // TTL
     virtual bool lua_cache_expire(std::string_view key, int seconds) { return false; }
-    virtual int lua_cache_ttl(std::string_view key) { return -2; }
+    virtual int64_t lua_cache_ttl(std::string_view key) { return -2; }
     virtual bool lua_cache_persist(std::string_view key) { return false; }
 
     // Pub/Sub

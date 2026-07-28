@@ -201,7 +201,42 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
         return parse_result::incomplete;
 
     if (__builtin_expect(data[0] != '*', 0))
-        return parse_result::error;
+    {
+        // Inline command format: "COMMAND arg1 arg2\r\n"
+        const char* crlf = find_crlf(data, sz);
+        if (!crlf)
+            return parse_result::incomplete;
+
+        size_t line_len = static_cast<size_t>(crlf - data);
+        const char* p = data;
+        const char* end = data + line_len;
+
+        while (p < end)
+        {
+            while (p < end && *p == ' ') ++p;
+            if (p >= end) break;
+
+            const char* tok_start = p;
+            if (*p == '"')
+            {
+                ++tok_start; ++p;
+                while (p < end && *p != '"') ++p;
+                args.emplace_back(tok_start, static_cast<size_t>(p - tok_start));
+                if (p < end) ++p;
+            }
+            else
+            {
+                while (p < end && *p != ' ') ++p;
+                args.emplace_back(tok_start, static_cast<size_t>(p - tok_start));
+            }
+        }
+
+        if (args.empty())
+            return parse_result::error;
+
+        consumed = static_cast<size_t>(crlf - data) + 2;
+        return parse_result::ok;
+    }
 
     const char* crlf = find_crlf(data + 1, sz - 1);
     if (__builtin_expect(!crlf, 0))
@@ -261,7 +296,45 @@ inline parse_result parse_message_views(std::string_view buf,
         return parse_result::incomplete;
 
     if (__builtin_expect(data[0] != '*', 0))
-        return parse_result::error;
+    {
+        // Inline command format: "COMMAND arg1 arg2\r\n"
+        // Redis supports this alongside RESP arrays.
+        const char* crlf = find_crlf(data, sz);
+        if (!crlf)
+            return parse_result::incomplete;
+
+        size_t line_len = static_cast<size_t>(crlf - data);
+        const char* p = data;
+        const char* end = data + line_len;
+        int count = 0;
+
+        while (p < end && count < max_args)
+        {
+            while (p < end && *p == ' ') ++p;
+            if (p >= end) break;
+
+            const char* tok_start = p;
+            if (*p == '"')
+            {
+                ++tok_start; ++p;
+                while (p < end && *p != '"') ++p;
+                args[count++] = std::string_view(tok_start, static_cast<size_t>(p - tok_start));
+                if (p < end) ++p;
+            }
+            else
+            {
+                while (p < end && *p != ' ') ++p;
+                args[count++] = std::string_view(tok_start, static_cast<size_t>(p - tok_start));
+            }
+        }
+
+        if (count == 0)
+            return parse_result::error;
+
+        argc = count;
+        consumed = static_cast<size_t>(crlf - data) + 2;
+        return parse_result::ok;
+    }
 
     int count = 0;
     size_t offset;

@@ -36,7 +36,11 @@ enum op_type : uint8_t
     op_splice                = 15,    // splice between fds through pipe
     op_file_read             = 16,    // async file read via io_uring
     op_connect               = 17,    // async connect via io_uring
-    op_health_check          = 18     // async health check (connect/write/read phases)
+    op_health_check          = 18,    // async health check (connect/write/read phases)
+    op_send_bundle           = 19,    // bundled send with provided buffers
+    op_bind                  = 20,    // async bind via io_uring
+    op_listen                = 21,    // async listen via io_uring
+    op_pipe                  = 22     // async pipe via io_uring
 };
 
 struct io_request

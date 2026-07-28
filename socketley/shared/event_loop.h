@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <liburing.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "event_loop_definitions.h"
 
@@ -34,6 +35,7 @@ public:
     void submit_read(int fd, char* buf, uint32_t len, io_request* req);
     void submit_write(int fd, const char* buf, uint32_t len, io_request* req);
     void submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req);
+    void submit_sendmsg(int fd, struct msghdr* msg, io_request* req);
     void submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
     void submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
@@ -42,6 +44,7 @@ public:
     void submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);
     void submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
     void submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req);
+    void submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req);
     void submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
     void submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
     void submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
@@ -55,6 +58,8 @@ public:
 
     // Provided buffer ring API
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
+    bool setup_buf_ring_incremental(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
+    bool buf_ring_is_incremental(uint16_t group_id) const;
     void submit_read_provided(int fd, uint16_t group_id, io_request* req);
     // Cancel all pending io_uring ops for a fd (user_data=null, CQE is ignored).
     // Submit this BEFORE close(fd) to guarantee the kernel generates cancellation
@@ -107,25 +112,43 @@ public:
     // Check if multishot accept is supported
     static bool supports_multishot_accept();
 
+    // Bundle send/recv: batched I/O using provided buffer rings.
+    void submit_send_bundle(int fd, uint16_t group_id, uint32_t len, io_request* req);
+    void submit_send_bundle_fixed_file(int fixed_idx, uint16_t group_id, uint32_t len, io_request* req);
+    void submit_recv_bundle(int fd, uint16_t group_id, io_request* req);
+    void submit_recv_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+
+    // Native bind/listen/pipe via io_uring
+    void submit_bind(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
+    void submit_listen(int fd, int backlog, io_request* req);
+    void submit_pipe(int* fds, int flags, io_request* req);
+
+    // NAPI busy polling: reduce latency by busy-polling the NIC driver.
+    bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
+    void disable_napi_busy_poll();
+
     // Feature queries
     bool sqpoll_enabled() const { return m_sqpoll_enabled; }
     bool direct_accept_supported() const { return m_direct_accept_supported; }
+    bool bundle_supported() const { return m_bundle_supported; }
 
 private:
     struct io_uring_sqe* get_sqe();
-    void setup_signal_pipe();
+    void setup_eventfd();
 
     struct io_uring m_ring{};
     std::atomic<bool> m_running;
     uint32_t m_queue_depth;
     uint32_t m_pending_submissions{0};
-    int m_signal_pipe[2]{-1, -1};
+    int m_eventfd{-1};
     io_request m_signal_req{};
-    char m_signal_buf{};
+    uint64_t m_signal_buf{};
+    uint32_t m_ring_features{0};
     bool m_multishot_supported{false};
     bool m_sqpoll_enabled{false};
     bool m_send_zc_supported{false};
     bool m_recv_multishot_supported{false};
+    bool m_bundle_supported{false};
     bool m_files_registered{false};
     bool m_bufs_registered{false};
     bool m_direct_accept_supported{false};
@@ -140,4 +163,5 @@ private:
 
     static constexpr uint16_t MAX_BUF_GROUPS = 8;
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};
+    bool m_buf_ring_incremental[MAX_BUF_GROUPS]{};
 };

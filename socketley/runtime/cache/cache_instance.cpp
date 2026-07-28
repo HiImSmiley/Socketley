@@ -526,7 +526,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (buf_ptr)
         {
             conn->partial.append(buf_ptr, cqe->res);
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            if (!(cqe->flags & IORING_CQE_F_BUF_MORE))
+                m_loop->return_buf(BUF_GROUP_ID, buf_id);
         }
     }
     else
@@ -716,11 +717,13 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             }
             else
             {
+                conn->write_msg.msg_iov = conn->write_iovs;
+                conn->write_msg.msg_iovlen = new_count;
                 conn->write_req.type = op_writev;
                 if (conn->direct_fd)
-                    m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, new_count, &conn->write_req);
+                    m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
                 else
-                    m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                    m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
             }
             return;
         }
@@ -844,22 +847,25 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             }
             auto key = args.substr(0, space);
             auto value = args.substr(space + 1);
-            m_store.check_expiry(key);
             if (!m_store.set(key, value))
-                rb.append("error: type conflict\n", 21);
-            else
             {
-                rb.append("ok\n", 3);
-                replicate_command(line);
-#ifndef SOCKETLEY_NO_LUA
-                if (lua() && lua()->has_on_write())
+                m_store.check_expiry(key);
+                if (!m_store.set(key, value))
                 {
-                    try { lua()->on_write()(key, value, 0); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                    rb.append("error: type conflict\n", 21);
+                    break;
                 }
-#endif
             }
+            rb.append("ok\n", 3);
+            replicate_command(line);
+#ifndef SOCKETLEY_NO_LUA
+            if (lua() && lua()->has_on_write())
+            {
+                try { lua()->on_write()(key, value, 0); }
+                catch (const sol::error& e)
+                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+            }
+#endif
             break;
         }
         case fnv1a("get"):
@@ -910,7 +916,6 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
-            m_store.check_expiry(args);
             if (m_store.del(args))
             {
                 rb.append("ok\n", 3);
@@ -930,7 +935,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("exists"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             rb.append(m_store.exists(args) ? "1\n" : "0\n");
             break;
         }
@@ -1015,7 +1020,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("strlen"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             append_int_nl(rb, static_cast<int64_t>(m_store.strlen_key(args)));
             break;
         }
@@ -1024,7 +1029,6 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
             auto [key, newval] = extract_key(args);
             if (key.empty() || newval.empty()) { rb.append("usage: getset key newvalue\n", 27); return; }
-            m_store.check_expiry(key);
             bool had_key = m_store.exists(key);
             std::string oldval;
             if (!m_store.getset(key, newval, oldval))
@@ -1045,7 +1049,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 size_t sp = rest.find(' ');
                 std::string_view key = (sp == std::string_view::npos) ? rest : rest.substr(0, sp);
-                m_store.check_expiry(key);
+                if (m_has_ttl_keys) m_store.check_expiry(key);
                 const std::string* val = m_store.get_ptr(key);
                 if (val) { rb.append(*val); rb.push_back('\n'); }
                 else rb.append("nil\n", 4);
@@ -1068,7 +1072,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rest = rest.substr(sp1 + 1);
                 size_t sp2 = rest.find(' ');
                 std::string_view val = (sp2 == std::string_view::npos) ? rest : rest.substr(0, sp2);
-                m_store.check_expiry(key);
+                if (m_has_ttl_keys) m_store.check_expiry(key);
                 m_store.set(key, val);
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
@@ -1087,7 +1091,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("type"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             rb.append(m_store.type(args));
             rb.push_back('\n');
             break;
@@ -1117,14 +1121,17 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: lpush key value\n", 23);
                 return;
             }
-            m_store.check_expiry(key);
             if (!m_store.lpush(key, val))
-                rb.append("error: type conflict\n", 21);
-            else
             {
-                rb.append("ok\n", 3);
-                replicate_command(line);
+                m_store.check_expiry(key);
+                if (!m_store.lpush(key, val))
+                {
+                    rb.append("error: type conflict\n", 21);
+                    break;
+                }
             }
+            rb.append("ok\n", 3);
+            replicate_command(line);
             break;
         }
         case fnv1a("rpush"):
@@ -1140,14 +1147,17 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: rpush key value\n", 23);
                 return;
             }
-            m_store.check_expiry(key);
             if (!m_store.rpush(key, val))
-                rb.append("error: type conflict\n", 21);
-            else
             {
-                rb.append("ok\n", 3);
-                replicate_command(line);
+                m_store.check_expiry(key);
+                if (!m_store.rpush(key, val))
+                {
+                    rb.append("error: type conflict\n", 21);
+                    break;
+                }
             }
+            rb.append("ok\n", 3);
+            replicate_command(line);
             break;
         }
         case fnv1a("lpop"):
@@ -1157,7 +1167,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             std::string val;
             if (m_store.lpop(args, val))
             {
@@ -1175,7 +1185,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             std::string val;
             if (m_store.rpop(args, val))
             {
@@ -1188,7 +1198,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("llen"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             append_int_nl(rb, m_store.llen(args));
             break;
         }
@@ -1200,7 +1210,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: lindex key index\n", 24);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             int idx;
             if (!parse_int_sv(idx_str, idx))
             {
@@ -1231,7 +1241,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: lrange key start stop\n", 29);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             int start, stop;
             if (!parse_int_sv(start_str, start) || !parse_int_sv(stop_str, stop))
             {
@@ -1273,8 +1283,12 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: sadd key member\n", 23);
                 return;
             }
-            m_store.check_expiry(key);
             int result = m_store.sadd(key, member);
+            if (result < 0)
+            {
+                m_store.check_expiry(key);
+                result = m_store.sadd(key, member);
+            }
             if (result < 0)
                 rb.append("error: type conflict\n", 21);
             else if (result == 0)
@@ -1299,7 +1313,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: srem key member\n", 23);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             rb.append(m_store.srem(key, member) ? "ok\n" : "nil\n");
             break;
         }
@@ -1311,19 +1325,19 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: sismember key member\n", 28);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             rb.append(m_store.sismember(key, member) ? "1\n" : "0\n");
             break;
         }
         case fnv1a("scard"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             append_int_nl(rb, m_store.scard(args));
             break;
         }
         case fnv1a("smembers"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             const auto* s = m_store.set_ptr(args);
             if (!s || s->empty())
             {
@@ -1360,14 +1374,17 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: hset key field value\n", 28);
                 return;
             }
-            m_store.check_expiry(key);
             if (!m_store.hset(key, field, val))
-                rb.append("error: type conflict\n", 21);
-            else
             {
-                rb.append("ok\n", 3);
-                replicate_command(line);
+                m_store.check_expiry(key);
+                if (!m_store.hset(key, field, val))
+                {
+                    rb.append("error: type conflict\n", 21);
+                    break;
+                }
             }
+            rb.append("ok\n", 3);
+            replicate_command(line);
             break;
         }
         case fnv1a("hget"):
@@ -1378,7 +1395,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: hget key field\n", 22);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             const std::string* val = m_store.hget(key, field);
             if (val)
             {
@@ -1402,19 +1419,19 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("usage: hdel key field\n", 22);
                 return;
             }
-            m_store.check_expiry(key);
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             rb.append(m_store.hdel(key, field) ? "ok\n" : "nil\n");
             break;
         }
         case fnv1a("hlen"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             append_int_nl(rb, m_store.hlen(args));
             break;
         }
         case fnv1a("hgetall"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             const auto* h = m_store.hash_ptr(args);
             if (!h || h->empty())
             {
@@ -1464,8 +1481,8 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("ttl"):
         {
-            m_store.check_expiry(args);
-            int ttl = m_store.get_ttl(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
+            int64_t ttl = m_store.get_ttl(args);
             append_int_nl(rb, ttl);
             break;
         }
@@ -1508,8 +1525,11 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             if (key.empty() || sec_str.empty() || val.empty()) { rb.append("usage: setex key seconds value\n", 31); return; }
             int sec = 0;
             if (!parse_int_sv(sec_str, sec) || sec <= 0) { rb.append("error: invalid seconds\n", 23); return; }
-            m_store.check_expiry(key);
-            if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+            if (!m_store.set(key, val))
+            {
+                m_store.check_expiry(key);
+                if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+            }
             m_store.set_expiry(key, sec);
             m_has_ttl_keys = true;
             rb.append("ok\n", 3);
@@ -1535,8 +1555,11 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 auto [p, e] = std::from_chars(ms_str.data(), ms_str.data() + ms_str.size(), ms);
                 if (e != std::errc{} || ms <= 0) { rb.append("error: invalid milliseconds\n", 28); return; }
             }
-            m_store.check_expiry(key);
-            if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+            if (!m_store.set(key, val))
+            {
+                m_store.check_expiry(key);
+                if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+            }
             m_store.set_expiry_ms(key, ms);
             m_has_ttl_keys = true;
             rb.append("ok\n", 3);
@@ -1572,7 +1595,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
         case fnv1a("pttl"):
         {
-            m_store.check_expiry(args);
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             append_int_nl(rb, m_store.get_pttl(args));
             break;
         }
@@ -1591,7 +1614,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(key); rb.append("1\n", 2); }
-                else if (m_store.set_expiry(key, static_cast<int>(remaining)))
+                else if (m_store.set_expiry(key, remaining))
                 { m_has_ttl_keys = true; rb.append("1\n", 2); }
                 else rb.append("0\n", 2);
             }
@@ -1792,12 +1815,18 @@ void cache_instance::flush_responses(client_connection* conn)
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
-            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            else
+                m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
-            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            if (conn->direct_fd)
+                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            else
+                m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         return;
     }
@@ -1854,11 +1883,13 @@ void cache_instance::flush_write_queue(client_connection* conn)
     }
     else
     {
+        conn->write_msg.msg_iov = conn->write_iovs;
+        conn->write_msg.msg_iovlen = count;
         conn->write_req.type = op_writev;
         if (conn->direct_fd)
-            m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, count, &conn->write_req);
+            m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
         else
-            m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+            m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
     }
 }
 
@@ -2069,7 +2100,7 @@ bool cache_instance::lua_expire(std::string_view key, int seconds)
     return false;
 }
 
-int cache_instance::lua_ttl(std::string_view key)
+int64_t cache_instance::lua_ttl(std::string_view key)
 {
     m_store.check_expiry(key);
     return m_store.get_ttl(key);
@@ -2218,11 +2249,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             // This is the overwhelmingly common case in benchmarks
             if (SOCKETLEY_LIKELY(argc == 3))
             {
-                m_store.check_expiry(args[1]);
                 if (SOCKETLEY_UNLIKELY(!m_store.set(args[1], args[2])))
                 {
-                    resp::encode_error_into(rb, "type conflict");
-                    break;
+                    m_store.check_expiry(args[1]);
+                    if (!m_store.set(args[1], args[2]))
+                    {
+                        resp::encode_error_into(rb, "type conflict");
+                        break;
+                    }
                 }
                 rb.append(resp::RESP_OK, 5);
                 repl(args, argc);
@@ -2264,7 +2298,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     default: break;
                 }
             }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             bool key_exists = m_store.exists(args[1]);
             if (nx && key_exists)  { resp::encode_null_into(rb); break; }
             if (xx && !key_exists) { resp::encode_null_into(rb); break; }
@@ -2334,7 +2368,6 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int deleted = 0;
             for (int i = 1; i < argc; i++)
             {
-                m_store.check_expiry(args[i]);
                 if (m_store.del(args[i]))
                 {
                     deleted++;
@@ -2355,7 +2388,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("exists"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.exists(args[1]) ? 1 : 0);
             break;
         }
@@ -2423,7 +2456,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("strlen"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, static_cast<int64_t>(m_store.strlen_key(args[1])));
             break;
         }
@@ -2431,7 +2464,6 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             bool had_key = m_store.exists(args[1]);
             std::string oldval;
             if (!m_store.getset(args[1], args[2], oldval))
@@ -2450,7 +2482,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             resp::encode_array_header_into(rb, argc - 1);
             for (int i = 1; i < argc; i++)
             {
-                m_store.check_expiry(args[i]);
+                if (m_has_ttl_keys) m_store.check_expiry(args[i]);
                 const std::string* val = m_store.get_ptr(args[i]);
                 if (val) resp::encode_bulk_into(rb, *val);
                 else resp::encode_null_into(rb);
@@ -2463,7 +2495,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             for (int i = 1; i + 1 < argc; i += 2)
             {
-                m_store.check_expiry(args[i]);
+                if (m_has_ttl_keys) m_store.check_expiry(args[i]);
                 m_store.set(args[i], args[i+1]);
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
@@ -2481,7 +2513,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("type"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_simple_into(rb, m_store.type(args[1]));
             break;
         }
@@ -2512,13 +2544,16 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             for (int i = 2; i < argc; i++)
             {
                 if (!m_store.lpush(args[1], args[i]))
                 {
-                    resp::encode_error_into(rb, "type conflict");
-                    return;
+                    m_store.check_expiry(args[1]);
+                    if (!m_store.lpush(args[1], args[i]))
+                    {
+                        resp::encode_error_into(rb, "type conflict");
+                        return;
+                    }
                 }
             }
             resp::encode_integer_into(rb, m_store.llen(args[1]));
@@ -2529,13 +2564,16 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             for (int i = 2; i < argc; i++)
             {
                 if (!m_store.rpush(args[1], args[i]))
                 {
-                    resp::encode_error_into(rb, "type conflict");
-                    return;
+                    m_store.check_expiry(args[1]);
+                    if (!m_store.rpush(args[1], args[i]))
+                    {
+                        resp::encode_error_into(rb, "type conflict");
+                        return;
+                    }
                 }
             }
             resp::encode_integer_into(rb, m_store.llen(args[1]));
@@ -2546,7 +2584,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             std::string val;
             if (m_store.lpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
             else resp::encode_null_into(rb);
@@ -2556,7 +2594,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             std::string val;
             if (m_store.rpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
             else resp::encode_null_into(rb);
@@ -2565,14 +2603,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("llen"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.llen(args[1]));
             break;
         }
         case fnv1a("lrange"):
         {
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int start = 0, stop = 0;
             auto [p1, e1] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), start);
             auto [p2, e2] = std::from_chars(args[3].data(), args[3].data() + args[3].size(), stop);
@@ -2593,7 +2631,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("lindex"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int idx = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), idx);
             if (e != std::errc{}) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
@@ -2606,12 +2644,16 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             int added = 0;
             for (int i = 2; i < argc; i++)
             {
                 int r = m_store.sadd(args[1], args[i]);
-                if (r < 0) { resp::encode_error_into(rb, "type conflict"); return; }
+                if (r < 0)
+                {
+                    m_store.check_expiry(args[1]);
+                    r = m_store.sadd(args[1], args[i]);
+                    if (r < 0) { resp::encode_error_into(rb, "type conflict"); return; }
+                }
                 added += r;
             }
             if (added > 0) repl(args, argc);
@@ -2622,7 +2664,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int removed = 0;
             for (int i = 2; i < argc; i++)
                 if (m_store.srem(args[1], args[i])) removed++;
@@ -2633,21 +2675,21 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("sismember"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.sismember(args[1], args[2]) ? 1 : 0);
             break;
         }
         case fnv1a("scard"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.scard(args[1]));
             break;
         }
         case fnv1a("smembers"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const auto* s = m_store.set_ptr(args[1]);
             if (!s) { resp::encode_array_header_into(rb, 0); break; }
             resp::encode_array_header_into(rb, static_cast<int>(s->size()));
@@ -2663,14 +2705,17 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 return;
             }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             int added = 0;
             for (int i = 2; i + 1 < argc; i += 2)
             {
                 if (!m_store.hset(args[1], args[i], args[i+1]))
                 {
-                    resp::encode_error_into(rb, "type conflict");
-                    return;
+                    m_store.check_expiry(args[1]);
+                    if (!m_store.hset(args[1], args[i], args[i+1]))
+                    {
+                        resp::encode_error_into(rb, "type conflict");
+                        return;
+                    }
                 }
                 added++;
             }
@@ -2681,7 +2726,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("hget"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const std::string* val = m_store.hget(args[1], args[2]);
             if (val) resp::encode_bulk_into(rb, *val);
             else resp::encode_null_into(rb);
@@ -2691,7 +2736,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int removed = 0;
             for (int i = 2; i < argc; i++)
                 if (m_store.hdel(args[1], args[i])) removed++;
@@ -2702,14 +2747,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("hlen"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.hlen(args[1]));
             break;
         }
         case fnv1a("hgetall"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const auto* h = m_store.hash_ptr(args[1]);
             if (!h) { resp::encode_array_header_into(rb, 0); break; }
             resp::encode_array_header_into(rb, static_cast<int>(h->size() * 2));
@@ -2740,7 +2785,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("ttl"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.get_ttl(args[1]));
             break;
         }
@@ -2778,8 +2823,11 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int sec = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), sec);
             if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in SETEX"); return; }
-            m_store.check_expiry(args[1]);
-            if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            if (!m_store.set(args[1], args[3]))
+            {
+                m_store.check_expiry(args[1]);
+                if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            }
             m_store.set_expiry(args[1], sec);
             m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
@@ -2801,8 +2849,11 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int64_t ms = 0;
             auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), ms);
             if (e != std::errc{} || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in PSETEX"); return; }
-            m_store.check_expiry(args[1]);
-            if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            if (!m_store.set(args[1], args[3]))
+            {
+                m_store.check_expiry(args[1]);
+                if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            }
             m_store.set_expiry_ms(args[1], ms);
             m_has_ttl_keys = true;
             resp::encode_ok_into(rb);
@@ -2837,7 +2888,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         case fnv1a("pttl"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            m_store.check_expiry(args[1]);
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.get_pttl(args[1]));
             break;
         }
@@ -2853,7 +2904,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
-                else if (m_store.set_expiry(args[1], static_cast<int>(remaining)))
+                else if (m_store.set_expiry(args[1], remaining))
                 { m_has_ttl_keys = true; repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else resp::encode_integer_into(rb, 0);
             }
@@ -3106,20 +3157,24 @@ void cache_instance::handle_replicate_request(client_connection* conn)
 
 void cache_instance::send_full_dump(int fd)
 {
-    // Send all data as SET/LPUSH/SADD/HSET commands
     std::string buf;
     buf.reserve(65536);
+    m_store.dump_commands(buf);
 
-    // Access store internals via the Lua API
-    // For strings: iterate via get_stats path — actually we need direct access
-    // We'll use the store's public interface indirectly
-    // The simplest approach: use the store save format but as text commands
+    if (buf.empty())
+        return;
 
-    // NOTE: For a complete implementation, cache_store would expose iterators.
-    // For now, this provides the framework. A full dump would require
-    // cache_store to expose iteration methods. We'll add a simple one.
-    (void)fd;
-    (void)buf;
+    // Send in chunks to avoid blocking too long on a single send
+    const char* p = buf.data();
+    size_t remaining = buf.size();
+    while (remaining > 0)
+    {
+        ssize_t sent = ::send(fd, p, remaining, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent <= 0)
+            break;
+        p += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
 }
 
 bool cache_instance::connect_to_master()

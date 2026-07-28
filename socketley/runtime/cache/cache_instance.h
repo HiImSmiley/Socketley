@@ -7,6 +7,7 @@
 #include <queue>
 #include <netinet/in.h>
 #include <sys/uio.h>
+#include <sys/socket.h>
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
@@ -31,6 +32,7 @@ struct client_connection
 
     std::string write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
+    struct msghdr write_msg{};
     uint32_t write_batch_count{0};
 
     bool read_pending{false};
@@ -131,7 +133,7 @@ public:
 
     // Lua cache access — TTL
     bool lua_expire(std::string_view key, int seconds);
-    int lua_ttl(std::string_view key);
+    int64_t lua_ttl(std::string_view key);
     bool lua_persist(std::string_view key);
 
     // Virtual overrides for Lua API
@@ -152,7 +154,7 @@ public:
     bool lua_cache_hdel(std::string_view key, std::string_view field) override { return lua_hdel(key, field); }
     int lua_cache_hlen(std::string_view key) override { return lua_hlen(key); }
     bool lua_cache_expire(std::string_view key, int seconds) override { return lua_expire(key, seconds); }
-    int lua_cache_ttl(std::string_view key) override { return lua_ttl(key); }
+    int64_t lua_cache_ttl(std::string_view key) override { return lua_ttl(key); }
     bool lua_cache_persist(std::string_view key) override { return lua_persist(key); }
     int lua_cache_publish(std::string_view channel, std::string_view message) override { return publish(channel, message); }
 

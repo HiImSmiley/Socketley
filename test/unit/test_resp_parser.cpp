@@ -111,11 +111,16 @@ TEST_CASE("RESP parsing")
         CHECK(args[0] == "GET");
     }
 
-    SUBCASE("non-RESP input")
+    SUBCASE("inline command input")
     {
         std::string buf = "set key value\r\n";
         auto result = resp::parse_message(buf, args, consumed);
-        CHECK(result == resp::parse_result::error);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(args.size() == 3);
+        CHECK(args[0] == "set");
+        CHECK(args[1] == "key");
+        CHECK(args[2] == "value");
+        CHECK(consumed == buf.size());
     }
 }
 

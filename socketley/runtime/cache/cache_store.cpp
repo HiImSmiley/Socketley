@@ -461,7 +461,7 @@ const hash_inner* cache_store::hash_ptr(std::string_view key) const
 
 // ─── TTL / Expiry ───
 
-bool cache_store::set_expiry(std::string_view key, int seconds)
+bool cache_store::set_expiry(std::string_view key, int64_t seconds)
 {
     if (!exists(key))
         return false;
@@ -475,7 +475,7 @@ bool cache_store::set_expiry(std::string_view key, int seconds)
     return true;
 }
 
-int cache_store::get_ttl(std::string_view key) const
+int64_t cache_store::get_ttl(std::string_view key) const
 {
     if (!exists(key))
         return -2;
@@ -486,7 +486,7 @@ int cache_store::get_ttl(std::string_view key) const
 
     auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
         it->second - std::chrono::steady_clock::now());
-    return static_cast<int>(remaining.count());
+    return remaining.count();
 }
 
 bool cache_store::persist(std::string_view key)
@@ -807,6 +807,75 @@ bool cache_store::exists(std::string_view key) const
 }
 
 // ─── Persistence ───
+
+void cache_store::dump_commands(std::string& buf) const
+{
+    // Strings
+    for (const auto& [key, val] : m_data)
+    {
+        buf.append("set ");
+        buf.append(key);
+        buf.push_back(' ');
+        buf.append(val);
+        buf.push_back('\n');
+    }
+
+    // Lists (emit rpush to preserve order)
+    for (const auto& [key, deq] : m_lists)
+    {
+        for (const auto& val : deq)
+        {
+            buf.append("rpush ");
+            buf.append(key);
+            buf.push_back(' ');
+            buf.append(val);
+            buf.push_back('\n');
+        }
+    }
+
+    // Sets
+    for (const auto& [key, members] : m_sets)
+    {
+        for (const auto& member : members)
+        {
+            buf.append("sadd ");
+            buf.append(key);
+            buf.push_back(' ');
+            buf.append(member);
+            buf.push_back('\n');
+        }
+    }
+
+    // Hashes
+    for (const auto& [key, fields] : m_hashes)
+    {
+        for (const auto& [field, val] : fields)
+        {
+            buf.append("hset ");
+            buf.append(key);
+            buf.push_back(' ');
+            buf.append(field);
+            buf.push_back(' ');
+            buf.append(val);
+            buf.push_back('\n');
+        }
+    }
+
+    // TTLs (emit as expire commands)
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& [key, tp] : m_expiry)
+    {
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(tp - now).count();
+        if (secs > 0)
+        {
+            buf.append("expire ");
+            buf.append(key);
+            buf.push_back(' ');
+            buf.append(std::to_string(secs));
+            buf.push_back('\n');
+        }
+    }
+}
 
 static constexpr char MAGIC_V2[4] = {'S', 'K', 'V', '2'};
 
