@@ -154,7 +154,6 @@ bool event_loop::init()
         if (io_uring_queue_init_params(m_queue_depth, &m_ring, &params) == 0)
         {
             m_sqpoll_enabled = true;
-            m_ring_features = params.features;
             initialized = true;
         }
     }
@@ -171,7 +170,6 @@ bool event_loop::init()
         p2.cq_entries = m_queue_depth * 4;
         if (io_uring_queue_init_params(m_queue_depth, &m_ring, &p2) == 0)
         {
-            m_ring_features = p2.features;
             initialized = true;
         }
     }
@@ -201,8 +199,6 @@ bool event_loop::init()
             io_uring_free_probe(probe);
         }
     }
-
-    m_bundle_supported = (m_ring_features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
 
     // Pre-register a sparse fixed file table for direct-descriptor accept
     // and fixed-file I/O.  All slots start as -1 (empty).
@@ -876,115 +872,4 @@ bool event_loop::enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer)
     napi.busy_poll_to = busy_poll_usec;
     napi.prefer_busy_poll = prefer ? 1u : 0u;
     return io_uring_register_napi(&m_ring, &napi) == 0;
-}
-
-void event_loop::disable_napi_busy_poll()
-{
-    struct io_uring_napi napi{};
-    io_uring_unregister_napi(&m_ring, &napi);
-}
-
-void event_loop::submit_send_bundle(int fd, uint16_t group_id, uint32_t len, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_send_bundle(sqe, fd, len, MSG_NOSIGNAL);
-    sqe->flags |= IOSQE_BUFFER_SELECT;
-    sqe->buf_group = group_id;
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_send_bundle;
-    m_pending_submissions++;
-}
-
-void event_loop::submit_send_bundle_fixed_file(int fixed_idx, uint16_t group_id, uint32_t len, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_send_bundle(sqe, fixed_idx, len, MSG_NOSIGNAL);
-    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
-    sqe->buf_group = group_id;
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_send_bundle;
-    m_pending_submissions++;
-}
-
-void event_loop::submit_recv_bundle(int fd, uint16_t group_id, io_request* req)
-{
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_recv(sqe, fd, nullptr, m_buf_rings[group_id].buf_size, 0);
-    sqe->flags |= IOSQE_BUFFER_SELECT;
-    sqe->buf_group = group_id;
-    sqe->ioprio |= IORING_RECVSEND_BUNDLE;
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_recv_multishot;
-    m_pending_submissions++;
-}
-
-void event_loop::submit_recv_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
-{
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_recv(sqe, fixed_idx, nullptr, m_buf_rings[group_id].buf_size, 0);
-    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
-    sqe->buf_group = group_id;
-    sqe->ioprio |= IORING_RECVSEND_BUNDLE;
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_recv_multishot;
-    m_pending_submissions++;
-}
-
-bool event_loop::setup_buf_ring_incremental(uint16_t group_id, uint32_t buf_count, uint32_t buf_size)
-{
-    if (group_id >= MAX_BUF_GROUPS)
-        return false;
-    if (m_buf_rings[group_id].ring)
-        return true;
-
-    int ret;
-    struct io_uring_buf_ring* br = io_uring_setup_buf_ring(&m_ring, buf_count, group_id,
-                                                            IOU_PBUF_RING_INC, &ret);
-    if (!br)
-        return false;
-
-    size_t total = static_cast<size_t>(buf_count) * buf_size;
-    size_t align = (total >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 4096;
-    size_t alloc_size = (total + align - 1) & ~(align - 1);
-    char* base = static_cast<char*>(aligned_alloc(align, alloc_size));
-    if (!base)
-    {
-        io_uring_free_buf_ring(&m_ring, br, buf_count, group_id);
-        return false;
-    }
-
-    if (madvise(base, alloc_size, MADV_WILLNEED) < 0) {}
-    if (alloc_size >= 2 * 1024 * 1024)
-    {
-        if (madvise(base, alloc_size, MADV_HUGEPAGE) < 0) {}
-    }
-    for (size_t i = 0; i < alloc_size; i += 4096)
-    {
-        volatile char touch = base[i];
-        (void)touch;
-    }
-
-    for (uint32_t i = 0; i < buf_count; i++)
-    {
-        io_uring_buf_ring_add(br, base + (i * buf_size), buf_size, static_cast<uint16_t>(i),
-            io_uring_buf_ring_mask(buf_count), static_cast<int>(i));
-    }
-    io_uring_buf_ring_advance(br, buf_count);
-
-    m_buf_rings[group_id] = { br, base, buf_count, buf_size };
-    m_buf_ring_incremental[group_id] = true;
-    return true;
-}
-
-bool event_loop::buf_ring_is_incremental(uint16_t group_id) const
-{
-    return group_id < MAX_BUF_GROUPS && m_buf_ring_incremental[group_id];
 }

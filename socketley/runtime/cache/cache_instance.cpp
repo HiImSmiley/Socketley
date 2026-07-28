@@ -626,8 +626,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->partial.append(buf_ptr, cqe->res);
             SKL_TRACE_ADD(conn, bytes_read, cqe->res);
             SKL_TRACE_ADD(conn, reads, 1);
-            if (!(cqe->flags & IORING_CQE_F_BUF_MORE))
-                m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
         }
     }
     else
