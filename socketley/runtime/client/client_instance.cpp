@@ -428,6 +428,18 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
 
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
+    // Resume a short write before moving on to the next message.
+    m_conn.write_off += static_cast<size_t>(cqe->res);
+    if (m_conn.write_off < m_conn.write_buf.size())
+    {
+        m_conn.write_pending = true;
+        m_loop->submit_write(m_conn.fd, m_conn.write_buf.data() + m_conn.write_off,
+            static_cast<uint32_t>(m_conn.write_buf.size() - m_conn.write_off),
+            &m_conn.write_req);
+        return;
+    }
+    m_conn.write_off = 0;
+
     // Flush queued writes before checking closing state
     if (!m_write_queue.empty() && !m_conn.closing)
     {
@@ -435,6 +447,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
         // Once there is room again, a later stall is worth reporting afresh.
         if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
             m_write_queue_full = false;
+        m_conn.write_off = 0;
         m_conn.write_pending = true;
         m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
             static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
@@ -536,6 +549,7 @@ void client_instance::lua_send(std::string_view msg)
     if (m_conn.write_buf.empty() || m_conn.write_buf.back() != '\n')
         m_conn.write_buf.push_back('\n');
 
+    m_conn.write_off = 0;
     m_conn.write_pending = true;
     m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
         static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
@@ -550,6 +564,7 @@ void client_instance::send_to_server(std::string_view msg)
     m_conn.write_req.buffer = m_conn.write_buf.data();
     m_conn.write_req.length = static_cast<uint32_t>(m_conn.write_buf.size());
 
+    m_conn.write_off = 0;
     m_conn.write_pending = true;
     m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
         static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);

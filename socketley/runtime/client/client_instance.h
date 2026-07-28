@@ -16,6 +16,11 @@ struct client_tcp_connection
     io_request write_req;
     char read_buf[4096];
     std::string write_buf;
+    // How much of write_buf the kernel has already taken. A write that returns
+    // short is ordinary, and resuming from the right offset is what keeps the
+    // remainder from being dropped and the next message from being appended to
+    // half of this one.
+    size_t write_off{0};
     std::string partial;
 
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;

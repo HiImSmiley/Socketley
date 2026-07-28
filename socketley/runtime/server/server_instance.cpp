@@ -1,4 +1,5 @@
 #include "server_instance.h"
+#include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/lua_context.h"
@@ -927,7 +928,9 @@ void server_instance::teardown(event_loop& /*loop*/)
             while (!conn->write_queue.empty())
             {
                 const auto& msg = conn->write_queue.front();
-                if (::write(fd, msg->data(), msg->size()) < 0) break;
+                // A short write leaves half a message on the wire; sending the
+                // next one after it would misframe everything that follows.
+                if (!socketley::write_all(fd, msg->data(), msg->size())) break;
                 conn->write_queue.pop();
             }
         }
@@ -3356,13 +3359,11 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
 {
     uc->write_pending = false;
 
-    // Release batch references
-    for (uint32_t i = 0; i < uc->write_batch_count; i++)
-        uc->write_batch[i].reset();
-    uc->write_batch_count = 0;
-
     if (cqe->res <= 0)
     {
+        for (uint32_t i = 0; i < uc->write_batch_count; i++)
+            uc->write_batch[i].reset();
+        uc->write_batch_count = 0;
         uc->closing = true;
         if (!uc->read_pending)
             upstream_disconnect(uc);
@@ -3370,6 +3371,71 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
     }
 
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
+    // Short write handling: resubmit remaining bytes.
+    //
+    // The batch used to be released on any positive result, so a kernel that
+    // took part of it dropped the rest — the upstream then read a truncated
+    // message with the next one appended to it, and every message after that
+    // was misframed. The client path a few hundred lines up already did this;
+    // upstream connections go through the same writev and need the same care.
+    if (uc->write_batch_count > 0)
+    {
+        size_t total_submitted = 0;
+        for (uint32_t i = 0; i < uc->write_batch_count; i++)
+            total_submitted += uc->write_iovs[i].iov_len;
+
+        const size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted)
+        {
+            size_t remaining = written;
+            uint32_t first_iov = 0;
+            for (; first_iov < uc->write_batch_count; first_iov++)
+            {
+                if (remaining < uc->write_iovs[first_iov].iov_len)
+                {
+                    uc->write_iovs[first_iov].iov_base =
+                        static_cast<char*>(uc->write_iovs[first_iov].iov_base) + remaining;
+                    uc->write_iovs[first_iov].iov_len -= remaining;
+                    break;
+                }
+                remaining -= uc->write_iovs[first_iov].iov_len;
+            }
+
+            const uint32_t new_count = uc->write_batch_count - first_iov;
+            if (first_iov > 0)
+            {
+                for (uint32_t i = 0; i < new_count; i++)
+                {
+                    uc->write_iovs[i] = uc->write_iovs[first_iov + i];
+                    uc->write_batch[i] = std::move(uc->write_batch[first_iov + i]);
+                }
+                for (uint32_t i = new_count; i < uc->write_batch_count; i++)
+                    uc->write_batch[i].reset();
+            }
+            uc->write_batch_count = new_count;
+
+            uc->write_pending = true;
+            if (new_count == 1)
+            {
+                uc->write_req.type = op_write;
+                m_loop->submit_write(uc->fd,
+                    static_cast<const char*>(uc->write_iovs[0].iov_base),
+                    static_cast<uint32_t>(uc->write_iovs[0].iov_len), &uc->write_req);
+            }
+            else
+            {
+                uc->write_req.type = op_writev;
+                m_loop->submit_writev(uc->fd, uc->write_iovs, new_count, &uc->write_req);
+            }
+            return;
+        }
+    }
+
+    // Full write completed — release batch
+    for (uint32_t i = 0; i < uc->write_batch_count; i++)
+        uc->write_batch[i].reset();
+    uc->write_batch_count = 0;
 
     if (!uc->write_queue.empty())
     {

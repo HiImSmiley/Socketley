@@ -1,4 +1,5 @@
 #include "proxy_instance.h"
+#include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/cluster_discovery.h"
@@ -498,7 +499,9 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             while (!conn->write_queue.empty())
             {
                 const auto& msg = conn->write_queue.front();
-                if (::write(i, msg.data(), msg.size()) < 0) break;
+                // A short write leaves half a message on the wire; sending the
+                // next one after it would misframe everything that follows.
+                if (!socketley::write_all(i, msg.data(), msg.size())) break;
                 conn->write_queue.pop();
             }
         }

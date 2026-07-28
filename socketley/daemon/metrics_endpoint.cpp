@@ -2,8 +2,10 @@
 #include "dashboard_html.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_instance.h"
+#include "../shared/blocking_write.h"
 
 #include <unistd.h>
+#include <cerrno>
 #include <cstring>
 #include <charconv>
 #include <shared_mutex>
@@ -82,15 +84,16 @@ static void send_http_response(int fd, std::string_view content_type, std::strin
     response.append(len_buf, end - len_buf);
     response += "\r\n\r\n";
     response += body;
-    // Blocking write is fine for dashboard (small payload, rare calls)
-    if (::write(fd, response.data(), response.size()) < 0) { /* ignore */ }
+    // Content-Length promises the whole body, so a short write here leaves the
+    // scraper waiting for bytes that are never coming.
+    socketley::write_all(fd, response.data(), response.size());
 }
 
 static void send_http_404(int fd)
 {
     static constexpr const char* resp =
         "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-    if (::write(fd, resp, std::strlen(resp)) < 0) { /* ignore */ }
+    socketley::write_all(fd, resp, std::strlen(resp));
 }
 
 void metrics_endpoint::serve_loop()

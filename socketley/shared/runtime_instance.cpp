@@ -1,4 +1,5 @@
 #include "runtime_instance.h"
+#include "blocking_write.h"
 #include "event_loop.h"
 #include "lua_context.h"
 #include "id_generator.h"
@@ -618,25 +619,47 @@ void runtime_instance::remove_interactive_fd(int fd)
         m_interactive_fds.end());
 }
 
+namespace
+{
+
+enum class notify_result { sent, skipped, broken };
+
+// Which of the two ways a write failed decides what to do about it.
+//
+// Nothing written means the message can be dropped and the stream stays intact.
+// A partial write has already put a fragment on the wire, and the reader will
+// splice it onto whatever comes next — that connection is finished.
+notify_result notify_write(int fd, const char* data, size_t len)
+{
+    size_t written = 0;
+    if (socketley::write_all(fd, data, len, &written))
+        return notify_result::sent;
+    return (written == 0) ? notify_result::skipped : notify_result::broken;
+}
+
+}  // namespace
+
 void runtime_instance::notify_interactive(std::string_view msg) const
 {
     if (m_interactive_fds.empty()) return;
 
-    // Fast path: message already ends with newline
-    bool has_newline = !msg.empty() && msg.back() == '\n';
-
-    const char newline = '\n';
-    struct iovec iov[2];
-    iov[0].iov_base = const_cast<char*>(msg.data());
-    iov[0].iov_len = msg.size();
-    iov[1].iov_base = const_cast<char*>(&newline);
-    iov[1].iov_len = 1;
-    int iovcnt = has_newline ? 1 : 2;
+    const bool has_newline = !msg.empty() && msg.back() == '\n';
 
     for (size_t i = 0; i < m_interactive_fds.size(); )
     {
-        ssize_t n = ::writev(m_interactive_fds[i], iov, iovcnt);
-        if (n < 0 && errno == EPIPE)
+        const int fd = m_interactive_fds[i];
+
+        notify_result r = notify_write(fd, msg.data(), msg.size());
+        if (r == notify_result::sent && !has_newline)
+        {
+            // The body is already out, so a terminator that does not follow it
+            // leaves the same broken stream a partial write would have.
+            r = (notify_write(fd, "\n", 1) == notify_result::sent)
+                    ? notify_result::sent
+                    : notify_result::broken;
+        }
+
+        if (r == notify_result::broken)
         {
             auto& fds = const_cast<std::vector<int>&>(m_interactive_fds);
             fds[i] = fds.back();

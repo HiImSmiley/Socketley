@@ -1,4 +1,5 @@
 #include "cache_instance.h"
+#include "../../shared/blocking_write.h"
 #include "../../shared/trace.h"
 #include "resp_parser.h"
 #include "../../shared/event_loop.h"
@@ -269,13 +270,22 @@ void cache_instance::teardown(event_loop& /*loop*/)
     {
         for (auto& [fd, conn] : m_clients)
         {
-            // Flush response_buf first
+            // Flush response_buf first.
+            //
+            // Giving up on this client must not give up on the rest: the break
+            // below used to leave the enclosing for-loop, so one peer that had
+            // already hung up cost every remaining client its pending replies.
             if (!conn->response_buf.empty())
-                if (::write(fd, conn->response_buf.data(), conn->response_buf.size()) < 0) break;
+            {
+                if (!socketley::write_all(fd, conn->response_buf.data(),
+                                          conn->response_buf.size()))
+                    continue;
+            }
             while (!conn->write_queue.empty())
             {
                 const auto& msg = conn->write_queue.front();
-                if (::write(fd, msg.data(), msg.size()) < 0) break;
+                if (!socketley::write_all(fd, msg.data(), msg.size()))
+                    break;
                 conn->write_queue.pop();
             }
         }
