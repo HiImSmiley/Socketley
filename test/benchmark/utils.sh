@@ -452,11 +452,18 @@ log_bench() {
 }
 
 # Run socketley_bench with timeout — drop-in replacement for "$SOCKETLEY_BENCH"
+#
+# Exit code 2 means a run completed fewer operations than it was asked for. Such
+# a run did not measure throughput, it measured how long it waited, and folding
+# that number into the results turns a defect into what looks like slow
+# hardware. It is surfaced here rather than swallowed.
 bench_run() {
     timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" "$@"
     local rc=$?
     if [[ $rc -eq 124 ]]; then
         log_bench "TIMEOUT" "socketley_bench $*"
+    elif [[ $rc -eq 2 ]]; then
+        log_bench "INCOMPLETE" "socketley_bench $* — fewer operations completed than requested"
     fi
     return $rc
 }

@@ -183,8 +183,17 @@ struct run_result {
     double throughput_mb;  /* MB/sec (if applicable, else 0) */
     int    success;
     int    failed;
+    /* How many operations the run was supposed to complete.  A run that ends
+     * with fewer than this did not measure throughput — it measured how long it
+     * waited for responses that never arrived, and reporting that number as a
+     * result hides a defect as if it were slow hardware.  0 means "unknown",
+     * which skips the check. */
+    int    expected;
     struct latency_log latencies;
 };
+
+/* Set when any run finished short, so the process can exit non-zero. */
+static int g_incomplete_runs = 0;
 
 static int cmp_double(const void *a, const void *b)
 {
@@ -554,6 +563,7 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
+    r.expected = nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -582,6 +592,7 @@ static struct run_result bench_cache_set(struct bench_config *cfg)
 
     int64_t start = time_ns();
     r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
+    r.expected = cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -616,6 +627,7 @@ static struct run_result bench_cache_get(struct bench_config *cfg)
 
     int64_t start = time_ns();
     r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
+    r.expected = cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -652,6 +664,7 @@ static struct run_result bench_cache_mixed(struct bench_config *cfg)
 
     int64_t start = time_ns();
     r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
+    r.expected = cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -743,6 +756,7 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
+    r.expected = nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -867,6 +881,7 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
+    r.expected = nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -1107,6 +1122,7 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
+    r.expected = nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -1153,6 +1169,39 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         }
     }
 
+    /* Second, independent signal.  Counting completed operations is not enough
+     * on its own: the client tallies responses by newline and can overshoot on
+     * the final read, so a broken run can still report success >= expected.
+     * Repetitions of one test on one machine do not legitimately differ by two
+     * orders of magnitude, so such a spread means at least one run measured
+     * something other than throughput. */
+    if (runs >= 2) {
+        double lo = throughputs[0], hi = throughputs[0];
+        for (int i = 1; i < runs; i++) {
+            if (throughputs[i] < lo) lo = throughputs[i];
+            if (throughputs[i] > hi) hi = throughputs[i];
+        }
+        if (lo > 0 && hi / lo > 100.0) {
+            g_incomplete_runs++;
+            fprintf(stderr,
+                "socketley-bench: UNSTABLE %s %s: runs span %.0f..%.0f (%.0fx) — "
+                "repetitions of one test should not differ this much\n",
+                category, test, lo, hi, hi / lo);
+        }
+    }
+
+    for (int i = 0; i < runs; i++) {
+        if (all_results[i].expected > 0 &&
+            all_results[i].success < all_results[i].expected) {
+            g_incomplete_runs++;
+            fprintf(stderr,
+                "socketley-bench: INCOMPLETE %s %s run %d/%d: %d of %d operations "
+                "completed — the elapsed time measures waiting, not throughput\n",
+                category, test, i + 1, runs,
+                all_results[i].success, all_results[i].expected);
+        }
+    }
+
     struct latency_log *lat = &all_results[best_idx].latencies;
     lat_sort(lat);
 
@@ -1172,6 +1221,11 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         if (med_mb > 0)
             json_kv_dbl(stdout, "median_throughput_mb", med_mb);
         json_kv_int(stdout, "success", all_results[best_idx].success);
+        if (all_results[best_idx].expected > 0) {
+            json_kv_int(stdout, "expected", all_results[best_idx].expected);
+            json_kv_int(stdout, "complete",
+                        all_results[best_idx].success >= all_results[best_idx].expected);
+        }
         json_kv_int(stdout, "failed", all_results[best_idx].failed);
         if (lat->count > 0) {
             json_kv_dbl(stdout, "lat_min_us", ns_to_us(lat_percentile(lat, 0)));
@@ -1411,5 +1465,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    return 0;
+    /* Exit non-zero when any run finished short.  The JSON still carries the
+     * numbers so a failure can be inspected, but callers that check exit codes
+     * will not silently fold an incomplete run into their results. */
+    return g_incomplete_runs > 0 ? 2 : 0;
 }
