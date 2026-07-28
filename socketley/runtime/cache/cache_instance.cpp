@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
 #include <charconv>
 #include <iostream>
 #include <arpa/inet.h>
@@ -191,10 +192,31 @@ bool cache_instance::setup(event_loop& loop)
         m_multishot_active = false;
     }
 
-    // Start periodic TTL sweep (100 ms)
-    m_ttl_ts = {0, 100'000'000};
+    // Periodic TTL sweep, started only once a key actually carries an expiry —
+    // a store loaded from disk may already contain some, otherwise the first
+    // SETEX/EXPIRE arms it via mark_ttl_keys().  Arming unconditionally would
+    // leave a timer running for the lifetime of every cache runtime, which is
+    // enough to keep the SQPOLL kernel thread from ever sleeping.
+    //
+    // The interval trades memory against CPU, not correctness: an expired key is
+    // never served regardless, because every read path checks the expiry itself.
+    // The sweep only decides how quickly keys that nobody touches again release
+    // their memory.  It also has to stay well above the SQPOLL idle timeout, or
+    // the poller is re-armed before it can ever sleep.
+    long sweep_ms = 500;
+    const char* sweep_env = getenv("SOCKETLEY_CACHE_TTL_SWEEP_MS");
+    if (sweep_env)
+    {
+        char* send;
+        long v = strtol(sweep_env, &send, 10);
+        if (send != sweep_env && v > 0)
+            sweep_ms = v;
+    }
+    m_ttl_ts = { sweep_ms / 1000, (sweep_ms % 1000) * 1'000'000 };
     m_ttl_req = {this, nullptr, -1, 0, op_timeout};
-    loop.submit_timeout(&m_ttl_ts, &m_ttl_req);
+    m_ttl_timer_armed = false;
+    if (m_has_ttl_keys)
+        arm_ttl_timer();
 
     if (m_idle_timeout_cached > 0)
     {
@@ -274,6 +296,20 @@ void cache_instance::teardown(event_loop& loop)
     m_multishot_active = false;
 }
 
+void cache_instance::arm_ttl_timer()
+{
+    if (m_ttl_timer_armed || !m_loop)
+        return;
+    m_ttl_timer_armed = true;
+    m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
+}
+
+void cache_instance::mark_ttl_keys()
+{
+    m_has_ttl_keys = true;
+    arm_ttl_timer();
+}
+
 void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
@@ -283,11 +319,9 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     // Periodic TTL sweep timer
     if (req == &m_ttl_req)
     {
+        m_ttl_timer_armed = false;
         if (!m_has_ttl_keys)
-        {
-            m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
-            return;
-        }
+            return;    // nothing to expire: stay off until mark_ttl_keys()
         auto expired_keys = m_store.sweep_expired();
         m_has_ttl_keys = m_store.has_expiry_keys();
         m_stat_keys_expired += expired_keys.size();
@@ -302,7 +336,10 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             }
         }
 #endif
-        m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
+        // Only keep sweeping while keys with an expiry remain.  sweep_expired()
+        // may have removed the last one, in which case the timer stops here.
+        if (m_has_ttl_keys)
+            arm_ttl_timer();
         return;
     }
 
@@ -898,7 +935,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                             sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
                             if (ttl_opt) ttl = *ttl_opt;
                             m_store.set(args, *fetched);
-                            if (ttl > 0) { m_store.set_expiry(args, ttl); m_has_ttl_keys = true; }
+                            if (ttl > 0) { m_store.set_expiry(args, ttl); mark_ttl_keys(); }
                             m_stat_get_hits++;
                             rb.append(*fetched);
                             rb.push_back('\n');
@@ -1485,7 +1522,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             }
             if (m_store.set_expiry(key, seconds))
             {
-                m_has_ttl_keys = true;
+                mark_ttl_keys();
                 rb.append("ok\n", 3);
             }
             else
@@ -1544,7 +1581,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
             }
             m_store.set_expiry(key, sec);
-            m_has_ttl_keys = true;
+            mark_ttl_keys();
             rb.append("ok\n", 3);
             replicate_command(line);
 #ifndef SOCKETLEY_NO_LUA
@@ -1574,7 +1611,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
             }
             m_store.set_expiry_ms(key, ms);
-            m_has_ttl_keys = true;
+            mark_ttl_keys();
             rb.append("ok\n", 3);
             replicate_command(line);
 #ifndef SOCKETLEY_NO_LUA
@@ -1599,7 +1636,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             }
             if (m_store.set_expiry_ms(key, ms))
             {
-                m_has_ttl_keys = true;
+                mark_ttl_keys();
                 rb.append("1\n", 2);
             }
             else
@@ -1628,7 +1665,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(key); rb.append("1\n", 2); }
                 else if (m_store.set_expiry(key, remaining))
-                { m_has_ttl_keys = true; rb.append("1\n", 2); }
+                { mark_ttl_keys(); rb.append("1\n", 2); }
                 else rb.append("0\n", 2);
             }
             break;
@@ -1649,7 +1686,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 int64_t remaining_ms = unix_ms - now_ms;
                 if (remaining_ms <= 0) { m_store.del(key); rb.append("1\n", 2); }
                 else if (m_store.set_expiry_ms(key, remaining_ms))
-                { m_has_ttl_keys = true; rb.append("1\n", 2); }
+                { mark_ttl_keys(); rb.append("1\n", 2); }
                 else rb.append("0\n", 2);
             }
             break;
@@ -2107,7 +2144,7 @@ bool cache_instance::lua_expire(std::string_view key, int seconds)
         return false;
     if (m_store.set_expiry(key, seconds))
     {
-        m_has_ttl_keys = true;
+        mark_ttl_keys();
         return true;
     }
     return false;
@@ -2320,8 +2357,8 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 resp::encode_error_into(rb, "type conflict");
                 break;
             }
-            if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); m_has_ttl_keys = true; }
-            else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); m_has_ttl_keys = true; }
+            if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); mark_ttl_keys(); }
+            else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); mark_ttl_keys(); }
             resp::encode_ok_into(rb);
             repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
@@ -2359,7 +2396,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                             sol::optional<int> ttl_opt = res.get<sol::optional<int>>(1);
                             if (ttl_opt) ttl = *ttl_opt;
                             m_store.set(args[1], *fetched);
-                            if (ttl > 0) { m_store.set_expiry(args[1], ttl); m_has_ttl_keys = true; }
+                            if (ttl > 0) { m_store.set_expiry(args[1], ttl); mark_ttl_keys(); }
                             m_stat_get_hits++;
                             resp::encode_bulk_into(rb, *fetched);
                             break;
@@ -2792,7 +2829,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
             if (m_store.set_expiry(args[1], sec))
             {
-                m_has_ttl_keys = true;
+                mark_ttl_keys();
                 repl(args, argc);
                 resp::encode_integer_into(rb, 1);
             }
@@ -2847,7 +2884,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             }
             m_store.set_expiry(args[1], sec);
-            m_has_ttl_keys = true;
+            mark_ttl_keys();
             resp::encode_ok_into(rb);
             repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
@@ -2873,7 +2910,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
             }
             m_store.set_expiry_ms(args[1], ms);
-            m_has_ttl_keys = true;
+            mark_ttl_keys();
             resp::encode_ok_into(rb);
             repl(args, argc);
 #ifndef SOCKETLEY_NO_LUA
@@ -2895,7 +2932,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (e != std::errc{} || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time"); return; }
             if (m_store.set_expiry_ms(args[1], ms))
             {
-                m_has_ttl_keys = true;
+                mark_ttl_keys();
                 repl(args, argc);
                 resp::encode_integer_into(rb, 1);
             }
@@ -2923,7 +2960,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 int64_t remaining = unix_s - now_s;
                 if (remaining <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else if (m_store.set_expiry(args[1], remaining))
-                { m_has_ttl_keys = true; repl(args, argc); resp::encode_integer_into(rb, 1); }
+                { mark_ttl_keys(); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else resp::encode_integer_into(rb, 0);
             }
             break;
@@ -2941,7 +2978,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                 int64_t remaining_ms = unix_ms - now_ms;
                 if (remaining_ms <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else if (m_store.set_expiry_ms(args[1], remaining_ms))
-                { m_has_ttl_keys = true; repl(args, argc); resp::encode_integer_into(rb, 1); }
+                { mark_ttl_keys(); repl(args, argc); resp::encode_integer_into(rb, 1); }
                 else resp::encode_integer_into(rb, 0);
             }
             break;

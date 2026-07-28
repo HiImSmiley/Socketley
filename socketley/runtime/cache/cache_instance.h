@@ -269,6 +269,25 @@ private:
     // TTL sweep short-circuit: skip m_expiry scan when no TTL keys exist
     bool m_has_ttl_keys{false};
 
+    // Whether a TTL sweep timeout is currently outstanding.
+    //
+    // The sweep used to rearm itself unconditionally, so every cache runtime
+    // kept submitting an SQE ten times a second whether or not a single key had
+    // an expiry.  With io_uring in SQPOLL mode that is enough to keep the kernel
+    // poller from ever reaching its idle timeout, which costs a full core at
+    // zero traffic.  The timer now stops when there is nothing to expire and is
+    // restarted by mark_ttl_keys() when a TTL first appears.
+    bool m_ttl_timer_armed{false};
+
+    // Submit the sweep timeout unless one is already pending.
+    void arm_ttl_timer();
+
+    // Record that at least one key now carries an expiry, restarting the sweep
+    // if it had stopped.  Use this instead of assigning m_has_ttl_keys directly:
+    // setting the flag without arming the timer leaves expired keys to be
+    // reclaimed only when something happens to touch them.
+    void mark_ttl_keys();
+
     // Connection struct pool — reuse allocations to avoid malloc/free per connect/disconnect
     static constexpr size_t CONN_POOL_INIT = 32;
     std::vector<std::unique_ptr<client_connection>> m_conn_pool;

@@ -101,12 +101,39 @@ bool event_loop::init()
         struct io_uring_params params{};
         params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER
                      | IORING_SETUP_SUBMIT_ALL | no_sqarray;
-        // sq_thread_idle: how long the SQPOLL kernel thread busy-polls before
-        // sleeping.  100ms is long enough to absorb request bursts without a
-        // wake-up syscall, but short enough to let the thread sleep between
-        // periodic timer events (idle sweeps, Lua ticks) so the daemon doesn't
-        // pin a CPU core at 100% when idle.
-        params.sq_thread_idle = 100;
+        // sq_thread_idle: how long the SQPOLL kernel thread keeps polling the
+        // submission queue before it sleeps.
+        //
+        // This interacts with periodic timers in a way that is easy to get
+        // wrong.  Any timer re-arming faster than this window prevents the
+        // thread from ever sleeping, and a thread that never sleeps is a
+        // saturated core no matter how little traffic there is.  Idle cost
+        // measured on the dev VM with a cache holding TTL keys, i.e. with the
+        // 500ms sweep timer running:
+        //
+        //   1000ms   100% of a core   (also 50% with no runtime at all,
+        //                              the 2s daemon health check suffices)
+        //    100ms    21.2%
+        //     10ms     2.8%
+        //
+        // Throughput over redis-benchmark, median of three runs, 100ms vs 10ms:
+        // +2.6% mean at pipeline depth 1, -0.8% at depth 100 — both inside the
+        // run-to-run noise of the machine.  Sleeping sooner costs nothing
+        // measurable because under real load the queue never drains long enough
+        // for the timeout to apply; it only decides how fast an *idle* daemon
+        // stops burning a core.
+        params.sq_thread_idle = 10;
+        // Override for tuning against a specific workload.  Lower values let
+        // the poller sleep sooner between periodic timers; higher values keep
+        // it hot across longer idle gaps at the cost of a busy core.
+        const char* idle_env = getenv("SOCKETLEY_SQPOLL_IDLE_MS");
+        if (idle_env)
+        {
+            char* iend;
+            long ms = strtol(idle_env, &iend, 10);
+            if (iend != idle_env && ms >= 0)
+                params.sq_thread_idle = static_cast<uint32_t>(ms);
+        }
         // Optional CPU affinity for the SQPOLL kernel thread.
         // Pin to a dedicated core to avoid cross-core cache misses on the SQ.
         // Set SOCKETLEY_SQPOLL_CPU=<N> in the environment before starting the daemon.

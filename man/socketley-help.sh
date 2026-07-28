@@ -1227,6 +1227,23 @@ architecture() {
     echo "  • Lua Context: Scripting and callbacks"
     echo ""
 
+    echo -e "${BOLD}Tuning (environment variables, read at daemon startup):${NC}"
+    echo -e "  ${CYAN}SOCKETLEY_SQPOLL_IDLE_MS${NC}      default 10"
+    echo "    How long the io_uring SQPOLL kernel thread polls before sleeping."
+    echo "    A periodic timer faster than this keeps it awake permanently, which"
+    echo "    burns a full core at zero traffic. Raise it only for workloads that"
+    echo "    idle for long stretches and then burst."
+    echo ""
+    echo -e "  ${CYAN}SOCKETLEY_CACHE_TTL_SWEEP_MS${NC}  default 500"
+    echo "    Interval between sweeps for expired cache keys. Never affects"
+    echo "    correctness — expired keys are never served regardless, since every"
+    echo "    read checks the expiry itself. It only controls how fast untouched"
+    echo "    keys release memory. Keep it above SOCKETLEY_SQPOLL_IDLE_MS."
+    echo ""
+    echo -e "  ${CYAN}SOCKETLEY_SQPOLL_CPU${NC}          unset"
+    echo "    Pin the SQPOLL kernel thread to a specific CPU."
+    echo ""
+
     read -p "Press Enter to continue..."
     main_menu
 }

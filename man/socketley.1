@@ -2237,6 +2237,43 @@ State is saved after create, start, stop, remove, and edit commands.
 The
 .B was_running
 field tracks whether a runtime should be auto-started on daemon startup.
+.SH ENVIRONMENT
+Tuning knobs read by the daemon at startup. All are optional; the defaults suit
+a general-purpose deployment and only need changing for an unusual workload.
+.TP
+.B SOCKETLEY_SOCKET
+Path to the IPC socket. Overrides the default lookup
+.RB ( /run/socketley/socketley.sock ,
+then
+.BR /tmp/socketley.sock ).
+.TP
+.B SOCKETLEY_SQPOLL_IDLE_MS
+How long the io_uring SQPOLL kernel thread keeps polling the submission queue
+before it sleeps, in milliseconds. Default
+.BR 10 .
+Any periodic timer that fires faster than this window prevents the thread from
+ever sleeping, which costs a full CPU core even at zero traffic. Raising it only
+helps workloads that sit idle for long stretches and then burst; under sustained
+load the queue never drains and the thread stays awake regardless.
+.TP
+.B SOCKETLEY_CACHE_TTL_SWEEP_MS
+Interval between periodic sweeps for expired cache keys, in milliseconds.
+Default
+.BR 500 .
+This never affects correctness: an expired key is not served no matter when the
+sweep runs, because every read path checks the expiry itself. It controls only
+how quickly keys that are never accessed again release their memory. Keep it
+comfortably above
+.B SOCKETLEY_SQPOLL_IDLE_MS
+so the poller can sleep between sweeps.
+.TP
+.B SOCKETLEY_SQPOLL_CPU=\fIN\fR
+Pin the SQPOLL kernel thread to CPU
+.IR N .
+Avoids cross-core cache misses on the submission queue; unset by default.
+.TP
+.B SOCKETLEY_CONFIG
+Path to the daemon configuration file.
 .SH FILES
 .SS System Mode (installed via package)
 .TP
