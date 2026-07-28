@@ -106,6 +106,7 @@ bool cache_instance::setup(event_loop& loop)
 {
     // Clear connections from a previous stop() — safe to free now.
     m_clients.clear();
+    m_followers.clear();
 
     // Pre-allocate connection pool
     if (m_conn_pool.empty())
@@ -283,12 +284,19 @@ void cache_instance::teardown(event_loop& loop)
         close(m_master_fd);
         m_master_fd = -1;
     }
-    for (int fd : m_follower_fds)
+    for (auto& f : m_followers)
     {
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
+        shutdown(f->fd, SHUT_RDWR);
+        close(f->fd);
+        // Neutralise the request so a late completion is ignored rather than
+        // dispatched against a torn-down instance.
+        f->write_req.owner = nullptr;
+        f->dead = true;
     }
-    m_follower_fds.clear();
+    // Same reasoning as m_clients above: a write may still be in flight, and the
+    // kernel holds pointers into these objects until its completion arrives.
+    // They are released when the instance itself goes, after the deferred-delete
+    // timeout.
 
     m_ttl_req.owner = nullptr;
     m_idle_sweep_req.owner = nullptr;
@@ -349,6 +357,20 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     {
         handle_master_read(cqe);
         return;
+    }
+
+    // Replication writes, matched by request pointer rather than by fd: a
+    // follower reached the leader as an ordinary client, so its socket also has
+    // a client_connection and the generic write handler would otherwise claim
+    // these completions and look up the wrong state.
+    for (auto& f : m_followers)
+    {
+        if (req == &f->write_req)
+        {
+            handle_follower_write(cqe, *f);
+            reap_followers();
+            return;
+        }
     }
 
     switch (req->type)
@@ -2276,7 +2298,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 
     // Helper: build text command from RESP args for replication
     auto repl = [&](std::string_view* a, int n) {
-        if (m_repl_role != repl_leader || m_follower_fds.empty()) return;
+        if (m_repl_role != repl_leader || m_followers.empty()) return;
         std::string cmd;
         for (int i = 0; i < n; i++) {
             if (i > 0) cmd += ' ';
@@ -3169,9 +3191,80 @@ cache_instance::repl_role cache_instance::get_repl_role() const
     return m_repl_role;
 }
 
+void cache_instance::follower_kick(follower_conn& f)
+{
+    if (f.write_pending || f.dead || !m_loop)
+        return;
+
+    // Safe to touch `out` only now that nothing is in flight.
+    if (f.out.empty() && !f.queued.empty())
+        f.out.swap(f.queued);
+    if (f.out.empty())
+        return;
+
+    f.in_flight = f.out.size();
+    f.write_req = { this, nullptr, f.fd, static_cast<uint32_t>(f.in_flight), op_write };
+    f.write_pending = true;
+    m_loop->submit_write(f.fd, f.out.data(), static_cast<uint32_t>(f.in_flight), &f.write_req);
+}
+
+bool cache_instance::follower_write(follower_conn& f, std::string_view data)
+{
+    if (f.dead)
+        return false;
+
+    f.queued.append(data.data(), data.size());
+
+    if (f.backlog() > MAX_FOLLOWER_PENDING)
+    {
+        std::cerr << "[cache] follower too far behind ("
+                  << f.backlog() << " bytes queued), dropping\n";
+        return false;
+    }
+
+    follower_kick(f);
+    return true;
+}
+
+void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f)
+{
+    f.write_pending = false;
+
+    if (cqe->res <= 0)
+    {
+        f.dead = true;
+        return;
+    }
+
+    // A short write is normal; only the acknowledged prefix may be dropped.
+    size_t written = std::min(static_cast<size_t>(cqe->res), f.in_flight);
+    f.out.erase(0, written);
+    f.in_flight = 0;
+
+    follower_kick(f);
+}
+
+void cache_instance::reap_followers()
+{
+    for (auto it = m_followers.begin(); it != m_followers.end(); )
+    {
+        // A follower with a write still in flight has to stay alive until its
+        // completion arrives — the kernel still points at its buffer.
+        if ((*it)->dead && !(*it)->write_pending)
+        {
+            close((*it)->fd);
+            it = m_followers.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
 void cache_instance::replicate_command(std::string_view cmd)
 {
-    if (m_repl_role != repl_leader || m_follower_fds.empty())
+    if (m_repl_role != repl_leader || m_followers.empty())
         return;
 
     std::string line;
@@ -3179,17 +3272,12 @@ void cache_instance::replicate_command(std::string_view cmd)
     line.append(cmd.data(), cmd.size());
     line.push_back('\n');
 
-    for (auto it = m_follower_fds.begin(); it != m_follower_fds.end(); )
+    for (auto& f : m_followers)
     {
-        ssize_t sent = ::send(*it, line.data(), line.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (sent <= 0)
-        {
-            close(*it);
-            it = m_follower_fds.erase(it);
-        }
-        else
-            ++it;
+        if (!follower_write(*f, line))
+            f->dead = true;
     }
+    reap_followers();
 }
 
 void cache_instance::handle_replicate_request(client_connection* conn)
@@ -3202,34 +3290,41 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     }
 
     m_repl_role = repl_leader;
-    m_follower_fds.push_back(conn->fd);
 
-    // Send full dump as a series of commands
-    send_full_dump(conn->fd);
+    // Register first, then queue the dump: both the dump and every command that
+    // follows travel through the same buffer, which is what keeps them ordered.
+    auto f = std::make_unique<follower_conn>();
+    f->fd = conn->fd;
+    follower_conn& fc = *f;
+    m_followers.push_back(std::move(f));
 
-    conn->response_buf.append("ok\n", 3);
+    // The acknowledgement travels through the follower buffer too, ahead of the
+    // dump.  Writing it to conn->response_buf instead would put a second,
+    // independent writer on the same socket and let the two interleave.  The
+    // follower ignores commands it does not recognise, so a leading "ok" is
+    // harmless there.
+    bool ok = follower_write(fc, "ok\n") && send_full_dump(fc);
+    if (!ok)
+    {
+        std::cerr << "[cache] full sync to follower failed, dropping it\n";
+        fc.dead = true;
+        reap_followers();
+    }
 }
 
-void cache_instance::send_full_dump(int fd)
+bool cache_instance::send_full_dump(follower_conn& f)
 {
     std::string buf;
     buf.reserve(65536);
     m_store.dump_commands(buf);
 
     if (buf.empty())
-        return;
+        return true;
 
-    // Send in chunks to avoid blocking too long on a single send
-    const char* p = buf.data();
-    size_t remaining = buf.size();
-    while (remaining > 0)
-    {
-        ssize_t sent = ::send(fd, p, remaining, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (sent <= 0)
-            break;
-        p += sent;
-        remaining -= static_cast<size_t>(sent);
-    }
+    // Queued rather than written synchronously.  A dataset of any size exceeds
+    // the socket buffer, and the follower may be a runtime inside this very
+    // daemon: waiting for it to drain would block the loop that has to feed it.
+    return follower_write(f, buf);
 }
 
 bool cache_instance::connect_to_master()
@@ -3426,6 +3521,6 @@ std::string cache_instance::get_stats() const
         << "eviction:" << static_cast<int>(m_store.get_eviction()) << "\n"
         << "channels:" << m_store.channel_count() << "\n"
         << "repl_role:" << static_cast<int>(m_repl_role) << "\n"
-        << "followers:" << m_follower_fds.size() << "\n";
+        << "followers:" << m_followers.size() << "\n";
     return out.str();
 }

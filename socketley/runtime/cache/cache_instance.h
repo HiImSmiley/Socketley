@@ -237,15 +237,61 @@ private:
     // Replication
     std::string m_replicate_target;
     repl_role m_repl_role{repl_none};
-    std::vector<int> m_follower_fds;
+
+    // A follower socket plus whatever has not reached it yet.
+    //
+    // Replication output cannot be written synchronously.  A follower may live
+    // in the same daemon as its leader, sharing this event loop, so blocking
+    // until the socket drains deadlocks: the follower cannot read while the loop
+    // is stuck inside the leader's write.  Everything therefore goes through an
+    // io_uring write and the unsent tail waits here.
+    //
+    // Keeping the tail also protects the command stream.  A short write would
+    // otherwise splice two commands together, which the follower has no way to
+    // detect.
+    struct follower_conn
+    {
+        int fd{-1};
+        // Two buffers, because the kernel reads directly out of `out` for the
+        // duration of a write.  Appending to it meanwhile can reallocate the
+        // string and leave the operation pointing at freed memory, so anything
+        // produced while a write is in flight waits in `queued` and moves over
+        // once `out` has drained.
+        std::string out;            // kernel owns out[0..in_flight) while writing
+        std::string queued;         // produced since the current write started
+        size_t in_flight{0};
+        io_request write_req{};
+        bool write_pending{false};
+        bool dead{false};
+
+        size_t backlog() const { return out.size() + queued.size(); }
+    };
+    // Cap on buffered-but-unsent replication data per follower.  A follower that
+    // falls this far behind is dropped: an explicit disconnect is recoverable,
+    // an unbounded buffer or a corrupted command stream is not.
+    static constexpr size_t MAX_FOLLOWER_PENDING = 8 * 1024 * 1024;
+
+    // unique_ptr because the kernel holds a pointer to each write_req for the
+    // lifetime of its operation; vector growth would move the elements.
+    std::vector<std::unique_ptr<follower_conn>> m_followers;
     int m_master_fd{-1};
+
+    // Start a write if nothing is in flight, moving queued data into out.
+    void follower_kick(follower_conn& f);
+    // Queue data for a follower and start writing if nothing is in flight.
+    // Returns false when the follower must be dropped.
+    bool follower_write(follower_conn& f, std::string_view data);
+    // Continue or finish a follower write after its completion arrives.
+    void handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f);
+    // Drop followers marked dead, closing their sockets.
+    void reap_followers();
     io_request m_master_read_req{};
     char m_master_read_buf[4096]{};
     std::string m_master_partial;
 
     void replicate_command(std::string_view cmd);
     void handle_replicate_request(client_connection* conn);
-    void send_full_dump(int fd);
+    bool send_full_dump(follower_conn& f);
     bool connect_to_master();
     void handle_master_read(struct io_uring_cqe* cqe);
 
