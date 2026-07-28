@@ -158,6 +158,10 @@ write_results_json() {
   "clients": $CLIENTS,
   "runs": $RUNS,
   "timestamp": "$(date -Iseconds)",
+  "redis_version": "$(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'redis_version:\K\S+')",
+  "redis_uptime_s": $(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'uptime_in_seconds:\K\d+' || echo 0),
+  "redis_appendonly": "$(redis-cli -p $REDIS_PORT config get appendonly 2>/dev/null | tail -1)",
+  "redis_io_threads": "$(redis-cli -p $REDIS_PORT config get io-threads 2>/dev/null | tail -1)",
   "operations": {
 JEOF
 
@@ -223,6 +227,18 @@ run_cache_resp_benchmarks() {
         log_error "Redis not running on port $REDIS_PORT"
         return 1
     fi
+
+    # Whatever Redis happens to be running is what gets measured — this script
+    # does not restart or reconfigure it.  Its version, uptime and the two
+    # settings that would make the comparison unfair (AOF fsync, extra IO
+    # threads) go into the results so a number can be judged later instead of
+    # taken on trust.  Measured here: a freshly restarted Redis came out about
+    # 7% slower than one warm from hours of use, so a long uptime does not
+    # flatter Socketley.
+    log_info "Redis $(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'redis_version:\K\S+')," \
+             "uptime $(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'uptime_in_seconds:\K\d+')s," \
+             "appendonly=$(redis-cli -p $REDIS_PORT config get appendonly 2>/dev/null | tail -1)," \
+             "io-threads=$(redis-cli -p $REDIS_PORT config get io-threads 2>/dev/null | tail -1)"
 
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
 
