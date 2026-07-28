@@ -1633,8 +1633,17 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 continue;
             }
 
-            // Data frame: compact payload into partial[ws_frag_len..]
-            if (frame.payload_len > 0)
+            // Data frame: compact payload into partial[ws_frag_len..], but only
+            // when this frame is actually part of a reassembly.
+            //
+            // The unfragmented fast path below reads straight from
+            // frame.payload_ptr, which points into partial past this frame's
+            // header and mask.  Compacting first moves the payload down over
+            // that very region, so the fast path then read the payload shifted
+            // by header+mask — corrupting every message longer than those 6
+            // bytes while leaving shorter ones intact.
+            const bool needs_compaction = !frame.fin || conn->ws_frag_len > 0;
+            if (frame.payload_len > 0 && needs_compaction)
             {
                 std::memmove(conn->partial.data() + conn->ws_frag_len,
                              frame.payload_ptr, frame.payload_len);
