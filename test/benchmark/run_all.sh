@@ -96,6 +96,17 @@ run_benchmarks() {
     # Export flag so subscripts don't manage daemon
     export SOCKETLEY_BENCH_PARENT=1
 
+    # Idle first: it measures CPU burned at zero load, so it has to run before
+    # the load tests leave warm caches and lingering connections behind.
+    # Shortened here so three scenarios still fit inside BENCH_TIMEOUT_SCRIPT;
+    # run bench_idle.sh directly for longer, more stable samples.  Exported
+    # explicitly rather than as an assignment prefix, which behaves ambiguously
+    # in front of a shell function.
+    export BENCH_IDLE_DURATION=10 BENCH_IDLE_RUNS=2
+    run_bench_script "$script_dir/bench_idle.sh"
+    unset BENCH_IDLE_DURATION BENCH_IDLE_RUNS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_server.sh"
     restart_daemon
 
@@ -126,6 +137,20 @@ generate_summary() {
 
     cat >> "$SUMMARY_FILE" << 'EOF'
 ## Results Summary
+
+### Idle CPU (100% = one saturated core, zero traffic)
+
+| Scenario | CPU % |
+|----------|-------|
+EOF
+
+    local idle_file="${RESULTS_DIR}/idle_${TIMESTAMP}.json"
+    if [[ -f "$idle_file" ]]; then
+        jq -rs '.[] | "| \(.label) | \(.cpu_percent_median) |"' "$idle_file" \
+            >> "$SUMMARY_FILE" 2>/dev/null
+    fi
+
+    cat >> "$SUMMARY_FILE" << 'EOF'
 
 ### Server Runtime
 
@@ -373,6 +398,13 @@ case "${1:-}" in
         export SOCKETLEY_BENCH_PARENT=1
         run_bench_script "$(dirname "$0")/bench_cache_resp.sh"
         ;;
+    --idle-only)
+        check_binary || exit 1
+        check_dependencies || exit 1
+        setup_cleanup_trap
+        export SOCKETLEY_BENCH_PARENT=1
+        run_bench_script "$(dirname "$0")/bench_idle.sh"
+        ;;
     --help|-h)
         echo "Usage: $0 [options]"
         echo ""
@@ -385,6 +417,7 @@ case "${1:-}" in
         echo "  --k6-http-only   Run only k6 HTTP benchmarks"
         echo "  --k6-ws-only     Run only k6 WebSocket benchmarks"
         echo "  --cache-resp-only Run cache vs Redis (RESP2, redis-benchmark)"
+        echo "  --idle-only      Run only the idle CPU benchmark"
         echo "  --fresh          Restart daemon between each test"
         echo "  --dev            Use dev binary (bin/Release/) instead of system"
         echo "  --help           Show this help"

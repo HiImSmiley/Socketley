@@ -35,8 +35,12 @@ DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
 # Ensure results directory exists
 mkdir -p "$RESULTS_DIR"
 
-# Generate timestamp for this run
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+# Timestamp for this run.  Exported so sub-scripts spawned by run_all.sh
+# inherit the parent's value: generate_summary() looks for result files named
+# with the parent's TIMESTAMP, and a freshly generated one in each child never
+# matches (the child starts a second or more later, leaving the tables empty).
+TIMESTAMP="${TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}"
+export TIMESTAMP
 
 # --fresh flag: restart daemon between every test
 BENCH_FRESH_DAEMON="${BENCH_FRESH_DAEMON:-0}"
@@ -424,7 +428,12 @@ BENCH_TIMEOUT_CMD=180         # per socketley_bench invocation
 BENCH_TIMEOUT_NC=180          # per nc pipeline
 BENCH_TIMEOUT_K6=180          # per k6 run
 BENCH_TIMEOUT_REDIS=180       # per redis-benchmark run
-BENCH_TIMEOUT_SCRIPT=180      # per bench_*.sh from run_all.sh
+# Per bench_*.sh from run_all.sh.  bench_cache.sh alone runs well over three
+# minutes (a dozen sub-tests, each restarting the runtime), and when the timeout
+# fires mid-write it leaves a truncated JSON file that no longer parses — the
+# suite then silently contributes nothing to a comparison.  Individual scripts
+# raise this further via BENCH_TIMEOUT_SCRIPT in their own environment.
+BENCH_TIMEOUT_SCRIPT=${BENCH_TIMEOUT_SCRIPT:-300}
 
 # Log a timestamped benchmark event to the bench log file.
 # The log file is the primary record — always written regardless of

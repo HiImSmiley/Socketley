@@ -1204,6 +1204,11 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         json_kv_str(stdout, "category", category);
         json_kv_int(stdout, "runs", runs);
         json_kv_int(stdout, "operations", cfg->num_ops);
+        /* Payload size belongs in the output because several tests differ in
+           nothing else: bench_cache.sh runs "cache set" once per value size,
+           and without this the resulting records are indistinguishable, so
+           tooling comparing two benchmark runs cannot line them up. */
+        json_kv_int(stdout, "msg_size", cfg->msg_size);
         json_kv_dbl(stdout, "median_throughput", med);
         if (med_mb > 0)
             json_kv_dbl(stdout, "median_throughput_mb", med_mb);

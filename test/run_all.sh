@@ -8,9 +8,23 @@ BIN_DIR="$ROOT/bin/Release"
 PASS=0; FAIL=0
 DAEMON_PID=""
 
-# Prefer system-wide socketley, fall back to local build
-SYS_BIN="$(command -v socketley 2>/dev/null)" || SYS_BIN="$ROOT/bin/Release/socketley"
-[ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried PATH and $ROOT/bin/Release/)"; exit 1; }
+# Prefer the local build over an installed socketley.
+#
+# The unit tests always run out of bin/Release, so picking the installed binary
+# for the integration tests meant the two halves of this suite could exercise
+# different builds.  Worse, the installed binary can be months old: the suite
+# would then report success for code that was never executed, which is exactly
+# the kind of false confidence a test run must not produce.  Set SOCKETLEY_BIN
+# explicitly to test an installed build on purpose.
+if [ -n "${SOCKETLEY_BIN:-}" ]; then
+    SYS_BIN="$SOCKETLEY_BIN"
+elif [ -x "$ROOT/bin/Release/socketley" ]; then
+    SYS_BIN="$ROOT/bin/Release/socketley"
+else
+    SYS_BIN="$(command -v socketley 2>/dev/null)"
+fi
+[ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $ROOT/bin/Release/, PATH)"; exit 1; }
+echo "Testing binary: $SYS_BIN"
 
 # Use a fixed test socket path (avoids system-mode path resolution issues)
 export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
