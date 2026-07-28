@@ -270,7 +270,7 @@ bool parse_cache_mode(uint32_t hash, cache_mode& mode)
 }
 
 int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
-                       runtime_manager* mgr, std::string_view name)
+                       runtime_manager* mgr, std::string_view /*name*/)
 {
     switch (pa.hashes[i])
     {
@@ -360,7 +360,7 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
 }
 
 int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
-                       std::string_view name)
+                       std::string_view /*name*/)
 {
     switch (pa.hashes[i])
     {
@@ -400,7 +400,7 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
 }
 
 int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
-                      std::string_view name)
+                      std::string_view /*name*/)
 {
     switch (pa.hashes[i])
     {
@@ -640,7 +640,7 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
 }
 
 int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
-                      std::string_view name)
+                      std::string_view /*name*/)
 {
     switch (pa.hashes[i])
     {

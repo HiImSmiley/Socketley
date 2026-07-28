@@ -230,7 +230,7 @@ bool cache_instance::setup(event_loop& loop)
     return true;
 }
 
-void cache_instance::teardown(event_loop& loop)
+void cache_instance::teardown(event_loop& /*loop*/)
 {
     if (!m_persistent_path.empty())
         m_store.save(m_persistent_path);

@@ -34,7 +34,7 @@ static bool daemon_is_running()
     return ok;
 }
 
-static bool ensure_daemon(char* argv0)
+static bool ensure_daemon(char* /*argv0*/)
 {
     if (daemon_is_running())
         return true;
@@ -366,7 +366,7 @@ int cli_send(int argc, char** argv)
     return exit_code;
 }
 
-int cli_stdin_send(int argc, char** argv)
+int cli_stdin_send(int /*argc*/, char** argv)
 {
     std::string name = argv[1];
 

@@ -297,7 +297,9 @@ bool proxy_instance::setup(event_loop& loop)
 {
     // Clear any connections left from a previous stop() — safe to free now that
     // all in-flight CQEs have been processed (we're starting a fresh run).
-    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
+    // proxy_conn_entry has a default member initializer, so memset over it is
+    // not defined behaviour even though conn_none happens to be 0.
+    for (auto& e : m_conn_idx) e = {};
     for (int i = 0; i < MAX_FDS; i++)
     {
         if (m_client_slots[i]) m_client_slots[i].reset();
@@ -437,7 +439,7 @@ bool proxy_instance::setup(event_loop& loop)
     return true;
 }
 
-void proxy_instance::teardown(event_loop& loop)
+void proxy_instance::teardown(event_loop& /*loop*/)
 {
     // Null out all req->owner pointers FIRST so any stale CQEs that arrive after
     // teardown (e.g. from SQPOLL processing a write SQE that was queued late) are
@@ -474,7 +476,9 @@ void proxy_instance::teardown(event_loop& loop)
     }
     m_health_checks_pending = false;
 
-    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
+    // proxy_conn_entry has a default member initializer, so memset over it is
+    // not defined behaviour even though conn_none happens to be 0.
+    for (auto& e : m_conn_idx) e = {};
 
     // Shutdown the listen socket before closing
     if (m_listen_fd >= 0)

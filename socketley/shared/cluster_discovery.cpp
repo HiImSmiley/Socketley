@@ -217,7 +217,7 @@ void cluster_discovery::stop()
     unpublish();
 }
 
-void cluster_discovery::on_cqe(struct io_uring_cqe* cqe)
+void cluster_discovery::on_cqe(struct io_uring_cqe* /*cqe*/)
 {
     if (!m_loop)
         return;

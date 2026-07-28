@@ -188,7 +188,7 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
         inst->on_publish_dispatch(cache_name, channel, message);
 }
 
-void runtime_manager::dispatch_cluster_events(const std::vector<cluster_event>& events)
+void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector<cluster_event>& events)
 {
     // Snapshot names under read lock — same pattern as dispatch_publish().
     // Re-lookup each name before invoking callbacks so that if a prior callback

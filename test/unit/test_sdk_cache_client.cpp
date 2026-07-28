@@ -2,17 +2,29 @@
 #include "socketley/cache_client.h"
 #include <cassert>
 
+// assert() expands to nothing under NDEBUG, which the Release build defines —
+// and Release is what the test suite runs.  Every assertion in this file was
+// therefore compiled away, leaving a test that verified nothing while still
+// exiting 0.  CHECK stays live in every configuration.
+#define CHECK(cond) do { \
+    if (!(cond)) { \
+        std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+        std::exit(1); \
+    } \
+} while (0)
+
+
 // ── cache_result tests ──────────────────────────────────────────
 
 static void test_result_default()
 {
     socketley::cache_result r;
-    assert(!r.ok);
-    assert(r.value.empty());
-    assert(r.values.empty());
-    assert(r.integer == 0);
-    assert(!r.is_nil());
-    assert(!static_cast<bool>(r));
+    CHECK(!r.ok);
+    CHECK(r.value.empty());
+    CHECK(r.values.empty());
+    CHECK(r.integer == 0);
+    CHECK(!r.is_nil());
+    CHECK(!static_cast<bool>(r));
 }
 
 static void test_result_ok()
@@ -20,8 +32,8 @@ static void test_result_ok()
     socketley::cache_result r;
     r.ok = true;
     r.value = "hello";
-    assert(static_cast<bool>(r));
-    assert(!r.is_nil());
+    CHECK(static_cast<bool>(r));
+    CHECK(!r.is_nil());
 }
 
 static void test_result_nil()
@@ -29,8 +41,8 @@ static void test_result_nil()
     socketley::cache_result r;
     r.ok = true;
     r.value = "nil";
-    assert(r.is_nil());
-    assert(static_cast<bool>(r));
+    CHECK(r.is_nil());
+    CHECK(static_cast<bool>(r));
 }
 
 static void test_result_integer()
@@ -39,7 +51,7 @@ static void test_result_integer()
     r.ok = true;
     r.value = "42";
     r.integer = 42;
-    assert(r.integer == 42);
+    CHECK(r.integer == 42);
 }
 
 static void test_result_multi()
@@ -49,9 +61,9 @@ static void test_result_multi()
     r.values.push_back("a");
     r.values.push_back("b");
     r.values.push_back("c");
-    assert(r.values.size() == 3);
-    assert(r.values[0] == "a");
-    assert(r.values[2] == "c");
+    CHECK(r.values.size() == 3);
+    CHECK(r.values[0] == "a");
+    CHECK(r.values[2] == "c");
 }
 
 // ── Compile verification ────────────────────────────────────────

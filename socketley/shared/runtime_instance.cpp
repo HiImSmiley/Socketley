@@ -457,7 +457,7 @@ bool runtime_instance::invoke_on_auth(int client_id)
 #endif
 }
 
-void runtime_instance::invoke_on_send(std::string_view msg)
+void runtime_instance::invoke_on_send([[maybe_unused]] std::string_view msg)
 {
     if (!m_lua || !m_lua->has_on_send())
         return;
@@ -649,7 +649,9 @@ void runtime_instance::notify_interactive(std::string_view msg) const
     }
 }
 
-void runtime_instance::on_publish_dispatch(std::string_view cache_name, std::string_view channel, std::string_view message)
+void runtime_instance::on_publish_dispatch([[maybe_unused]] std::string_view cache_name,
+                                          [[maybe_unused]] std::string_view channel,
+                                          [[maybe_unused]] std::string_view message)
 {
 #ifndef SOCKETLEY_NO_LUA
     if (m_lua) m_lua->dispatch_publish(cache_name, channel, message);

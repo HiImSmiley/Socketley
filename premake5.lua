@@ -22,6 +22,11 @@ workspace "Socketley"
         }
     filter {}
 
+    -- Warnings are part of the build contract: the tree must stay clean under
+    -- -Wall -Wextra.  Vendored headers go through externalincludedirs below so
+    -- they are included with -isystem and cannot drown out our own diagnostics.
+    warnings "Extra"
+
 project "socketley"
     kind "ConsoleApp"
     language "C++"
@@ -34,9 +39,11 @@ project "socketley"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs {
+    externalincludedirs {
         "thirdparty/sol2",
-        "thirdparty/luajit",
+        "thirdparty/luajit"
+    }
+    includedirs {
         "socketley"
     }
 

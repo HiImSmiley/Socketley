@@ -165,19 +165,6 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
     return (ssize_t)sent;
 }
 
-/* Read until we've accumulated at least `expect` bytes or connection closes.
- * Returns total bytes read. */
-static ssize_t recv_until(int fd, char *buf, size_t bufsz, size_t expect)
-{
-    size_t total = 0;
-    while (total < expect) {
-        ssize_t n = read(fd, buf + total, bufsz - total);
-        if (n <= 0) break;
-        total += n;
-    }
-    return (ssize_t)total;
-}
-
 /* Count newlines in buffer (for plaintext cache responses). */
 static int count_newlines(const char *buf, size_t len)
 {
@@ -380,33 +367,6 @@ static int ws_build_frame(char *out, const char *payload, int payload_len)
     return off;
 }
 
-/* Read a WS frame, return payload length (-1 on error). */
-static int ws_read_frame(int fd, char *buf, int bufsz)
-{
-    unsigned char hdr[2];
-    ssize_t n = recv_until(fd, (char *)hdr, 2, 2);
-    if (n < 2) return -1;
-
-    int payload_len = hdr[1] & 0x7F;
-    if (payload_len == 126) {
-        unsigned char ext[2];
-        if (recv_until(fd, (char *)ext, 2, 2) < 2) return -1;
-        payload_len = (ext[0] << 8) | ext[1];
-    } else if (payload_len == 127) {
-        /* 8-byte length — unlikely in benchmarks */
-        unsigned char ext[8];
-        if (recv_until(fd, (char *)ext, 8, 8) < 8) return -1;
-        payload_len = (int)((ext[4] << 24) | (ext[5] << 16) | (ext[6] << 8) | ext[7]);
-    }
-
-    if (payload_len > bufsz) payload_len = bufsz;
-    if (payload_len > 0) {
-        if (recv_until(fd, buf, payload_len, payload_len) < payload_len)
-            return -1;
-    }
-    return payload_len;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * H. Server benchmarks
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -560,7 +520,6 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
     lat_init(&r.latencies, 1);
 
     int nc = cfg->num_clients;
-    int msgs = cfg->num_ops; /* per client */
 
     pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
     struct server_concurrent_args *args =

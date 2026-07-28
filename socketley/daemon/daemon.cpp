@@ -263,7 +263,7 @@ static void restore_runtimes(state_persistence& persistence,
 }
 
 int daemon_start(runtime_manager& manager, event_loop& loop,
-                 int argc, char** argv)
+                 int /*argc*/, char** /*argv*/)
 {
     // Resolve paths (system vs dev mode)
     auto paths = socketley_paths::resolve();

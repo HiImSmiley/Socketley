@@ -544,6 +544,9 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     }
 }
 
+// Only reachable from the Lua on_http_request path below, so the no-Lua build
+// has no caller for either helper.
+#ifndef SOCKETLEY_NO_LUA
 static std::string build_http_response_full(int status, std::string_view reason,
     const std::vector<std::pair<std::string, std::string>>& headers,
     std::string_view body, bool keep_alive)
@@ -611,6 +614,7 @@ static std::string_view http_reason(int status)
         default:  return "Unknown";
     }
 }
+#endif
 
 void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
 {
@@ -883,7 +887,7 @@ bool server_instance::setup(event_loop& loop)
     return true;
 }
 
-void server_instance::teardown(event_loop& loop)
+void server_instance::teardown(event_loop& /*loop*/)
 {
     if (m_udp)
     {
@@ -2924,7 +2928,7 @@ std::string_view server_instance::get_client_route(int client_fd) const
 }
 
 void server_instance::process_forwarded_message(int client_fd, std::string_view msg,
-                                                  std::string_view parent_name)
+                                                  std::string_view /*parent_name*/)
 {
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
     invoke_on_client_message(client_fd, msg);
@@ -3440,7 +3444,7 @@ std::vector<int> server_instance::lua_upstreams() const
     return result;
 }
 
-void server_instance::invoke_on_upstream(int conn_id, std::string_view data)
+void server_instance::invoke_on_upstream([[maybe_unused]] int conn_id, [[maybe_unused]] std::string_view data)
 {
 #ifndef SOCKETLEY_NO_LUA
     auto* lctx = lua();
@@ -3453,7 +3457,7 @@ void server_instance::invoke_on_upstream(int conn_id, std::string_view data)
 #endif
 }
 
-void server_instance::invoke_on_upstream_connect(int conn_id)
+void server_instance::invoke_on_upstream_connect([[maybe_unused]] int conn_id)
 {
 #ifndef SOCKETLEY_NO_LUA
     auto* lctx = lua();
@@ -3466,7 +3470,7 @@ void server_instance::invoke_on_upstream_connect(int conn_id)
 #endif
 }
 
-void server_instance::invoke_on_upstream_disconnect(int conn_id)
+void server_instance::invoke_on_upstream_disconnect([[maybe_unused]] int conn_id)
 {
 #ifndef SOCKETLEY_NO_LUA
     auto* lctx = lua();

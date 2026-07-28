@@ -218,7 +218,7 @@ bool client_instance::setup(event_loop& loop)
     return true;
 }
 
-void client_instance::teardown(event_loop& loop)
+void client_instance::teardown(event_loop& /*loop*/)
 {
     // Drain write queue
     while (!m_write_queue.empty())

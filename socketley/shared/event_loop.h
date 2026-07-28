@@ -118,11 +118,6 @@ public:
     void submit_recv_bundle(int fd, uint16_t group_id, io_request* req);
     void submit_recv_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
 
-    // Native bind/listen/pipe via io_uring
-    void submit_bind(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
-    void submit_listen(int fd, int backlog, io_request* req);
-    void submit_pipe(int* fds, int flags, io_request* req);
-
     // NAPI busy polling: reduce latency by busy-polling the NIC driver.
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
     void disable_napi_busy_poll();

@@ -179,41 +179,41 @@ public:
     virtual void on_publish_dispatch(std::string_view cache_name, std::string_view channel, std::string_view message);
 
     // Virtual methods for Lua actions (overridden by specific runtimes)
-    virtual void lua_send(std::string_view msg) {}
-    virtual void lua_broadcast(std::string_view msg) {}
-    virtual void lua_send_to(int client_id, std::string_view msg) {}
+    virtual void lua_send(std::string_view /*msg*/) {}
+    virtual void lua_broadcast(std::string_view /*msg*/) {}
+    virtual void lua_send_to(int /*client_id*/, std::string_view /*msg*/) {}
 
     // Virtual methods for Lua cache access (overridden by cache_instance)
-    virtual std::string lua_cache_get(std::string_view key) { return ""; }
-    virtual bool lua_cache_set(std::string_view key, std::string_view value) { return false; }
-    virtual bool lua_cache_del(std::string_view key) { return false; }
+    virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }
+    virtual bool lua_cache_set(std::string_view /*key*/, std::string_view /*value*/) { return false; }
+    virtual bool lua_cache_del(std::string_view /*key*/) { return false; }
 
     // Lists
-    virtual bool lua_cache_lpush(std::string_view key, std::string_view val) { return false; }
-    virtual bool lua_cache_rpush(std::string_view key, std::string_view val) { return false; }
-    virtual std::string lua_cache_lpop(std::string_view key) { return ""; }
-    virtual std::string lua_cache_rpop(std::string_view key) { return ""; }
-    virtual int lua_cache_llen(std::string_view key) { return 0; }
+    virtual bool lua_cache_lpush(std::string_view /*key*/, std::string_view /*val*/) { return false; }
+    virtual bool lua_cache_rpush(std::string_view /*key*/, std::string_view /*val*/) { return false; }
+    virtual std::string lua_cache_lpop(std::string_view /*key*/) { return ""; }
+    virtual std::string lua_cache_rpop(std::string_view /*key*/) { return ""; }
+    virtual int lua_cache_llen(std::string_view /*key*/) { return 0; }
 
     // Sets
-    virtual int lua_cache_sadd(std::string_view key, std::string_view member) { return -1; }
-    virtual bool lua_cache_srem(std::string_view key, std::string_view member) { return false; }
-    virtual bool lua_cache_sismember(std::string_view key, std::string_view member) { return false; }
-    virtual int lua_cache_scard(std::string_view key) { return 0; }
+    virtual int lua_cache_sadd(std::string_view /*key*/, std::string_view /*member*/) { return -1; }
+    virtual bool lua_cache_srem(std::string_view /*key*/, std::string_view /*member*/) { return false; }
+    virtual bool lua_cache_sismember(std::string_view /*key*/, std::string_view /*member*/) { return false; }
+    virtual int lua_cache_scard(std::string_view /*key*/) { return 0; }
 
     // Hashes
-    virtual bool lua_cache_hset(std::string_view key, std::string_view field, std::string_view val) { return false; }
-    virtual std::string lua_cache_hget(std::string_view key, std::string_view field) { return ""; }
-    virtual bool lua_cache_hdel(std::string_view key, std::string_view field) { return false; }
-    virtual int lua_cache_hlen(std::string_view key) { return 0; }
+    virtual bool lua_cache_hset(std::string_view /*key*/, std::string_view /*field*/, std::string_view /*val*/) { return false; }
+    virtual std::string lua_cache_hget(std::string_view /*key*/, std::string_view /*field*/) { return ""; }
+    virtual bool lua_cache_hdel(std::string_view /*key*/, std::string_view /*field*/) { return false; }
+    virtual int lua_cache_hlen(std::string_view /*key*/) { return 0; }
 
     // TTL
-    virtual bool lua_cache_expire(std::string_view key, int seconds) { return false; }
-    virtual int64_t lua_cache_ttl(std::string_view key) { return -2; }
-    virtual bool lua_cache_persist(std::string_view key) { return false; }
+    virtual bool lua_cache_expire(std::string_view /*key*/, int /*seconds*/) { return false; }
+    virtual int64_t lua_cache_ttl(std::string_view /*key*/) { return -2; }
+    virtual bool lua_cache_persist(std::string_view /*key*/) { return false; }
 
     // Pub/Sub
-    virtual int lua_cache_publish(std::string_view channel, std::string_view message) { return 0; }
+    virtual int lua_cache_publish(std::string_view /*channel*/, std::string_view /*message*/) { return 0; }
 
 protected:
     // Invoke Lua callbacks safely

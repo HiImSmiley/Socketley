@@ -988,33 +988,3 @@ bool event_loop::buf_ring_is_incremental(uint16_t group_id) const
 {
     return group_id < MAX_BUF_GROUPS && m_buf_ring_incremental[group_id];
 }
-
-void event_loop::submit_bind(int fd, const struct sockaddr* addr, socklen_t len, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_bind(sqe, fd, const_cast<struct sockaddr*>(addr), len);
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_bind;
-    m_pending_submissions++;
-}
-
-void event_loop::submit_listen(int fd, int backlog, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_listen(sqe, fd, backlog);
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_listen;
-    m_pending_submissions++;
-}
-
-void event_loop::submit_pipe(int* fds, int flags, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
-    io_uring_prep_pipe(sqe, fds, flags);
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_pipe;
-    m_pending_submissions++;
-}
