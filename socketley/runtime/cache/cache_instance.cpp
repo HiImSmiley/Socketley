@@ -61,7 +61,7 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     }
     conn->partial.clear();
     conn->response_buf.clear();
-    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     conn->fd = -1;
@@ -274,7 +274,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
                 if (::write(fd, conn->response_buf.data(), conn->response_buf.size()) < 0) break;
             while (!conn->write_queue.empty())
             {
-                auto& msg = conn->write_queue.front();
+                const auto& msg = conn->write_queue.front();
                 if (::write(fd, msg.data(), msg.size()) < 0) break;
                 conn->write_queue.pop();
             }
@@ -1921,13 +1921,13 @@ void cache_instance::flush_responses(client_connection* conn)
     }
     SKL_TRACE_ADD(conn, bytes_queued, conn->response_buf.size());
 
-    if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE))
+    if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
-        // Reaching this after coalescing means the peer has genuinely stopped
-        // reading while hundreds of megabytes pile up.  Dropping the connection
-        // is the right answer, but it must not happen quietly: everything still
-        // in flight for this client is lost with it.
+        // The peer has genuinely stopped reading while megabytes pile up.
+        // Dropping the connection is the right answer, but it must not happen
+        // quietly: everything still in flight for this client is lost with it.
         std::cerr << "[cache] client " << conn->fd << " is not draining its socket ("
+                  << conn->write_queue.bytes() << " bytes in "
                   << conn->write_queue.size() << " queued buffers), closing\n";
         conn->closing = true;
         return;
@@ -1966,12 +1966,10 @@ void cache_instance::flush_responses(client_connection* conn)
     }
 
     // Append to the tail entry instead of adding another one whenever that keeps
-    // it a sensible size.  The queue bound counts entries, not bytes, and a
-    // pipelined client produces one tiny reply per command — "ok\n" is three
-    // bytes — so one entry per flush reaches MAX_WRITE_QUEUE after roughly 12 KB
-    // of actual data.  The connection was then marked closing and every later
-    // response silently discarded while the read path kept parsing, leaving the
-    // client waiting for answers that had already been thrown away.
+    // it a sensible size.  A pipelined client produces one tiny reply per
+    // command — "ok\n" is three bytes — and one queue entry per flush turns a
+    // few kilobytes of data into thousands of entries, each with its own node
+    // and allocation.  Merging them costs a memcpy and saves all of that.
     //
     // Only the tail is touched: entries are moved out of the queue into
     // write_batch before submission, so nothing the kernel is reading gets
@@ -1979,7 +1977,7 @@ void cache_instance::flush_responses(client_connection* conn)
     if (!conn->write_queue.empty() &&
         conn->write_queue.back().size() + conn->response_buf.size() <= client_connection::WRITE_COALESCE_LIMIT)
     {
-        conn->write_queue.back().append(conn->response_buf);
+        conn->write_queue.append_back(conn->response_buf);
         conn->response_buf.clear();
     }
     else
@@ -2000,8 +1998,7 @@ void cache_instance::flush_write_queue(client_connection* conn)
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < client_connection::MAX_WRITE_BATCH)
     {
-        conn->write_batch[count] = std::move(conn->write_queue.front());
-        conn->write_queue.pop();
+        conn->write_batch[count] = conn->write_queue.take_front();
 
         conn->write_iovs[count].iov_base = conn->write_batch[count].data();
         conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
@@ -3182,7 +3179,11 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             if (sub_conn->closing)
                 continue;
 
-            if (sub_conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE)
+            // A subscriber that has stopped reading must not be allowed to grow
+            // the queue without limit, but the bound is memory: a slow reader on
+            // 30-byte notifications was dropped after 123 KB when this counted
+            // entries.
+            if (sub_conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
             {
                 sub_conn->closing = true;
                 continue;

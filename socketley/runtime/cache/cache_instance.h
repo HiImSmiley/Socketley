@@ -13,11 +13,11 @@
 #include "../../shared/event_loop_definitions.h"
 #include "cache_store.h"
 #include "../../shared/trace.h"
+#include "../../shared/write_queue.h"
 
 struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
     // Upper size for merging consecutive responses into one queue entry.  Large
     // enough that thousands of small replies share a handful of entries, small
     // enough that a single entry stays a reasonable write.
@@ -33,7 +33,7 @@ struct client_connection
     std::string partial;
     std::string response_buf;
     // write_queue holds owned strings — no shared_ptr overhead per flush
-    std::queue<std::string> write_queue;
+    socketley::byte_counted_queue<std::string> write_queue;
 
     std::string write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
@@ -66,7 +66,7 @@ struct client_connection
         direct_fd = false;
         partial.clear();
         response_buf.clear();
-        while (!write_queue.empty()) write_queue.pop();
+        write_queue.clear();
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].clear();
         write_batch_count = 0;
         read_pending = false;

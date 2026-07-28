@@ -74,7 +74,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     // the next connection will likely need the same buffer sizes).
     conn->partial.clear();
     conn->meta.clear();
-    while (!conn->write_queue.empty()) conn->write_queue.pop();
+    conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
@@ -926,7 +926,7 @@ void server_instance::teardown(event_loop& /*loop*/)
         {
             while (!conn->write_queue.empty())
             {
-                auto& msg = conn->write_queue.front();
+                const auto& msg = conn->write_queue.front();
                 if (::write(fd, msg->data(), msg->size()) < 0) break;
                 conn->write_queue.pop();
             }
@@ -973,8 +973,7 @@ void server_instance::teardown(event_loop& /*loop*/)
         // keep the server_connection structs alive — their embedded io_request
         // members are still referenced by in-flight CQEs until the cancellations
         // complete and the deferred-delete timeout fires.
-        while (!conn->write_queue.empty())
-            conn->write_queue.pop();
+        conn->write_queue.clear();
         for (size_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].reset();
         conn->write_batch_count = 0;
@@ -995,8 +994,7 @@ void server_instance::teardown(event_loop& /*loop*/)
         }
         uc->connected = false;
         // Release write queue refs
-        while (!uc->write_queue.empty())
-            uc->write_queue.pop();
+        uc->write_queue.clear();
         for (size_t j = 0; j < uc->write_batch_count; j++)
             uc->write_batch[j].reset();
         uc->write_batch_count = 0;
@@ -2197,7 +2195,7 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
         if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
-        if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE))
+        if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
         {
             conn->closing = true;
             continue;
@@ -2231,7 +2229,7 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->closing))
         return;
 
-    if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE))
+    if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
         conn->closing = true;
         return;
@@ -2263,8 +2261,7 @@ void server_instance::flush_write_queue(server_connection* conn)
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < server_connection::MAX_WRITE_BATCH)
     {
-        conn->write_batch[count] = std::move(conn->write_queue.front());
-        conn->write_queue.pop();
+        conn->write_batch[count] = conn->write_queue.take_front();
 
         conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
         conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
@@ -3147,7 +3144,7 @@ void server_instance::lua_group_send(std::string_view group, std::string_view ms
     {
         auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
         if (!conn || conn->closing) continue;
-        if (conn->write_queue.size() >= server_connection::MAX_WRITE_QUEUE)
+        if (conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
         {
             conn->closing = true;
             continue;
@@ -3282,8 +3279,7 @@ void server_instance::upstream_disconnect(upstream_connection* uc)
     uc->partial.clear();
 
     // Release write queue refs
-    while (!uc->write_queue.empty())
-        uc->write_queue.pop();
+    uc->write_queue.clear();
     for (size_t i = 0; i < uc->write_batch_count; i++)
         uc->write_batch[i].reset();
     uc->write_batch_count = 0;
@@ -3390,7 +3386,7 @@ void server_instance::upstream_send(upstream_connection* uc, const std::shared_p
     if (!m_loop || !uc->connected || uc->closing)
         return;
 
-    if (uc->write_queue.size() >= upstream_connection::MAX_WRITE_QUEUE)
+    if (uc->write_queue.bytes() >= socketley::write_queue_max_bytes)
     {
         uc->closing = true;
         return;
@@ -3409,8 +3405,7 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     uint32_t count = 0;
     while (!uc->write_queue.empty() && count < upstream_connection::MAX_WRITE_BATCH)
     {
-        uc->write_batch[count] = std::move(uc->write_queue.front());
-        uc->write_queue.pop();
+        uc->write_batch[count] = uc->write_queue.take_front();
         uc->write_iovs[count].iov_base = const_cast<char*>(uc->write_batch[count]->data());
         uc->write_iovs[count].iov_len = uc->write_batch[count]->size();
         count++;

@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 #include <cstring>
+#include <iostream>
 #include <charconv>
 #include <chrono>
 #include <arpa/inet.h>
@@ -221,8 +222,8 @@ bool client_instance::setup(event_loop& loop)
 void client_instance::teardown(event_loop& /*loop*/)
 {
     // Drain write queue
-    while (!m_write_queue.empty())
-        m_write_queue.pop();
+    m_write_queue.clear();
+    m_write_queue_full = false;
 
     if (m_conn.fd >= 0)
     {
@@ -430,8 +431,10 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     // Flush queued writes before checking closing state
     if (!m_write_queue.empty() && !m_conn.closing)
     {
-        m_conn.write_buf = std::move(m_write_queue.front());
-        m_write_queue.pop();
+        m_conn.write_buf = m_write_queue.take_front();
+        // Once there is room again, a later stall is worth reporting afresh.
+        if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+            m_write_queue_full = false;
         m_conn.write_pending = true;
         m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
             static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
@@ -504,8 +507,23 @@ void client_instance::lua_send(std::string_view msg)
     // Queue message if a write is already in flight
     if (m_conn.write_pending || m_conn.closing)
     {
-        if (!m_conn.closing && m_write_queue.size() < MAX_WRITE_QUEUE)
+        if (!m_conn.closing)
         {
+            // The bound is memory, not entries: a client sending 20-byte lines
+            // hit a 4096-entry cap after 80 KB and every message past it was
+            // dropped without a word, while one sending megabyte payloads could
+            // queue gigabytes before the same cap noticed.
+            if (m_write_queue.bytes() >= socketley::write_queue_max_bytes)
+            {
+                if (!m_write_queue_full)
+                {
+                    m_write_queue_full = true;
+                    std::cerr << "[client] server is not reading ("
+                              << m_write_queue.bytes()
+                              << " bytes queued), dropping messages\n";
+                }
+                return;
+            }
             std::string out(msg.data(), msg.size());
             if (out.empty() || out.back() != '\n')
                 out.push_back('\n');

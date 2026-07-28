@@ -12,6 +12,7 @@
 #include <filesystem>
 
 #include "../../shared/runtime_instance.h"
+#include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 #include <linux/time_types.h>
 
@@ -29,7 +30,6 @@ enum proto_state : uint8_t {
 struct alignas(64) server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
@@ -52,7 +52,7 @@ struct alignas(64) server_connection
 
     // === WARM fields (message processing path) ===
     std::string partial;
-    std::queue<std::shared_ptr<const std::string>> write_queue;
+    socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
 
     // writev batch: holds refs alive until CQE completes
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
@@ -117,7 +117,7 @@ struct alignas(64) server_connection
         direct_fd = false;
         read_req = {};
         write_req = {};
-        while (!write_queue.empty()) write_queue.pop();
+        write_queue.clear();
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
         write_batch_count = 0;
         read_pending = false;
@@ -185,7 +185,6 @@ struct upstream_target
 struct upstream_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
@@ -196,7 +195,7 @@ struct upstream_connection
     io_request write_req;
     char read_buf[READ_BUF_SIZE];
     std::string partial;
-    std::queue<std::shared_ptr<const std::string>> write_queue;
+    socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
     uint32_t write_batch_count{0};

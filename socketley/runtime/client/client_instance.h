@@ -6,6 +6,7 @@
 #include <linux/time_types.h>
 
 #include "../../shared/runtime_instance.h"
+#include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 
 struct client_tcp_connection
@@ -69,8 +70,11 @@ private:
     bool m_connected;
 
     // Write queue (prevents silent message loss when write_pending)
-    std::queue<std::string> m_write_queue;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    socketley::byte_counted_queue<std::string> m_write_queue;
+    // Latches the "not draining" report. A stuck peer drops every message that
+    // follows, and one line per dropped message would bury the first — which is
+    // the only one that says anything new.
+    bool m_write_queue_full{false};
 
     // Reconnect state
     int m_reconnect_attempt{0};

@@ -66,7 +66,7 @@ void proxy_client_connection::reset(int new_fd)
     splice_in_req = {};
     splice_out_req = {};
     partial.clear();
-    write_queue = decltype(write_queue){};
+    write_queue.clear();
     for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
     if (pipe_to_backend[0] >= 0) { close(pipe_to_backend[0]); pipe_to_backend[0] = -1; }
     if (pipe_to_backend[1] >= 0) { close(pipe_to_backend[1]); pipe_to_backend[1] = -1; }
@@ -100,7 +100,7 @@ void proxy_backend_connection::reset(int new_fd)
     splice_in_req = {};
     splice_out_req = {};
     partial.clear();
-    write_queue = decltype(write_queue){};
+    write_queue.clear();
     for (uint32_t i = 0; i < MAX_WRITE_BATCH; i++) write_batch[i].clear();
     if (pipe_to_client[0] >= 0) { close(pipe_to_client[0]); pipe_to_client[0] = -1; }
     if (pipe_to_client[1] >= 0) { close(pipe_to_client[1]); pipe_to_client[1] = -1; }
@@ -133,7 +133,7 @@ std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int
 void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection> conn)
 {
     conn->partial.clear();
-    conn->write_queue = decltype(conn->write_queue){};
+    conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
@@ -165,7 +165,7 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
 void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connection> conn)
 {
     conn->partial.clear();
-    conn->write_queue = decltype(conn->write_queue){};
+    conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     if (conn->pipe_to_client[0] >= 0) { close(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
@@ -497,7 +497,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             if (!conn) continue;
             while (!conn->write_queue.empty())
             {
-                auto& msg = conn->write_queue.front();
+                const auto& msg = conn->write_queue.front();
                 if (::write(i, msg.data(), msg.size()) < 0) break;
                 conn->write_queue.pop();
             }
@@ -965,7 +965,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 {
                     auto& be = m_conn_idx[conn->backend_fd];
                     if (be.side == conn_backend &&
-                        be.backend->write_queue.size() >= WRITE_QUEUE_BACKPRESSURE)
+                        be.backend->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
                         backpressured = true;
                 }
                 if (!backpressured)
@@ -1092,7 +1092,7 @@ proxy_http_resubmit:
             {
                 auto& be = m_conn_idx[conn->backend_fd];
                 if (be.side == conn_backend &&
-                    be.backend->write_queue.size() >= WRITE_QUEUE_BACKPRESSURE)
+                    be.backend->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
                     bp = true;
             }
             if (!bp)
@@ -1365,7 +1365,7 @@ proxy_backend_read_done:
             {
                 auto& ce = m_conn_idx[conn->client_fd];
                 if (ce.side == conn_client &&
-                    ce.client->write_queue.size() >= WRITE_QUEUE_BACKPRESSURE)
+                    ce.client->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
                     backpressured = true;
             }
             if (!backpressured)
@@ -3121,7 +3121,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     }
 #endif
 
-    if (SOCKETLEY_UNLIKELY(bconn->write_queue.size() >= proxy_backend_connection::MAX_WRITE_QUEUE))
+    if (SOCKETLEY_UNLIKELY(bconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
         bconn->closing = true;
         return;
@@ -3183,7 +3183,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     }
 #endif
 
-    if (SOCKETLEY_UNLIKELY(cconn->write_queue.size() >= proxy_client_connection::MAX_WRITE_QUEUE))
+    if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
         cconn->closing = true;
         return;
@@ -3253,8 +3253,7 @@ void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < proxy_client_connection::MAX_WRITE_BATCH)
     {
-        conn->write_batch[count] = std::move(conn->write_queue.front());
-        conn->write_queue.pop();
+        conn->write_batch[count] = conn->write_queue.take_front();
 
         conn->write_iovs[count].iov_base = conn->write_batch[count].data();
         conn->write_iovs[count].iov_len = conn->write_batch[count].size();
@@ -3295,8 +3294,7 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < proxy_backend_connection::MAX_WRITE_BATCH)
     {
-        conn->write_batch[count] = std::move(conn->write_queue.front());
-        conn->write_queue.pop();
+        conn->write_batch[count] = conn->write_queue.take_front();
 
         conn->write_iovs[count].iov_base = conn->write_batch[count].data();
         conn->write_iovs[count].iov_len = conn->write_batch[count].size();
@@ -3446,7 +3444,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     }
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
-    if (conn->write_queue.size() < WRITE_QUEUE_BACKPRESSURE &&
+    if (conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes &&
         conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
     {
         auto& be = m_conn_idx[conn->backend_fd];
@@ -3576,7 +3574,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     }
 
     // Backpressure resume: if write queue drained below threshold, restart client reads
-    if (conn->write_queue.size() < WRITE_QUEUE_BACKPRESSURE &&
+    if (conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes &&
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];

@@ -12,6 +12,7 @@
 #include <sys/uio.h>
 
 #include "../../shared/runtime_instance.h"
+#include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 
 class runtime_manager;
@@ -44,7 +45,6 @@ static constexpr size_t PROXY_READ_BUF_SIZE = 65536;
 struct alignas(64) proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t MAX_HEADER_SIZE = 16384;
 
@@ -69,7 +69,7 @@ struct alignas(64) proxy_client_connection
     io_request splice_in_req;
     io_request splice_out_req;
     std::string partial;
-    std::queue<std::string> write_queue;
+    socketley::byte_counted_queue<std::string> write_queue;
     std::string write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
 
@@ -98,7 +98,6 @@ struct alignas(64) proxy_client_connection
 struct alignas(64) proxy_backend_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
-    static constexpr size_t MAX_WRITE_QUEUE = 4096;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     // === HOT fields (CQE dispatch) — first 2 cache lines ===
@@ -119,7 +118,7 @@ struct alignas(64) proxy_backend_connection
     io_request splice_in_req;
     io_request splice_out_req;
     std::string partial;
-    std::queue<std::string> write_queue;
+    socketley::byte_counted_queue<std::string> write_queue;
     std::string write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
 
@@ -352,8 +351,6 @@ private:
     // Connection pool for backend reuse (avoids connect() per request)
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
-    // Backpressure: stop client reads when backend write queue reaches this
-    static constexpr size_t WRITE_QUEUE_BACKPRESSURE = 2048;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
 
     // Service mesh
