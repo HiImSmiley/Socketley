@@ -177,7 +177,26 @@ bool cache_instance::setup(event_loop& loop)
     if (m_repl_role == repl_follower && !m_replicate_target.empty())
         connect_to_master();
 
-    m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+    // Provided-buffer ring geometry.  Buffer size decides how many commands a
+    // single read completion can carry: with 4 KB buffers a 4 KB value fills one
+    // buffer per command, so every command costs its own completion.  Count
+    // decides how much concurrent traffic fits before the pool runs dry and
+    // reads fall back to a slower per-read path.  Both are tunable so the
+    // trade-off against memory (count * size per cache runtime) can be measured
+    // rather than guessed.
+    uint32_t buf_count = BUF_COUNT;
+    uint32_t buf_size  = BUF_SIZE;
+    if (const char* e = getenv("SOCKETLEY_CACHE_BUF_COUNT"))
+    {
+        char* end; long v = strtol(e, &end, 10);
+        if (end != e && v > 0) buf_count = static_cast<uint32_t>(v);
+    }
+    if (const char* e = getenv("SOCKETLEY_CACHE_BUF_SIZE"))
+    {
+        char* end; long v = strtol(e, &end, 10);
+        if (end != e && v >= 1024) buf_size = static_cast<uint32_t>(v);
+    }
+    m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
     m_send_zc = loop.send_zc_supported();
 

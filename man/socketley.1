@@ -2267,6 +2267,27 @@ comfortably above
 .B SOCKETLEY_SQPOLL_IDLE_MS
 so the poller can sleep between sweeps.
 .TP
+.B SOCKETLEY_CACHE_BUF_SIZE
+Size in bytes of each buffer in a cache runtime's io_uring provided-buffer ring.
+Default
+.BR 4096 .
+Larger buffers let one read completion carry more commands, but a read that
+returns less than a full buffer still consumes the whole one, so the waste per
+partial read grows with the size. Measured on the dev VM, raising this to 16384
+cost 31% at 1 KB values and 8% at 4 KB values — the default is where it belongs
+unless a specific workload shows otherwise.
+.TP
+.B SOCKETLEY_CACHE_BUF_COUNT
+Number of buffers in that ring. Default
+.BR 512 .
+Together with the size this bounds how much concurrent traffic the runtime can
+absorb before the pool runs dry and reads fall back to a slower per-read path;
+the pool costs count times size of memory per cache runtime.
+.TP
+.B SOCKETLEY_NAPI_BUSY_POLL_US
+Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by
+default. Trades CPU for lower receive latency on busy links.
+.TP
 .B SOCKETLEY_SQPOLL_CPU=\fIN\fR
 Pin the SQPOLL kernel thread to CPU
 .IR N .
