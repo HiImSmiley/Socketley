@@ -49,6 +49,25 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
 
 bool cache_store::set(std::string_view key, std::string_view value)
 {
+    // A plain SET discards any expiry the key already carried, as Redis
+    // specifies for SET without KEEPTTL.  Leaving it in place made a freshly
+    // written value inherit its predecessor's deadline and disappear at a time
+    // the writer had no reason to expect:
+    //
+    //   SET k v1 / EXPIRE k 2 / SET k v2   ->  v2 gone two seconds later
+    //
+    // SETEX, PSETEX and SET ... EX all assign the expiry after calling this, so
+    // they are unaffected.  Guarded on empty() to keep the common case — a cache
+    // with no TTLs at all — free of the lookup.
+    // find() accepts a string_view through the transparent hash; erase() does
+    // not, so go through the iterator rather than allocating a std::string.
+    if (!m_expiry.empty())
+    {
+        auto eit = m_expiry.find(key);
+        if (eit != m_expiry.end())
+            m_expiry.erase(eit);
+    }
+
     // Fast-path: key already exists as string (most common in benchmarks).
     // Check m_data first — this avoids the type-conflict cross-map lookups.
     auto it = m_data.find(key);
