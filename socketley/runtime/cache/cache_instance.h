@@ -18,6 +18,10 @@ struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
     static constexpr size_t MAX_WRITE_QUEUE = 4096;
+    // Upper size for merging consecutive responses into one queue entry.  Large
+    // enough that thousands of small replies share a handful of entries, small
+    // enough that a single entry stays a reasonable write.
+    static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     int fd;
@@ -73,6 +77,7 @@ struct client_connection
         resp_detected = false;
         rl_tokens = 0.0;
         rl_max = 0.0;
+        SKL_TRACE_RESET(*this);
     }
 };
 

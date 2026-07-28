@@ -1905,6 +1905,12 @@ void cache_instance::flush_responses(client_connection* conn)
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE))
     {
+        // Reaching this after coalescing means the peer has genuinely stopped
+        // reading while hundreds of megabytes pile up.  Dropping the connection
+        // is the right answer, but it must not happen quietly: everything still
+        // in flight for this client is lost with it.
+        std::cerr << "[cache] client " << conn->fd << " is not draining its socket ("
+                  << conn->write_queue.size() << " queued buffers), closing\n";
         conn->closing = true;
         return;
     }
@@ -1941,7 +1947,27 @@ void cache_instance::flush_responses(client_connection* conn)
         return;
     }
 
-    conn->write_queue.push(std::move(conn->response_buf));
+    // Append to the tail entry instead of adding another one whenever that keeps
+    // it a sensible size.  The queue bound counts entries, not bytes, and a
+    // pipelined client produces one tiny reply per command — "ok\n" is three
+    // bytes — so one entry per flush reaches MAX_WRITE_QUEUE after roughly 12 KB
+    // of actual data.  The connection was then marked closing and every later
+    // response silently discarded while the read path kept parsing, leaving the
+    // client waiting for answers that had already been thrown away.
+    //
+    // Only the tail is touched: entries are moved out of the queue into
+    // write_batch before submission, so nothing the kernel is reading gets
+    // modified here.
+    if (!conn->write_queue.empty() &&
+        conn->write_queue.back().size() + conn->response_buf.size() <= client_connection::WRITE_COALESCE_LIMIT)
+    {
+        conn->write_queue.back().append(conn->response_buf);
+        conn->response_buf.clear();
+    }
+    else
+    {
+        conn->write_queue.push(std::move(conn->response_buf));
+    }
     conn->response_buf.reserve(4096);
 
     if (!conn->write_pending)

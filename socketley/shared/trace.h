@@ -49,6 +49,9 @@ struct conn_stats
 #define SKL_TRACE_FIELD(name) ::skl_trace::conn_stats name;
 #define SKL_TRACE_ADD(conn, field, n) ((conn)->tr.field += (n))
 #define SKL_TRACE_SET(conn, field, v) ((conn)->tr.field = (v))
+// Pooled connections are reused, so the counters have to start over with
+// each one or every report is a running total of the pool slot.
+#define SKL_TRACE_RESET(obj) ((obj).tr = ::skl_trace::conn_stats{})
 
 #define SKL_TRACE_LOG(...)                                                     \
     do {                                                                       \
@@ -83,6 +86,7 @@ struct conn_stats
 #define SKL_TRACE_FIELD(name)
 #define SKL_TRACE_ADD(conn, field, n) ((void)0)
 #define SKL_TRACE_SET(conn, field, v) ((void)0)
+#define SKL_TRACE_RESET(obj)          ((void)0)
 #define SKL_TRACE_LOG(...)            ((void)0)
 #define SKL_TRACE_CLOSE(conn, fd, reason) ((void)0)
 
