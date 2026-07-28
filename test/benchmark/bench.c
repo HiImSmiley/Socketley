@@ -502,14 +502,22 @@ static void *server_concurrent_worker(void *arg)
     struct bench_config *cfg = a->cfg;
 
     int fd = tcp_connect(cfg->host, cfg->port);
-    if (fd < 0) return NULL;
 
-    char *msg = (char *)malloc(cfg->msg_size + 1);
-    memset(msg, 'Y', cfg->msg_size);
-    msg[cfg->msg_size] = '\n';
+    char *msg = NULL;
+    if (fd >= 0) {
+        msg = (char *)malloc(cfg->msg_size + 1);
+        memset(msg, 'Y', cfg->msg_size);
+        msg[cfg->msg_size] = '\n';
+    }
 
-    /* All threads connected — wait for barrier before sending */
+    /* All threads connected — wait for barrier before sending.
+     *
+     * Reached even when the connect failed. A worker that returns early leaves
+     * the barrier one short of its count, and the main thread then waits on it
+     * forever — so a runtime refusing connections showed up as a benchmark that
+     * hung until the suite timeout, saying nothing about why. */
     pthread_barrier_wait(a->barrier);
+    if (fd < 0) return NULL;
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -690,7 +698,6 @@ static void *cache_concurrent_worker(void *arg)
     struct bench_config *cfg = a->cfg;
 
     int fd = tcp_connect(cfg->host, cfg->port);
-    if (fd < 0) return NULL;
 
     char value[64];
     memset(value, 'V', sizeof(value));
@@ -708,8 +715,11 @@ static void *cache_concurrent_worker(void *arg)
         off += n;
     }
 
-    /* All threads connected + pipeline built — wait for barrier */
+    /* All threads connected + pipeline built — wait for barrier.
+     * Reached even on a failed connect — see server_concurrent_worker. */
     pthread_barrier_wait(a->barrier);
+
+    if (fd < 0) { free(buf); return NULL; }
 
     a->thread_success = pipeline_execute(fd, buf, off, ops);
     close(fd);
@@ -821,15 +831,18 @@ static void *proxy_concurrent_worker(void *arg)
     struct bench_config *cfg = a->cfg;
 
     int fd = tcp_connect(cfg->host, cfg->port);
-    if (fd < 0) return NULL;
 
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 128;
-    char *msg = (char *)malloc(msize + 1);
-    memset(msg, 'P', msize);
-    msg[msize] = '\n';
+    char *msg = NULL;
+    if (fd >= 0) {
+        msg = (char *)malloc(msize + 1);
+        memset(msg, 'P', msize);
+        msg[msize] = '\n';
+    }
 
-    /* All threads connected — wait for barrier before sending */
+    /* Barrier is reached even on a failed connect — see server_concurrent_worker. */
     pthread_barrier_wait(a->barrier);
+    if (fd < 0) return NULL;
 
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
