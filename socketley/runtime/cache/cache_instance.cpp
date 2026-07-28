@@ -163,7 +163,12 @@ bool cache_instance::setup(event_loop& loop)
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
     m_rate_limit_cached = get_rate_limit();
-    m_has_ttl_keys = false;
+    // Seed from the store rather than clearing: load() above restores expiry
+    // timestamps from the persistence file, and this flag gates both the
+    // periodic sweep and every lazy check_expiry() call.  Forcing it to false
+    // here would leave keys restored with a TTL immortal until some unrelated
+    // command set a new TTL and flipped the flag back on.
+    m_has_ttl_keys = m_store.has_expiry_keys();
 
     // Connect to master if follower
     if (m_repl_role == repl_follower && !m_replicate_target.empty())
@@ -916,6 +921,11 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
+            // Unlike set/lpush/sadd, del() cannot detect a stale key by failing:
+            // it happily removes one that has already expired and reports
+            // success, so DEL on an expired key would answer "ok" instead of
+            // "nil".  The expiry check has to happen up front.
+            if (m_has_ttl_keys) m_store.check_expiry(args);
             if (m_store.del(args))
             {
                 rb.append("ok\n", 3);
@@ -1029,6 +1039,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
             auto [key, newval] = extract_key(args);
             if (key.empty() || newval.empty()) { rb.append("usage: getset key newvalue\n", 27); return; }
+            // getset() overwrites unconditionally, so an expired key would be
+            // reported as present and its stale value returned as the old one.
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             bool had_key = m_store.exists(key);
             std::string oldval;
             if (!m_store.getset(key, newval, oldval))
@@ -2368,6 +2381,9 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             int deleted = 0;
             for (int i = 1; i < argc; i++)
             {
+                // del() succeeds on an already-expired key, so without this the
+                // reply would count keys that Redis reports as absent.
+                if (m_has_ttl_keys) m_store.check_expiry(args[i]);
                 if (m_store.del(args[i]))
                 {
                     deleted++;
@@ -2464,6 +2480,8 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            // GETSET must return nil for an expired key, not its stale value.
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             bool had_key = m_store.exists(args[1]);
             std::string oldval;
             if (!m_store.getset(args[1], args[2], oldval))
