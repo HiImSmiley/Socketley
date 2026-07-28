@@ -1861,8 +1861,16 @@ submit_next_read:
         // (If write_pending, handle_write will clean up when write completes.)
         // (If file_read_pending, handle_file_read will clean up when read completes.)
         // (If splice_remaining, handle_splice_out will clean up when splice completes.)
+        // Same teardown as the other close paths: authority and group membership
+        // are keyed by fd, and the kernel reissues that number to the next
+        // accepted connection.  Leaving either behind hands the newcomer what
+        // belonged to the client that just left — for m_master_fd that is
+        // broadcast authority granted without the password.
+        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+            m_master_fd = -1;
         unroute_client(fd);
         invoke_on_disconnect(fd);
+        remove_from_all_groups(fd);
         if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
         remove_active_fd(fd);
         close(fd);
@@ -2509,8 +2517,11 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         conn->file_size = 0;
         if (!conn->write_pending && !conn->read_pending)
         {
+            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+                m_master_fd = -1;
             unroute_client(fd);
             invoke_on_disconnect(fd);
+            remove_from_all_groups(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             remove_active_fd(fd);
             close(fd);
