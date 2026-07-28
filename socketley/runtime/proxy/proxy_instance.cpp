@@ -830,6 +830,14 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
+            // Reset the request type: the fallback is a plain read into the
+            // connection's own buffer, not a provided-buffer one.  Leaving it
+            // as a recv/provided type makes the completion handler treat the
+            // result as a buffer-ring delivery — it then appends whatever sits
+            // in ring buffer 0 instead of the bytes just read, discards those
+            // bytes, and returns a buffer it never took, corrupting the ring's
+            // free list.
+            conn->read_req.type = op_read;
             m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
             return;
         }
@@ -1130,6 +1138,14 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
+            // Reset the request type: the fallback is a plain read into the
+            // connection's own buffer, not a provided-buffer one.  Leaving it
+            // as a recv/provided type makes the completion handler treat the
+            // result as a buffer-ring delivery — it then appends whatever sits
+            // in ring buffer 0 instead of the bytes just read, discards those
+            // bytes, and returns a buffer it never took, corrupting the ring's
+            // free list.
+            conn->read_req.type = op_read;
             m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
             return;
         }

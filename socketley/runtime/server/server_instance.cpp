@@ -1390,6 +1390,14 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
+            // Reset the request type: the fallback is a plain read into the
+            // connection's own buffer, not a provided-buffer one.  Leaving it
+            // as a recv/provided type makes the completion handler treat the
+            // result as a buffer-ring delivery — it then appends whatever sits
+            // in ring buffer 0 instead of the bytes just read, discards those
+            // bytes, and returns a buffer it never took, corrupting the ring's
+            // free list.
+            conn->read_req.type = op_read;
             if (conn->direct_fd)
                 m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
             else

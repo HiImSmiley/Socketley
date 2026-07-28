@@ -12,6 +12,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
 #include "cache_store.h"
+#include "../../shared/trace.h"
 
 struct client_connection
 {
@@ -51,6 +52,8 @@ struct client_connection
 
     // Idle connection tracking
     std::chrono::steady_clock::time_point last_activity{};
+
+    SKL_TRACE_FIELD(tr)
 
     void reset(int new_fd)
     {

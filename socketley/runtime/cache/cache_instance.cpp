@@ -1,4 +1,5 @@
 #include "cache_instance.h"
+#include "../../shared/trace.h"
 #include "resp_parser.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
@@ -447,6 +448,7 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
 
         auto conn = pool_acquire(client_fd);
+        SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
         conn->partial.reserve(4096);
         conn->response_buf.reserve(4096);
         conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
@@ -540,7 +542,10 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (!is_multishot_recv)
         conn->read_pending = false;
     else if (!multishot_more)
+    {
         conn->read_pending = false;
+        SKL_TRACE_ADD(conn, multishot_ends, 1);
+    }
 
     bool is_provided = (req->type == op_read_provided || is_multishot_recv);
 
@@ -556,7 +561,16 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // ENOBUFS: buffer pool exhausted — fall back to regular read
         if (is_provided && cqe->res == -ENOBUFS)
         {
+            SKL_TRACE_ADD(conn, enobufs, 1);
             conn->read_pending = true;
+            // Reset the request type: the fallback is a plain read into the
+            // connection's own buffer, not a provided-buffer one.  Leaving it
+            // as a recv/provided type makes the completion handler treat the
+            // result as a buffer-ring delivery — it then appends whatever sits
+            // in ring buffer 0 instead of the bytes just read, discards those
+            // bytes, and returns a buffer it never took, corrupting the ring's
+            // free list.
+            conn->read_req.type = op_read;
             if (conn->direct_fd)
                 m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
             else
@@ -572,6 +586,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         }
         else
         {
+            SKL_TRACE_CLOSE(conn, fd, "read-error-or-eof");
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
@@ -590,6 +605,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (buf_ptr)
         {
             conn->partial.append(buf_ptr, cqe->res);
+            SKL_TRACE_ADD(conn, bytes_read, cqe->res);
+            SKL_TRACE_ADD(conn, reads, 1);
             if (!(cqe->flags & IORING_CQE_F_BUF_MORE))
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
         }
@@ -597,6 +614,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     else
     {
         conn->partial.append(conn->read_buf, cqe->res);
+        SKL_TRACE_ADD(conn, bytes_read, cqe->res);
+        SKL_TRACE_ADD(conn, reads, 1);
     }
 
     if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
@@ -605,6 +624,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->write_pending)
         {
             m_store.unsubscribe_all(fd);
+            SKL_TRACE_CLOSE(conn, fd, "partial-overflow");
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
@@ -635,7 +655,11 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (!line.empty() && line.back() == '\r')
                 line.remove_suffix(1);
 
+            SKL_TRACE_ADD(conn, commands_parsed, 1);
+            const size_t rb_before = conn->response_buf.size();
             process_command(conn, line);
+            if (conn->response_buf.size() != rb_before)
+                SKL_TRACE_ADD(conn, responses_made, 1);
 
             scan_from = pos + 1;
         }
@@ -701,6 +725,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                  conn->closing && !conn->read_pending)
         {
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+            SKL_TRACE_CLOSE(conn, fd, "write-failed");
             close(fd);
             { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
         }
@@ -708,9 +733,13 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     }
 
     conn->write_pending = false;
+    SKL_TRACE_ADD(conn, writes, 1);
+    if (cqe->res > 0)
+        SKL_TRACE_ADD(conn, bytes_written, cqe->res);
 
     if (cqe->res <= 0)
     {
+        SKL_TRACE_LOG("write failed fd=%d res=%d", fd, cqe->res);
         if (!conn->zc_notif_pending)
         {
             for (uint32_t i = 0; i < conn->write_batch_count; i++)
@@ -720,6 +749,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->closing = true;
         if (!conn->read_pending && !conn->zc_notif_pending)
         {
+            SKL_TRACE_CLOSE(conn, fd, "write-drained-closing");
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
@@ -810,6 +840,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     {
         if (conn->closing && !conn->read_pending && !conn->zc_notif_pending)
         {
+            SKL_TRACE_CLOSE(conn, fd, "idle-sweep");
             close(fd);
             if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
             { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
@@ -1863,7 +1894,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 void cache_instance::flush_responses(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->response_buf.empty() || !m_loop || conn->closing))
+    {
+        if (!conn->response_buf.empty() && (conn->closing || !m_loop))
+            SKL_TRACE_LOG("flush skipped fd=%d bytes=%zu closing=%d loop=%d",
+                          conn->fd, conn->response_buf.size(),
+                          (int)conn->closing, (int)(m_loop != nullptr));
         return;
+    }
+    SKL_TRACE_ADD(conn, bytes_queued, conn->response_buf.size());
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.size() >= client_connection::MAX_WRITE_QUEUE))
     {
@@ -2244,7 +2282,13 @@ void cache_instance::process_resp(client_connection* conn)
         offset += consumed;
 
         if (argc > 0)
+        {
+            SKL_TRACE_ADD(conn, commands_parsed, 1);
+            const size_t rb_before = conn->response_buf.size();
             process_resp_command(conn, args, argc);
+            if (conn->response_buf.size() != rb_before)
+                SKL_TRACE_ADD(conn, responses_made, 1);
+        }
 
         // Cap response_buf at 1 MiB during large pipelines to prevent OOM
         if (conn->response_buf.size() > (1 << 20))
