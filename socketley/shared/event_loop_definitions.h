@@ -74,6 +74,39 @@ enum op_type : uint8_t
     op_poll                  = 19     // wait for readiness (used to finish a non-blocking connect)
 };
 
+inline constexpr uint8_t op_type_count = 20;
+
+// For diagnostics only.  A count of outstanding operations says an owner cannot
+// be released yet; the kind says why, which is the difference between reading a
+// number and knowing where to look.
+inline const char* io_op_name(uint8_t t)
+{
+    switch (t)
+    {
+        case op_accept:                  return "accept";
+        case op_read:                    return "read";
+        case op_write:                   return "write";
+        case op_nop:                     return "nop";
+        case op_multishot_accept:        return "multishot-accept";
+        case op_read_provided:           return "read-provided";
+        case op_writev:                  return "writev";
+        case op_recvmsg:                 return "recvmsg";
+        case op_timeout:                 return "timeout";
+        case op_recv_multishot:          return "recv-multishot";
+        case op_send_zc:                 return "send-zc";
+        case op_send_zc_notif:           return "send-zc-notif";
+        case op_multishot_accept_direct: return "multishot-accept-direct";
+        case op_read_fixed_buf:          return "read-fixed-buf";
+        case op_write_fixed_buf:         return "write-fixed-buf";
+        case op_splice:                  return "splice";
+        case op_file_read:               return "file-read";
+        case op_connect:                 return "connect";
+        case op_health_check:            return "health-check";
+        case op_poll:                    return "poll";
+        default:                         return "unknown";
+    }
+}
+
 struct io_request
 {
     io_handler* owner;

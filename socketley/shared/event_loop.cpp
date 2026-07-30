@@ -242,6 +242,25 @@ bool event_loop::owner_registered(const io_handler* owner) const
     return m_owners[tok & OWNER_SLOT_MASK].token == tok;
 }
 
+void event_loop::owner_inflight_breakdown(const io_handler* owner, uint32_t* out) const
+{
+    for (uint8_t t = 0; t < op_type_count; ++t)
+        out[t] = 0;
+    if (!owner)
+        return;
+
+    // Slot 0 is skipped for the same reason owner_inflight() skips it: it
+    // aggregates every handler that could not be registered, so it cannot
+    // answer for any single one of them.
+    for (uint32_t s = 1; s < MAX_OWNERS; ++s)
+    {
+        if (m_owners[s].handler != owner)
+            continue;
+        for (uint8_t t = 0; t < op_type_count; ++t)
+            out[t] += m_owners[s].by_type[t];
+    }
+}
+
 uint32_t event_loop::owner_inflight(const io_handler* owner) const
 {
     if (!owner)
@@ -280,17 +299,22 @@ inline void event_loop::arm(io_request* req)
     // A token of 0 lands on slot 0 next to the unverifiable handlers.  Slot 0
     // is never freed, so counting there costs nothing and keeps this increment
     // and the decrement in run() symmetric without a branch on either side.
-    ++m_owners[tok & OWNER_SLOT_MASK].inflight;
+    auto& aslot = m_owners[tok & OWNER_SLOT_MASK];
+    ++aslot.inflight;
+    if (__builtin_expect(req->type < op_type_count, 1))
+        ++aslot.by_type[req->type];
     ++m_pending_submissions;
 }
 
-inline void event_loop::disarm(uint32_t token)
+inline void event_loop::disarm(uint32_t token, uint8_t type)
 {
     auto& slot = m_owners[token & OWNER_SLOT_MASK];
     // Guarded rather than assumed: an unmatched decrement would wrap the
     // counter and the slot would never be reusable again.
     if (__builtin_expect(slot.inflight > 0, 1))
         --slot.inflight;
+    if (__builtin_expect(type < op_type_count, 1) && slot.by_type[type] > 0)
+        --slot.by_type[type];
 
     // The owner deregistered while this was still in flight and this was the
     // last one: the slot is now genuinely free, and the handler pointer is
@@ -554,7 +578,7 @@ void event_loop::run()
                 // has already counted the new submission, so this decrement
                 // belongs to the old one either way.
                 if (__builtin_expect((cqe->flags & IORING_CQE_F_MORE) == 0, 1))
-                    disarm(tok);
+                    disarm(tok, req ? req->type : op_nop);
             }
         }
 

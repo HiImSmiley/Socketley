@@ -60,6 +60,11 @@ public:
     // licence to free that storage; this reaching zero is.
     uint32_t owner_inflight(const io_handler* owner) const;
 
+    // The same figure broken down by operation kind, summed over every
+    // registration the handler has held.  out must hold op_type_count entries.
+    // A count alone says an owner cannot be released; the kind says why.
+    void owner_inflight_breakdown(const io_handler* owner, uint32_t* out) const;
+
     // True once the owner table has run out and handlers began sharing one
     // identity.  From that point owner_inflight() cannot answer for any single
     // one of them — it reports zero for a handler that never got a slot, which
@@ -185,7 +190,7 @@ private:
     // count it towards the next flush.  Every submit_* helper ends with this.
     void arm(io_request* req);
     // One completion for that submission has landed and no more will follow.
-    void disarm(uint32_t token);
+    void disarm(uint32_t token, uint8_t type);
     // A completion nobody can act on any more.
     void drop_completion(const struct io_uring_cqe* cqe, const io_request* req);
 
@@ -240,6 +245,9 @@ private:
     struct owner_slot
     {
         io_handler* handler{nullptr};
+        // The same total split by operation kind.  Diagnostics only: when a
+        // slot will not drain, this says which operation is holding it.
+        uint32_t    by_type[op_type_count]{};
         // The one value run() compares against; 0 while no registration holds
         // this slot, which no stamped token can equal.
         uint32_t    token{0};

@@ -186,9 +186,14 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
             // instance a completion, and it cannot be freed until that lands.
             if (*it)
             {
+                uint32_t by_type[op_type_count];
+                loop.owner_inflight_breakdown(it->get(), by_type);
                 std::string dbg = "reap: instance still owes the ring "
                                 + std::to_string(loop.owner_inflight(it->get()))
-                                + " completion(s)";
+                                + " completion(s):";
+                for (uint8_t t = 0; t < op_type_count; ++t)
+                    if (by_type[t])
+                        dbg += " " + std::string(io_op_name(t)) + "=" + std::to_string(by_type[t]);
                 LOG_DEBUG(dbg.c_str());
             }
 #endif
