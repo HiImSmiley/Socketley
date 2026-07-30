@@ -212,8 +212,21 @@ private:
     void process_command(client_connection* conn, std::string_view line);
     void process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
-    void flush_responses(client_connection* conn);
-    void flush_write_queue(client_connection* conn);
+
+    // Both report whether the submission reached the ring; see the definitions
+    // for why a caller must not ignore that.
+    bool flush_responses(client_connection* conn);
+    bool flush_write_queue(client_connection* conn);
+
+    // Arm the read that fits the configured mode.  Returns false when nothing
+    // reached the ring, with read_pending left clear so no one waits on it.
+    bool submit_client_read(client_connection* conn, int fd);
+
+    // Re-arm the listener, falling back to the backoff timer when the
+    // submission does not reach the ring.  Without that the cache stops taking
+    // connections silently — there is no completion left to report it.
+    void rearm_accept();
+    void schedule_accept_backoff();
 
     int m_listen_fd;
     struct sockaddr_in m_accept_addr;

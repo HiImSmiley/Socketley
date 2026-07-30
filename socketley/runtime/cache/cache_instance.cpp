@@ -5,6 +5,7 @@
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/lua_context.h"
+#include "../../shared/logging.h"
 #include "../../cli/command_hashing.h"
 
 #include <unistd.h>
@@ -224,15 +225,14 @@ bool cache_instance::setup(event_loop& loop)
     if (event_loop::supports_multishot_accept())
     {
         m_accept_req.type = op_multishot_accept;
-        loop.submit_multishot_accept(m_listen_fd, &m_accept_req);
         m_multishot_active = true;
     }
     else
     {
         m_accept_req.type = op_accept;
-        loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
         m_multishot_active = false;
     }
+    rearm_accept();
 
     // Periodic TTL sweep, started only once a key actually carries an expiry —
     // a store loaded from disk may already contain some, otherwise the first
@@ -265,7 +265,8 @@ bool cache_instance::setup(event_loop& loop)
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
         m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+            LOG_ERROR("cache: idle sweep timer refused — idle connections will not be reaped");
     }
 
     return true;
@@ -359,7 +360,15 @@ void cache_instance::arm_ttl_timer()
     if (m_ttl_timer_armed || !m_loop)
         return;
     m_ttl_timer_armed = true;
-    m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req);
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req)))
+    {
+        // Clear the flag again.  Nothing else would ever retry: mark_ttl_keys()
+        // only submits while the flag is unset, so a single refused timeout
+        // would stop the sweep for the lifetime of the runtime and leave every
+        // key with an expiry holding its memory until something touched it.
+        m_ttl_timer_armed = false;
+        LOG_WARN("cache: TTL sweep timer refused — expired keys keep their memory until touched");
+    }
 }
 
 void cache_instance::mark_ttl_keys()
@@ -453,18 +462,13 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                     }
                 }
-                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+                    LOG_ERROR("cache: idle sweep timer refused — no further sweeps will run");
             }
             // Accept backoff expired — resubmit accept
             else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
             {
-                if (m_multishot_active)
-                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-                else
-                {
-                    m_accept_addrlen = sizeof(m_accept_addr);
-                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
-                }
+                rearm_accept();
             }
             break;
         default:
@@ -527,34 +531,18 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 
         ptr->last_activity = now_tp;
 
-        ptr->read_pending = true;
-        if (ptr->direct_fd)
-        {
-            if (m_recv_multishot)
-                m_loop->submit_recv_multishot_fixed_file(ptr->fixed_idx, BUF_GROUP_ID, &ptr->read_req);
-            else if (m_use_provided_bufs)
-                m_loop->submit_read_provided_fixed_file(ptr->fixed_idx, BUF_GROUP_ID, &ptr->read_req);
-            else
-                m_loop->submit_read_fixed_file(ptr->fixed_idx, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
-        }
-        else
-        {
-            if (m_recv_multishot)
-                m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
-            else if (m_use_provided_bufs)
-                m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
-            else
-                m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
-        }
+        // A connection whose very first read cannot be armed has no way to make
+        // progress: the client would sit on an open socket that this side never
+        // reads from.  Nothing else touches ptr after this, so the teardown is
+        // safe here — the accept is still re-armed below.
+        if (SOCKETLEY_UNLIKELY(!submit_client_read(ptr, client_fd)))
+            close_client(ptr, client_fd, "read-submit-failed");
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
     if (client_fd == -EMFILE || client_fd == -ENFILE)
     {
-        m_accept_backoff_ts.tv_sec = 0;
-        m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        schedule_accept_backoff();
         return;
     }
 
@@ -562,19 +550,81 @@ cache_resubmit_accept:
     if (m_multishot_active)
     {
         if (!(cqe->flags & IORING_CQE_F_MORE))
-        {
-            if (m_listen_fd >= 0)
-                m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-        }
+            rearm_accept();
     }
     else
     {
-        if (m_listen_fd >= 0)
-        {
-            m_accept_addrlen = sizeof(m_accept_addr);
-            m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
-        }
+        rearm_accept();
     }
+}
+
+bool cache_instance::submit_client_read(client_connection* conn, int fd)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop))
+        return false;
+
+    conn->read_pending = true;
+    bool queued;
+    if (conn->direct_fd)
+    {
+        if (m_recv_multishot)
+            queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        else if (m_use_provided_bufs)
+            queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        else
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    }
+    else
+    {
+        if (m_recv_multishot)
+            queued = m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
+        else if (m_use_provided_bufs)
+            queued = m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
+        else
+            queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    }
+
+    // Leaving the flag set after a refusal is what turns a busy ring into a hung
+    // connection: every path here treats read_pending as "a completion is on its
+    // way", and none is.
+    if (SOCKETLEY_UNLIKELY(!queued))
+        conn->read_pending = false;
+    return queued;
+}
+
+void cache_instance::schedule_accept_backoff()
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop))
+        return;
+
+    m_accept_backoff_ts.tv_sec = 0;
+    m_accept_backoff_ts.tv_nsec = 100000000LL;
+    m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req)))
+        LOG_ERROR("cache: accept could not be re-armed and the retry timer was refused too — "
+                  "the listener has stopped taking connections");
+}
+
+void cache_instance::rearm_accept()
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || m_listen_fd < 0))
+        return;
+
+    bool queued;
+    if (m_multishot_active)
+    {
+        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+    }
+    else
+    {
+        m_accept_addrlen = sizeof(m_accept_addr);
+        queued = m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+    }
+
+    // The listener has no completion left to bring it back, so fall back to the
+    // backoff timer rather than going deaf without a word.
+    if (SOCKETLEY_UNLIKELY(!queued))
+        schedule_accept_backoff();
 }
 
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
@@ -620,10 +670,20 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             // bytes, and returns a buffer it never took, corrupting the ring's
             // free list.
             conn->read_req.type = op_read;
+            bool queued;
             if (conn->direct_fd)
-                m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
             else
-                m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+                queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                // The fallback is the only read left for this connection; with
+                // it refused there is nothing to wake it again.
+                conn->read_pending = false;
+                conn->closing = true;
+                if (!conn->write_pending && !conn->zc_notif_pending)
+                    close_client(conn, fd, "read-submit-failed");
+            }
             return;
         }
 
@@ -717,31 +777,39 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Flush accumulated responses as single write
-    flush_responses(conn);
+    if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+        conn->closing = true;
 
     if (m_loop && !conn->closing)
     {
-        if (!conn->read_pending)
+        if (!conn->read_pending && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
         {
-            conn->read_pending = true;
-            if (conn->direct_fd)
-            {
-                if (m_recv_multishot)
-                    m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-                else if (m_use_provided_bufs)
-                    m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-                else
-                    m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
-            }
-            else
-            {
-                if (m_recv_multishot)
-                    m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-                else if (m_use_provided_bufs)
-                    m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-                else
-                    m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
-            }
+            close_client(conn, fd, "read-submit-failed");
+            return;
+        }
+        return;
+    }
+
+    // Closing with nothing left in flight.  Every teardown in this runtime used
+    // to run out of a completion handler, which only works while a completion is
+    // still owed: a connection marked closing after its last operation had
+    // already finished sat here holding its fd and its subscriptions until the
+    // runtime stopped.  A refused submission makes that the ordinary case rather
+    // than a corner one, because the completion being waited on never existed.
+    if (conn->closing && !conn->read_pending && !conn->write_pending && !conn->zc_notif_pending)
+    {
+        // A queue that still holds data is not "nothing in flight": those are
+        // bytes the client already handed us and considers answered.  Push them
+        // out and let the write completion finish the teardown; closing on top
+        // of them discards a reply that was accepted.
+        if (!conn->write_queue.empty())
+        {
+            if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+                close_client(conn, fd, "write-submit-failed");
+        }
+        else
+        {
+            close_client(conn, fd, "closing-nothing-in-flight");
         }
     }
 }
@@ -763,7 +831,14 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 
         // Drain queue if we were waiting for NOTIF
         if (!conn->write_queue.empty() && !conn->write_pending)
-            flush_write_queue(conn);
+        {
+            if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+            {
+                conn->closing = true;
+                if (!conn->read_pending)
+                    close_client(conn, fd, "write-submit-failed");
+            }
+        }
         else if (conn->write_queue.empty() && !conn->write_pending &&
                  conn->closing && !conn->read_pending)
         {
@@ -832,16 +907,17 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             conn->write_batch_count = new_count;
 
             conn->write_pending = true;
+            bool queued;
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
                 if (conn->direct_fd)
-                    m_loop->submit_write_fixed_file(conn->fixed_idx,
+                    queued = m_loop->submit_write_fixed_file(conn->fixed_idx,
                         static_cast<const char*>(conn->write_iovs[0].iov_base),
                         static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                         &conn->write_req);
                 else
-                    m_loop->submit_write(conn->fd,
+                    queued = m_loop->submit_write(conn->fd,
                         static_cast<const char*>(conn->write_iovs[0].iov_base),
                         static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                         &conn->write_req);
@@ -852,9 +928,20 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                 conn->write_msg.msg_iovlen = new_count;
                 conn->write_req.type = op_writev;
                 if (conn->direct_fd)
-                    m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
+                    queued = m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
                 else
-                    m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
+                    queued = m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
+            }
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                // The tail of a short write cannot be handed over.  Leaving
+                // write_pending set strands the connection halfway through a
+                // reply, and the client would keep waiting for the rest of a
+                // response that no completion is left to finish.
+                conn->write_pending = false;
+                conn->closing = true;
+                if (!conn->read_pending && !conn->zc_notif_pending)
+                    close_client(conn, fd, "write-submit-failed");
             }
             return;
         }
@@ -871,7 +958,12 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     // Flush remaining queued messages
     if (!conn->write_queue.empty() && !conn->zc_notif_pending)
     {
-        flush_write_queue(conn);
+        if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+        {
+            conn->closing = true;
+            if (!conn->read_pending && !conn->zc_notif_pending)
+                close_client(conn, fd, "write-submit-failed");
+        }
     }
     else
     {
@@ -1934,7 +2026,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
     }
 }
 
-void cache_instance::flush_responses(client_connection* conn)
+// Returns false only when a submission was attempted and did not reach the
+// ring.  A caller that leaves write_pending set after that waits for a
+// completion that cannot come: the connection stops making progress and the
+// client is left holding a request nobody will ever answer.  On failure the
+// pending flags are cleared and the batch dropped — the bytes are
+// undeliverable, and saying so is the difference between a closed connection
+// and a hung one.
+bool cache_instance::flush_responses(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->response_buf.empty() || !m_loop || conn->closing))
     {
@@ -1942,7 +2041,7 @@ void cache_instance::flush_responses(client_connection* conn)
             SKL_TRACE_LOG("flush skipped fd=%d bytes=%zu closing=%d loop=%d",
                           conn->fd, conn->response_buf.size(),
                           (int)conn->closing, (int)(m_loop != nullptr));
-        return;
+        return true;
     }
     SKL_TRACE_ADD(conn, bytes_queued, conn->response_buf.size());
 
@@ -1955,7 +2054,7 @@ void cache_instance::flush_responses(client_connection* conn)
                   << conn->write_queue.bytes() << " bytes in "
                   << conn->write_queue.size() << " queued buffers), closing\n";
         conn->closing = true;
-        return;
+        return true;
     }
 
     // Fast-path: if no write is pending and queue is empty, submit directly
@@ -1970,24 +2069,34 @@ void cache_instance::flush_responses(client_connection* conn)
         conn->write_pending = true;
 
         auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+        bool queued;
         if (m_send_zc && len >= (512u << 10))
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
             if (conn->direct_fd)
-                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
             if (conn->direct_fd)
-                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
-        return;
+
+        if (SOCKETLEY_UNLIKELY(!queued))
+        {
+            conn->write_batch[0].clear();
+            conn->write_batch_count = 0;
+            conn->write_pending = false;
+            conn->zc_notif_pending = false;
+            return false;
+        }
+        return true;
     }
 
     // Append to the tail entry instead of adding another one whenever that keeps
@@ -2012,13 +2121,17 @@ void cache_instance::flush_responses(client_connection* conn)
     conn->response_buf.reserve(4096);
 
     if (!conn->write_pending)
-        flush_write_queue(conn);
+        return flush_write_queue(conn);
+    return true;
 }
 
-void cache_instance::flush_write_queue(client_connection* conn)
+// Same contract as flush_responses above: false means nothing reached the ring
+// and no completion is owed, so the caller has to stop treating the connection
+// as one that is still going to be written to.
+bool cache_instance::flush_write_queue(client_connection* conn)
 {
     if (!m_loop || conn->write_queue.empty() || conn->zc_notif_pending)
-        return;
+        return true;
 
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < client_connection::MAX_WRITE_BATCH)
@@ -2033,6 +2146,7 @@ void cache_instance::flush_write_queue(client_connection* conn)
     conn->write_batch_count = count;
     conn->write_pending = true;
 
+    bool queued;
     if (count == 1)
     {
         auto len = static_cast<uint32_t>(conn->write_batch[0].size());
@@ -2044,17 +2158,17 @@ void cache_instance::flush_write_queue(client_connection* conn)
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
             if (conn->direct_fd)
-                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
             if (conn->direct_fd)
-                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+                queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
     }
     else
@@ -2063,10 +2177,21 @@ void cache_instance::flush_write_queue(client_connection* conn)
         conn->write_msg.msg_iovlen = count;
         conn->write_req.type = op_writev;
         if (conn->direct_fd)
-            m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
+            queued = m_loop->submit_sendmsg_fixed_file(conn->fixed_idx, &conn->write_msg, &conn->write_req);
         else
-            m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
+            queued = m_loop->submit_sendmsg(conn->fd, &conn->write_msg, &conn->write_req);
     }
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
+        conn->write_pending = false;
+        conn->zc_notif_pending = false;
+        return false;
+    }
+    return true;
 }
 
 // ─── Lua accessor methods ───
@@ -2359,7 +2484,16 @@ void cache_instance::process_resp(client_connection* conn)
         // Cap response_buf at 1 MiB during large pipelines to prevent OOM
         if (conn->response_buf.size() > (1 << 20))
         {
-            flush_responses(conn);
+            if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+            {
+                // Nothing more can be delivered to this client, so parsing the
+                // rest of the pipeline only grows a reply buffer that will never
+                // be written.  Marking it is all this may do — the caller is
+                // still holding conn — and the tail of the read handler tears it
+                // down once it sees closing with nothing in flight.
+                conn->closing = true;
+                break;
+            }
             conn->response_buf.reserve(4096);
         }
     }
@@ -3247,8 +3381,16 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 sub_conn->write_queue.push(text_msg);
             }
 
-            if (!sub_conn->write_pending)
-                flush_write_queue(sub_conn);
+            if (!sub_conn->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(sub_conn)))
+            {
+                // Marking it is all that is allowed here.  close_client() would
+                // call unsubscribe_all() on the very subscriber set this loop is
+                // walking, and publish() returns into a command handler that
+                // goes on using its own connection.  The subscriber has a read
+                // armed; its handler finishes the teardown.
+                sub_conn->closing = true;
+                continue;
+            }
             count++;
         }
     }
@@ -3326,7 +3468,20 @@ void cache_instance::follower_kick(follower_conn& f)
     f.in_flight = f.out.size();
     f.write_req = { this, nullptr, f.fd, static_cast<uint32_t>(f.in_flight), op_write };
     f.write_pending = true;
-    m_loop->submit_write(f.fd, f.out.data(), static_cast<uint32_t>(f.in_flight), &f.write_req);
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(f.fd, f.out.data(),
+                                                 static_cast<uint32_t>(f.in_flight), &f.write_req)))
+    {
+        // Nothing restarts the stream after this: the write completion is what
+        // kicks the next one, and there will not be one.  Replication would go
+        // on looking healthy while the follower silently stopped advancing, so
+        // the follower is dropped instead — that it reconnects and takes a fresh
+        // dump is recoverable, a follower quietly stuck at an old snapshot is
+        // not.
+        f.write_pending = false;
+        f.in_flight = 0;
+        f.dead = true;
+        LOG_WARN("cache: replication write refused by the ring, dropping the follower");
+    }
 }
 
 bool cache_instance::follower_write(follower_conn& f, std::string_view data)
@@ -3343,8 +3498,11 @@ bool cache_instance::follower_write(follower_conn& f, std::string_view data)
         return false;
     }
 
+    // follower_kick() gives up on the follower when its write cannot be handed
+    // to the ring; report that here rather than letting the caller believe the
+    // data is on its way.
     follower_kick(f);
-    return true;
+    return !f.dead;
 }
 
 void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f)
@@ -3510,8 +3668,18 @@ bool cache_instance::connect_to_master()
 
     // Submit read for master data
     m_master_read_req = { this, m_master_read_buf, fd, sizeof(m_master_read_buf), op_read };
-    if (m_loop)
-        m_loop->submit_read(fd, m_master_read_buf, sizeof(m_master_read_buf), &m_master_read_req);
+    if (m_loop && SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, m_master_read_buf,
+                                                          sizeof(m_master_read_buf), &m_master_read_req)))
+    {
+        // Without this read the node is connected and deaf: the leader would
+        // stream the full dump and every command after it into a socket nobody
+        // drains.  Failing the connect outright keeps the follower visibly
+        // unsynced rather than silently frozen at an empty dataset.
+        LOG_ERROR("cache: read from master could not be armed — replication link not established");
+        close(fd);
+        m_master_fd = -1;
+        return false;
+    }
 
     // Set mode to readonly as follower
     m_mode = cache_mode_readonly;
@@ -3620,8 +3788,18 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     }
 
     // Re-submit read
-    if (m_loop && m_master_fd >= 0)
-        m_loop->submit_read(m_master_fd, m_master_read_buf, sizeof(m_master_read_buf), &m_master_read_req);
+    if (m_loop && m_master_fd >= 0 &&
+        SOCKETLEY_UNLIKELY(!m_loop->submit_read(m_master_fd, m_master_read_buf,
+                                                sizeof(m_master_read_buf), &m_master_read_req)))
+    {
+        // This read is the only thing that ever re-arms itself, so a refusal
+        // ends replication for good.  Dropping the socket makes the break look
+        // like a master disconnect, which is at least visible, instead of a
+        // follower that stays up serving a dataset that stopped advancing.
+        LOG_ERROR("cache: read from master refused — the replication link is dropped");
+        close(m_master_fd);
+        m_master_fd = -1;
+    }
 }
 
 // ─── Stats ───
