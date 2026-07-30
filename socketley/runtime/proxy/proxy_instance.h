@@ -14,6 +14,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
+#include "../../shared/trace.h"
 
 class runtime_manager;
 
@@ -83,11 +84,32 @@ struct alignas(64) proxy_client_connection
     size_t backend_idx{0};
     std::string saved_request;
 
+    // Group routing (@groupname) picks a member per connection, so backend_idx
+    // does not identify the target — it still points at the group entry, whose
+    // resolved_host/resolved_port are deliberately left unset.  These carry the
+    // endpoint that was actually selected.
+    // The client sent FIN while the backend connect was still in flight; its
+    // buffered payload still has to go out before this pair is torn down.
+    // Bumped on every reuse from the pool; stamped into io_requests so late
+    // completions from the previous occupant can be recognised and dropped.
+    uint32_t generation{0};
+    // One re-attempt when a connect completion turns out to reference a
+    // descriptor that is no longer valid.  That is an internal inconsistency,
+    // not a refusal by the backend, and it must not cost the client its
+    // connection.  Bounded so a persistent problem still surfaces.
+    bool connect_reattempted{false};
+    bool client_eof{false};
+    bool backend_from_group{false};
+    std::string backend_host;
+    uint16_t backend_port{0};
+
     // Async connect state
     bool connect_pending{false};
     int connect_fd{-1};
     io_request connect_req;
     struct sockaddr_in connect_addr{};
+
+    SKL_TRACE_FIELD(tr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -133,6 +155,8 @@ struct alignas(64) proxy_backend_connection
     bool http_no_body{false};      // 204/304/1xx: no message body
     uint16_t http_status_code{0};
     size_t http_body_remaining{0};
+
+    SKL_TRACE_FIELD(tr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -291,6 +315,11 @@ private:
     int acquire_pooled_backend(size_t backend_idx);
     void release_to_pool(int backend_fd, size_t backend_idx);
 
+    // Append "Host: <backend>:<port>\r\n" for the endpoint this connection was
+    // actually routed to.  Returns false when no usable endpoint is known, in
+    // which case the caller must leave the client's own Host header alone.
+    bool append_backend_host_header(std::string& out, const proxy_client_connection* conn) const;
+
     void forward_to_backend(proxy_client_connection* conn, std::string_view data);
     void forward_to_client(proxy_backend_connection* conn, std::string_view data);
     void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body);
@@ -388,5 +417,8 @@ private:
     size_t m_peak_connections{0};
 
     // Max backends for fixed-size array in select_and_resolve_backend
-    static constexpr size_t MAX_BACKENDS = 256;
+    // Reused availability list for random selection over healthy backends.
+    // Held here rather than on the stack so the number of backends is not
+    // silently bounded by a frame-sized array; reserved in setup().
+    std::vector<size_t> m_avail_scratch;
 };

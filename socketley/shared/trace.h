@@ -42,6 +42,26 @@ struct conn_stats
     uint32_t enobufs{0};          // provided-buffer pool ran dry
     uint32_t multishot_ends{0};   // multishot recv had to be re-armed
     double   opened_ms{0.0};
+
+    // Why the connection ended.  A teardown with no reason recorded here was
+    // decided somewhere other than the read path, which is worth knowing on its
+    // own — "it just closed" is never a useful answer.
+    int      last_read_res{1};    // 1 = no read completion has failed yet
+    unsigned last_read_flags{0};
+
+    // The splice pipeline moves bytes without them ever reaching userspace, so
+    // the read/write counters above stay at zero for a spliced connection.
+    // These make that path visible: how much the kernel moved, and what the
+    // last splice completion said.
+    uint64_t spliced{0};
+    // The conservation law: what a connection takes off its socket into the
+    // pipe must come out of the pipe onto the peer's socket.  Any difference
+    // beyond what is still resident in the pipe is loss, and which of the two
+    // counters fell short names the hop it happened on.
+    uint64_t sp_in{0};    // socket -> pipe   (leg 1 on a client, leg 3 on a backend)
+    uint64_t sp_out{0};   // pipe   -> socket (leg 2 on a client, leg 4 on a backend)
+    int      last_splice_res{1};
+    unsigned splice_leg{0};       // 1=c->pipe 2=pipe->be 3=be->pipe 4=pipe->c
 };
 
 } // namespace skl_trace

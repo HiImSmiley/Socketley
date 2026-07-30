@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Integration test: a proxy with more backends than the old fixed-size buffer held.
+#
+# Random selection over healthy backends collected the available indices into a
+# 256-entry array on the stack, filled by a loop bounded only by the number of
+# configured backends.  Nothing capped that number, so backend 257 wrote past
+# the end of the frame; the stack protector catches it and aborts the process.
+#
+# This test runs its own daemon on its own socket and state directory.  That is
+# not tidiness: against a build with the defect the daemon dies, and if that
+# were the shared one it would take every later test in the suite with it.
+set -euo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+
+PROXY_PORT=19286
+SINK_PORT=19287
+BACKENDS=300
+PASS=0; FAIL=0; TOTAL=0
+
+TMPDIR_T=$(mktemp -d /tmp/socketley-manybe-XXXXXX)
+export HOME="$TMPDIR_T/home"
+export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
+mkdir -p "$HOME"
+DPID=""
+NC_PID=""
+
+cleanup() {
+    [ -n "$NC_PID" ] && kill "$NC_PID" 2>/dev/null || true
+    [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true
+    rm -rf "$TMPDIR_T"
+}
+trap cleanup EXIT
+
+echo "=== Integration: proxy with $BACKENDS backends ==="
+
+"$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
+DPID=$!
+sleep 2
+
+# One reachable sink so a backend is usable; the rest are dead ends.
+timeout 25 nc -l 127.0.0.1 "$SINK_PORT" >/dev/null 2>&1 &
+NC_PID=$!
+sleep 0.3
+
+BE="127.0.0.1:$SINK_PORT"
+for i in $(seq 1 $((BACKENDS-1))); do
+    BE="$BE,127.0.0.1:$((21000+i))"
+done
+
+"$BIN" create proxy manybe -p "$PROXY_PORT" --backend "$BE" \
+    --protocol tcp --strategy random --health-check tcp --health-interval 1 -s 2>&1 || true
+sleep 2
+
+TOTAL=$((TOTAL+1))
+if "$BIN" stats manybe 2>/dev/null | grep -q "^backends:$BACKENDS$"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [setup]: proxy does not report $BACKENDS backends"
+fi
+
+# Every connection runs backend selection, which is where the overflow happened.
+for i in 1 2 3 4 5; do
+    printf 'probe\n' | timeout 2 nc -q 1 127.0.0.1 "$PROXY_PORT" >/dev/null 2>&1 || true
+done
+sleep 0.5
+
+TOTAL=$((TOTAL+1))
+if kill -0 "$DPID" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [daemon survived backend selection]: it aborted"
+    grep -E "stack smashing|AddressSanitizer|Segmentation" "$TMPDIR_T/daemon.log" 2>/dev/null | head -3
+fi
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"

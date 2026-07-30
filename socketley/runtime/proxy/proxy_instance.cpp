@@ -11,6 +11,8 @@
 #include <charconv>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <algorithm>
@@ -49,6 +51,8 @@ proxy_instance::~proxy_instance()
 
 void proxy_client_connection::reset(int new_fd)
 {
+    ++generation;
+    connect_reattempted = false;
     fd = new_fd;
     read_pending = false;
     write_pending = false;
@@ -78,6 +82,11 @@ void proxy_client_connection::reset(int new_fd)
     retries_remaining = 0;
     backend_idx = 0;
     saved_request.clear();
+    SKL_TRACE_RESET(*this);
+    client_eof = false;
+    backend_from_group = false;
+    backend_host.clear();
+    backend_port = 0;
     connect_pending = false;
     connect_fd = -1;
     connect_req = {};
@@ -86,6 +95,7 @@ void proxy_client_connection::reset(int new_fd)
 
 void proxy_backend_connection::reset(int new_fd)
 {
+    SKL_TRACE_RESET(*this);
     fd = new_fd;
     read_pending = false;
     write_pending = false;
@@ -319,6 +329,8 @@ bool proxy_instance::setup(event_loop& loop)
         if (!resolve_backend(b))
             return false;
     }
+
+    m_avail_scratch.reserve(m_backends.size());
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
@@ -591,6 +603,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_splice(cqe, req);
             break;
         case op_connect:
+        case op_poll:
             handle_connect(cqe, req);
             break;
         case op_health_check:
@@ -724,7 +737,41 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         if (m_idle_timeout_cached > 0)
             ptr->last_activity = std::chrono::steady_clock::now();
 
+        SKL_TRACE_SET(ptr, opened_ms, ::skl_trace::now_ms());
         invoke_on_connect(client_fd);
+
+        // TCP: which backend this goes to does not depend on anything the client
+        // sends, so connect first and only start reading once there is somewhere
+        // to put the data.  Reading earlier means acknowledging bytes at the TCP
+        // level that we may then have to discard if no backend materialises —
+        // the client is told they arrived and nobody ever finds out otherwise.
+        // Until the read is armed the bytes simply stay in the socket buffer and
+        // TCP flow control slows the client down, which is the honest signal.
+        if (m_protocol == protocol_tcp)
+        {
+            auto* target = select_and_resolve_backend(ptr);
+            bool have_target = (target != nullptr);
+            bool connected = have_target && connect_to_backend(ptr, target);
+            if (SOCKETLEY_UNLIKELY(!connected))
+            {
+                SKL_TRACE_LOG("accept-connect-failed cfd=%d target=%d errno=%d (%s) clients=%u",
+                              client_fd, (int)have_target, errno, strerror(errno), (unsigned)m_client_count);
+                if (have_target) record_backend_error(ptr->backend_idx);
+                close_pair(client_fd, -1);
+                goto proxy_resubmit_accept;
+            }
+
+            // Still connecting — handle_connect arms the read once it is up.
+            if (ptr->connect_pending)
+                goto proxy_resubmit_accept;
+
+            // Connected synchronously.  If that path already handed the
+            // connection to the splice pipeline, the pipeline is the reader —
+            // arming a userspace read as well would put two readers on the same
+            // socket and let their data reach the backend out of order.
+            if (ptr->splice_active)
+                goto proxy_resubmit_accept;
+        }
 
         ptr->read_pending = true;
         if (m_recv_multishot)
@@ -822,6 +869,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
+        SKL_TRACE_SET(conn, last_read_res, cqe->res);
+        SKL_TRACE_SET(conn, last_read_flags, cqe->flags);
+
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
         {
@@ -849,6 +899,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
+    SKL_TRACE_ADD(conn, bytes_read, (unsigned long long)cqe->res);
+    SKL_TRACE_ADD(conn, reads, 1);
+
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
@@ -864,6 +917,31 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             uint16_t buf_id_rl = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
             m_loop->return_buf(BUF_GROUP_ID, buf_id_rl);
         }
+        // A zero-length completion is end of stream only when the socket is
+        // actually drained.  IORING_CQE_F_SOCK_NONEMPTY says the opposite: the
+        // multishot recv ended while data is still queued.  Treating that as
+        // EOF tears the connection down under a client that is still writing,
+        // and its next write fails for data the proxy simply never collected.
+        if (cqe->res == 0 && (cqe->flags & IORING_CQE_F_SOCK_NONEMPTY) && !conn->closing)
+        {
+            SKL_TRACE_ADD(conn, multishot_ends, 1);
+            if (!conn->read_pending)
+                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+            return;
+        }
+
+        // A clean EOF from the client means it will send no more — not that we
+        // may throw away what it already sent.  With the backend connect still
+        // in flight the whole payload sits in saved_request, and tearing down
+        // here discards it silently: the client's writes all succeeded, and the
+        // backend never sees a byte.  Hold the connection until the connect
+        // completes and handle_connect has forwarded it.
+        if (cqe->res == 0 && conn->connect_pending && !conn->saved_request.empty())
+        {
+            conn->client_eof = true;
+            return;
+        }
+
         close_pair(fd, conn->backend_fd);
         return;
     }
@@ -954,6 +1032,17 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         forward_to_backend(conn, data);
         if (is_provided)
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
+
+        if (SOCKETLEY_LIKELY(!conn->closing) && conn->splice_active &&
+            conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
+        {
+            // The read that raced the splice start has now been handed to the
+            // write queue; once that has drained the pipeline can take over.
+            auto& be2 = m_conn_idx[conn->backend_fd];
+            if (be2.side == conn_backend && !be2.backend->write_pending &&
+                be2.backend->write_queue.empty())
+                start_splice_forwarding(conn, be2.backend);
+        }
 
         if (SOCKETLEY_LIKELY(!conn->closing))
         {
@@ -1130,6 +1219,11 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
+        SKL_TRACE_LOG("backend-read-end bfd=%d cfd=%d res=%d flags=0x%x queued=%llu written=%llu",
+                      fd, conn->client_fd, cqe->res, cqe->flags,
+                      (unsigned long long)conn->tr.bytes_queued,
+                      (unsigned long long)conn->tr.bytes_written);
+
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
         {
@@ -1464,6 +1558,38 @@ bool proxy_instance::parse_http_request_line(proxy_client_connection* conn)
     return true;
 }
 
+bool proxy_instance::append_backend_host_header(std::string& out,
+                                                const proxy_client_connection* conn) const
+{
+    std::string_view host;
+    uint16_t port = 0;
+
+    if (conn->backend_from_group)
+    {
+        host = conn->backend_host;
+        port = conn->backend_port;
+    }
+    else if (conn->backend_idx < m_backends.size())
+    {
+        host = m_backends[conn->backend_idx].resolved_host;
+        port = m_backends[conn->backend_idx].resolved_port;
+    }
+
+    // A group entry keeps resolved_host empty and resolved_port zero; emitting
+    // it would put a literal "Host: :0" on the wire.
+    if (host.empty() || port == 0)
+        return false;
+
+    out += "Host: ";
+    out += host;
+    out += ':';
+    char port_buf[8];
+    auto [pend, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+    out.append(port_buf, static_cast<size_t>(pend - port_buf));
+    out += "\r\n";
+    return true;
+}
+
 // Case-insensitive header name match helper
 std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                                                   std::string_view new_path)
@@ -1526,18 +1652,7 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // Rewrite Host header to backend address
         if (header_name_equals(hdr_line, "host", 4))
         {
-            if (conn->backend_idx < m_backends.size())
-            {
-                auto& b = m_backends[conn->backend_idx];
-                result += "Host: ";
-                result += b.resolved_host;
-                result += ':';
-                char port_buf[8];
-                auto [pend, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), b.resolved_port);
-                result.append(port_buf, static_cast<size_t>(pend - port_buf));
-                result += "\r\n";
-            }
-            else
+            if (!append_backend_host_header(result, conn))
             {
                 result += hdr_line;
                 result += "\r\n";
@@ -1557,17 +1672,8 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     }
 
     // Add Host if not present
-    if (!host_written && conn->backend_idx < m_backends.size())
-    {
-        auto& b = m_backends[conn->backend_idx];
-        result += "Host: ";
-        result += b.resolved_host;
-        result += ':';
-        char port_buf[8];
-        auto [pend, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), b.resolved_port);
-        result.append(port_buf, static_cast<size_t>(pend - port_buf));
-        result += "\r\n";
-    }
+    if (!host_written)
+        append_backend_host_header(result, conn);
 
     // Request keep-alive to enable backend connection pooling,
     // unless the client sent Connection: close
@@ -1588,6 +1694,10 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
 {
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
         return nullptr;
+
+    // Cleared up front so every non-group return path leaves it false, including
+    // a keep-alive connection that was group-routed on an earlier request.
+    conn->backend_from_group = false;
 
     // Fast path: check if any backend is a group
     bool has_group = false;
@@ -1665,20 +1775,26 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
 
             if (m_strategy == strategy_random)
             {
-                // Build availability list in a single pass
-                size_t avail_indices[MAX_BACKENDS];
-                size_t avail_count = 0;
+                // Build availability list in a single pass.  This used to fill a
+                // fixed 256-entry stack array from a loop bounded only by the
+                // number of configured backends, so a 257th backend wrote past
+                // the end of the frame — reliably fatal, since the stack
+                // protector catches it and aborts the whole daemon.  Nothing
+                // capped the backend count, so the array's size was never a
+                // limit anyone enforced.  The scratch vector is a member and is
+                // reserved at setup, so this stays allocation-free per call.
+                m_avail_scratch.clear();
                 for (size_t i = 0; i < pool_size; i++)
                 {
                     if (is_backend_available(i))
-                        avail_indices[avail_count++] = i;
+                        m_avail_scratch.push_back(i);
                 }
 
-                if (avail_count == 0)
+                if (m_avail_scratch.empty())
                     return nullptr;
 
-                std::uniform_int_distribution<size_t> dist(0, avail_count - 1);
-                selected_idx = avail_indices[dist(m_rng)];
+                std::uniform_int_distribution<size_t> dist(0, m_avail_scratch.size() - 1);
+                selected_idx = m_avail_scratch[dist(m_rng)];
                 found = true;
             }
             else
@@ -1796,10 +1912,16 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         }
     }
 
-    // Write selected result into scratch space
+    // Write selected result into scratch space.  The scratch is shared by all
+    // connections and is overwritten by the next selection, so the endpoint is
+    // also recorded on the connection itself — everything after the connect
+    // (Host rewrite, pool eligibility) has to read it from there.
     m_scratch_backend.resolved_host = std::move(selected->host);
     m_scratch_backend.resolved_port = selected->port;
     m_scratch_backend.has_cached_addr = false;
+    conn->backend_from_group = true;
+    conn->backend_host = m_scratch_backend.resolved_host;
+    conn->backend_port = m_scratch_backend.resolved_port;
     if (inet_pton(AF_INET, m_scratch_backend.resolved_host.c_str(),
                   &m_scratch_backend.cached_addr.sin_addr) == 1)
     {
@@ -1894,8 +2016,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     int bfd = -1;
 
-    // Try connection pool first (both TCP and HTTP, non-group backends)
-    if (!target->is_group && conn->backend_idx < m_backend_pool.size())
+    // Try connection pool first (both TCP and HTTP, non-group backends).
+    // A group-routed connection must not touch the pool: its backend_idx still
+    // points at the group entry, so it would hand back a connection to some
+    // other endpoint entirely.
+    if (!target->is_group && !conn->backend_from_group && conn->backend_idx < m_backend_pool.size())
     {
         bfd = acquire_pooled_backend(conn->backend_idx);
     }
@@ -2046,7 +2171,9 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
                         forward_to_backend(conn, conn->saved_request);
                         conn->saved_request.clear();
                     }
-                    start_splice_forwarding(conn, ptr);
+                    // Only queued, not written yet — see handle_connect.
+                    if (!ptr->write_pending && ptr->write_queue.empty())
+                        start_splice_forwarding(conn, ptr);
                     return true;  // connect_pending stays false, splice handles data flow
                 }
             }
@@ -2070,15 +2197,23 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    // EINPROGRESS — async connect via io_uring
+    // EINPROGRESS — the kernel is already completing the handshake for the
+    // socket we just called connect() on.  Waiting for it means polling for
+    // writability, not issuing a second connect: io_uring runs that against an
+    // fd that is already connected and answers EISCONN, and that completion was
+    // then dropped rather than acted on, leaving the connection wedged.
     conn->connect_pending = true;
     conn->connect_fd = bfd;
     conn->connect_addr = addr;
-    conn->connect_req = { this, nullptr, conn->fd, 0, op_connect };
+    conn->connect_req = { this, nullptr, conn->fd, 0, op_poll, conn->generation };
 
-    m_loop->submit_connect(bfd,
-        reinterpret_cast<const struct sockaddr*>(&conn->connect_addr),
-        sizeof(conn->connect_addr), &conn->connect_req);
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(bfd, POLLOUT, &conn->connect_req)))
+    {
+        close(bfd);
+        conn->connect_fd = -1;
+        conn->connect_pending = false;
+        return false;
+    }
 
     return true;  // connect_pending = true — caller must check
 }
@@ -2112,8 +2247,14 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     if (!m_loop || !conn->splice_active || !bconn->splice_active)
         return;
 
-    // Client -> pipe_write (first leg of client -> backend)
-    if (!conn->splice_in_pending)
+    // Client -> pipe_write (first leg of client -> backend).
+    //
+    // Not while a userspace read is still in flight: that read's data goes to
+    // the backend through the write queue, and the pipe would carry newer bytes
+    // to the same socket at the same time.  Two independent writers on one
+    // connection is exactly how later data ends up ahead of earlier data.
+    // handle_client_read starts the pipeline once the read has been consumed.
+    if (!conn->splice_in_pending && !conn->read_pending)
     {
         conn->splice_in_pending = true;
         m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
@@ -2144,6 +2285,9 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         if (req == &conn->splice_in_req)
         {
             conn->splice_in_pending = false;
+            SKL_TRACE_SET(conn, last_splice_res, cqe->res);
+            SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 1u : 3u);
+            if (cqe->res > 0) { SKL_TRACE_ADD(conn, spliced, (unsigned long long)cqe->res); SKL_TRACE_ADD(conn, sp_in, (unsigned long long)cqe->res); }
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -2169,7 +2313,10 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         }
         else if (req == &conn->splice_out_req)
         {
+            if (cqe->res > 0) SKL_TRACE_ADD(conn, sp_out, (unsigned long long)cqe->res);
             conn->splice_out_pending = false;
+            SKL_TRACE_SET(conn, last_splice_res, cqe->res);
+            SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 2u : 4u);
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -2182,6 +2329,19 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     return;
                 }
                 close_pair(conn->fd, conn->backend_fd);
+                return;
+            }
+
+            // Same on this leg: what a partial splice left in the pipe has to go
+            // out before anything else happens, or it is lost.
+            int pipe_left = 0;
+            if (conn->pipe_to_backend[0] >= 0)
+                ioctl(conn->pipe_to_backend[0], FIONREAD, &pipe_left);
+            if (pipe_left > 0 && conn->backend_fd >= 0)
+            {
+                conn->splice_out_pending = true;
+                m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req);
                 return;
             }
 
@@ -2205,6 +2365,9 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         if (req == &conn->splice_in_req)
         {
             conn->splice_in_pending = false;
+            SKL_TRACE_SET(conn, last_splice_res, cqe->res);
+            SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 1u : 3u);
+            if (cqe->res > 0) { SKL_TRACE_ADD(conn, spliced, (unsigned long long)cqe->res); SKL_TRACE_ADD(conn, sp_in, (unsigned long long)cqe->res); }
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -2220,8 +2383,12 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
-            // Data is now in pipe_to_client — splice it out to the client fd
-            if (conn->client_fd >= 0)
+            // Data is now in pipe_to_client — splice it out to the client fd.
+            // Only ever into a client that still names us as its backend: a
+            // descriptor alone does not prove identity once fd numbers are reused.
+            if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
+                m_conn_idx[conn->client_fd].side == conn_client &&
+                m_conn_idx[conn->client_fd].client->backend_fd == conn->fd)
             {
                 conn->splice_out_pending = true;
                 m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
@@ -2230,7 +2397,10 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         }
         else if (req == &conn->splice_out_req)
         {
+            if (cqe->res > 0) SKL_TRACE_ADD(conn, sp_out, (unsigned long long)cqe->res);
             conn->splice_out_pending = false;
+            SKL_TRACE_SET(conn, last_splice_res, cqe->res);
+            SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 2u : 4u);
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -2243,6 +2413,21 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     return;
                 }
                 close_pair(conn->client_fd, conn->fd);
+                return;
+            }
+
+            // A splice can move fewer bytes than the pipe holds.  Whatever stays
+            // there is in neither a socket buffer nor a write queue, so going
+            // back to the inbound leg — or closing — simply loses it.  Drain the
+            // pipe first; only then continue.
+            int pipe_left = 0;
+            if (conn->pipe_to_client[0] >= 0)
+                ioctl(conn->pipe_to_client[0], FIONREAD, &pipe_left);
+            if (pipe_left > 0 && conn->client_fd >= 0)
+            {
+                conn->splice_out_pending = true;
+                m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req);
                 return;
             }
 
@@ -2280,6 +2465,10 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     if (bconn->http_conn_close)
         return false;
     if (!cconn)
+        return false;
+    // Group-routed connections carry a per-connection endpoint that backend_idx
+    // does not describe; pooling one would file it under an unrelated backend.
+    if (cconn->backend_from_group)
         return false;
     size_t idx = cconn->backend_idx;
     if (idx >= backends.size() || backends[idx].is_group)
@@ -2335,9 +2524,17 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
         {
             auto* bconn = be.backend;
             if (bconn->read_pending || bconn->write_pending ||
-                bconn->splice_in_pending || bconn->splice_out_pending)
+                bconn->splice_in_pending || bconn->splice_out_pending ||
+                !bconn->write_queue.empty())
             {
+                // A queue that still holds data is as good a reason to defer as an
+                // operation in flight: closing here throws away bytes the client
+                // already handed us and considers delivered.  Keep the write side
+                // open and push them out; the write completion tears down once the
+                // queue has actually drained.
                 bconn->closing = true;
+                if (!bconn->write_pending && !bconn->write_queue.empty())
+                    flush_backend_write_queue(bconn);
                 shutdown(backend_fd, SHUT_RD);
             }
             else
@@ -2376,9 +2573,12 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 {
                     auto* bconn2 = be2.backend;
                     if (bconn2->read_pending || bconn2->write_pending ||
-                        bconn2->splice_in_pending || bconn2->splice_out_pending)
+                        bconn2->splice_in_pending || bconn2->splice_out_pending ||
+                        !bconn2->write_queue.empty())
                     {
                         bconn2->closing = true;
+                        if (!bconn2->write_pending && !bconn2->write_queue.empty())
+                            flush_backend_write_queue(bconn2);
                         shutdown(conn->backend_fd, SHUT_RD);
                     }
                     else
@@ -2404,9 +2604,12 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             }
 
             if (conn->read_pending || conn->write_pending ||
-                conn->splice_in_pending || conn->splice_out_pending)
+                conn->splice_in_pending || conn->splice_out_pending ||
+                !conn->write_queue.empty())
             {
                 conn->closing = true;
+                if (!conn->write_pending && !conn->write_queue.empty())
+                    flush_client_write_queue(conn);
                 shutdown(client_fd, SHUT_RD);
             }
             else
@@ -2418,6 +2621,68 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 if (conn->pipe_to_backend[1] >= 0) close(conn->pipe_to_backend[1]);
                 conn->pipe_to_backend[0] = -1;
                 conn->pipe_to_backend[1] = -1;
+
+#ifdef SOCKETLEY_TRACE
+                // One report per connection, at the point it actually goes away.
+                // Emitting it on every close_pair call produced snapshots of a
+                // teardown still in progress, which is worse than no number at
+                // all.  "unread" is the discriminator: bytes still sitting in
+                // the socket when we close are bytes the client believes it
+                // delivered, and its next write will fail.
+                {
+                    [[maybe_unused]] int unread = 0;
+                    ioctl(client_fd, FIONREAD, &unread);
+                    [[maybe_unused]] unsigned long long be_spliced = 0;
+                    [[maybe_unused]] long long be_owed = 0;
+                    if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
+                        m_conn_idx[conn->backend_fd].side == conn_backend)
+                    {
+                        [[maybe_unused]] auto* tb = m_conn_idx[conn->backend_fd].backend;
+                        be_owed = (long long)(tb->tr.bytes_queued - tb->tr.bytes_written);
+                    }
+                    [[maybe_unused]] unsigned long long be_in = 0, be_out = 0;
+                    [[maybe_unused]] int pipe_c = 0, pipe_b = 0, unread_b = 0;
+                    if (conn->pipe_to_backend[0] >= 0)
+                        ioctl(conn->pipe_to_backend[0], FIONREAD, &pipe_c);
+                    if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
+                        m_conn_idx[conn->backend_fd].side == conn_backend)
+                    {
+                        [[maybe_unused]] auto* tb2 = m_conn_idx[conn->backend_fd].backend;
+                        be_in = tb2->tr.sp_in; be_out = tb2->tr.sp_out;
+                        if (tb2->pipe_to_client[0] >= 0)
+                            ioctl(tb2->pipe_to_client[0], FIONREAD, &pipe_b);
+                        ioctl(conn->backend_fd, FIONREAD, &unread_b);
+                    }
+                    // Conservation: c_in == c_out + pipe_c, and be_in == be_out + pipe_b.
+                    // Whichever equation fails names the hop the bytes vanished on.
+                    SKL_TRACE_LOG("final cfd=%d life=%.1fms | c_in=%llu c_out=%llu pipe_c=%d "
+                                  "| be_in=%llu be_out=%llu pipe_b=%d "
+                                  "| unread_c=%d unread_b=%d owed=%lld sres=%d leg=%u rres=%d",
+                        client_fd, ::skl_trace::now_ms() - conn->tr.opened_ms,
+                        (unsigned long long)conn->tr.sp_in, (unsigned long long)conn->tr.sp_out, pipe_c,
+                        be_in, be_out, pipe_b,
+                        unread, unread_b, be_owed,
+                        conn->tr.last_splice_res, conn->tr.splice_leg,
+                        conn->tr.last_read_res);
+                }
+
+#endif
+                // Drop every back-reference to this descriptor before it goes
+                // back to the kernel.  The detach used to be one-sided: tearing
+                // the backend down clears the client's backend_fd, but a client
+                // that dies first leaves a deferred backend still holding
+                // client_fd.  The number is reused by the next accept within
+                // microseconds, and the stale backend then splices its data into
+                // a stranger's socket and takes that connection down with it when
+                // it sees EOF — a healthy client killed mid-transfer, with no
+                // error recorded anywhere.
+                for (int cand : { backend_fd, conn->backend_fd })
+                {
+                    if (cand < 0 || cand >= MAX_FDS) continue;
+                    auto& bslot = m_conn_idx[cand];
+                    if (bslot.side == conn_backend && bslot.backend->client_fd == client_fd)
+                        bslot.backend->client_fd = -1;
+                }
 
                 shutdown(client_fd, SHUT_RDWR);
                 close(client_fd);
@@ -2554,12 +2819,28 @@ void proxy_instance::health_check_sweep()
 
         struct sockaddr_in addr{};
         if (b.has_cached_addr)
+        {
             addr = b.cached_addr;
+        }
         else
         {
             addr.sin_family = AF_INET;
             addr.sin_port = htons(b.resolved_port);
-            inet_pton(AF_INET, b.resolved_host.c_str(), &addr.sin_addr);
+
+            // has_cached_addr is only false for a hostname that failed to
+            // resolve at setup.  inet_pton cannot parse a hostname and leaves
+            // sin_addr zeroed — connecting to 0.0.0.0 reaches localhost, so the
+            // check would probe an unrelated local service and record the
+            // result as this backend's health.  Skip the check instead and
+            // leave the health state untouched; the data path still retries DNS
+            // on each connect.
+            if (inet_pton(AF_INET, b.resolved_host.c_str(), &addr.sin_addr) != 1)
+            {
+                close(fd);
+                hc.fd = -1;
+                hc.current = async_health_check::done;
+                continue;
+            }
         }
 
         // Store addr in write_buf for connect (we need it to persist)
@@ -2706,6 +2987,12 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         return;
 
     auto* conn = entry.client;
+
+    // The struct at this fd may already belong to a different connection than
+    // the one that issued this connect; the generation says which.
+    if (SOCKETLEY_UNLIKELY(req->generation != conn->generation))
+        return;
+
     if (SOCKETLEY_UNLIKELY(!conn->connect_pending))
         return;
 
@@ -2713,10 +3000,59 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     int bfd = conn->connect_fd;
     conn->connect_fd = -1;
 
-    if (cqe->res < 0)
+    // A poll completion only reports readiness; whether the connect succeeded
+    // is in SO_ERROR.  Fold it into one value so the failure path stays shared.
+    int res = cqe->res;
+    bool fd_ours = (bfd >= 0);
+    if (res >= 0 && req->type == op_poll)
     {
+        // A poll completion carries the revents mask, and POLLNVAL, POLLERR and
+        // POLLHUP are all positive — testing only the sign accepts them as
+        // "writable".  POLLNVAL in particular means the descriptor is no longer
+        // valid, so the socket must not be touched again, least of all closed:
+        // the number may already belong to someone else.
+        const int revents = res;
+        int so_err = 0;
+        socklen_t elen = sizeof(so_err);
+        if (bfd < 0 || (revents & POLLNVAL))
+        {
+            res = -EBADF;
+            fd_ours = false;
+        }
+        else if (getsockopt(bfd, SOL_SOCKET, SO_ERROR, &so_err, &elen) < 0)
+        {
+            // The descriptor is already gone.  It is not ours to close: the
+            // number has very likely been handed to another socket by now, and
+            // closing it again destroys a live connection that has nothing to
+            // do with this one — turning one failure into several.
+            res = -errno;
+            fd_ours = false;
+        }
+        else if (so_err != 0)
+        {
+            res = -so_err;
+        }
+    }
+
+    if (res < 0)
+    {
+        SKL_TRACE_LOG("connect-result-failed cfd=%d bfd=%d res=%d (%s) saved=%zu",
+                      client_fd, bfd, res, strerror(res < 0 ? -res : 0),
+                      conn->saved_request.size());
         // Connect failed
-        if (bfd >= 0) close(bfd);
+        if (fd_ours && bfd >= 0) close(bfd);
+
+        // The descriptor was gone rather than the backend refusing us.  Nothing
+        // about the client is wrong in that case, and it may already have data
+        // waiting — take one fresh socket before giving up on it.
+        if (!fd_ours && !conn->connect_reattempted && !conn->closing &&
+            m_protocol == protocol_tcp)
+        {
+            conn->connect_reattempted = true;
+            auto* again = select_and_resolve_backend(conn);
+            if (again && connect_to_backend(conn, again))
+                return;
+        }
         record_backend_error(conn->backend_idx);
 
         if (m_protocol == protocol_http)
@@ -2769,13 +3105,21 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
             setup_splice_pipes(conn, ptr);
             if (conn->splice_active)
             {
-                // Forward saved data via write, then start splice
+                // Forward saved data via write, then start splice.
                 if (!conn->saved_request.empty())
                 {
                     forward_to_backend(conn, conn->saved_request);
                     conn->saved_request.clear();
                 }
-                start_splice_forwarding(conn, ptr);
+
+                // forward_to_backend only queues; the write is still in flight.
+                // Splice writes to the same backend socket through a separate
+                // io_uring operation, and nothing orders the two against each
+                // other — starting it now lets later data overtake the bytes
+                // that opened the stream.  handle_backend_write starts splice
+                // once the queue has actually drained.
+                if (!ptr->write_pending && ptr->write_queue.empty())
+                    start_splice_forwarding(conn, ptr);
                 return;
             }
         }
@@ -2797,6 +3141,18 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         if (m_mesh.retry_count <= 0)
             conn->saved_request.clear();
     }
+
+    // The client read was deliberately left unarmed until a backend existed;
+    // now that one does, start taking data.  (The splice path returns earlier —
+    // there the pipeline does the reading.)
+    if (!conn->closing && !conn->read_pending && !conn->splice_active)
+        submit_read_op(m_loop, conn->fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+
+    // The client had already half-closed while this connect was in flight.  Now
+    // that its payload is on its way, pass the half-close on rather than leaving
+    // the pair open waiting for a client that will never write again.
+    if (conn->client_eof)
+        shutdown(bfd, SHUT_WR);
 }
 
 void proxy_instance::record_backend_error(size_t backend_idx)
@@ -2919,6 +3275,7 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
             continue;
 
         conn->backend_idx = idx;
+        conn->backend_from_group = false;
 
         // If async connect pending, handle_connect will forward saved_request
         if (conn->connect_pending)
@@ -3085,19 +3442,36 @@ void proxy_instance::set_on_proxy_response(proxy_hook cb) { m_cb_on_proxy_respon
 
 void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::string_view data)
 {
+    // Every path out of here that does not deliver has to take the client down
+    // with it.  Returning quietly leaves the client connection open and
+    // accepting: it keeps writing, every write succeeds, and not one byte
+    // reaches the backend.  A dropped connection is a bad outcome; a connection
+    // that silently swallows data is a worse one, because nobody finds out.
     if (SOCKETLEY_UNLIKELY(conn->backend_fd < 0 || !m_loop))
+    {
+        conn->closing = true;
         return;
+    }
 
     if (SOCKETLEY_UNLIKELY(conn->backend_fd >= MAX_FDS))
+    {
+        conn->closing = true;
         return;
+    }
 
     auto& be = m_conn_idx[conn->backend_fd];
     if (SOCKETLEY_UNLIKELY(be.side != conn_backend))
+    {
+        conn->closing = true;
         return;
+    }
 
     auto* bconn = be.backend;
     if (SOCKETLEY_UNLIKELY(bconn->closing))
+    {
+        conn->closing = true;
         return;
+    }
 
     std::string hook_storage;
     bool hook_modified = false;
@@ -3124,9 +3498,13 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     }
 #endif
 
+    SKL_TRACE_ADD(bconn, bytes_queued, (unsigned long long)data.size());
     if (SOCKETLEY_UNLIKELY(bconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
+        // The backend is not draining and the queue has hit its memory bound.
+        // Marking only the backend left the client writing into a void.
         bconn->closing = true;
+        conn->closing = true;
         return;
     }
 
@@ -3557,6 +3935,9 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         }
     }
 
+    SKL_TRACE_ADD(conn, bytes_written, (unsigned long long)(cqe->res > 0 ? cqe->res : 0));
+    SKL_TRACE_ADD(conn, writes, 1);
+
     // Full write completed — release batch
     if (SOCKETLEY_LIKELY(!conn->zc_notif_pending))
     {
@@ -3574,6 +3955,17 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     {
         close_pair(conn->client_fd, fd);
         return;
+    }
+
+    // Splice was held back while queued bytes were still on their way to this
+    // socket; now that the queue has drained it is safe to let the kernel take
+    // over without anything overtaking what came before.
+    if (conn->write_queue.empty() && !conn->write_pending && !conn->splice_in_pending &&
+        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& se = m_conn_idx[conn->client_fd];
+        if (se.side == conn_client && se.client->splice_active && conn->splice_active)
+            start_splice_forwarding(se.client, conn);
     }
 
     // Backpressure resume: if write queue drained below threshold, restart client reads
