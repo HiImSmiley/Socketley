@@ -818,7 +818,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
     if (SOCKETLEY_UNLIKELY(fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]))
+    {
+        // Nobody owns this any more, but the buffer it carries belongs to the
+        // ring.  Dropping it here leaked one per stale completion, and the group
+        // is shared by every cache on this loop.
+        if (m_loop) m_loop->return_cqe_buf(cqe, req);
         return;
+    }
     auto* conn = m_conn_idx[fd];
 
     bool is_multishot_recv = (req->type == op_recv_multishot);

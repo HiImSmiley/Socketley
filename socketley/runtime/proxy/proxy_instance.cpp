@@ -112,7 +112,12 @@ proxy_instance::~proxy_instance()
 
 void proxy_client_connection::reset(int new_fd)
 {
-    ++generation;
+    // Process-wide, not a per-struct count: both check sites resolve the struct
+    // by descriptor first, so a per-struct counter is compared against a
+    // different object's value once a descriptor moves between structs — and
+    // with a small pool those values sit in a narrow band, so agreeing by
+    // accident is common rather than rare.
+    generation = next_io_generation();
     connect_reattempted = false;
     fd = new_fd;
     read_pending = false;
@@ -157,7 +162,12 @@ void proxy_client_connection::reset(int new_fd)
 void proxy_backend_connection::reset(int new_fd)
 {
     SKL_TRACE_RESET(*this);
-    ++generation;
+    // Process-wide, not a per-struct count: both check sites resolve the struct
+    // by descriptor first, so a per-struct counter is compared against a
+    // different object's value once a descriptor moves between structs — and
+    // with a small pool those values sit in a narrow band, so agreeing by
+    // accident is common rather than rare.
+    generation = next_io_generation();
     fd = new_fd;
     read_pending = false;
     write_pending = false;
@@ -202,6 +212,9 @@ std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int
     {
         conn = std::make_unique<proxy_client_connection>();
         conn->fd = fd;
+        // A fresh struct skips reset(), and zero is what an unstamped request
+        // carries — so without this every brand new connection matches one.
+        conn->generation = next_io_generation();
     }
     return conn;
 }
@@ -282,6 +295,9 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
     {
         conn = std::make_unique<proxy_backend_connection>();
         conn->fd = fd;
+        // A fresh struct skips reset(), and zero is what an unstamped request
+        // carries — so without this every brand new connection matches one.
+        conn->generation = next_io_generation();
     }
     return conn;
 }
@@ -760,12 +776,21 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_read_provided:
         case op_recv_multishot:
         {
-            if (SOCKETLEY_UNLIKELY(req->fd < 0 || req->fd >= MAX_FDS)) break;
+            // Both ways out of this without a handler have to give the buffer
+            // back: it is the ring's, not the connection's, and the group is
+            // shared by every proxy on this loop.
+            if (SOCKETLEY_UNLIKELY(req->fd < 0 || req->fd >= MAX_FDS))
+            {
+                if (m_loop) m_loop->return_cqe_buf(cqe, req);
+                break;
+            }
             auto& re = m_conn_idx[req->fd];
             if (SOCKETLEY_LIKELY(re.side == conn_client))
                 handle_client_read(cqe, req);
             else if (re.side == conn_backend)
                 handle_backend_read(cqe, req);
+            else if (m_loop)
+                m_loop->return_cqe_buf(cqe, req);
             break;
         }
         case op_write:
