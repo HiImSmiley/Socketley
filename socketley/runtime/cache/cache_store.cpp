@@ -9,6 +9,34 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+// ─── Per-entry cost (see the constants in cache_store.h) ───
+
+size_t cache_store::entry_cost(const std::string& key, const std::string& val)
+{
+    return stored_string(key) + stored_string(val);
+}
+
+size_t cache_store::entry_cost(const std::string& key, const std::deque<std::string>& deq)
+{
+    size_t bytes = stored_string(key);
+    for (const auto& e : deq) bytes += stored_string(e);
+    return bytes;
+}
+
+size_t cache_store::entry_cost(const std::string& key, const set_inner& members)
+{
+    size_t bytes = stored_string(key);
+    for (const auto& e : members) bytes += stored_string(e);
+    return bytes;
+}
+
+size_t cache_store::entry_cost(const std::string& key, const hash_inner& fields)
+{
+    size_t bytes = stored_string(key);
+    for (const auto& [f, v] : fields) bytes += stored_string(f) + stored_string(v);
+    return bytes;
+}
+
 // ─── Type conflict checks (fast-path: empty() avoids hash lookups) ───
 
 bool cache_store::has_type_conflict_for_string(std::string_view key) const
@@ -80,7 +108,13 @@ bool cache_store::set(std::string_view key, std::string_view value)
         // shrinking or rewriting in place can never push us over.
         if (__builtin_expect(m_max_memory != 0 && value.size() > it->second.size(), 0))
         {
-            if (!check_memory(value.size() - it->second.size()))
+            // The delta is between what the two values *cost*, not between their
+            // lengths: 15 bytes to 16 is one byte of payload and a whole new
+            // 32-byte heap block.  Nothing is asked for when the buffer already
+            // charged for is big enough to take the new value in place.
+            const size_t held = stored_string(it->second);
+            const size_t want = stored_string(value.size());
+            if (want > held && !check_memory(want - held))
                 return false;
             // check_memory may have evicted, and the victim can be this very
             // key — the iterator is only safe to reuse after re-acquiring it.
@@ -89,10 +123,10 @@ bool cache_store::set(std::string_view key, std::string_view value)
 
         if (__builtin_expect(it != m_data.end(), 1))
         {
-            track_sub(it->second.size());
+            track_sub(stored_string(it->second));
             // Use assign() instead of operator= to potentially reuse existing allocation
             it->second.assign(value.data(), value.size());
-            track_add(value.size());
+            track_add(stored_string(it->second));
             touch_lru(key);
             return true;
         }
@@ -104,13 +138,13 @@ bool cache_store::set(std::string_view key, std::string_view value)
     if (__builtin_expect(has_type_conflict_for_string(key), 0))
         return false;
 
-    if (__builtin_expect(!check_memory(key.size() + value.size() + new_key_overhead()), 0))
+    if (__builtin_expect(!check_memory(stored_string(value.size()) + new_key_cost(key.size())), 0))
         return false;
 
     auto [it2, inserted] = m_data.try_emplace(std::string(key), std::string(value));
     if (!inserted)
         it2->second = std::string(value);
-    track_add(key.size() + value.size());
+    track_add(entry_cost(it2->first, it2->second));
     touch_lru(key);
     return true;
 }
@@ -157,7 +191,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                 auto sit = m_data.find(key);
                 if (sit != m_data.end())
                 {
-                    track_sub(sit->first.size() + sit->second.size());
+                    track_sub(entry_cost(sit->first, sit->second));
                     m_data.erase(sit);
                 }
                 else
@@ -165,25 +199,19 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                     // Could be in lists/sets/hashes — clean up with memory tracking
                     if (auto lit = m_lists.find(key); lit != m_lists.end())
                     {
-                        size_t mem = lit->first.size();
-                        for (const auto& e : lit->second) mem += e.size();
-                        track_sub(mem);
+                        track_sub(entry_cost(lit->first, lit->second));
                         m_list_elems -= lit->second.size();
                         m_lists.erase(lit);
                     }
                     else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end())
                     {
-                        size_t mem = eit2->first.size();
-                        for (const auto& e : eit2->second) mem += e.size();
-                        track_sub(mem);
+                        track_sub(entry_cost(eit2->first, eit2->second));
                         m_set_elems -= eit2->second.size();
                         m_sets.erase(eit2);
                     }
                     else if (auto hit = m_hashes.find(key); hit != m_hashes.end())
                     {
-                        size_t mem = hit->first.size();
-                        for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
-                        track_sub(mem);
+                        track_sub(entry_cost(hit->first, hit->second));
                         m_hash_fields -= hit->second.size();
                         m_hashes.erase(hit);
                     }
@@ -209,11 +237,13 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(val.size() + list_elem_overhead))
+        if (!check_memory(stored_string(val.size()) + list_elem_overhead))
             return false;
-        it->second.emplace_front(val);
+        // Measured after it has been constructed in place, like every other add
+        // here: what it costs is the buffer it ended up with.
+        const std::string& elem = it->second.emplace_front(val);
         ++m_list_elems;
-        track_add(val.size());
+        track_add(stored_string(elem));
         touch_lru(key);
         return true;
     }
@@ -221,12 +251,13 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(key.size() + val.size() + new_key_overhead() + list_elem_overhead))
+    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead))
         return false;
 
-    m_lists.emplace(std::string(key), std::deque<std::string>{}).first->second.emplace_front(val);
+    auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
+    nit->second.emplace_front(val);
     ++m_list_elems;
-    track_add(key.size() + val.size());
+    track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
     return true;
 }
@@ -236,11 +267,12 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(val.size() + list_elem_overhead))
+        if (!check_memory(stored_string(val.size()) + list_elem_overhead))
             return false;
-        it->second.emplace_back(val);
+        // Same as lpush(): measured once it exists.
+        const std::string& elem = it->second.emplace_back(val);
         ++m_list_elems;
-        track_add(val.size());
+        track_add(stored_string(elem));
         touch_lru(key);
         return true;
     }
@@ -248,12 +280,13 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(key.size() + val.size() + new_key_overhead() + list_elem_overhead))
+    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead))
         return false;
 
-    m_lists.emplace(std::string(key), std::deque<std::string>{}).first->second.emplace_back(val);
+    auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
+    nit->second.emplace_back(val);
     ++m_list_elems;
-    track_add(key.size() + val.size());
+    track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
     return true;
 }
@@ -264,14 +297,17 @@ bool cache_store::lpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
+    // Measured before the move: `out` belongs to the caller and is reused across
+    // calls, so its capacity afterwards is its own history, not the element's.
+    const size_t elem_cost = stored_string(it->second.front());
     out = std::move(it->second.front());
     it->second.pop_front();
     --m_list_elems;
-    track_sub(out.size());
+    track_sub(elem_cost);
 
     if (it->second.empty())
     {
-        track_sub(key.size());
+        track_sub(stored_string(it->first));
         m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
@@ -286,14 +322,16 @@ bool cache_store::rpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
+    // Same as lpop(): the element is measured while it is still the deque's.
+    const size_t elem_cost = stored_string(it->second.back());
     out = std::move(it->second.back());
     it->second.pop_back();
     --m_list_elems;
-    track_sub(out.size());
+    track_sub(elem_cost);
 
     if (it->second.empty())
     {
-        track_sub(key.size());
+        track_sub(stored_string(it->first));
         m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
@@ -342,13 +380,13 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     auto it = m_sets.find(key);
     if (it != m_sets.end())
     {
-        if (!check_memory(member.size() + set_elem_overhead))
+        if (!check_memory(stored_string(member.size()) + set_elem_overhead))
             return -1;
-        auto [_, inserted] = it->second.emplace(member);
+        auto [mit, inserted] = it->second.emplace(member);
         if (inserted)
         {
             ++m_set_elems;
-            track_add(member.size());
+            track_add(stored_string(*mit));
             touch_lru(key);
         }
         return inserted ? 1 : 0;
@@ -357,13 +395,13 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     if (has_type_conflict_for_set(key))
         return -1;
 
-    if (!check_memory(key.size() + member.size() + new_key_overhead() + set_elem_overhead))
+    if (!check_memory(stored_string(member.size()) + new_key_cost(key.size()) + set_elem_overhead))
         return -1;
 
-    auto& s = m_sets.emplace(std::string(key), set_inner{}).first->second;
-    s.emplace(member);
+    auto nit = m_sets.emplace(std::string(key), set_inner{}).first;
+    nit->second.emplace(member);
     ++m_set_elems;
-    track_add(key.size() + member.size());
+    track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
     return 1;
 }
@@ -378,13 +416,13 @@ bool cache_store::srem(std::string_view key, std::string_view member)
     if (mit == it->second.end())
         return false;
 
-    track_sub(mit->size());
+    track_sub(stored_string(*mit));
     it->second.erase(mit);
     --m_set_elems;
 
     if (it->second.empty())
     {
-        track_sub(key.size());
+        track_sub(stored_string(it->first));
         m_set_elems -= it->second.size();
         m_sets.erase(it);
         m_expiry.erase(std::string(key));
@@ -427,17 +465,17 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         auto fit = it->second.find(field);
         if (fit != it->second.end())
         {
-            track_sub(fit->second.size());
+            track_sub(stored_string(fit->second));
             fit->second = val;
-            track_add(val.size());
+            track_add(stored_string(fit->second));
         }
         else
         {
-            if (!check_memory(field.size() + val.size() + hash_field_overhead))
+            if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead))
                 return false;
-            it->second.emplace(std::string(field), std::string(val));
+            auto nfit = it->second.emplace(std::string(field), std::string(val)).first;
             ++m_hash_fields;
-            track_add(field.size() + val.size());
+            track_add(stored_string(nfit->first) + stored_string(nfit->second));
         }
         touch_lru(key);
         return true;
@@ -446,13 +484,14 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     if (has_type_conflict_for_hash(key))
         return false;
 
-    if (!check_memory(key.size() + field.size() + val.size() + new_key_overhead() + hash_field_overhead))
+    if (!check_memory(stored_string(field.size()) + stored_string(val.size())
+                      + new_key_cost(key.size()) + hash_field_overhead))
         return false;
 
-    auto& h = m_hashes.emplace(std::string(key), hash_inner{}).first->second;
-    h.emplace(std::string(field), std::string(val));
+    auto nit = m_hashes.emplace(std::string(key), hash_inner{}).first;
+    nit->second.emplace(std::string(field), std::string(val));
     ++m_hash_fields;
-    track_add(key.size() + field.size() + val.size());
+    track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
     return true;
 }
@@ -480,13 +519,13 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     if (fit == it->second.end())
         return false;
 
-    track_sub(fit->first.size() + fit->second.size());
+    track_sub(stored_string(fit->first) + stored_string(fit->second));
     it->second.erase(fit);
     --m_hash_fields;
 
     if (it->second.empty())
     {
-        track_sub(key.size());
+        track_sub(stored_string(it->first));
         m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         m_expiry.erase(std::string(key));
@@ -569,33 +608,27 @@ void cache_store::check_expiry(std::string_view key)
 
     if (auto sit = m_data.find(key); sit != m_data.end())
     {
-        track_sub(sit->first.size() + sit->second.size());
+        track_sub(entry_cost(sit->first, sit->second));
         m_data.erase(sit);
         return;
     }
     if (auto lit = m_lists.find(key); lit != m_lists.end())
     {
-        size_t mem = lit->first.size();
-        for (const auto& e : lit->second) mem += e.size();
-        track_sub(mem);
+        track_sub(entry_cost(lit->first, lit->second));
         m_list_elems -= lit->second.size();
         m_lists.erase(lit);
         return;
     }
     if (auto eit = m_sets.find(key); eit != m_sets.end())
     {
-        size_t mem = eit->first.size();
-        for (const auto& e : eit->second) mem += e.size();
-        track_sub(mem);
+        track_sub(entry_cost(eit->first, eit->second));
         m_set_elems -= eit->second.size();
         m_sets.erase(eit);
         return;
     }
     if (auto hit = m_hashes.find(key); hit != m_hashes.end())
     {
-        size_t mem = hit->first.size();
-        for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
-        track_sub(mem);
+        track_sub(entry_cost(hit->first, hit->second));
         m_hash_fields -= hit->second.size();
         m_hashes.erase(hit);
         return;
@@ -702,16 +735,16 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
 
     if (it != m_data.end())
     {
-        track_sub(it->second.size());
+        track_sub(stored_string(it->second));
         it->second.assign(sv.data(), sv.size());
-        track_add(it->second.size());
+        track_add(stored_string(it->second));
     }
     else
     {
-        if (!check_memory(key.size() + sv.size() + new_key_overhead()))
+        if (!check_memory(stored_string(sv.size()) + new_key_cost(key.size())))
             return false;
-        m_data.emplace(std::string(key), std::string(sv));
-        track_add(key.size() + sv.size());
+        auto nit = m_data.emplace(std::string(key), std::string(sv)).first;
+        track_add(entry_cost(nit->first, nit->second));
     }
     touch_lru(key);
     return true;
@@ -730,7 +763,13 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
         {
             // Refusing has to be visible.  Returning the unchanged length here
             // told the caller the append had happened and produced nothing.
-            if (!check_memory(suffix.size()))
+            //
+            // What is asked for is the growth of the *allocation*, not the
+            // length of the suffix: appending one byte to a full 4 KB buffer
+            // buys another 4 KB, and appending into spare capacity buys nothing.
+            const size_t held = stored_string(it->second);
+            const size_t want = stored_string(it->second.size() + suffix.size());
+            if (want > held && !check_memory(want - held))
                 return append_denied;
             // check_memory may have evicted, and the victim can be this very
             // key — the iterator is only safe to reuse after re-acquiring it.
@@ -739,20 +778,25 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
 
         if (it != m_data.end())
         {
+            // Measured on both sides of the append rather than added as the
+            // suffix length: libstdc++ doubles the buffer instead of growing it
+            // to fit, so a string appended to in a loop holds up to twice what
+            // its length says.
+            track_sub(stored_string(it->second));
             it->second.append(suffix.data(), suffix.size());
-            track_add(suffix.size());
+            track_add(stored_string(it->second));
             touch_lru(key);
             return it->second.size();
         }
         // Eviction took the key we were appending to; fall through and create it.
     }
 
-    if (!check_memory(key.size() + suffix.size() + new_key_overhead()))
+    if (!check_memory(stored_string(suffix.size()) + new_key_cost(key.size())))
         return append_denied;
-    auto& str = m_data.emplace(std::string(key), std::string(suffix)).first->second;
-    track_add(key.size() + suffix.size());
+    auto nit = m_data.emplace(std::string(key), std::string(suffix)).first;
+    track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
-    return str.size();
+    return nit->second.size();
 }
 
 size_t cache_store::strlen_key(std::string_view key) const
@@ -816,33 +860,27 @@ bool cache_store::del(std::string_view key)
 
     if (auto it = m_data.find(key); it != m_data.end())
     {
-        track_sub(it->first.size() + it->second.size());
+        track_sub(entry_cost(it->first, it->second));
         m_data.erase(it);
         return true;
     }
     if (auto it = m_lists.find(key); it != m_lists.end())
     {
-        size_t mem = it->first.size();
-        for (const auto& e : it->second) mem += e.size();
-        track_sub(mem);
+        track_sub(entry_cost(it->first, it->second));
         m_list_elems -= it->second.size();
         m_lists.erase(it);
         return true;
     }
     if (auto it = m_sets.find(key); it != m_sets.end())
     {
-        size_t mem = it->first.size();
-        for (const auto& e : it->second) mem += e.size();
-        track_sub(mem);
+        track_sub(entry_cost(it->first, it->second));
         m_set_elems -= it->second.size();
         m_sets.erase(it);
         return true;
     }
     if (auto it = m_hashes.find(key); it != m_hashes.end())
     {
-        size_t mem = it->first.size();
-        for (const auto& [f, v] : it->second) mem += f.size() + v.size();
-        track_sub(mem);
+        track_sub(entry_cost(it->first, it->second));
         m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         return true;
@@ -1470,41 +1508,37 @@ void cache_store::set_eviction(eviction_policy policy)
     m_eviction = policy;
 }
 
+// Each of these measures the entry after it has been moved into place, for the
+// same reason the live writes do: what a restored string costs is whatever
+// buffer it arrived with, not the sum of the lengths that were on disk.
 void cache_store::adopt_loaded_string(std::string&& key, std::string&& value)
 {
-    const size_t bytes = key.size() + value.size();
     auto it = m_data.insert_or_assign(std::move(key), std::move(value)).first;
-    track_add(bytes);
+    track_add(entry_cost(it->first, it->second));
     touch_lru(it->first);
 }
 
 void cache_store::adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq)
 {
-    size_t bytes = key.size();
-    for (const auto& e : deq) bytes += e.size();
     m_list_elems += deq.size();
     auto it = m_lists.insert_or_assign(std::move(key), std::move(deq)).first;
-    track_add(bytes);
+    track_add(entry_cost(it->first, it->second));
     touch_lru(it->first);
 }
 
 void cache_store::adopt_loaded_set(std::string&& key, set_inner&& members)
 {
-    size_t bytes = key.size();
-    for (const auto& e : members) bytes += e.size();
     m_set_elems += members.size();
     auto it = m_sets.insert_or_assign(std::move(key), std::move(members)).first;
-    track_add(bytes);
+    track_add(entry_cost(it->first, it->second));
     touch_lru(it->first);
 }
 
 void cache_store::adopt_loaded_hash(std::string&& key, hash_inner&& fields)
 {
-    size_t bytes = key.size();
-    for (const auto& [f, v] : fields) bytes += f.size() + v.size();
     m_hash_fields += fields.size();
     auto it = m_hashes.insert_or_assign(std::move(key), std::move(fields)).first;
-    track_add(bytes);
+    track_add(entry_cost(it->first, it->second));
     touch_lru(it->first);
 }
 
@@ -1524,6 +1558,10 @@ void cache_store::drop_lru(std::string_view key)
         return;
     m_lru_order.erase(it->second);
     m_lru_map.erase(it);
+    // The two copies of the key go with them; see lru_key_copies().  Entering
+    // and leaving the LRU is the only thing that creates or destroys them, which
+    // is why they are counted here and not at the payload sites.
+    track_sub(lru_key_copies(key.size()));
 }
 
 void cache_store::touch_lru(std::string_view key)
@@ -1547,6 +1585,9 @@ void cache_store::touch_lru(std::string_view key)
         std::string k(key);
         m_lru_order.push_back(k);
         m_lru_map[std::move(k)] = std::prev(m_lru_order.end());
+        // Two more copies of the key now exist; nothing else counts them.  The
+        // splice branch above allocates nothing, so it adds nothing.
+        track_add(lru_key_copies(key.size()));
     }
 }
 
@@ -1559,86 +1600,56 @@ bool cache_store::try_evict(size_t needed)
     // stop far short of the limit the caller actually set.
     while (get_memory_used() + needed > m_max_memory && !m_lru_order.empty())
     {
-        if (m_eviction == evict_allkeys_lru)
+        // Both branches go through drop_lru() rather than unlinking the node and
+        // erasing the map entry by hand.  That is the one place that knows what
+        // leaving the LRU costs — it gives back the two copies of the key — and
+        // an eviction path that skipped it would leak those bytes into the
+        // reported figure for as long as the process ran.
+        auto node = m_lru_order.begin();
+        if (m_eviction != evict_allkeys_lru)   // evict_allkeys_random
         {
-            // Evict least recently used (front of list)
-            std::string victim = m_lru_order.front();
-            m_lru_order.pop_front();
-            m_lru_map.erase(victim);
-            m_expiry.erase(victim);
-
-            // Delete from whichever container holds it
-            if (auto it = m_data.find(victim); it != m_data.end())
-            {
-                track_sub(it->first.size() + it->second.size());
-                m_data.erase(it);
-            }
-            else if (auto it = m_lists.find(victim); it != m_lists.end())
-            {
-                size_t mem = it->first.size();
-                for (const auto& e : it->second) mem += e.size();
-                track_sub(mem);
-                m_list_elems -= it->second.size();
-                m_lists.erase(it);
-            }
-            else if (auto it = m_sets.find(victim); it != m_sets.end())
-            {
-                size_t mem = it->first.size();
-                for (const auto& e : it->second) mem += e.size();
-                track_sub(mem);
-                m_set_elems -= it->second.size();
-                m_sets.erase(it);
-            }
-            else if (auto it = m_hashes.find(victim); it != m_hashes.end())
-            {
-                size_t mem = it->first.size();
-                for (const auto& [f, v] : it->second) mem += f.size() + v.size();
-                track_sub(mem);
-                m_hash_fields -= it->second.size();
-                m_hashes.erase(it);
-            }
-        }
-        else // evict_allkeys_random
-        {
-            // Pick a random key from LRU order
             static thread_local std::mt19937 rng(std::random_device{}());
             auto dist = std::uniform_int_distribution<size_t>(0, m_lru_order.size() - 1);
-            auto it = m_lru_order.begin();
-            std::advance(it, dist(rng));
-            std::string victim = *it;
-            m_lru_order.erase(it);
-            m_lru_map.erase(victim);
-            m_expiry.erase(victim);
+            std::advance(node, dist(rng));
+        }
+        std::string victim = *node;
 
-            if (auto dit = m_data.find(victim); dit != m_data.end())
-            {
-                track_sub(dit->first.size() + dit->second.size());
-                m_data.erase(dit);
-            }
-            else if (auto lit = m_lists.find(victim); lit != m_lists.end())
-            {
-                size_t mem = lit->first.size();
-                for (const auto& e : lit->second) mem += e.size();
-                track_sub(mem);
-                m_list_elems -= lit->second.size();
-                m_lists.erase(lit);
-            }
-            else if (auto sit = m_sets.find(victim); sit != m_sets.end())
-            {
-                size_t mem = sit->first.size();
-                for (const auto& e : sit->second) mem += e.size();
-                track_sub(mem);
-                m_set_elems -= sit->second.size();
-                m_sets.erase(sit);
-            }
-            else if (auto hit = m_hashes.find(victim); hit != m_hashes.end())
-            {
-                size_t mem = hit->first.size();
-                for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
-                track_sub(mem);
-                m_hash_fields -= hit->second.size();
-                m_hashes.erase(hit);
-            }
+        const size_t order_before = m_lru_order.size();
+        drop_lru(victim);
+        if (m_lru_order.size() == order_before)
+        {
+            // The map held no entry for this node, so drop_lru() found nothing
+            // to remove.  It cannot happen while the two stay in step, but the
+            // loop above only ends when the list shrinks: leaving the node in
+            // place would spin here forever.  Whatever removed the map entry
+            // accounted for the copies, so this only unlinks.
+            m_lru_order.erase(node);
+        }
+        m_expiry.erase(victim);
+
+        // Delete from whichever container holds it
+        if (auto it = m_data.find(victim); it != m_data.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_data.erase(it);
+        }
+        else if (auto it = m_lists.find(victim); it != m_lists.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_list_elems -= it->second.size();
+            m_lists.erase(it);
+        }
+        else if (auto it = m_sets.find(victim); it != m_sets.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_set_elems -= it->second.size();
+            m_sets.erase(it);
+        }
+        else if (auto it = m_hashes.find(victim); it != m_hashes.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_hash_fields -= it->second.size();
+            m_hashes.erase(it);
         }
     }
 

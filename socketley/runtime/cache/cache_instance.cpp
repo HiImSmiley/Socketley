@@ -685,6 +685,12 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (auto& [cfd, cconn] : m_clients)
                 {
+                    // A replication follower is idle by definition: it may not
+                    // send anything once promoted, and the stream it receives
+                    // never touches last_activity.  Sweeping it would tear
+                    // replication down on a timer for behaving correctly.
+                    if (cconn->is_follower)
+                        continue;
                     if (!cconn->closing && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
@@ -1033,7 +1039,15 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->resp_mode = true;
     }
 
-    if (conn->resp_mode)
+    // A connection that was promoted by REPLICATE is not a client any more: the
+    // socket carries the replication stream and this runtime is its only writer.
+    // Parsing what arrives on it would produce replies with nowhere to go —
+    // handle_replicate_request() has the rule and the reasoning.
+    if (SOCKETLEY_UNLIKELY(conn->is_follower))
+    {
+        refuse_follower_input(conn);
+    }
+    else if (conn->resp_mode)
     {
         process_resp(conn);
     }
@@ -1055,6 +1069,12 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 SKL_TRACE_ADD(conn, responses_made, 1);
 
             scan_from = pos + 1;
+
+            // REPLICATE takes effect on the line that carried it, so the rest of
+            // the batch is already follower input.  Answering it would put a
+            // second writer on the socket the dump is going out on.
+            if (SOCKETLEY_UNLIKELY(conn->is_follower))
+                break;
         }
 
         if (scan_from > 0)
@@ -1064,6 +1084,10 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             else
                 conn->partial.erase(0, scan_from);
         }
+
+        // Whatever was pipelined behind REPLICATE is refused, not executed.
+        if (SOCKETLEY_UNLIKELY(conn->is_follower && !conn->partial.empty()))
+            refuse_follower_input(conn);
     }
 
     // Flush accumulated responses as single write
@@ -3632,7 +3656,11 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 continue;
 
             auto* sub_conn = m_conn_idx[fd];
-            if (sub_conn->closing)
+            // A promoted follower has had its subscriptions dropped, so it
+            // should never appear here; the check stays because delivering to it
+            // would mean a publish writing into the middle of the replication
+            // stream, and that is not something to leave to one call site.
+            if (sub_conn->closing || sub_conn->is_follower)
                 continue;
 
             // A subscriber that has stopped reading must not be allowed to grow
@@ -3872,6 +3900,45 @@ void cache_instance::detach_follower(int fd)
     reap_followers();
 }
 
+cache_instance::follower_conn* cache_instance::follower_for_fd(int fd)
+{
+    if (fd < 0)
+        return nullptr;
+    for (auto& f : m_followers)
+        if (f->fd == fd)
+            return f.get();
+    return nullptr;
+}
+
+void cache_instance::refuse_follower_input(client_connection* conn)
+{
+    // The bytes are dropped, not parsed.  Executing them would produce a
+    // response, and there is nowhere to put a response: the follower buffer owns
+    // this socket now.
+    conn->partial.clear();
+
+    if (conn->follower_refused)
+        return;
+    conn->follower_refused = true;
+
+    LOG_WARN("cache: command received on a replication follower connection, ignoring");
+
+    // Say so through the replication stream itself, so the socket keeps exactly
+    // one writer.  A real follower drops any line it does not recognise —
+    // handle_master_read() acts on a fixed set of commands and ignores the rest
+    // — so this reaches a person watching the socket and nobody else.  Once per
+    // connection: a client that keeps sending would otherwise be able to push
+    // the follower past MAX_FOLLOWER_PENDING with error lines alone.
+    follower_conn* f = follower_for_fd(conn->fd);
+    if (!f)
+        return;
+    if (!follower_write(*f, "error: replication follower, commands are not accepted\n"))
+    {
+        f->dead = true;
+        reap_followers();
+    }
+}
+
 void cache_instance::replicate_command(std::string_view cmd)
 {
     if (m_repl_role != repl_leader || m_followers.empty())
@@ -3909,7 +3976,49 @@ void cache_instance::handle_replicate_request(client_connection* conn)
         return;
     }
 
+    // ─── What REPLICATE promises ───────────────────────────────────────────
+    //
+    // The promotion makes this runtime the sole writer on the descriptor.  From
+    // the moment it succeeds the socket carries one thing, leader to follower:
+    // the "ok", the full dump, and then the replicated command stream, all out
+    // of the follower's own buffer and therefore in that order.  A client may
+    // read that stream or close the socket.  It may not send anything else —
+    // any further command is dropped with a single error line and never
+    // executed (see refuse_follower_input()).
+    //
+    // The alternative was to let the connection keep answering commands, which
+    // is what it did: its client_connection is still there and still queues into
+    // conn->response_buf, and flush_responses() then submits a second write on
+    // the same fd.  io_uring orders nothing between two writes in flight, so
+    // that reply lands wherever it lands — including inside a replicated
+    // command, which the follower has no way to detect and no way to resync
+    // from.  One socket, one writer, is the only version of this that can be
+    // made to hold.
+    //
+    // Which is also why promotion is refused while the ordinary path still owes
+    // this client bytes.  Those bytes were promised before REPLICATE and cannot
+    // be moved into the replication stream — a GET reply is arbitrary data and a
+    // follower would try to read it as commands — nor dropped, since the client
+    // is waiting for them.  The one case that matters in practice, a client
+    // whose first command is REPLICATE, passes straight through.
+    if (!conn->response_buf.empty() || !conn->write_queue.empty() ||
+        conn->write_pending || conn->zc_notif_pending)
+    {
+        conn->response_buf.append("error: replicate needs an idle connection\n", 42);
+        return;
+    }
+
     m_repl_role = repl_leader;
+    // Ordinary command service on this connection ends here, not when the dump
+    // finishes: the refusal in handle_read() has to cover anything the client
+    // pipelined behind the REPLICATE line as well.
+    conn->is_follower = true;
+
+    // Any channel this connection had subscribed to goes with the promotion.
+    // publish() writes straight into a subscriber's write queue, which is the
+    // same second writer by another route, and the subscriber can no longer
+    // unsubscribe itself.
+    m_store.unsubscribe_all(conn->fd);
 
     // Register first, then queue the dump: both the dump and every command that
     // follows travel through the same buffer, which is what keeps them ordered.

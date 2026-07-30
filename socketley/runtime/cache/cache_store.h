@@ -147,7 +147,9 @@ public:
     size_t get_max_memory() const { return m_max_memory; }
     // Payload plus the cost of the containers holding it.  Counting payload
     // alone made this read 10 MB where the process had actually grown by
-    // 111 MB, so --maxmemory 256M would happily occupy ~2.8 GB.
+    // 111 MB, so --maxmemory 256M would happily occupy ~2.8 GB.  "Payload" here
+    // means what the strings really allocate, not the sum of their lengths;
+    // see stored_string().
     size_t get_memory_used() const { return m_current_memory + structural_overhead(); }
     void set_eviction(eviction_policy policy);
     eviction_policy get_eviction() const { return m_eviction; }
@@ -215,17 +217,35 @@ private:
     // key additionally carries an m_lru_order node and an m_lru_map entry for
     // ~139 bytes more.
     //
-    // These are approximations, and deliberately so: the residual is the heap
-    // allocation of individual strings, which only the payload sites know the
-    // length of.  Measured against RSS at 500k keys:
+    // They cover the *fixed* part of an entry only.  What a fixed term cannot
+    // cover is the heap block a std::string takes once it outgrows the buffer
+    // inside the string object: that depends on the length, and only the payload
+    // sites know it.  Counting the length alone read low — the dangerous
+    // direction, because --maxmemory then lets the process grow past the ceiling
+    // it was given.  Measured against RSS at 500k keys, with the figure this
+    // file now produces alongside:
     //
-    //   11-byte keys, 10-byte values  ->  reported 234 B/key, actual 234 B/key
-    //   26-byte keys, 100-byte values ->  reported 340 B/key, actual 489 B/key
+    //   11-byte keys, 10-byte values  ->  was 234, now 234 B/key   actual 234
+    //   26-byte keys, 100-byte values ->  was 340, now 469 B/key   actual 489
     //
-    // So short keys land on the nose and keys past the 15-byte SSO limit still
-    // read about 1.4x low, because key and value then allocate separately and
-    // the LRU holds a second copy of the key.  That is a bound worth having —
-    // the same measurement against payload-only accounting was out by 11.2x.
+    // (the "now" column is what stored_string() below computes for those two
+    // shapes; the parent measurement is the check on it.)
+    //
+    // Short keys are untouched — nothing leaves the SSO buffer there.  The long
+    // key reads ~4% low instead of 1.4x low, and what is left no longer grows
+    // with the key or the value: it is these fixed terms being ~23 bytes light
+    // per key, which the short-key calibration hid because the SSO payload is
+    // counted on top of them.  Left alone on purpose — bending the constants
+    // until a second workload matched is how they came to be wrong for the
+    // first one.
+    //
+    // One gap is knowingly still open: a key that carries a TTL is copied into
+    // m_expiry as well, and that copy's heap block is not counted (the node is,
+    // through expiry_entry_overhead).  Unlike the LRU, whose entries are created
+    // and destroyed by exactly two functions, m_expiry is written in a dozen
+    // places, so counting it there would be precisely the scattered bookkeeping
+    // structural_overhead() exists to avoid.  It costs one block per expiring
+    // key with a name over the SSO limit.
     static constexpr size_t key_entry_overhead    = 74;
     static constexpr size_t lru_entry_overhead    = 139;
     static constexpr size_t expiry_entry_overhead = 64;
@@ -233,14 +253,96 @@ private:
     static constexpr size_t set_elem_overhead     = 64;
     static constexpr size_t hash_field_overhead   = 74;
 
-    // What a brand new key costs before any payload.  Callers add this to the
-    // amount they pass to check_memory, so admission and the limit are measured
-    // the same way — otherwise every accepted write overshoots by its own
-    // structural cost and the cache settles above the configured maximum.
-    size_t new_key_overhead() const
+    // Longest string libstdc++ keeps inside the string object itself.  Derived,
+    // not written as 15, for the same reason structural_overhead() is derived
+    // from live container sizes: a std::string with a different layout has to
+    // move this number rather than silently invalidate it.  The object is a
+    // pointer, a length and a union of {capacity, inline buffer}, so the buffer
+    // is what is left over, minus the terminator.
+    static constexpr size_t sso_capacity =
+        sizeof(std::string) - sizeof(char*) - sizeof(size_t) - 1;
+    static_assert(sso_capacity >= 7 && sso_capacity < sizeof(std::string),
+                  "std::string is not laid out the way this accounting assumes");
+
+    // Bytes glibc malloc actually spends on a request: rounded up to a 16-byte
+    // chunk that carries an 8-byte header, never smaller than 32 bytes.  The
+    // header and the rounding are resident memory like any other, so they are
+    // charged.
+    static constexpr size_t malloc_chunk(size_t request)
     {
-        return key_entry_overhead + (m_max_memory != 0 ? lru_entry_overhead : 0);
+        constexpr size_t header = 8, align = 16, min_chunk = 32;
+        const size_t chunk = (request + header + align - 1) & ~(align - 1);
+        return chunk < min_chunk ? min_chunk : chunk;
     }
+
+    // What one stored string costs, given its length.  Inside the SSO limit the
+    // bytes live in the node that key_entry_overhead already measures, so the
+    // length is all there is to add; past it the string owns a separate block of
+    // length+1 bytes and the payload has moved into that block, so the block is
+    // the whole cost.  The jump at the boundary is real: crossing it buys a
+    // fresh 32-byte chunk while the inline buffer stays behind, unused.
+    //
+    // Assumes capacity == size.  That is true of every string this class
+    // creates, and it is what admission has to assume anyway, since the string
+    // it is deciding about does not exist yet.
+    static constexpr size_t stored_string(size_t len)
+    {
+        return len <= sso_capacity ? len : malloc_chunk(len + 1);
+    }
+
+    // The same cost, read off a string that does exist — capacity, not length.
+    // Used by everything that adds to or subtracts from the running total, for
+    // two reasons the length alone gets wrong in the low direction:
+    //
+    //   * assign() never hands a buffer back, so after SET k <1 KB> followed by
+    //     SET k <10 B> the key still owns the kilobyte;
+    //   * APPEND doubles the buffer rather than growing it to fit.
+    //
+    // It also keeps the two sides honest: every site subtracts what the live
+    // string costs before it changes and adds what it costs after, so the pair
+    // can only disagree if something mutates a stored string behind this class's
+    // back — and nothing outside it gets a non-const reference to one.
+    static size_t stored_string(const std::string& s)
+    {
+        return s.capacity() <= sso_capacity ? s.size() : malloc_chunk(s.capacity() + 1);
+    }
+
+    // The LRU keeps two further copies of the key — one in the m_lru_order node,
+    // one as the key of m_lru_map — and nothing else counts their bytes.  Only
+    // the heap block is charged here; the two string objects themselves are part
+    // of lru_entry_overhead.  Tracked by touch_lru/drop_lru rather than by the
+    // payload sites, because those two are what actually decide whether a key is
+    // in the LRU at all.
+    static constexpr size_t lru_key_copies(size_t key_len)
+    {
+        return key_len <= sso_capacity ? 0 : 2 * malloc_chunk(key_len + 1);
+    }
+
+    // What a brand new key costs: the key string itself plus everything holding
+    // it.  Callers add this to the amount they pass to check_memory, so
+    // admission and the limit are measured the same way — otherwise every
+    // accepted write overshoots by its own structural cost and the cache settles
+    // above the configured maximum.  That is why the LRU's copies of the key are
+    // in here too: they are charged the moment the key is admitted.
+    //
+    // This was new_key_overhead() and blind to the key's length while a key cost
+    // its own byte count; it takes the length now because both the key's own
+    // block and the LRU's copies of it turn on where that length falls.
+    size_t new_key_cost(size_t key_len) const
+    {
+        return stored_string(key_len) + key_entry_overhead
+             + (m_max_memory != 0 ? lru_entry_overhead + lru_key_copies(key_len) : 0);
+    }
+
+    // Accounted payload of one whole key, for the removal paths.  Five copies of
+    // the same loop (del, check_expiry, the expiring GET and both halves of
+    // try_evict) used to compute this by hand; now that a string no longer costs
+    // its own length, one of them getting it wrong is a permanent error in the
+    // reported figure, so they all come through here.
+    static size_t entry_cost(const std::string& key, const std::string& val);
+    static size_t entry_cost(const std::string& key, const std::deque<std::string>& deq);
+    static size_t entry_cost(const std::string& key, const set_inner& members);
+    static size_t entry_cost(const std::string& key, const hash_inner& fields);
 
     // Derived from live container sizes rather than tracked incrementally: a
     // missed increment somewhere would corrupt the figure permanently, and this
@@ -273,7 +375,10 @@ private:
 
     // Eviction / Memory
     size_t m_max_memory = 0;
-    size_t m_current_memory = 0;   // payload bytes only; see structural_overhead()
+    // Payload: every stored string charged through stored_string(), plus the LRU's
+    // own copies of the keys.  The containers holding them are the other half of
+    // get_memory_used() — see structural_overhead().
+    size_t m_current_memory = 0;
 
     // Element counts for the collection types.  The number of keys is O(1) from
     // the maps themselves, but the number of members inside them is not.

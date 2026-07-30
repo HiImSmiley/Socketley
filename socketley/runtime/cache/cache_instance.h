@@ -49,6 +49,15 @@ struct client_connection
     bool resp_mode{false};
     bool resp_detected{false};  // true once first byte examined
 
+    // Set by REPLICATE: this socket now carries the replication stream and
+    // nothing else, and the follower buffer is its only writer.  Ordinary
+    // commands are refused from here on — see handle_replicate_request() for the
+    // rule and what a client is still allowed to do.  follower_refused keeps the
+    // refusal to one line per connection, so a client that keeps talking cannot
+    // grow the replication backlog until the follower is dropped for it.
+    bool is_follower{false};
+    bool follower_refused{false};
+
     // Rate limiting (token bucket)
     double rl_tokens{0.0};
     double rl_max{0.0};
@@ -75,6 +84,8 @@ struct client_connection
         zc_notif_pending = false;
         resp_mode = false;
         resp_detected = false;
+        is_follower = false;
+        follower_refused = false;
         rl_tokens = 0.0;
         rl_max = 0.0;
         SKL_TRACE_RESET(*this);
@@ -333,6 +344,13 @@ private:
     // Keeping the tail also protects the command stream.  A short write would
     // otherwise splice two commands together, which the follower has no way to
     // detect.
+    //
+    // This buffer is the *only* writer on the descriptor once the promotion has
+    // happened — the acknowledgement, the dump and every replicated command
+    // leave through it, in that order.  The client_connection the socket came
+    // from stops answering commands at the same moment, because two writers on
+    // one socket cannot be ordered against each other; see
+    // handle_replicate_request() and client_connection::is_follower.
     struct follower_conn
     {
         // Borrowed, never owned.  A follower reaches the leader as an ordinary
@@ -396,6 +414,14 @@ private:
     // Give up the follower that was promoted from this descriptor, if any.
     // Called from close_client(), which is the only owner of the socket.
     void detach_follower(int fd);
+
+    // The follower promoted from this descriptor, or nullptr.
+    follower_conn* follower_for_fd(int fd);
+
+    // Drop input that arrived on a socket that is now a replication follower,
+    // and tell the client once — through the replication stream, because that
+    // buffer is the socket's only writer.
+    void refuse_follower_input(client_connection* conn);
 
     void replicate_command(std::string_view cmd);
     void handle_replicate_request(client_connection* conn);

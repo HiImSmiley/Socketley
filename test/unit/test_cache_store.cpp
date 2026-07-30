@@ -254,10 +254,11 @@ TEST_CASE("cache_store TTL")
 TEST_CASE("cache_store eviction")
 {
     cache_store store;
-    // The limit counts the containers, not just the payload: a key costs its
-    // own bytes plus ~74 for the map node and, while a limit is configured,
-    // ~139 more for the LRU bookkeeping.  600 therefore holds two of the
-    // ~46-byte entries below and evicts on the third.
+    // The limit counts the containers, not just the payload: a key costs what
+    // its strings allocate plus ~74 for the map node and, while a limit is
+    // configured, ~139 more for the LRU bookkeeping.  A 40-byte value is past
+    // the small-string limit and takes a 64-byte heap block of its own, so an
+    // entry below is ~279 bytes: 600 holds two of them and evicts on the third.
     store.set_max_memory(600);
     store.set_eviction(evict_allkeys_lru);
 
@@ -423,6 +424,229 @@ TEST_CASE("cache_store memory accounting")
         for (int i = 0; i < 20; i++) CHECK(store.srem("s", "m" + std::to_string(i)));
         for (int i = 0; i < 20; i++) store.hset("h", "f" + std::to_string(i), "v");
         for (int i = 0; i < 20; i++) CHECK(store.hdel("h", "f" + std::to_string(i)));
+        CHECK(store.get_memory_used() == empty);
+    }
+}
+
+// An independent model of what libstdc++ and glibc actually spend on one stored
+// string — deliberately not the one cache_store uses, so that a formula that
+// drifts is caught rather than confirmed.  It is a *lower* bound: a store
+// reporting less than this is reporting less memory than it is holding, which is
+// the direction that lets --maxmemory be exceeded.
+namespace
+{
+    // libstdc++ keeps up to 15 bytes inside the string object itself.
+    constexpr size_t sso_limit = 15;
+
+    // glibc rounds an allocation up to a 16-byte chunk with an 8-byte header,
+    // and never hands out less than 32 bytes.  A string of `len` asks for
+    // len + 1 (the terminator).
+    size_t heap_block(size_t len)
+    {
+        if (len <= sso_limit)
+            return 0;
+        size_t chunk = (len + 1 + 8 + 15) & ~static_cast<size_t>(15);
+        return chunk < 32 ? 32 : chunk;
+    }
+
+    // Reported cost of a single string key, over an empty store.
+    size_t reported_cost(const std::string& key, const std::string& val, bool with_limit)
+    {
+        cache_store store;
+        if (with_limit)
+        {
+            // Far above anything these cases store, so nothing is ever evicted;
+            // the point of the limit is that it switches the LRU on.
+            store.set_max_memory(size_t(1) << 30);
+            store.set_eviction(evict_allkeys_lru);
+        }
+        const size_t empty = store.get_memory_used();
+        REQUIRE(store.set(key, val));
+        return store.get_memory_used() - empty;
+    }
+}
+
+TEST_CASE("cache_store memory accounting past the small-string limit")
+{
+    // Everything a key costs that does not depend on its length: map node,
+    // bucket slot and LRU bookkeeping.  Taken from the store itself with a key
+    // and value that both fit inside their string objects, which is the one
+    // shape the reported figure was measured to match RSS on exactly (234 B/key
+    // at 500k keys).  Deriving it here rather than writing the constants down
+    // keeps this test about the part that was wrong: the string allocations.
+    const std::string tiny_key(11, 'k');
+    const std::string tiny_val(10, 'v');
+    const size_t fixed = reported_cost(tiny_key, tiny_val, true)
+                       - tiny_key.size() - tiny_val.size();
+
+    SUBCASE("a key and value past the limit are charged for their heap blocks")
+    {
+        // The shape that used to read 1.4x low: 26-byte key, 100-byte value.
+        // The key exists three times over — once in the map node, once in the
+        // LRU list node, once as the LRU map's key — and each copy owns a block.
+        const std::string key(26, 'k');
+        const std::string val(100, 'v');
+
+        const size_t floor_ = fixed + 3 * heap_block(key.size()) + heap_block(val.size());
+        CHECK(reported_cost(key, val, true) >= floor_);
+    }
+
+    SUBCASE("one byte over the limit buys a whole block")
+    {
+        const size_t at_limit = reported_cost("k", std::string(sso_limit, 'v'), true);
+        const size_t over     = reported_cost("k", std::string(sso_limit + 1, 'v'), true);
+
+        // 15 bytes live in the string object; 16 take a 32-byte chunk of their
+        // own and leave the inline buffer behind, unused.  The step is real and
+        // has to show up as one.
+        CHECK(over >= at_limit + heap_block(sso_limit + 1) - sso_limit);
+    }
+
+    SUBCASE("the LRU's own copies of a long key are charged")
+    {
+        const std::string val(4, 'v');
+        const std::string short_key(sso_limit, 'k');
+        const std::string long_key(sso_limit + 1, 'k');
+
+        // What the LRU costs for a key that needs no allocation: bookkeeping only.
+        const size_t lru_fixed = reported_cost(short_key, val, true)
+                               - reported_cost(short_key, val, false);
+
+        // For a longer key it is that plus the two extra copies of the key.
+        // Their bytes were counted nowhere — the map node's copy was counted
+        // once and stood in for all three.
+        const size_t lru_long = reported_cost(long_key, val, true)
+                              - reported_cost(long_key, val, false);
+        CHECK(lru_long >= lru_fixed + 2 * heap_block(long_key.size()));
+    }
+
+    SUBCASE("with no limit configured there is no LRU to charge for")
+    {
+        const std::string key(26, 'k');
+        const std::string val(100, 'v');
+        const size_t reported = reported_cost(key, val, false);
+
+        // Still the two blocks the map node's own strings need...
+        CHECK(reported >= heap_block(key.size()) + heap_block(val.size()));
+        // ...and not the LRU's, which do not exist while touch_lru is a no-op.
+        CHECK(reported < fixed + 3 * heap_block(key.size()) + heap_block(val.size()));
+    }
+
+    SUBCASE("500 keys never report below what their strings allocate")
+    {
+        cache_store store;
+        store.set_max_memory(size_t(1) << 30);
+        store.set_eviction(evict_allkeys_lru);
+        const size_t empty = store.get_memory_used();
+
+        const std::string val(100, 'v');
+        constexpr int n = 500;
+        for (int i = 0; i < n; i++)
+        {
+            std::string key = std::to_string(1000 + i);   // 4 bytes
+            key.append(22, 'k');                          // 26 in total
+            REQUIRE(store.set(key, val));
+        }
+
+        // 234 B/key was right and 340 B/key was not; the difference is entirely
+        // in these blocks.  Reading low is what lets a cache with --maxmemory
+        // 256M settle well above 256 MB, so the check is one-sided on purpose.
+        const size_t floor_ = size_t(n) * (fixed + 3 * heap_block(26) + heap_block(val.size()));
+        CHECK(store.get_memory_used() - empty >= floor_);
+    }
+
+    SUBCASE("a value that shrinks in place is still charged for its buffer")
+    {
+        cache_store store;
+        const size_t empty = store.get_memory_used();
+        REQUIRE(store.set("k", std::string(1000, 'v')));
+        REQUIRE(store.set("k", std::string(4, 'v')));
+
+        // assign() never gives a buffer back, so the key still owns the
+        // kilobyte it was given.  Charging the new length instead would report
+        // four bytes for a kilobyte of resident memory.
+        CHECK(store.get_memory_used() - empty >= heap_block(1000));
+    }
+
+    SUBCASE("a value grown by APPEND is charged for its buffer")
+    {
+        cache_store store;
+        const size_t empty = store.get_memory_used();
+        const std::string chunk(1000, 'x');
+        REQUIRE(store.set("k", "seed"));
+        for (int i = 0; i < 5; i++)
+            REQUIRE(store.append("k", chunk) != cache_store::append_denied);
+
+        // libstdc++ doubles the buffer rather than growing it to fit, so the
+        // real allocation is larger than this; the length is the safe bound.
+        CHECK(store.get_memory_used() - empty >= heap_block(4 + 5 * chunk.size()));
+    }
+
+    SUBCASE("long keys of every type balance back to the baseline")
+    {
+        // The LRU's copies are added by touch_lru and given back by drop_lru,
+        // which is a second pair of books to get wrong.  Once with a limit
+        // configured and once without, because only the first has an LRU.
+        for (int with_limit = 0; with_limit < 2; with_limit++)
+        {
+            cache_store store;
+            if (with_limit)
+            {
+                store.set_max_memory(size_t(1) << 30);
+                store.set_eviction(evict_allkeys_lru);
+            }
+            const size_t empty = store.get_memory_used();
+
+            const std::string elem(80, 'e');
+            for (int i = 0; i < 20; i++)
+            {
+                const std::string n = std::to_string(i);
+                REQUIRE(store.set("string:key:padding:" + n, elem));
+                REQUIRE(store.rpush("list:key:padding:" + n, elem));
+                REQUIRE(store.sadd("set:key:padding:" + n, elem) == 1);
+                REQUIRE(store.hset("hash:key:padding:" + n, "field:padding:" + n, elem));
+            }
+            CHECK(store.get_memory_used() > empty);
+
+            for (int i = 0; i < 20; i++)
+            {
+                const std::string n = std::to_string(i);
+                CHECK(store.del("string:key:padding:" + n));
+                CHECK(store.del("list:key:padding:" + n));
+                CHECK(store.del("set:key:padding:" + n));
+                CHECK(store.del("hash:key:padding:" + n));
+            }
+            CHECK(store.get_memory_used() == empty);
+        }
+    }
+
+    SUBCASE("draining long-keyed collections element by element balances too")
+    {
+        cache_store store;
+        store.set_max_memory(size_t(1) << 30);
+        store.set_eviction(evict_allkeys_lru);
+        const size_t empty = store.get_memory_used();
+
+        const std::string list_key(30, 'l');
+        const std::string set_key(30, 's');
+        const std::string hash_key(30, 'h');
+        std::string out;
+
+        for (int i = 0; i < 20; i++)
+            REQUIRE(store.rpush(list_key, std::string(40, 'e')));
+        for (int i = 0; i < 20; i++)
+            CHECK(store.lpop(list_key, out));
+
+        for (int i = 0; i < 20; i++)
+            REQUIRE(store.sadd(set_key, "member:padding:" + std::to_string(i)) == 1);
+        for (int i = 0; i < 20; i++)
+            CHECK(store.srem(set_key, "member:padding:" + std::to_string(i)));
+
+        for (int i = 0; i < 20; i++)
+            REQUIRE(store.hset(hash_key, "field:padding:" + std::to_string(i), std::string(40, 'v')));
+        for (int i = 0; i < 20; i++)
+            CHECK(store.hdel(hash_key, "field:padding:" + std::to_string(i)));
+
         CHECK(store.get_memory_used() == empty);
     }
 }
