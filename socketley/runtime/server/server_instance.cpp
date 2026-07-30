@@ -53,13 +53,47 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
         conn = std::make_unique<server_connection>();
         conn->fd = fd;
     }
+    // A new connection is a new identity even when it inherits the struct and
+    // the descriptor number of the one before it.
+    conn->generation = next_io_generation();
     return conn;
+}
+
+bool server_instance::conn_ops_pending(const server_connection* conn) const
+{
+    return conn->read_pending || conn->write_pending || conn->zc_notif_pending
+        || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending;
+}
+
+void server_instance::release_conn(std::unique_ptr<server_connection> conn)
+{
+    if (SOCKETLEY_UNLIKELY(conn_ops_pending(conn.get())))
+    {
+        // The kernel is still working on something that names this struct: its
+        // read buffer, its write batch, one of its io_requests.  Reusing it now
+        // gives the next client a second writer into its own buffers; freeing it
+        // gives the loop a dangling request.  It waits instead — see
+        // reap_retired(), which puts it back once the last completion lands.
+        m_conn_retired.push_back(std::move(conn));
+        return;
+    }
+    pool_release(std::move(conn));
 }
 
 void server_instance::pool_release(std::unique_ptr<server_connection> conn)
 {
     // Release fixed file slot before reuse
     release_fixed_slot(conn.get());
+
+    // Nothing is in flight for this struct (release_conn checked), but the
+    // requests still carry a live owner pointer.  Clearing it means a completion
+    // that reaches the loop anyway is dropped there instead of being dispatched
+    // into whichever connection took the struct over.
+    conn->read_req.owner = nullptr;
+    conn->write_req.owner = nullptr;
+    conn->file_read_req.owner = nullptr;
+    conn->splice_in_req.owner = nullptr;
+    conn->splice_out_req.owner = nullptr;
 
     // Unpipe: clear peer's back-pointer
     if (conn->pipe_peer_fd >= 0)
@@ -91,6 +125,136 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->http_keep_alive = false;
     conn->fd = -1;
     m_conn_pool.push_back(std::move(conn));
+}
+
+void server_instance::return_provided_buf(struct io_uring_cqe* cqe)
+{
+    if (SOCKETLEY_LIKELY(!(cqe->flags & IORING_CQE_F_BUFFER)) || !m_ring_loop)
+        return;
+    m_ring_loop->return_buf(BUF_GROUP_ID,
+        static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+}
+
+// One teardown for a client connection, reached from every path that closes
+// one.  They used to do the same ten steps in their own order and with their
+// own idea of what made a release unsafe, which is how the zero-copy
+// notification came to be checked in three of them and forgotten in two.
+void server_instance::close_conn(server_connection* conn, bool notify_disconnect)
+{
+    const int fd = conn->fd;
+
+    // This connection may still be holding the shared splice pipe.  No splice op
+    // is armed (the caller checked conn_ops_pending), so handing the pipe on is
+    // safe here and nowhere else.
+    if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0 || conn->splice_pending || conn->splice_remaining))
+        splice_cleanup(conn);
+
+    // Authority and group membership are keyed by fd, and the kernel reissues
+    // that number to the next accepted connection.  Leaving either behind hands
+    // the newcomer what belonged to the client that just left — for m_master_fd
+    // that is broadcast authority granted without the password.
+    if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
+        m_master_fd = -1;
+    unroute_client(fd);
+    if (notify_disconnect)
+        invoke_on_disconnect(fd);
+    remove_from_all_groups(fd);
+
+    // Before the index entry goes, not after: remove_active_fd() finds the
+    // connection through m_conn_idx to learn its slot, so clearing the index
+    // first turned every one of these calls into a no-op and left closed
+    // descriptors in the broadcast list for the rest of the run.
+    remove_active_fd(fd);
+    if (fd >= 0 && fd < MAX_FDS)
+        m_conn_idx[fd] = nullptr;
+    close(fd);
+
+    auto it = m_clients.find(fd);
+    if (it != m_clients.end())
+    {
+        // The disconnect callback may have queued a write on this connection,
+        // so what is in flight is re-examined here rather than above.
+        release_conn(std::move(it->second));
+        m_clients.erase(it);
+    }
+}
+
+// A completion whose request lives inside a retired struct.  There is no index
+// to find it through any more — the fd is closed and may already belong to
+// somebody else — so it is found by the one thing the kernel hands back
+// unchanged: the address of the request itself.
+bool server_instance::reap_retired(struct io_uring_cqe* cqe, io_request* req)
+{
+    const auto* r = reinterpret_cast<const char*>(req);
+
+    for (size_t i = 0; i < m_conn_retired.size(); i++)
+    {
+        auto* c = m_conn_retired[i].get();
+        const auto* base = reinterpret_cast<const char*>(c);
+        if (r < base || r >= base + sizeof(server_connection))
+            continue;
+
+        return_provided_buf(cqe);
+
+        if (req == &c->read_req)
+        {
+            // A multishot recv is still armed until it completes without MORE.
+            if (!(cqe->flags & IORING_CQE_F_MORE))
+                c->read_pending = false;
+        }
+        else if (req == &c->write_req)
+        {
+            // A zero-copy send completes twice: once when the kernel has taken
+            // the request, once when it has finished reading the pages.
+            if (cqe->flags & IORING_CQE_F_NOTIF)
+                c->zc_notif_pending = false;
+            else
+                c->write_pending = false;
+        }
+        else if (req == &c->file_read_req)   c->file_read_pending = false;
+        else if (req == &c->splice_in_req)   c->splice_in_pending = false;
+        else if (req == &c->splice_out_req)  c->splice_out_pending = false;
+
+        if (!conn_ops_pending(c))
+        {
+            // Nothing in the ring names it any more, so the messages it was
+            // sending can go and the struct can serve somebody else.
+            for (uint32_t k = 0; k < c->write_batch_count; k++)
+                c->write_batch[k].reset();
+            c->write_batch_count = 0;
+
+            auto owned = std::move(m_conn_retired[i]);
+            if (i + 1 != m_conn_retired.size())
+                m_conn_retired[i] = std::move(m_conn_retired.back());
+            m_conn_retired.pop_back();
+            pool_release(std::move(owned));
+        }
+        return true;
+    }
+
+    for (size_t i = 0; i < m_upstream_retired.size(); i++)
+    {
+        auto* u = m_upstream_retired[i].get();
+        const auto* base = reinterpret_cast<const char*>(u);
+        if (r < base || r >= base + sizeof(upstream_connection))
+            continue;
+
+        return_provided_buf(cqe);
+
+        if (req == &u->read_req)            u->read_pending = false;
+        else if (req == &u->write_req)      u->write_pending = false;
+        else if (req == &u->timeout_req)    u->timeout_pending = false;
+
+        if (!u->read_pending && !u->write_pending && !u->timeout_pending)
+        {
+            if (i + 1 != m_upstream_retired.size())
+                m_upstream_retired[i] = std::move(m_upstream_retired.back());
+            m_upstream_retired.pop_back();
+        }
+        return true;
+    }
+
+    return false;
 }
 
 void server_instance::set_mode(server_mode mode)
@@ -540,7 +704,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         conn->file_read_pending = true;
 
         // Submit async read — req->fd = socket fd for CQE dispatch
-        conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read };
+        conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read,
+                                conn->generation };
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0,
                                                          &conn->file_read_req)))
         {
@@ -727,15 +892,17 @@ size_t server_instance::get_connection_count() const
 
 bool server_instance::setup(event_loop& loop)
 {
-    // Clear any connections left over from a previous stop() — their fds are
-    // already closed, but we deferred freeing them so that in-flight io_uring
-    // CQEs could reference their io_request members safely.  Now that setup()
-    // is starting a fresh run it is safe to destroy them.
-    m_clients.clear();
+    // Nothing is freed here.  teardown() emptied m_clients into the pool and the
+    // retired list, and a retired struct is one the kernel has not finished
+    // with: this used to call m_clients.clear() and destroy exactly the structs
+    // the teardown had deliberately kept, so a completion that arrived in the
+    // gap read a freed io_request.  What is left over is a restart's business
+    // only in so far as it must not be touched.
     m_active_fds.clear();
     m_active_fds.reserve(256);  // Pre-allocate to avoid reallocs on first connections
 
     m_loop = &loop;
+    m_ring_loop = &loop;
 
     // Cache config getters once at setup to avoid virtual calls on the hot path
     m_idle_timeout_cached = get_idle_timeout();
@@ -791,8 +958,17 @@ bool server_instance::setup(event_loop& loop)
         m_udp_recv_msg.msg_iov = &m_udp_recv_iov;
         m_udp_recv_msg.msg_iovlen = 1;
 
-        m_udp_recv_req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
-        loop.submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+        // Only if the previous run's recvmsg has completed.  It reads into
+        // m_udp_recv_buf and writes the sender into m_udp_recv_addr; a second
+        // one armed on the same msghdr gives the kernel two writers into one
+        // buffer and one sockaddr, and answers go to whichever peer landed
+        // there last.  If one is still armed it re-arms itself on the new
+        // socket when it completes.
+        if (!m_udp_recv_armed)
+        {
+            m_udp_recv_req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
+            arm_udp_recv();
+        }
 
         return true;
     }
@@ -841,17 +1017,21 @@ bool server_instance::setup(event_loop& loop)
     // cqe->res returns a fixed file index, not a real fd — setsockopt,
     // getpeername, and other syscalls require a real fd.  Instead, we
     // register the accepted fd into the fixed file table post-accept.
+    // The previous run's accept chain died with its listener: teardown()
+    // shuts the socket down, which completes every accept it holds.  Arming a
+    // fresh one here is therefore right; handle_accept() is what must not arm a
+    // second when that dead chain's last completion finally arrives.
     m_direct_accept = false;
     if (event_loop::supports_multishot_accept())
     {
         m_accept_req.type = op_multishot_accept;
-        loop.submit_multishot_accept(m_listen_fd, &m_accept_req);
+        m_accept_armed = loop.submit_multishot_accept(m_listen_fd, &m_accept_req);
         m_multishot_active = true;
     }
     else
     {
         m_accept_req.type = op_accept;
-        loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+        m_accept_armed = loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
         m_multishot_active = false;
     }
 
@@ -859,12 +1039,16 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
-    if (m_idle_timeout_cached > 0)
+    // A timeout hangs off no fd, so a stop cannot cancel one: the sweep armed by
+    // the previous run is still counting down on this very request.  Arming
+    // another gave the server a second self-perpetuating chain, one more per
+    // restart.  The one still in flight re-arms itself when it fires.
+    if (m_idle_timeout_cached > 0 && !m_idle_sweep_armed)
     {
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
         m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+        m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
     }
 
     // Create splice pipe for zero-copy HTTP file serving
@@ -877,9 +1061,9 @@ bool server_instance::setup(event_loop& loop)
     }
     m_splice_busy = false;
 
-    // Connect to upstreams
-    // Clear stale upstream connections from a previous stop (deferred for CQE safety)
-    m_upstreams.clear();
+    // Connect to upstreams.  Nothing to clear: teardown() either dropped the
+    // previous run's structs or moved the ones with work still in the ring to
+    // m_upstream_retired.  Clearing here destroyed both kinds alike.
     m_upstream_by_fd.clear();
     m_next_upstream_id = 1;
     for (const auto& target : m_upstream_targets)
@@ -896,12 +1080,21 @@ bool server_instance::setup(event_loop& loop)
     return true;
 }
 
-void server_instance::teardown(event_loop& /*loop*/)
+void server_instance::teardown(event_loop& loop)
 {
     if (m_udp)
     {
         if (m_udp_fd >= 0)
         {
+            // The recvmsg holds a reference to the socket, so close() does not
+            // end it — it stays armed on m_udp_recv_buf and m_udp_recv_addr.
+            // SO_REUSEPORT then makes that matter: once a restart binds a new
+            // socket to the same port the kernel delivers datagrams to the old
+            // one as well, and the completion used to arm a second recvmsg on
+            // the same msghdr.  Cancel first, close second — event_loop.h says
+            // why that order and not the other one.
+            loop.submit_cancel_fd(m_udp_fd);
+            loop.flush();
             close(m_udp_fd);
             m_udp_fd = -1;
         }
@@ -951,8 +1144,7 @@ void server_instance::teardown(event_loop& /*loop*/)
         if (fd >= 0 && fd < MAX_FDS)
             m_conn_idx[fd] = nullptr;
 
-        // Release fixed file slot before closing
-        release_fixed_slot(conn.get());
+        conn->closing = true;
 
         // Shutdown the connection before closing it.  Like for the listen fd,
         // shutdown() completes any pending io_uring read/write ops synchronously
@@ -962,40 +1154,40 @@ void server_instance::teardown(event_loop& /*loop*/)
         shutdown(fd, SHUT_RDWR);
         close(fd);
 
-        // Clean up any pending async file read.
-        // Do NOT free file_buf here — io_uring may still be writing to it
-        // (the SQE targets the file fd, not the socket fd, so shutdown() on
-        // the socket does not cancel it). The buffer stays alive until the
-        // server_connection is destroyed (on restart or remove).
-        // Null the req owner so the stale CQE is dropped by the event loop.
-        conn->file_read_req.owner = nullptr;
+        // The file read and the file→pipe splice target the file fd, not the
+        // socket, so the shutdown above does not touch them.  Closing the file
+        // ends them; the ops themselves keep the struct out of the pool until
+        // their completions arrive, and file_buf stays allocated until then
+        // because that is where the kernel is writing.
         if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
-        conn->file_read_pending = false;
-
-        // Clean up splice state
-        conn->splice_in_req.owner = nullptr;
-        conn->splice_out_req.owner = nullptr;
         if (conn->splice_file_fd >= 0) { close(conn->splice_file_fd); conn->splice_file_fd = -1; }
         conn->splice_remaining = 0;
         conn->splice_pipe_pending = 0;
         conn->splice_pending = false;
 
-        // Release shared_ptr message refs now so memory is freed promptly, but
-        // keep the server_connection structs alive — their embedded io_request
-        // members are still referenced by in-flight CQEs until the cancellations
-        // complete and the deferred-delete timeout fires.
+        // The queue is ours to drop.  The batch is not: a write that has reached
+        // the ring is reading out of write_batch[0] right now, and a zero-copy
+        // send is doing so long after write_pending went down.  Those refs are
+        // released where every other path releases them — when the completion
+        // says the kernel is finished with them.
         conn->write_queue.clear();
-        for (size_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].reset();
-        conn->write_batch_count = 0;
+        if (!conn->write_pending && !conn->zc_notif_pending)
+        {
+            for (size_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].reset();
+            conn->write_batch_count = 0;
+        }
     }
+
+    // Empty m_clients: idle structs go back to the pool, the rest to the
+    // retired list, where they stay valid until their completions arrive.
+    for (auto& [fd, conn] : m_clients)
+        release_conn(std::move(conn));
+    m_clients.clear();
 
     // Tear down upstream connections
     for (auto& [cid, uc] : m_upstreams)
     {
-        // Null timeout owner to prevent stale CQE dispatch
-        uc->timeout_req.owner = nullptr;
-
         if (uc->fd >= 0)
         {
             m_upstream_by_fd.erase(uc->fd);
@@ -1006,22 +1198,32 @@ void server_instance::teardown(event_loop& /*loop*/)
         uc->connected = false;
         // Release write queue refs
         uc->write_queue.clear();
-        for (size_t j = 0; j < uc->write_batch_count; j++)
-            uc->write_batch[j].reset();
-        uc->write_batch_count = 0;
-    }
-    // Do NOT clear m_upstreams here — keep structs alive for pending CQEs.
-    // They are freed in the next setup() call.
+        if (!uc->write_pending)
+        {
+            for (size_t j = 0; j < uc->write_batch_count; j++)
+                uc->write_batch[j].reset();
+            uc->write_batch_count = 0;
+        }
 
-    // Do NOT call m_clients.clear() here.  The server_connection objects must
-    // stay alive until the server_instance itself is destroyed (see setup() for
-    // when they are freed on a restart, or the destructor for the remove case).
+        // The reconnect timer is attached to no fd, so nothing above reached it
+        // and it can still be counting down thirty seconds from here.  Its owner
+        // stays set on purpose: the completion is the only thing that can tell
+        // us this struct is free, and the struct is kept for it to arrive in.
+        if (uc->read_pending || uc->write_pending || uc->timeout_pending)
+            m_upstream_retired.push_back(std::move(uc));
+    }
+    m_upstreams.clear();
+
     // Close splice pipe
     if (m_splice_pipe[0] >= 0) { close(m_splice_pipe[0]); m_splice_pipe[0] = -1; }
     if (m_splice_pipe[1] >= 0) { close(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
     m_splice_busy = false;
 
-    m_idle_sweep_req.owner = nullptr;
+    // m_idle_sweep_req keeps its owner.  Nulling it made the loop drop the
+    // sweep's completion, which left m_idle_sweep_armed true for ever and the
+    // next start() unable to tell an armed timer from a lost one.  The request
+    // lives in this instance, and an instance that ever armed I/O is retired
+    // rather than freed, so the loop reading it is reading valid memory.
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
@@ -1056,8 +1258,31 @@ void server_instance::teardown(event_loop& /*loop*/)
 void server_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (SOCKETLEY_UNLIKELY(!req || !m_loop))
+    if (SOCKETLEY_UNLIKELY(!req))
         return;
+
+    // Structs the ring has not finished with are recognised by the address the
+    // kernel handed back, before anything tries to find them by descriptor —
+    // theirs are closed and may belong to somebody else by now.
+    if (SOCKETLEY_UNLIKELY(!m_conn_retired.empty() || !m_upstream_retired.empty()))
+    {
+        if (reap_retired(cqe, req))
+            return;
+    }
+
+    if (SOCKETLEY_UNLIKELY(!m_loop))
+    {
+        // Stopped.  Nothing may be submitted from here, but the completion is
+        // not nothing: the buffer it carries belongs to a group shared with
+        // every other server on this loop, and a timer that completes here is
+        // no longer armed, which is what the next start() needs to know.
+        return_provided_buf(cqe);
+        if (req == &m_idle_sweep_req)          m_idle_sweep_armed = false;
+        else if (req == &m_accept_backoff_req) m_accept_backoff_armed = false;
+        else if (req == &m_udp_recv_req)       m_udp_recv_armed = false;
+        else if (req == &m_accept_req)         m_accept_armed = false;
+        return;
+    }
 
     switch (req->type)
     {
@@ -1071,22 +1296,29 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_file_read:
         {
             // Async file read completion — route via socket fd in req->fd
-            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
+            auto* conn = (req->fd >= 0 && req->fd < MAX_FDS) ? m_conn_idx[req->fd] : nullptr;
+            if (SOCKETLEY_LIKELY(conn && req == &conn->file_read_req
+                                 && req->generation == conn->generation))
                 handle_file_read(cqe, req);
             break;
         }
         case op_splice:
         {
-            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
+            auto* conn = (req->fd >= 0 && req->fd < MAX_FDS) ? m_conn_idx[req->fd] : nullptr;
+            if (SOCKETLEY_LIKELY(conn && req->generation == conn->generation))
             {
-                auto* conn = m_conn_idx[req->fd];
                 if (req == &conn->splice_in_req)
                     handle_splice_in(cqe, conn);
-                else
+                else if (req == &conn->splice_out_req)
                     handle_splice_out(cqe, conn);
             }
             else
-                m_splice_busy = false;  // orphan CQE — release pipe
+            {
+                // Nobody owns this splice any more, so nobody is going to hand
+                // the shared pipe back; without this no later request could ever
+                // use the zero-copy path again.
+                m_splice_busy = false;
+            }
             break;
         }
         case op_read:
@@ -1097,31 +1329,50 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_send_zc:
         case op_send_zc_notif:
         {
-            // Fast path: client connection via O(1) array lookup
-            if (SOCKETLEY_LIKELY(req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd]))
+            const bool is_read = (req->type == op_read || req->type == op_read_provided
+                                  || req->type == op_recv_multishot);
+
+            // The descriptor says where to look; the request address and the
+            // generation say whether what we found is who submitted it.  An
+            // upstream's fd can be reissued to an accepted client, and the
+            // client index is consulted first — without this the upstream's
+            // completion was applied to a client connection.
+            auto* conn = (req->fd >= 0 && req->fd < MAX_FDS) ? m_conn_idx[req->fd] : nullptr;
+            if (SOCKETLEY_LIKELY(conn && (req == &conn->read_req || req == &conn->write_req)
+                                 && req->generation == conn->generation))
             {
-                if (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot)
+                if (is_read)
                     handle_read(cqe, req);
                 else
                     handle_write(cqe, req);
+                break;
             }
-            else
+
+            // Slow path: check upstream connections
+            auto uit = m_upstream_by_fd.find(req->fd);
+            if (uit != m_upstream_by_fd.end())
             {
-                // Slow path: check upstream connections
-                auto uit = m_upstream_by_fd.find(req->fd);
-                if (uit != m_upstream_by_fd.end())
+                auto* uc = uit->second;
+                if (SOCKETLEY_LIKELY((req == &uc->read_req || req == &uc->write_req)
+                                     && req->generation == uc->generation))
                 {
-                    if (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot)
-                        handle_upstream_read(cqe, uit->second);
+                    if (is_read)
+                        handle_upstream_read(cqe, uc);
                     else
-                        handle_upstream_write(cqe, uit->second);
+                        handle_upstream_write(cqe, uc);
+                    break;
                 }
             }
+
+            // Nobody owns this any more — but the buffer it carries is still
+            // the ring's.
+            return_provided_buf(cqe);
             break;
         }
         case op_timeout:
             if (req == &m_idle_sweep_req)
             {
+                m_idle_sweep_armed = false;   // this link of the chain is done
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (int cfd : m_active_fds)
@@ -1133,17 +1384,26 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                     }
                 }
-                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+                if (m_idle_timeout_cached > 0)
+                    m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
             // Accept backoff expired — resubmit accept
-            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            else if (req == &m_accept_backoff_req)
             {
-                if (m_multishot_active)
-                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-                else
+                m_accept_backoff_armed = false;
+                // Not if an accept is already armed: this timer can outlive the
+                // stop that closed the listener it was waiting for, and the
+                // start() that followed has armed a chain of its own.
+                if (m_listen_fd >= 0 && !m_accept_armed)
                 {
-                    m_accept_addrlen = sizeof(m_accept_addr);
-                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+                    if (m_multishot_active)
+                        m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                    else
+                    {
+                        m_accept_addrlen = sizeof(m_accept_addr);
+                        m_accept_armed = m_loop->submit_accept(m_listen_fd, &m_accept_addr,
+                                                               &m_accept_addrlen, &m_accept_req);
+                    }
                 }
             }
             else
@@ -1153,6 +1413,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 {
                     if (req == &uc->timeout_req)
                     {
+                        uc->timeout_pending = false;
                         uc->reconnect_attempt++;
                         if (!upstream_try_connect(uc.get()))
                             upstream_schedule_reconnect(uc.get());
@@ -1218,9 +1479,11 @@ inline void server_instance::submit_conn_read(server_connection* conn)
 
 inline void server_instance::release_fixed_slot(server_connection* conn)
 {
-    if (conn->direct_fd && conn->fixed_idx >= 0)
+    // m_ring_loop, not m_loop: a retired connection can become releasable while
+    // the runtime is stopped, and its slot has to go back all the same.
+    if (conn->direct_fd && conn->fixed_idx >= 0 && m_ring_loop)
     {
-        m_loop->free_fixed_file_slot(static_cast<uint32_t>(conn->fixed_idx));
+        m_ring_loop->free_fixed_file_slot(static_cast<uint32_t>(conn->fixed_idx));
         conn->fixed_idx = -1;
         conn->direct_fd = false;
     }
@@ -1229,6 +1492,14 @@ inline void server_instance::release_fixed_slot(server_connection* conn)
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
 {
     int client_fd = cqe->res;
+
+    // A listener that was shut down completes its accepts with one of these, and
+    // a stop does exactly that.  Such a completion can arrive after the start()
+    // that followed, and resubmitting on the strength of it would arm a second
+    // accept chain on the listener that start() created.
+    if (SOCKETLEY_UNLIKELY(client_fd == -ECANCELED || client_fd == -EBADF
+                           || client_fd == -EINVAL || client_fd == -ENOTSOCK))
+        return;
 
     if (SOCKETLEY_LIKELY(client_fd >= 0))
     {
@@ -1255,8 +1526,9 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
         auto conn = pool_acquire(client_fd);
         conn->partial.reserve(8192);
-        conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE, op_read };
-        conn->write_req = { this, nullptr, client_fd, 0, op_write };
+        conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE,
+                           op_read, conn->generation };
+        conn->write_req = { this, nullptr, client_fd, 0, op_write, conn->generation };
 
         // Register fd in fixed file table for fget/fput-free I/O
         int slot = m_loop->alloc_fixed_file_slot();
@@ -1320,16 +1592,10 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
                 }
                 else if (it->second.failures >= 10)
                 {
-                    if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-                    remove_active_fd(client_fd);
-                    auto cit = m_clients.find(client_fd);
-                    if (cit != m_clients.end())
-                    {
-                        pool_release(std::move(cit->second));
-                        m_clients.erase(cit);
-                    }
+                    // No on_disconnect: this client never got an on_connect.
                     shutdown(client_fd, SHUT_RDWR);
-                    close(client_fd);
+                    ptr->closing = true;
+                    close_conn(ptr, false);
                     goto resubmit_accept;
                 }
             }
@@ -1338,16 +1604,14 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         // on_auth fires before on_connect; a rejected client never triggers on_connect
         if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
         {
-            if (client_fd < MAX_FDS) m_conn_idx[client_fd] = nullptr;
-            remove_active_fd(client_fd);
-            auto cit = m_clients.find(client_fd);
-            if (cit != m_clients.end())
-            {
-                pool_release(std::move(cit->second));
-                m_clients.erase(cit);
-            }
+            // A Lua on_auth that answers before rejecting leaves a write in the
+            // ring, reading out of this connection's batch.  close_conn hands
+            // the struct on through release_conn, which keeps it out of the pool
+            // until that write completes — it used to go straight back and be
+            // handed to the next client with the kernel still reading it.
             shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
+            ptr->closing = true;
+            close_conn(ptr, false);
             goto resubmit_accept;
         }
 
@@ -1359,10 +1623,15 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
     if (SOCKETLEY_UNLIKELY(client_fd == -EMFILE || client_fd == -ENFILE))
     {
-        m_accept_backoff_ts.tv_sec = 0;
-        m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        // The chain ended with this completion unless the kernel kept it armed.
+        m_accept_armed = m_multishot_active && (cqe->flags & IORING_CQE_F_MORE) != 0;
+        if (!m_accept_backoff_armed)
+        {
+            m_accept_backoff_ts.tv_sec = 0;
+            m_accept_backoff_ts.tv_nsec = 100000000LL;
+            m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
+            m_accept_backoff_armed = m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        }
         return;
     }
 
@@ -1373,19 +1642,20 @@ resubmit_accept:
         // Multishot: only resubmit if IORING_CQE_F_MORE is NOT set
         if (!(cqe->flags & IORING_CQE_F_MORE))
         {
+            m_accept_armed = false;
             if (m_listen_fd >= 0)
-            {
-                m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-            }
+                m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
         }
     }
     else
     {
         // Regular accept: always resubmit
+        m_accept_armed = false;
         if (m_listen_fd >= 0)
         {
             m_accept_addrlen = sizeof(m_accept_addr);
-            m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+            m_accept_armed = m_loop->submit_accept(m_listen_fd, &m_accept_addr,
+                                                   &m_accept_addrlen, &m_accept_req);
         }
     }
 }
@@ -1442,29 +1712,16 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error
-        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-            m_master_fd = -1;
-        if (conn->write_pending || conn->file_read_pending
-            || conn->splice_remaining || conn->splice_pending)
-        {
-            conn->closing = true;
-        }
-        else
-        {
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        // Connection closed or error.  A zero-copy send clears write_pending on
+        // its first completion and keeps DMA-ing out of write_batch[0] until the
+        // notification arrives, so the old guard here — which did not look at
+        // zc_notif_pending — released the struct while the kernel was still
+        // reading the pages, and another connection's bytes went out on the
+        // wire.  Splices were not tracked at all.  conn_ops_pending() is now the
+        // one answer to that question.
+        conn->closing = true;
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -1912,34 +2169,21 @@ submit_next_read:
     {
         // Don't resubmit socket read while async file read is in progress
         if (!conn->read_pending && !conn->file_read_pending)
-            submit_conn_read(conn);
-    }
-    else if (conn->closing && !conn->write_pending && !conn->file_read_pending
-             && !conn->splice_remaining && !conn->splice_pending)
-    {
-        // No write, file read, or splice in flight and closing — clean up now.
-        // (If write_pending, handle_write will clean up when write completes.)
-        // (If file_read_pending, handle_file_read will clean up when read completes.)
-        // (If splice_remaining, handle_splice_out will clean up when splice completes.)
-        // Same teardown as the other close paths: authority and group membership
-        // are keyed by fd, and the kernel reissues that number to the next
-        // accepted connection.  Leaving either behind hands the newcomer what
-        // belonged to the client that just left — for m_master_fd that is
-        // broadcast authority granted without the password.
-        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-            m_master_fd = -1;
-        unroute_client(fd);
-        invoke_on_disconnect(fd);
-        remove_from_all_groups(fd);
-        if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-        remove_active_fd(fd);
-        close(fd);
-        auto it = m_clients.find(fd);
-        if (it != m_clients.end())
         {
-            pool_release(std::move(it->second));
-            m_clients.erase(it);
+            submit_conn_read(conn);
+            // A read that could not be queued marks the connection closing and
+            // leaves nothing in flight to notice that later — no completion is
+            // coming.  Without this it sits here until the runtime stops.
+            if (SOCKETLEY_UNLIKELY(conn->closing && !conn_ops_pending(conn)))
+                close_conn(conn);
         }
+    }
+    else if (conn->closing && !conn_ops_pending(conn))
+    {
+        // Nothing left in the ring for this connection, so it can go now.
+        // Whichever operation is still outstanding owns the teardown instead:
+        // its completion handler asks the same question and finds it answered.
+        close_conn(conn);
     }
 }
 
@@ -2402,25 +2646,8 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         // Drain queue if we were waiting for NOTIF
         if (!conn->write_queue.empty() && !conn->write_pending)
             flush_write_queue(conn);
-        else if (conn->write_queue.empty() && !conn->write_pending &&
-                 conn->closing && !conn->read_pending && !conn->file_read_pending
-                 && !conn->splice_remaining && !conn->splice_pending)
-        {
-            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-                m_master_fd = -1;
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        else if (conn->write_queue.empty() && conn->closing && !conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -2435,27 +2662,15 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                 conn->write_batch[i].reset();
             conn->write_batch_count = 0;
         }
-        if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-            m_master_fd = -1;
         conn->closing = true;
+        // splice_cleanup() declines while a splice is armed — it closes the file
+        // fd and hands the shared pipe on, and doing that under a running splice
+        // mixes one response's bytes into the next connection's.  The splice
+        // completion does the cleanup, and the close, when it arrives.
         if (conn->splice_pending || conn->splice_remaining)
             splice_cleanup(conn);
-        if (!conn->read_pending && !conn->zc_notif_pending && !conn->file_read_pending
-            && !conn->splice_remaining && !conn->splice_pending)
-        {
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -2554,31 +2769,23 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         // Headers sent — start file→pipe splice
         conn->splice_pending = false;
         uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
-        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice };
-        m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
-    }
-    else
-    {
-        if (conn->closing && !conn->read_pending && !conn->zc_notif_pending
-            && !conn->file_read_pending && !conn->splice_remaining && !conn->splice_pending)
+        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
+        conn->splice_in_pending =
+            m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
+        if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
         {
-            if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0))
-                splice_cleanup(conn);
-            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-                m_master_fd = -1;
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
+            // Nothing reached the ring, so no completion will finish this
+            // transfer.  Give the pipe back and drop the connection rather than
+            // leave the response half-sent and the pipe marked busy for ever.
+            splice_cleanup(conn);
+            conn->closing = true;
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
         }
+    }
+    else if (conn->closing && !conn_ops_pending(conn))
+    {
+        close_conn(conn);
     }
 }
 
@@ -2598,23 +2805,11 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
-        if (!conn->write_pending && !conn->read_pending)
-        {
-            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-                m_master_fd = -1;
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        // The old guard here looked at the read and the write only, so a
+        // zero-copy send still reading out of write_batch[0] — write_pending
+        // long since down, notification not yet in — did not stop the release.
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -2683,6 +2878,14 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
 
 void server_instance::splice_cleanup(server_connection* conn)
 {
+    // Not while a splice is armed.  This closes the file the kernel is reading
+    // from, hands the shared pipe to the next connection and drains it — under a
+    // running splice that mixes one response into another's socket.  The
+    // completion handler calls back in once the op is really finished; until
+    // then splice_in_pending / splice_out_pending keep the connection alive.
+    if (SOCKETLEY_UNLIKELY(conn->splice_in_pending || conn->splice_out_pending))
+        return;
+
     if (conn->splice_file_fd >= 0)
     {
         close(conn->splice_file_fd);
@@ -2703,28 +2906,14 @@ void server_instance::splice_cleanup(server_connection* conn)
 
 void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn)
 {
+    // The file→pipe op is done: it no longer names this connection's request.
+    conn->splice_in_pending = false;
+
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
     {
         splice_cleanup(conn);
-        if (conn->closing && !conn->read_pending && !conn->write_pending
-            && !conn->zc_notif_pending && !conn->file_read_pending)
-        {
-            int fd = conn->fd;
-            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-                m_master_fd = -1;
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        if (conn->closing && !conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -2733,34 +2922,30 @@ void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connecti
     conn->splice_pipe_pending = static_cast<uint32_t>(bytes_in);
 
     // Submit pipe→socket splice
-    conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice };
-    m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+    conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice,
+                             conn->generation };
+    conn->splice_out_pending =
+        m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+    if (SOCKETLEY_UNLIKELY(!conn->splice_out_pending))
+    {
+        // The bytes are in the pipe and nothing will move them; the drain in
+        // splice_cleanup is what keeps them out of the next response.
+        splice_cleanup(conn);
+        conn->closing = true;
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+    }
 }
 
 void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn)
 {
+    conn->splice_out_pending = false;
+
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
     {
         splice_cleanup(conn);
-        if (conn->closing && !conn->read_pending && !conn->write_pending
-            && !conn->zc_notif_pending && !conn->file_read_pending)
-        {
-            int fd = conn->fd;
-            if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
-                m_master_fd = -1;
-            unroute_client(fd);
-            invoke_on_disconnect(fd);
-            remove_from_all_groups(fd);
-            m_conn_idx[fd] = nullptr;
-            remove_active_fd(fd);
-            close(fd);
-            auto it = m_clients.find(fd);
-            if (it != m_clients.end())
-            {
-                pool_release(std::move(it->second));
-                m_clients.erase(it);
-            }
-        }
+        if (conn->closing && !conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -2772,8 +2957,17 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     if (conn->splice_pipe_pending > 0)
     {
         // Short write to socket — resubmit remaining pipe→socket
-        conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice };
-        m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+        conn->splice_out_req = { this, nullptr, conn->fd, conn->splice_pipe_pending, op_splice,
+                                 conn->generation };
+        conn->splice_out_pending =
+            m_loop->submit_splice(m_splice_pipe[0], conn->fd, conn->splice_pipe_pending, &conn->splice_out_req);
+        if (SOCKETLEY_UNLIKELY(!conn->splice_out_pending))
+        {
+            splice_cleanup(conn);
+            conn->closing = true;
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
+        }
         return;
     }
 
@@ -2781,8 +2975,16 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     {
         // More file data to transfer — submit next file→pipe chunk
         uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
-        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice };
-        m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
+        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
+        conn->splice_in_pending =
+            m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
+        if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
+        {
+            splice_cleanup(conn);
+            conn->closing = true;
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
+        }
         return;
     }
 
@@ -2801,22 +3003,36 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     }
 }
 
+// One recvmsg at a time, always.  It reads into m_udp_recv_buf and writes the
+// sender into m_udp_recv_addr, both single-instance, so a second one armed
+// beside it gives the kernel two writers into the same buffer and the same
+// sockaddr: datagrams interleave and replies go to the wrong peer.
+void server_instance::arm_udp_recv()
+{
+    if (!m_loop || m_udp_fd < 0)
+    {
+        m_udp_recv_armed = false;
+        return;
+    }
+    m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
+    m_udp_recv_armed = m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+}
+
 void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
 {
+    // Whatever else happens below, the op that produced this is finished.
+    m_udp_recv_armed = false;
+
     if (cqe->res <= 0)
     {
-        // Resubmit on error
-        if (m_loop && m_udp_fd >= 0)
-            m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+        arm_udp_recv();  // Resubmit on error
         return;
     }
 
     // Register peer if new; skip processing if peer list is full
     if (find_or_add_peer(m_udp_recv_addr) < 0)
     {
-        m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
-        if (m_loop && m_udp_fd >= 0)
-            m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+        arm_udp_recv();
         return;
     }
 
@@ -2835,9 +3051,7 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
         process_message(nullptr, msg);
 
     // Resubmit for next datagram
-    m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
-    if (m_loop && m_udp_fd >= 0)
-        m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+    arm_udp_recv();
 }
 
 void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude)
@@ -3338,11 +3552,15 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     uc->partial.reserve(4096);
     uc->read_pending = false;
     uc->write_pending = false;
+    // A new socket is a new identity: this descriptor number may have belonged
+    // to an accepted client a moment ago, and completions for that client can
+    // still be on their way.
+    uc->generation = next_io_generation();
 
     m_upstream_by_fd[fd] = uc;
 
-    uc->read_req = { this, uc->read_buf, fd, sizeof(uc->read_buf), op_read };
-    uc->write_req = { this, nullptr, fd, 0, op_write };
+    uc->read_req = { this, uc->read_buf, fd, sizeof(uc->read_buf), op_read, uc->generation };
+    uc->write_req = { this, nullptr, fd, 0, op_write, uc->generation };
 
     // Submit first read
     uc->read_pending = true;
@@ -3362,7 +3580,10 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
 
 void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
 {
-    if (!m_loop)
+    // Not while one is already counting down: the timer request is a single
+    // slot on this struct, and re-arming it while the kernel still holds it
+    // gives one upstream two reconnect chains.
+    if (!m_loop || uc->timeout_pending)
         return;
 
     // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
@@ -3372,8 +3593,8 @@ void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
 
     uc->timeout_ts.tv_sec = delay_sec;
     uc->timeout_ts.tv_nsec = jitter_ms * 1000000LL;
-    uc->timeout_req = { this, nullptr, -1, 0, op_timeout };
-    m_loop->submit_timeout(&uc->timeout_ts, &uc->timeout_req);
+    uc->timeout_req = { this, nullptr, -1, 0, op_timeout, uc->generation };
+    uc->timeout_pending = m_loop->submit_timeout(&uc->timeout_ts, &uc->timeout_req);
 }
 
 void server_instance::upstream_disconnect(upstream_connection* uc)

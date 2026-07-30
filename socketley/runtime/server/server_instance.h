@@ -36,6 +36,11 @@ struct alignas(64) server_connection
     // === HOT fields (CQE dispatch path) — first 2 cache lines ===
     int fd{-1};
     int fixed_idx{-1};       // io_uring fixed file table index (-1 = not registered)
+    // Identity of the connection currently living in this struct.  Structs are
+    // pooled and file descriptor numbers are reissued, so "same address, same
+    // fd" is not the same connection; every request this connection submits
+    // carries this stamp and the dispatcher compares before acting on it.
+    uint32_t generation{0};
     bool direct_fd{false};   // true if fd came from direct-accept (fixed file index)
     bool read_pending{false};
     bool write_pending{false};
@@ -74,7 +79,15 @@ struct alignas(64) server_connection
     int splice_file_fd{-1};
     size_t splice_remaining{0};
     uint32_t splice_pipe_pending{0};
+    // Headers are queued and the file→pipe splice starts once they are on the
+    // wire; this says the transfer is owed, not that an op is armed.
     bool splice_pending{false};
+    // These two say an op is armed.  splice_remaining and splice_pending are
+    // transfer bookkeeping that splice_cleanup zeroes, so guarding a close with
+    // them proved nothing: the cleanup made the guard true and the connection
+    // was freed with a splice still running against its fd and its requests.
+    bool splice_in_pending{false};
+    bool splice_out_pending{false};
 
     // WebSocket handshake headers (non-empty only for ws_active connections)
     std::string ws_cookie;
@@ -137,6 +150,8 @@ struct alignas(64) server_connection
         splice_remaining = 0;
         splice_pipe_pending = 0;
         splice_pending = false;
+        splice_in_pending = false;
+        splice_out_pending = false;
         http_keep_alive = false;
         proto = proto_unknown;
         routed = false;
@@ -190,6 +205,10 @@ struct upstream_connection
 
     int conn_id;                  // 1-based Lua-facing ID (stable across reconnects)
     int fd{-1};
+    // Same purpose as server_connection::generation: an upstream socket's fd
+    // number can be reissued to an accepted client, and the client index is
+    // consulted first, so the completion needs to say which one it belongs to.
+    uint32_t generation{0};
     upstream_target target;
     io_request read_req;
     io_request write_req;
@@ -206,6 +225,9 @@ struct upstream_connection
     int reconnect_attempt{0};
     io_request timeout_req{};
     struct __kernel_timespec timeout_ts{};
+    // A reconnect timer is not attached to an fd, so nothing a stop does can
+    // cancel it; it stays armed on this struct for up to 30 seconds.
+    bool timeout_pending{false};
 
     // Resolved endpoint, kept across reconnects.  upstream_try_connect runs on
     // the event loop thread, so every name lookup it performs stalls every other
@@ -315,6 +337,26 @@ private:
     void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
+    // Is anything the kernel is holding still naming this struct?  Every close
+    // path asks this one question now.  Each used to assemble its own list of
+    // flags, and the lists disagreed: the zero-copy notification was missing
+    // from two of them and the splice ops were tracked by nothing at all.
+    bool conn_ops_pending(const server_connection* conn) const;
+    // The single teardown for a client connection.  Only legal when
+    // conn_ops_pending() is false.
+    void close_conn(server_connection* conn, bool notify_disconnect = true);
+    // Hand a connection struct back: to the pool when the ring is done with it,
+    // to the retired list when it is not.
+    void release_conn(std::unique_ptr<server_connection> conn);
+    // Completions for retired connections and upstreams: recognised by the
+    // address the kernel hands back, since they are no longer in any index.
+    bool reap_retired(struct io_uring_cqe* cqe, io_request* req);
+    // Give a provided buffer back to its group when we drop the completion that
+    // carried it.  The group is shared by every server runtime on this loop, so
+    // dropping one silently starves the others.
+    void return_provided_buf(struct io_uring_cqe* cqe);
+    void arm_udp_recv();
+
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
     void serve_http(server_connection* conn, std::string_view path);
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
@@ -359,6 +401,10 @@ private:
     socklen_t m_accept_addrlen;
     io_request m_accept_req;
     event_loop* m_loop;
+    // The same loop, kept across teardown.  A completion that arrives while we
+    // are stopped may carry a provided buffer or a fixed-file slot that has to
+    // go back, and m_loop is null exactly then.  Never used to submit.
+    event_loop* m_ring_loop{nullptr};
 
     // EMFILE/ENFILE accept backoff
     io_request m_accept_backoff_req{};
@@ -367,6 +413,16 @@ private:
     // Idle connection sweep timer
     io_request m_idle_sweep_req{};
     struct __kernel_timespec m_idle_sweep_ts{};
+
+    // An armed request stays armed across a stop: a timeout is attached to no
+    // fd, so neither shutdown() nor a cancel reaches it, and it completes when
+    // it completes.  Arming a second one at the next start() is what gave a
+    // restarted server two sweep chains, then three.  These say "occupied";
+    // nothing re-arms an occupied request, and the completion is what frees it.
+    bool m_accept_armed{false};
+    bool m_accept_backoff_armed{false};
+    bool m_idle_sweep_armed{false};
+    bool m_udp_recv_armed{false};
 
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
@@ -391,6 +447,15 @@ private:
     // Connection pool: pre-allocated connections for reuse (avoids malloc per accept)
     static constexpr size_t CONN_POOL_INIT = 64;
     std::vector<std::unique_ptr<server_connection>> m_conn_pool;
+
+    // Connections and upstreams the kernel has not finished with.  They are not
+    // freed and not reused; they sit here until their completions arrive, and
+    // each completion that lands is what tells us one more of them is free.
+    // Freeing them at the next start() instead — which is what this code used to
+    // do — is how a completion came to be read out of memory that had already
+    // been handed to somebody else.
+    std::vector<std::unique_ptr<server_connection>> m_conn_retired;
+    std::vector<std::unique_ptr<upstream_connection>> m_upstream_retired;
 
     // Acquire a connection from the pool (or allocate if empty)
     std::unique_ptr<server_connection> pool_acquire(int fd);

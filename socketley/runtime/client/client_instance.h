@@ -67,11 +67,37 @@ private:
     void send_to_server(std::string_view msg);
     void schedule_reconnect();
     bool try_connect();
+    // The one place a read is armed, and only when one is not already armed.
+    void arm_read();
+    // The one place a write is armed.  The request records the descriptor it was
+    // armed for, which is how a completion for a socket since lost is spotted.
+    void arm_write(const char* data, uint32_t len);
+    // Take the next queued message once the write request comes free.
+    void flush_queued_write();
+    // Lose the socket and start the reconnect clock.  Every path that gets here
+    // does the same five things; they used to do them each in their own copy.
+    void drop_connection();
+    // Account for a completion that is not ours to act on any more.
+    void settle_stale(struct io_uring_cqe* cqe, io_request* req);
+    // Hand a provided buffer back when we drop the completion carrying it.  The
+    // group has 64 buffers and every client runtime on this loop shares it, so
+    // a runtime that keeps dropping them starves all of them.
+    void return_provided_buf(struct io_uring_cqe* cqe);
 
     client_mode m_mode;
     bool m_udp{false};
     client_tcp_connection m_conn;
+    // Which socket the requests in flight belong to.  There is one read request
+    // and one write request on this instance and both are reused, and a closed
+    // descriptor number comes straight back from the kernel on the next
+    // connect — so neither the address nor the fd tells a completion for the
+    // socket we have now from one for the socket we had before.  This does.
+    uint32_t m_conn_generation{0};
     event_loop* m_loop;
+    // The same loop, kept across teardown: completions still arrive while the
+    // runtime is stopped and the buffers they carry have to go back. Never used
+    // to submit — m_loop being null is what says submitting is not allowed.
+    event_loop* m_ring_loop{nullptr};
     bool m_connected;
 
     // Write queue (prevents silent message loss when write_pending)

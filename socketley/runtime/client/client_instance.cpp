@@ -176,28 +176,126 @@ bool client_instance::try_connect()
 
 connected:
     m_connected = true;
+    // Everything armed from here on says it belongs to this socket.
+    m_conn_generation = next_io_generation();
     m_reconnect_attempt = 0;
     m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
     invoke_on_connect(m_conn.fd);
     m_conn.partial.clear();
     m_conn.partial.reserve(65536);
     m_conn.closing = false;
-    m_conn.read_pending = false;
-    m_conn.write_pending = false;
 
-    m_conn.read_req = { this, m_conn.read_buf, m_conn.fd, sizeof(m_conn.read_buf), op_read };
-    m_conn.write_req = { this, nullptr, m_conn.fd, 0, op_write };
+    // read_pending and write_pending are deliberately left alone.  There is one
+    // read request and one write request on this instance, and a previous
+    // socket's operation can still be holding one of them — across a stop and
+    // into the next start, since a request is occupied until its completion
+    // arrives and no earlier.  Clearing the flags here and arming again would
+    // point a second kernel read at m_conn.read_buf while the first is still
+    // writing into it.
+    arm_read();
+    flush_queued_write();
 
-    if (m_mode != client_mode_out)
+    return m_connected;
+}
+
+// The one place a read is armed.  Never while one is already armed: both would
+// be writing into m_conn.read_buf, and the second's bytes would land in the
+// middle of the first's.
+void client_instance::arm_read()
+{
+    if (!m_loop || !m_connected || m_conn.closing || m_conn.fd < 0)
+        return;
+    if (m_conn.read_pending || m_mode == client_mode_out)
+        return;
+
+    m_conn.read_req = { this, m_conn.read_buf, m_conn.fd, sizeof(m_conn.read_buf), op_read,
+                        m_conn_generation };
+    if (m_use_provided_bufs)
+        m_conn.read_pending = m_loop->submit_read_provided(m_conn.fd, BUF_GROUP_ID, &m_conn.read_req);
+    else
+        m_conn.read_pending = m_loop->submit_read(m_conn.fd, m_conn.read_buf,
+                                                  sizeof(m_conn.read_buf), &m_conn.read_req);
+
+    // Nothing reached the ring, so no completion will arrive for this socket and
+    // nothing would ever wake this client again; it would sit connected and deaf
+    // until the runtime stopped.
+    if (!m_conn.read_pending)
+        drop_connection();
+}
+
+// The one place a write is armed.  Stamped like the read with the socket it
+// belongs to, so a completion left over from a socket this client has already
+// lost cannot push the remains of that conversation into the current one.
+void client_instance::arm_write(const char* data, uint32_t len)
+{
+    m_conn.write_req = { this, const_cast<char*>(data), m_conn.fd, len, op_write,
+                         m_conn_generation };
+    m_conn.write_pending = m_loop->submit_write(m_conn.fd, data, len, &m_conn.write_req);
+
+    // Nothing reached the ring: no completion will come, so nothing would ever
+    // drain what is queued behind this message.
+    if (!m_conn.write_pending)
+        drop_connection();
+}
+
+void client_instance::flush_queued_write()
+{
+    if (!m_loop || !m_connected || m_conn.closing || m_conn.write_pending)
+        return;
+    if (m_write_queue.empty())
+        return;
+
+    m_conn.write_buf = m_write_queue.take_front();
+    // Once there is room again, a later stall is worth reporting afresh.
+    if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+        m_write_queue_full = false;
+    m_conn.write_off = 0;
+    arm_write(m_conn.write_buf.data(), static_cast<uint32_t>(m_conn.write_buf.size()));
+}
+
+// Losing the socket: one teardown, reached from every path that loses it.
+void client_instance::drop_connection()
+{
+    if (m_conn.fd >= 0)
     {
-        m_conn.read_pending = true;
-        if (m_use_provided_bufs)
-            m_loop->submit_read_provided(m_conn.fd, BUF_GROUP_ID, &m_conn.read_req);
-        else
-            m_loop->submit_read(m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), &m_conn.read_req);
+        invoke_on_disconnect(m_conn.fd);
+        shutdown(m_conn.fd, SHUT_RDWR);
+        close(m_conn.fd);
+        m_conn.fd = -1;
     }
+    m_connected = false;
+    schedule_reconnect();
+}
 
-    return true;
+void client_instance::return_provided_buf(struct io_uring_cqe* cqe)
+{
+    if (!(cqe->flags & IORING_CQE_F_BUFFER) || !m_ring_loop)
+        return;
+    m_ring_loop->return_buf(BUF_GROUP_ID,
+        static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+}
+
+// A completion that belongs to a socket we no longer have, or that arrived
+// while the runtime is stopped.  It is not acted on, but it is not nothing
+// either: the buffer it carries belongs to the shared group, and the request it
+// names is free to be armed again only once this has arrived.
+void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
+{
+    return_provided_buf(cqe);
+
+    if (req == &m_conn.read_req)
+    {
+        if (!(cqe->flags & IORING_CQE_F_MORE))
+            m_conn.read_pending = false;
+    }
+    else if (req == &m_conn.write_req)
+    {
+        m_conn.write_pending = false;
+    }
+    else if (req == &m_timeout_req)
+    {
+        m_reconnect_pending = false;
+    }
 }
 
 void client_instance::schedule_reconnect()
@@ -209,6 +307,12 @@ void client_instance::schedule_reconnect()
     if (max > 0 && m_reconnect_attempt >= max)
         return; // Max attempts reached
 
+    // One timer, one request slot.  Arming it again while the kernel still
+    // holds it gives the client two reconnect chains racing to open a socket,
+    // and the loser's fd is leaked when the winner overwrites m_conn.fd.
+    if (m_reconnect_pending)
+        return;
+
     // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
     int base_sec = 1 << std::min(m_reconnect_attempt, 4); // 1,2,4,8,16
     int delay_sec = std::min(base_sec, 30);
@@ -219,14 +323,14 @@ void client_instance::schedule_reconnect()
     m_timeout_ts.tv_sec = delay_sec;
     m_timeout_ts.tv_nsec = jitter_ms * 1000000LL;
 
-    m_timeout_req = { this, nullptr, -1, 0, op_timeout };
-    m_reconnect_pending = true;
-    m_loop->submit_timeout(&m_timeout_ts, &m_timeout_req);
+    m_timeout_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
+    m_reconnect_pending = m_loop->submit_timeout(&m_timeout_ts, &m_timeout_req);
 }
 
 bool client_instance::setup(event_loop& loop)
 {
     m_loop = &loop;
+    m_ring_loop = &loop;
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
 
@@ -244,7 +348,7 @@ bool client_instance::setup(event_loop& loop)
     return true;
 }
 
-void client_instance::teardown(event_loop& /*loop*/)
+void client_instance::teardown(event_loop& loop)
 {
     // Drain write queue
     m_write_queue.clear();
@@ -252,21 +356,54 @@ void client_instance::teardown(event_loop& /*loop*/)
 
     if (m_conn.fd >= 0)
     {
+        // Cancel before closing, in that order — event_loop.h says why.  A read
+        // and a write can both be in flight on this socket, and closing alone
+        // leaves them armed on m_conn.read_buf and m_conn.write_buf, which the
+        // next start() would hand straight to a new socket.
+        loop.submit_cancel_fd(m_conn.fd);
+        loop.flush();
         shutdown(m_conn.fd, SHUT_RDWR);
         close(m_conn.fd);
         m_conn.fd = -1;
     }
 
+    // The reconnect timer is attached to no fd: nothing above touched it, and it
+    // can be up to thirty seconds from firing.  Its request keeps its owner so
+    // the completion still reaches on_cqe, which drops it — m_loop is null by
+    // then, and that is what says a stopped client must not dial out.  The
+    // pending flags are left standing for the same reason they are in
+    // try_connect: the requests stay occupied until their completions arrive.
     m_connected = false;
+    m_conn.closing = false;
     m_conn.partial.clear();
+    // Nothing armed before this stop belongs to anything that comes after it,
+    // including a start() that fails to connect and so never stamps a new
+    // socket of its own.
+    m_conn_generation = next_io_generation();
     m_loop = nullptr;
 }
 
 void client_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (!req || !m_loop)
+    if (!req)
         return;
+
+    // Stopped, or the completion belongs to a socket we have already lost: not
+    // acted on, but settled, so the buffer goes back and the request it names
+    // becomes free to arm again.  Acting on it instead would put the tail of a
+    // finished conversation into the current one — the descriptor number alone
+    // cannot tell the two apart, because the kernel hands the closed one
+    // straight back to the next connect.
+    if (!m_loop || req->generation != m_conn_generation)
+    {
+        settle_stale(cqe, req);
+        // Whatever that completion was occupying is free now, and the current
+        // socket may have been waiting on exactly that.
+        arm_read();
+        flush_queued_write();
+        return;
+    }
 
     switch (req->type)
     {
@@ -312,24 +449,18 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
             // bytes, and returns a buffer it never took, corrupting the ring's
             // free list.
             m_conn.read_req.type = op_read;
-            m_loop->submit_read(m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), &m_conn.read_req);
+            m_conn.read_pending = m_loop->submit_read(m_conn.fd, m_conn.read_buf,
+                                                      sizeof(m_conn.read_buf), &m_conn.read_req);
+            if (!m_conn.read_pending)
+                drop_connection();
             return;
         }
 
         // Connection closed or error — defer if write pending
         if (m_conn.write_pending)
-        {
             m_conn.closing = true;
-        }
         else
-        {
-            invoke_on_disconnect(m_conn.fd);
-            shutdown(m_conn.fd, SHUT_RDWR);
-            close(m_conn.fd);
-            m_conn.fd = -1;
-            m_connected = false;
-            schedule_reconnect();
-        }
+            drop_connection();
         return;
     }
 
@@ -422,14 +553,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
     }
 
 resubmit:
-    if (m_loop && m_connected && !m_conn.closing)
-    {
-        m_conn.read_pending = true;
-        if (m_use_provided_bufs)
-            m_loop->submit_read_provided(m_conn.fd, BUF_GROUP_ID, &m_conn.read_req);
-        else
-            m_loop->submit_read(m_conn.fd, m_conn.read_buf, sizeof(m_conn.read_buf), &m_conn.read_req);
-    }
+    arm_read();
 }
 
 void client_instance::handle_write(struct io_uring_cqe* cqe)
@@ -440,14 +564,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     {
         m_conn.closing = true;
         if (!m_conn.read_pending)
-        {
-            invoke_on_disconnect(m_conn.fd);
-            shutdown(m_conn.fd, SHUT_RDWR);
-            close(m_conn.fd);
-            m_conn.fd = -1;
-            m_connected = false;
-            schedule_reconnect();
-        }
+            drop_connection();
         return;
     }
 
@@ -457,37 +574,19 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     m_conn.write_off += static_cast<size_t>(cqe->res);
     if (m_conn.write_off < m_conn.write_buf.size())
     {
-        m_conn.write_pending = true;
-        m_loop->submit_write(m_conn.fd, m_conn.write_buf.data() + m_conn.write_off,
-            static_cast<uint32_t>(m_conn.write_buf.size() - m_conn.write_off),
-            &m_conn.write_req);
+        arm_write(m_conn.write_buf.data() + m_conn.write_off,
+                  static_cast<uint32_t>(m_conn.write_buf.size() - m_conn.write_off));
         return;
     }
     m_conn.write_off = 0;
 
     // Flush queued writes before checking closing state
-    if (!m_write_queue.empty() && !m_conn.closing)
-    {
-        m_conn.write_buf = m_write_queue.take_front();
-        // Once there is room again, a later stall is worth reporting afresh.
-        if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
-            m_write_queue_full = false;
-        m_conn.write_off = 0;
-        m_conn.write_pending = true;
-        m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
-            static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
+    flush_queued_write();
+    if (m_conn.write_pending)
         return;
-    }
 
-    if (m_conn.closing && !m_conn.read_pending)
-    {
-        invoke_on_disconnect(m_conn.fd);
-        shutdown(m_conn.fd, SHUT_RDWR);
-        close(m_conn.fd);
-        m_conn.fd = -1;
-        m_connected = false;
-        schedule_reconnect();
-    }
+    if (m_conn.closing && !m_conn.read_pending && m_connected)
+        drop_connection();
 }
 
 void client_instance::handle_timeout(struct io_uring_cqe* cqe)
@@ -496,6 +595,12 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe)
 
     // io_uring timeout fires with -ETIME on expiration
     if (cqe->res != -ETIME && cqe->res != 0)
+        return;
+
+    // A timer that outlived what it was waiting for.  The socket is already up,
+    // and dialling again here would overwrite m_conn.fd and leak the one it
+    // replaced.
+    if (m_connected)
         return;
 
     m_reconnect_attempt++;
@@ -575,9 +680,7 @@ void client_instance::lua_send(std::string_view msg)
         m_conn.write_buf.push_back('\n');
 
     m_conn.write_off = 0;
-    m_conn.write_pending = true;
-    m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
-        static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
+    arm_write(m_conn.write_buf.data(), static_cast<uint32_t>(m_conn.write_buf.size()));
 }
 
 void client_instance::send_to_server(std::string_view msg)
@@ -586,11 +689,6 @@ void client_instance::send_to_server(std::string_view msg)
         return;
 
     m_conn.write_buf.assign(msg.data(), msg.size());
-    m_conn.write_req.buffer = m_conn.write_buf.data();
-    m_conn.write_req.length = static_cast<uint32_t>(m_conn.write_buf.size());
-
     m_conn.write_off = 0;
-    m_conn.write_pending = true;
-    m_loop->submit_write(m_conn.fd, m_conn.write_buf.data(),
-        static_cast<uint32_t>(m_conn.write_buf.size()), &m_conn.write_req);
+    arm_write(m_conn.write_buf.data(), static_cast<uint32_t>(m_conn.write_buf.size()));
 }
