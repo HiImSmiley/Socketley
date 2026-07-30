@@ -746,6 +746,30 @@ bool event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
     return true;
 }
 
+bool event_loop::submit_timeout_remove(io_request* target)
+{
+    if (!target)
+        return false;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    // Keyed on the user_data the timeout was submitted with, which is the
+    // address of its io_request — event_loop.h says why there is nothing else
+    // to key on.  The kernel only compares the value; it never dereferences it.
+    io_uring_prep_timeout_remove(
+        sqe, static_cast<__u64>(reinterpret_cast<std::uintptr_t>(target)), 0);
+    // No request of its own, exactly like submit_cancel_fd: the removal's answer
+    // is only "found it" or "-ENOENT", nothing here acts on either, and run()
+    // skips a completion that names no request without dispatching or counting
+    // it.  So there is no arm() here and no disarm() owed for it.  The timeout
+    // being withdrawn keeps the one it already had — it still reports, with
+    // -ECANCELED, and that completion is what balances its submit_timeout().
+    io_uring_sqe_set_data(sqe, nullptr);
+    m_pending_submissions++;
+    return true;
+}
+
 bool event_loop::submit_cancel_fd(int fd)
 {
     struct io_uring_sqe* sqe = get_sqe();

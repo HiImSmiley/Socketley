@@ -754,6 +754,41 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         pool.clear();
     }
 
+    // Withdraw every timer this run armed, before they are retired below.
+    //
+    // Nothing above reached them: a timeout hangs off no descriptor, so the
+    // shutdown()s and the cancel on the listen fd walked straight past, and the
+    // ring went on owing this owner one completion per armed timer for as long
+    // as the interval — thirty seconds for the sweep.  reap_retired() frees a
+    // removed instance only once that count reaches zero, so it never did, and
+    // the whole proxy stayed in the graveyard: about 6 MB, held until the daemon
+    // exited.
+    //
+    // A withdrawal does not take the completion away, it brings it forward: the
+    // timeout reports once more with -ECANCELED, which is the completion the
+    // retire() below is already waiting for, so every `owed` count here stays
+    // exactly as it was.  Withdrawing only where a completion is genuinely owed
+    // matters for the same reason — the cancelled timeout is delivered carrying
+    // the address of its request, and retire() with a count of zero would have
+    // freed the storage that address points into.
+    if (m_loop)
+    {
+        bool withdrawn = true;
+        if (m_idle_sweep_armed && m_idle_sweep_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_idle_sweep_timer->req);
+        if (m_accept_backoff_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_accept_backoff_timer->req);
+        if (m_health_check_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_health_check_timer->req);
+        if (m_health_timeout_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_health_timeout_timer->req);
+        m_loop->flush();
+
+        if (SOCKETLEY_UNLIKELY(!withdrawn))
+            LOG_WARN("proxy: a timer withdrawal did not reach the ring — this instance "
+                     "stays retired until the timer fires on its own");
+    }
+
     // The timers and the listener, for the reason on timer_op: nothing cancels
     // an io_uring timeout, and the accept completion is still owed.  Retiring
     // them costs a few dozen bytes per stop; re-arming them cost an extra timer

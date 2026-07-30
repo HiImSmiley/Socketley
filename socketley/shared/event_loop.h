@@ -99,6 +99,42 @@ public:
     bool submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
     bool submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
+    // Withdraw a timeout that submit_timeout() put in the ring, named by the
+    // request it was submitted with — a timeout hangs off no descriptor, so
+    // there is nothing else to name it by, and neither close() nor
+    // submit_cancel_fd() reaches one.  Every teardown used to close its sockets
+    // and leave its own timers counting down; the loop went on owing that owner
+    // a completion for up to thirty seconds, reap_retired() frees an instance
+    // only once that count is zero, and so the instance was never freed at all —
+    // about 6 MB per removed runtime, held until the daemon exited.
+    //
+    // Two completions follow this, and only one of them is accounted for:
+    //
+    //   * The withdrawn timeout reports once more, with -ECANCELED and without
+    //     IORING_CQE_F_MORE.  That is the completion its own submit_timeout()
+    //     was already owed, so its arm() is answered by that single disarm()
+    //     exactly as if it had run to term.  This call changes no count; it only
+    //     makes the completion arrive now instead of when the timer would have
+    //     fired.
+    //
+    //   * The withdrawal itself reports whether the kernel found the timeout (0)
+    //     or not (-ENOENT).  Nothing acts on either answer, so it goes out with
+    //     no request attached and run() skips it without dispatching or
+    //     counting — which is why this is deliberately not arm()ed.  An arm()
+    //     with no disarm to answer it is this very bug again, and a disarm with
+    //     no arm wraps the counter so the owner's slot is never reusable.
+    //
+    // Only call this for a request a completion is genuinely owed on: the
+    // kernel compares the key without ever dereferencing it, but the cancelled
+    // timeout is delivered carrying that same pointer, and run() does read it.
+    // Calling it for a timeout that has already fired is still safe — the kernel
+    // answers -ENOENT and the completion it already posted does the disarm — but
+    // the storage behind the request has to be alive either way.
+    //
+    // False means the submission never reached the ring, so the timeout stays
+    // armed and ends only when it fires.
+    bool submit_timeout_remove(io_request* target);
+
     // Fixed-file variants: use registered fd index instead of raw fd.
     // Avoids fget/fput per I/O op (hot path).
     bool submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);

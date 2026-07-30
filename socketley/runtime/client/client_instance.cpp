@@ -1,5 +1,6 @@
 #include "client_instance.h"
 #include "../../shared/event_loop.h"
+#include "../../shared/logging.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -367,12 +368,31 @@ void client_instance::teardown(event_loop& loop)
         m_conn.fd = -1;
     }
 
-    // The reconnect timer is attached to no fd: nothing above touched it, and it
-    // can be up to thirty seconds from firing.  Its request keeps its owner so
-    // the completion still reaches on_cqe, which drops it — m_loop is null by
-    // then, and that is what says a stopped client must not dial out.  The
-    // pending flags are left standing for the same reason they are in
-    // try_connect: the requests stay occupied until their completions arrive.
+    // The reconnect timer is attached to no fd: the cancel above could not reach
+    // it, and it can be up to thirty seconds from firing.  Thirty seconds during
+    // which the ring still owes this owner a completion, which is what the
+    // manager waits on before it frees a removed runtime — so a client removed
+    // while backing off was never freed at all on any reap that ran in between,
+    // and the whole instance stayed in the graveyard.  Withdraw it instead: the
+    // timeout still reports, with -ECANCELED, only now rather than later.
+    if (m_reconnect_pending)
+    {
+        if (!loop.submit_timeout_remove(&m_timeout_req))
+            LOG_WARN("client: the reconnect timer withdrawal did not reach the ring — "
+                     "this instance stays retired until the timer fires on its own");
+        loop.flush();
+    }
+
+    // Its request keeps its owner all the same.  The loop reads the request
+    // when that completion lands — to decide whether to deliver it, and to count
+    // it off this owner's tally — so it has to go on pointing at memory that is
+    // there, which retirement guarantees and a null does not.
+    //
+    // The pending flags are left standing for the same reason they are in
+    // try_connect: the request stays occupied until its completion arrives, and
+    // a withdrawn timeout is still owed exactly one.  Clearing m_reconnect_pending
+    // here would let a start() in this same loop iteration arm a second timeout
+    // on a request the kernel is still carrying one for.
     m_connected = false;
     m_conn.closing = false;
     m_conn.partial.clear();

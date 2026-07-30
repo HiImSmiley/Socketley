@@ -5,6 +5,7 @@
 #include "../../shared/lua_context.h"
 #include "../../shared/ws_protocol.h"
 #include "../../shared/invariants.h"
+#include "../../shared/logging.h"
 #include "../../cli/command_hashing.h"
 #include "../cache/cache_instance.h"
 #include "../cache/resp_parser.h"
@@ -1250,6 +1251,11 @@ void server_instance::teardown(event_loop& loop)
         release_conn(std::move(conn));
     m_clients.clear();
 
+    // Set false by any timer withdrawal the ring refused; reported once at the
+    // end rather than per timer, because they all fail for the same reason and
+    // they all fail together.
+    bool timers_withdrawn = true;
+
     // Tear down upstream connections
     for (auto& [cid, uc] : m_upstreams)
     {
@@ -1274,6 +1280,15 @@ void server_instance::teardown(event_loop& loop)
         // and it can still be counting down thirty seconds from here.  Its owner
         // stays set on purpose: the completion is the only thing that can tell
         // us this struct is free, and the struct is kept for it to arrive in.
+        //
+        // Withdrawing it does not change that — the timeout still reports, with
+        // -ECANCELED, and timeout_pending is still cleared by that completion
+        // and by nothing else.  It only stops the wait being thirty seconds
+        // long, which is thirty seconds this whole instance spends in the
+        // manager's graveyard.
+        if (uc->timeout_pending)
+            timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
+
         if (uc->read_pending || uc->write_pending || uc->timeout_pending)
             m_upstream_retired.push_back(std::move(uc));
     }
@@ -1284,11 +1299,50 @@ void server_instance::teardown(event_loop& loop)
     if (m_splice_pipe[1] >= 0) { close(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
     m_splice_busy = false;
 
-    // m_idle_sweep_req keeps its owner.  Nulling it made the loop drop the
-    // sweep's completion, which left m_idle_sweep_armed true for ever and the
-    // next start() unable to tell an armed timer from a lost one.  The request
-    // lives in this instance, and an instance that ever armed I/O is retired
-    // rather than freed, so the loop reading it is reading valid memory.
+    // The timers this server armed.  Everything above closed a descriptor and
+    // was done; a timeout is attached to none, so shutdown() and
+    // submit_cancel_fd() both walked straight past these and the ring went on
+    // owing this owner a completion for as long as thirty seconds — long enough
+    // that reap_retired() never saw the count reach zero on any pass, and the
+    // whole instance stayed in the graveyard: about 6 MB per removed runtime.
+    // Withdrawing them is the only way to end one early.
+    //
+    // The armed flags decide, not a guess: they say "this request is occupied",
+    // and withdrawing a timeout that is not there would submit a removal for a
+    // request the ring is not carrying, which answers -ENOENT and wastes an SQE.
+    if (m_idle_sweep_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_idle_sweep_req);
+    if (m_accept_backoff_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_accept_backoff_req);
+    loop.flush();
+
+    if (SOCKETLEY_UNLIKELY(!timers_withdrawn))
+        LOG_WARN("server: a timer withdrawal did not reach the ring — this instance "
+                 "stays retired until the timer fires on its own");
+
+    // The armed flags are deliberately left standing.  A withdrawn timeout is
+    // still owed exactly one completion, and that completion has not landed yet
+    // — it cannot, nothing reaps the ring until this call returns.  Clearing the
+    // flags here would let a start() in this same loop iteration, which is what
+    // `restart` does, submit a fresh timeout on a request the kernel is still
+    // carrying one for: the new submission overwrites owner_token, the old
+    // completion then passes the check meant for the new one, and the disarm it
+    // triggers lands on the wrong slot — leaving the old slot owing a completion
+    // for ever, which is the leak this whole change is about.
+    //
+    // What clears them is on_cqe below, but only for a completion the loop still
+    // delivers.  After stop() has deregistered this owner it drops them instead,
+    // so across a stop the flags survive and the next start() declines to re-arm
+    // a sweep it believes is still occupied.  That was equally true when the
+    // timer simply ran its thirty seconds out, so it is not something this
+    // withdrawal introduces — but it is why the flags cannot be cleared here to
+    // fix it either.
+    //
+    // m_idle_sweep_req keeps its owner for the same reason.  Nulling it made the
+    // loop drop the sweep's completion, which left m_idle_sweep_armed true for
+    // ever and the next start() unable to tell an armed timer from a lost one.
+    // The request lives in this instance, and an instance that ever armed I/O is
+    // retired rather than freed, so the loop reading it is reading valid memory.
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
