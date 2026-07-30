@@ -1,4 +1,5 @@
 #include "runtime_manager.h"
+#include <algorithm>
 #include "runtime_factory.h"
 #include "event_loop.h"
 #include "cluster_discovery.h"
@@ -148,6 +149,8 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
     // removes started runtimes in a loop grows.  Nothing available here can
     // bound that without help from the event loop, so say it out loud on every
     // doubling instead of letting it be found later as a leak.
+    event_loop* reap_loop = inst->get_event_loop();
+
     size_t retired = 0;
     {
         std::unique_lock lock(mutex);
@@ -159,12 +162,53 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
         }
     }
 
+    // Clear out whatever the ring has finished with.  Retiring is the only
+    // moment the graveyard grows, so reaping here is what keeps it from
+    // growing: what is left afterwards is exactly the instances the kernel is
+    // still working through, plus at most one that has nothing outstanding and
+    // is waiting for the next retirement or for shutdown.
+    if (reap_loop)
+        retired -= std::min(retired, reap_retired(*reap_loop));
+
     if (retired > 0)
     {
-        std::string msg = "retired runtime instances awaiting daemon shutdown: "
+        std::string msg = "retired runtime instances the ring has not finished with: "
                         + std::to_string(retired);
         LOG_WARN(msg.c_str());
     }
+}
+
+size_t runtime_manager::reap_retired(const event_loop& loop)
+{
+    if (loop.owner_table_full())
+        return 0;
+
+    std::vector<std::unique_ptr<runtime_instance>> doomed;
+    {
+        std::unique_lock lock(mutex);
+        for (auto it = m_retired.begin(); it != m_retired.end(); )
+        {
+            if (*it && loop.owner_inflight(it->get()) == 0)
+            {
+                doomed.push_back(std::move(*it));
+                it = m_retired.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        // Let the warning threshold fall again, or a graveyard that grew once
+        // would stay silent through every later growth up to that mark.
+        if (m_retired.size() * 2 < m_retired_warn_at)
+            m_retired_warn_at = std::max<size_t>(32, m_retired.size() * 2);
+    }
+
+    // Destructors out here: a runtime unwinding through Lua can reach back into
+    // the manager, and this mutex does not nest.
+    size_t freed = doomed.size();
+    doomed.clear();
+    return freed;
 }
 
 bool runtime_manager::remove(std::string_view name)

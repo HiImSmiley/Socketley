@@ -67,6 +67,13 @@ public:
     // gone: event_loop::run() exits the ring on its way out, and that is the
     // first moment nothing can complete against retired storage any more.
     void free_retired();
+
+    // Free the retired instances the ring has finished with.  Safe at any time:
+    // an instance is released only once the loop reports that no request it
+    // submitted is still in flight, which is exactly the condition its storage
+    // was being held for.  Does nothing while the loop's owner table is full,
+    // because a zero is then not proof of anything.  Returns how many went.
+    size_t reap_retired(const event_loop& loop);
     size_t retired_count() const;
 
     // Cross-runtime pub/sub: dispatch a published message to all runtimes

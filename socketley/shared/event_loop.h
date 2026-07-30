@@ -60,6 +60,13 @@ public:
     // licence to free that storage; this reaching zero is.
     uint32_t owner_inflight(const io_handler* owner) const;
 
+    // True once the owner table has run out and handlers began sharing one
+    // identity.  From that point owner_inflight() cannot answer for any single
+    // one of them — it reports zero for a handler that never got a slot, which
+    // is indistinguishable from a handler that has fully drained.  A caller
+    // that frees storage on the strength of a zero has to stop doing so.
+    bool owner_table_full() const { return m_owner_table_full_logged; }
+
     // Give back the provided buffer a completion is carrying, for a caller that
     // is about to drop that completion — a connection index that no longer
     // resolves, a handler that cannot place the request.  A buffer dropped with
