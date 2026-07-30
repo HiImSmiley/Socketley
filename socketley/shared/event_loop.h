@@ -26,6 +26,49 @@ public:
     void request_stop();
     int get_signal_write_fd() const;
 
+    // ── Owner registration ──────────────────────────────────────────────────
+    // The loop delivers a completion only while the handler that submitted it
+    // is still the handler that owns it.  Registration hands out that identity;
+    // deregistration revokes it, and from that moment every completion still in
+    // the ring for that handler is dropped — with whatever it carries released
+    // — instead of dispatched.
+    //
+    // Registration is implicit: the first submission from an unregistered
+    // handler registers it.  Nothing has to remember to call this, because
+    // forgetting to would mean the loop silently swallowing all of that
+    // handler's I/O — a far worse failure than forgetting to deregister, which
+    // only costs the check.  Call it explicitly when the identity is wanted
+    // before the first submission.  Idempotent.
+    uint32_t register_owner(io_handler* owner);
+
+    // Call when the handler can no longer service a completion: a runtime that
+    // has torn down, a timer about to free itself.  A handler that frees itself
+    // from inside its own on_cqe must deregister there and not earlier —
+    // deregistering while its last completion is still in flight means that
+    // completion is dropped and the callback that would have freed it never
+    // runs.
+    void deregister_owner(io_handler* owner);
+
+    bool owner_registered(const io_handler* owner) const;
+
+    // Submissions by this handler that are still owed a final completion, over
+    // every registration it has held.  Zero means no request the handler
+    // submitted is still in the ring, so the storage those requests live in —
+    // the handler itself, the connection structs it kept alive for exactly this
+    // reason — can finally be freed.  Note that dropping a completion still
+    // reads the request it points at, so "deregistered" is not on its own a
+    // licence to free that storage; this reaching zero is.
+    uint32_t owner_inflight(const io_handler* owner) const;
+
+    // Give back the provided buffer a completion is carrying, for a caller that
+    // is about to drop that completion — a connection index that no longer
+    // resolves, a handler that cannot place the request.  A buffer dropped with
+    // its completion never comes back to the group, and the groups are shared
+    // by every instance of a runtime type on this loop, so one instance leaking
+    // them starves all of them.  No-op unless the completion actually carries
+    // one.
+    void return_cqe_buf(const struct io_uring_cqe* cqe, const io_request* req);
+
     // Batched submissions - these queue SQEs without submitting
     // The submit_* helpers return false when no SQE could be obtained even after
     // flushing the ring.  Nothing is queued in that case, so a caller that has
@@ -131,6 +174,14 @@ private:
     struct io_uring_sqe* get_sqe();
     void setup_eventfd();
 
+    // Stamp the owner identity onto a submission, count it as outstanding and
+    // count it towards the next flush.  Every submit_* helper ends with this.
+    void arm(io_request* req);
+    // One completion for that submission has landed and no more will follow.
+    void disarm(uint32_t token);
+    // A completion nobody can act on any more.
+    void drop_completion(const struct io_uring_cqe* cqe, const io_request* req);
+
     struct io_uring m_ring{};
     std::atomic<bool> m_running;
     uint32_t m_queue_depth;
@@ -159,4 +210,41 @@ private:
 
     static constexpr uint16_t MAX_BUF_GROUPS = 8;
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};
+
+    // ── Owner table ─────────────────────────────────────────────────────────
+    // run() asks "is this owner still there?" of every single completion, so
+    // the answer has to be one indexed load and one compare — an array reached
+    // through a small id the owner was given, never a lookup keyed on the
+    // handler pointer.
+    //
+    // A power of two so a token from a corrupted request still indexes inside
+    // the array; the compare that follows then rejects it.
+    static constexpr uint32_t MAX_OWNERS = 1024;
+    static constexpr uint32_t OWNER_SLOT_MASK = MAX_OWNERS - 1;
+
+    // Slot 0 is never handed out.  It is what a handler gets when the table is
+    // full: its completions still validate, so a runtime that is doing nothing
+    // wrong keeps working, it just cannot be told apart from the others in the
+    // same position.  That is precisely the guarantee the loop gave before this
+    // table existed, and far better than refusing to deliver its I/O.  Epoch 1,
+    // slot 0.
+    static constexpr uint32_t OWNER_UNVERIFIED = 1u << 16;
+
+    struct owner_slot
+    {
+        io_handler* handler{nullptr};
+        // The one value run() compares against; 0 while no registration holds
+        // this slot, which no stamped token can equal.
+        uint32_t    token{0};
+        // Submissions stamped with this slot that are still owed a final
+        // completion.  Kept accurate on the drop path too, or a slot whose
+        // owner is gone would never look drained.
+        uint32_t    inflight{0};
+        // Survives the slot being freed, so a later registration on the same
+        // slot cannot reproduce a token that a request in the ring still holds.
+        uint16_t    epoch{0};
+    };
+    owner_slot m_owners[MAX_OWNERS]{};
+    uint32_t m_owner_hint{0};
+    bool m_owner_table_full_logged{false};
 };

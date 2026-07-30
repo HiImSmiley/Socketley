@@ -1,4 +1,5 @@
 #include "event_loop.h"
+#include "logging.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
@@ -13,6 +14,13 @@
 event_loop::event_loop(uint32_t queue_depth)
     : m_running(false), m_queue_depth(queue_depth), m_pending_submissions(0)
 {
+    // Slot 0 is the shared identity for handlers the table had no room for, and
+    // it is live from the start: a submission can happen before init() (nothing
+    // stops it), and the compare in run() must not reject it for a reason the
+    // owner cannot see or fix.
+    m_owners[0].handler = nullptr;
+    m_owners[0].token   = OWNER_UNVERIFIED;
+    m_owners[0].epoch   = 1;
 }
 
 event_loop::~event_loop()
@@ -141,6 +149,171 @@ inline struct io_uring_sqe* event_loop::get_sqe()
         sqe = io_uring_get_sqe(&m_ring);
     }
     return sqe;
+}
+
+uint32_t event_loop::register_owner(io_handler* owner)
+{
+    if (!owner)
+        return 0;
+
+    // Idempotent, and it has to be: re-registering a handler that already has
+    // an identity would strand every submission already in the ring under the
+    // old one, and those are exactly the completions it is still waiting for.
+    if (owner->m_loop_token != 0)
+        return owner->m_loop_token;
+
+    for (uint32_t i = 0; i < MAX_OWNERS - 1; ++i)
+    {
+        const uint32_t s = 1u + ((m_owner_hint + i) % (MAX_OWNERS - 1u));
+        auto& slot = m_owners[s];
+
+        // A slot the previous occupant left is only free once nothing is still
+        // owed to it.  Handing it out earlier would let a decrement that
+        // belongs to a completion already in the ring land on the new
+        // occupant's counter, and its slot would then look drained while it is
+        // not.
+        if (slot.token != 0 || slot.inflight != 0)
+            continue;
+
+        // The epoch is the whole reason a recycled slot is a different
+        // identity.  It deliberately survives the free above, so the next
+        // registration cannot reproduce a token some request is still carrying.
+        slot.epoch = static_cast<uint16_t>(slot.epoch + 1);
+        if (slot.epoch == 0)
+            slot.epoch = 1;
+
+        slot.handler = owner;
+        slot.token   = (static_cast<uint32_t>(slot.epoch) << 16) | s;
+        m_owner_hint = s;
+        owner->m_loop_token = slot.token;
+        return slot.token;
+    }
+
+    // Said once, because it is a capacity fact rather than an event: from here
+    // on some handlers share one identity and stale completions for them are
+    // delivered rather than dropped.
+    if (!m_owner_table_full_logged)
+    {
+        m_owner_table_full_logged = true;
+        LOG_WARN("event loop owner table full: further handlers share one identity, "
+                 "so their completions are delivered without a staleness check");
+    }
+    owner->m_loop_token = OWNER_UNVERIFIED;
+    return OWNER_UNVERIFIED;
+}
+
+void event_loop::deregister_owner(io_handler* owner)
+{
+    if (!owner)
+        return;
+
+    const uint32_t tok = owner->m_loop_token;
+    owner->m_loop_token = 0;
+
+    // Nothing to revoke for a handler that never registered, and slot 0 is
+    // shared — clearing it would revoke every other handler that landed there.
+    if (tok == 0 || tok == OWNER_UNVERIFIED)
+        return;
+
+    auto& slot = m_owners[tok & OWNER_SLOT_MASK];
+    if (slot.token != tok)
+        return;
+
+    // Clearing the token is what makes every completion still in the ring for
+    // this handler stale.  The slot itself stays claimed until those have
+    // drained — see the reuse test in register_owner() — and disarm() releases
+    // it when the last one lands.
+    slot.token = 0;
+    if (slot.inflight == 0)
+        slot.handler = nullptr;
+}
+
+bool event_loop::owner_registered(const io_handler* owner) const
+{
+    if (!owner)
+        return false;
+
+    const uint32_t tok = owner->m_loop_token;
+    if (tok == 0)
+        return false;
+    if (tok == OWNER_UNVERIFIED)
+        return true;
+
+    return m_owners[tok & OWNER_SLOT_MASK].token == tok;
+}
+
+uint32_t event_loop::owner_inflight(const io_handler* owner) const
+{
+    if (!owner)
+        return 0;
+
+    // Summed over every registration this handler has held, not just its
+    // current one: a handler that stopped and started again has a draining slot
+    // from the old run and a fresh slot from the new one, and the question this
+    // answers — is any request inside my storage still in the ring — is only
+    // answered by both.  Slot 0 is skipped on purpose: it counts every handler
+    // that could not be registered together, so it cannot answer for any single
+    // one of them.
+    uint32_t total = 0;
+    for (uint32_t s = 1; s < MAX_OWNERS; ++s)
+    {
+        if (m_owners[s].handler == owner)
+            total += m_owners[s].inflight;
+    }
+    return total;
+}
+
+// Stamp the owner identity onto the submission and count it as outstanding.
+// Reached from every submit_* helper on the path where the SQE was obtained,
+// so the count only ever includes submissions that were really queued.
+inline void event_loop::arm(io_request* req)
+{
+    uint32_t tok = 0;
+    if (__builtin_expect(req->owner != nullptr, 1))
+    {
+        tok = req->owner->m_loop_token;
+        if (__builtin_expect(tok == 0, 0))
+            tok = register_owner(req->owner);
+    }
+    req->owner_token = tok;
+
+    // A token of 0 lands on slot 0 next to the unverifiable handlers.  Slot 0
+    // is never freed, so counting there costs nothing and keeps this increment
+    // and the decrement in run() symmetric without a branch on either side.
+    ++m_owners[tok & OWNER_SLOT_MASK].inflight;
+    ++m_pending_submissions;
+}
+
+inline void event_loop::disarm(uint32_t token)
+{
+    auto& slot = m_owners[token & OWNER_SLOT_MASK];
+    // Guarded rather than assumed: an unmatched decrement would wrap the
+    // counter and the slot would never be reusable again.
+    if (__builtin_expect(slot.inflight > 0, 1))
+        --slot.inflight;
+
+    // The owner deregistered while this was still in flight and this was the
+    // last one: the slot is now genuinely free, and the handler pointer is
+    // dropped so a later object at the same address is not mistaken for it.
+    if (__builtin_expect(slot.inflight == 0 && slot.token == 0, 0))
+        slot.handler = nullptr;
+}
+
+// The completion cannot be delivered.  Whatever the kernel attached to it still
+// has to come back, and the loop is the only one left that can do it: the owner
+// that would have released the buffer is the reason we are here.
+inline void event_loop::drop_completion(const struct io_uring_cqe* cqe, const io_request* req)
+{
+    if (__builtin_expect((cqe->flags & IORING_CQE_F_BUFFER) != 0, 0))
+        return_buf(req->buf_group,
+                   static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+}
+
+void event_loop::return_cqe_buf(const struct io_uring_cqe* cqe, const io_request* req)
+{
+    if (!cqe || !req)
+        return;
+    drop_completion(cqe, req);
 }
 
 bool event_loop::init()
@@ -357,8 +530,32 @@ void event_loop::run()
                 break;
             }
 
-            if (__builtin_expect(req != nullptr && req->owner != nullptr, 1))
-                req->owner->on_cqe(cqe);
+            if (__builtin_expect(req != nullptr, 1))
+            {
+                // Being readable is not the same as being current.  The owner
+                // may have torn down since it submitted this, or the connection
+                // struct holding the request may have come back from a pool
+                // under a different owner entirely.  One indexed load and one
+                // compare settle it, and the answer is known before anything
+                // dereferences the handler.
+                const uint32_t tok = req->owner_token;
+                if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
+                                     && req->owner != nullptr, 1))
+                    req->owner->on_cqe(cqe);
+                else
+                    drop_completion(cqe, req);
+
+                // IORING_CQE_F_MORE means the submission is still armed and
+                // will complete again; without it this was its last completion,
+                // delivered or dropped.  Accounting for the dropped ones too is
+                // the point: a slot that keeps looking armed is never reusable,
+                // and its owner can never be told it is quiescent.  Read after
+                // dispatch on purpose — a handler that re-armed inside on_cqe
+                // has already counted the new submission, so this decrement
+                // belongs to the old one either way.
+                if (__builtin_expect((cqe->flags & IORING_CQE_F_MORE) == 0, 1))
+                    disarm(tok);
+            }
         }
 
         io_uring_cq_advance(&m_ring, count);
@@ -401,7 +598,7 @@ bool event_loop::submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_
 
     io_uring_prep_accept(sqe, listen_fd, reinterpret_cast<struct sockaddr*>(addr), addrlen, 0);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -422,7 +619,7 @@ bool event_loop::submit_multishot_accept(int listen_fd, io_request* req)
         io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
     }
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -452,7 +649,7 @@ bool event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
         io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
     }
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -465,7 +662,7 @@ bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
     // avoids file-position locking, and enables MSG_NOSIGNAL
     io_uring_prep_recv(sqe, fd, buf, len, 0);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -478,7 +675,7 @@ bool event_loop::submit_write(int fd, const char* buf, uint32_t len, io_request*
     // between our check and the actual send, without needing a global signal mask.
     io_uring_prep_send(sqe, fd, buf, len, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -489,7 +686,7 @@ bool event_loop::submit_writev(int fd, struct iovec* iovs, uint32_t count, io_re
 
     io_uring_prep_writev(sqe, fd, iovs, count, 0);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -499,7 +696,7 @@ bool event_loop::submit_sendmsg(int fd, struct msghdr* msg, io_request* req)
     if (!sqe) return false;
     io_uring_prep_sendmsg(sqe, fd, msg, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -510,7 +707,7 @@ bool event_loop::submit_recvmsg(int fd, struct msghdr* msg, io_request* req)
 
     io_uring_prep_recvmsg(sqe, fd, msg, 0);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -521,7 +718,7 @@ bool event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
 
     io_uring_prep_timeout(sqe, ts, 0, 0);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -551,7 +748,7 @@ bool event_loop::submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, 
     io_uring_prep_recv(sqe, fixed_idx, buf, len, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -563,7 +760,7 @@ bool event_loop::submit_write_fixed_file(int fixed_idx, const char* buf, uint32_
     io_uring_prep_send(sqe, fixed_idx, buf, len, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -575,7 +772,7 @@ bool event_loop::submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uin
     io_uring_prep_writev(sqe, fixed_idx, iovs, count, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -586,7 +783,7 @@ bool event_loop::submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io
     io_uring_prep_sendmsg(sqe, fixed_idx, msg, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -603,7 +800,10 @@ bool event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_recv_multishot;
-    m_pending_submissions++;
+    // Recorded on the request because a completion never names its group, and
+    // the loop may end up having to return the buffer itself.
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req);
     return true;
 }
 
@@ -620,7 +820,8 @@ bool event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_i
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
-    m_pending_submissions++;
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req);
     return true;
 }
 
@@ -633,7 +834,7 @@ bool event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint3
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -669,7 +870,7 @@ bool event_loop::submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t
     io_uring_prep_read_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_fixed_buf;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -681,7 +882,7 @@ bool event_loop::submit_write_fixed_buf(int fd, const char* buf, uint32_t len, u
     io_uring_prep_write_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_write_fixed_buf;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -751,7 +952,8 @@ bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
-    m_pending_submissions++;
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req);
     return true;
 }
 
@@ -829,7 +1031,8 @@ bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* re
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_recv_multishot;
-    m_pending_submissions++;
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req);
     return true;
 }
 
@@ -841,7 +1044,7 @@ bool event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_reques
     io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -857,7 +1060,7 @@ bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -870,7 +1073,7 @@ bool event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t
     io_uring_prep_read(sqe, file_fd, buf, len, offset);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_file_read;
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -881,7 +1084,7 @@ bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
 
     io_uring_prep_poll_add(sqe, fd, mask);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 
@@ -892,7 +1095,7 @@ bool event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t l
 
     io_uring_prep_connect(sqe, fd, addr, len);
     io_uring_sqe_set_data(sqe, req);
-    m_pending_submissions++;
+    arm(req);
     return true;
 }
 

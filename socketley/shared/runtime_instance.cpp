@@ -25,7 +25,12 @@ runtime_instance::~runtime_instance() = default;
 
 void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 {
-    if (!rt) { delete this; return; }
+    if (!rt)
+    {
+        if (loop) loop->deregister_owner(this);
+        delete this;
+        return;
+    }
     rt->fire_tick(cqe->res);
 }
 
@@ -36,6 +41,7 @@ void runtime_instance::start_tick_timer()
     if (ms < 10) ms = 10;
     m_tick = new tick_handler();
     m_tick->rt = this;
+    m_tick->loop = m_event_loop;
     m_tick->req = { m_tick, nullptr, -1, 0, op_timeout };
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
@@ -115,6 +121,10 @@ bool runtime_instance::start(event_loop& loop)
     // us which.  Erring towards "armed" costs a retired object; erring the
     // other way costs the daemon.
     m_armed_io = true;
+    // The loop keeps a token per owner so a completion arriving after this
+    // runtime is gone can be recognised and dropped rather than dispatched
+    // into it.
+    loop.register_owner(this);
 
     if (!setup(loop))
     {
@@ -150,6 +160,7 @@ bool runtime_instance::stop(event_loop& loop)
     if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
     invoke_on_stop();
     teardown(loop);
+    loop.deregister_owner(this);
     m_state.store(runtime_stopped, std::memory_order_release);
 
     // Signal all interactive sessions that runtime has stopped

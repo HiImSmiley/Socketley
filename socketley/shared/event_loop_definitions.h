@@ -9,12 +9,46 @@
 #define SOCKETLEY_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
+class event_loop;
+
 class io_handler
 {
 public:
     virtual ~io_handler() = default;
     virtual void on_cqe(struct io_uring_cqe* cqe) = 0;
+
+private:
+    friend class event_loop;
+
+    // Who this handler is as far as the loop is concerned: the index of its
+    // slot in the loop's owner table in the low bits, the epoch of the
+    // registration holding that slot in the high 16.  Written only by
+    // event_loop::register_owner() and cleared only by deregister_owner().
+    //
+    // Every submission copies it into its io_request, so a completion carries
+    // the identity its owner had at submit time.  The loop can then decide
+    // whether that owner is still there without dereferencing it — which it
+    // must not do, because "still there" is exactly the question.
+    uint32_t m_loop_token{0};
 };
+
+// Stamp source for io_request::generation below.  One counter for the whole
+// process: the comparison it feeds is only meaningful if no two structs that
+// are alive at the same time can hold the same value, and per-struct counters
+// cannot promise that.  Only the loop thread calls this, so a plain increment
+// is enough.  Zero stays reserved for "never stamped" and is skipped on wrap,
+// so a request that was never given a generation never looks current.
+inline uint32_t next_io_generation()
+{
+    static uint32_t seq = 0;
+    if (SOCKETLEY_UNLIKELY(++seq == 0))
+        seq = 1;
+    return seq;
+}
+
+// io_request::buf_group for a submission that selected no provided buffer.
+// Outside every valid group id, so returning it is a no-op.
+inline constexpr uint8_t NO_BUF_GROUP = 0xFF;
 
 enum op_type : uint8_t
 {
@@ -51,7 +85,35 @@ struct io_request
     // Connection structs are pooled and their io_requests live inside them, so
     // a completion that arrives after the struct was handed to a new connection
     // is indistinguishable from that connection's own — same address, same fd
-    // number, valid owner.  The handler would then act on the wrong connection.
-    // Stamp the owner's generation at submit time and compare on completion.
+    // number, and the same owner, so owner_token below cannot separate them:
+    // the owner really is unchanged.  This is the finer-grained stamp for that
+    // case.  A struct writes the value it was reset with into every request it
+    // submits, and the handler compares before acting on the completion.
+    //
+    // The value must come from next_io_generation() and from nowhere else.  A
+    // counter kept per struct does not work, because both check sites reach the
+    // struct through the fd index first: once a descriptor is handed to a
+    // different struct, the stamp is compared against a *different* object's
+    // counter, and with a pool of a few dozen structs those counters sit in a
+    // narrow band, so two unrelated connections agreeing is common rather than
+    // rare.  One monotonic source makes agreement mean identity again.
     uint32_t generation{0};
+
+    // Which handler this submission belonged to, copied from the owner's
+    // io_handler::m_loop_token by the submit_* helpers.  run() compares it
+    // against the loop's owner table before dispatching: a handler that has
+    // deregistered since — or a request left over from an earlier registration
+    // that happened to land on the same slot — fails the compare and its
+    // completion is dropped instead of delivered.  Zero means the request had
+    // no owner at submit time, which never matches a live registration.
+    uint32_t owner_token{0};
+
+    // The provided-buffer group this submission selected from, so the loop can
+    // put the buffer back when it drops the completion — by then the owner that
+    // knew the group may be gone.  Set only by the helpers that ask for a
+    // provided buffer; a value left behind by an earlier such submission on the
+    // same request is never read, because it is only consulted when the
+    // completion carries IORING_CQE_F_BUFFER and only those helpers can produce
+    // that.
+    uint8_t buf_group{NO_BUF_GROUP};
 };

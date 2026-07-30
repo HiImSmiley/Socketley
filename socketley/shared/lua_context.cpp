@@ -54,6 +54,10 @@ struct lua_timer : io_handler
     {
         if (!*alive || cqe->res == -ECANCELED || cancelled)
         {
+            // Out of the loop's owner table first: this object is about to be
+            // pooled or freed, and a token left behind would let a later
+            // completion be dispatched into whoever takes its place.
+            if (loop) loop->deregister_owner(this);
             if (ctx) { ctx->unregister_timer(this); ctx->timer_pool_release(this); }
             else delete this;
             return;
@@ -65,6 +69,10 @@ struct lua_timer : io_handler
             loop->submit_timeout(&ts, &req);
         else
         {
+            // Out of the loop's owner table first: this object is about to be
+            // pooled or freed, and a token left behind would let a later
+            // completion be dispatched into whoever takes its place.
+            if (loop) loop->deregister_owner(this);
             if (ctx) { ctx->unregister_timer(this); ctx->timer_pool_release(this); }
             else delete this;
         }

@@ -321,6 +321,10 @@ private:
     // Tick timer
     struct tick_handler : io_handler {
         runtime_instance* rt{nullptr};
+        // Kept so the handler can take itself out of the loop's owner table in
+        // its own last completion.  Deregistering any earlier would have that
+        // completion dropped, and the handler would then never free itself.
+        event_loop* loop{nullptr};
         io_request req{};
         struct __kernel_timespec ts{};
         std::chrono::steady_clock::time_point last{};
