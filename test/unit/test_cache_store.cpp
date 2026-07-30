@@ -2,6 +2,7 @@
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
 #include <thread>
+#include <unistd.h>
 
 TEST_CASE("cache_store string operations")
 {
@@ -253,7 +254,11 @@ TEST_CASE("cache_store TTL")
 TEST_CASE("cache_store eviction")
 {
     cache_store store;
-    store.set_max_memory(100);
+    // The limit counts the containers, not just the payload: a key costs its
+    // own bytes plus ~74 for the map node and, while a limit is configured,
+    // ~139 more for the LRU bookkeeping.  600 therefore holds two of the
+    // ~46-byte entries below and evicts on the third.
+    store.set_max_memory(600);
     store.set_eviction(evict_allkeys_lru);
 
     SUBCASE("basic eviction")
@@ -271,8 +276,154 @@ TEST_CASE("cache_store eviction")
     SUBCASE("noeviction rejects writes")
     {
         store.set_eviction(evict_none);
+        store.set_max_memory(500);
         store.set("k1", std::string(90, 'a'));
         CHECK_FALSE(store.set("k2", std::string(20, 'b')));
+    }
+
+    SUBCASE("growing an existing value is checked against the limit")
+    {
+        store.set_eviction(evict_none);
+        store.set_max_memory(500);
+        CHECK(store.set("k", std::string(90, 'a')));
+
+        // Overwriting upward used to skip check_memory altogether, so a small
+        // value could be replaced by an arbitrarily large one with the limit
+        // never consulted.  It has to be refused, not silently accepted.
+        CHECK_FALSE(store.set("k", std::string(5000, 'b')));
+
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out.size() == 90);
+    }
+
+    SUBCASE("a refused append says so instead of reporting success")
+    {
+        store.set_eviction(evict_none);
+        store.set_max_memory(500);
+        CHECK(store.set("k", std::string(90, 'a')));
+
+        // The refusal used to come back as the unchanged length, which reads
+        // exactly like a successful append of nothing.
+        CHECK(store.append("k", std::string(5000, 'b')) == cache_store::append_denied);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out.size() == 90);
+
+        // Same for a key that does not exist yet, where the refusal used to be
+        // reported as a new length of 0.
+        CHECK(store.append("brandnew", std::string(5000, 'c')) == cache_store::append_denied);
+        CHECK_FALSE(store.exists("brandnew"));
+    }
+
+    SUBCASE("emptying a collection does not corrupt LRU order")
+    {
+        // Draining a list deletes the key.  That path used to erase the key
+        // from m_lru_map while leaving its m_lru_order node behind, so when the
+        // key came back touch_lru appended a *second* node.  Eviction then
+        // walked the stale node and deleted the key it named — the live one,
+        // even though it was the most recently used.
+        std::string out;
+        store.rpush("a", "x");
+        CHECK(store.lpop("a", out));
+        CHECK_FALSE(store.exists("a"));
+
+        store.set("a", std::string(45, 'a'));
+        store.set("b", std::string(45, 'b'));
+
+        // Touch "a" so "b" is unambiguously the least recently used.
+        // get_ptr is what the command path uses; plain get() is const and does
+        // not update the LRU.
+        CHECK(store.get_ptr("a") != nullptr);
+
+        // Adding "c" has to evict exactly one key, and it must be "b"
+        CHECK(store.set("c", std::string(45, 'c')));
+        CHECK(store.exists("a"));
+        CHECK_FALSE(store.exists("b"));
+    }
+}
+
+TEST_CASE("cache_store load restores accounting and eviction order")
+{
+    const std::string path = "/tmp/socketley-unit-load-" + std::to_string(::getpid()) + ".bin";
+    size_t expected = 0;
+
+    {
+        cache_store src;
+        src.set_max_memory(1000000);
+        src.set_eviction(evict_allkeys_lru);
+        for (int i = 0; i < 20; i++)
+            src.set("k" + std::to_string(i), std::string(50, 'v'));
+        src.rpush("l", std::string(40, 'e'));
+        src.sadd("s", std::string(40, 'm'));
+        src.hset("h", "f", std::string(40, 'x'));
+        expected = src.get_memory_used();
+        CHECK(src.save(path));
+    }
+
+    cache_store dst;
+    dst.set_max_memory(1000000);          // limit is configured before the load, as the runtime does
+    dst.set_eviction(evict_allkeys_lru);
+    CHECK(dst.load(path));
+    CHECK(dst.size() == 23);
+
+    // load() inserted straight into the containers, so the restored data was
+    // invisible to the accounting: same bytes resident, but reported as nothing.
+    CHECK(dst.get_memory_used() == expected);
+
+    // And the eviction order has to come back too.  With an empty LRU try_evict
+    // has nothing to walk, so a write that needs room fails instead of making it.
+    dst.set_max_memory(dst.get_memory_used() + 200);
+    CHECK(dst.set("fresh", std::string(400, 'z')));
+
+    ::unlink(path.c_str());
+}
+
+TEST_CASE("cache_store memory accounting")
+{
+    cache_store store;
+    const size_t empty = store.get_memory_used();
+
+    SUBCASE("reports the cost of the containers, not just the payload")
+    {
+        store.set("k", std::string(10, 'v'));
+        // 11 bytes of payload live in a map node that costs several times that
+        CHECK(store.get_memory_used() - empty > 50);
+    }
+
+    SUBCASE("returns to baseline once every key is gone")
+    {
+        for (int i = 0; i < 50; i++)
+        {
+            std::string n = std::to_string(i);
+            store.set("k" + n, "value");
+            store.rpush("list", "element");
+            store.sadd("set", "member" + n);
+            store.hset("hash", "field" + n, "v");
+        }
+        CHECK(store.get_memory_used() > empty);
+
+        for (int i = 0; i < 50; i++)
+            CHECK(store.del("k" + std::to_string(i)));
+        CHECK(store.del("list"));
+        CHECK(store.del("set"));
+        CHECK(store.del("hash"));
+
+        // A missed decrement anywhere leaves the cache permanently believing it
+        // holds memory it does not — and that error only ever accumulates.
+        CHECK(store.get_memory_used() == empty);
+    }
+
+    SUBCASE("draining collections element by element balances too")
+    {
+        std::string out;
+        for (int i = 0; i < 20; i++) store.rpush("l", "e");
+        for (int i = 0; i < 20; i++) CHECK(store.lpop("l", out));
+        for (int i = 0; i < 20; i++) store.sadd("s", "m" + std::to_string(i));
+        for (int i = 0; i < 20; i++) CHECK(store.srem("s", "m" + std::to_string(i)));
+        for (int i = 0; i < 20; i++) store.hset("h", "f" + std::to_string(i), "v");
+        for (int i = 0; i < 20; i++) CHECK(store.hdel("h", "f" + std::to_string(i)));
+        CHECK(store.get_memory_used() == empty);
     }
 }
 

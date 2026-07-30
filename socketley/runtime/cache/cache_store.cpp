@@ -73,19 +73,38 @@ bool cache_store::set(std::string_view key, std::string_view value)
     auto it = m_data.find(key);
     if (__builtin_expect(it != m_data.end(), 1))
     {
-        track_sub(it->second.size());
-        // Use assign() instead of operator= to potentially reuse existing allocation
-        it->second.assign(value.data(), value.size());
-        track_add(value.size());
-        touch_lru(key);
-        return true;
+        // Growing an existing value has to clear the same bar as creating one.
+        // This path used to skip check_memory entirely, so a 10-byte value could
+        // be replaced by a 100 MB one without maxmemory ever being consulted.
+        // Only the growing case needs the check, and only when a limit is set —
+        // shrinking or rewriting in place can never push us over.
+        if (__builtin_expect(m_max_memory != 0 && value.size() > it->second.size(), 0))
+        {
+            if (!check_memory(value.size() - it->second.size()))
+                return false;
+            // check_memory may have evicted, and the victim can be this very
+            // key — the iterator is only safe to reuse after re-acquiring it.
+            it = m_data.find(key);
+        }
+
+        if (__builtin_expect(it != m_data.end(), 1))
+        {
+            track_sub(it->second.size());
+            // Use assign() instead of operator= to potentially reuse existing allocation
+            it->second.assign(value.data(), value.size());
+            track_add(value.size());
+            touch_lru(key);
+            return true;
+        }
+        // Eviction took the key we were about to overwrite; fall through and
+        // insert it as a new one, which charges the full per-key cost.
     }
 
     // Slow path: new key — check type conflicts
     if (__builtin_expect(has_type_conflict_for_string(key), 0))
         return false;
 
-    if (__builtin_expect(!check_memory(key.size() + value.size()), 0))
+    if (__builtin_expect(!check_memory(key.size() + value.size() + new_key_overhead()), 0))
         return false;
 
     auto [it2, inserted] = m_data.try_emplace(std::string(key), std::string(value));
@@ -134,12 +153,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
             {
                 // Expired — remove
                 m_expiry.erase(eit);
-                // Remove from LRU
-                if (auto lru_it = m_lru_map.find(key); lru_it != m_lru_map.end())
-                {
-                    m_lru_order.erase(lru_it->second);
-                    m_lru_map.erase(lru_it);
-                }
+                drop_lru(key);
                 auto sit = m_data.find(key);
                 if (sit != m_data.end())
                 {
@@ -154,6 +168,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                         size_t mem = lit->first.size();
                         for (const auto& e : lit->second) mem += e.size();
                         track_sub(mem);
+                        m_list_elems -= lit->second.size();
                         m_lists.erase(lit);
                     }
                     else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end())
@@ -161,6 +176,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                         size_t mem = eit2->first.size();
                         for (const auto& e : eit2->second) mem += e.size();
                         track_sub(mem);
+                        m_set_elems -= eit2->second.size();
                         m_sets.erase(eit2);
                     }
                     else if (auto hit = m_hashes.find(key); hit != m_hashes.end())
@@ -168,6 +184,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                         size_t mem = hit->first.size();
                         for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
                         track_sub(mem);
+                        m_hash_fields -= hit->second.size();
                         m_hashes.erase(hit);
                     }
                 }
@@ -192,9 +209,10 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(val.size()))
+        if (!check_memory(val.size() + list_elem_overhead))
             return false;
         it->second.emplace_front(val);
+        ++m_list_elems;
         track_add(val.size());
         touch_lru(key);
         return true;
@@ -203,10 +221,11 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(key.size() + val.size()))
+    if (!check_memory(key.size() + val.size() + new_key_overhead() + list_elem_overhead))
         return false;
 
     m_lists.emplace(std::string(key), std::deque<std::string>{}).first->second.emplace_front(val);
+    ++m_list_elems;
     track_add(key.size() + val.size());
     touch_lru(key);
     return true;
@@ -217,9 +236,10 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(val.size()))
+        if (!check_memory(val.size() + list_elem_overhead))
             return false;
         it->second.emplace_back(val);
+        ++m_list_elems;
         track_add(val.size());
         touch_lru(key);
         return true;
@@ -228,10 +248,11 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(key.size() + val.size()))
+    if (!check_memory(key.size() + val.size() + new_key_overhead() + list_elem_overhead))
         return false;
 
     m_lists.emplace(std::string(key), std::deque<std::string>{}).first->second.emplace_back(val);
+    ++m_list_elems;
     track_add(key.size() + val.size());
     touch_lru(key);
     return true;
@@ -245,14 +266,16 @@ bool cache_store::lpop(std::string_view key, std::string& out)
 
     out = std::move(it->second.front());
     it->second.pop_front();
+    --m_list_elems;
     track_sub(out.size());
 
     if (it->second.empty())
     {
         track_sub(key.size());
+        m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
-        m_lru_map.erase(std::string(key));
+        drop_lru(key);
     }
     return true;
 }
@@ -265,14 +288,16 @@ bool cache_store::rpop(std::string_view key, std::string& out)
 
     out = std::move(it->second.back());
     it->second.pop_back();
+    --m_list_elems;
     track_sub(out.size());
 
     if (it->second.empty())
     {
         track_sub(key.size());
+        m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
-        m_lru_map.erase(std::string(key));
+        drop_lru(key);
     }
     return true;
 }
@@ -317,11 +342,12 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     auto it = m_sets.find(key);
     if (it != m_sets.end())
     {
-        if (!check_memory(member.size()))
+        if (!check_memory(member.size() + set_elem_overhead))
             return -1;
         auto [_, inserted] = it->second.emplace(member);
         if (inserted)
         {
+            ++m_set_elems;
             track_add(member.size());
             touch_lru(key);
         }
@@ -331,11 +357,12 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     if (has_type_conflict_for_set(key))
         return -1;
 
-    if (!check_memory(key.size() + member.size()))
+    if (!check_memory(key.size() + member.size() + new_key_overhead() + set_elem_overhead))
         return -1;
 
     auto& s = m_sets.emplace(std::string(key), set_inner{}).first->second;
     s.emplace(member);
+    ++m_set_elems;
     track_add(key.size() + member.size());
     touch_lru(key);
     return 1;
@@ -353,13 +380,15 @@ bool cache_store::srem(std::string_view key, std::string_view member)
 
     track_sub(mit->size());
     it->second.erase(mit);
+    --m_set_elems;
 
     if (it->second.empty())
     {
         track_sub(key.size());
+        m_set_elems -= it->second.size();
         m_sets.erase(it);
         m_expiry.erase(std::string(key));
-        m_lru_map.erase(std::string(key));
+        drop_lru(key);
     }
     return true;
 }
@@ -404,9 +433,10 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         }
         else
         {
-            if (!check_memory(field.size() + val.size()))
+            if (!check_memory(field.size() + val.size() + hash_field_overhead))
                 return false;
             it->second.emplace(std::string(field), std::string(val));
+            ++m_hash_fields;
             track_add(field.size() + val.size());
         }
         touch_lru(key);
@@ -416,11 +446,12 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     if (has_type_conflict_for_hash(key))
         return false;
 
-    if (!check_memory(key.size() + field.size() + val.size()))
+    if (!check_memory(key.size() + field.size() + val.size() + new_key_overhead() + hash_field_overhead))
         return false;
 
     auto& h = m_hashes.emplace(std::string(key), hash_inner{}).first->second;
     h.emplace(std::string(field), std::string(val));
+    ++m_hash_fields;
     track_add(key.size() + field.size() + val.size());
     touch_lru(key);
     return true;
@@ -451,13 +482,15 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
 
     track_sub(fit->first.size() + fit->second.size());
     it->second.erase(fit);
+    --m_hash_fields;
 
     if (it->second.empty())
     {
         track_sub(key.size());
+        m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         m_expiry.erase(std::string(key));
-        m_lru_map.erase(std::string(key));
+        drop_lru(key);
     }
     return true;
 }
@@ -532,12 +565,7 @@ void cache_store::check_expiry(std::string_view key)
 
     // Expired — remove from all containers
     m_expiry.erase(it);
-    // Remove from LRU
-    if (auto lit = m_lru_map.find(key); lit != m_lru_map.end())
-    {
-        m_lru_order.erase(lit->second);
-        m_lru_map.erase(lit);
-    }
+    drop_lru(key);
 
     if (auto sit = m_data.find(key); sit != m_data.end())
     {
@@ -550,6 +578,7 @@ void cache_store::check_expiry(std::string_view key)
         size_t mem = lit->first.size();
         for (const auto& e : lit->second) mem += e.size();
         track_sub(mem);
+        m_list_elems -= lit->second.size();
         m_lists.erase(lit);
         return;
     }
@@ -558,6 +587,7 @@ void cache_store::check_expiry(std::string_view key)
         size_t mem = eit->first.size();
         for (const auto& e : eit->second) mem += e.size();
         track_sub(mem);
+        m_set_elems -= eit->second.size();
         m_sets.erase(eit);
         return;
     }
@@ -566,6 +596,7 @@ void cache_store::check_expiry(std::string_view key)
         size_t mem = hit->first.size();
         for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
         track_sub(mem);
+        m_hash_fields -= hit->second.size();
         m_hashes.erase(hit);
         return;
     }
@@ -677,7 +708,7 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
     }
     else
     {
-        if (!check_memory(key.size() + sv.size()))
+        if (!check_memory(key.size() + sv.size() + new_key_overhead()))
             return false;
         m_data.emplace(std::string(key), std::string(sv));
         track_add(key.size() + sv.size());
@@ -690,27 +721,38 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
 {
     check_expiry(key);
     if (has_type_conflict_for_string(key))
-        return std::string::npos;  // type conflict
+        return append_wrong_type;
 
     auto it = m_data.find(key);
     if (it != m_data.end())
     {
-        if (m_max_memory > 0 && !check_memory(suffix.size()))
+        if (__builtin_expect(m_max_memory != 0, 0))
+        {
+            // Refusing has to be visible.  Returning the unchanged length here
+            // told the caller the append had happened and produced nothing.
+            if (!check_memory(suffix.size()))
+                return append_denied;
+            // check_memory may have evicted, and the victim can be this very
+            // key — the iterator is only safe to reuse after re-acquiring it.
+            it = m_data.find(key);
+        }
+
+        if (it != m_data.end())
+        {
+            it->second.append(suffix.data(), suffix.size());
+            track_add(suffix.size());
+            touch_lru(key);
             return it->second.size();
-        it->second.append(suffix.data(), suffix.size());
-        track_add(suffix.size());
-        touch_lru(key);
-        return it->second.size();
+        }
+        // Eviction took the key we were appending to; fall through and create it.
     }
-    else
-    {
-        if (!check_memory(key.size() + suffix.size()))
-            return 0;
-        auto& str = m_data.emplace(std::string(key), std::string(suffix)).first->second;
-        track_add(key.size() + suffix.size());
-        touch_lru(key);
-        return str.size();
-    }
+
+    if (!check_memory(key.size() + suffix.size() + new_key_overhead()))
+        return append_denied;
+    auto& str = m_data.emplace(std::string(key), std::string(suffix)).first->second;
+    track_add(key.size() + suffix.size());
+    touch_lru(key);
+    return str.size();
 }
 
 size_t cache_store::strlen_key(std::string_view key) const
@@ -770,12 +812,7 @@ bool cache_store::del(std::string_view key)
     if (auto eit = m_expiry.find(key); eit != m_expiry.end())
         m_expiry.erase(eit);
 
-    // Remove from LRU (transparent find avoids string allocation)
-    if (auto lit = m_lru_map.find(key); lit != m_lru_map.end())
-    {
-        m_lru_order.erase(lit->second);
-        m_lru_map.erase(lit);
-    }
+    drop_lru(key);
 
     if (auto it = m_data.find(key); it != m_data.end())
     {
@@ -788,6 +825,7 @@ bool cache_store::del(std::string_view key)
         size_t mem = it->first.size();
         for (const auto& e : it->second) mem += e.size();
         track_sub(mem);
+        m_list_elems -= it->second.size();
         m_lists.erase(it);
         return true;
     }
@@ -796,6 +834,7 @@ bool cache_store::del(std::string_view key)
         size_t mem = it->first.size();
         for (const auto& e : it->second) mem += e.size();
         track_sub(mem);
+        m_set_elems -= it->second.size();
         m_sets.erase(it);
         return true;
     }
@@ -804,6 +843,7 @@ bool cache_store::del(std::string_view key)
         size_t mem = it->first.size();
         for (const auto& [f, v] : it->second) mem += f.size() + v.size();
         track_sub(mem);
+        m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         return true;
     }
@@ -1099,6 +1139,9 @@ bool cache_store::load_v2(const char* data, size_t size)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_list_elems = 0;
+    m_set_elems = 0;
+    m_hash_fields = 0;
     m_expiry.clear();
     m_current_memory = 0;
     m_lru_order.clear();
@@ -1177,7 +1220,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                         expired = true;
                 }
                 if (!expired)
-                    m_data[std::move(key)] = std::move(value);
+                    adopt_loaded_string(std::move(key), std::move(value));
                 break;
             }
             case TYPE_LIST:
@@ -1193,7 +1236,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_lists[std::move(key)] = std::move(deq);
+                    adopt_loaded_list(std::move(key), std::move(deq));
                 break;
             }
             case TYPE_SET:
@@ -1209,7 +1252,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_sets[std::move(key)] = std::move(s);
+                    adopt_loaded_set(std::move(key), std::move(s));
                 break;
             }
             case TYPE_HASH:
@@ -1226,7 +1269,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_hashes[std::move(key)] = std::move(h);
+                    adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
             default:
@@ -1244,6 +1287,9 @@ bool cache_store::load_v2_stream(std::ifstream& file)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_list_elems = 0;
+    m_set_elems = 0;
+    m_hash_fields = 0;
     m_expiry.clear();
     m_current_memory = 0;
     m_lru_order.clear();
@@ -1301,7 +1347,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                         expired = true;
                 }
                 if (!expired)
-                    m_data[std::move(key)] = std::move(value);
+                    adopt_loaded_string(std::move(key), std::move(value));
                 break;
             }
             case TYPE_LIST:
@@ -1318,7 +1364,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_lists[std::move(key)] = std::move(deq);
+                    adopt_loaded_list(std::move(key), std::move(deq));
                 break;
             }
             case TYPE_SET:
@@ -1335,7 +1381,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_sets[std::move(key)] = std::move(s);
+                    adopt_loaded_set(std::move(key), std::move(s));
                 break;
             }
             case TYPE_HASH:
@@ -1353,7 +1399,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                 }
                 read_expiry(key);
                 if (!m_expiry.count(key) || m_expiry[key] > now)
-                    m_hashes[std::move(key)] = std::move(h);
+                    adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
             default:
@@ -1370,6 +1416,9 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_list_elems = 0;
+    m_set_elems = 0;
+    m_hash_fields = 0;
     m_expiry.clear();
     m_current_memory = 0;
     m_lru_order.clear();
@@ -1392,8 +1441,7 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
         file.read(value.data(), val_len);
         if (!file) break;
 
-        m_current_memory += key.size() + value.size();
-        m_data[std::move(key)] = std::move(value);
+        adopt_loaded_string(std::move(key), std::move(value));
 
         // Try reading next key_len
         file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
@@ -1407,12 +1455,75 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
 
 void cache_store::set_max_memory(size_t bytes)
 {
+    // touch_lru is a no-op while there is no limit, so anything written before
+    // now is absent from the eviction order.  Without this, switching a limit on
+    // over existing data leaves try_evict with an empty list and no way to get
+    // back under the ceiling.
+    const bool enabling = (m_max_memory == 0 && bytes != 0);
     m_max_memory = bytes;
+    if (enabling)
+        rebuild_lru();
 }
 
 void cache_store::set_eviction(eviction_policy policy)
 {
     m_eviction = policy;
+}
+
+void cache_store::adopt_loaded_string(std::string&& key, std::string&& value)
+{
+    const size_t bytes = key.size() + value.size();
+    auto it = m_data.insert_or_assign(std::move(key), std::move(value)).first;
+    track_add(bytes);
+    touch_lru(it->first);
+}
+
+void cache_store::adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq)
+{
+    size_t bytes = key.size();
+    for (const auto& e : deq) bytes += e.size();
+    m_list_elems += deq.size();
+    auto it = m_lists.insert_or_assign(std::move(key), std::move(deq)).first;
+    track_add(bytes);
+    touch_lru(it->first);
+}
+
+void cache_store::adopt_loaded_set(std::string&& key, set_inner&& members)
+{
+    size_t bytes = key.size();
+    for (const auto& e : members) bytes += e.size();
+    m_set_elems += members.size();
+    auto it = m_sets.insert_or_assign(std::move(key), std::move(members)).first;
+    track_add(bytes);
+    touch_lru(it->first);
+}
+
+void cache_store::adopt_loaded_hash(std::string&& key, hash_inner&& fields)
+{
+    size_t bytes = key.size();
+    for (const auto& [f, v] : fields) bytes += f.size() + v.size();
+    m_hash_fields += fields.size();
+    auto it = m_hashes.insert_or_assign(std::move(key), std::move(fields)).first;
+    track_add(bytes);
+    touch_lru(it->first);
+}
+
+void cache_store::rebuild_lru()
+{
+    for (const auto& e : m_data)   touch_lru(e.first);
+    for (const auto& e : m_lists)  touch_lru(e.first);
+    for (const auto& e : m_sets)   touch_lru(e.first);
+    for (const auto& e : m_hashes) touch_lru(e.first);
+}
+
+void cache_store::drop_lru(std::string_view key)
+{
+    // Transparent find — no std::string allocation for the lookup.
+    auto it = m_lru_map.find(key);
+    if (it == m_lru_map.end())
+        return;
+    m_lru_order.erase(it->second);
+    m_lru_map.erase(it);
 }
 
 void cache_store::touch_lru(std::string_view key)
@@ -1424,9 +1535,12 @@ void cache_store::touch_lru(std::string_view key)
     auto it = m_lru_map.find(key);
     if (it != m_lru_map.end())
     {
-        m_lru_order.erase(it->second);
-        m_lru_order.push_back(std::string(key));
-        it->second = std::prev(m_lru_order.end());
+        // Relink the existing node instead of destroying and rebuilding it.
+        // erase + push_back frees a list node, allocates a new one and copies
+        // the key string again — on every cache hit, purely to move an element
+        // to the end of a list.  splice does it by pointer swap, and iterators
+        // to the moved element stay valid, so the map entry needs no update.
+        m_lru_order.splice(m_lru_order.end(), m_lru_order, it->second);
     }
     else
     {
@@ -1441,7 +1555,9 @@ bool cache_store::try_evict(size_t needed)
     if (m_eviction == evict_none)
         return false;
 
-    while (m_current_memory + needed > m_max_memory && !m_lru_order.empty())
+    // Same measure check_memory uses — evicting against payload alone would
+    // stop far short of the limit the caller actually set.
+    while (get_memory_used() + needed > m_max_memory && !m_lru_order.empty())
     {
         if (m_eviction == evict_allkeys_lru)
         {
@@ -1462,6 +1578,7 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = it->first.size();
                 for (const auto& e : it->second) mem += e.size();
                 track_sub(mem);
+                m_list_elems -= it->second.size();
                 m_lists.erase(it);
             }
             else if (auto it = m_sets.find(victim); it != m_sets.end())
@@ -1469,6 +1586,7 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = it->first.size();
                 for (const auto& e : it->second) mem += e.size();
                 track_sub(mem);
+                m_set_elems -= it->second.size();
                 m_sets.erase(it);
             }
             else if (auto it = m_hashes.find(victim); it != m_hashes.end())
@@ -1476,6 +1594,7 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = it->first.size();
                 for (const auto& [f, v] : it->second) mem += f.size() + v.size();
                 track_sub(mem);
+                m_hash_fields -= it->second.size();
                 m_hashes.erase(it);
             }
         }
@@ -1501,6 +1620,7 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = lit->first.size();
                 for (const auto& e : lit->second) mem += e.size();
                 track_sub(mem);
+                m_list_elems -= lit->second.size();
                 m_lists.erase(lit);
             }
             else if (auto sit = m_sets.find(victim); sit != m_sets.end())
@@ -1508,6 +1628,7 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = sit->first.size();
                 for (const auto& e : sit->second) mem += e.size();
                 track_sub(mem);
+                m_set_elems -= sit->second.size();
                 m_sets.erase(sit);
             }
             else if (auto hit = m_hashes.find(victim); hit != m_hashes.end())
@@ -1515,12 +1636,13 @@ bool cache_store::try_evict(size_t needed)
                 size_t mem = hit->first.size();
                 for (const auto& [f, v] : hit->second) mem += f.size() + v.size();
                 track_sub(mem);
+                m_hash_fields -= hit->second.size();
                 m_hashes.erase(hit);
             }
         }
     }
 
-    return m_current_memory + needed <= m_max_memory;
+    return get_memory_used() + needed <= m_max_memory;
 }
 
 // ─── Pub/Sub ───

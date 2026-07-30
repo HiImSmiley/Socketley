@@ -118,6 +118,13 @@ public:
     bool incr(std::string_view key, int64_t delta, int64_t& result);
 
     // --- String extras ---
+    // append() sentinels.  npos has always meant "wrong type"; a refusal by the
+    // memory limit used to come back as the *unchanged* length, which a caller
+    // cannot tell apart from a successful append of nothing — so a discarded
+    // write was reported to the client as a successful one.
+    static constexpr size_t append_wrong_type = std::string::npos;
+    static constexpr size_t append_denied     = std::string::npos - 1;
+
     size_t append(std::string_view key, std::string_view suffix);  // returns new length
     size_t strlen_key(std::string_view key) const;                  // 0 if missing
     bool getset(std::string_view key, std::string_view newval, std::string& oldval);
@@ -138,7 +145,10 @@ public:
     // --- Eviction / Memory ---
     void set_max_memory(size_t bytes);
     size_t get_max_memory() const { return m_max_memory; }
-    size_t get_memory_used() const { return m_current_memory; }
+    // Payload plus the cost of the containers holding it.  Counting payload
+    // alone made this read 10 MB where the process had actually grown by
+    // 111 MB, so --maxmemory 256M would happily occupy ~2.8 GB.
+    size_t get_memory_used() const { return m_current_memory + structural_overhead(); }
     void set_eviction(eviction_policy policy);
     eviction_policy get_eviction() const { return m_eviction; }
     // Inline fast-path: most configs have no memory limit
@@ -146,7 +156,7 @@ public:
     {
         if (__builtin_expect(m_max_memory == 0, 1))
             return true;
-        if (__builtin_expect(m_current_memory + needed <= m_max_memory, 1))
+        if (__builtin_expect(get_memory_used() + needed <= m_max_memory, 1))
             return true;
         return try_evict(needed);
     }
@@ -174,8 +184,76 @@ private:
     bool load_v2_stream(std::ifstream& file);  // legacy fallback
     bool load_v1(std::ifstream& file, uint32_t first_key_len);
 
+    // Take ownership of one entry restored by load(), with the same bookkeeping
+    // a live write would have done.  load() used to insert straight into the
+    // containers, so a reloaded store reported zero bytes in use and — worse —
+    // had an empty LRU, which leaves try_evict nothing to walk and makes the
+    // configured maxmemory unenforceable for everything that came off disk.
+    void adopt_loaded_string(std::string&& key, std::string&& value);
+    void adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq);
+    void adopt_loaded_set(std::string&& key, set_inner&& members);
+    void adopt_loaded_hash(std::string&& key, hash_inner&& fields);
+
+    // Populate the eviction order from the data already resident.  Needed when a
+    // limit is switched on after the fact: touch_lru does nothing while
+    // m_max_memory is zero, so those keys never entered the LRU.
+    void rebuild_lru();
+
     void touch_lru(std::string_view key);
+
+    // Remove a key from the LRU bookkeeping.  Both structures have to go
+    // together: erasing only from m_lru_map orphans the m_lru_order node, and
+    // touch_lru then appends a *second* node when the key comes back, so
+    // eviction later drops a live key while walking the stale one.
+    void drop_lru(std::string_view key);
     bool try_evict(size_t needed);
+
+    // Structural cost of the containers, in bytes per entry.  Measured on this
+    // toolchain (libstdc++ / glibc malloc, x86-64) with 500k short keys: an
+    // unordered_map node holding two std::strings plus its bucket slot costs
+    // ~74 bytes before any payload, and while a memory limit is configured each
+    // key additionally carries an m_lru_order node and an m_lru_map entry for
+    // ~139 bytes more.
+    //
+    // These are approximations, and deliberately so: the residual is the heap
+    // allocation of individual strings, which only the payload sites know the
+    // length of.  Measured against RSS at 500k keys:
+    //
+    //   11-byte keys, 10-byte values  ->  reported 234 B/key, actual 234 B/key
+    //   26-byte keys, 100-byte values ->  reported 340 B/key, actual 489 B/key
+    //
+    // So short keys land on the nose and keys past the 15-byte SSO limit still
+    // read about 1.4x low, because key and value then allocate separately and
+    // the LRU holds a second copy of the key.  That is a bound worth having —
+    // the same measurement against payload-only accounting was out by 11.2x.
+    static constexpr size_t key_entry_overhead    = 74;
+    static constexpr size_t lru_entry_overhead    = 139;
+    static constexpr size_t expiry_entry_overhead = 64;
+    static constexpr size_t list_elem_overhead    = 32;
+    static constexpr size_t set_elem_overhead     = 64;
+    static constexpr size_t hash_field_overhead   = 74;
+
+    // What a brand new key costs before any payload.  Callers add this to the
+    // amount they pass to check_memory, so admission and the limit are measured
+    // the same way — otherwise every accepted write overshoots by its own
+    // structural cost and the cache settles above the configured maximum.
+    size_t new_key_overhead() const
+    {
+        return key_entry_overhead + (m_max_memory != 0 ? lru_entry_overhead : 0);
+    }
+
+    // Derived from live container sizes rather than tracked incrementally: a
+    // missed increment somewhere would corrupt the figure permanently, and this
+    // cannot drift.  Every term is O(1).
+    size_t structural_overhead() const
+    {
+        return (m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size()) * key_entry_overhead
+             + m_lru_map.size() * lru_entry_overhead
+             + m_expiry.size()  * expiry_entry_overhead
+             + m_list_elems     * list_elem_overhead
+             + m_set_elems      * set_elem_overhead
+             + m_hash_fields    * hash_field_overhead;
+    }
 
     // Inline memory tracking — called on every set/del, must be fast
     void track_add(size_t bytes) { m_current_memory += bytes; }
@@ -195,7 +273,13 @@ private:
 
     // Eviction / Memory
     size_t m_max_memory = 0;
-    size_t m_current_memory = 0;
+    size_t m_current_memory = 0;   // payload bytes only; see structural_overhead()
+
+    // Element counts for the collection types.  The number of keys is O(1) from
+    // the maps themselves, but the number of members inside them is not.
+    size_t m_list_elems = 0;
+    size_t m_set_elems = 0;
+    size_t m_hash_fields = 0;
     eviction_policy m_eviction = evict_none;
     std::list<std::string> m_lru_order;
     std::unordered_map<std::string, std::list<std::string>::iterator, string_hash, string_equal> m_lru_map;
