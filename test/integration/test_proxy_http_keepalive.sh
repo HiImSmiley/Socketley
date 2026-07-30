@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Integration test: an HTTP keep-alive connection survives every response.
+#
+# detach_and_pool_backend has a fallback for a backend that still has a
+# completion owed to it, and that fallback closed the whole pair.  A backend
+# read is armed essentially all of the time, so that fallback is the branch that
+# runs — the client was torn down after every single response although both
+# sides had negotiated keep-alive, pooling never happened, and every request
+# paid for a fresh TCP handshake.
+#
+# The test sends several requests down one socket and requires every one of them
+# to be answered on that same socket.  Each request carries its own marker in
+# the path, the backend echoes that marker back as the response body, and the
+# body is compared against what was asked for: "some bytes came back" is not a
+# result.  Against the broken build the first request is answered and the second
+# one gets EOF, so the second assertion is the one that discriminates.
+#
+# Two green runs against a broken build in this project came from comparing a
+# value that could not be read against an equally empty expectation, so nothing
+# here is checked by string equality with a captured variable.  Every assertion
+# below demands the *presence* of a positive result line, absence is a failure,
+# and the harness prints a final DONE line that is asserted separately so that
+# a harness which died halfway cannot look like a clean run.
+set -euo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+
+# Own daemon, socket and state directory: against the shared one this test does
+# not discriminate — auto-restart hides a crash, and a leftover runtime from an
+# earlier run answers on the port before this test ever creates its own.
+TMPDIR_T=$(mktemp -d /tmp/socketley-kalive-XXXXXX)
+export HOME="$TMPDIR_T/home"
+export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
+mkdir -p "$HOME"
+DPID=""
+BEPID=""
+
+BE_PORT=19420
+PX_PORT=19421
+PX_NAME=kalive_px
+NREQ=4
+OUT="$TMPDIR_T/client.out"
+PASS=0; FAIL=0; TOTAL=0
+
+cleanup() {
+    [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
+    [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true
+    rm -rf "$TMPDIR_T"
+}
+trap cleanup EXIT
+
+echo "=== Integration: HTTP keep-alive through the proxy ==="
+
+# Backend.  There is no HTTP echo mode in the server runtime, so this is a
+# minimal HTTP/1.1 origin that answers with Content-Length and keep-alive —
+# both are required for the proxy to reach the pooling path at all, and a
+# backend that answered "Connection: close" would skip the defect entirely.
+# It echoes the request path back as the body, which is the marker.
+python3 - "$BE_PORT" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
+import socket, sys, threading
+
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(64)
+
+
+def handle(c):
+    c.settimeout(15)
+    buf = b""
+    try:
+        while True:
+            while b"\r\n\r\n" not in buf:
+                chunk = c.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            head, buf = buf.split(b"\r\n\r\n", 1)
+            req_line = head.split(b"\r\n", 1)[0].split(b" ")
+            path = req_line[1] if len(req_line) > 1 else b"/"
+            body = path.lstrip(b"/")
+            c.sendall(b"HTTP/1.1 200 OK\r\n"
+                      b"Content-Type: text/plain\r\n"
+                      b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                      b"Connection: keep-alive\r\n"
+                      b"\r\n" + body)
+    except OSError:
+        pass
+    finally:
+        try:
+            c.close()
+        except OSError:
+            pass
+
+
+while True:
+    try:
+        conn, _ = srv.accept()
+    except OSError:
+        break
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+BEPID=$!
+
+"$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
+DPID=$!
+for _ in $(seq 1 60); do "$BIN" ps >/dev/null 2>&1 && break; sleep 0.1; done
+
+for _ in $(seq 1 50); do nc -z 127.0.0.1 "$BE_PORT" 2>/dev/null && break; sleep 0.1; done
+
+TOTAL=$((TOTAL+1))
+if nc -z 127.0.0.1 "$BE_PORT" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [setup]: the HTTP backend never came up on $BE_PORT"
+fi
+
+# The proxy only routes paths under /<name>/ and strips that prefix before
+# forwarding, so the marker has to sit behind it.
+"$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol http -s 2>&1 || true
+for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PX_PORT" 2>/dev/null && break; sleep 0.1; done
+sleep 0.3
+
+TOTAL=$((TOTAL+1))
+if "$BIN" stats "$PX_NAME" >/dev/null 2>&1; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [setup]: the proxy runtime is not up — everything below is meaningless"
+fi
+
+# One socket, several requests.  The socket object is never reopened: if the
+# proxy closes it, request 2 has nowhere to go and says so.
+python3 - "$PX_PORT" "$PX_NAME" "$NREQ" >"$OUT" 2>&1 <<'PYEOF' || true
+import socket, sys
+
+port = int(sys.argv[1])
+name = sys.argv[2]
+count = int(sys.argv[3])
+
+
+def read_response(s):
+    """Returns (status, body).  Every way of not getting an answer has its own
+    status, so a response that could not be read can never be mistaken for an
+    empty one that matched."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            return ("TIMEOUT-before-headers", "")
+        except OSError as e:
+            return ("RESET-before-headers:%s" % type(e).__name__, "")
+        if not chunk:
+            return ("EOF-before-headers", "")
+        buf += chunk
+    head, body = buf.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    clen = None
+    for line in lines[1:]:
+        if line.lower().startswith(b"content-length:"):
+            try:
+                clen = int(line.split(b":", 1)[1].strip())
+            except ValueError:
+                return ("BAD-CONTENT-LENGTH", "")
+    if clen is None:
+        return ("NO-CONTENT-LENGTH", "")
+    while len(body) < clen:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            return ("TIMEOUT-mid-body", "")
+        except OSError as e:
+            return ("RESET-mid-body:%s" % type(e).__name__, "")
+        if not chunk:
+            return ("EOF-mid-body", "")
+        body += chunk
+    if b" 200 " not in lines[0]:
+        return ("STATUS:%s" % lines[0].decode("latin1", "replace"), "")
+    return ("OK", body[:clen].decode("latin1", "replace"))
+
+
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=4)
+except OSError as e:
+    print("CONNECT-FAILED %s" % type(e).__name__)
+    print("DONE 0/%d" % count)
+    sys.exit(0)
+s.settimeout(4)
+
+ok = 0
+for i in range(1, count + 1):
+    marker = "keepalive-marker-%d" % i
+    req = ("GET /%s/%s HTTP/1.1\r\n"
+           "Host: 127.0.0.1:%d\r\n"
+           "Connection: keep-alive\r\n"
+           "\r\n" % (name, marker, port))
+    try:
+        s.sendall(req.encode())
+    except OSError as e:
+        print("RESP %d SEND-FAILED:%s" % (i, type(e).__name__))
+        break
+    status, body = read_response(s)
+    if status != "OK":
+        print("RESP %d %s" % (i, status))
+        break
+    if body != marker:
+        print("RESP %d WRONG-BODY want=%r got=%r" % (i, marker, body[:60]))
+        break
+    print("RESP %d OK" % i)
+    ok += 1
+
+print("DONE %d/%d" % (ok, count))
+try:
+    s.close()
+except OSError:
+    pass
+PYEOF
+
+# The harness has to have reached its last line.  Without this an aborted run
+# would only show up as a pile of confusing per-request failures, and any check
+# phrased as "compare what we read" would have nothing to compare and pass.
+TOTAL=$((TOTAL+1))
+if grep -q '^DONE ' "$OUT" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [harness ran]: the client produced no DONE line; raw output:"
+    grep -v '^$' "$OUT" 2>/dev/null | head -5 | sed 's/^/        /' || true
+fi
+
+# One assertion per request.  Request 1 failing means the proxy is broken
+# outright; request 2 onwards failing while request 1 passed is the keep-alive
+# defect, which is why they are counted separately instead of as one "all
+# requests answered" check.
+for i in $(seq 1 "$NREQ"); do
+    TOTAL=$((TOTAL+1))
+    if grep -qx "RESP $i OK" "$OUT" 2>/dev/null; then
+        PASS=$((PASS+1))
+    else
+        WHY=$(grep "^RESP $i " "$OUT" 2>/dev/null | head -1 || true)
+        [ -n "$WHY" ] || WHY="no result at all — the harness stopped before request $i"
+        FAIL=$((FAIL+1))
+        echo "  FAIL [request $i answered on the same connection]: $WHY"
+    fi
+done
+
+TOTAL=$((TOTAL+1))
+if grep -qx "DONE $NREQ/$NREQ" "$OUT" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [all $NREQ requests on one connection]: $(grep '^DONE ' "$OUT" 2>/dev/null | head -1 || echo 'no DONE line')"
+fi
+
+# Detaching a backend must not take the runtime with it.
+TOTAL=$((TOTAL+1))
+if "$BIN" stats "$PX_NAME" >/dev/null 2>&1; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [runtime alive]: the proxy did not survive the keep-alive session"
+fi
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"
