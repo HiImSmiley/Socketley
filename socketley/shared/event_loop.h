@@ -27,42 +27,47 @@ public:
     int get_signal_write_fd() const;
 
     // Batched submissions - these queue SQEs without submitting
-    void submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req);
-    void submit_multishot_accept(int listen_fd, io_request* req);
+    // The submit_* helpers return false when no SQE could be obtained even after
+    // flushing the ring.  Nothing is queued in that case, so a caller that has
+    // already marked an operation in flight must undo that and give up on the
+    // connection — otherwise nothing will ever complete for it and it hangs
+    // until the runtime stops.
+    bool submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req);
+    bool submit_multishot_accept(int listen_fd, io_request* req);
     // Direct-descriptor multishot accept: accepted fds go straight into the
     // fixed file table at IORING_FILE_INDEX_ALLOC, skipping the process fd table.
-    void submit_multishot_accept_direct(int listen_fd, io_request* req);
-    void submit_read(int fd, char* buf, uint32_t len, io_request* req);
-    void submit_write(int fd, const char* buf, uint32_t len, io_request* req);
-    void submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req);
-    void submit_sendmsg(int fd, struct msghdr* msg, io_request* req);
-    void submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
-    void submit_timeout(struct __kernel_timespec* ts, io_request* req);
+    bool submit_multishot_accept_direct(int listen_fd, io_request* req);
+    bool submit_read(int fd, char* buf, uint32_t len, io_request* req);
+    bool submit_write(int fd, const char* buf, uint32_t len, io_request* req);
+    bool submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req);
+    bool submit_sendmsg(int fd, struct msghdr* msg, io_request* req);
+    bool submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
+    bool submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
     // Fixed-file variants: use registered fd index instead of raw fd.
     // Avoids fget/fput per I/O op (hot path).
-    void submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);
-    void submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
-    void submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req);
-    void submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req);
-    void submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
-    void submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
-    void submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
+    bool submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);
+    bool submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
+    bool submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req);
+    bool submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req);
+    bool submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+    bool submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+    bool submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
 
     // Registered buffers: eliminate copy_from_user/copy_to_user per I/O op.
     bool register_buffers(const struct iovec* iovs, uint32_t count);
     void unregister_buffers();
-    void submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
-    void submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
+    bool submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
+    bool submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
     bool buffers_registered() const { return m_bufs_registered; }
 
     // Provided buffer ring API
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
-    void submit_read_provided(int fd, uint16_t group_id, io_request* req);
+    bool submit_read_provided(int fd, uint16_t group_id, io_request* req);
     // Cancel all pending io_uring ops for a fd (user_data=null, CQE is ignored).
     // Submit this BEFORE close(fd) to guarantee the kernel generates cancellation
     // CQEs before any subsequently-submitted timeout/cleanup SQE fires.
-    void submit_cancel_fd(int fd);
+    bool submit_cancel_fd(int fd);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
     void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);
@@ -70,13 +75,13 @@ public:
 
     // Multishot recv: single SQE generates multiple CQEs until error or cancel.
     // Uses provided buffer ring. Resubmit only when !(cqe->flags & IORING_CQE_F_MORE).
-    void submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
+    bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
     bool recv_multishot_supported() const;
 
     // Zero-copy send: kernel DMAs directly from user buffer.
     // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
     // Buffer must stay alive until NOTIF CQE arrives.
-    void submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
+    bool submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
     bool send_zc_supported() const;
 
     // Registered files: pre-register fds to avoid fget/fput per op
@@ -92,15 +97,20 @@ public:
 
     // Splice: zero-copy data transfer between two fds through a pipe.
     // fd_in -> fd_out, len bytes, off_in/off_out = -1 for pipes/sockets.
-    void submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
+    bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
 
     // Async file read: uses io_uring_prep_read (not recv) for regular files.
     // req->fd should be set to the *socket* fd for CQE dispatch routing.
-    void submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req);
+    bool submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req);
 
     // Async connect: non-blocking connect via io_uring.
     // CQE res is 0 on success, negative errno on failure.
-    void submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
+    bool submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
+
+    // Wait for readiness on an fd.  A connect() that returned EINPROGRESS is
+    // finished by polling for POLLOUT and then reading SO_ERROR — issuing a
+    // second connect on the same socket instead only ever answers EISCONN.
+    bool submit_poll_add(int fd, unsigned mask, io_request* req);
 
     // Flush all pending submissions (single syscall)
     void flush();

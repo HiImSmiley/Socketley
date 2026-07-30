@@ -36,7 +36,8 @@ enum op_type : uint8_t
     op_splice                = 15,    // splice between fds through pipe
     op_file_read             = 16,    // async file read via io_uring
     op_connect               = 17,    // async connect via io_uring
-    op_health_check          = 18     // async health check (connect/write/read phases)
+    op_health_check          = 18,    // async health check (connect/write/read phases)
+    op_poll                  = 19     // wait for readiness (used to finish a non-blocking connect)
 };
 
 struct io_request
@@ -46,4 +47,11 @@ struct io_request
     int fd;
     uint32_t length;
     op_type type;
+
+    // Connection structs are pooled and their io_requests live inside them, so
+    // a completion that arrives after the struct was handed to a new connection
+    // is indistinguishable from that connection's own — same address, same fd
+    // number, valid owner.  The handler would then act on the wrong connection.
+    // Stamp the owner's generation at submit time and compare on completion.
+    uint32_t generation{0};
 };

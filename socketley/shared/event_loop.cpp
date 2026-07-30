@@ -394,20 +394,21 @@ struct io_uring* event_loop::get_ring()
     return &m_ring;
 }
 
-void event_loop::submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req)
+bool event_loop::submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_accept(sqe, listen_fd, reinterpret_cast<struct sockaddr*>(addr), addrlen, 0);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_multishot_accept(int listen_fd, io_request* req)
+bool event_loop::submit_multishot_accept(int listen_fd, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     if (m_multishot_supported)
     {
@@ -422,12 +423,13 @@ void event_loop::submit_multishot_accept(int listen_fd, io_request* req)
     }
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
+bool event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     if (m_multishot_supported && m_files_registered)
     {
@@ -451,75 +453,82 @@ void event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
     }
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     // recv() is more efficient than read() for sockets: skips VFS layer,
     // avoids file-position locking, and enables MSG_NOSIGNAL
     io_uring_prep_recv(sqe, fd, buf, len, 0);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_write(int fd, const char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_write(int fd, const char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     // send() with MSG_NOSIGNAL: avoids SIGPIPE if peer closed the connection
     // between our check and the actual send, without needing a global signal mask.
     io_uring_prep_send(sqe, fd, buf, len, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req)
+bool event_loop::submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_writev(sqe, fd, iovs, count, 0);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_sendmsg(int fd, struct msghdr* msg, io_request* req)
+bool event_loop::submit_sendmsg(int fd, struct msghdr* msg, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
     io_uring_prep_sendmsg(sqe, fd, msg, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_recvmsg(int fd, struct msghdr* msg, io_request* req)
+bool event_loop::submit_recvmsg(int fd, struct msghdr* msg, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recvmsg(sqe, fd, msg, 0);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
+bool event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_timeout(sqe, ts, 0, 0);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_cancel_fd(int fd)
+bool event_loop::submit_cancel_fd(int fd)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     // IORING_ASYNC_CANCEL_ALL cancels ALL pending ops for this fd in one shot.
     // Without it, only one op is cancelled per SQE -- leaving the second CQE
@@ -529,60 +538,65 @@ void event_loop::submit_cancel_fd(int fd)
     // Null user_data so the cancel-result CQE is silently discarded by event_loop::run()
     io_uring_sqe_set_data(sqe, nullptr);
     m_pending_submissions++;
+    return true;
 }
 
 // Fixed-file variants: use the IOSQE_FIXED_FILE flag so the kernel uses
 // the pre-registered file reference, skipping fget/fput per I/O op.
-void event_loop::submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recv(sqe, fixed_idx, buf, len, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_send(sqe, fixed_idx, buf, len, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req)
+bool event_loop::submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_writev(sqe, fixed_idx, iovs, count, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req)
+bool event_loop::submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
     io_uring_prep_sendmsg(sqe, fixed_idx, msg, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
+bool event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
+        return false;
 
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recv_multishot(sqe, fixed_idx, nullptr, 0, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
@@ -590,15 +604,16 @@ void event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_
     io_uring_sqe_set_data(sqe, req);
     req->type = op_recv_multishot;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
+bool event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
+        return false;
 
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recv(sqe, fixed_idx, nullptr, m_buf_rings[group_id].buf_size, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
@@ -606,18 +621,20 @@ void event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_i
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_send_zc(sqe, fixed_idx, buf, len, MSG_NOSIGNAL, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
     m_pending_submissions++;
+    return true;
 }
 
 // Registered buffers: the kernel pins these pages and skips
@@ -644,26 +661,28 @@ void event_loop::unregister_buffers()
     }
 }
 
-void event_loop::submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t buf_idx, io_request* req)
+bool event_loop::submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t buf_idx, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_read_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_fixed_buf;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req)
+bool event_loop::submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_write_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_write_fixed_buf;
     m_pending_submissions++;
+    return true;
 }
 
 bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size)
@@ -719,13 +738,13 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     return true;
 }
 
-void event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req)
+bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
+        return false;
 
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recv(sqe, fd, nullptr, m_buf_rings[group_id].buf_size, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT;
@@ -733,6 +752,7 @@ void event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
     m_pending_submissions++;
+    return true;
 }
 
 char* event_loop::get_buf_ptr(uint16_t group_id, uint16_t buf_id)
@@ -776,7 +796,7 @@ void event_loop::return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, u
         io_uring_buf_ring_add(pool.ring,
             pool.base + (static_cast<size_t>(bid) * pool.buf_size),
             pool.buf_size, bid,
-            io_uring_buf_ring_mask(pool.buf_count), 0);
+            io_uring_buf_ring_mask(pool.buf_count), static_cast<int>(i));
     }
     io_uring_buf_ring_advance(pool.ring, count);
 }
@@ -796,13 +816,13 @@ bool event_loop::send_zc_supported() const
     return m_send_zc_supported;
 }
 
-void event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
+bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
-        return;
+        return false;
 
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT;
@@ -810,23 +830,25 @@ void event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* re
     io_uring_sqe_set_data(sqe, req);
     req->type = op_recv_multishot;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req)
+bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     // off_in = off_out = -1 for pipes/sockets (no seekable offset)
     // No SPLICE_F_NONBLOCK: io_uring handles the operation asynchronously, so the
@@ -836,28 +858,42 @@ void event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req)
+bool event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     // Use io_uring_prep_read (not recv) — works on regular files
     io_uring_prep_read(sqe, file_fd, buf, len, offset);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_file_read;
     m_pending_submissions++;
+    return true;
 }
 
-void event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req)
+bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
+
+    io_uring_prep_poll_add(sqe, fd, mask);
+    io_uring_sqe_set_data(sqe, req);
+    m_pending_submissions++;
+    return true;
+}
+
+bool event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
 
     io_uring_prep_connect(sqe, fd, addr, len);
     io_uring_sqe_set_data(sqe, req);
     m_pending_submissions++;
+    return true;
 }
 
 bool event_loop::register_files(const int* fds, uint32_t count)
@@ -908,9 +944,20 @@ int event_loop::alloc_fixed_file_slot()
         {
             // Find the first zero bit
             int bit = __builtin_ctzll(~m_file_bitmap[w]);
+            uint32_t idx = w * 64 + static_cast<uint32_t>(bit);
+
+            // The bitmap spans MAX_FIXED_FILES, but only m_registered_file_count
+            // entries actually exist in the kernel's table.  Handing out anything
+            // past that produces a slot update_registered_file always rejects,
+            // and the caller then has a number it cannot use and cannot give
+            // back — the bit stayed set for the lifetime of the loop, so the
+            // table filled up with slots that were never really in use.
+            if (idx >= m_registered_file_count)
+                return -1;
+
             m_file_bitmap[w] |= (1ULL << bit);
             m_file_bitmap_hint = w;
-            return static_cast<int>(w * 64 + static_cast<uint32_t>(bit));
+            return static_cast<int>(idx);
         }
     }
     return -1; // All slots occupied
