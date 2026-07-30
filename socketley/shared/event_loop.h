@@ -217,6 +217,15 @@ public:
     // second connect on the same socket instead only ever answers EISCONN.
     bool submit_poll_add(int fd, unsigned mask, io_request* req);
 
+    // Withdraw a poll submitted with submit_poll_add.  Needed because a poll
+    // holds its own reference to the file: closing the descriptor does not end
+    // it, so a poll nobody withdraws is a completion the ring owes for as long
+    // as the file lives — see submit_cancel_fd for the same hazard on the
+    // whole-descriptor scale.  This one is keyed on the request rather than the
+    // descriptor, so it takes back exactly the poll it names and leaves a read
+    // or a write armed on the same socket alone.
+    bool submit_poll_remove(io_request* target);
+
     // Flush all pending submissions (single syscall)
     void flush();
 

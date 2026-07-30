@@ -157,6 +157,8 @@ void proxy_client_connection::reset(int new_fd)
     connect_pending = false;
     connect_fd = -1;
     connect_req = {};
+    abort_watch_pending = false;
+    abort_req = {};
     std::memset(&connect_addr, 0, sizeof(connect_addr));
 }
 
@@ -256,7 +258,7 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     // close_pair's client path left out both splice requests, and a retry left
     // out everything.  This is the one place that has to know.
     {
-        io_request* owed[5];
+        io_request* owed[6];
         size_t n = 0;
         if (conn->read_pending)
             owed[n++] = &conn->read_req;
@@ -271,6 +273,11 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
             owed[n++] = &conn->splice_out_req;
         if (conn->connect_pending)
             owed[n++] = &conn->connect_req;
+        // The abort watch is a poll, and a poll survives the close of the
+        // descriptor it is armed on — it holds its own reference to the file.
+        // Its completion is owed exactly like the rest.
+        if (conn->abort_watch_pending)
+            owed[n++] = &conn->abort_req;
         if (n > 0)
         {
             retire(std::shared_ptr<void>(std::move(conn)), owed, n);
@@ -286,6 +293,7 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     conn->splice_in_req.owner = nullptr;
     conn->splice_out_req.owner = nullptr;
     conn->connect_req.owner = nullptr;
+    conn->abort_req.owner = nullptr;
     conn->partial.clear();
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
@@ -297,9 +305,10 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
 
     SKL_INV_POOLABLE("proxy::client_pool_release", conn->fd,
         conn->read_pending || conn->write_pending || conn->zc_notif_pending ||
-        conn->splice_in_pending || conn->splice_out_pending || conn->connect_pending,
+        conn->splice_in_pending || conn->splice_out_pending || conn->connect_pending ||
+        conn->abort_watch_pending,
         conn->read_req.owner || conn->write_req.owner || conn->splice_in_req.owner ||
-        conn->splice_out_req.owner || conn->connect_req.owner);
+        conn->splice_out_req.owner || conn->connect_req.owner || conn->abort_req.owner);
 
     m_client_pool.push_back(std::move(conn));
 }
@@ -732,6 +741,11 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             close(conn->connect_fd);
             conn->connect_fd = -1;
         }
+        // Same for the abort watch on the client socket: a poll outlives the
+        // close of the descriptor it names, so it is withdrawn rather than left
+        // to the shutdown below.
+        if (conn->abort_watch_pending && m_loop)
+            m_loop->submit_poll_remove(&conn->abort_req);
         shutdown(i, SHUT_RDWR);
         close(i);
         client_pool_release(std::move(conn));
@@ -904,6 +918,9 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_poll:
             handle_connect(cqe, req);
             break;
+        case op_poll_abort:
+            handle_client_abort(cqe, req);
+            break;
         case op_health_check:
             handle_health_cqe(cqe, req);
             break;
@@ -1014,6 +1031,14 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 
 #ifdef SOCKETLEY_INVARIANTS
     inv_check_pair(inv_fd, "proxy::on_cqe");
+    // See inv_sweep_all: the check above can only ever look at the pair this
+    // completion named, and says nothing at all when the handler tore that pair
+    // down — which is exactly when another one gets stranded.
+    if (++m_inv_sweep_countdown >= INV_SWEEP_EVERY)
+    {
+        m_inv_sweep_countdown = 0;
+        inv_sweep_all("proxy::sweep");
+    }
 #endif
 }
 
@@ -1061,7 +1086,8 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
         c.present   = true;
         c.in_flight = cconn->read_pending || cconn->write_pending ||
                       cconn->zc_notif_pending || cconn->splice_in_pending ||
-                      cconn->splice_out_pending || cconn->connect_pending;
+                      cconn->splice_out_pending || cconn->connect_pending ||
+                      cconn->abort_watch_pending;
         c.queued    = !cconn->write_queue.empty();
         c.closing   = cconn->closing;
         c.fd        = cconn->fd;
@@ -1079,6 +1105,18 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
 
     SKL_INV_PAIR(where, c, b);
 }
+
+void proxy_instance::inv_sweep_all(const char* where)
+{
+    // Both sides, not just the client side: a backend whose client has already
+    // gone keeps client_fd == -1 and is reachable from no client slot at all,
+    // and that is the half most likely to have been left behind.
+    for (int fd = 0; fd < MAX_FDS; fd++)
+    {
+        if (m_conn_idx[fd].side != conn_none)
+            inv_check_pair(fd, where);
+    }
+}
 #endif
 
 void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
@@ -1092,6 +1130,35 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         {
             close(client_fd);
             goto proxy_resubmit_accept;
+        }
+
+        // A descriptor can come off the backlog already broken.  The handshake
+        // completes in the kernel, so a client is free to connect, push a
+        // payload and reset long before its turn to be accepted comes round —
+        // and under a flood that is not the exception, it is nearly every
+        // connection: the backlog is thousands deep and takes hundreds of
+        // milliseconds to drain.  Everything below is then spent on a peer that
+        // cannot receive one byte of the answer: seven socket options on the
+        // client, a 64KB connection struct, a backend socket with seven more,
+        // a TCP handshake, and the cancel and close that undo them.  One
+        // getsockopt separates the two cases, and it costs a live connection
+        // nothing — sk_err is zero there, so there is nothing to read and clear
+        // and the abort watch armed later still has its POLLERR to report.
+        //
+        // The bytes such a client sent are dropped with it.  That is the same
+        // answer the read paths already give — a reset is an abort, not a
+        // half-close, and a half-close (FIN) leaves sk_err at zero and comes
+        // through here untouched.
+        {
+            int sock_err = 0;
+            socklen_t err_len = sizeof(sock_err);
+            if (SOCKETLEY_UNLIKELY(
+                    getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sock_err, &err_len) == 0 &&
+                    sock_err != 0))
+            {
+                close(client_fd);
+                goto proxy_resubmit_accept;
+            }
         }
 
         tune_socket(client_fd);
@@ -2820,6 +2887,27 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
+    // Watch the client for death for as long as this handshake lasts.  Nothing
+    // else is armed on that socket while a connect is pending, so until this
+    // existed a client that reset the moment it had pushed its payload stayed
+    // invisible: the pair was held — a 64KB client struct, a client socket and
+    // a half-open backend socket — until the handshake finished on its own.
+    // With a backend that is slow to accept, that is a second or more each, and
+    // a single client looping connect/write/reset put 14000 of those corpses in
+    // the proxy at once and a gigabyte of them in its RSS.  The proxy then fell
+    // behind on its own listen queue and healthy clients were refused at the
+    // SYN, which is how one misbehaving connection took the whole runtime's
+    // capacity.  Failing to arm it is not fatal — it only means this connection
+    // goes back to being noticed late — so nothing is unwound on refusal.
+    // See proxy_instance.h for why POLLERR|POLLHUP and nothing more.
+    if (!conn->abort_watch_pending)
+    {
+        conn->abort_req = { this, nullptr, conn->fd, 0, op_poll_abort, conn->generation };
+        if (SOCKETLEY_LIKELY(m_loop->submit_poll_add(conn->fd, POLLERR | POLLHUP,
+                                                     &conn->abort_req)))
+            conn->abort_watch_pending = true;
+    }
+
     return true;  // connect_pending = true — caller must check
 }
 
@@ -3202,6 +3290,40 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
     if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd].side == conn_client)
         client_for_pool = m_conn_idx[client_fd].client;
 
+    // A splice the backend has already started towards the client's descriptor
+    // is as good a reason to keep that descriptor as one of the client's own
+    // operations, and it is not covered by any of the client's flags: the
+    // request lives on the backend's struct, and it names the *client's* fd.
+    //
+    // This is where an aborting client's payload was landing in a stranger's
+    // socket.  A submission carries a descriptor *number*, and the kernel
+    // resolves it when it consumes the SQE — with SQPOLL that is a separate
+    // thread, and even without it this loop batches a whole completion round
+    // before it submits.  So closing the number here and letting the next accept
+    // take it does not cancel that write, it redirects it: the 8KB an aborted
+    // client had already pushed to the backend came back and was spliced
+    // straight into whoever inherited the number, in the middle of that
+    // connection's own stream.  The mutual-pairing checks on the forwarding
+    // paths cannot catch it, because they were right when they ran — the
+    // descriptor moved afterwards.  Holding it until that splice reports is what
+    // makes the number safe to give away.
+    //
+    // Read before anything below runs: the block that closes the client's other
+    // backend clears conn->backend_fd on its way out, and the answer would be no
+    // by the time it is asked.
+    bool peer_splicing_into_client = false;
+    if (client_for_pool)
+    {
+        for (int cand : { backend_fd, client_for_pool->backend_fd })
+        {
+            if (cand < 0 || cand >= MAX_FDS) continue;
+            const auto& bslot = m_conn_idx[cand];
+            if (bslot.side == conn_backend && bslot.backend->client_fd == client_fd &&
+                bslot.backend->splice_out_pending)
+                peer_splicing_into_client = true;
+        }
+    }
+
     if (backend_fd >= 0 && backend_fd < MAX_FDS)
     {
         auto& be = m_conn_idx[backend_fd];
@@ -3223,7 +3345,14 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             bool defer = bconn->read_pending || bconn->write_pending ||
                          bconn->zc_notif_pending ||
                          bconn->splice_in_pending || bconn->splice_out_pending ||
-                         !bconn->write_queue.empty();
+                         !bconn->write_queue.empty() ||
+                         // The other direction of the same rule as below: the
+                         // client's outbound splice writes into *this*
+                         // descriptor, so closing it while that operation is
+                         // outstanding hands the number away with the write
+                         // still to come.
+                         (client_for_pool && client_for_pool->splice_out_pending &&
+                          client_for_pool->backend_fd == backend_fd);
             if (defer)
             {
                 // A queue that still holds data is as good a reason to defer as an
@@ -3314,12 +3443,22 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 conn->connect_fd = -1;
             }
 
+            // The abort watch is a poll on the client socket and survives its
+            // close for the same reason.  Withdrawing it by request rather than
+            // by descriptor matters here: a read or a splice may be armed on
+            // this same socket and the deferral below is counting on it.
+            // abort_watch_pending stays set on purpose — it is what tells
+            // client_pool_release() this struct cannot be reused yet.
+            if (conn->abort_watch_pending && m_loop)
+                m_loop->submit_poll_remove(&conn->abort_req);
+
             // Zero-copy notification included, for the reason given on the
-            // backend side above.
+            // backend side above.  peer_splicing_into_client is the descriptor
+            // the backend is still writing into — see the top of this function.
             bool defer_c = conn->read_pending || conn->write_pending ||
                            conn->zc_notif_pending ||
                            conn->splice_in_pending || conn->splice_out_pending ||
-                           !conn->write_queue.empty();
+                           !conn->write_queue.empty() || peer_splicing_into_client;
             if (defer_c)
             {
                 conn->closing = true;
@@ -3893,6 +4032,16 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     int bfd = conn->connect_fd;
     conn->connect_fd = -1;
 
+    // The abort watch covered exactly this handshake; from here on the client's
+    // own read, or the splice pipeline, reports its death.  Withdraw it rather
+    // than leave a poll armed for the rest of the connection's life: every
+    // struct that still owes a completion is retired instead of pooled, so a
+    // watch nobody takes back costs the pool one struct per connection.  The
+    // flag stays set until the -ECANCELED lands, which is what tells
+    // client_pool_release the struct is not reusable yet.
+    if (conn->abort_watch_pending && m_loop)
+        m_loop->submit_poll_remove(&conn->abort_req);
+
     // A poll completion only reports readiness; whether the connect succeeded
     // is in SO_ERROR.  Fold it into one value so the failure path stays shared.
     int res = cqe->res;
@@ -4056,6 +4205,58 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     // the pair open waiting for a client that will never write again.
     if (conn->client_eof)
         shutdown(bfd, SHUT_WR);
+}
+
+void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* req)
+{
+    int client_fd = req->fd;
+    if (SOCKETLEY_UNLIKELY(client_fd < 0 || client_fd >= MAX_FDS))
+        return;
+
+    auto& entry = m_conn_idx[client_fd];
+    if (SOCKETLEY_UNLIKELY(entry.side != conn_client))
+        return;
+
+    auto* conn = entry.client;
+
+    // The struct at this fd may already belong to a different connection than
+    // the one that armed this watch; the generation says which.  (A struct that
+    // was still owed this completion is retired rather than reused, so a
+    // mismatch here means the descriptor moved, not the memory.)
+    if (SOCKETLEY_UNLIKELY(req->generation != conn->generation))
+        return;
+
+    if (SOCKETLEY_UNLIKELY(!conn->abort_watch_pending))
+        return;
+    conn->abort_watch_pending = false;
+
+    // Negative is the withdrawal (-ECANCELED) that handle_connect or close_pair
+    // asked for, and nothing beyond clearing the flag is owed for it.
+    if (cqe->res < 0)
+        return;
+
+    const int revents = cqe->res;
+
+    // POLLNVAL says the descriptor is no longer valid.  The number may already
+    // belong to someone else, so it must not be closed on the strength of this
+    // — the same reasoning as the POLLNVAL branch in handle_connect.
+    if (SOCKETLEY_UNLIKELY(revents & POLLNVAL))
+        return;
+
+    if (!(revents & (POLLERR | POLLHUP)))
+        return;
+
+    // Already being torn down: whatever is in flight will finish the job, and
+    // re-entering here would only race it.
+    if (conn->closing)
+        return;
+
+    // The client is gone for good — reset, or shut down in both directions.
+    // Whatever the backend eventually says has nowhere to go, so the handshake
+    // still running for it is work nobody will ever collect.
+    SKL_TRACE_LOG("client-abort cfd=%d revents=0x%x connect_pending=%d clients=%u",
+                  client_fd, revents, (int)conn->connect_pending, (unsigned)m_client_count);
+    close_pair(client_fd, conn->backend_fd);
 }
 
 void proxy_instance::record_backend_error(size_t backend_idx)

@@ -1204,6 +1204,31 @@ bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
     return true;
 }
 
+bool event_loop::submit_poll_remove(io_request* target)
+{
+    if (!target)
+        return false;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    // Keyed on the user_data the poll was submitted with, which is the address
+    // of its io_request — the same key submit_timeout_remove uses, and for the
+    // same reason.  The kernel only compares the value; it never dereferences
+    // it, so a request whose storage has since been retired is still a safe key.
+    io_uring_prep_poll_remove(
+        sqe, static_cast<__u64>(reinterpret_cast<std::uintptr_t>(target)));
+    // No request of its own, exactly like submit_timeout_remove: the removal's
+    // answer is only "found it" or "-ENOENT", nothing acts on either, and run()
+    // skips a completion that names no request without dispatching or counting
+    // it.  So there is no arm() here and no disarm() owed for it.  The poll
+    // being withdrawn keeps the one it already had — it still reports, with
+    // -ECANCELED, and that completion is what balances its submit_poll_add().
+    io_uring_sqe_set_data(sqe, nullptr);
+    m_pending_submissions++;
+    return true;
+}
+
 bool event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();

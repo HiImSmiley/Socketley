@@ -6,11 +6,49 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
+#include <openssl/x509v3.h>
+#include <arpa/inet.h>
 #else
 #define SOCKETLEY_HAS_TLS 0
 #endif
 
+#include <cerrno>
+#include <cstring>
 #include <iostream>
+
+// ─── TLS refusal gate ───
+// See the header for why these exist.  They deliberately live next to the
+// unused OpenSSL wrapper: whoever wires the handshake up will be reading this
+// file, and deleting the gate is part of that work.
+
+const char* tls_requested_option(bool tls,
+                                 std::string_view cert_path,
+                                 std::string_view key_path,
+                                 std::string_view ca_path,
+                                 std::string_view mesh_client_ca,
+                                 std::string_view mesh_client_cert,
+                                 std::string_view mesh_client_key)
+{
+    // Order matters only for the error message: report the flag the operator
+    // most likely typed first.
+    if (tls)                        return "--tls";
+    if (!cert_path.empty())         return "--cert";
+    if (!key_path.empty())          return "--key";
+    if (!ca_path.empty())           return "--ca";
+    if (!mesh_client_ca.empty())    return "--client-ca";
+    if (!mesh_client_cert.empty())  return "--client-cert";
+    if (!mesh_client_key.empty())   return "--client-key";
+    return nullptr;
+}
+
+std::string tls_not_implemented_error(std::string_view option)
+{
+    std::string msg(option);
+    msg += ": TLS transport is not implemented -- no runtime performs a "
+           "handshake, so this would serve cleartext on a port reported as "
+           "encrypted\n";
+    return msg;
+}
 
 tls_context::tls_context() = default;
 
@@ -23,6 +61,54 @@ tls_context::~tls_context()
 }
 
 #if SOCKETLEY_HAS_TLS
+static const char* ssl_error_name(int err)
+{
+    switch (err)
+    {
+        case SSL_ERROR_NONE:             return "SSL_ERROR_NONE";
+        case SSL_ERROR_ZERO_RETURN:      return "SSL_ERROR_ZERO_RETURN";
+        case SSL_ERROR_WANT_READ:        return "SSL_ERROR_WANT_READ";
+        case SSL_ERROR_WANT_WRITE:       return "SSL_ERROR_WANT_WRITE";
+        case SSL_ERROR_WANT_X509_LOOKUP: return "SSL_ERROR_WANT_X509_LOOKUP";
+        case SSL_ERROR_SYSCALL:          return "SSL_ERROR_SYSCALL";
+        case SSL_ERROR_SSL:              return "SSL_ERROR_SSL";
+        default:                         return "SSL_ERROR_(unknown)";
+    }
+}
+
+// Drain OpenSSL's error queue to stderr, one line per queued reason.
+//
+// Every failure below used to report a bare "handshake failed" / "failed to
+// load certificate".  The half of the message that matters -- expired cert,
+// unknown CA, no shared cipher, a client speaking plain HTTP at a TLS port,
+// wrong passphrase on the key file -- was already sitting on OpenSSL's
+// thread-local error queue and nobody popped it, so an operator got a symptom
+// and no cause.  Draining is not optional bookkeeping either: the queue is
+// per-thread and persistent, so an entry left behind resurfaces later and is
+// reported as the diagnosis for some unrelated connection's failure.
+static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
+{
+    char buf[256];
+    bool any = false;
+    for (unsigned long e = ERR_get_error(); e != 0; e = ERR_get_error())
+    {
+        ERR_error_string_n(e, buf, sizeof(buf));
+        std::cerr << "[tls] " << what << ": " << buf << "\n";
+        any = true;
+    }
+    if (any)
+        return;
+
+    // An empty queue is itself information: SSL_ERROR_SYSCALL with nothing
+    // queued means the transport broke under OpenSSL rather than the protocol.
+    std::cerr << "[tls] " << what << ": no OpenSSL error queued";
+    if (ssl_err != SSL_ERROR_NONE)
+        std::cerr << " (" << ssl_error_name(ssl_err) << ")";
+    if (ssl_err == SSL_ERROR_SYSCALL)
+        std::cerr << " (transport: " << std::strerror(errno) << ")";
+    std::cerr << "\n";
+}
+
 // Apply performance-critical SSL_CTX options common to both server and client.
 // Called once at context initialization — all per-connection SSL objects inherit these.
 static void apply_ctx_performance_options(SSL_CTX* ctx)
@@ -35,13 +121,19 @@ static void apply_ctx_performance_options(SSL_CTX* ctx)
     long opts = SSL_CTX_get_options(ctx);
     opts &= ~SSL_OP_NO_TICKET;
 
-    // ── Kernel TLS offload (KTLS) ──
-    // When available (OpenSSL 3.0+ with kernel support), offloads symmetric
-    // encryption/decryption to the kernel. This allows io_uring to work with
-    // encrypted data directly via sendfile/splice, bypassing userspace crypto.
-#if defined(SSL_OP_ENABLE_KTLS)
-    opts |= SSL_OP_ENABLE_KTLS;
-#endif
+    // ── No kernel TLS here, by design ──
+    // SSL_OP_ENABLE_KTLS used to be set on this line. It could never do
+    // anything: KTLS requires the SSL object to sit on a socket BIO so OpenSSL
+    // can hand the kernel the file descriptor and the traffic keys, and this
+    // wrapper deliberately gives every connection a memory BIO pair instead
+    // (see create_ssl). That choice is the whole point of the design -- with
+    // memory BIOs OpenSSL is a codec and nothing else, every network byte is
+    // still moved by an io_uring submission, and there is exactly one place in
+    // the daemon that talks to sockets. A socket BIO would take reads and
+    // writes back into OpenSSL's own blocking syscalls, behind the event
+    // loop's back. So the option was a no-op that advertised an optimisation
+    // the transport is not built for: don't put it back without moving off
+    // memory BIOs first.
 
     // Prefer server cipher order for better security/performance control
     opts |= SSL_OP_CIPHER_SERVER_PREFERENCE;
@@ -83,6 +175,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     if (!m_ctx)
     {
         std::cerr << "[tls] failed to create SSL context\n";
+        log_ssl_errors("SSL_CTX_new");
         return false;
     }
     SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
@@ -96,12 +189,13 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     // Session timeout: 5 minutes. Balances memory vs resumption hit rate.
     SSL_CTX_set_timeout(m_ctx, 300);
 
-    // Apply common performance options (KTLS, tickets, modes, fragment size)
+    // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
 
     if (SSL_CTX_use_certificate_file(m_ctx, std::string(cert_path).c_str(), SSL_FILETYPE_PEM) <= 0)
     {
         std::cerr << "[tls] failed to load certificate: " << cert_path << "\n";
+        log_ssl_errors("certificate load");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
         return false;
@@ -110,6 +204,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     if (SSL_CTX_use_PrivateKey_file(m_ctx, std::string(key_path).c_str(), SSL_FILETYPE_PEM) <= 0)
     {
         std::cerr << "[tls] failed to load private key: " << key_path << "\n";
+        log_ssl_errors("private key load");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
         return false;
@@ -118,6 +213,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     if (!SSL_CTX_check_private_key(m_ctx))
     {
         std::cerr << "[tls] private key does not match certificate\n";
+        log_ssl_errors("private key check");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
         return false;
@@ -129,6 +225,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
         if (SSL_CTX_load_verify_locations(m_ctx, std::string(client_ca).c_str(), nullptr) <= 0)
         {
             std::cerr << "[tls] failed to load client CA: " << client_ca << "\n";
+            log_ssl_errors("client CA load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
             return false;
@@ -152,6 +249,7 @@ bool tls_context::init_client(std::string_view ca_path,
     if (!m_ctx)
     {
         std::cerr << "[tls] failed to create SSL context\n";
+        log_ssl_errors("SSL_CTX_new");
         return false;
     }
     SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
@@ -162,7 +260,7 @@ bool tls_context::init_client(std::string_view ca_path,
     SSL_CTX_set_session_cache_mode(m_ctx, SSL_SESS_CACHE_CLIENT);
     SSL_CTX_sess_set_cache_size(m_ctx, 1024);
 
-    // Apply common performance options (KTLS, tickets, modes, fragment size)
+    // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
 
     if (!ca_path.empty())
@@ -170,6 +268,7 @@ bool tls_context::init_client(std::string_view ca_path,
         if (SSL_CTX_load_verify_locations(m_ctx, std::string(ca_path).c_str(), nullptr) <= 0)
         {
             std::cerr << "[tls] failed to load CA file: " << ca_path << "\n";
+            log_ssl_errors("CA file load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
             return false;
@@ -188,6 +287,7 @@ bool tls_context::init_client(std::string_view ca_path,
         if (SSL_CTX_use_certificate_file(m_ctx, std::string(client_cert).c_str(), SSL_FILETYPE_PEM) <= 0)
         {
             std::cerr << "[tls] failed to load client certificate: " << client_cert << "\n";
+            log_ssl_errors("client certificate load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
             return false;
@@ -195,6 +295,7 @@ bool tls_context::init_client(std::string_view ca_path,
         if (SSL_CTX_use_PrivateKey_file(m_ctx, std::string(client_key).c_str(), SSL_FILETYPE_PEM) <= 0)
         {
             std::cerr << "[tls] failed to load client key: " << client_key << "\n";
+            log_ssl_errors("client key load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
             return false;
@@ -216,20 +317,53 @@ SSL* tls_context::create_ssl() const
 
     SSL* ssl = SSL_new(m_ctx);
     if (!ssl)
+    {
+        log_ssl_errors("SSL_new");
         return nullptr;
+    }
 
-    // Create BIO memory pair for non-blocking I/O
+    // Memory BIO pair, not a socket BIO: OpenSSL only ever encodes and decodes
+    // here, and every byte on the wire is carried by an io_uring submission.
+    // See apply_ctx_performance_options for what that costs us (KTLS) and why
+    // it is worth it.
     BIO* rbio = BIO_new(BIO_s_mem());
     BIO* wbio = BIO_new(BIO_s_mem());
+    if (!rbio || !wbio)
+    {
+        // Never hand SSL_set_bio a half-allocated pair. Which side it takes
+        // ownership of when the other is NULL has changed between OpenSSL
+        // releases, so the survivor either leaks or gets freed twice -- and the
+        // one situation that makes BIO_new fail is the situation where leaking
+        // matters. Refuse the connection instead; the caller sees nullptr and
+        // drops the socket.
+        if (rbio) BIO_free(rbio);
+        if (wbio) BIO_free(wbio);
+        SSL_free(ssl);
+        log_ssl_errors("BIO allocation");
+        return nullptr;
+    }
 
     BIO_set_nbio(rbio, 1);
     BIO_set_nbio(wbio, 1);
 
+    // SSL_free() frees both BIOs from here on; do not free them separately.
     SSL_set_bio(ssl, rbio, wbio);
 
-    // Limit BIO buffering to 512KB to prevent memory exhaustion on failed handshakes
-    BIO_set_mem_eof_return(rbio, 0);
-    BIO_set_mem_eof_return(wbio, 0);
+    // What this actually does: decide what BIO_read returns from an *empty*
+    // memory BIO. -1 plus the retry flag means "nothing yet, ask again", which
+    // is what an empty buffer means in a non-blocking design; 0 would mean EOF,
+    // and OpenSSL would read a drained buffer as a closed connection -- which
+    // it did, on the value that was here. A peer that really has gone is
+    // signalled by the caller tearing the connection down after its io_uring
+    // read returns 0; it is never inferred from this buffer being empty.
+    //
+    // What it does not do: limit anything. The comment that stood here claimed
+    // it capped buffering at 512KB. It never has -- BIO_set_mem_eof_return has
+    // no size argument and no relation to the buffer's growth -- so the daemon
+    // carried a documented protection that did not exist. The real cap is
+    // max_bio_buffered, enforced in bio_write_in and ssl_write below.
+    BIO_set_mem_eof_return(rbio, -1);
+    BIO_set_mem_eof_return(wbio, -1);
 
     return ssl;
 #else
@@ -248,13 +382,70 @@ SSL* tls_context::create_ssl_server() const
 #endif
 }
 
-SSL* tls_context::create_ssl_client() const
+SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
 {
 #if SOCKETLEY_HAS_TLS
+    // ── Hostname verification ──
+    // init_client sets SSL_VERIFY_PEER, which proves only that some trusted CA
+    // signed the chain. It says nothing about *who* the chain was issued to, so
+    // a certificate for any unrelated host -- one anybody can buy for a domain
+    // they own -- satisfied it, and a peer that redirected the connection to
+    // itself was accepted as the intended backend. The name has to be pinned
+    // per connection, before the handshake, which is why it arrives here as an
+    // argument instead of a setter someone can skip.
+    if (expected_hostname.empty())
+    {
+        std::cerr << "[tls] refusing client connection: no expected peer name given\n";
+        return nullptr;
+    }
+
     SSL* ssl = create_ssl();
-    if (ssl) SSL_set_connect_state(ssl);
+    if (!ssl)
+        return nullptr;
+
+    const std::string name(expected_hostname);
+
+    // An address literal has to be checked against the certificate's iPAddress
+    // SAN, and must not be sent as SNI at all (RFC 6066 allows host names
+    // there only; some servers reject the handshake outright when it is). The
+    // probe is inet_pton rather than just trying the IP form first, because a
+    // failed parse in there pushes a reason onto the error queue that would
+    // then be drained and reported as the cause of an unrelated failure.
+    unsigned char ip_probe[16];
+    const bool is_ip = inet_pton(AF_INET,  name.c_str(), ip_probe) == 1 ||
+                       inet_pton(AF_INET6, name.c_str(), ip_probe) == 1;
+
+    bool pinned;
+    if (is_ip)
+    {
+        // No SSL_set1_ip_asc convenience wrapper exists the way SSL_set1_host
+        // does; go through the connection's verify param directly.
+        pinned = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.c_str()) == 1;
+    }
+    else
+    {
+        // Reject partial-label wildcards ("w*.example.com"): still issuable,
+        // never what an operator writing a backend address meant.
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        pinned = SSL_set1_host(ssl, name.c_str()) == 1 &&
+                 SSL_set_tlsext_host_name(ssl, name.c_str()) == 1;
+    }
+
+    if (!pinned)
+    {
+        // Fail rather than return a connection that would verify the chain and
+        // not the name: a half-verified SSL here is the exact outcome this
+        // function exists to prevent, and it would look identical to a good one.
+        std::cerr << "[tls] failed to pin expected peer name: " << name << "\n";
+        log_ssl_errors("peer name setup");
+        SSL_free(ssl);   // frees both memory BIOs with it
+        return nullptr;
+    }
+
+    SSL_set_connect_state(ssl);
     return ssl;
 #else
+    (void)expected_hostname;
     return nullptr;
 #endif
 }
@@ -262,6 +453,7 @@ SSL* tls_context::create_ssl_client() const
 int tls_context::do_handshake(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS
+    ERR_clear_error();   // so whatever we drain below belongs to this call
     int ret = SSL_do_handshake(ssl);
     if (ret == 1)
         return 1;
@@ -270,6 +462,15 @@ int tls_context::do_handshake(SSL* ssl)
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         return 0;
 
+    // A rejected certificate reaches here as a generic protocol error. The
+    // useful half of the diagnosis -- expired, self-signed, name mismatch -- is
+    // in the verify result and is not on the error queue at all, so report both
+    // or an operator is left guessing which of the two went wrong.
+    long verify = SSL_get_verify_result(ssl);
+    if (verify != X509_V_OK)
+        std::cerr << "[tls] handshake failed: peer certificate rejected: "
+                  << X509_verify_cert_error_string(verify) << "\n";
+    log_ssl_errors("handshake failed", err);
     return -1;
 #else
     return -1;
@@ -279,6 +480,7 @@ int tls_context::do_handshake(SSL* ssl)
 int tls_context::ssl_read(SSL* ssl, char* buf, int len)
 {
 #if SOCKETLEY_HAS_TLS
+    ERR_clear_error();
     int ret = SSL_read(ssl, buf, len);
     if (ret > 0)
         return ret;
@@ -287,6 +489,16 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         return 0;
 
+    if (err == SSL_ERROR_ZERO_RETURN)
+    {
+        // close_notify: an orderly shutdown by the peer, not a failure. Still
+        // empty the queue -- a leftover entry would be blamed on the next
+        // connection that does fail.
+        ERR_clear_error();
+        return -1;
+    }
+
+    log_ssl_errors("read failed", err);
     return -1;
 #else
     return -1;
@@ -296,6 +508,18 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
 int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
 {
 #if SOCKETLEY_HAS_TLS
+    // Outbound half of the buffer cap. SSL_write appends ciphertext to the
+    // write BIO whether or not anyone is draining it, so a peer that stops
+    // reading would otherwise let a fast producer buffer without limit -- the
+    // same unbounded growth as the inbound side, just driven from our end.
+    // Report 0 ("want more data") rather than an error: the contract for 0 is
+    // that the caller retries this same buffer once it has flushed, which is
+    // exactly the right answer to backpressure, and the connection survives.
+    BIO* wbio = SSL_get_wbio(ssl);
+    if (wbio && BIO_ctrl_pending(wbio) >= max_bio_buffered)
+        return 0;
+
+    ERR_clear_error();
     int ret = SSL_write(ssl, buf, len);
     if (ret > 0)
         return ret;
@@ -304,6 +528,7 @@ int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         return 0;
 
+    log_ssl_errors("write failed", err);
     return -1;
 #else
     return -1;
@@ -334,6 +559,32 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     BIO* rbio = SSL_get_rbio(ssl);
     if (!rbio)
         return -1;
+    if (len <= 0)
+        return 0;
+
+    // ── Inbound buffer cap ──
+    // A memory BIO grows to hold whatever is written into it; nothing in
+    // OpenSSL bounds it, and BIO_set_mem_eof_return -- which the comment in
+    // create_ssl used to claim did -- has nothing to do with size. Handshake
+    // records are the cheap way to abuse that: SSL only consumes a record once
+    // it is whole, so a peer that sends a few hundred bytes at a time and never
+    // finishes leaves every byte of it sitting here. One connection, no
+    // authentication needed, unlimited allocation, inside a daemon that goes to
+    // the trouble of capping connection counts everywhere else.
+    //
+    // 512KB is far above any legitimate need: a TLS record maxes out at 16KB
+    // and a large certificate chain is a few tens of KB, so a connection that
+    // reaches this is either broken or hostile. Either way it does not recover
+    // by being fed more, so this is fatal rather than backpressure -- the
+    // caller's contract for -1 is free_ssl() plus close, and nothing is
+    // allocated here to leak on the way out.
+    const long buffered = static_cast<long>(BIO_ctrl_pending(rbio));
+    if (buffered + static_cast<long>(len) > max_bio_buffered)
+    {
+        std::cerr << "[tls] inbound buffer limit exceeded (" << buffered << " + " << len
+                  << " > " << max_bio_buffered << " bytes unconsumed) -- dropping connection\n";
+        return -1;
+    }
 
     int ret = BIO_write(rbio, buf, len);
     if (ret > 0)

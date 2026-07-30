@@ -16,11 +16,17 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <poll.h>
 #include <unistd.h>
+#include <cerrno>
 #include <charconv>
+#include <chrono>
+#include <climits>
+#include <cstring>
 #ifndef SOCKETLEY_NO_HTTPS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 #endif
 
 lua_context::lua_context()
@@ -264,10 +270,97 @@ void lua_context::update_self_state(const char* state_str)
 // socketley.http(opts) — synchronous HTTP/HTTPS client for Lua scripts
 // opts = { url, method="GET", body="", headers={}, timeout_ms=5000 }
 // Returns { ok=bool, status=int, body=string, error=string }
-// WARNING: Blocks the event loop thread. Use only in on_start/on_stop or
-// low-frequency on_tick callbacks. For HTTPS, cert verification is skipped
-// (SSL_VERIFY_NONE) — suitable for trusted internal services.
+//
+// HTTPS now verifies the chain against the system trust store *and* that the
+// certificate was issued for the host in the URL. It used to do neither
+// (SSL_VERIFY_NONE): that bought encryption against somebody recording the
+// wire and nothing whatsoever against somebody sitting on it. Any self-signed
+// certificate was accepted, so a script fetching config, polling a health
+// endpoint or posting a webhook could be answered by whoever got in the middle
+// — with no error, no log line, and a `result.ok` of true.
+//
+// STILL BLOCKS THE EVENT-LOOP THREAD. This runs on the single thread that
+// serves every runtime in the daemon, so a slow host still stalls all of them.
+// Making it asynchronous means driving the socket from event_loop and
+// suspending the Lua callback across the round trip, which is a different
+// change in a different file. What is fixed here is that the block is now
+// *bounded*: DNS aside, connect, handshake, send and receive share one deadline
+// of timeout_ms enforced with poll(). Before, connect() ignored timeout_ms
+// entirely and sat in the kernel's SYN retry schedule for over two minutes,
+// and the socket timeouts restarted on every byte, so a server trickling one
+// byte at a time held the whole daemon for as long as it cared to.
+//
+// Residual: getaddrinfo() is still unbounded and is not counted against the
+// deadline until it returns — the resolver has no per-call timeout, and giving
+// it one means resolving off-thread, which is the same asynchronous rework.
+//
+// Keep to on_start/on_stop or low-frequency on_tick callbacks regardless.
 // ---------------------------------------------------------------------------
+
+using http_clock = std::chrono::steady_clock;
+
+// Milliseconds left before `deadline`, never negative.
+static int http_ms_left(http_clock::time_point deadline)
+{
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - http_clock::now()).count();
+    if (left <= 0)       return 0;
+    if (left > INT_MAX)  return INT_MAX;
+    return static_cast<int>(left);
+}
+
+// Wait for `fd` to become ready for `events`, or for the deadline to pass.
+// Returns 1 = ready, 0 = out of time, -1 = poll failed.
+static int http_wait(int fd, short events, http_clock::time_point deadline)
+{
+    for (;;)
+    {
+        int left = http_ms_left(deadline);
+        if (left <= 0)
+            return 0;
+
+        struct pollfd p{};
+        p.fd     = fd;
+        p.events = events;
+
+        int r = ::poll(&p, 1, left);
+        if (r > 0)  return 1;
+        if (r == 0) return 0;
+        if (errno == EINTR)
+            continue;      // a signal is not a timeout; the deadline decides
+        return -1;
+    }
+}
+
+// Ceiling on what one response may accumulate in daemon memory. The old loop
+// appended until the peer stopped sending, so a hostile or broken endpoint
+// could grow this string until the allocator gave up — on a box with no swap
+// that takes the daemon down, not just the script.
+static constexpr size_t http_max_response = 8u * 1024u * 1024u;
+
+#ifndef SOCKETLEY_NO_HTTPS
+// Drain OpenSSL's thread-local error queue into readable text.
+//
+// Every TLS failure here reported the bare string "TLS handshake failed". The
+// reason — expired certificate, unknown CA, name mismatch, a plain-HTTP server
+// on port 443 — was on that queue and nobody popped it. Leaving it there is a
+// second bug: the queue persists, so a stale entry gets drained later and
+// reported as the cause of an unrelated request's failure.
+static std::string ssl_error_text()
+{
+    std::string out;
+    char buf[256];
+    for (unsigned long e = ERR_get_error(); e != 0; e = ERR_get_error())
+    {
+        ERR_error_string_n(e, buf, sizeof(buf));
+        if (!out.empty())
+            out += "; ";
+        out += buf;
+    }
+    return out;
+}
+#endif
+
 static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 {
     sol::table result = lua.create_table();
@@ -283,6 +376,14 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     std::string url     = *url_opt;
     std::string body    = sol::optional<std::string>(opts["body"]).value_or("");
     int timeout_ms      = sol::optional<int>(opts["timeout_ms"]).value_or(5000);
+    if (timeout_ms <= 0)
+        timeout_ms = 5000;
+
+    // One deadline for the whole exchange, taken before anything can block.
+    // Every wait below measures against this, so the total time this call can
+    // hold the event-loop thread is timeout_ms plus the resolver, rather than
+    // timeout_ms per operation with no ceiling on the number of operations.
+    const auto deadline = http_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     // Parse scheme
     bool is_https = false;
@@ -326,20 +427,47 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         return result;
     }
 
-    // Connect
-    int sock = ::socket(addrs->ai_family, SOCK_STREAM, 0);
+    // Connect.
+    //
+    // Non-blocking socket plus poll(), not a blocking connect() with
+    // SO_SNDTIMEO: that option does not bound connect() on Linux at all. A host
+    // that drops the SYN — a firewall blackholing the port is the usual way —
+    // left this parked in the kernel's retry schedule for well over two
+    // minutes, on the thread every other runtime needs, no matter what
+    // timeout_ms said. The socket stays non-blocking for the rest of the call
+    // so every later wait goes through the same deadline.
+    int sock = ::socket(addrs->ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sock < 0) { freeaddrinfo(addrs); result["error"] = "socket() failed"; return result; }
 
-    struct timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {}
-    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {}
+    if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0)
+    {
+        if (errno != EINPROGRESS)
+        {
+            freeaddrinfo(addrs); ::close(sock);
+            result["error"] = std::string("connect() failed: ") + std::strerror(errno);
+            return result;
+        }
 
-    if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0) {
-        freeaddrinfo(addrs); ::close(sock);
-        result["error"] = "connect() failed";
-        return result;
+        int ready  = http_wait(sock, POLLOUT, deadline);
+        int so_err = 0;
+        if (ready == 1)
+        {
+            // Writable only means the attempt finished, not that it succeeded:
+            // a refused connection reports readiness and hides ECONNREFUSED in
+            // SO_ERROR, which is how a failed connect turns into a mysterious
+            // empty response if nobody looks.
+            socklen_t so_len = sizeof(so_err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0)
+                so_err = errno;
+        }
+        if (ready != 1 || so_err != 0)
+        {
+            freeaddrinfo(addrs); ::close(sock);
+            result["error"] = (ready == 0)
+                ? std::string("connect timed out after ") + std::to_string(timeout_ms) + "ms"
+                : std::string("connect() failed: ") + std::strerror(so_err ? so_err : errno);
+            return result;
+        }
     }
     freeaddrinfo(addrs);
 
@@ -376,39 +504,159 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     req.append("Connection: close\r\n\r\n");
     req.append(body);
 
-    // Send + receive
+    // Send + receive. Both directions are poll-driven against the shared
+    // deadline: the socket timeouts this used to rely on restart on every byte
+    // that arrives, so a peer sending one byte per second never "times out"
+    // while holding the thread forever.
     std::string response;
-    std::string send_err;
+    std::string xfer_err;
 
 #ifndef SOCKETLEY_NO_HTTPS
     if (is_https) {
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+
+        // ── Verification ──
+        // SSL_VERIFY_PEER fails the handshake on a chain no trusted CA signed;
+        // the host pin below fails it when the chain is trusted but was issued
+        // to somebody else. Both are needed: a certificate for a domain the
+        // attacker owns is entirely valid, and without the name check it
+        // impersonates any host this script fetches.
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+        if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            std::string why = ssl_error_text();
+            SSL_CTX_free(ctx); ::close(sock);
+            result["error"] = "no system CA store available" + (why.empty() ? "" : ": " + why);
+            return result;
+        }
+#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
+        // HTTP/1.0 with "Connection: close": a great many servers just drop the
+        // TCP connection instead of sending close_notify. OpenSSL 3.0 calls
+        // that a protocol error by default, which would turn a complete
+        // response into "SSL_read failed" for a large slice of the internet.
+        // The cost is that a truncated response is indistinguishable from a
+        // complete one — the same exposure the plaintext path has always had,
+        // and the reason a caller should check status and body rather than
+        // trust length.
+        SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+
         SSL* ssl = SSL_new(ctx);
         if (!ssl) { SSL_CTX_free(ctx); ::close(sock); result["error"] = "SSL_new failed"; return result; }
         SSL_set_fd(ssl, sock);
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        if (SSL_connect(ssl) != 1) {
-            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
-            result["error"] = "TLS handshake failed"; return result;
+
+        // An address literal is matched against the certificate's iPAddress SAN
+        // and must not be sent as SNI (RFC 6066 permits host names there only).
+        unsigned char ip_probe[16];
+        const bool host_is_ip = inet_pton(AF_INET,  host.c_str(), ip_probe) == 1 ||
+                                inet_pton(AF_INET6, host.c_str(), ip_probe) == 1;
+        bool pinned;
+        if (host_is_ip) {
+            pinned = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host.c_str()) == 1;
+        } else {
+            SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+            pinned = SSL_set1_host(ssl, host.c_str()) == 1 &&
+                     SSL_set_tlsext_host_name(ssl, host.c_str()) == 1;
         }
+        if (!pinned) {
+            // Refuse rather than continue unpinned: a connection that verifies
+            // the chain and not the name looks identical to a good one.
+            std::string why = ssl_error_text();
+            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
+            result["error"] = "failed to pin expected certificate name for " + host
+                            + (why.empty() ? "" : ": " + why);
+            return result;
+        }
+
+        // Handshake, bounded by the shared deadline. The socket is
+        // non-blocking, so OpenSSL hands back WANT_READ/WANT_WRITE instead of
+        // sleeping inside read(), and poll() decides how long we are willing to
+        // wait for the peer's next record.
+        std::string tls_err;
+        for (;;) {
+            ERR_clear_error();
+            int hr = SSL_connect(ssl);
+            if (hr == 1)
+                break;
+            int e = SSL_get_error(ssl, hr);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                if (http_wait(sock, (e == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT, deadline) != 1) {
+                    tls_err = "TLS handshake timed out"; break;
+                }
+                continue;
+            }
+            // The verify result carries the half of the diagnosis that never
+            // reaches the error queue, so report whichever one has something.
+            tls_err = "TLS handshake failed";
+            long verify = SSL_get_verify_result(ssl);
+            if (verify != X509_V_OK) {
+                tls_err += ": certificate rejected: ";
+                tls_err += X509_verify_cert_error_string(verify);
+            }
+            std::string why = ssl_error_text();
+            if (!why.empty()) { tls_err += ": "; tls_err += why; }
+            break;
+        }
+        if (!tls_err.empty()) {
+            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
+            result["error"] = tls_err;
+            return result;
+        }
+
         {
-            const char* wr_ptr = req.c_str();
-            int wr_rem = static_cast<int>(req.size());
-            while (wr_rem > 0) {
-                int w = SSL_write(ssl, wr_ptr, wr_rem);
-                if (w <= 0) { send_err = "SSL_write failed"; break; }
-                wr_ptr += w;
-                wr_rem -= w;
+            size_t sent = 0;
+            while (sent < req.size()) {
+                ERR_clear_error();
+                int w = SSL_write(ssl, req.data() + sent, static_cast<int>(req.size() - sent));
+                if (w > 0) { sent += static_cast<size_t>(w); continue; }
+                int e = SSL_get_error(ssl, w);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                    if (http_wait(sock, (e == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT, deadline) != 1) {
+                        xfer_err = "send timed out"; break;
+                    }
+                    continue;
+                }
+                xfer_err = "SSL_write failed";
+                { std::string why = ssl_error_text(); if (!why.empty()) xfer_err += ": " + why; }
+                break;
             }
         }
-        if (send_err.empty()) {
-            char buf[4096]; int n;
-            while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0)
-                response.append(buf, n);
+        if (xfer_err.empty()) {
+            char buf[4096];
+            for (;;) {
+                ERR_clear_error();
+                int n = SSL_read(ssl, buf, sizeof(buf));
+                if (n > 0) {
+                    if (response.size() + static_cast<size_t>(n) > http_max_response) {
+                        xfer_err = "response exceeds 8MB limit"; break;
+                    }
+                    response.append(buf, static_cast<size_t>(n));
+                    continue;
+                }
+                int e = SSL_get_error(ssl, n);
+                if (e == SSL_ERROR_ZERO_RETURN)
+                    break;                      // close_notify: response complete
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                    if (http_wait(sock, (e == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT, deadline) != 1) {
+                        xfer_err = "response timed out"; break;
+                    }
+                    continue;
+                }
+                if (e == SSL_ERROR_SYSCALL && ERR_peek_error() == 0 && !response.empty())
+                    break;                      // peer closed without close_notify
+                xfer_err = "SSL_read failed";
+                { std::string why = ssl_error_text(); if (!why.empty()) xfer_err += ": " + why; }
+                break;
+            }
         }
-        SSL_shutdown(ssl);
+
+        // One attempt only: on a non-blocking socket SSL_shutdown normally
+        // wants another round trip, and we are closing the connection either
+        // way — waiting for the peer's close_notify would spend the deadline we
+        // just spent enforcing on nothing.
+        if (SSL_shutdown(ssl) < 0) {}
+        ERR_clear_error();
         SSL_free(ssl); SSL_CTX_free(ctx);
         ::close(sock);
     } else
@@ -417,20 +665,44 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         {
             size_t s_total = 0;
             while (s_total < req.size()) {
-                ssize_t w = ::send(sock, req.c_str() + s_total, req.size() - s_total, 0);
-                if (w < 0) { send_err = "send() failed"; break; }
-                s_total += static_cast<size_t>(w);
+                // MSG_NOSIGNAL for the same reason event_loop uses it: writing
+                // to a peer that already closed must not raise SIGPIPE.
+                ssize_t w = ::send(sock, req.data() + s_total, req.size() - s_total, MSG_NOSIGNAL);
+                if (w > 0) { s_total += static_cast<size_t>(w); continue; }
+                if (w < 0 && errno == EINTR) continue;
+                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    if (http_wait(sock, POLLOUT, deadline) != 1) { xfer_err = "send timed out"; break; }
+                    continue;
+                }
+                xfer_err = std::string("send() failed: ") + std::strerror(errno);
+                break;
             }
         }
-        if (send_err.empty()) {
-            char buf[4096]; ssize_t n;
-            while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0)
-                response.append(buf, n);
+        if (xfer_err.empty()) {
+            char buf[4096];
+            for (;;) {
+                ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+                if (n > 0) {
+                    if (response.size() + static_cast<size_t>(n) > http_max_response) {
+                        xfer_err = "response exceeds 8MB limit"; break;
+                    }
+                    response.append(buf, static_cast<size_t>(n));
+                    continue;
+                }
+                if (n == 0) break;              // peer closed — end of an HTTP/1.0 response
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (http_wait(sock, POLLIN, deadline) != 1) { xfer_err = "response timed out"; break; }
+                    continue;
+                }
+                xfer_err = std::string("recv() failed: ") + std::strerror(errno);
+                break;
+            }
         }
         ::close(sock);
     }
 
-    if (!send_err.empty()) { result["error"] = send_err; return result; }
+    if (!xfer_err.empty()) { result["error"] = xfer_err; return result; }
 
     // Parse HTTP status line: "HTTP/1.x NNN Reason"
     int status = 0;

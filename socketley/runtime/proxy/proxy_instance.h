@@ -109,6 +109,21 @@ struct alignas(64) proxy_client_connection
     io_request connect_req;
     struct sockaddr_in connect_addr{};
 
+    // While the backend handshake is in flight the client socket has nothing
+    // armed on it — in TCP mode deliberately, so that unread bytes stay in the
+    // kernel and TCP flow control keeps applying.  That left no way at all to
+    // notice a client that died in the meantime: the pair was held, with a
+    // 64KB struct and a backend socket, until the connect finished and the
+    // first read or splice finally reported the corpse.  A client that connects,
+    // dumps a payload and resets is therefore free to make the proxy hold
+    // arbitrarily many of those at once.  This poll watches for POLLERR/POLLHUP
+    // only, which means "reset, or shut down in both directions" and nothing
+    // else — a clean close or a half-close leaves it silent, so a client that
+    // legitimately stops writing while it waits for its answer is untouched.
+    // It reads nothing, so the flow-control argument above still holds.
+    bool abort_watch_pending{false};
+    io_request abort_req;
+
     SKL_TRACE_FIELD(tr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
@@ -330,6 +345,10 @@ private:
     void handle_backend_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_splice(struct io_uring_cqe* cqe, io_request* req);
     void handle_connect(struct io_uring_cqe* cqe, io_request* req);
+    // The abort watch armed in connect_to_backend has reported.  Tears the pair
+    // down when the client is really gone, and does nothing at all otherwise —
+    // including when the report is only the withdrawal that put an end to it.
+    void handle_client_abort(struct io_uring_cqe* cqe, io_request* req);
     void handle_health_cqe(struct io_uring_cqe* cqe, io_request* req);
 
     bool parse_http_request_line(proxy_client_connection* conn);
@@ -370,6 +389,19 @@ private:
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
     void inv_check_pair(int fd, const char* where);
+    // Every pair the runtime still holds, not just the one a completion named.
+    // A completion names one connection, and when its handler tears that
+    // connection down the per-completion check finds an empty slot and says
+    // nothing — while the half that was stranded is the *other* one, sitting at
+    // a descriptor no completion will ever mention again.  That is the shape of
+    // every defect this invariant was written for, so without a sweep the check
+    // cannot see its own subject.
+    void inv_sweep_all(const char* where);
+    // Completions between sweeps.  A sweep walks the whole descriptor space, so
+    // it is amortised rather than run per completion; small enough that a pair
+    // stranded during a load run is reported while the run is still going.
+    static constexpr uint32_t INV_SWEEP_EVERY = 4096;
+    uint32_t m_inv_sweep_countdown{0};
 #endif
 
     // Append "Host: <backend>:<port>\r\n" for the endpoint this connection was

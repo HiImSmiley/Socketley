@@ -1,4 +1,6 @@
 #include "runtime_instance.h"
+#include "logging.h"
+#include "tls_context.h"
 #include "blocking_write.h"
 #include "event_loop.h"
 #include "lua_context.h"
@@ -120,6 +122,21 @@ bool runtime_instance::start(event_loop& loop)
     // or a timer before it gave up on a later step, and it has no way to tell
     // us which.  Erring towards "armed" costs a retired object; erring the
     // other way costs the daemon.
+    // Last gate before anything is armed, and the only one the daemon's own
+    // restore path also passes through: the flag handlers refuse TLS at create
+    // time, but a state file written before that gate existed carries
+    // was_running and is auto-started at boot without going near them.  Serving
+    // cleartext on a port the operator asked to encrypt — and which inspect
+    // still reports as encrypted — is worse than refusing to come up.
+    if (const char* opt = tls_requested_option(get_tls(), get_cert_path(), get_key_path(),
+                                               get_ca_path(), {}, {}, {}))
+    {
+        const std::string msg = tls_not_implemented_error(opt);
+        LOG_ERROR(msg.c_str());
+        m_state.store(runtime_failed, std::memory_order_release);
+        return false;
+    }
+
     m_armed_io = true;
     // The loop keeps a token per owner so a completion arriving after this
     // runtime is gone can be recognised and dropped rather than dispatched

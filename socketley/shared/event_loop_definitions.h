@@ -71,10 +71,11 @@ enum op_type : uint8_t
     op_file_read             = 16,    // async file read via io_uring
     op_connect               = 17,    // async connect via io_uring
     op_health_check          = 18,    // async health check (connect/write/read phases)
-    op_poll                  = 19     // wait for readiness (used to finish a non-blocking connect)
+    op_poll                  = 19,    // wait for readiness (used to finish a non-blocking connect)
+    op_poll_abort            = 20     // wait for a peer to die (POLLERR/POLLHUP), reading nothing
 };
 
-inline constexpr uint8_t op_type_count = 20;
+inline constexpr uint8_t op_type_count = 21;
 
 // For diagnostics only.  A count of outstanding operations says an owner cannot
 // be released yet; the kind says why, which is the difference between reading a
@@ -103,6 +104,7 @@ inline const char* io_op_name(uint8_t t)
         case op_connect:                 return "connect";
         case op_health_check:            return "health-check";
         case op_poll:                    return "poll";
+        case op_poll_abort:              return "poll-abort";
         default:                         return "unknown";
     }
 }

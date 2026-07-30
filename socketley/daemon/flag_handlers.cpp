@@ -1,5 +1,6 @@
 #include "flag_handlers.h"
 #include "../shared/runtime_instance.h"
+#include "../shared/tls_context.h"
 #include <iostream>
 #include <charconv>
 #include "../shared/runtime_manager.h"
@@ -181,42 +182,26 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        // TLS flags are refused here rather than stored.  Accepting them made
+        // `create` report success and `inspect` show the certificate, while the
+        // listener never handshook and answered plaintext — see the gate in
+        // shared/tls_context.h.  Failing at the point the flag is typed is the
+        // only place the operator is still looking.
         case fnv1a("--tls"):
-            instance->set_tls(true);
-            return 0;
+            std::cout << tls_not_implemented_error("--tls");
+            return 1;
 
         case fnv1a("--cert"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--cert requires a file path\n";
-                return 1;
-            }
-            instance->set_cert_path(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--cert");
+            return 1;
 
         case fnv1a("--key"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--key requires a file path\n";
-                return 1;
-            }
-            instance->set_key_path(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--key");
+            return 1;
 
         case fnv1a("--ca"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--ca requires a file path\n";
-                return 1;
-            }
-            instance->set_ca_path(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--ca");
+            return 1;
 
         case fnv1a("--group"):
         case fnv1a("-g"):
@@ -596,36 +581,17 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
+        // mTLS is TLS: with no handshake anywhere in the proxy these only ever
+        // decorated `inspect` output.  Refused for the same reason as --tls.
         case fnv1a("--client-ca"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--client-ca requires a file path\n";
-                return 1;
-            }
-            proxy->set_mesh_client_ca(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--client-ca");
+            return 1;
         case fnv1a("--client-cert"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--client-cert requires a file path\n";
-                return 1;
-            }
-            proxy->set_mesh_client_cert(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--client-cert");
+            return 1;
         case fnv1a("--client-key"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--client-key requires a file path\n";
-                return 1;
-            }
-            proxy->set_mesh_client_key(pa.args[++i]);
-            return 0;
-        }
+            std::cout << tls_not_implemented_error("--client-key");
+            return 1;
         case fnv1a("--sidecar"):
             // Sidecar mode: shorthand for health-check tcp + circuit + retry + drain
             proxy->set_health_check(mesh_config::health_tcp);

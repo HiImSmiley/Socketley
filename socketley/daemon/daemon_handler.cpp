@@ -12,6 +12,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../shared/cluster_discovery.h"
+#include "../shared/tls_context.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -27,6 +28,32 @@
 #include "../shared/logging.h"
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
+
+// The TLS options a runtime is carrying, or nullptr if it is carrying none.
+//
+// The parse gate in flag_handlers.cpp stops these being set by `create`, but an
+// instance can also be configured from a state file written before the gate
+// existed, so the check is repeated wherever a runtime is about to go live.
+// Without it a state file from an older daemon still brings up a listener that
+// answers cleartext on a port `inspect` describes as encrypted.
+static const char* instance_tls_option(const runtime_instance* inst)
+{
+    if (!inst)
+        return nullptr;
+
+    std::string_view mesh_ca, mesh_cert, mesh_key;
+    if (inst->get_type() == runtime_proxy)
+    {
+        const auto& mesh = static_cast<const proxy_instance*>(inst)->get_mesh_config();
+        mesh_ca   = mesh.client_ca;
+        mesh_cert = mesh.client_cert;
+        mesh_key  = mesh.client_key;
+    }
+
+    return tls_requested_option(inst->get_tls(), inst->get_cert_path(),
+                                inst->get_key_path(), inst->get_ca_path(),
+                                mesh_ca, mesh_cert, mesh_key);
+}
 
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     : m_manager(manager), m_loop(loop), m_listen_fd(-1)
@@ -497,6 +524,16 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
 
         if (!already_running)
         {
+            // Refuse to bring up a listener that would serve cleartext under a
+            // configuration promising encryption.  Reached by runtimes restored
+            // from a state file written before TLS was gated at parse time.
+            if (const char* opt = instance_tls_option(inst))
+            {
+                conn->write_buf += std::string(n) + ": " + tls_not_implemented_error(opt);
+                ++failed;
+                continue;
+            }
+
             if (!m_manager.start(n, m_loop))
             {
                 conn->write_buf += "failed to start: " + std::string(n) + "\n";
@@ -1852,6 +1889,19 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
+    // Same refusal as the create path: a config carrying TLS is rejected before
+    // anything is applied or written back to the state file.  Note the check is
+    // on what the incoming JSON *sets* — a config that omits the TLS fields is
+    // accepted, which is how an operator clears them from a runtime restored
+    // out of an older state file (dump, drop the fields, import).
+    if (const char* opt = tls_requested_option(cfg.tls, cfg.cert_path, cfg.key_path,
+                                               cfg.ca_path, cfg.mesh_client_ca,
+                                               cfg.mesh_client_cert, cfg.mesh_client_key))
+    {
+        conn->write_buf = tls_not_implemented_error(opt);
+        return 1;
+    }
+
     bool is_running = instance->get_state() == runtime_running;
     runtime_type type = instance->get_type();
 
@@ -2000,6 +2050,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             for (const auto& b : cfg.backends)
                 prx->add_backend(b);
             prx->set_runtime_manager(&m_manager);
+            // The gate above guarantees these three are empty, so this is the
+            // clearing half of the escape hatch: without it a proxy restored
+            // from a state file with mesh mTLS paths could never be emptied,
+            // and would refuse to start forever.
+            prx->set_mesh_client_ca(cfg.mesh_client_ca);
+            prx->set_mesh_client_cert(cfg.mesh_client_cert);
+            prx->set_mesh_client_key(cfg.mesh_client_key);
             break;
         }
         case runtime_cache:
@@ -2057,16 +2114,26 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
+    int refused = 0;
     for (const auto& n : names)
     {
         auto* inst = m_manager.get(n);
         if (!inst || inst->get_state() != runtime_running)
             continue;
+        // reload is a stop followed by a start, so it is a start: refuse
+        // before touching the runtime rather than tearing it down and
+        // bringing it back up in cleartext.
+        if (const char* opt = instance_tls_option(inst))
+        {
+            conn->write_buf += std::string(n) + ": " + tls_not_implemented_error(opt);
+            ++refused;
+            continue;
+        }
         m_manager.stop(n, m_loop);
         if (m_manager.start(n, m_loop) && m_persistence)
             m_persistence->set_was_running(n, true);
     }
-    return 0;
+    return refused > 0 ? 1 : 0;
 }
 
 int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
