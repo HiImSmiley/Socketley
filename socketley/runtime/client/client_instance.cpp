@@ -16,8 +16,8 @@ client_instance::client_instance(std::string_view name)
     : runtime_instance(runtime_client, name), m_mode(client_mode_inout), m_loop(nullptr), m_connected(false)
 {
     m_conn.fd = -1;
-    std::memset(&m_conn.read_req, 0, sizeof(m_conn.read_req));
-    std::memset(&m_conn.write_req, 0, sizeof(m_conn.write_req));
+    m_conn.read_req = {};
+    m_conn.write_req = {};
 }
 
 client_instance::~client_instance()
@@ -111,6 +111,31 @@ bool client_instance::try_connect()
     }
 
     {
+    // A literal address needs no resolver.  getaddrinfo runs on the event loop
+    // thread and stalls every other connection this runtime serves for as long
+    // as it takes, so the common case — a configured IP — must not enter it.
+    {
+        struct sockaddr_in lit{};
+        lit.sin_family = AF_INET;
+        lit.sin_port = htons(port);
+        if (inet_pton(AF_INET, host.c_str(), &lit.sin_addr) == 1)
+        {
+            m_cached_addr = lit;
+            m_cached_host = host;
+            m_cached_port = port;
+            m_has_cached_addr = true;
+
+            int connect_ret = connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&lit), sizeof(lit));
+            if (connect_ret < 0 && errno != EINPROGRESS)
+            {
+                close(m_conn.fd);
+                m_conn.fd = -1;
+                return false;
+            }
+            goto connected;
+        }
+    }
+
     // Resolve hostname (supports both IPs and DNS names like Docker hostnames)
     char port_str[8];
     auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), port);
