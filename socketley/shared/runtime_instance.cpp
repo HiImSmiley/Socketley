@@ -108,6 +108,14 @@ bool runtime_instance::start(event_loop& loop)
         return true;  // skip setup(), on_start, tick timer
     }
 
+    // From here on the kernel may be holding addresses that point inside this
+    // object, so it can no longer be freed on demand — see runtime_manager's
+    // graveyard.  A setup() that fails counts too: it can have armed an accept
+    // or a timer before it gave up on a later step, and it has no way to tell
+    // us which.  Erring towards "armed" costs a retired object; erring the
+    // other way costs the daemon.
+    m_armed_io = true;
+
     if (!setup(loop))
     {
         m_state.store(runtime_failed, std::memory_order_release);
@@ -160,6 +168,11 @@ runtime_state runtime_instance::get_state() const
 runtime_type runtime_instance::get_type() const
 {
     return m_type;
+}
+
+bool runtime_instance::has_armed_io() const
+{
+    return m_armed_io;
 }
 
 std::string_view runtime_instance::get_name() const

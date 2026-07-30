@@ -3,9 +3,30 @@
 #include "event_loop.h"
 #include "cluster_discovery.h"
 #include "lua_context.h"
+#include "logging.h"
 #include <cctype>
 #include <mutex>
 #include <shared_mutex>
+
+namespace
+{
+
+// What extract() answers with now that the real instance may not leave the
+// manager's hands.  It carries the removed runtime's identity, so a caller that
+// looks at it sees the runtime it asked about; it owns no I/O of its own, so it
+// can be destroyed at any moment — which is exactly what its one caller does, a
+// tick after taking it.
+struct detached_shell final : runtime_instance
+{
+    detached_shell(runtime_type type, std::string_view name)
+        : runtime_instance(type, name) {}
+
+    void on_cqe(struct io_uring_cqe*) override {}
+    bool setup(event_loop&) override { return false; }
+    void teardown(event_loop&) override {}
+};
+
+}  // namespace
 
 bool runtime_manager::create(runtime_type type, std::string_view name)
 {
@@ -81,29 +102,131 @@ bool runtime_manager::stop(std::string_view name, event_loop& loop)
     return true;
 }
 
+// A runtime instance is the storage for its own io_requests: the accept
+// request, the timers, and — through the connection structs it owns — one set
+// per connection.  io_uring keeps whatever addresses we hand it, so destroying
+// an instance while any of its completions is still queued leaves the event
+// loop reading freed memory; that is the segfault in event_loop::run() on
+// `req->owner`.  Nulling req->owner in teardown() does not save us, because
+// that convention only carries while there is still an object there to read the
+// null out of.
+//
+// So removal never destroys.  The instance leaves the map — which is what ps,
+// stats, start, rename and the rest look at, so it is gone as far as anyone can
+// tell, and its name is free again — and lands here instead, to be freed once
+// the ring is gone.
+void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
+{
+    if (!inst)
+        return;
+
+    // An instance that never reached setup() never put an io_request of its own
+    // into the ring, so nothing can point into it and it goes now.  That covers
+    // create-then-reject-a-flag, and external runtimes, which do no I/O of
+    // their own — and which have to keep being dropped untouched, the way
+    // removal has always treated them, rather than being handed the SIGTERM
+    // that stopping one sends.
+    if (!inst->has_armed_io())
+        return;
+
+    // Every caller that can reach a running runtime stops it first, so this is
+    // a backstop rather than a path.  It has to be here all the same: retiring
+    // a runtime that is still armed would turn the old crash into something
+    // quieter and worse — a runtime nobody can see or name that keeps serving
+    // traffic for the rest of the daemon's life.  Done with the map lock
+    // released, because on_stop may run Lua that calls back into the manager.
+    if (inst->get_state() == runtime_running)
+    {
+        if (event_loop* loop = inst->get_event_loop())
+            inst->stop(*loop);
+        else
+            LOG_WARN("removed a running runtime that has no event loop: "
+                     "its fds stay open until the daemon exits");
+    }
+
+    // The graveyard is only emptied at shutdown, so a daemon that creates and
+    // removes started runtimes in a loop grows.  Nothing available here can
+    // bound that without help from the event loop, so say it out loud on every
+    // doubling instead of letting it be found later as a leak.
+    size_t retired = 0;
+    {
+        std::unique_lock lock(mutex);
+        m_retired.push_back(std::move(inst));
+        if (m_retired.size() >= m_retired_warn_at)
+        {
+            retired = m_retired.size();
+            m_retired_warn_at = retired * 2;
+        }
+    }
+
+    if (retired > 0)
+    {
+        std::string msg = "retired runtime instances awaiting daemon shutdown: "
+                        + std::to_string(retired);
+        LOG_WARN(msg.c_str());
+    }
+}
+
 bool runtime_manager::remove(std::string_view name)
 {
-    std::unique_lock lock(mutex);
+    std::unique_ptr<runtime_instance> inst;
+    {
+        std::unique_lock lock(mutex);
 
-    auto it = runtimes.find(name);
-    if (it == runtimes.end())
-        return false;
+        auto it = runtimes.find(name);
+        if (it == runtimes.end())
+            return false;
 
-    runtimes.erase(it);
+        inst = std::move(it->second);
+        runtimes.erase(it);
+    }
+
+    retire(std::move(inst));
     return true;
 }
 
 std::unique_ptr<runtime_instance> runtime_manager::extract(std::string_view name)
 {
-    std::unique_lock lock(mutex);
+    std::unique_ptr<runtime_instance> inst;
+    {
+        std::unique_lock lock(mutex);
 
-    auto it = runtimes.find(name);
-    if (it == runtimes.end())
-        return nullptr;
+        auto it = runtimes.find(name);
+        if (it == runtimes.end())
+            return nullptr;
 
-    auto ptr = std::move(it->second);
-    runtimes.erase(it);
-    return ptr;
+        inst = std::move(it->second);
+        runtimes.erase(it);
+    }
+
+    // Built before the instance is handed on, while its name and id are still
+    // ours to read.
+    std::unique_ptr<runtime_instance> shell =
+        std::make_unique<detached_shell>(inst->get_type(), inst->get_name());
+    shell->set_id(inst->get_id());
+
+    retire(std::move(inst));
+    return shell;
+}
+
+void runtime_manager::free_retired()
+{
+    std::vector<std::unique_ptr<runtime_instance>> doomed;
+    {
+        std::unique_lock lock(mutex);
+        doomed.swap(m_retired);
+    }
+
+    // The destructors run out here, with the map lock released: a runtime that
+    // unwinds through Lua can reach back into the manager, and this mutex does
+    // not nest.
+    doomed.clear();
+}
+
+size_t runtime_manager::retired_count() const
+{
+    std::shared_lock lock(mutex);
+    return m_retired.size();
 }
 
 bool runtime_manager::rename(std::string_view old_name, std::string_view new_name)

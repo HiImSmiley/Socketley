@@ -6,6 +6,7 @@
 #include <string_view>
 #include <shared_mutex>
 #include <functional>
+#include <vector>
 
 #include "runtime_instance.h"
 
@@ -48,11 +49,25 @@ public:
     bool create(runtime_type type, std::string_view name);
     bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
+    // Takes the runtime out of the map.  The object itself may outlive the call
+    // — see retire() for why — but it is gone as far as every reader is
+    // concerned, and its name is free again immediately.
     bool remove(std::string_view name);
-    // Like remove(), but returns ownership so the caller controls when destruction happens.
+    // remove() for the one caller written against the old contract, where
+    // extraction handed back the instance so the caller could time its own
+    // destruction.  Timing it from outside is exactly what is no longer sound,
+    // so what comes back is a detached stand-in carrying the removed runtime's
+    // identity: non-null on success, safe to drop at any moment, and good for
+    // nothing but "yes, that runtime was here".
     std::unique_ptr<runtime_instance> extract(std::string_view name);
     bool rename(std::string_view old_name, std::string_view new_name);
     void stop_all(event_loop& loop);
+
+    // Destroys every retired instance.  Only legal once the io_uring instance is
+    // gone: event_loop::run() exits the ring on its way out, and that is the
+    // first moment nothing can complete against retired storage any more.
+    void free_retired();
+    size_t retired_count() const;
 
     // Cross-runtime pub/sub: dispatch a published message to all runtimes
     void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
@@ -78,6 +93,17 @@ public:
     mutable std::shared_mutex mutex;
 
 private:
+    // Takes over an instance that has just left the map.  Called with the map
+    // lock released.
+    void retire(std::unique_ptr<runtime_instance> inst);
+
     runtime_map runtimes;
+
+    // The graveyard: instances that are gone as far as every reader is
+    // concerned, but whose storage the ring may still point into.  Emptied by
+    // free_retired() at daemon shutdown, and only there.
+    std::vector<std::unique_ptr<runtime_instance>> m_retired;
+    size_t m_retired_warn_at = 32;
+
     cluster_discovery* m_cluster = nullptr;
 };

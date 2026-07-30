@@ -37,6 +37,17 @@ public:
 
     runtime_state get_state() const;
     runtime_type get_type() const;
+
+    // True once start() has entered setup(), i.e. once this instance may have
+    // handed the kernel the address of an io_request that lives inside it — its
+    // own accept/timer requests, or the ones embedded in every connection
+    // struct it owns.  Never cleared: stop() closes the fds and nulls the owner
+    // pointers, but a completion for this object can still be sitting in the
+    // ring afterwards, and the kernel keeps the address either way.
+    // runtime_manager reads this to decide whether an instance that has just
+    // left the map has to be retired or can be destroyed on the spot.
+    bool has_armed_io() const;
+
     std::string_view get_name() const;
     void set_name(std::string_view name);
     std::string_view get_id() const;
@@ -237,6 +248,7 @@ private:
     std::string m_id;
     runtime_type m_type;
     std::atomic<runtime_state> m_state;
+    bool m_armed_io = false;
     uint16_t m_port = 0;
     bool m_test_mode = false;
     std::string m_log_file;

@@ -328,6 +328,13 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     loop.run();
 
     manager.stop_all(loop);
+
+    // run() exits the ring on its way out, so from here on no completion can
+    // reference a retired runtime's storage.  This is the point — the only one
+    // we can prove — where the instances that removal deliberately kept alive
+    // can finally be freed.
+    manager.free_retired();
+
     handler.teardown();
 
     g_signal_write_fd = -1;
