@@ -206,6 +206,13 @@ struct upstream_connection
     int reconnect_attempt{0};
     io_request timeout_req{};
     struct __kernel_timespec timeout_ts{};
+
+    // Resolved endpoint, kept across reconnects.  upstream_try_connect runs on
+    // the event loop thread, so every name lookup it performs stalls every other
+    // connection this runtime is serving — and a flapping upstream retries on a
+    // timer, so that was once per attempt.
+    struct sockaddr_in cached_addr{};
+    bool has_cached_addr{false};
 };
 
 class server_instance : public runtime_instance

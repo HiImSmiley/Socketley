@@ -541,7 +541,15 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
 
         // Submit async read — req->fd = socket fd for CQE dispatch
         conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read };
-        m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0, &conn->file_read_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0,
+                                                         &conn->file_read_req)))
+        {
+            // No completion will arrive for a read that was never queued.  The
+            // teardown closes file_fd and frees file_buf, both already recorded
+            // on the connection above.
+            conn->file_read_pending = false;
+            conn->closing = true;
+        }
     }
 }
 
@@ -1175,25 +1183,37 @@ inline void server_instance::remove_active_fd(int fd)
 
 inline void server_instance::submit_conn_read(server_connection* conn)
 {
-    conn->read_pending = true;
+    bool queued;
     if (conn->direct_fd)
     {
         if (m_recv_multishot)
-            m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+            queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         else if (m_use_provided_bufs)
-            m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+            queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         else
-            m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
     }
     else
     {
         if (m_recv_multishot)
-            m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
+            queued = m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
         else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
+            queued = m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
         else
-            m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            queued = m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
     }
+
+    // The flag goes up only once the read is actually queued.  Setting it first
+    // and submitting into a full ring left the connection believing a read was
+    // in flight when nothing was: no completion would ever arrive and it hung
+    // until the runtime stopped.
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->read_pending = false;
+        conn->closing = true;
+        return;
+    }
+    conn->read_pending = true;
 }
 
 inline void server_instance::release_fixed_slot(server_connection* conn)
@@ -1240,10 +1260,20 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
         // Register fd in fixed file table for fget/fput-free I/O
         int slot = m_loop->alloc_fixed_file_slot();
-        if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+        if (slot >= 0)
         {
-            conn->fixed_idx = slot;
-            conn->direct_fd = true;
+            if (m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+            {
+                conn->fixed_idx = slot;
+                conn->direct_fd = true;
+            }
+            else
+            {
+                // The slot is already marked used in the bitmap.  If it cannot be
+                // pointed at this fd it has to go back immediately: the connection
+                // never learns its number, so no close path can ever release it.
+                m_loop->free_fixed_file_slot(static_cast<uint32_t>(slot));
+            }
         }
 
         auto* ptr = conn.get();
@@ -1399,10 +1429,16 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             // bytes, and returns a buffer it never took, corrupting the ring's
             // free list.
             conn->read_req.type = op_read;
+            bool queued;
             if (conn->direct_fd)
-                m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
             else
-                m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                conn->read_pending = false;
+                conn->closing = true;
+            }
             return;
         }
 
@@ -1631,6 +1667,8 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                         flush_write_queue(conn);
                     conn->closing = true;
                 }
+                if (conn->closing)
+                    break;
                 continue;
             }
 
@@ -1674,6 +1712,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 if (!payload.empty())
                     process_message(conn, payload);
             }
+
+            // Once the connection is marked closing, everything still
+            // buffered belongs to a conversation that is over.  Parsing it
+            // produces responses the teardown below discards, so the peer
+            // waits for answers that were computed and thrown away.
+            if (conn->closing)
+                break;
         }
         // Batch erase consumed data
         if (conn->ws_frag_len > 0)
@@ -1809,6 +1854,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 }
                 process_message(conn, cmd);
             }
+
+            // Once the connection is marked closing, everything still
+            // buffered belongs to a conversation that is over.  Parsing it
+            // produces responses the teardown below discards, so the peer
+            // waits for answers that were computed and thrown away.
+            if (conn->closing)
+                break;
         }
 
         if (offset > 0)
@@ -1836,6 +1888,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 process_message(conn, line);
 
             scan_from = pos + 1;
+
+            // Once the connection is marked closing, everything still
+            // buffered belongs to a conversation that is over.  Parsing it
+            // produces responses the teardown below discards, so the peer
+            // waits for answers that were computed and thrown away.
+            if (conn->closing)
+                break;
         }
 
         if (scan_from > 0)
@@ -2274,6 +2333,7 @@ void server_instance::flush_write_queue(server_connection* conn)
     conn->write_batch_count = count;
     conn->write_pending = true;
 
+    bool queued;
     if (count == 1)
     {
         auto len = static_cast<uint32_t>(conn->write_batch[0]->size());
@@ -2285,27 +2345,41 @@ void server_instance::flush_write_queue(server_connection* conn)
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
             if (conn->direct_fd)
-                m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
             else
-                m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
         }
         else
         {
             // Single message — use plain write (lower overhead than writev)
             conn->write_req.type = op_write;
             if (conn->direct_fd)
-                m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
             else
-                m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
         }
     }
     else
     {
         conn->write_req.type = op_writev;
         if (conn->direct_fd)
-            m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, count, &conn->write_req);
+            queued = m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, count, &conn->write_req);
         else
-            m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+            queued = m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+    }
+
+    // Nothing reached the ring, so no write completion will arrive.  Undo the
+    // in-flight bookkeeping and drop the connection — the batch is lost either
+    // way, and a write_pending that never clears keeps the teardown waiting
+    // forever for a completion that cannot come.
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->write_pending = false;
+        conn->zc_notif_pending = false;
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].reset();
+        conn->write_batch_count = 0;
+        conn->closing = true;
     }
 }
 
@@ -2427,16 +2501,17 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             conn->write_batch_count = new_count;
 
             conn->write_pending = true;
+            bool requeued;
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
                 if (conn->direct_fd)
-                    m_loop->submit_write_fixed_file(conn->fixed_idx,
+                    requeued = m_loop->submit_write_fixed_file(conn->fixed_idx,
                         static_cast<const char*>(conn->write_iovs[0].iov_base),
                         static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                         &conn->write_req);
                 else
-                    m_loop->submit_write(conn->fd,
+                    requeued = m_loop->submit_write(conn->fd,
                         static_cast<const char*>(conn->write_iovs[0].iov_base),
                         static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                         &conn->write_req);
@@ -2445,9 +2520,17 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             {
                 conn->write_req.type = op_writev;
                 if (conn->direct_fd)
-                    m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, new_count, &conn->write_req);
+                    requeued = m_loop->submit_writev_fixed_file(conn->fixed_idx, conn->write_iovs, new_count, &conn->write_req);
                 else
-                    m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                    requeued = m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            if (SOCKETLEY_UNLIKELY(!requeued))
+            {
+                conn->write_pending = false;
+                for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                    conn->write_batch[i].reset();
+                conn->write_batch_count = 0;
+                conn->closing = true;
             }
             return;
         }
@@ -3196,33 +3279,56 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     if (host.empty() || port == 0)
         return false;
 
-    // DNS resolve
-    struct addrinfo hints{}, *addrs = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_buf[8];
-    auto [pe, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
-    *pe = '\0';
-    if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs)
-        return false;
+    // Resolve the endpoint once and keep it.  Two things matter here: a literal
+    // address needs no resolver at all, and a name that has been resolved once
+    // must not be looked up again on every reconnect.  Both lookups happen on
+    // the event loop thread, where they stall everything else this runtime is
+    // serving for as long as the resolver takes.
+    if (!uc->has_cached_addr)
+    {
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+
+        if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) == 1)
+        {
+            uc->cached_addr = addr;
+            uc->has_cached_addr = true;
+        }
+        else
+        {
+            struct addrinfo hints{}, *addrs = nullptr;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            char port_buf[8];
+            auto [pe, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+            *pe = '\0';
+            if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs)
+                return false;
+            if (addrs->ai_addrlen == sizeof(struct sockaddr_in))
+            {
+                std::memcpy(&uc->cached_addr, addrs->ai_addr, sizeof(struct sockaddr_in));
+                uc->has_cached_addr = true;
+            }
+            freeaddrinfo(addrs);
+            if (!uc->has_cached_addr)
+                return false;
+        }
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0)
-    {
-        freeaddrinfo(addrs);
         return false;
-    }
 
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    if (connect(fd, addrs->ai_addr, addrs->ai_addrlen) < 0 && errno != EINPROGRESS)
+    if (connect(fd, reinterpret_cast<const struct sockaddr*>(&uc->cached_addr),
+                sizeof(uc->cached_addr)) < 0 && errno != EINPROGRESS)
     {
-        freeaddrinfo(addrs);
         close(fd);
         return false;
     }
-    freeaddrinfo(addrs);
 
     uc->fd = fd;
     uc->connected = true;
@@ -3240,7 +3346,13 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
 
     // Submit first read
     uc->read_pending = true;
-    m_loop->submit_read(fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req);
+    // Nothing queued means no completion will arrive; leaving the flag up would
+    // wedge this upstream connection for the life of the runtime.
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req)))
+    {
+        uc->read_pending = false;
+        uc->closing = true;
+    }
 
     // Fire on_upstream_connect callback
     invoke_on_upstream_connect(uc->conn_id);
@@ -3347,7 +3459,11 @@ submit_next:
     if (m_loop && !uc->closing)
     {
         uc->read_pending = true;
-        m_loop->submit_read(uc->fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(uc->fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req)))
+        {
+            uc->read_pending = false;
+            uc->closing = true;
+        }
     }
     else if (uc->closing && !uc->write_pending)
     {
@@ -3416,17 +3532,26 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
             uc->write_batch_count = new_count;
 
             uc->write_pending = true;
+            bool requeued;
             if (new_count == 1)
             {
                 uc->write_req.type = op_write;
-                m_loop->submit_write(uc->fd,
+                requeued = m_loop->submit_write(uc->fd,
                     static_cast<const char*>(uc->write_iovs[0].iov_base),
                     static_cast<uint32_t>(uc->write_iovs[0].iov_len), &uc->write_req);
             }
             else
             {
                 uc->write_req.type = op_writev;
-                m_loop->submit_writev(uc->fd, uc->write_iovs, new_count, &uc->write_req);
+                requeued = m_loop->submit_writev(uc->fd, uc->write_iovs, new_count, &uc->write_req);
+            }
+            if (SOCKETLEY_UNLIKELY(!requeued))
+            {
+                uc->write_pending = false;
+                for (uint32_t i = 0; i < uc->write_batch_count; i++)
+                    uc->write_batch[i].reset();
+                uc->write_batch_count = 0;
+                uc->closing = true;
             }
             return;
         }
@@ -3480,16 +3605,26 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     uc->write_batch_count = count;
     uc->write_pending = true;
 
+    bool queued;
     if (count == 1)
     {
         uc->write_req.type = op_write;
-        m_loop->submit_write(uc->fd, uc->write_batch[0]->data(),
+        queued = m_loop->submit_write(uc->fd, uc->write_batch[0]->data(),
             static_cast<uint32_t>(uc->write_batch[0]->size()), &uc->write_req);
     }
     else
     {
         uc->write_req.type = op_writev;
-        m_loop->submit_writev(uc->fd, uc->write_iovs, count, &uc->write_req);
+        queued = m_loop->submit_writev(uc->fd, uc->write_iovs, count, &uc->write_req);
+    }
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        uc->write_pending = false;
+        for (uint32_t i = 0; i < uc->write_batch_count; i++)
+            uc->write_batch[i].reset();
+        uc->write_batch_count = 0;
+        uc->closing = true;
     }
 }
 
