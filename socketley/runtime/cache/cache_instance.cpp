@@ -69,6 +69,21 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     m_conn_pool.push_back(std::move(conn));
 }
 
+void cache_instance::close_client([[maybe_unused]] client_connection* conn, int fd,
+                                  [[maybe_unused]] const char* reason)
+{
+    m_store.unsubscribe_all(fd);
+    SKL_TRACE_CLOSE(conn, fd, reason);
+    close(fd);
+    if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
+    auto it = m_clients.find(fd);
+    if (it != m_clients.end())
+    {
+        pool_release(std::move(it->second));
+        m_clients.erase(it);
+    }
+}
+
 void cache_instance::set_persistent(std::string_view path)
 {
     // Validate parent directory exists
@@ -106,7 +121,12 @@ size_t cache_instance::get_connection_count() const
 
 bool cache_instance::setup(event_loop& loop)
 {
-    // Clear connections from a previous stop() — safe to free now.
+    // Clear connections from a previous stop() — safe to free now.  stop()
+    // closes the fds but leaves m_clients populated, so their subscriptions are
+    // still in the store; drop them here or a new connection that lands on a
+    // recycled fd number inherits the old client's channels.
+    for (const auto& entry : m_clients)
+        m_store.unsubscribe_all(entry.first);
     m_clients.clear();
     m_followers.clear();
 
@@ -607,7 +627,9 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error — defer if write pending
+        // Connection closed or error — defer if write pending.  Drop the
+        // subscriptions right away even when deferring: the read side is
+        // already gone, so a publish must not queue further writes to it.
         m_store.unsubscribe_all(fd);
         if (conn->write_pending)
         {
@@ -615,10 +637,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         }
         else
         {
-            SKL_TRACE_CLOSE(conn, fd, "read-error-or-eof");
-            close(fd);
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+            close_client(conn, fd, "read-error-or-eof");
         }
         return;
     }
@@ -651,11 +670,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->closing = true;
         if (!conn->write_pending)
         {
-            m_store.unsubscribe_all(fd);
-            SKL_TRACE_CLOSE(conn, fd, "partial-overflow");
-            close(fd);
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+            close_client(conn, fd, "partial-overflow");
         }
         return;
     }
@@ -752,10 +767,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         else if (conn->write_queue.empty() && !conn->write_pending &&
                  conn->closing && !conn->read_pending)
         {
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            SKL_TRACE_CLOSE(conn, fd, "write-failed");
-            close(fd);
-            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+            close_client(conn, fd, "write-failed");
         }
         return;
     }
@@ -777,10 +789,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->closing = true;
         if (!conn->read_pending && !conn->zc_notif_pending)
         {
-            SKL_TRACE_CLOSE(conn, fd, "write-drained-closing");
-            close(fd);
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+            close_client(conn, fd, "write-drained-closing");
         }
         return;
     }
@@ -868,10 +877,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     {
         if (conn->closing && !conn->read_pending && !conn->zc_notif_pending)
         {
-            SKL_TRACE_CLOSE(conn, fd, "idle-sweep");
-            close(fd);
-            if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
-            { auto it = m_clients.find(fd); if (it != m_clients.end()) { pool_release(std::move(it->second)); m_clients.erase(it); } }
+            close_client(conn, fd, "idle-sweep");
         }
     }
 }
@@ -975,7 +981,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 m_store.check_expiry(key);
                 if (!m_store.set(key, value))
                 {
-                    rb.append("error: type conflict\n", 21);
+                    // set() refuses for two unrelated reasons; the key's own
+                    // type says which, so the client stops being told a memory
+                    // refusal was a type conflict.
+                    auto t = m_store.type(key);
+                    if (t == "none" || t == "string")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
                     break;
                 }
             }
@@ -1137,8 +1150,10 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             auto [key, suffix] = extract_key(args);
             if (key.empty() || suffix.empty()) { rb.append("usage: append key value\n", 24); return; }
             size_t newlen = m_store.append(key, suffix);
-            if (newlen == std::string::npos)
+            if (newlen == cache_store::append_wrong_type)
                 rb.append("error: type conflict\n", 21);
+            else if (newlen == cache_store::append_denied)
+                rb.append("error: out of memory\n", 21);
             else
             {
                 append_int_nl(rb, static_cast<int64_t>(newlen));
@@ -2421,7 +2436,12 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     m_store.check_expiry(args[1]);
                     if (!m_store.set(args[1], args[2]))
                     {
-                        resp::encode_error_into(rb, "type conflict");
+                        auto t = m_store.type(args[1]);
+                        if (t == "none" || t == "string")
+                            resp::encode_error_into(rb,
+                                "OOM command not allowed when used memory > 'maxmemory'");
+                        else
+                            resp::encode_error_into(rb, "type conflict");
                         break;
                     }
                 }
@@ -2617,8 +2637,10 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             size_t newlen = m_store.append(args[1], args[2]);
-            if (newlen == std::string::npos)
+            if (newlen == cache_store::append_wrong_type)
                 resp::encode_error_into(rb, "WRONGTYPE");
+            else if (newlen == cache_store::append_denied)
+                resp::encode_error_into(rb, "OOM command not allowed when used memory > 'maxmemory'");
             else
             { resp::encode_integer_into(rb, static_cast<int64_t>(newlen)); repl(args, argc); }
             break;

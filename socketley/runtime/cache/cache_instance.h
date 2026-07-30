@@ -347,4 +347,11 @@ private:
     std::vector<std::unique_ptr<client_connection>> m_conn_pool;
     std::unique_ptr<client_connection> pool_acquire(int fd);
     void pool_release(std::unique_ptr<client_connection> conn);
+
+    // Full teardown of a client connection.  Every close path must go through
+    // this rather than open-coding the steps: dropping the fd without clearing
+    // its subscriptions leaves it in the store's channel map forever, and the
+    // next connection that happens to get the same fd number inherits the dead
+    // client's channels.
+    void close_client(client_connection* conn, int fd, const char* reason);
 };
