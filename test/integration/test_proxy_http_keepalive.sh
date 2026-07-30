@@ -45,7 +45,20 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
-    [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true
+    # Wait for the daemon to actually go, and insist if it does not.  A plain
+    # kill returns immediately, and this test leaves a daemon holding thousands
+    # of connections, which takes long enough to shut down that the next test in
+    # the suite starts while it is still bound — the leftovers accumulate and one
+    # of them ends up answering somebody else's requests.
+    if [ -n "$DPID" ]; then
+        kill "$DPID" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$DPID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "$DPID" 2>/dev/null || true
+        wait "$DPID" 2>/dev/null || true
+    fi
     rm -rf "$TMPDIR_T"
 }
 trap cleanup EXIT

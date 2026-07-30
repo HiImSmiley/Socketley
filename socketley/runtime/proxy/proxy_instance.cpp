@@ -2479,6 +2479,17 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     return;
                 }
             }
+            else
+            {
+                // No backend to deliver to.  There used to be no else here, and
+                // falling through was fatal: splice_in_pending had just been
+                // cleared and nothing new was armed, so no completion was owed —
+                // and since every teardown in this runtime runs out of a
+                // completion handler, the connection was never torn down at all.
+                // Its descriptors stayed until the runtime stopped.
+                close_pair(conn->fd, -1);
+                return;
+            }
         }
         else if (req == &conn->splice_out_req)
         {
@@ -2587,6 +2598,17 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     close_pair(conn->client_fd, conn->fd);
                     return;
                 }
+            }
+            else
+            {
+                // Same hole in this direction, and this is the one the churn
+                // measurement hit: thousands of backends outliving a client that
+                // had aborted, each left with nothing in flight and therefore
+                // unreachable for the lifetime of the runtime.  Only the backend
+                // goes — whatever sits at client_fd is either gone or somebody
+                // else's, which is precisely why we are here.
+                close_pair(-1, conn->fd);
+                return;
             }
         }
         else if (req == &conn->splice_out_req)
