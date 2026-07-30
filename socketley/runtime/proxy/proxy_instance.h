@@ -324,7 +324,15 @@ private:
 
     bool resolve_backend(backend_info& b);
     const backend_info* select_and_resolve_backend(proxy_client_connection* conn);
-    bool connect_to_backend(proxy_client_connection* conn, const backend_info* target);
+    // A false return means "no backend connection was established", which
+    // covers two very different things.  If the backend refused us, that belongs
+    // in the circuit breaker; if we simply ran out of room in the submission
+    // ring or a slot table, it does not — blaming the backend for our own
+    // resource limit trips the breaker and takes a healthy backend out of
+    // rotation for everybody.  When *resource_failure comes back true, the
+    // backend said nothing at all and must not be charged for it.
+    bool connect_to_backend(proxy_client_connection* conn, const backend_info* target,
+                            bool* resource_failure = nullptr);
     void close_pair(int client_fd, int backend_fd);
     inline void close_pair_close_backend(int backend_fd,
                                           proxy_backend_connection* bconn,

@@ -761,12 +761,18 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         {
             auto* target = select_and_resolve_backend(ptr);
             bool have_target = (target != nullptr);
-            bool connected = have_target && connect_to_backend(ptr, target);
+            bool ours = false;
+            bool connected = have_target && connect_to_backend(ptr, target, &ours);
             if (SOCKETLEY_UNLIKELY(!connected))
             {
-                SKL_TRACE_LOG("accept-connect-failed cfd=%d target=%d errno=%d (%s) clients=%u",
-                              client_fd, (int)have_target, errno, strerror(errno), (unsigned)m_client_count);
-                if (have_target) record_backend_error(ptr->backend_idx);
+                SKL_TRACE_LOG("accept-connect-failed cfd=%d target=%d ours=%d errno=%d (%s) clients=%u",
+                              client_fd, (int)have_target, (int)ours, errno, strerror(errno),
+                              (unsigned)m_client_count);
+                // Only a backend that actually refused belongs in the breaker.
+                // Charging it for our own full ring took the one healthy backend
+                // out of rotation after circuit_threshold connections and then
+                // refused every client that followed.
+                if (have_target && !ours) record_backend_error(ptr->backend_idx);
                 close_pair(client_fd, -1);
                 goto proxy_resubmit_accept;
             }
@@ -1050,9 +1056,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
-            if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target)))
+            bool ours = false;
+            if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target, &ours)))
             {
-                record_backend_error(conn->backend_idx);
+                if (!ours) record_backend_error(conn->backend_idx);
                 close_pair(fd, -1);
                 return;
             }
@@ -1210,9 +1217,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         std::string rewritten = rewrite_http_request(conn, new_path);
         conn->saved_request = std::move(rewritten);
 
-        if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target)))
+        bool ours = false;
+        if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target, &ours)))
         {
-            record_backend_error(conn->backend_idx);
+            if (!ours) record_backend_error(conn->backend_idx);
             if (!try_retry(conn))
             {
                 send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
@@ -2126,8 +2134,11 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx)
 // Finish setting up backend after connect (pooled or async connect completion).
 // Creates backend conn struct, registers in maps, sets up splice/read.
 // Returns true if backend is ready. connect_pending will be false.
-bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const backend_info* target)
+bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const backend_info* target,
+                                       bool* resource_failure)
 {
+    // Local helper: mark this as our own shortage rather than the backend's fault.
+    const auto ours = [resource_failure]() { if (resource_failure) *resource_failure = true; };
     if (SOCKETLEY_UNLIKELY(!target || target->resolved_port == 0))
         return false;
 
@@ -2201,6 +2212,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             ptr->pipe_to_client[1] = -1;
             conn->backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
+            ours();
             return false;
         }
 
@@ -2320,6 +2332,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             ptr->pipe_to_client[1] = -1;
             conn->backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
+            ours();
             return false;
         }
 
@@ -2347,6 +2360,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         close(bfd);
         conn->connect_fd = -1;
         conn->connect_pending = false;
+        ours();
         return false;
     }
 
@@ -3394,15 +3408,20 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         // The descriptor was gone rather than the backend refusing us.  Nothing
         // about the client is wrong in that case, and it may already have data
         // waiting — take one fresh socket before giving up on it.
+        bool retry_ours = false;
         if (!fd_ours && !conn->connect_reattempted && !conn->closing &&
             m_protocol == protocol_tcp)
         {
             conn->connect_reattempted = true;
             auto* again = select_and_resolve_backend(conn);
-            if (again && connect_to_backend(conn, again))
+            if (again && connect_to_backend(conn, again, &retry_ours))
                 return;
         }
-        record_backend_error(conn->backend_idx);
+        // Two things that are not the backend's fault must not reach the
+        // breaker: a descriptor that vanished under us (see above), and a retry
+        // that failed on our own resources rather than on a refusal.
+        if (fd_ours && !retry_ours)
+            record_backend_error(conn->backend_idx);
 
         if (m_protocol == protocol_http)
         {
