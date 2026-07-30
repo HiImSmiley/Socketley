@@ -669,7 +669,18 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     for (auto& e : m_conn_idx) e = {};
 
     // Shutdown the listen socket before closing
-    if (m_listen_fd >= 0)
+    // Cancel before closing.  A multishot accept holds its own reference to
+        // the socket, so close() does not end it and the terminating completion
+        // never arrives — which leaves the loop counting one operation this
+        // owner still owes, forever.  reap_retired waits for that count to
+        // reach zero, so the whole instance was never freed: about 6 MB per
+        // removed runtime, held until the daemon exited.
+        if (m_listen_fd >= 0 && m_loop)
+        {
+            m_loop->submit_cancel_fd(m_listen_fd);
+            m_loop->flush();
+        }
+        if (m_listen_fd >= 0)
     {
         shutdown(m_listen_fd, SHUT_RDWR);
         close(m_listen_fd);

@@ -180,6 +180,18 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
         std::unique_lock lock(mutex);
         for (auto it = m_retired.begin(); it != m_retired.end(); )
         {
+#ifdef SOCKETLEY_INVARIANTS
+            // What this number is doing is the whole question when a graveyard
+            // stops draining: anything but zero means the ring still owes this
+            // instance a completion, and it cannot be freed until that lands.
+            if (*it)
+            {
+                std::string dbg = "reap: instance still owes the ring "
+                                + std::to_string(loop.owner_inflight(it->get()))
+                                + " completion(s)";
+                LOG_DEBUG(dbg.c_str());
+            }
+#endif
             if (*it && loop.owner_inflight(it->get()) == 0)
             {
                 doomed.push_back(std::move(*it));
