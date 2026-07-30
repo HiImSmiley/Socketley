@@ -2895,8 +2895,23 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     if (bconn->read_pending || bconn->write_pending || bconn->zc_notif_pending ||
         bconn->splice_in_pending || bconn->splice_out_pending)
     {
-        // Fall back to normal close — shutdown will drain pending CQEs
-        close_pair(cconn->fd, backend_fd);
+        // The backend cannot be pooled while a completion is still owed to it.
+        // That is no reason to take the client with it: it negotiated
+        // keep-alive, its response has been delivered in full, and it has done
+        // nothing wrong.  Closing the pair here ended the client connection
+        // after every single response — and since a backend read is armed
+        // essentially all the time, this branch is the one that runs, so
+        // keep-alive through the proxy never worked and every request paid for
+        // a fresh TCP handshake.
+        //
+        // Detach the two and let the backend go on its own.  Its pending
+        // completion arrives with client_fd already cleared, so the teardown
+        // that follows touches only the backend.
+        cconn->backend_fd = -1;
+        bconn->client_fd = -1;
+        bconn->closing = true;
+        shutdown(backend_fd, SHUT_RDWR);
+        reset_client_for_next_request(cconn);
         return;
     }
 
@@ -2918,7 +2933,11 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
         m_backend_count--;
     }
 
-    // Reset client for next HTTP request
+    reset_client_for_next_request(cconn);
+}
+
+void proxy_instance::reset_client_for_next_request(proxy_client_connection* cconn)
+{
     cconn->header_parsed = false;
     cconn->response_started = false;
     cconn->client_conn_close = false;
@@ -3664,6 +3683,17 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     }
 
     auto* bconn = be.backend;
+    // The pairing has to be mutual.  A descriptor number does not prove
+    // identity once numbers are reused, and forwarding into a backend that
+    // belongs to somebody else delivers this client's request on a stranger's
+    // connection — the same failure the splice path guards against, on the
+    // path that carries HTTP.
+    if (SOCKETLEY_UNLIKELY(bconn->client_fd != conn->fd))
+    {
+        conn->closing = true;
+        return;
+    }
+
     if (SOCKETLEY_UNLIKELY(bconn->closing))
     {
         conn->closing = true;
@@ -3736,6 +3766,9 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         return;
 
     auto* cconn = ce.client;
+    if (SOCKETLEY_UNLIKELY(cconn->backend_fd != conn->fd))
+        return;   // not our client any more; see forward_to_backend
+
     if (SOCKETLEY_UNLIKELY(cconn->closing))
         return;
 

@@ -307,6 +307,7 @@ private:
     inline void close_pair_close_backend(int backend_fd,
                                           proxy_backend_connection* bconn,
                                           proxy_client_connection* cconn);
+    void reset_client_for_next_request(proxy_client_connection* cconn);
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
     void setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn);
     void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
