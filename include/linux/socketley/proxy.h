@@ -106,7 +106,14 @@ public:
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
         m_loop.run();
+        // Still with a live ring: stopping a runtime submits — teardown()
+        // cancels what is attached to its descriptors and withdraws its own
+        // timers.  run() deliberately leaves the ring standing for this.
         m_mgr.stop_all(m_loop);
+        // And ended here, not in the destructor.  m_mgr is destroyed before
+        // m_loop, so a ring still open at that point would let the kernel go on
+        // writing into the buffers of connections the manager is freeing.
+        m_loop.shutdown_ring();
     }
     void stop() { m_loop.request_stop(); }
 

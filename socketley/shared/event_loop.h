@@ -23,6 +23,20 @@ public:
 
     bool init();
     void run();
+
+    // End the ring.  run() returning does not do this, on purpose: a daemon
+    // shutting down still has runtimes to stop, and stopping one submits —
+    // teardown() cancels the operations attached to its descriptors and
+    // withdraws its own timers, both of which need a ring to submit into.
+    //
+    // Call it once those are done and before anything an in-flight operation
+    // could still be naming is freed.  That is the one point where both halves
+    // hold: nothing more will be submitted, and nothing has been released yet.
+    // Afterwards every submit_* answers false instead of reaching into an
+    // unmapped queue, and the kernel can no longer be writing into memory the
+    // process is about to give back.  Idempotent; the destructor calls it.
+    void shutdown_ring();
+
     void request_stop();
     int get_signal_write_fd() const;
 
@@ -247,6 +261,10 @@ private:
     bool m_files_registered{false};
     bool m_bufs_registered{false};
     bool m_direct_accept_supported{false};
+    // Whether m_ring is a ring at all: false before init() and again after
+    // shutdown_ring().  get_sqe() is the single door every submission goes
+    // through, so testing it there covers all of them.
+    bool m_ring_open{false};
     uint32_t m_registered_file_count{0};
 
     // Fixed file slot allocation (bitmap-based)

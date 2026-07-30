@@ -25,18 +25,46 @@ event_loop::event_loop(uint32_t queue_depth)
 
 event_loop::~event_loop()
 {
+    shutdown_ring();
+
+    if (m_eventfd >= 0) close(m_eventfd);
+}
+
+void event_loop::shutdown_ring()
+{
+    if (!m_ring_open)
+        return;
+
+    // Before the ring goes, not after.  Every one of these names the ring —
+    // io_uring_free_buf_ring unregisters the group through it, and
+    // unregister_buffers is a syscall on its fd — and they used to run in this
+    // destructor, which is reached long after run() had already exited the
+    // ring: a closed descriptor that the process may well have reissued by
+    // then, told to release buffers on somebody else's behalf.
     for (uint16_t gid = 0; gid < MAX_BUF_GROUPS; ++gid)
     {
         auto& pool = m_buf_rings[gid];
         if (pool.ring)
+        {
             io_uring_free_buf_ring(&m_ring, pool.ring, pool.buf_count, gid);
+            pool.ring = nullptr;
+        }
         free(pool.base);
+        pool.base = nullptr;
     }
 
     if (m_bufs_registered)
+    {
         io_uring_unregister_buffers(&m_ring);
+        m_bufs_registered = false;
+    }
 
-    if (m_eventfd >= 0) close(m_eventfd);
+    // From here every submit_* answers false rather than reaching into an
+    // unmapped submission queue: get_sqe() is the single door they all go
+    // through, and a caller that is told its submission never landed already
+    // knows what to do with that.
+    m_ring_open = false;
+    io_uring_queue_exit(&m_ring);
 }
 
 // Submit one accept SQE built the way submit_multishot_accept() would, against
@@ -141,6 +169,15 @@ void event_loop::setup_eventfd()
 // happen at our queue depths, but defensive).
 inline struct io_uring_sqe* event_loop::get_sqe()
 {
+    // There is no ring to hand out an SQE from before init() and none after
+    // shutdown_ring(); in both cases the queue pointers are null or unmapped and
+    // io_uring_get_sqe() would dereference them.  Every submit_* helper already
+    // reports "this never reached the ring" by returning false, so answering
+    // that here costs one predictable branch and turns a segfault into the
+    // outcome the callers are written for.
+    if (__builtin_expect(!m_ring_open, 0))
+        return nullptr;
+
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
     if (__builtin_expect(!sqe, 0))
     {
@@ -442,6 +479,10 @@ bool event_loop::init()
             return false;
     }
 
+    // The ring exists from here on, and only from here: everything below and
+    // every submission afterwards may reach into it.
+    m_ring_open = true;
+
     // Register the ring fd itself: eliminates an fget/fput per io_uring
     // syscall (submit, wait, enter).  ~1-3% throughput improvement.
     io_uring_register_ring_fd(&m_ring);
@@ -563,6 +604,26 @@ void event_loop::run()
                 // compare settle it, and the answer is known before anything
                 // dereferences the handler.
                 const uint32_t tok = req->owner_token;
+
+                // Both of these are read before the dispatch, and that is not a
+                // convenience: on_cqe may free the storage the request lives in.
+                // A handler is entitled to — this completion is the one that
+                // said the kernel was finished with it, and daemon_handler does
+                // exactly that when a CLI client hangs up, destroying the
+                // ipc_connection whose read_req this is.  Reading req->type
+                // afterwards was therefore a read of freed memory on every CLI
+                // disconnect.  It survived because the block was normally still
+                // mapped; churning server runtimes frees megabytes at a time, so
+                // the free that released the connection coalesced into the top
+                // chunk, glibc trimmed the heap back to the kernel, and the
+                // read landed on an unmapped page.
+                //
+                // Reading it early is also the more correct value: it is the
+                // type this submission was armed with, which is the counter
+                // arm() incremented, whatever a re-arm inside on_cqe may have
+                // written into the request since.
+                const uint8_t rtype = req->type;
+
                 if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
                                      && req->owner != nullptr, 1))
                     req->owner->on_cqe(cqe);
@@ -573,12 +634,11 @@ void event_loop::run()
                 // will complete again; without it this was its last completion,
                 // delivered or dropped.  Accounting for the dropped ones too is
                 // the point: a slot that keeps looking armed is never reusable,
-                // and its owner can never be told it is quiescent.  Read after
-                // dispatch on purpose — a handler that re-armed inside on_cqe
-                // has already counted the new submission, so this decrement
-                // belongs to the old one either way.
+                // and its owner can never be told it is quiescent.  cqe is the
+                // ring's own memory, so it stays readable whatever the handler
+                // did with its own.
                 if (__builtin_expect((cqe->flags & IORING_CQE_F_MORE) == 0, 1))
-                    disarm(tok, req ? req->type : op_nop);
+                    disarm(tok, rtype);
             }
         }
 
@@ -591,7 +651,15 @@ void event_loop::run()
         }
     }
 
-    io_uring_queue_exit(&m_ring);
+    // The ring is deliberately left standing.  This used to end with
+    // io_uring_queue_exit(), and everything the daemon does after run() returns
+    // — stopping the runtimes that are still up — was then submitting into a
+    // ring that had been unmapped and whose fd was closed: teardown() cancels
+    // the operations attached to its descriptors and withdraws its own timers,
+    // and the first of those calls dereferenced the freed submission queue.
+    // That is a segfault on every SIGTERM with a runtime still running.
+    // shutdown_ring() ends it instead, at the point the caller knows both that
+    // no more submissions are coming and that nothing has been freed yet.
 }
 
 void event_loop::request_stop()

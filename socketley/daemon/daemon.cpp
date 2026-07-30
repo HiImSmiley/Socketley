@@ -327,12 +327,21 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     loop.run();
 
+    // Still with a live ring: every teardown cancels the operations hanging off
+    // its descriptors and withdraws its own timers, and all of that is
+    // submitted.  run() used to end the ring on its way out, so the first
+    // runtime this stopped submitted into an unmapped submission queue — a
+    // segfault on every SIGTERM that found a runtime still running.
     manager.stop_all(loop);
 
-    // run() exits the ring on its way out, so from here on no completion can
-    // reference a retired runtime's storage.  This is the point — the only one
-    // we can prove — where the instances that removal deliberately kept alive
-    // can finally be freed.
+    // Nothing more will be submitted, so the ring can go — and it has to go
+    // before anything is freed, because until it does the kernel may still be
+    // writing into the read buffers of connections a retired instance is
+    // holding on to.  With it gone, no completion can reference a retired
+    // runtime's storage, which makes this the one point we can prove is safe to
+    // free the instances that removal deliberately kept alive.
+    loop.shutdown_ring();
+
     manager.free_retired();
 
     handler.teardown();
