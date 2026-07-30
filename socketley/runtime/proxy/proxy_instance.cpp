@@ -4,6 +4,7 @@
 #include "../../shared/runtime_manager.h"
 #include "../../shared/cluster_discovery.h"
 #include "../../shared/lua_context.h"
+#include "../../shared/logging.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -17,6 +18,13 @@
 #include <netinet/tcp.h>
 #include <algorithm>
 #include <liburing.h>
+
+// Defined below, next to the read handlers they belong to; handle_accept needs
+// them earlier than that.
+static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connection* conn,
+                                  bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
+static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backend_connection* conn,
+                                          bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
 
 
 // Socket buffer sizes: 256KB gives good throughput for bulk transfers
@@ -406,7 +414,8 @@ bool proxy_instance::setup(event_loop& loop)
         m_idle_sweep_ts.tv_sec = 30;
         m_idle_sweep_ts.tv_nsec = 0;
         m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+            LOG_ERROR("proxy: idle sweep timer refused — idle connections will not be reaped");
     }
 
     // Pre-allocate connection struct pools
@@ -446,7 +455,8 @@ bool proxy_instance::setup(event_loop& loop)
         m_health_check_ts.tv_sec = m_mesh.health_interval;
         m_health_check_ts.tv_nsec = 0;
         m_health_check_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req)))
+            LOG_ERROR("proxy: health check timer refused — backend health will not be tracked");
     }
 
     return true;
@@ -644,24 +654,20 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                             }),
                         pool.end());
                 }
-                m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+                    LOG_ERROR("proxy: idle sweep timer refused — no further sweeps will run");
             }
             // Accept backoff expired — resubmit accept
             else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
             {
-                if (m_multishot_active)
-                    m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-                else
-                {
-                    m_accept_addrlen = sizeof(m_accept_addr);
-                    m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
-                }
+                rearm_accept();
             }
             // Health check sweep timer
             else if (req == &m_health_check_req)
             {
                 health_check_sweep();
-                m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req)))
+                    LOG_ERROR("proxy: health check timer refused — no further sweeps will run");
             }
             // Health check timeout — mark all still-pending checks as failed
             else if (req == &m_health_timeout_req)
@@ -773,22 +779,15 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 goto proxy_resubmit_accept;
         }
 
-        ptr->read_pending = true;
-        if (m_recv_multishot)
-            m_loop->submit_recv_multishot(client_fd, BUF_GROUP_ID, &ptr->read_req);
-        else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(client_fd, BUF_GROUP_ID, &ptr->read_req);
-        else
-            m_loop->submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, client_fd, ptr, m_recv_multishot,
+                                               m_use_provided_bufs, BUF_GROUP_ID)))
+            close_pair(client_fd, ptr->backend_fd);
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
     if (SOCKETLEY_UNLIKELY(client_fd == -EMFILE || client_fd == -ENFILE))
     {
-        m_accept_backoff_ts.tv_sec = 0;
-        m_accept_backoff_ts.tv_nsec = 100000000LL;
-        m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req);
+        schedule_accept_backoff();
         return;
     }
 
@@ -796,44 +795,81 @@ proxy_resubmit_accept:
     if (m_multishot_active)
     {
         if (!(cqe->flags & IORING_CQE_F_MORE))
-        {
-            if (SOCKETLEY_LIKELY(m_listen_fd >= 0))
-                m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
-        }
+            rearm_accept();
     }
     else
     {
-        if (SOCKETLEY_LIKELY(m_listen_fd >= 0))
-        {
-            m_accept_addrlen = sizeof(m_accept_addr);
-            m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
-        }
+        rearm_accept();
     }
 }
 
-// Inline helper to submit the appropriate read op
-static inline void submit_read_op(event_loop* loop, int fd, proxy_client_connection* conn,
+// Arm the read that fits the configured mode.  Returns false when the
+// submission did not make it into the ring: the caller must not leave the
+// connection marked pending then, because no completion is coming for it and
+// the connection would sit there until the idle sweep eventually reaps it —
+// with the peer waiting on a reply that is never read, let alone answered.
+static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connection* conn,
                                    bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
 {
     conn->read_pending = true;
+    bool queued;
     if (recv_multishot)
-        loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
+        queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
     else if (use_provided_bufs)
-        loop->submit_read_provided(fd, buf_group, &conn->read_req);
+        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
     else
-        loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+        conn->read_pending = false;
+    return queued;
 }
 
-static inline void submit_read_op_backend(event_loop* loop, int fd, proxy_backend_connection* conn,
+static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backend_connection* conn,
                                            bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
 {
     conn->read_pending = true;
+    bool queued;
     if (recv_multishot)
-        loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
+        queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
     else if (use_provided_bufs)
-        loop->submit_read_provided(fd, buf_group, &conn->read_req);
+        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
     else
-        loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+        conn->read_pending = false;
+    return queued;
+}
+
+void proxy_instance::schedule_accept_backoff()
+{
+    m_accept_backoff_ts.tv_sec = 0;
+    m_accept_backoff_ts.tv_nsec = 100000000LL;
+    m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req)))
+        LOG_ERROR("proxy: accept could not be re-armed and the retry timer was refused too — "
+                  "the listener has stopped taking connections");
+}
+
+void proxy_instance::rearm_accept()
+{
+    if (SOCKETLEY_UNLIKELY(m_listen_fd < 0))
+        return;
+
+    bool queued;
+    if (m_multishot_active)
+    {
+        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+    }
+    else
+    {
+        m_accept_addrlen = sizeof(m_accept_addr);
+        queued = m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+    }
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+        schedule_accept_backoff();
 }
 
 static bool header_name_equals(std::string_view line, const char* lower_name, size_t name_len)
@@ -891,7 +927,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             // bytes, and returns a buffer it never took, corrupting the ring's
             // free list.
             conn->read_req.type = op_read;
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->read_buf,
+                                                        sizeof(conn->read_buf), &conn->read_req)))
+            {
+                conn->read_pending = false;
+                close_pair(fd, conn->backend_fd);
+            }
             return;
         }
 
@@ -926,7 +967,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         {
             SKL_TRACE_ADD(conn, multishot_ends, 1);
             if (!conn->read_pending)
-                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
             return;
         }
 
@@ -976,7 +1021,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             // Pause reads if too much data buffered, resume in handle_connect
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending &&
                 conn->saved_request.size() < proxy_client_connection::MAX_PARTIAL_SIZE)
-                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
             return;
         }
 
@@ -1008,7 +1057,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             {
                 // Async connect submitted — handle_connect will forward saved data
                 if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-                    submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                    if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                    {
+                        close_pair(fd, conn->backend_fd);
+                        return;
+                    }
                 return;
             }
 
@@ -1019,7 +1072,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 if (!conn->splice_active && !conn->read_pending)
-                    submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                    if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                    {
+                        close_pair(fd, conn->backend_fd);
+                        return;
+                    }
             }
             else if (!conn->write_pending)
             {
@@ -1061,7 +1118,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                         backpressured = true;
                 }
                 if (!backpressured)
-                    submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                    if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                    {
+                        close_pair(fd, conn->backend_fd);
+                        return;
+                    }
             }
         }
         else if (!conn->write_pending)
@@ -1081,7 +1142,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->connect_pending))
     {
         if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-            submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+            if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+            {
+                close_pair(fd, conn->backend_fd);
+                return;
+            }
         return;
     }
 
@@ -1104,7 +1169,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         {
             // Need more data
             if (!conn->read_pending)
-                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
             return;
         }
 
@@ -1153,7 +1222,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         {
             // Async connect submitted — handle_connect will forward saved_request
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
             return;
         }
 
@@ -1188,7 +1261,11 @@ proxy_http_resubmit:
                     bp = true;
             }
             if (!bp)
-                submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
         }
     }
     else if (!conn->write_pending)
@@ -1243,7 +1320,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // bytes, and returns a buffer it never took, corrupting the ring's
             // free list.
             conn->read_req.type = op_read;
-            m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->read_buf,
+                                                        sizeof(conn->read_buf), &conn->read_req)))
+            {
+                conn->read_pending = false;
+                close_pair(conn->client_fd, fd);
+            }
             return;
         }
 
@@ -1466,7 +1548,11 @@ proxy_backend_read_done:
                     backpressured = true;
             }
             if (!backpressured)
-                submit_read_op_backend(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+                if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(conn->client_fd, fd);
+                    return;
+                }
         }
     }
     else if (!conn->write_pending)
@@ -2070,13 +2156,21 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             }
         }
 
-        ptr->read_pending = true;
-        if (m_recv_multishot)
-            m_loop->submit_recv_multishot(bfd, BUF_GROUP_ID, &ptr->read_req);
-        else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(bfd, BUF_GROUP_ID, &ptr->read_req);
-        else
-            m_loop->submit_read(bfd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, bfd, ptr, m_recv_multishot,
+                                                       m_use_provided_bufs, BUF_GROUP_ID)))
+        {
+            // Give up the backend only.  Every caller of this function keeps
+            // working with conn after a false return — closing the pair here
+            // would hand them a freed connection — so this looks to them
+            // exactly like any other failed connect.
+            if (ptr->pipe_to_client[0] >= 0) close(ptr->pipe_to_client[0]);
+            if (ptr->pipe_to_client[1] >= 0) close(ptr->pipe_to_client[1]);
+            ptr->pipe_to_client[0] = -1;
+            ptr->pipe_to_client[1] = -1;
+            conn->backend_fd = -1;
+            close_pair_close_backend(bfd, ptr, conn);
+            return false;
+        }
 
         return true;  // connect_pending stays false
     }
@@ -2180,13 +2274,21 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         }
 
         // Submit read on backend
-        ptr->read_pending = true;
-        if (m_recv_multishot)
-            m_loop->submit_recv_multishot(bfd, BUF_GROUP_ID, &ptr->read_req);
-        else if (m_use_provided_bufs)
-            m_loop->submit_read_provided(bfd, BUF_GROUP_ID, &ptr->read_req);
-        else
-            m_loop->submit_read(bfd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, bfd, ptr, m_recv_multishot,
+                                                       m_use_provided_bufs, BUF_GROUP_ID)))
+        {
+            // Give up the backend only.  Every caller of this function keeps
+            // working with conn after a false return — closing the pair here
+            // would hand them a freed connection — so this looks to them
+            // exactly like any other failed connect.
+            if (ptr->pipe_to_client[0] >= 0) close(ptr->pipe_to_client[0]);
+            if (ptr->pipe_to_client[1] >= 0) close(ptr->pipe_to_client[1]);
+            ptr->pipe_to_client[0] = -1;
+            ptr->pipe_to_client[1] = -1;
+            conn->backend_fd = -1;
+            close_pair_close_backend(bfd, ptr, conn);
+            return false;
+        }
 
         return true;  // connect_pending stays false — caller forwards saved_request
     }
@@ -2257,16 +2359,26 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     if (!conn->splice_in_pending && !conn->read_pending)
     {
         conn->splice_in_pending = true;
-        m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                              PROXY_READ_BUF_SIZE, &conn->splice_in_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
+                              PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+        {
+            conn->splice_in_pending = false;
+            close_pair(conn->fd, conn->backend_fd);
+            return;
+        }
     }
 
     // Backend -> pipe_write (first leg of backend -> client)
     if (!bconn->splice_in_pending)
     {
         bconn->splice_in_pending = true;
-        m_loop->submit_splice(bconn->fd, bconn->pipe_to_client[1],
-                              PROXY_READ_BUF_SIZE, &bconn->splice_in_req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(bconn->fd, bconn->pipe_to_client[1],
+                              PROXY_READ_BUF_SIZE, &bconn->splice_in_req)))
+        {
+            bconn->splice_in_pending = false;
+            close_pair(bconn->client_fd, bconn->fd);
+            return;
+        }
     }
 }
 
@@ -2295,8 +2407,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (cqe->res == -EAGAIN && !conn->closing)
                 {
                     conn->splice_in_pending = true;
-                    m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req);
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
+                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                    {
+                        conn->splice_in_pending = false;
+                        close_pair(conn->fd, conn->backend_fd);
+                        return;
+                    }
                     return;
                 }
                 close_pair(conn->fd, conn->backend_fd);
@@ -2307,8 +2424,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (conn->backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
-                                      static_cast<uint32_t>(cqe->res), &conn->splice_out_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                      static_cast<uint32_t>(cqe->res), &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->fd, conn->backend_fd);
+                    return;
+                }
             }
         }
         else if (req == &conn->splice_out_req)
@@ -2324,8 +2446,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (cqe->res == -EAGAIN && !conn->closing && conn->backend_fd >= 0)
                 {
                     conn->splice_out_pending = true;
-                    m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
-                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req);
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                    {
+                        conn->splice_out_pending = false;
+                        close_pair(conn->fd, conn->backend_fd);
+                        return;
+                    }
                     return;
                 }
                 close_pair(conn->fd, conn->backend_fd);
@@ -2340,8 +2467,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (pipe_left > 0 && conn->backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
-                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->fd, conn->backend_fd);
+                    return;
+                }
                 return;
             }
 
@@ -2349,8 +2481,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 conn->splice_in_pending = true;
-                m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
+                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                {
+                    conn->splice_in_pending = false;
+                    close_pair(conn->fd, conn->backend_fd);
+                    return;
+                }
             }
             else
             {
@@ -2375,8 +2512,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (cqe->res == -EAGAIN && !conn->closing)
                 {
                     conn->splice_in_pending = true;
-                    m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
-                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req);
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
+                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                    {
+                        conn->splice_in_pending = false;
+                        close_pair(conn->client_fd, conn->fd);
+                        return;
+                    }
                     return;
                 }
                 close_pair(conn->client_fd, conn->fd);
@@ -2391,8 +2533,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 m_conn_idx[conn->client_fd].client->backend_fd == conn->fd)
             {
                 conn->splice_out_pending = true;
-                m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
-                                      static_cast<uint32_t>(cqe->res), &conn->splice_out_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                                      static_cast<uint32_t>(cqe->res), &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->client_fd, conn->fd);
+                    return;
+                }
             }
         }
         else if (req == &conn->splice_out_req)
@@ -2408,8 +2555,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (cqe->res == -EAGAIN && !conn->closing && conn->client_fd >= 0)
                 {
                     conn->splice_out_pending = true;
-                    m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
-                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req);
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                    {
+                        conn->splice_out_pending = false;
+                        close_pair(conn->client_fd, conn->fd);
+                        return;
+                    }
                     return;
                 }
                 close_pair(conn->client_fd, conn->fd);
@@ -2426,8 +2578,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (pipe_left > 0 && conn->client_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
-                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                                      static_cast<uint32_t>(pipe_left), &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->client_fd, conn->fd);
+                    return;
+                }
                 return;
             }
 
@@ -2435,8 +2592,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 conn->splice_in_pending = true;
-                m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
-                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req);
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
+                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                {
+                    conn->splice_in_pending = false;
+                    close_pair(conn->client_fd, conn->fd);
+                    return;
+                }
             }
             else
             {
@@ -2523,9 +2685,15 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
         if (be.side == conn_backend)
         {
             auto* bconn = be.backend;
-            if (bconn->read_pending || bconn->write_pending ||
-                bconn->splice_in_pending || bconn->splice_out_pending ||
-                !bconn->write_queue.empty())
+            // Deferring is only right while something is actually in flight.  If
+            // the flush below cannot reach the ring there will be no completion
+            // to finish the teardown, and the connection would sit here until
+            // the idle sweep reaps it — so that case falls through to the
+            // immediate teardown instead.
+            bool defer = bconn->read_pending || bconn->write_pending ||
+                         bconn->splice_in_pending || bconn->splice_out_pending ||
+                         !bconn->write_queue.empty();
+            if (defer)
             {
                 // A queue that still holds data is as good a reason to defer as an
                 // operation in flight: closing here throws away bytes the client
@@ -2533,11 +2701,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 // open and push them out; the write completion tears down once the
                 // queue has actually drained.
                 bconn->closing = true;
-                if (!bconn->write_pending && !bconn->write_queue.empty())
-                    flush_backend_write_queue(bconn);
-                shutdown(backend_fd, SHUT_RD);
+                if (!bconn->write_pending && !bconn->write_queue.empty() &&
+                    !flush_backend_write_queue(bconn))
+                    defer = false;
+                else
+                    shutdown(backend_fd, SHUT_RD);
             }
-            else
+            if (!defer)
             {
                 // Clear the stale reference on the client side
                 if (bconn->client_fd >= 0 && bconn->client_fd < MAX_FDS)
@@ -2572,16 +2742,19 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 if (be2.side == conn_backend)
                 {
                     auto* bconn2 = be2.backend;
-                    if (bconn2->read_pending || bconn2->write_pending ||
-                        bconn2->splice_in_pending || bconn2->splice_out_pending ||
-                        !bconn2->write_queue.empty())
+                    bool defer2 = bconn2->read_pending || bconn2->write_pending ||
+                                  bconn2->splice_in_pending || bconn2->splice_out_pending ||
+                                  !bconn2->write_queue.empty();
+                    if (defer2)
                     {
                         bconn2->closing = true;
-                        if (!bconn2->write_pending && !bconn2->write_queue.empty())
-                            flush_backend_write_queue(bconn2);
-                        shutdown(conn->backend_fd, SHUT_RD);
+                        if (!bconn2->write_pending && !bconn2->write_queue.empty() &&
+                            !flush_backend_write_queue(bconn2))
+                            defer2 = false;
+                        else
+                            shutdown(conn->backend_fd, SHUT_RD);
                     }
-                    else
+                    if (!defer2)
                     {
                         // Close splice pipes
                         if (bconn2->pipe_to_client[0] >= 0) close(bconn2->pipe_to_client[0]);
@@ -2603,16 +2776,19 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 conn->connect_pending = false;
             }
 
-            if (conn->read_pending || conn->write_pending ||
-                conn->splice_in_pending || conn->splice_out_pending ||
-                !conn->write_queue.empty())
+            bool defer_c = conn->read_pending || conn->write_pending ||
+                           conn->splice_in_pending || conn->splice_out_pending ||
+                           !conn->write_queue.empty();
+            if (defer_c)
             {
                 conn->closing = true;
-                if (!conn->write_pending && !conn->write_queue.empty())
-                    flush_client_write_queue(conn);
-                shutdown(client_fd, SHUT_RD);
+                if (!conn->write_pending && !conn->write_queue.empty() &&
+                    !flush_client_write_queue(conn))
+                    defer_c = false;
+                else
+                    shutdown(client_fd, SHUT_RD);
             }
-            else
+            if (!defer_c)
             {
                 invoke_on_disconnect(client_fd);
 
@@ -2847,16 +3023,25 @@ void proxy_instance::health_check_sweep()
         hc.write_buf.clear();
         std::memcpy(hc.buf, &addr, sizeof(addr));
 
-        m_loop->submit_connect(fd,
-            reinterpret_cast<const struct sockaddr*>(hc.buf),
-            sizeof(struct sockaddr_in), &hc.req);
+        // A refused submission is our problem, not the backend's: recording it
+        // as a failure would take a healthy backend out of rotation whenever the
+        // ring is busy.  The probe is dropped and the next sweep tries again.
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_connect(fd,
+                reinterpret_cast<const struct sockaddr*>(hc.buf),
+                sizeof(struct sockaddr_in), &hc.req)))
+        {
+            close(fd);
+            hc.fd = -1;
+            hc.current = async_health_check::done;
+        }
     }
 
     // Submit a 500ms timeout for all checks
     m_health_timeout_ts.tv_sec = 0;
     m_health_timeout_ts.tv_nsec = 500000000LL;
     m_health_timeout_req = { this, nullptr, -1, 0, op_timeout };
-    m_loop->submit_timeout(&m_health_timeout_ts, &m_health_timeout_req);
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_timeout_ts, &m_health_timeout_req)))
+        LOG_WARN("proxy: health check deadline timer refused — this sweep has no timeout");
 }
 
 void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req)
@@ -2918,8 +3103,12 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
                             b.resolved_host + "\r\nConnection: close\r\n\r\n";
             hc->current = async_health_check::writing;
             hc->req.type = op_health_check;
-            m_loop->submit_write(hc->fd, hc->write_buf.data(),
-                                 static_cast<uint32_t>(hc->write_buf.size()), &hc->req);
+            if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(hc->fd, hc->write_buf.data(),
+                                     static_cast<uint32_t>(hc->write_buf.size()), &hc->req)))
+            {
+                if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
+                hc->current = async_health_check::done;
+            }
         }
     }
     else if (hc->current == async_health_check::writing)
@@ -2942,7 +3131,11 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
         // Write succeeded — read response
         hc->current = async_health_check::reading;
         hc->req.type = op_health_check;
-        m_loop->submit_read(hc->fd, hc->buf, sizeof(hc->buf) - 1, &hc->req);
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(hc->fd, hc->buf, sizeof(hc->buf) - 1, &hc->req)))
+        {
+            if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
+            hc->current = async_health_check::done;
+        }
     }
     else if (hc->current == async_health_check::reading)
     {
@@ -3126,13 +3319,12 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Submit read on backend
-    ptr->read_pending = true;
-    if (m_recv_multishot)
-        m_loop->submit_recv_multishot(bfd, BUF_GROUP_ID, &ptr->read_req);
-    else if (m_use_provided_bufs)
-        m_loop->submit_read_provided(bfd, BUF_GROUP_ID, &ptr->read_req);
-    else
-        m_loop->submit_read(bfd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+    if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, bfd, ptr, m_recv_multishot,
+                                                   m_use_provided_bufs, BUF_GROUP_ID)))
+    {
+        close_pair(conn->fd, bfd);
+        return;
+    }
 
     // Forward any saved data
     if (!conn->saved_request.empty())
@@ -3145,8 +3337,13 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     // The client read was deliberately left unarmed until a backend existed;
     // now that one does, start taking data.  (The splice path returns earlier —
     // there the pipeline does the reading.)
-    if (!conn->closing && !conn->read_pending && !conn->splice_active)
-        submit_read_op(m_loop, conn->fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+    if (!conn->closing && !conn->read_pending && !conn->splice_active &&
+        SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->fd, conn, m_recv_multishot,
+                                           m_use_provided_bufs, BUF_GROUP_ID)))
+    {
+        close_pair(conn->fd, bfd);
+        return;
+    }
 
     // The client had already half-closed while this connect was in flight.  Now
     // that its payload is on its way, pass the half-close on rather than leaving
@@ -3519,8 +3716,11 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         bconn->write_queue.emplace(data);
     }
 
-    if (!bconn->write_pending)
-        flush_backend_write_queue(bconn);
+    // Undeliverable.  Marking the connection is all this may do — the callers
+    // go on using conn right after this returns, and the read handlers tear the
+    // pair down once they see closing with nothing left in flight.
+    if (!bconn->write_pending && !flush_backend_write_queue(bconn))
+        conn->closing = true;
 }
 
 void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::string_view data)
@@ -3581,8 +3781,8 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         cconn->write_queue.emplace(data);
     }
 
-    if (!cconn->write_pending)
-        flush_client_write_queue(cconn);
+    if (!cconn->write_pending && !flush_client_write_queue(cconn))
+        cconn->closing = true;
 }
 
 void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body)
@@ -3622,14 +3822,23 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     conn->write_queue.push(std::move(response));
     conn->closing = true;
 
-    if (!conn->write_pending)
-        flush_client_write_queue(conn);
+    // conn->closing is already set above.  If the error body cannot be handed
+    // to the ring it simply never goes out; the caller's teardown proceeds
+    // either way, so there is nothing for this to decide.
+    if (!conn->write_pending && !flush_client_write_queue(conn))
+        conn->write_queue.clear();
 }
 
-void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
+// Returns false when nothing reached the ring.  A caller that leaves
+// write_pending set after that waits for a completion that cannot come:
+// the connection stops making progress and the peer is left holding a
+// request nobody will ever answer.  On failure the pending flag is
+// cleared and the batch dropped — the bytes are undeliverable, and
+// saying so is the difference between a closed connection and a hung one.
+bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
-        return;
+        return true;
 
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < proxy_client_connection::MAX_WRITE_BATCH)
@@ -3644,6 +3853,7 @@ void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     conn->write_batch_count = count;
     conn->write_pending = true;
 
+    bool queued;
     if (count == 1)
     {
         auto len = static_cast<uint32_t>(std::min(conn->write_batch[0].size(),
@@ -3652,25 +3862,40 @@ void proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
-            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
-            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
     }
     else
     {
         conn->write_req.type = op_writev;
-        m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+        queued = m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
     }
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->write_pending = false;
+        conn->zc_notif_pending = false;
+        conn->write_batch_count = 0;
+        return false;
+    }
+    return true;
 }
 
-void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
+// Returns false when nothing reached the ring.  A caller that leaves
+// write_pending set after that waits for a completion that cannot come:
+// the connection stops making progress and the peer is left holding a
+// request nobody will ever answer.  On failure the pending flag is
+// cleared and the batch dropped — the bytes are undeliverable, and
+// saying so is the difference between a closed connection and a hung one.
+bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
-        return;
+        return true;
 
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < proxy_backend_connection::MAX_WRITE_BATCH)
@@ -3685,6 +3910,7 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     conn->write_batch_count = count;
     conn->write_pending = true;
 
+    bool queued;
     if (count == 1)
     {
         auto len = static_cast<uint32_t>(std::min(conn->write_batch[0].size(),
@@ -3693,19 +3919,28 @@ void proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
         {
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
-            m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             conn->write_req.type = op_write;
-            m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
     }
     else
     {
         conn->write_req.type = op_writev;
-        m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
+        queued = m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
     }
+
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->write_pending = false;
+        conn->zc_notif_pending = false;
+        conn->write_batch_count = 0;
+        return false;
+    }
+    return true;
 }
 
 void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* req)
@@ -3726,7 +3961,13 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         conn->write_batch_count = 0;
 
         if (!conn->write_queue.empty() && !conn->write_pending)
-            flush_client_write_queue(conn);
+        {
+            if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
+            {
+                close_pair(conn->fd, conn->backend_fd);
+                return;
+            }
+        }
         else if (conn->write_queue.empty() && !conn->write_pending &&
                  conn->closing && !conn->read_pending &&
                  !conn->splice_in_pending && !conn->splice_out_pending)
@@ -3788,10 +4029,11 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             conn->write_batch_count = new_count;
 
             conn->write_pending = true;
+            bool queued;
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
-                m_loop->submit_write(conn->fd,
+                queued = m_loop->submit_write(conn->fd,
                     static_cast<const char*>(conn->write_iovs[0].iov_base),
                     static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                     &conn->write_req);
@@ -3799,7 +4041,15 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             else
             {
                 conn->write_req.type = op_writev;
-                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                queued = m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                // The remainder of a short write cannot be handed over.  Leaving
+                // write_pending set would strand the connection mid-message with
+                // no completion coming to finish it.
+                conn->write_pending = false;
+                close_pair(conn->fd, conn->backend_fd);
             }
             return;
         }
@@ -3815,7 +4065,11 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
 
     if (!conn->write_queue.empty() && !conn->zc_notif_pending)
     {
-        flush_client_write_queue(conn);
+        if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
+        {
+            close_pair(conn->fd, conn->backend_fd);
+            return;
+        }
     }
     else if (conn->closing && !conn->read_pending && !conn->zc_notif_pending &&
              !conn->splice_in_pending && !conn->splice_out_pending)
@@ -3832,8 +4086,13 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         if (be.side == conn_backend && !be.backend->read_pending &&
             !be.backend->closing && !be.backend->splice_active)
         {
-            submit_read_op_backend(m_loop, conn->backend_fd, be.backend,
-                                   m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+            if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, conn->backend_fd, be.backend,
+                                                           m_recv_multishot, m_use_provided_bufs,
+                                                           BUF_GROUP_ID)))
+            {
+                close_pair(conn->fd, conn->backend_fd);
+                return;
+            }
         }
     }
 }
@@ -3856,7 +4115,13 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         conn->write_batch_count = 0;
 
         if (!conn->write_queue.empty() && !conn->write_pending)
-            flush_backend_write_queue(conn);
+        {
+            if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
+            {
+                close_pair(conn->client_fd, conn->fd);
+                return;
+            }
+        }
         else if (conn->write_queue.empty() && !conn->write_pending &&
                  conn->closing && !conn->read_pending &&
                  !conn->splice_in_pending && !conn->splice_out_pending)
@@ -3918,10 +4183,11 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
             conn->write_batch_count = new_count;
 
             conn->write_pending = true;
+            bool queued;
             if (new_count == 1)
             {
                 conn->write_req.type = op_write;
-                m_loop->submit_write(conn->fd,
+                queued = m_loop->submit_write(conn->fd,
                     static_cast<const char*>(conn->write_iovs[0].iov_base),
                     static_cast<uint32_t>(conn->write_iovs[0].iov_len),
                     &conn->write_req);
@@ -3929,7 +4195,15 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
             else
             {
                 conn->write_req.type = op_writev;
-                m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+                queued = m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
+            }
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                // The remainder of a short write cannot be handed over.  Leaving
+                // write_pending set would strand the connection mid-message with
+                // no completion coming to finish it.
+                conn->write_pending = false;
+                close_pair(conn->client_fd, conn->fd);
             }
             return;
         }
@@ -3948,7 +4222,11 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
 
     if (!conn->write_queue.empty() && !conn->zc_notif_pending)
     {
-        flush_backend_write_queue(conn);
+        if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
+        {
+            close_pair(conn->client_fd, conn->fd);
+            return;
+        }
     }
     else if (conn->closing && !conn->read_pending && !conn->zc_notif_pending &&
              !conn->splice_in_pending && !conn->splice_out_pending)
@@ -3976,8 +4254,13 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         if (ce.side == conn_client && !ce.client->read_pending &&
             !ce.client->closing && !ce.client->splice_active)
         {
-            submit_read_op(m_loop, conn->client_fd, ce.client,
-                           m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID);
+            if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->client_fd, ce.client,
+                                                   m_recv_multishot, m_use_provided_bufs,
+                                                   BUF_GROUP_ID)))
+            {
+                close_pair(conn->client_fd, conn->fd);
+                return;
+            }
         }
     }
 }

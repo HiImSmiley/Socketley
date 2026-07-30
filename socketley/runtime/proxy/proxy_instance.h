@@ -323,8 +323,16 @@ private:
     void forward_to_backend(proxy_client_connection* conn, std::string_view data);
     void forward_to_client(proxy_backend_connection* conn, std::string_view data);
     void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body);
-    void flush_client_write_queue(proxy_client_connection* conn);
-    void flush_backend_write_queue(proxy_backend_connection* conn);
+    // Re-arm the listener, falling back to the backoff timer when the
+    // submission does not reach the ring.  Without that the proxy stops
+    // accepting connections silently — there is no completion to report it.
+    void rearm_accept();
+    void schedule_accept_backoff();
+
+    // Both report whether the submission reached the ring; see the
+    // definitions for why a caller must not ignore that.
+    bool flush_client_write_queue(proxy_client_connection* conn);
+    bool flush_backend_write_queue(proxy_backend_connection* conn);
 
     // Socket tuning: set optimal buffer sizes and options
     void tune_socket(int fd);
