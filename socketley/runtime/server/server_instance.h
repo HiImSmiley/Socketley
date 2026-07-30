@@ -357,6 +357,12 @@ private:
     void return_provided_buf(struct io_uring_cqe* cqe);
     void arm_udp_recv();
 
+#ifdef SOCKETLEY_INVARIANTS
+    // Debug-only: see invariants.h.  Asserts that a connection the runtime still
+    // has indexed still has something that will wake it.
+    void inv_check_reachable(int fd, const char* where);
+#endif
+
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
     void serve_http(server_connection* conn, std::string_view path);
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);

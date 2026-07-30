@@ -98,15 +98,8 @@ private:
     std::string m_daemon_name;
     uint16_t m_metrics_port{0};
 
-    // Deferred deletion: runtimes are held here for one event loop tick after cmd_remove so
-    // that any in-flight io_uring CQEs referencing their io_request members can be processed
-    // safely before the objects are destroyed.
-    std::vector<std::unique_ptr<runtime_instance>> m_deferred_delete;
-    struct __kernel_timespec m_cleanup_ts{};
-    io_request m_cleanup_req{};
-    bool m_cleanup_pending{false};
-
-    // Health monitoring for managed runtimes
+    // Health monitoring for managed runtimes, and the periodic reap of retired
+    // runtime instances — see the op_timeout branch of on_cqe().
     io_request m_health_req{};
     struct __kernel_timespec m_health_ts{};
     bool m_health_pending{false};

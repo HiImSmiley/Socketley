@@ -53,13 +53,6 @@ public:
     // — see retire() for why — but it is gone as far as every reader is
     // concerned, and its name is free again immediately.
     bool remove(std::string_view name);
-    // remove() for the one caller written against the old contract, where
-    // extraction handed back the instance so the caller could time its own
-    // destruction.  Timing it from outside is exactly what is no longer sound,
-    // so what comes back is a detached stand-in carrying the removed runtime's
-    // identity: non-null on success, safe to drop at any moment, and good for
-    // nothing but "yes, that runtime was here".
-    std::unique_ptr<runtime_instance> extract(std::string_view name);
     bool rename(std::string_view old_name, std::string_view new_name);
     void stop_all(event_loop& loop);
 
@@ -73,6 +66,10 @@ public:
     // submitted is still in flight, which is exactly the condition its storage
     // was being held for.  Does nothing while the loop's owner table is full,
     // because a zero is then not proof of anything.  Returns how many went.
+    //
+    // Called from removal, and — because removal can only ever reap what was
+    // retired before it — from the daemon's periodic timer, so that the last
+    // runtime removed is released too.
     size_t reap_retired(const event_loop& loop);
     size_t retired_count() const;
 
@@ -107,8 +104,9 @@ private:
     runtime_map runtimes;
 
     // The graveyard: instances that are gone as far as every reader is
-    // concerned, but whose storage the ring may still point into.  Emptied by
-    // free_retired() at daemon shutdown, and only there.
+    // concerned, but whose storage the ring may still point into.  Drained by
+    // reap_retired() as the completions land, and by free_retired() at daemon
+    // shutdown for whatever never completed.
     std::vector<std::unique_ptr<runtime_instance>> m_retired;
     size_t m_retired_warn_at = 32;
 

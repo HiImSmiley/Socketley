@@ -9,26 +9,6 @@
 #include <mutex>
 #include <shared_mutex>
 
-namespace
-{
-
-// What extract() answers with now that the real instance may not leave the
-// manager's hands.  It carries the removed runtime's identity, so a caller that
-// looks at it sees the runtime it asked about; it owns no I/O of its own, so it
-// can be destroyed at any moment — which is exactly what its one caller does, a
-// tick after taking it.
-struct detached_shell final : runtime_instance
-{
-    detached_shell(runtime_type type, std::string_view name)
-        : runtime_instance(type, name) {}
-
-    void on_cqe(struct io_uring_cqe*) override {}
-    bool setup(event_loop&) override { return false; }
-    void teardown(event_loop&) override {}
-};
-
-}  // namespace
-
 bool runtime_manager::create(runtime_type type, std::string_view name)
 {
     std::unique_lock lock(mutex);
@@ -115,7 +95,7 @@ bool runtime_manager::stop(std::string_view name, event_loop& loop)
 // So removal never destroys.  The instance leaves the map — which is what ps,
 // stats, start, rename and the rest look at, so it is gone as far as anyone can
 // tell, and its name is free again — and lands here instead, to be freed once
-// the ring is gone.
+// the loop reports that nothing it submitted is still in the ring.
 void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
 {
     if (!inst)
@@ -145,10 +125,8 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
                      "its fds stay open until the daemon exits");
     }
 
-    // The graveyard is only emptied at shutdown, so a daemon that creates and
-    // removes started runtimes in a loop grows.  Nothing available here can
-    // bound that without help from the event loop, so say it out loud on every
-    // doubling instead of letting it be found later as a leak.
+    // Read before the instance is handed on: this is the loop that can say when
+    // the graveyard's older residents are finished with.
     event_loop* reap_loop = inst->get_event_loop();
 
     size_t retired = 0;
@@ -162,13 +140,27 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
         }
     }
 
-    // Clear out whatever the ring has finished with.  Retiring is the only
-    // moment the graveyard grows, so reaping here is what keeps it from
-    // growing: what is left afterwards is exactly the instances the kernel is
-    // still working through, plus at most one that has nothing outstanding and
-    // is waiting for the next retirement or for shutdown.
+    // Clear out whatever the ring has finished with.  This can never reach the
+    // instance being retired right now — it has only just stopped, and its last
+    // completions are still in the ring — which is why the daemon's periodic
+    // timer reaps as well.  Without that second caller the most recently
+    // removed runtime waits for the next removal, and the last one a daemon
+    // ever removes waits for shutdown.
     if (reap_loop)
         retired -= std::min(retired, reap_retired(*reap_loop));
+
+    // The warning below says nothing until 32 instances are waiting, and a
+    // graveyard far below that already costs whole runtimes — a proxy is two
+    // megabytes of fd-indexed tables before it has taken a single connection,
+    // six once its connection pools are counted.  Nothing has ever read
+    // retired_count(), so the size was unobservable between "empty" and "32";
+    // this makes it readable for anyone who turns debug logging on.
+    if (logger::g_level <= log_debug)
+    {
+        std::string waiting = "retired runtime instances waiting: "
+                            + std::to_string(retired_count());
+        LOG_DEBUG(waiting.c_str());
+    }
 
     if (retired > 0)
     {
@@ -227,30 +219,6 @@ bool runtime_manager::remove(std::string_view name)
 
     retire(std::move(inst));
     return true;
-}
-
-std::unique_ptr<runtime_instance> runtime_manager::extract(std::string_view name)
-{
-    std::unique_ptr<runtime_instance> inst;
-    {
-        std::unique_lock lock(mutex);
-
-        auto it = runtimes.find(name);
-        if (it == runtimes.end())
-            return nullptr;
-
-        inst = std::move(it->second);
-        runtimes.erase(it);
-    }
-
-    // Built before the instance is handed on, while its name and id are still
-    // ours to read.
-    std::unique_ptr<runtime_instance> shell =
-        std::make_unique<detached_shell>(inst->get_type(), inst->get_name());
-    shell->set_id(inst->get_id());
-
-    retire(std::move(inst));
-    return shell;
 }
 
 void runtime_manager::free_retired()

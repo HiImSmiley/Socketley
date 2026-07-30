@@ -4,6 +4,7 @@
 #include "../../shared/runtime_manager.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/ws_protocol.h"
+#include "../../shared/invariants.h"
 #include "../../cli/command_hashing.h"
 #include "../cache/cache_instance.h"
 #include "../cache/resp_parser.h"
@@ -67,6 +68,26 @@ bool server_instance::conn_ops_pending(const server_connection* conn) const
 
 void server_instance::release_conn(std::unique_ptr<server_connection> conn)
 {
+    // The fixed-file slot belongs to the descriptor, not to the struct, and the
+    // descriptor is already closed by the time anything gets here — so the slot
+    // goes back now, whether or not the struct itself is free to be reused.
+    //
+    // Leaving it to pool_release() meant a connection with anything in flight
+    // carried its slot into the retired list, and a stop deregisters the runtime
+    // from the loop, after which its completions are dropped rather than
+    // dispatched — so reap_retired() never ran and pool_release() never
+    // happened.  The slot then survives the instance itself.  That costs more
+    // than a table entry: free_fixed_file_slot() is what unregisters the file,
+    // so until it runs the kernel still holds a reference to that socket and
+    // close() did not really close it.  The table is 8192 entries and shared by
+    // every server and cache on this loop, so one runtime bleeds all of them.
+    //
+    // Doing this while a request is still in flight is safe for the same reason
+    // closing the socket is: the request took its own reference to the file when
+    // it was issued and keeps it until it completes.  This is also what teardown
+    // did before the retired list existed.
+    release_fixed_slot(conn.get());
+
     if (SOCKETLEY_UNLIKELY(conn_ops_pending(conn.get())))
     {
         // The kernel is still working on something that names this struct: its
@@ -82,7 +103,20 @@ void server_instance::release_conn(std::unique_ptr<server_connection> conn)
 
 void server_instance::pool_release(std::unique_ptr<server_connection> conn)
 {
-    // Release fixed file slot before reuse
+    // A splice that was still armed when the connection was closed kept
+    // splice_cleanup() from running — it would have closed the file the kernel
+    // was reading from and handed the shared pipe to somebody else mid-transfer.
+    // Nothing is armed by the time a struct reaches here, so this is where that
+    // deferred cleanup finally happens.  Without it the file descriptor rode
+    // into the pool, held until the struct happened to be reused and lost for
+    // good if it never was — and m_splice_busy stayed true, which takes the
+    // splice path out of service for the rest of the runtime's life.
+    if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0 || conn->splice_pending ||
+                           conn->splice_remaining))
+        splice_cleanup(conn.get());
+
+    // Normally already done by release_conn(), which is where the slot is given
+    // up; this covers reap_retired(), which reaches the pool directly.
     release_fixed_slot(conn.get());
 
     // Nothing is in flight for this struct (release_conn checked), but the
@@ -123,6 +157,12 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->file_is_html = false;
     conn->file_read_pending = false;
     conn->http_keep_alive = false;
+
+    SKL_INV_POOLABLE("server::pool_release", conn->fd,
+        conn_ops_pending(conn.get()),
+        conn->read_req.owner || conn->write_req.owner || conn->file_read_req.owner ||
+        conn->splice_in_req.owner || conn->splice_out_req.owner);
+
     conn->fd = -1;
     m_conn_pool.push_back(std::move(conn));
 }
@@ -168,6 +208,20 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     if (fd >= 0 && fd < MAX_FDS)
         m_conn_idx[fd] = nullptr;
     close(fd);
+
+    // The file a response is being served out of is this connection's, not the
+    // pool's.  pool_release() closes it — but a connection with anything in
+    // flight never reaches pool_release(), it is retired, so the descriptor was
+    // held for as long as the struct was, and for good once the runtime stopped
+    // and the completion that would have released it was dropped.  Closing it
+    // here ends the read armed on it exactly as closing the socket above ends
+    // the read armed on that; file_buf deliberately stays where it is, because
+    // that is where the kernel is writing.
+    if (SOCKETLEY_UNLIKELY(conn->file_fd >= 0))
+    {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+    }
 
     auto it = m_clients.find(fd);
     if (it != m_clients.end())
@@ -1284,6 +1338,15 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         return;
     }
 
+#ifdef SOCKETLEY_INVARIANTS
+    // Remembered before the dispatch, because the handler may release the
+    // struct and the request with it.  Only per-connection operations are worth
+    // asking about; an accept or a timer names no connection.
+    const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
+                        req->type == op_timeout || req->type == op_recvmsg)
+                       ? -1 : req->fd;
+#endif
+
     switch (req->type)
     {
         case op_accept:
@@ -1425,7 +1488,45 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         default:
             break;
     }
+
+#ifdef SOCKETLEY_INVARIANTS
+    inv_check_reachable(inv_fd, "server::on_cqe");
+#endif
 }
+
+#ifdef SOCKETLEY_INVARIANTS
+// Invariant (1) from invariants.h, in the form this runtime takes: a client
+// connection is normally its own pair — nothing else drives it — except while
+// it is piped to another connection for zero-copy forwarding, where the peer's
+// read is what will wake both of them.
+void server_instance::inv_check_reachable(int fd, const char* where)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+
+    const auto* conn = m_conn_idx[fd];
+    if (!conn)
+        return;   // already torn down: nothing left that needs waking
+
+    const auto fill = [](const server_connection* c) {
+        skl_inv::half h{};
+        if (!c) return h;
+        h.present   = true;
+        h.in_flight = c->read_pending || c->write_pending || c->zc_notif_pending ||
+                      c->file_read_pending || c->splice_in_pending || c->splice_out_pending;
+        h.queued    = !c->write_queue.empty();
+        h.closing   = c->closing;
+        h.fd        = c->fd;
+        return h;
+    };
+
+    const server_connection* peer = nullptr;
+    if (conn->pipe_peer_fd >= 0 && conn->pipe_peer_fd < MAX_FDS)
+        peer = m_conn_idx[conn->pipe_peer_fd];
+
+    SKL_INV_PAIR(where, fill(conn), fill(peer));
+}
+#endif
 
 // O(1) removal from active_fds using the index stored in the connection.
 // The swapped-in element's connection gets its index updated.

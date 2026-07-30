@@ -163,18 +163,18 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
         case op_write:
             break;
         case op_timeout:
-            if (req == &m_cleanup_req)
-            {
-                // Deferred-delete cleanup: all in-flight CQEs for the removed runtimes have
-                // now been processed (event loop completed at least one full iteration), so
-                // it is safe to destroy the runtime objects.
-                m_deferred_delete.clear();
-                m_cleanup_pending = false;
-            }
-            else if (req == &m_health_req)
+            if (req == &m_health_req)
             {
                 m_health_pending = false;
                 check_managed_health();
+                // Release the retired runtimes the ring has finished with.
+                // Removal reaps too, but only ever the ones retired before it —
+                // the instance it retires itself is still owed completions at
+                // that moment.  Without a second caller, the last runtime a
+                // daemon removes keeps its whole object until something else is
+                // removed or the daemon exits: two megabytes for a proxy before
+                // a single connection, six with its connection pools.
+                m_manager.reap_retired(m_loop);
                 start_health_timer();
             }
             break;
@@ -565,28 +565,24 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
 
     for (const auto& n : names)
     {
-        // Use extract() instead of remove() so we hold the runtime alive for one
-        // event loop tick.  Any io_uring CQEs that are still in-flight reference
-        // io_request members embedded in the runtime object; freeing the object
-        // immediately would make those pointers dangling and crash the daemon.
-        auto ptr = m_manager.extract(n);
-        if (ptr)
+        // Nothing is held on this side any more.  remove() hands the runtime to
+        // the manager's graveyard, which is what waits for the ring to finish
+        // with the io_requests embedded in it — the reason this used to keep the
+        // object alive for a tick.  A tick was never the right measure anyway: a
+        // POLLOUT on a connect socket or a parked splice outlives one easily.
+        //
+        // Holding it here as well was worse than redundant.  The list was
+        // emptied by a timeout whose "did it reach the ring" answer nobody read,
+        // and the flag saying one was pending was set before the submission
+        // rather than after it, so a submission that never made it left the flag
+        // set for the life of the daemon and the list was never emptied again —
+        // one whole runtime retained per removal from then on, six megabytes for
+        // a proxy once its connection pools are counted, with nothing said.
+        if (m_manager.remove(n))
         {
-            m_deferred_delete.push_back(std::move(ptr));
             if (m_persistence)
                 m_persistence->remove_runtime(n);
         }
-    }
-
-    // Schedule a 0-ms timeout so we get a CQE in the very next event loop
-    // iteration.  By the time that CQE fires, all pending CQEs for the removed
-    // runtimes will have been processed and it is safe to destroy the objects.
-    if (!m_deferred_delete.empty() && !m_cleanup_pending)
-    {
-        m_cleanup_pending = true;
-        m_cleanup_ts = {};   // {0, 0} — fires immediately
-        m_cleanup_req = { this, nullptr, -1, 0, op_timeout };
-        m_loop.submit_timeout(&m_cleanup_ts, &m_cleanup_req);
     }
 
     return 0;
@@ -2309,7 +2305,19 @@ void daemon_handler::start_health_timer()
         return;
     m_health_req = { this, nullptr, -1, 0, op_timeout };
     m_health_ts = { 2, 0 };  // 2 seconds
-    m_loop.submit_timeout(&m_health_ts, &m_health_req);
+
+    // Nothing re-arms this chain but its own completion, so a submission that
+    // never reached the ring ends it — and it takes both of the daemon's
+    // periodic duties with it: managed runtimes stop being supervised, and
+    // retired instances stop being reaped.  The flag is left clear so a later
+    // caller can pick the chain back up, and the loss is said out loud rather
+    // than being found later as a leak.
+    if (!m_loop.submit_timeout(&m_health_ts, &m_health_req))
+    {
+        LOG_ERROR("daemon health timer refused: managed runtimes are no longer "
+                  "supervised and retired runtimes are no longer reaped");
+        return;
+    }
     m_health_pending = true;
 }
 

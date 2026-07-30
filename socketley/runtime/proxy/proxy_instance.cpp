@@ -5,6 +5,7 @@
 #include "../../shared/cluster_discovery.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/logging.h"
+#include "../../shared/invariants.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -229,6 +230,20 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
     if (conn->pipe_to_backend[1] >= 0) { close(conn->pipe_to_backend[1]); conn->pipe_to_backend[1] = -1; }
 
+    // The half-open connect socket goes the same way, and for the same reason.
+    // Every caller closes it before getting here, but nothing downstream would:
+    // reset() only sets connect_fd to -1, so a struct that ever reached the pool
+    // still carrying one lost that descriptor for good, and a retired struct
+    // would hold it until its last completion landed — which, once the runtime
+    // is stopped and its completions are dropped, is never.  This is the funnel;
+    // it is the place that has to know.
+    if (SOCKETLEY_UNLIKELY(conn->connect_fd >= 0))
+    {
+        if (m_loop) m_loop->submit_cancel_fd(conn->connect_fd);
+        close(conn->connect_fd);
+        conn->connect_fd = -1;
+    }
+
     // A struct only goes back into the pool once the ring is finished with it.
     // The pool hands its structs to the very next accepted connection, and a
     // completion landing on one that has already been reissued is charged to a
@@ -279,6 +294,13 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     conn->path.clear();
     conn->version.clear();
     conn->saved_request.clear();
+
+    SKL_INV_POOLABLE("proxy::client_pool_release", conn->fd,
+        conn->read_pending || conn->write_pending || conn->zc_notif_pending ||
+        conn->splice_in_pending || conn->splice_out_pending || conn->connect_pending,
+        conn->read_req.owner || conn->write_req.owner || conn->splice_in_req.owner ||
+        conn->splice_out_req.owner || conn->connect_req.owner);
+
     m_client_pool.push_back(std::move(conn));
 }
 
@@ -335,6 +357,13 @@ void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connecti
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
+
+    SKL_INV_POOLABLE("proxy::backend_pool_release", conn->fd,
+        conn->read_pending || conn->write_pending || conn->zc_notif_pending ||
+        conn->splice_in_pending || conn->splice_out_pending,
+        conn->read_req.owner || conn->write_req.owner || conn->splice_in_req.owner ||
+        conn->splice_out_req.owner);
+
     m_backend_struct_pool.push_back(std::move(conn));
 }
 
@@ -567,17 +596,18 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
+
+    // Fresh timer for this run, for the reason spelled out on timer_op.  It is
+    // built whether or not it is armed here, because the backend pool arms it on
+    // demand — see release_to_pool().
+    m_idle_sweep_timer = std::make_unique<timer_op>();
+    m_idle_sweep_timer->ts.tv_sec = 30;
+    m_idle_sweep_timer->ts.tv_nsec = 0;
+    m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
+    m_idle_sweep_armed = false;
+    m_idle_sweep_warned = false;
     if (m_idle_timeout_cached > 0)
-    {
-        // Fresh timer for this run, for the reason spelled out on timer_op.
-        m_idle_sweep_timer = std::make_unique<timer_op>();
-        m_idle_sweep_timer->ts.tv_sec = 30;
-        m_idle_sweep_timer->ts.tv_nsec = 0;
-        m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
-                                                       &m_idle_sweep_timer->req)))
-            LOG_ERROR("proxy: idle sweep timer refused — idle connections will not be reaped");
-    }
+        arm_idle_sweep();
 
     // Pre-allocate connection struct pools
     if (m_client_pool.empty())
@@ -727,8 +757,13 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         }
         if (m_idle_sweep_timer)
         {
+            // Only owed a completion while the chain is actually running: the
+            // sweep stops re-arming itself once there is nothing left to
+            // reclaim, and retiring an object nothing will ever complete for
+            // holds it until the instance is destroyed.
+            const size_t n = m_idle_sweep_armed ? 1 : 0;
             owed[0] = &m_idle_sweep_timer->req;
-            retire(std::shared_ptr<void>(std::move(m_idle_sweep_timer)), owed, 1);
+            retire(std::shared_ptr<void>(std::move(m_idle_sweep_timer)), owed, n);
         }
         if (m_accept_backoff_timer)
         {
@@ -747,6 +782,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         }
     }
 
+    m_idle_sweep_armed = false;
     m_loop = nullptr;
     m_multishot_active = false;
 }
@@ -765,6 +801,15 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
+
+#ifdef SOCKETLEY_INVARIANTS
+    // Remembered before the dispatch: the handler may release the struct and
+    // the request along with it.  Only per-connection operations name a pair —
+    // an accept, a timer or a health probe does not.
+    const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
+                        req->type == op_timeout || req->type == op_health_check)
+                       ? -1 : req->fd;
+#endif
 
     switch (req->type)
     {
@@ -819,22 +864,32 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_timeout:
             if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
             {
+                // This link of the chain has spoken; nothing is owed on it now.
+                m_idle_sweep_armed = false;
+
                 auto now = std::chrono::steady_clock::now();
-                auto timeout = std::chrono::seconds(m_idle_timeout_cached);
-                size_t found = 0;
-                for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
+                if (m_idle_timeout_cached > 0)
                 {
-                    auto& cconn = m_client_slots[cfd];
-                    if (!cconn) continue;
-                    found++;
-                    if (cconn->closing) continue;
-                    if ((now - cconn->last_activity) > timeout)
+                    auto timeout = std::chrono::seconds(m_idle_timeout_cached);
+                    size_t found = 0;
+                    for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
                     {
-                        cconn->closing = true;
-                        shutdown(cfd, SHUT_RD);
+                        auto& cconn = m_client_slots[cfd];
+                        if (!cconn) continue;
+                        found++;
+                        if (cconn->closing) continue;
+                        if ((now - cconn->last_activity) > timeout)
+                        {
+                            cconn->closing = true;
+                            shutdown(cfd, SHUT_RD);
+                        }
                     }
                 }
-                // Evict stale pooled connections
+
+                // Evict stale pooled connections.  This half runs for every
+                // proxy, configured idle timeout or not: the pool is the only
+                // place a backend socket can sit with nobody watching it.
+                bool pooled_left = false;
                 for (auto& pool : m_backend_pool)
                 {
                     pool.erase(
@@ -850,10 +905,15 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                                 return stale;
                             }),
                         pool.end());
+                    pooled_left = pooled_left || !pool.empty();
                 }
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
-                                                               &m_idle_sweep_timer->req)))
-                    LOG_ERROR("proxy: idle sweep timer refused — no further sweeps will run");
+
+                // Keep the chain going only while it still has work.  An armed
+                // timeout is attached to no descriptor and cannot be cancelled,
+                // so one that runs for ever holds a removed proxy in the
+                // manager's graveyard for ever with it.
+                if (m_idle_timeout_cached > 0 || pooled_left)
+                    arm_idle_sweep();
             }
             // Accept backoff expired — resubmit accept.  The timer has spoken,
             // so it owes nothing more and the next shortage may arm a new one.
@@ -905,7 +965,75 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         default:
             break;
     }
+
+#ifdef SOCKETLEY_INVARIANTS
+    inv_check_pair(inv_fd, "proxy::on_cqe");
+#endif
 }
+
+#ifdef SOCKETLEY_INVARIANTS
+// Invariant (1) from invariants.h, in the form this runtime takes.  A proxied
+// connection is half of a pair and only the pair can answer the question: a
+// client waiting on its backend's connect or its reply has nothing of its own
+// in flight and is perfectly healthy, and so is a backend still reading a
+// response for a client that is doing nothing but wait for it.  What is not
+// healthy is neither of them having anything in flight while both are still
+// indexed — no completion is coming, nothing else drives either side, so
+// whatever is in their write queues is never going out and the descriptors are
+// held until the runtime stops.
+void proxy_instance::inv_check_pair(int fd, const char* where)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+
+    const auto& entry = m_conn_idx[fd];
+    const proxy_client_connection*  cconn = nullptr;
+    const proxy_backend_connection* bconn = nullptr;
+
+    if (entry.side == conn_client)
+    {
+        cconn = entry.client;
+        const int bfd = cconn->backend_fd;
+        if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
+            bconn = m_conn_idx[bfd].backend;
+    }
+    else if (entry.side == conn_backend)
+    {
+        bconn = entry.backend;
+        const int cfd = bconn->client_fd;
+        if (cfd >= 0 && cfd < MAX_FDS && m_conn_idx[cfd].side == conn_client)
+            cconn = m_conn_idx[cfd].client;
+    }
+    else
+    {
+        return;   // already torn down: nothing left that needs waking
+    }
+
+    skl_inv::half c{}, b{};
+    if (cconn)
+    {
+        c.present   = true;
+        c.in_flight = cconn->read_pending || cconn->write_pending ||
+                      cconn->zc_notif_pending || cconn->splice_in_pending ||
+                      cconn->splice_out_pending || cconn->connect_pending;
+        c.queued    = !cconn->write_queue.empty();
+        c.closing   = cconn->closing;
+        c.fd        = cconn->fd;
+    }
+    if (bconn)
+    {
+        b.present   = true;
+        b.in_flight = bconn->read_pending || bconn->write_pending ||
+                      bconn->zc_notif_pending || bconn->splice_in_pending ||
+                      bconn->splice_out_pending;
+        b.queued    = !bconn->write_queue.empty();
+        b.closing   = bconn->closing;
+        b.fd        = bconn->fd;
+    }
+
+    SKL_INV_PAIR(where, c, b);
+}
+#endif
 
 void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 {
@@ -2330,6 +2458,39 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx)
     return -1;
 }
 
+// The idle sweep is what reclaims pooled backend sockets, so it has to run for
+// every proxy that pools — not only for one that was configured with an idle
+// timeout for its clients.  Arming it was tied to that timeout, which meant a
+// proxy without one kept up to MAX_POOL_PER_BACKEND sockets per backend open
+// for the rest of its life: acquire_pooled_backend() drops stale entries, but
+// only when somebody asks for a connection, and an idle proxy never does.
+//
+// It is armed on demand rather than always, so a proxy that never pools costs
+// no timer chain at all, and the chain stops itself once the pools are empty
+// again — a timeout is attached to no descriptor, so an armed one keeps the
+// instance in the manager's graveyard until it fires.
+void proxy_instance::arm_idle_sweep()
+{
+    if (m_idle_sweep_armed || !m_loop || !m_idle_sweep_timer)
+        return;
+
+    m_idle_sweep_armed = true;
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
+                                                   &m_idle_sweep_timer->req)))
+    {
+        m_idle_sweep_armed = false;
+        // Once per run.  release_to_pool() calls this on a hot path, and a ring
+        // that is full stays full for a while — reporting every attempt would
+        // bury the log under one message per pooled connection.
+        if (!m_idle_sweep_warned)
+        {
+            m_idle_sweep_warned = true;
+            LOG_ERROR("proxy: idle sweep timer refused — idle connections and pooled "
+                      "backend sockets will not be reclaimed");
+        }
+    }
+}
+
 // Return a backend fd to the pool for later reuse
 void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx)
 {
@@ -2350,6 +2511,10 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx)
     }
 
     pool.push_back({backend_fd, backend_idx, std::chrono::steady_clock::now()});
+
+    // Something is in the pool now, so there is something for the sweep to
+    // reclaim.  No-op while it is already running.
+    arm_idle_sweep();
 }
 
 // Finish setting up backend after connect (pooled or async connect completion).
@@ -2427,10 +2592,22 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             // working with conn after a false return — closing the pair here
             // would hand them a freed connection — so this looks to them
             // exactly like any other failed connect.
+            //
+            // The client's half of the splice pipeline goes with it.  Only the
+            // backend's pipe used to be closed here, and setup_splice_pipes()
+            // writes straight into pipe_to_backend[] without looking at what is
+            // already there — so the next attempt on this same client
+            // overwrote two live descriptors with two new ones, and the pair it
+            // replaced was in no index for teardown to find.
             if (ptr->pipe_to_client[0] >= 0) close(ptr->pipe_to_client[0]);
             if (ptr->pipe_to_client[1] >= 0) close(ptr->pipe_to_client[1]);
             ptr->pipe_to_client[0] = -1;
             ptr->pipe_to_client[1] = -1;
+            if (conn->pipe_to_backend[0] >= 0) close(conn->pipe_to_backend[0]);
+            if (conn->pipe_to_backend[1] >= 0) close(conn->pipe_to_backend[1]);
+            conn->pipe_to_backend[0] = -1;
+            conn->pipe_to_backend[1] = -1;
+            conn->splice_active = false;
             conn->backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
             ours();
@@ -2547,10 +2724,22 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             // working with conn after a false return — closing the pair here
             // would hand them a freed connection — so this looks to them
             // exactly like any other failed connect.
+            //
+            // The client's half of the splice pipeline goes with it.  Only the
+            // backend's pipe used to be closed here, and setup_splice_pipes()
+            // writes straight into pipe_to_backend[] without looking at what is
+            // already there — so the next attempt on this same client
+            // overwrote two live descriptors with two new ones, and the pair it
+            // replaced was in no index for teardown to find.
             if (ptr->pipe_to_client[0] >= 0) close(ptr->pipe_to_client[0]);
             if (ptr->pipe_to_client[1] >= 0) close(ptr->pipe_to_client[1]);
             ptr->pipe_to_client[0] = -1;
             ptr->pipe_to_client[1] = -1;
+            if (conn->pipe_to_backend[0] >= 0) close(conn->pipe_to_backend[0]);
+            if (conn->pipe_to_backend[1] >= 0) close(conn->pipe_to_backend[1]);
+            conn->pipe_to_backend[0] = -1;
+            conn->pipe_to_backend[1] = -1;
+            conn->splice_active = false;
             conn->backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
             ours();

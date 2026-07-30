@@ -209,6 +209,12 @@ private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
 
+#ifdef SOCKETLEY_INVARIANTS
+    // Debug-only: see invariants.h.  Asserts that a connection the runtime still
+    // has indexed still has something that will wake it.
+    void inv_check_reachable(int fd, const char* where);
+#endif
+
     void process_command(client_connection* conn, std::string_view line);
     void process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);

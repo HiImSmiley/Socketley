@@ -363,6 +363,14 @@ private:
     // Connection pool: reuse idle backend connections
     int acquire_pooled_backend(size_t backend_idx);
     void release_to_pool(int backend_fd, size_t backend_idx);
+    // Start the periodic sweep if it is not already running.  Idempotent; see
+    // the definition for why it is armed on demand rather than always.
+    void arm_idle_sweep();
+
+#ifdef SOCKETLEY_INVARIANTS
+    // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
+    void inv_check_pair(int fd, const char* where);
+#endif
 
     // Append "Host: <backend>:<port>\r\n" for the endpoint this connection was
     // actually routed to.  Returns false when no usable endpoint is known, in
@@ -468,8 +476,14 @@ private:
     // EMFILE/ENFILE accept backoff
     std::unique_ptr<timer_op> m_accept_backoff_timer;
 
-    // Idle connection sweep timer
+    // Idle connection sweep timer.  It reaps idle clients when an idle timeout
+    // is configured, and evicts stale pooled backend sockets always — which is
+    // why it is armed on demand rather than only from setup(), and why whether
+    // it is currently armed has to be tracked: teardown() may only claim a
+    // completion is owed for it while one really is.
     std::unique_ptr<timer_op> m_idle_sweep_timer;
+    bool m_idle_sweep_armed{false};
+    bool m_idle_sweep_warned{false};
 
     static constexpr int MAX_FDS = 65536;
     std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];

@@ -6,6 +6,7 @@
 #include "../../shared/runtime_manager.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/logging.h"
+#include "../../shared/invariants.h"
 #include "../../cli/command_hashing.h"
 
 #include <unistd.h>
@@ -149,6 +150,11 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
+
+    SKL_INV_POOLABLE("cache::pool_release", conn->fd,
+        conn->read_pending || conn->write_pending || conn->zc_notif_pending,
+        conn->read_req.owner || conn->write_req.owner);
+
     conn->fd = -1;
     m_conn_pool.push_back(std::move(conn));
 }
@@ -603,6 +609,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         }
     }
 
+#ifdef SOCKETLEY_INVARIANTS
+    // Remembered before the dispatch: the handler may release the struct and the
+    // request along with it.  Only per-connection operations name a connection.
+    const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
+                        req->type == op_timeout)
+                       ? -1 : req->fd;
+#endif
+
     switch (req->type)
     {
         case op_accept:
@@ -649,7 +663,39 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         default:
             break;
     }
+
+#ifdef SOCKETLEY_INVARIANTS
+    inv_check_reachable(inv_fd, "cache::on_cqe");
+#endif
 }
+
+#ifdef SOCKETLEY_INVARIANTS
+// Invariant (1) from invariants.h.  A cache client has no peer — it asks and is
+// answered on the one socket — so the pair here is a single half, and the
+// question is simply whether the ring still owes it anything.  If it does not,
+// nothing will ever run the read that would take its next command, and whatever
+// is in its write queue is an answer that will never be sent.
+void cache_instance::inv_check_reachable(int fd, const char* where)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+
+    const auto* conn = m_conn_idx[fd];
+    if (!conn)
+        return;   // already torn down: nothing left that needs waking
+
+    skl_inv::half c{};
+    c.present   = true;
+    c.in_flight = conn->read_pending || conn->write_pending || conn->zc_notif_pending;
+    // response_buf counts as queued too: it is answers already built and not yet
+    // handed to the write path, which is the same loss with one hop less.
+    c.queued    = !conn->write_queue.empty() || !conn->response_buf.empty();
+    c.closing   = conn->closing;
+    c.fd        = conn->fd;
+
+    SKL_INV_PAIR(where, c, skl_inv::half{});
+}
+#endif
 
 void cache_instance::handle_accept(struct io_uring_cqe* cqe)
 {
