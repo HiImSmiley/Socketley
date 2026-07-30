@@ -131,8 +131,18 @@ struct alignas(64) proxy_backend_connection
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    // The response is finished and this connection is on its way to the pool,
+    // but the read that was armed on it has been cancelled and its completion
+    // is still owed.  Nothing may touch the fd until that completion lands.
+    bool pool_draining{false};
     int client_fd;
     uint32_t write_batch_count{0};
+    // Bumped on every reuse from the struct pool and stamped into read_req.
+    // Backend structs and backend fds are both pooled, so a completion that
+    // outlives its connection is indistinguishable from the next occupant's
+    // own — same struct address, same fd number, valid owner — and acting on
+    // it appends one backend's bytes to a different client's response.
+    uint32_t generation{0};
     io_request read_req;
     io_request write_req;
 
@@ -155,6 +165,18 @@ struct alignas(64) proxy_backend_connection
     bool http_no_body{false};      // 204/304/1xx: no message body
     uint16_t http_status_code{0};
     size_t http_body_remaining{0};
+
+    // Set while pool_draining when the cancelled read turns out to have
+    // delivered something other than the cancellation: data past the end of
+    // the response, an EOF, or an error.  Any of those leaves the stream at an
+    // offset the next request cannot start from, so the fd is closed instead
+    // of pooled — but only once the read has actually finished owing us a
+    // completion, which is why the verdict has to be remembered.
+    bool pool_abandoned{false};
+    // The client is detached the moment draining starts and is free to be
+    // routed somewhere else before the cancellation lands, so the pool this
+    // connection belongs to cannot be read off it later.
+    size_t pool_backend_idx{0};
 
     SKL_TRACE_FIELD(tr)
 
@@ -309,6 +331,10 @@ private:
                                           proxy_client_connection* cconn);
     void reset_client_for_next_request(proxy_client_connection* cconn);
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
+    // Consumes the completion of the read that detach_and_pool_backend
+    // cancelled, and releases the fd and the struct once it is the last one.
+    void finish_pool_drain(proxy_backend_connection* bconn,
+                           struct io_uring_cqe* cqe, io_request* req);
     void setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn);
     void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
 

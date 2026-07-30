@@ -104,6 +104,7 @@ void proxy_client_connection::reset(int new_fd)
 void proxy_backend_connection::reset(int new_fd)
 {
     SKL_TRACE_RESET(*this);
+    ++generation;
     fd = new_fd;
     read_pending = false;
     write_pending = false;
@@ -112,6 +113,9 @@ void proxy_backend_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
+    pool_draining = false;
+    pool_abandoned = false;
+    pool_backend_idx = 0;
     client_fd = -1;
     write_batch_count = 0;
     read_req = {};
@@ -1284,6 +1288,33 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
 
     auto* conn = entry.backend;
 
+    // Backend fds and backend structs are both pooled, so this completion may
+    // belong to whoever held them before: same struct address, same fd number,
+    // valid owner.  Crediting it to the current occupant would splice one
+    // backend's bytes into an unrelated client's response, which nothing
+    // downstream could detect.  The generation stamped at submit time is what
+    // tells the two apart.
+    if (SOCKETLEY_UNLIKELY(req->generation != conn->generation))
+    {
+        // The buffer is the ring's regardless of who the completion was for;
+        // dropping it along with the completion bleeds the pool one entry at a
+        // time until reads start failing with ENOBUFS.
+        if (cqe->flags & IORING_CQE_F_BUFFER)
+        {
+            uint16_t stale_buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+            m_loop->return_buf(BUF_GROUP_ID, stale_buf_id);
+        }
+        return;
+    }
+
+    // Response already delivered and the fd promised to the pool — this is the
+    // cancelled read finishing, not traffic.
+    if (SOCKETLEY_UNLIKELY(conn->pool_draining))
+    {
+        finish_pool_drain(conn, cqe, req);
+        return;
+    }
+
     bool is_multishot_recv = (req->type == op_recv_multishot);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
@@ -2124,7 +2155,8 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
         auto bconn = backend_pool_acquire(bfd);
         bconn->client_fd = conn->fd;
-        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read };
+        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+                            bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
         bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
         bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
@@ -2233,7 +2265,8 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
         auto bconn = backend_pool_acquire(bfd);
         bconn->client_fd = conn->fd;
-        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read };
+        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+                            bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
         bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
         bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
@@ -2890,6 +2923,44 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
 
     auto* bconn = be.backend;
 
+    // A backend read is armed essentially all of the time — under multishot
+    // recv it stays armed across completions — so "no pending ops" was almost
+    // never true here and the connection was thrown away after every response.
+    // A read is the one operation that can be taken back: it owns nothing but
+    // the connection's own buffer, and cancelling it costs no data because the
+    // response is already complete.  Writes, zero-copy notifications and
+    // splices are not cancellable this way; their buffers and pipes have to
+    // outlive them, so those still cost the connection.
+    const bool only_read_pending =
+        bconn->read_pending && !bconn->write_pending && !bconn->zc_notif_pending &&
+        !bconn->splice_in_pending && !bconn->splice_out_pending;
+
+    // submit_cancel_fd is the last condition on purpose: a refused submission
+    // must leave no trace, because there would be no completion to finish what
+    // it started and the connection would sit in a half-detached state until
+    // the runtime stops.  Nothing below is touched unless it reached the ring.
+    if (only_read_pending && m_loop &&
+        backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
+        m_loop->submit_cancel_fd(backend_fd))
+    {
+        // The fd stays registered and the struct stays alive until that
+        // cancellation has been accounted for; only then is it safe to pool
+        // either.  Handing the fd over now would let the next request pick it
+        // up while a completion still points at the struct behind it.
+        bconn->pool_draining = true;
+        bconn->pool_abandoned = false;
+        bconn->pool_backend_idx = cconn->backend_idx;
+
+        // The client is released immediately — it has its full response and
+        // should not wait a round trip for the backend's paperwork.  Its next
+        // request takes whatever the pool offers by then, which is why the
+        // backend has to carry its own pool index from here on.
+        bconn->client_fd = -1;
+        cconn->backend_fd = -1;
+        reset_client_for_next_request(cconn);
+        return;
+    }
+
     // Cannot pool if there are pending io_uring ops — CQEs would arrive for a
     // pooled (unregistered) fd, causing UAF or misrouted completions.
     if (bconn->read_pending || bconn->write_pending || bconn->zc_notif_pending ||
@@ -2934,6 +3005,72 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     }
 
     reset_client_for_next_request(cconn);
+}
+
+// Last step of handing a finished backend to the pool: consume the completion
+// of the read that detach_and_pool_backend cancelled.
+//
+// Nothing about the fd or the struct may be released before this runs.  A
+// pooled fd can be handed to another client on the very next request and a
+// released struct to the connection after that, so a completion arriving later
+// would be charged to a connection it has nothing to do with — the exact
+// use-after-free / misrouted-completion pair this whole detour exists to avoid.
+void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
+                                       struct io_uring_cqe* cqe, io_request* req)
+{
+    const int fd = conn->fd;
+
+    // The buffer belongs to the ring whatever the result says.
+    if (cqe->flags & IORING_CQE_F_BUFFER)
+    {
+        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+        m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    }
+
+    // -ECANCELED is the answer we asked for, and the only one that leaves the
+    // connection reusable.  Bytes past the end of the response mean the stream
+    // sits at an offset the next request cannot start from; an EOF or error
+    // means there is nothing left to reuse at all.  Either way the verdict has
+    // to be remembered rather than acted on, because a multishot recv can still
+    // owe a terminating completion and the fd must not move until it arrives.
+    if (cqe->res != -ECANCELED)
+        conn->pool_abandoned = true;
+
+    // Still armed — the completion that ends the read is yet to come.
+    if (req->type == op_recv_multishot && (cqe->flags & IORING_CQE_F_MORE))
+        return;
+
+    conn->read_pending = false;
+    conn->pool_draining = false;
+
+    m_conn_idx[fd] = {};
+
+    // release_to_pool returns without taking the fd when the index is out of
+    // range, so asking it to pool one it will refuse leaks the descriptor
+    // silently — this is the last owner the fd has.
+    if (SOCKETLEY_LIKELY(!conn->pool_abandoned &&
+                         conn->pool_backend_idx < m_backend_pool.size()))
+    {
+        release_to_pool(fd, conn->pool_backend_idx);
+    }
+    else
+    {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+
+    if (m_backend_slots[fd])
+    {
+        // Null the owners before the struct goes back: the event loop skips a
+        // completion whose owner is null, which is the only protection a struct
+        // sitting in the pool has.
+        conn->read_req.owner = nullptr;
+        conn->write_req.owner = nullptr;
+        conn->splice_in_req.owner = nullptr;
+        conn->splice_out_req.owner = nullptr;
+        backend_pool_release(std::move(m_backend_slots[fd]));
+        m_backend_count--;
+    }
 }
 
 void proxy_instance::reset_client_for_next_request(proxy_client_connection* cconn)
@@ -3291,7 +3428,8 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
 
     auto bconn = backend_pool_acquire(bfd);
     bconn->client_fd = conn->fd;
-    bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read };
+    bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+                        bconn->generation };
     bconn->write_req = { this, nullptr, bfd, 0, op_write };
     bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
     bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
