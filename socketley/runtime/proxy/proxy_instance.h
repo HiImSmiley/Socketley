@@ -236,14 +236,28 @@ struct mesh_config
     std::string client_key;      // proxy-side: client key for backend mTLS
 };
 
-// Async health check state per backend
+// One probe of one backend.
+//
+// Allocated per sweep and never reused.  The 500 ms deadline that gives up on a
+// probe cancels nothing — the connect, write or read it was waiting on is still
+// owed a completion — so a shared probe meant the next sweep overwrote the
+// address the previous connect was reading, and reassigned the string a write
+// was still sending from.  What came back was a health verdict for an operation
+// that belonged to the sweep before it, and a backend marked unhealthy on that
+// evidence is taken out of rotation for every client.
 struct async_health_check
 {
     int fd{-1};
     size_t backend_idx{0};
     enum phase : uint8_t { idle, connecting, writing, reading, done };
     phase current{idle};
+    // Whether the ring still owes this probe a completion.  `current` cannot
+    // answer that: the deadline moves a probe to `done` while its operation is
+    // still in flight.
+    bool op_pending{false};
     io_request req;
+    // The connect target, kept apart from the response buffer it used to share.
+    struct sockaddr_in addr{};
     char buf[256];
     std::string write_buf;
 };
@@ -384,20 +398,78 @@ private:
     std::vector<backend_info> m_backends;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
+    // ─── Retired I/O ───────────────────────────────────────────────────────
+    //
+    // One rule, applied everywhere: nothing io_uring may still be reading from
+    // or writing into is freed, reused or re-armed.  It is retired instead —
+    // moved out of the running state into m_retired, which owns the memory and
+    // leaves the io_requests inside it pointing at this instance, so the
+    // completion that is still owed lands in absorb_retired() instead of on
+    // whatever has taken the object's place.
+    //
+    // A stop/start cycle used to get this wrong in several places at once.
+    // teardown() nulled the request owners and left the connection structs
+    // alive precisely because the kernel still held their addresses, and then
+    // setup() deleted them — an armed POLLOUT on a connect socket, a splice
+    // waiting on a pipe or a health-check read outlives that gap easily, and
+    // the event loop reads req->owner straight out of the freed struct.
+    struct retired_op
+    {
+        // Released as soon as the last request below has completed; anything
+        // that never completes is held until the instance itself is destroyed,
+        // which the manager already delays past the last completion.
+        std::shared_ptr<void> storage;
+        io_request* waiting[6]{};
+        uint8_t count{0};
+    };
+    std::vector<retired_op> m_retired;
+    // The loop stays reachable after m_loop is cleared: a retired read may
+    // still be holding a provided buffer that has to go back to the ring.
+    event_loop* m_retired_loop{nullptr};
+
+    // Retire `storage`, waiting for the `count` requests in `owed` whose
+    // completions the ring still owes us.  With nothing owed the object is
+    // released here and now.
+    void retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count);
+    // Consume a completion that belongs to a retired object.  True means the
+    // request was one of those, and the caller must not look at it again.
+    bool absorb_retired(io_request* req, struct io_uring_cqe* cqe);
+
+    // A timeout and the request that carries it, allocated per run.
+    //
+    // io_uring keeps both addresses for the life of the operation, and an
+    // interval timer is nearly always in flight when a runtime stops.  Timeouts
+    // are attached to no descriptor, so neither shutdown() nor submit_cancel_fd
+    // reaches them.  Re-arming the same request on restart therefore leaves two
+    // self-perpetuating chains driving one piece of state — for the health check
+    // that means two sweeps running one state machine; a fresh object per run
+    // keeps the old completion recognisable.
+    struct timer_op
+    {
+        io_request req{};
+        struct __kernel_timespec ts{};
+    };
+
+    // The accept request together with the address the kernel fills in through
+    // it.  Same reasoning as timer_op: a stale accept completion landing on a
+    // re-armed request arms the listener twice.
+    struct accept_op
+    {
+        io_request req{};
+        sockaddr_in addr{};
+        socklen_t addrlen{sizeof(sockaddr_in)};
+    };
+
     int m_listen_fd = -1;
-    sockaddr_in m_accept_addr{};
-    socklen_t m_accept_addrlen = sizeof(sockaddr_in);
-    io_request m_accept_req{};
+    std::unique_ptr<accept_op> m_accept;
     event_loop* m_loop = nullptr;
     bool m_multishot_active = false;
 
     // EMFILE/ENFILE accept backoff
-    io_request m_accept_backoff_req{};
-    struct __kernel_timespec m_accept_backoff_ts{};
+    std::unique_ptr<timer_op> m_accept_backoff_timer;
 
     // Idle connection sweep timer
-    io_request m_idle_sweep_req{};
-    struct __kernel_timespec m_idle_sweep_ts{};
+    std::unique_ptr<timer_op> m_idle_sweep_timer;
 
     static constexpr int MAX_FDS = 65536;
     std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];
@@ -429,14 +501,17 @@ private:
     mesh_config m_mesh{};
     std::vector<backend_health> m_backend_health;
     std::vector<circuit_breaker> m_circuit_breakers;
-    io_request m_health_check_req{};
-    struct __kernel_timespec m_health_check_ts{};
+    std::unique_ptr<timer_op> m_health_check_timer;
 
-    // Async health checks
-    std::vector<async_health_check> m_health_checks;
+    // Async health checks.  One probe object per backend per sweep, held by
+    // pointer so the address the ring was given never moves and a probe the
+    // deadline gave up on can be retired instead of overwritten.
+    std::vector<std::unique_ptr<async_health_check>> m_health_checks;
     bool m_health_checks_pending{false};
-    io_request m_health_timeout_req{};
-    struct __kernel_timespec m_health_timeout_ts{};
+    std::unique_ptr<timer_op> m_health_timeout_timer;
+    // Give up on a probe: retire it if the ring still owes it a completion,
+    // release it otherwise, and leave the slot empty for the next sweep.
+    void drop_health_check(size_t idx);
 
     // C++ proxy intercept hooks
     proxy_hook m_cb_on_proxy_request;
@@ -448,6 +523,10 @@ private:
     std::vector<std::unique_ptr<proxy_backend_connection>> m_backend_struct_pool;
 
     std::unique_ptr<proxy_client_connection> client_pool_acquire(int fd);
+    // Hand a connection struct back for reuse — or retire it, when the ring
+    // still owes it a completion.  The pool gives structs straight to the next
+    // connection, so this is the one place that has to decide, and every close
+    // path goes through it.
     void client_pool_release(std::unique_ptr<proxy_client_connection> conn);
     std::unique_ptr<proxy_backend_connection> backend_pool_acquire(int fd);
     void backend_pool_release(std::unique_ptr<proxy_backend_connection> conn);

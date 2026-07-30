@@ -24,15 +24,68 @@
 cache_instance::cache_instance(std::string_view name)
     : runtime_instance(runtime_cache, name), m_listen_fd(-1), m_loop(nullptr)
 {
-    std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
-    m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { this, nullptr, -1, 0, op_accept };
 }
 
 cache_instance::~cache_instance()
 {
     if (m_listen_fd >= 0)
         close(m_listen_fd);
+}
+
+void cache_instance::retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count)
+{
+    // Nothing outstanding: the ring has no way to reach this object again, so
+    // holding on to it would only leak.
+    if (count == 0)
+        return;
+
+    if (m_loop)
+        m_retired_loop = m_loop;
+
+    retired_op op;
+    op.storage = std::move(storage);
+    constexpr size_t max_waiting = sizeof(op.waiting) / sizeof(op.waiting[0]);
+    for (size_t i = 0; i < count && op.count < max_waiting; i++)
+        op.waiting[op.count++] = owed[i];
+    m_retired.push_back(std::move(op));
+}
+
+bool cache_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
+{
+    for (size_t i = 0; i < m_retired.size(); i++)
+    {
+        auto& op = m_retired[i];
+        for (uint8_t k = 0; k < op.count; k++)
+        {
+            if (op.waiting[k] != req)
+                continue;
+
+            // A read that came out of the provided-buffer ring still holds one
+            // even when it is only reporting its own cancellation.  Hand it
+            // back, or every restart costs the ring a few buffers for good.
+            if ((cqe->flags & IORING_CQE_F_BUFFER) && m_retired_loop)
+                m_retired_loop->return_buf(BUF_GROUP_ID,
+                                           static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+
+            // More to come: a multishot read keeps delivering until it reports
+            // without this flag, and a zero-copy send answers twice — once for
+            // the write and once to say the kernel is done reading the buffer.
+            // The memory stays where it is until that last word.
+            if (cqe->flags & IORING_CQE_F_MORE)
+                return true;
+
+            op.waiting[k] = op.waiting[op.count - 1];
+            op.count--;
+            if (op.count == 0)
+            {
+                if (i + 1 != m_retired.size())
+                    m_retired[i] = std::move(m_retired.back());
+                m_retired.pop_back();
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 std::unique_ptr<client_connection> cache_instance::pool_acquire(int fd)
@@ -61,6 +114,36 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
         conn->fixed_idx = -1;
         conn->direct_fd = false;
     }
+
+    // A struct only goes back into the pool once the ring is finished with it.
+    // The pool hands its structs to the very next accepted connection, and a
+    // completion landing on one that has already been reissued is charged to a
+    // connection it has nothing to do with — while the kernel is still reading
+    // out of write_batch[0], which reset() clears.  Anything still owed is
+    // retired instead, requests included, so its completion comes back to
+    // absorb_retired() and the memory is released only then.
+    {
+        io_request* owed[2];
+        size_t n = 0;
+        if (conn->read_pending)
+            owed[n++] = &conn->read_req;
+        // A zero-copy send clears write_pending on its first completion and
+        // still owes the notification that says the kernel has stopped reading
+        // the buffer, so the two flags together are the condition.
+        if (conn->write_pending || conn->zc_notif_pending)
+            owed[n++] = &conn->write_req;
+        if (n > 0)
+        {
+            retire(std::shared_ptr<void>(std::move(conn)), owed, n);
+            return;
+        }
+    }
+
+    // Nothing is owed, so nothing can arrive: clear the owners anyway, because
+    // that is the only protection a struct sitting in the pool has if this
+    // reasoning is ever wrong.
+    conn->read_req.owner = nullptr;
+    conn->write_req.owner = nullptr;
     conn->partial.clear();
     conn->response_buf.clear();
     conn->write_queue.clear();
@@ -74,6 +157,11 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
                                   [[maybe_unused]] const char* reason)
 {
     m_store.unsubscribe_all(fd);
+    // A follower registered on this descriptor has to go with it.  It holds no
+    // reference of its own — the socket is this client's — so leaving it behind
+    // pointed replication at a number the kernel was free to hand to the next
+    // connection that came in.
+    detach_follower(fd);
     SKL_TRACE_CLOSE(conn, fd, reason);
     close(fd);
     if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
@@ -122,14 +210,19 @@ size_t cache_instance::get_connection_count() const
 
 bool cache_instance::setup(event_loop& loop)
 {
-    // Clear connections from a previous stop() — safe to free now.  stop()
-    // closes the fds but leaves m_clients populated, so their subscriptions are
-    // still in the store; drop them here or a new connection that lands on a
-    // recycled fd number inherits the old client's channels.
-    for (const auto& entry : m_clients)
-        m_store.unsubscribe_all(entry.first);
-    m_clients.clear();
-    m_followers.clear();
+    // Nothing from the previous run is cleaned up here any more.  teardown()
+    // hands everything it cannot free to retire(), which owns it for as long as
+    // the ring might still touch it; freeing it here instead was the crash —
+    // the event loop went on to read req->owner out of a connection that had
+    // just been deleted, and a follower write was still reading out of a string
+    // that no longer existed.
+    //
+    // What can go is whatever the loop confirms is finished with.  A completion
+    // from a previous registration is dropped rather than delivered, so
+    // absorb_retired() never hears about those and this is the only thing that
+    // releases them.
+    if (!m_retired.empty() && loop.owner_inflight(this) == 0)
+        m_retired.clear();
 
     // Pre-allocate connection pool
     if (m_conn_pool.empty())
@@ -222,14 +315,21 @@ bool cache_instance::setup(event_loop& loop)
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
     m_send_zc = loop.send_zc_supported();
 
+    // A fresh accept request for this run.  The previous one may still be owed
+    // a completion — a multishot accept stays armed until it reports without
+    // IORING_CQE_F_MORE — and re-arming that same request would leave the
+    // listener with two accept chains sharing one io_request and one address
+    // buffer.
+    m_accept = std::make_unique<accept_op>();
+    m_accept->req = { this, nullptr, -1, 0, op_accept };
     if (event_loop::supports_multishot_accept())
     {
-        m_accept_req.type = op_multishot_accept;
+        m_accept->req.type = op_multishot_accept;
         m_multishot_active = true;
     }
     else
     {
-        m_accept_req.type = op_accept;
+        m_accept->req.type = op_accept;
         m_multishot_active = false;
     }
     rearm_accept();
@@ -254,18 +354,26 @@ bool cache_instance::setup(event_loop& loop)
         if (send != sweep_env && v > 0)
             sweep_ms = v;
     }
-    m_ttl_ts = { sweep_ms / 1000, (sweep_ms % 1000) * 1'000'000 };
-    m_ttl_req = {this, nullptr, -1, 0, op_timeout};
+    // Fresh timers for this run, for the reason spelled out on timer_op: the
+    // sweep that was running when the runtime stopped is still on its way, and
+    // it cannot be cancelled.  m_ttl_timer_armed cannot tell the difference
+    // either — each sweep clears the flag and sets it again — so reusing the
+    // request left two chains expiring keys on one timer.
+    m_ttl_timer = std::make_unique<timer_op>();
+    m_ttl_timer->ts = { sweep_ms / 1000, (sweep_ms % 1000) * 1'000'000 };
+    m_ttl_timer->req = { this, nullptr, -1, 0, op_timeout };
     m_ttl_timer_armed = false;
     if (m_has_ttl_keys)
         arm_ttl_timer();
 
     if (m_idle_timeout_cached > 0)
     {
-        m_idle_sweep_ts.tv_sec = 30;
-        m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+        m_idle_sweep_timer = std::make_unique<timer_op>();
+        m_idle_sweep_timer->ts.tv_sec = 30;
+        m_idle_sweep_timer->ts.tv_nsec = 0;
+        m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
+                                                       &m_idle_sweep_timer->req)))
             LOG_ERROR("cache: idle sweep timer refused — idle connections will not be reaped");
     }
 
@@ -313,6 +421,11 @@ void cache_instance::teardown(event_loop& /*loop*/)
     }
 
     std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
+
+    // The listener goes first, then everything that hangs off it.  Each object
+    // is closed and then handed to pool_release()/retire(), which keeps it —
+    // and its io_requests, still pointing here — until the ring has finished
+    // with it.  The next setup() starts from nothing and touches none of this.
     for (auto& [fd, conn] : m_clients)
     {
         // Release fixed file slot before closing
@@ -322,45 +435,93 @@ void cache_instance::teardown(event_loop& /*loop*/)
             conn->fixed_idx = -1;
             conn->direct_fd = false;
         }
+        // shutdown() before close() so an armed read or write is completed by
+        // the kernel now rather than whenever the peer gets around to it.
         shutdown(fd, SHUT_RDWR);
         close(fd);
+        // Drop the subscriptions with the socket.  Leaving them in the store
+        // let a connection that later landed on the same fd number inherit the
+        // dead client's channels.
+        m_store.unsubscribe_all(fd);
+        // A follower promoted from this connection must lose the descriptor
+        // before the loop below sees it, or it would close the number a second
+        // time.
+        detach_follower(fd);
+        pool_release(std::move(conn));
     }
-    // Do NOT clear m_clients here — connection objects must stay alive until the
-    // deferred-delete timeout fires and all pending CQEs have been processed.
+    m_clients.clear();
 
     // Close replication connections
-    if (m_master_fd >= 0)
+    if (m_master)
     {
-        shutdown(m_master_fd, SHUT_RDWR);
-        close(m_master_fd);
-        m_master_fd = -1;
+        if (m_master->fd >= 0)
+        {
+            shutdown(m_master->fd, SHUT_RDWR);
+            close(m_master->fd);
+            m_master->fd = -1;
+        }
+        io_request* owed[1];
+        size_t n = 0;
+        if (m_master->read_pending)
+            owed[n++] = &m_master->read_req;
+        retire(std::shared_ptr<void>(std::move(m_master)), owed, n);
     }
     for (auto& f : m_followers)
     {
-        shutdown(f->fd, SHUT_RDWR);
-        close(f->fd);
-        // Neutralise the request so a late completion is ignored rather than
-        // dispatched against a torn-down instance.
-        f->write_req.owner = nullptr;
+        // The socket belonged to the client connection above, which has already
+        // closed it; only the buffers are ours to account for here.  The kernel
+        // reads straight out of f->out for the duration of a write, which is
+        // why this object cannot simply be dropped.
+        f->fd = -1;
         f->dead = true;
+        io_request* owed[1];
+        size_t n = 0;
+        if (f->write_pending)
+            owed[n++] = &f->write_req;
+        retire(std::shared_ptr<void>(std::move(f)), owed, n);
     }
-    // Same reasoning as m_clients above: a write may still be in flight, and the
-    // kernel holds pointers into these objects until its completion arrives.
-    // They are released when the instance itself goes, after the deferred-delete
-    // timeout.
+    m_followers.clear();
 
-    m_ttl_req.owner = nullptr;
-    m_idle_sweep_req.owner = nullptr;
+    // The timers and the listener, for the reason on timer_op: nothing cancels
+    // an io_uring timeout, and the accept completion is still owed.  Retiring
+    // them costs a few dozen bytes per stop; re-arming them cost a second timer
+    // chain per restart, each one keeping the next alive.
+    {
+        io_request* owed[1];
+        if (m_accept)
+        {
+            owed[0] = &m_accept->req;
+            retire(std::shared_ptr<void>(std::move(m_accept)), owed, 1);
+        }
+        if (m_ttl_timer)
+        {
+            const size_t n = m_ttl_timer_armed ? 1 : 0;
+            owed[0] = &m_ttl_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_ttl_timer)), owed, n);
+        }
+        if (m_idle_sweep_timer)
+        {
+            owed[0] = &m_idle_sweep_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_idle_sweep_timer)), owed, 1);
+        }
+        if (m_accept_backoff_timer)
+        {
+            owed[0] = &m_accept_backoff_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_accept_backoff_timer)), owed, 1);
+        }
+    }
+
+    m_ttl_timer_armed = false;
     m_loop = nullptr;
     m_multishot_active = false;
 }
 
 void cache_instance::arm_ttl_timer()
 {
-    if (m_ttl_timer_armed || !m_loop)
+    if (m_ttl_timer_armed || !m_loop || !m_ttl_timer)
         return;
     m_ttl_timer_armed = true;
-    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_ttl_ts, &m_ttl_req)))
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_ttl_timer->ts, &m_ttl_timer->req)))
     {
         // Clear the flag again.  Nothing else would ever retry: mark_ttl_keys()
         // only submits while the flag is unset, so a single refused timeout
@@ -380,11 +541,20 @@ void cache_instance::mark_ttl_keys()
 void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (!req || !m_loop)
+    if (!req)
+        return;
+
+    // Before anything else, and before the check below that gives up while the
+    // runtime is stopped: this may be the completion a previous run is still
+    // owed, and it is the one that lets the memory behind it go.
+    if (SOCKETLEY_UNLIKELY(!m_retired.empty()) && absorb_retired(req, cqe))
+        return;
+
+    if (!m_loop)
         return;
 
     // Periodic TTL sweep timer
-    if (req == &m_ttl_req)
+    if (m_ttl_timer && req == &m_ttl_timer->req)
     {
         m_ttl_timer_armed = false;
         if (!m_has_ttl_keys)
@@ -410,9 +580,10 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         return;
     }
 
-    // Check if this is a read from master (replication)
-    if (req->fd == m_master_fd && m_master_fd >= 0 &&
-        (req->type == op_read || req->type == op_read_provided || req->type == op_recv_multishot))
+    // Read from the master (replication), matched by request rather than by fd.
+    // The link owns its request, so this cannot be confused with a client that
+    // happens to sit on the same descriptor number.
+    if (m_master && req == &m_master->read_req)
     {
         handle_master_read(cqe);
         return;
@@ -450,7 +621,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_write(cqe, req);
             break;
         case op_timeout:
-            if (req == &m_idle_sweep_req)
+            if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
             {
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
@@ -462,13 +633,17 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                     }
                 }
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
+                                                               &m_idle_sweep_timer->req)))
                     LOG_ERROR("cache: idle sweep timer refused — no further sweeps will run");
             }
-            // Accept backoff expired — resubmit accept
-            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            // Accept backoff expired — resubmit accept.  The timer has spoken,
+            // so it owes nothing more and the next shortage may arm a new one.
+            else if (m_accept_backoff_timer && req == &m_accept_backoff_timer->req)
             {
-                rearm_accept();
+                m_accept_backoff_timer.reset();
+                if (m_listen_fd >= 0)
+                    rearm_accept();
             }
             break;
         default:
@@ -597,28 +772,40 @@ void cache_instance::schedule_accept_backoff()
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
-    m_accept_backoff_ts.tv_sec = 0;
-    m_accept_backoff_ts.tv_nsec = 100000000LL;
-    m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
-    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req)))
+    // One backoff timer at a time.  A second one on the same request would give
+    // the listener two retry chains, and the earlier timeout cannot be taken
+    // back — it is not attached to any descriptor.
+    if (m_accept_backoff_timer)
+        return;
+
+    m_accept_backoff_timer = std::make_unique<timer_op>();
+    m_accept_backoff_timer->ts.tv_sec = 0;
+    m_accept_backoff_timer->ts.tv_nsec = 100000000LL;
+    m_accept_backoff_timer->req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_timer->ts,
+                                                   &m_accept_backoff_timer->req)))
+    {
+        m_accept_backoff_timer.reset();
         LOG_ERROR("cache: accept could not be re-armed and the retry timer was refused too — "
                   "the listener has stopped taking connections");
+    }
 }
 
 void cache_instance::rearm_accept()
 {
-    if (SOCKETLEY_UNLIKELY(!m_loop || m_listen_fd < 0))
+    if (SOCKETLEY_UNLIKELY(!m_loop || m_listen_fd < 0 || !m_accept))
         return;
 
     bool queued;
     if (m_multishot_active)
     {
-        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept->req);
     }
     else
     {
-        m_accept_addrlen = sizeof(m_accept_addr);
-        queued = m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+        m_accept->addrlen = sizeof(m_accept->addr);
+        queued = m_loop->submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen,
+                                       &m_accept->req);
     }
 
     // The listener has no completion left to bring it back, so fall back to the
@@ -687,11 +874,16 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error — defer if write pending.  Drop the
+        // Connection closed or error — defer if a write is still owed.  Drop the
         // subscriptions right away even when deferring: the read side is
         // already gone, so a publish must not queue further writes to it.
+        //
+        // A zero-copy send answers twice and clears write_pending on the first
+        // of them, so write_pending alone says "done" while the kernel is still
+        // reading out of write_batch[0] — which the struct's reset() clears the
+        // moment it is handed to the next connection.
         m_store.unsubscribe_all(fd);
-        if (conn->write_pending)
+        if (conn->write_pending || conn->zc_notif_pending)
         {
             conn->closing = true;
         }
@@ -728,7 +920,9 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
     {
         conn->closing = true;
-        if (!conn->write_pending)
+        // Same as above: the notification of a zero-copy send is a completion
+        // this connection still owes, whatever write_pending says.
+        if (!conn->write_pending && !conn->zc_notif_pending)
         {
             close_client(conn, fd, "partial-overflow");
         }
@@ -3456,7 +3650,12 @@ cache_instance::repl_role cache_instance::get_repl_role() const
 
 void cache_instance::follower_kick(follower_conn& f)
 {
-    if (f.write_pending || f.dead || !m_loop)
+    // fd < 0 means the client this follower was promoted from has gone and
+    // taken the socket with it.  Submitting against the number anyway is how
+    // the whole replication stream — dump included — used to end up in an
+    // unrelated client's socket the moment the kernel reissued it, with every
+    // write reporting success so nothing ever noticed.
+    if (f.write_pending || f.dead || f.fd < 0 || !m_loop)
         return;
 
     // Safe to touch `out` only now that nothing is in flight.
@@ -3486,7 +3685,7 @@ void cache_instance::follower_kick(follower_conn& f)
 
 bool cache_instance::follower_write(follower_conn& f, std::string_view data)
 {
-    if (f.dead)
+    if (f.dead || f.fd < 0)
         return false;
 
     f.queued.append(data.data(), data.size());
@@ -3529,16 +3728,52 @@ void cache_instance::reap_followers()
     {
         // A follower with a write still in flight has to stay alive until its
         // completion arrives — the kernel still points at its buffer.
-        if ((*it)->dead && !(*it)->write_pending)
-        {
-            close((*it)->fd);
-            it = m_followers.erase(it);
-        }
-        else
+        if (!(*it)->dead || (*it)->write_pending)
         {
             ++it;
+            continue;
         }
+
+        // The socket is not ours to close: it belongs to the client_connection
+        // this follower was promoted from, and close_client() is the only path
+        // that also drops that client's subscriptions and hands its struct
+        // back.  Ask for the connection to go instead of taking the descriptor
+        // out from under it.
+        //
+        // Marking rather than closing, because this runs from inside command
+        // handling — replicate_command() reaches here from process_command() —
+        // and the connection being dropped may be the very one whose handler is
+        // running.  The read completion that the shutdown produces finishes the
+        // teardown from a place where freeing it is safe; a handler that is
+        // already mid-close finishes it itself when it finds nothing in flight.
+        const int fd = (*it)->fd;
+        if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd])
+        {
+            m_conn_idx[fd]->closing = true;
+            shutdown(fd, SHUT_RDWR);
+        }
+        it = m_followers.erase(it);
     }
+}
+
+void cache_instance::detach_follower(int fd)
+{
+    if (m_followers.empty() || fd < 0)
+        return;
+
+    for (auto& f : m_followers)
+    {
+        if (f->fd != fd)
+            continue;
+        // The descriptor goes back to the kernel with the client; everything
+        // this follower still holds is buffers.  A write that is already in
+        // flight keeps going to the socket it was submitted against — the
+        // operation holds its own reference — so only new submissions have to
+        // be stopped, which clearing the fd does.
+        f->fd = -1;
+        f->dead = true;
+    }
+    reap_followers();
 }
 
 void cache_instance::replicate_command(std::string_view cmd)
@@ -3565,6 +3800,16 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     if (m_repl_role == repl_follower)
     {
         conn->response_buf.append("error: this node is a follower\n", 31);
+        return;
+    }
+
+    // A follower is a socket, and interactive execute() has none: it runs
+    // commands through a connection with fd -1.  Registering one anyway put a
+    // follower in the list that could never be written to and that the reaper
+    // would then try to tie back to a client connection.
+    if (conn->fd < 0)
+    {
+        conn->response_buf.append("error: replicate needs a connection\n", 36);
         return;
     }
 
@@ -3664,12 +3909,17 @@ bool cache_instance::connect_to_master()
     const char* cmd = "replicate\n";
     if (::write(fd, cmd, 10) < 0) { ::close(fd); return false; }
 
-    m_master_fd = fd;
+    // A link of its own, never the previous one reused.  The read armed on the
+    // old link survives its socket being closed, and a reconnect usually lands
+    // on the same fd number: two reads filling one buffer left the replication
+    // stream with holes in it that neither side could see.
+    auto link = std::make_unique<master_link>();
+    link->fd = fd;
+    link->read_req = { this, link->buf, fd, sizeof(link->buf), op_read };
+    link->read_pending = true;
 
-    // Submit read for master data
-    m_master_read_req = { this, m_master_read_buf, fd, sizeof(m_master_read_buf), op_read };
-    if (m_loop && SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, m_master_read_buf,
-                                                          sizeof(m_master_read_buf), &m_master_read_req)))
+    if (m_loop && SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, link->buf,
+                                                          sizeof(link->buf), &link->read_req)))
     {
         // Without this read the node is connected and deaf: the leader would
         // stream the full dump and every command after it into a socket nobody
@@ -3677,9 +3927,12 @@ bool cache_instance::connect_to_master()
         // unsynced rather than silently frozen at an empty dataset.
         LOG_ERROR("cache: read from master could not be armed — replication link not established");
         close(fd);
-        m_master_fd = -1;
         return false;
     }
+    if (!m_loop)
+        link->read_pending = false;
+
+    m_master = std::move(link);
 
     // Set mode to readonly as follower
     m_mode = cache_mode_readonly;
@@ -3689,22 +3942,31 @@ bool cache_instance::connect_to_master()
 
 void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 {
+    if (!m_master)
+        return;
+
+    auto& link = *m_master;
+    link.read_pending = false;
+
     if (cqe->res <= 0)
     {
-        // Master disconnected
-        close(m_master_fd);
-        m_master_fd = -1;
+        // Master disconnected.  The link goes with it rather than being kept for
+        // the next attempt: nothing is in flight on it any more, and a fresh one
+        // is what connect_to_master() hands back.
+        if (link.fd >= 0)
+            close(link.fd);
+        m_master.reset();
         return;
     }
 
-    m_master_partial.append(m_master_read_buf, cqe->res);
+    link.partial.append(link.buf, cqe->res);
 
     // Process replicated commands
     size_t scan_from = 0;
     size_t pos;
-    while ((pos = m_master_partial.find('\n', scan_from)) != std::string::npos)
+    while ((pos = link.partial.find('\n', scan_from)) != std::string::npos)
     {
-        std::string_view line(m_master_partial.data() + scan_from, pos - scan_from);
+        std::string_view line(link.partial.data() + scan_from, pos - scan_from);
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
 
@@ -3781,24 +4043,29 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
     if (scan_from > 0)
     {
-        if (scan_from >= m_master_partial.size())
-            m_master_partial.clear();
+        if (scan_from >= link.partial.size())
+            link.partial.clear();
         else
-            m_master_partial.erase(0, scan_from);
+            link.partial.erase(0, scan_from);
     }
 
     // Re-submit read
-    if (m_loop && m_master_fd >= 0 &&
-        SOCKETLEY_UNLIKELY(!m_loop->submit_read(m_master_fd, m_master_read_buf,
-                                                sizeof(m_master_read_buf), &m_master_read_req)))
+    if (m_loop && link.fd >= 0)
     {
-        // This read is the only thing that ever re-arms itself, so a refusal
-        // ends replication for good.  Dropping the socket makes the break look
-        // like a master disconnect, which is at least visible, instead of a
-        // follower that stays up serving a dataset that stopped advancing.
-        LOG_ERROR("cache: read from master refused — the replication link is dropped");
-        close(m_master_fd);
-        m_master_fd = -1;
+        link.read_pending = true;
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(link.fd, link.buf,
+                                                    sizeof(link.buf), &link.read_req)))
+        {
+            // This read is the only thing that ever re-arms itself, so a refusal
+            // ends replication for good.  Dropping the socket makes the break
+            // look like a master disconnect, which is at least visible, instead
+            // of a follower that stays up serving a dataset that stopped
+            // advancing.
+            LOG_ERROR("cache: read from master refused — the replication link is dropped");
+            link.read_pending = false;
+            close(link.fd);
+            m_master.reset();
+        }
     }
 }
 

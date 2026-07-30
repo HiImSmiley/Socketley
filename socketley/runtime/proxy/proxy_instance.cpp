@@ -36,9 +36,62 @@ static constexpr int SPLICE_PIPE_SIZE = 256 * 1024;
 proxy_instance::proxy_instance(std::string_view name)
     : runtime_instance(runtime_proxy, name)
 {
-    std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
-    m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { this, nullptr, -1, 0, op_accept };
+}
+
+void proxy_instance::retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count)
+{
+    // Nothing outstanding: the ring has no way to reach this object again, so
+    // holding on to it would only leak.
+    if (count == 0)
+        return;
+
+    if (m_loop)
+        m_retired_loop = m_loop;
+
+    retired_op op;
+    op.storage = std::move(storage);
+    constexpr size_t max_waiting = sizeof(op.waiting) / sizeof(op.waiting[0]);
+    for (size_t i = 0; i < count && op.count < max_waiting; i++)
+        op.waiting[op.count++] = owed[i];
+    m_retired.push_back(std::move(op));
+}
+
+bool proxy_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
+{
+    for (size_t i = 0; i < m_retired.size(); i++)
+    {
+        auto& op = m_retired[i];
+        for (uint8_t k = 0; k < op.count; k++)
+        {
+            if (op.waiting[k] != req)
+                continue;
+
+            // A read that came out of the provided-buffer ring still holds one
+            // even when it is only reporting its own cancellation.  Hand it
+            // back, or every restart costs the ring a few buffers for good.
+            if ((cqe->flags & IORING_CQE_F_BUFFER) && m_retired_loop)
+                m_retired_loop->return_buf(BUF_GROUP_ID,
+                                           static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+
+            // More to come: a multishot read keeps delivering until it reports
+            // without this flag, and a zero-copy send answers twice — once for
+            // the write and once to say the kernel is done reading the buffer.
+            // The memory stays where it is until that last word.
+            if (cqe->flags & IORING_CQE_F_MORE)
+                return true;
+
+            op.waiting[k] = op.waiting[op.count - 1];
+            op.count--;
+            if (op.count == 0)
+            {
+                if (i + 1 != m_retired.size())
+                    m_retired[i] = std::move(m_retired.back());
+                m_retired.pop_back();
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 proxy_instance::~proxy_instance()
@@ -155,12 +208,60 @@ std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int
 
 void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection> conn)
 {
+    // The splice pipes go back to the kernel here even when the struct does not.
+    // A splice already in flight keeps working on the file it was handed at
+    // submission time, exactly as an armed read does after its socket is
+    // closed, so nothing is lost — whereas leaving the descriptors to a struct
+    // that may sit retired for minutes leaks two of them per connection.
+    if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
+    if (conn->pipe_to_backend[1] >= 0) { close(conn->pipe_to_backend[1]); conn->pipe_to_backend[1] = -1; }
+
+    // A struct only goes back into the pool once the ring is finished with it.
+    // The pool hands its structs to the very next accepted connection, and a
+    // completion landing on one that has already been reissued is charged to a
+    // connection it has nothing to do with — while the kernel may still be
+    // reading out of write_batch[0], which reset() clears.  Anything still owed
+    // is retired instead, requests included, so its completion comes back to
+    // absorb_retired() and the memory is released only then.
+    //
+    // Callers used to null the owners here and there and get it half right:
+    // close_pair's client path left out both splice requests, and a retry left
+    // out everything.  This is the one place that has to know.
+    {
+        io_request* owed[5];
+        size_t n = 0;
+        if (conn->read_pending)
+            owed[n++] = &conn->read_req;
+        // A zero-copy send clears write_pending on its first completion and
+        // still owes the notification that says the kernel has stopped reading
+        // the buffer, so the two flags together are the condition.
+        if (conn->write_pending || conn->zc_notif_pending)
+            owed[n++] = &conn->write_req;
+        if (conn->splice_in_pending)
+            owed[n++] = &conn->splice_in_req;
+        if (conn->splice_out_pending)
+            owed[n++] = &conn->splice_out_req;
+        if (conn->connect_pending)
+            owed[n++] = &conn->connect_req;
+        if (n > 0)
+        {
+            retire(std::shared_ptr<void>(std::move(conn)), owed, n);
+            return;
+        }
+    }
+
+    // Nothing is owed, so nothing can arrive: clear the owners anyway, because
+    // that is the only protection a struct sitting in the pool has if this
+    // reasoning is ever wrong.
+    conn->read_req.owner = nullptr;
+    conn->write_req.owner = nullptr;
+    conn->splice_in_req.owner = nullptr;
+    conn->splice_out_req.owner = nullptr;
+    conn->connect_req.owner = nullptr;
     conn->partial.clear();
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
-    if (conn->pipe_to_backend[0] >= 0) { close(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
-    if (conn->pipe_to_backend[1] >= 0) { close(conn->pipe_to_backend[1]); conn->pipe_to_backend[1] = -1; }
     conn->method.clear();
     conn->path.clear();
     conn->version.clear();
@@ -187,12 +288,37 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
 
 void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connection> conn)
 {
+    // Pipes first, for the reason in client_pool_release.
+    if (conn->pipe_to_client[0] >= 0) { close(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
+    if (conn->pipe_to_client[1] >= 0) { close(conn->pipe_to_client[1]); conn->pipe_to_client[1] = -1; }
+
+    // Same rule as the client side — see client_pool_release.
+    {
+        io_request* owed[4];
+        size_t n = 0;
+        if (conn->read_pending)
+            owed[n++] = &conn->read_req;
+        if (conn->write_pending || conn->zc_notif_pending)
+            owed[n++] = &conn->write_req;
+        if (conn->splice_in_pending)
+            owed[n++] = &conn->splice_in_req;
+        if (conn->splice_out_pending)
+            owed[n++] = &conn->splice_out_req;
+        if (n > 0)
+        {
+            retire(std::shared_ptr<void>(std::move(conn)), owed, n);
+            return;
+        }
+    }
+
+    conn->read_req.owner = nullptr;
+    conn->write_req.owner = nullptr;
+    conn->splice_in_req.owner = nullptr;
+    conn->splice_out_req.owner = nullptr;
     conn->partial.clear();
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
-    if (conn->pipe_to_client[0] >= 0) { close(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
-    if (conn->pipe_to_client[1] >= 0) { close(conn->pipe_to_client[1]); conn->pipe_to_client[1] = -1; }
     m_backend_struct_pool.push_back(std::move(conn));
 }
 
@@ -318,16 +444,21 @@ bool proxy_instance::resolve_backend(backend_info& b)
 
 bool proxy_instance::setup(event_loop& loop)
 {
-    // Clear any connections left from a previous stop() — safe to free now that
-    // all in-flight CQEs have been processed (we're starting a fresh run).
-    // proxy_conn_entry has a default member initializer, so memset over it is
-    // not defined behaviour even though conn_none happens to be 0.
-    for (auto& e : m_conn_idx) e = {};
-    for (int i = 0; i < MAX_FDS; i++)
-    {
-        if (m_client_slots[i]) m_client_slots[i].reset();
-        if (m_backend_slots[i]) m_backend_slots[i].reset();
-    }
+    // Nothing from the previous run is cleaned up here any more.  teardown()
+    // hands everything it cannot free to retire(), which owns it for as long as
+    // the ring might still touch it.  Freeing it here was the crash: "all
+    // in-flight CQEs have been processed" is not something a restart can
+    // assume — a POLLOUT armed on a connect socket, a splice parked on a pipe
+    // and a health-check read all outlive a stop, and the event loop reads
+    // req->owner out of the struct before it can find out the runtime moved on.
+    //
+    // What can go is whatever the loop confirms is finished with.  A completion
+    // from a previous registration is dropped rather than delivered, so
+    // absorb_retired() never hears about those and this is the only thing that
+    // releases them.
+    if (!m_retired.empty() && loop.owner_inflight(this) == 0)
+        m_retired.clear();
+
     m_client_count = 0;
     m_backend_count = 0;
 
@@ -398,16 +529,23 @@ bool proxy_instance::setup(event_loop& loop)
         return false;
     }
 
+    // A fresh accept request for this run.  The previous one may still be owed
+    // a completion — a multishot accept stays armed until it reports without
+    // IORING_CQE_F_MORE — and re-arming that same request would leave the
+    // listener with two accept chains sharing one io_request and one address
+    // buffer.
+    m_accept = std::make_unique<accept_op>();
+    m_accept->req = { this, nullptr, -1, 0, op_accept };
     if (event_loop::supports_multishot_accept())
     {
-        m_accept_req.type = op_multishot_accept;
-        loop.submit_multishot_accept(m_listen_fd, &m_accept_req);
+        m_accept->req.type = op_multishot_accept;
+        loop.submit_multishot_accept(m_listen_fd, &m_accept->req);
         m_multishot_active = true;
     }
     else
     {
-        m_accept_req.type = op_accept;
-        loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+        m_accept->req.type = op_accept;
+        loop.submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen, &m_accept->req);
         m_multishot_active = false;
     }
 
@@ -415,10 +553,13 @@ bool proxy_instance::setup(event_loop& loop)
     m_max_conns_cached = get_max_connections();
     if (m_idle_timeout_cached > 0)
     {
-        m_idle_sweep_ts.tv_sec = 30;
-        m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+        // Fresh timer for this run, for the reason spelled out on timer_op.
+        m_idle_sweep_timer = std::make_unique<timer_op>();
+        m_idle_sweep_timer->ts.tv_sec = 30;
+        m_idle_sweep_timer->ts.tv_nsec = 0;
+        m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
+                                                       &m_idle_sweep_timer->req)))
             LOG_ERROR("proxy: idle sweep timer refused — idle connections will not be reaped");
     }
 
@@ -443,23 +584,21 @@ bool proxy_instance::setup(event_loop& loop)
     m_backend_pool.clear();
     m_backend_pool.resize(m_backends.size());
 
-    // Initialize async health check state
+    // Async health checks: one empty slot per backend, filled by the sweep.
+    // teardown() has already retired whatever the previous run left behind.
     m_health_checks.clear();
     m_health_checks.resize(m_backends.size());
-    for (size_t i = 0; i < m_health_checks.size(); i++)
-    {
-        m_health_checks[i].backend_idx = i;
-        m_health_checks[i].current = async_health_check::idle;
-    }
     m_health_checks_pending = false;
 
     // Start health check timer if configured
     if (m_mesh.health_check != mesh_config::health_none && m_mesh.health_interval > 0)
     {
-        m_health_check_ts.tv_sec = m_mesh.health_interval;
-        m_health_check_ts.tv_nsec = 0;
-        m_health_check_req = { this, nullptr, -1, 0, op_timeout };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req)))
+        m_health_check_timer = std::make_unique<timer_op>();
+        m_health_check_timer->ts.tv_sec = m_mesh.health_interval;
+        m_health_check_timer->ts.tv_nsec = 0;
+        m_health_check_timer->req = { this, nullptr, -1, 0, op_timeout };
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_timer->ts,
+                                                       &m_health_check_timer->req)))
             LOG_ERROR("proxy: health check timer refused — backend health will not be tracked");
     }
 
@@ -468,39 +607,15 @@ bool proxy_instance::setup(event_loop& loop)
 
 void proxy_instance::teardown(event_loop& /*loop*/)
 {
-    // Null out all req->owner pointers FIRST so any stale CQEs that arrive after
-    // teardown (e.g. from SQPOLL processing a write SQE that was queued late) are
-    // safely skipped by the event loop's `if (req && req->owner)` guard.
-    m_accept_req.owner = nullptr;
-    m_accept_backoff_req.owner = nullptr;
-    m_idle_sweep_req.owner = nullptr;
-    m_health_check_req.owner = nullptr;
-    m_health_timeout_req.owner = nullptr;
-    for (int i = 0; i < MAX_FDS; i++)
-    {
-        if (m_client_slots[i])
-        {
-            m_client_slots[i]->read_req.owner  = nullptr;
-            m_client_slots[i]->write_req.owner = nullptr;
-            m_client_slots[i]->splice_in_req.owner = nullptr;
-            m_client_slots[i]->splice_out_req.owner = nullptr;
-            m_client_slots[i]->connect_req.owner = nullptr;
-        }
-        if (m_backend_slots[i])
-        {
-            m_backend_slots[i]->read_req.owner  = nullptr;
-            m_backend_slots[i]->write_req.owner = nullptr;
-            m_backend_slots[i]->splice_in_req.owner = nullptr;
-            m_backend_slots[i]->splice_out_req.owner = nullptr;
-        }
-    }
-    // Null health check req owners and close fds
-    for (auto& hc : m_health_checks)
-    {
-        hc.req.owner = nullptr;
-        if (hc.fd >= 0) { close(hc.fd); hc.fd = -1; }
-        hc.current = async_health_check::idle;
-    }
+    // Everything here is closed and then handed to the release path, which
+    // keeps whatever the ring is still working on — the struct, its buffers,
+    // and its io_requests, still pointing at this instance — until the last
+    // completion has landed.  Nulling the owners was the old answer, and it
+    // only holds while there is an object left to read the null out of: the
+    // next setup() deleted them all, and the loop went on dereferencing
+    // req->owner inside freed memory.
+    for (size_t i = 0; i < m_health_checks.size(); i++)
+        drop_health_check(i);
     m_health_checks_pending = false;
 
     // proxy_conn_entry has a default member initializer, so memset over it is
@@ -533,29 +648,39 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         }
     }
 
+    // shutdown() before close() on every socket, so that a read, a write or a
+    // splice armed on it is completed by the kernel now rather than whenever
+    // the peer gets around to it.  The release path below then only has to wait
+    // for completions that are genuinely on their way.
     for (int i = 0; i < MAX_FDS; i++)
     {
         auto& conn = m_backend_slots[i];
         if (!conn) continue;
-        // Close splice pipes
-        if (conn->pipe_to_client[0] >= 0) close(conn->pipe_to_client[0]);
-        if (conn->pipe_to_client[1] >= 0) close(conn->pipe_to_client[1]);
         shutdown(i, SHUT_RDWR);
         close(i);
+        backend_pool_release(std::move(conn));
     }
 
     for (int i = 0; i < MAX_FDS; i++)
     {
         auto& conn = m_client_slots[i];
         if (!conn) continue;
-        // Close splice pipes
-        if (conn->pipe_to_backend[0] >= 0) close(conn->pipe_to_backend[0]);
-        if (conn->pipe_to_backend[1] >= 0) close(conn->pipe_to_backend[1]);
-        // Close pending async connect fd
-        if (conn->connect_fd >= 0) { close(conn->connect_fd); conn->connect_fd = -1; }
+        // A connect that has not finished is waiting on POLLOUT, and closing
+        // the socket does not take that back — the poll holds its own reference
+        // and would otherwise report minutes later, when TCP finally gives up.
+        // Cancelling first turns it into a completion we get straight away.
+        if (conn->connect_fd >= 0)
+        {
+            if (m_loop) m_loop->submit_cancel_fd(conn->connect_fd);
+            close(conn->connect_fd);
+            conn->connect_fd = -1;
+        }
         shutdown(i, SHUT_RDWR);
         close(i);
+        client_pool_release(std::move(conn));
     }
+    m_client_count = 0;
+    m_backend_count = 0;
 
     // Close pooled backend connections
     for (auto& pool : m_backend_pool)
@@ -572,6 +697,40 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         pool.clear();
     }
 
+    // The timers and the listener, for the reason on timer_op: nothing cancels
+    // an io_uring timeout, and the accept completion is still owed.  Retiring
+    // them costs a few dozen bytes per stop; re-arming them cost an extra timer
+    // chain per restart, each one keeping the next alive — and for the health
+    // check, two sweeps driving one state machine.
+    {
+        io_request* owed[1];
+        if (m_accept)
+        {
+            owed[0] = &m_accept->req;
+            retire(std::shared_ptr<void>(std::move(m_accept)), owed, 1);
+        }
+        if (m_idle_sweep_timer)
+        {
+            owed[0] = &m_idle_sweep_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_idle_sweep_timer)), owed, 1);
+        }
+        if (m_accept_backoff_timer)
+        {
+            owed[0] = &m_accept_backoff_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_accept_backoff_timer)), owed, 1);
+        }
+        if (m_health_check_timer)
+        {
+            owed[0] = &m_health_check_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_health_check_timer)), owed, 1);
+        }
+        if (m_health_timeout_timer)
+        {
+            owed[0] = &m_health_timeout_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_health_timeout_timer)), owed, 1);
+        }
+    }
+
     m_loop = nullptr;
     m_multishot_active = false;
 }
@@ -579,7 +738,16 @@ void proxy_instance::teardown(event_loop& /*loop*/)
 void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (SOCKETLEY_UNLIKELY(!req || !m_loop))
+    if (SOCKETLEY_UNLIKELY(!req))
+        return;
+
+    // Before anything else, and before the check below that gives up while the
+    // runtime is stopped: this may be the completion a previous run is still
+    // owed, and it is the one that lets the memory behind it go.
+    if (SOCKETLEY_UNLIKELY(!m_retired.empty()) && absorb_retired(req, cqe))
+        return;
+
+    if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
     switch (req->type)
@@ -624,7 +792,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_health_cqe(cqe, req);
             break;
         case op_timeout:
-            if (req == &m_idle_sweep_req)
+            if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
             {
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
@@ -658,41 +826,54 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                             }),
                         pool.end());
                 }
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req)))
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
+                                                               &m_idle_sweep_timer->req)))
                     LOG_ERROR("proxy: idle sweep timer refused — no further sweeps will run");
             }
-            // Accept backoff expired — resubmit accept
-            else if (req == &m_accept_backoff_req && m_listen_fd >= 0)
+            // Accept backoff expired — resubmit accept.  The timer has spoken,
+            // so it owes nothing more and the next shortage may arm a new one.
+            else if (m_accept_backoff_timer && req == &m_accept_backoff_timer->req)
             {
-                rearm_accept();
+                m_accept_backoff_timer.reset();
+                if (m_listen_fd >= 0)
+                    rearm_accept();
             }
             // Health check sweep timer
-            else if (req == &m_health_check_req)
+            else if (m_health_check_timer && req == &m_health_check_timer->req)
             {
                 health_check_sweep();
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_ts, &m_health_check_req)))
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_check_timer->ts,
+                                                               &m_health_check_timer->req)))
                     LOG_ERROR("proxy: health check timer refused — no further sweeps will run");
             }
-            // Health check timeout — mark all still-pending checks as failed
-            else if (req == &m_health_timeout_req)
+            // Health check deadline — give up on whatever has not answered.
+            else if (m_health_timeout_timer && req == &m_health_timeout_timer->req)
             {
-                for (auto& hc : m_health_checks)
+                for (size_t i = 0; i < m_health_checks.size(); i++)
                 {
-                    if (hc.current != async_health_check::idle && hc.current != async_health_check::done)
+                    auto* hc = m_health_checks[i].get();
+                    if (!hc || hc->current == async_health_check::idle ||
+                        hc->current == async_health_check::done)
+                        continue;
+
+                    // Timed out — count as failure
+                    if (hc->backend_idx < m_backend_health.size())
                     {
-                        // Timed out — count as failure
-                        if (hc.fd >= 0) { close(hc.fd); hc.fd = -1; }
-                        hc.current = async_health_check::done;
-                        if (hc.backend_idx < m_backend_health.size())
-                        {
-                            auto& health = m_backend_health[hc.backend_idx];
-                            health.consecutive_failures++;
-                            if (health.consecutive_failures >= m_mesh.health_threshold)
-                                health.healthy = false;
-                            health.last_check = std::chrono::steady_clock::now();
-                        }
+                        auto& health = m_backend_health[hc->backend_idx];
+                        health.consecutive_failures++;
+                        if (health.consecutive_failures >= m_mesh.health_threshold)
+                            health.healthy = false;
+                        health.last_check = std::chrono::steady_clock::now();
                     }
+                    // The operation it was waiting on is not cancelled by this
+                    // deadline and is still owed a completion, so the probe is
+                    // let go rather than handed to the next sweep — which used
+                    // to overwrite the address the connect was reading and the
+                    // string the write was sending from.
+                    drop_health_check(i);
                 }
+                // This deadline has spoken; the next sweep brings its own.
+                m_health_timeout_timer.reset();
                 m_health_checks_pending = false;
             }
             break;
@@ -854,28 +1035,43 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
 
 void proxy_instance::schedule_accept_backoff()
 {
-    m_accept_backoff_ts.tv_sec = 0;
-    m_accept_backoff_ts.tv_nsec = 100000000LL;
-    m_accept_backoff_req = { this, nullptr, -1, 0, op_timeout };
-    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_ts, &m_accept_backoff_req)))
+    if (SOCKETLEY_UNLIKELY(!m_loop))
+        return;
+
+    // One backoff timer at a time.  A second one on the same request would give
+    // the listener two retry chains, and the earlier timeout cannot be taken
+    // back — it is attached to no descriptor.
+    if (m_accept_backoff_timer)
+        return;
+
+    m_accept_backoff_timer = std::make_unique<timer_op>();
+    m_accept_backoff_timer->ts.tv_sec = 0;
+    m_accept_backoff_timer->ts.tv_nsec = 100000000LL;
+    m_accept_backoff_timer->req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_accept_backoff_timer->ts,
+                                                   &m_accept_backoff_timer->req)))
+    {
+        m_accept_backoff_timer.reset();
         LOG_ERROR("proxy: accept could not be re-armed and the retry timer was refused too — "
                   "the listener has stopped taking connections");
+    }
 }
 
 void proxy_instance::rearm_accept()
 {
-    if (SOCKETLEY_UNLIKELY(m_listen_fd < 0))
+    if (SOCKETLEY_UNLIKELY(m_listen_fd < 0 || !m_loop || !m_accept))
         return;
 
     bool queued;
     if (m_multishot_active)
     {
-        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept->req);
     }
     else
     {
-        m_accept_addrlen = sizeof(m_accept_addr);
-        queued = m_loop->submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
+        m_accept->addrlen = sizeof(m_accept->addr);
+        queued = m_loop->submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen,
+                                       &m_accept->req);
     }
 
     if (SOCKETLEY_UNLIKELY(!queued))
@@ -2730,12 +2926,10 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
 
     if (m_backend_slots[backend_fd])
     {
-        // Null io_request owners before releasing to pool —
-        // stale CQEs could arrive after the struct is reused.
-        bconn->read_req.owner = nullptr;
-        bconn->write_req.owner = nullptr;
-        bconn->splice_in_req.owner = nullptr;
-        bconn->splice_out_req.owner = nullptr;
+        // The owners are backend_pool_release()'s business: it keeps them
+        // pointing here for anything the ring has not finished with, and clears
+        // them for what it puts back in the pool.  Clearing them from out here
+        // took away the only way a late completion could be recognised.
         backend_pool_release(std::move(m_backend_slots[backend_fd]));
         m_backend_count--;
     }
@@ -2759,7 +2953,15 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             // to finish the teardown, and the connection would sit here until
             // the idle sweep reaps it — so that case falls through to the
             // immediate teardown instead.
+            // zc_notif_pending belongs in this list: a zero-copy send answers
+            // twice and clears write_pending on the first of them, so the flag
+            // on its own says "finished" while the kernel is still DMA-ing out
+            // of write_batch[0] — which reset() clears the moment the struct is
+            // handed on, and the fd may already be serving a new request out of
+            // the pool.  One 512 KB message is enough, which is a routine HTTP
+            // body.
             bool defer = bconn->read_pending || bconn->write_pending ||
+                         bconn->zc_notif_pending ||
                          bconn->splice_in_pending || bconn->splice_out_pending ||
                          !bconn->write_queue.empty();
             if (defer)
@@ -2811,7 +3013,9 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 if (be2.side == conn_backend)
                 {
                     auto* bconn2 = be2.backend;
+                    // Same list as above, zero-copy notification included.
                     bool defer2 = bconn2->read_pending || bconn2->write_pending ||
+                                  bconn2->zc_notif_pending ||
                                   bconn2->splice_in_pending || bconn2->splice_out_pending ||
                                   !bconn2->write_queue.empty();
                     if (defer2)
@@ -2837,15 +3041,23 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 conn->backend_fd = -1;
             }
 
-            // Close pending async connect fd
+            // Close pending async connect fd.  The POLLOUT armed on it is not
+            // taken back by the close — the poll holds its own reference to the
+            // file — so cancel it to get the completion now rather than when
+            // TCP eventually gives up.  connect_pending stays set on purpose:
+            // it is what tells client_pool_release() that this struct cannot be
+            // reused yet.
             if (conn->connect_fd >= 0)
             {
+                if (m_loop) m_loop->submit_cancel_fd(conn->connect_fd);
                 close(conn->connect_fd);
                 conn->connect_fd = -1;
-                conn->connect_pending = false;
             }
 
+            // Zero-copy notification included, for the reason given on the
+            // backend side above.
             bool defer_c = conn->read_pending || conn->write_pending ||
+                           conn->zc_notif_pending ||
                            conn->splice_in_pending || conn->splice_out_pending ||
                            !conn->write_queue.empty();
             if (defer_c)
@@ -2934,11 +3146,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 m_conn_idx[client_fd] = {};
                 if (m_client_slots[client_fd])
                 {
-                    // Null io_request owners before releasing to pool —
-                    // stale CQEs (e.g. async connect) could arrive after reuse.
-                    conn->read_req.owner = nullptr;
-                    conn->write_req.owner = nullptr;
-                    conn->connect_req.owner = nullptr;
+                    // See close_pair_close_backend: the owners belong to the
+                    // release path.  This one used to null three of the five and
+                    // leave both splice requests pointing at a struct that went
+                    // straight back into the pool.
                     client_pool_release(std::move(m_client_slots[client_fd]));
                     m_client_count--;
                 }
@@ -3031,11 +3242,12 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     // Release fd to pool
     release_to_pool(backend_fd, b_idx);
 
-    // Release struct to struct pool
+    // Release struct to struct pool.  Nothing is pending on this path — the
+    // check above returned for every case that is — so the release clears all
+    // four owners itself; this used to null two of them and leave the splice
+    // pair pointing at a struct on its way back into circulation.
     if (m_backend_slots[backend_fd])
     {
-        bconn->read_req.owner = nullptr;
-        bconn->write_req.owner = nullptr;
         backend_pool_release(std::move(m_backend_slots[backend_fd]));
         m_backend_count--;
     }
@@ -3097,13 +3309,8 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
 
     if (m_backend_slots[fd])
     {
-        // Null the owners before the struct goes back: the event loop skips a
-        // completion whose owner is null, which is the only protection a struct
-        // sitting in the pool has.
-        conn->read_req.owner = nullptr;
-        conn->write_req.owner = nullptr;
-        conn->splice_in_req.owner = nullptr;
-        conn->splice_out_req.owner = nullptr;
+        // backend_pool_release() decides whether this can be reused at all; the
+        // owners are its business, not the caller's.
         backend_pool_release(std::move(m_backend_slots[fd]));
         m_backend_count--;
     }
@@ -3146,6 +3353,31 @@ bool proxy_instance::is_backend_available(size_t idx) const
     return true;
 }
 
+void proxy_instance::drop_health_check(size_t idx)
+{
+    if (idx >= m_health_checks.size() || !m_health_checks[idx])
+        return;
+
+    auto probe = std::move(m_health_checks[idx]);
+    if (probe->fd >= 0)
+    {
+        // Cancel before closing: an operation still in flight is not taken back
+        // by close() — it holds its own reference to the file — and without
+        // this its completion could be minutes away, keeping the probe retired
+        // for just as long.
+        if (probe->op_pending && m_loop)
+            m_loop->submit_cancel_fd(probe->fd);
+        close(probe->fd);
+        probe->fd = -1;
+    }
+
+    io_request* owed[1];
+    size_t n = 0;
+    if (probe->op_pending)
+        owed[n++] = &probe->req;
+    retire(std::shared_ptr<void>(std::move(probe)), owed, n);
+}
+
 void proxy_instance::health_check_sweep()
 {
     // Skip if previous checks are still in flight
@@ -3157,19 +3389,18 @@ void proxy_instance::health_check_sweep()
     for (size_t i = 0; i < m_backends.size() && i < m_health_checks.size(); i++)
     {
         auto& b = m_backends[i];
-        auto& hc = m_health_checks[i];
-        hc.backend_idx = i;
+
+        // Whatever is left in this slot belongs to an earlier sweep.  It is let
+        // go rather than reused: reusing it is what let a late completion write
+        // into the address the next connect was about to read.
+        drop_health_check(i);
 
         if (b.is_group)
-        {
-            hc.current = async_health_check::done;
             continue;
-        }
 
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0)
         {
-            hc.current = async_health_check::done;
             if (i < m_backend_health.size())
             {
                 auto& health = m_backend_health[i];
@@ -3181,6 +3412,9 @@ void proxy_instance::health_check_sweep()
             continue;
         }
 
+        m_health_checks[i] = std::make_unique<async_health_check>();
+        auto& hc = *m_health_checks[i];
+        hc.backend_idx = i;
         hc.fd = fd;
         hc.current = async_health_check::connecting;
         hc.req = { this, nullptr, fd, 0, op_health_check };
@@ -3206,68 +3440,107 @@ void proxy_instance::health_check_sweep()
             {
                 close(fd);
                 hc.fd = -1;
-                hc.current = async_health_check::done;
+                m_health_checks[i].reset();
                 continue;
             }
         }
 
-        // Store addr in write_buf for connect (we need it to persist)
+        // The kernel reads the address asynchronously, so it lives in the probe
+        // for the duration of the connect.  It used to share `buf` with the HTTP
+        // response, which meant a late read from an abandoned probe rewrote the
+        // address the next connect was about to use.
         hc.write_buf.clear();
-        std::memcpy(hc.buf, &addr, sizeof(addr));
+        hc.addr = addr;
 
         // A refused submission is our problem, not the backend's: recording it
         // as a failure would take a healthy backend out of rotation whenever the
         // ring is busy.  The probe is dropped and the next sweep tries again.
+        hc.op_pending = true;
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_connect(fd,
-                reinterpret_cast<const struct sockaddr*>(hc.buf),
+                reinterpret_cast<const struct sockaddr*>(&hc.addr),
                 sizeof(struct sockaddr_in), &hc.req)))
         {
             close(fd);
             hc.fd = -1;
-            hc.current = async_health_check::done;
+            hc.op_pending = false;
+            m_health_checks[i].reset();
         }
     }
 
-    // Submit a 500ms timeout for all checks
-    m_health_timeout_ts.tv_sec = 0;
-    m_health_timeout_ts.tv_nsec = 500000000LL;
-    m_health_timeout_req = { this, nullptr, -1, 0, op_timeout };
-    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_timeout_ts, &m_health_timeout_req)))
+    // A 500 ms deadline of its own for this sweep.  The previous one cannot be
+    // cancelled, so if it somehow has not reported yet it is retired rather than
+    // written over.
+    if (m_health_timeout_timer)
+    {
+        io_request* owed[1] = { &m_health_timeout_timer->req };
+        retire(std::shared_ptr<void>(std::move(m_health_timeout_timer)), owed, 1);
+    }
+    m_health_timeout_timer = std::make_unique<timer_op>();
+    m_health_timeout_timer->ts.tv_sec = 0;
+    m_health_timeout_timer->ts.tv_nsec = 500000000LL;
+    m_health_timeout_timer->req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_health_timeout_timer->ts,
+                                                   &m_health_timeout_timer->req)))
+    {
+        m_health_timeout_timer.reset();
+        // Without a deadline nothing would ever clear the pending flag, and the
+        // sweep after this one would decline to run at all.
+        m_health_checks_pending = false;
         LOG_WARN("proxy: health check deadline timer refused — this sweep has no timeout");
+    }
 }
 
 void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req)
 {
     // Find which health check this belongs to
     async_health_check* hc = nullptr;
-    for (auto& check : m_health_checks)
+    size_t slot = 0;
+    for (size_t i = 0; i < m_health_checks.size(); i++)
     {
-        if (&check.req == req)
+        if (m_health_checks[i] && &m_health_checks[i]->req == req)
         {
-            hc = &check;
+            hc = m_health_checks[i].get();
+            slot = i;
             break;
         }
     }
     if (!hc || hc->current == async_health_check::done || hc->current == async_health_check::idle)
         return;
 
+    // Whatever this completion says, the operation it belongs to is finished.
+    hc->op_pending = false;
+
     size_t idx = hc->backend_idx;
+
+    // Every path below either arms the next step of this probe or finishes it.
+    // Finishing means letting the probe go — drop_health_check() closes the
+    // socket and releases the state — rather than parking it in `done` for the
+    // next sweep to write over while its last operation is still in flight.
+    const auto record = [&](bool ok) {
+        if (idx >= m_backend_health.size())
+            return;
+        auto& health = m_backend_health[idx];
+        if (ok)
+        {
+            health.consecutive_failures = 0;
+            health.healthy = true;
+        }
+        else
+        {
+            health.consecutive_failures++;
+            if (health.consecutive_failures >= m_mesh.health_threshold)
+                health.healthy = false;
+        }
+        health.last_check = std::chrono::steady_clock::now();
+    };
 
     if (hc->current == async_health_check::connecting)
     {
         if (cqe->res < 0)
         {
             // Connect failed
-            if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-            hc->current = async_health_check::done;
-            if (idx < m_backend_health.size())
-            {
-                auto& health = m_backend_health[idx];
-                health.consecutive_failures++;
-                if (health.consecutive_failures >= m_mesh.health_threshold)
-                    health.healthy = false;
-                health.last_check = std::chrono::steady_clock::now();
-            }
+            record(false);
+            drop_health_check(slot);
             return;
         }
 
@@ -3275,58 +3548,50 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
         if (m_mesh.health_check == mesh_config::health_tcp)
         {
             // TCP check: connect success is enough
-            if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-            hc->current = async_health_check::done;
-            if (idx < m_backend_health.size())
-            {
-                auto& health = m_backend_health[idx];
-                health.consecutive_failures = 0;
-                health.healthy = true;
-                health.last_check = std::chrono::steady_clock::now();
-            }
+            record(true);
+            drop_health_check(slot);
             return;
         }
 
         // HTTP check: send GET request
-        if (idx < m_backends.size())
+        if (idx >= m_backends.size())
         {
-            auto& b = m_backends[idx];
-            hc->write_buf = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
-                            b.resolved_host + "\r\nConnection: close\r\n\r\n";
-            hc->current = async_health_check::writing;
-            hc->req.type = op_health_check;
-            if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(hc->fd, hc->write_buf.data(),
-                                     static_cast<uint32_t>(hc->write_buf.size()), &hc->req)))
-            {
-                if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-                hc->current = async_health_check::done;
-            }
+            drop_health_check(slot);
+            return;
+        }
+
+        auto& b = m_backends[idx];
+        hc->write_buf = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
+                        b.resolved_host + "\r\nConnection: close\r\n\r\n";
+        hc->current = async_health_check::writing;
+        hc->req.type = op_health_check;
+        hc->op_pending = true;
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(hc->fd, hc->write_buf.data(),
+                                 static_cast<uint32_t>(hc->write_buf.size()), &hc->req)))
+        {
+            // Our shortage, not the backend's: no verdict is recorded.
+            hc->op_pending = false;
+            drop_health_check(slot);
         }
     }
     else if (hc->current == async_health_check::writing)
     {
         if (cqe->res <= 0)
         {
-            if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-            hc->current = async_health_check::done;
-            if (idx < m_backend_health.size())
-            {
-                auto& health = m_backend_health[idx];
-                health.consecutive_failures++;
-                if (health.consecutive_failures >= m_mesh.health_threshold)
-                    health.healthy = false;
-                health.last_check = std::chrono::steady_clock::now();
-            }
+            record(false);
+            drop_health_check(slot);
             return;
         }
 
-        // Write succeeded — read response
+        // Write succeeded — read response.  Into the probe's own buffer, which
+        // nothing else shares: the connect address has a field of its own.
         hc->current = async_health_check::reading;
         hc->req.type = op_health_check;
+        hc->op_pending = true;
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(hc->fd, hc->buf, sizeof(hc->buf) - 1, &hc->req)))
         {
-            if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-            hc->current = async_health_check::done;
+            hc->op_pending = false;
+            drop_health_check(slot);
         }
     }
     else if (hc->current == async_health_check::reading)
@@ -3339,25 +3604,8 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
                 got_2xx = true;
         }
 
-        if (hc->fd >= 0) { close(hc->fd); hc->fd = -1; }
-        hc->current = async_health_check::done;
-
-        if (idx < m_backend_health.size())
-        {
-            auto& health = m_backend_health[idx];
-            if (got_2xx)
-            {
-                health.consecutive_failures = 0;
-                health.healthy = true;
-            }
-            else
-            {
-                health.consecutive_failures++;
-                if (health.consecutive_failures >= m_mesh.health_threshold)
-                    health.healthy = false;
-            }
-            health.last_check = std::chrono::steady_clock::now();
-        }
+        record(got_2xx);
+        drop_health_check(slot);
     }
 }
 
@@ -3635,12 +3883,12 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
             m_conn_idx[conn->backend_fd] = {};
             if (m_backend_slots[conn->backend_fd])
             {
-                // Null io_request owners before releasing to pool —
-                // pending CQEs would dereference recycled struct memory.
-                old_bconn->read_req.owner = nullptr;
-                old_bconn->write_req.owner = nullptr;
-                old_bconn->splice_in_req.owner = nullptr;
-                old_bconn->splice_out_req.owner = nullptr;
+                // A retry abandons the backend mid-request, so this is the one
+                // release that regularly happens with a read — sometimes a
+                // write — still in flight.  backend_pool_release() keeps the
+                // struct out of the pool until those have landed; nulling the
+                // owners here instead let it be reused immediately, and the
+                // completion was charged to whoever had it by then.
                 backend_pool_release(std::move(m_backend_slots[conn->backend_fd]));
                 m_backend_count--;
             }

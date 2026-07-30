@@ -228,10 +228,69 @@ private:
     void rearm_accept();
     void schedule_accept_backoff();
 
+    // ─── Retired I/O ───────────────────────────────────────────────────────
+    //
+    // One rule, applied everywhere: nothing io_uring may still be reading from
+    // or writing into is freed, reused or re-armed.  It is retired instead —
+    // moved out of the running state into m_retired, which owns the memory and
+    // leaves the io_requests inside it pointing at this instance, so the
+    // completion that is still owed lands in absorb_retired() instead of on
+    // whatever has taken the object's place.
+    //
+    // A stop/start cycle used to get this wrong in half a dozen places at once.
+    // teardown() deliberately kept connections, followers and timers alive
+    // because the kernel still held their addresses, and then setup() freed
+    // them or armed a second operation on the very same request — a completion
+    // arriving in that gap was dispatched through a pointer into memory that
+    // had already been handed to somebody else.
+    struct retired_op
+    {
+        // Released as soon as the last request below has completed; anything
+        // that never completes is held until the instance itself is destroyed,
+        // which the manager already delays past the last completion.
+        std::shared_ptr<void> storage;
+        io_request* waiting[4]{};
+        uint8_t count{0};
+    };
+    std::vector<retired_op> m_retired;
+    // The loop stays reachable after m_loop is cleared: a retired read may
+    // still be holding a provided buffer that has to go back to the ring.
+    event_loop* m_retired_loop{nullptr};
+
+    // Retire `storage`, waiting for the `count` requests in `owed` whose
+    // completions the ring still owes us.  With nothing owed the object is
+    // released here and now.
+    void retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count);
+    // Consume a completion that belongs to a retired object.  True means the
+    // request was one of those, and the caller must not look at it again.
+    bool absorb_retired(io_request* req, struct io_uring_cqe* cqe);
+
+    // A timeout and the request that carries it, allocated per run.
+    //
+    // io_uring keeps both addresses for the life of the operation, and an
+    // interval timer is nearly always in flight when a runtime stops — the TTL
+    // sweep fires twice a second.  Timeouts are not attached to an fd either,
+    // so no shutdown() or cancel reaches them.  Re-arming the same request on
+    // restart therefore leaves two self-perpetuating chains driving one piece
+    // of state; a fresh object per run keeps the old completion recognisable.
+    struct timer_op
+    {
+        io_request req{};
+        struct __kernel_timespec ts{};
+    };
+
+    // The accept request together with the address the kernel fills in through
+    // it.  Same reasoning as timer_op: a stale accept completion landing on a
+    // re-armed request arms the listener twice.
+    struct accept_op
+    {
+        io_request req{};
+        struct sockaddr_in addr{};
+        socklen_t addrlen{sizeof(struct sockaddr_in)};
+    };
+
     int m_listen_fd;
-    struct sockaddr_in m_accept_addr;
-    socklen_t m_accept_addrlen;
-    io_request m_accept_req;
+    std::unique_ptr<accept_op> m_accept;
     bool m_multishot_active{false};
 
     cache_store m_store;
@@ -244,12 +303,10 @@ private:
     event_loop* m_loop;
 
     // EMFILE/ENFILE accept backoff
-    io_request m_accept_backoff_req{};
-    struct __kernel_timespec m_accept_backoff_ts{};
+    std::unique_ptr<timer_op> m_accept_backoff_timer;
 
     // Idle connection sweep timer
-    io_request m_idle_sweep_req{};
-    struct __kernel_timespec m_idle_sweep_ts{};
+    std::unique_ptr<timer_op> m_idle_sweep_timer;
 
     std::string m_persistent_path;
     cache_mode m_mode = cache_mode_readwrite;
@@ -272,6 +329,14 @@ private:
     // detect.
     struct follower_conn
     {
+        // Borrowed, never owned.  A follower reaches the leader as an ordinary
+        // client, so this descriptor belongs to that client_connection and is
+        // closed by close_client() alone.  Closing it here as well handed the
+        // number back to the kernel twice; worse, keeping it after the client
+        // had gone meant the next accepted connection inherited it and received
+        // the replication stream — dataset dump included — while the writes
+        // succeeded, so the follower was never even noticed as gone.
+        // close_client() sets this back to -1 as it goes.
         int fd{-1};
         // Two buffers, because the kernel reads directly out of `out` for the
         // duration of a write.  Appending to it meanwhile can reallocate the
@@ -295,7 +360,23 @@ private:
     // unique_ptr because the kernel holds a pointer to each write_req for the
     // lifetime of its operation; vector growth would move the elements.
     std::vector<std::unique_ptr<follower_conn>> m_followers;
-    int m_master_fd{-1};
+
+    // The link to the leader, allocated per connect.
+    //
+    // The read armed on it is not cancelled by closing the socket — the
+    // operation holds its own reference to the file and completes on its own
+    // terms — so neither the request nor the buffer may be handed to the next
+    // link.  Reconnecting usually lands on the same fd number, and two reads
+    // into one buffer produce a replication stream with holes in it.
+    struct master_link
+    {
+        io_request read_req{};
+        char buf[4096]{};
+        std::string partial;
+        int fd{-1};
+        bool read_pending{false};
+    };
+    std::unique_ptr<master_link> m_master;
 
     // Start a write if nothing is in flight, moving queued data into out.
     void follower_kick(follower_conn& f);
@@ -304,11 +385,11 @@ private:
     bool follower_write(follower_conn& f, std::string_view data);
     // Continue or finish a follower write after its completion arrives.
     void handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f);
-    // Drop followers marked dead, closing their sockets.
+    // Drop followers marked dead and ask their client connections to close.
     void reap_followers();
-    io_request m_master_read_req{};
-    char m_master_read_buf[4096]{};
-    std::string m_master_partial;
+    // Give up the follower that was promoted from this descriptor, if any.
+    // Called from close_client(), which is the only owner of the socket.
+    void detach_follower(int fd);
 
     void replicate_command(std::string_view cmd);
     void handle_replicate_request(client_connection* conn);
@@ -325,8 +406,7 @@ private:
     bool m_send_zc{false};
 
     // Periodic TTL sweep timer
-    io_request m_ttl_req{};
-    struct __kernel_timespec m_ttl_ts{};
+    std::unique_ptr<timer_op> m_ttl_timer;
 
     // Cached config values (read once in setup, avoid virtual calls on hot path)
     uint32_t m_idle_timeout_cached{0};
@@ -359,6 +439,10 @@ private:
     static constexpr size_t CONN_POOL_INIT = 32;
     std::vector<std::unique_ptr<client_connection>> m_conn_pool;
     std::unique_ptr<client_connection> pool_acquire(int fd);
+    // Hand a connection back for reuse — or retire it, when the ring still owes
+    // it a completion.  The pool gives structs straight to the next accepted
+    // connection, so this is the one place that has to decide, and every close
+    // path goes through it.
     void pool_release(std::unique_ptr<client_connection> conn);
 
     // Full teardown of a client connection.  Every close path must go through
