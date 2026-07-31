@@ -46,14 +46,25 @@
 # else competing for the four cores shows up as connect failures that belong to
 # the machine and not to the proxy.
 #
-# Window boundaries are measured, never assumed.  The fault reports the instant
-# it took effect and the analysis is offset from the load driver's own start, so
-# a control command that takes a moment to land cannot shift a whole phase and
-# make the wrong window look clean.
+# Window boundaries are measured, never assumed -- and "measured" now means an
+# event was observed, not that a stopwatch reached a number.  Each window opens
+# on something that happened:
+#
+#   healthy   the first response the proxy serves
+#   settled   the moment the daemon's own stats show it has noticed the fault
+#   restored  the first response the repaired backend serves again
+#
+# and each closes only once it has carried traffic.  The old boundaries were
+# "the fault instant plus three seconds" and "the restore instant plus three",
+# against a driver that stopped at a fixed 3 x WIN -- so a control command that
+# took a second longer than usual, which is what happens inside
+# `bash test/run_all.sh`, moved the restored window past the end of the run and
+# left it empty.  An empty window has to be reported as one; see lib_window.sh.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_window.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-failover-XXXXXX)
@@ -61,16 +72,27 @@ export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-CTRL=19570; BE1=19571; BE2=19572; BE3=19573; PX=19580
+# Ports come off one base so two runs can share a machine -- the socket and the
+# state directory already do.
+PORT_BASE=${PORT_BASE:-19570}
+CTRL=$PORT_BASE
+BE1=$((PORT_BASE+1)); BE2=$((PORT_BASE+2)); BE3=$((PORT_BASE+3))
+PX=$((PORT_BASE+10))
 NAME=foprox
 CLIENTS=${CLIENTS:-12}
-WIN=${WIN:-6}              # seconds per measured window
+WIN=${WIN:-6}              # least seconds a measured window stays open
 FAULTS=${FAULTS:-"down rst stall"}
 MIN_REQS=1500              # a window thinner than this proved nothing
-DPID=""; BEPID=""
-PASS=0; FAIL=0; TOTAL=0
+MIN_LATE=600               # ... in the two windows that follow a change
+WIN_LATE=3                 # least seconds for those two
+PHASE_CAP=45               # a window that has not filled by now is not going to
+ANCHOR_WAIT=20             # bound on every "wait until it happened"
+DRIVER_CAP=240             # the driver's own dead-man switch
+DPID=""; BEPID=""; LPID=""
+PASS=0; FAIL=0; HERR=0; TOTAL=0
 
 cleanup() {
+    [ -n "$LPID" ] && kill "$LPID" 2>/dev/null
     "$BIN" stop $NAME >/dev/null 2>&1 || true
     "$BIN" remove $NAME >/dev/null 2>&1 || true
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null
@@ -97,6 +119,11 @@ trap cleanup EXIT
 
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+# A claim this run could not put a question to -- an empty or too-thin window.
+# Distinct from bad() because the two used to print the same sentence, and a run
+# that measured nothing was read as a proxy that routed wrongly.  Both end the
+# run non-zero; only one of them is about the product.
+herr() { TOTAL=$((TOTAL+1)); HERR=$((HERR+1)); echo "  NOT MEASURABLE [$1]: $2"; }
 
 echo "=== Integration: proxy failover under load ==="
 
@@ -219,31 +246,66 @@ asyncio.run(main())
 PYEOF
 
 # ---- load driver: marker-verified, reconnecting, timestamped ---------------
+#
+# It writes each request down as it finishes -- when it was sent, when it was
+# answered, what came back and which backend stamped it -- and keeps going until
+# a stop file appears.  Both changes exist for the same reason: the windows are
+# decided from these events while the run is still going, so the events have to
+# be readable while the run is still going, and the run has to still be going
+# when the last window opens.  The old driver buffered everything to the end and
+# stopped at a fixed 3 x WIN, which is how the restored window came to be
+# measured after the traffic had stopped.
 cat > "$TMPD/drv.py" <<'PYEOF'
-import asyncio, re, sys, time
+import asyncio, os, re, sys, time
 
-port, name, clients, secs = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+port, name, clients = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+cap, stopfile = float(sys.argv[4]), sys.argv[5]
 CLEN = re.compile(rb"Content-Length: (\d+)", re.I)
 STATUS = re.compile(rb"^HTTP/1\.[01] (\d{3})")
 MARKER = re.compile(r"^(\d+)-(\d+)$")
-events = []
+out = sys.stdout
 counter = [0]
+stop = None
 
 
-async def worker(deadline):
-    while time.time() < deadline:
+class Dead(Exception):
+    """This connection cannot carry another request."""
+
+
+def ev(t_send, kind, be, cid):
+    out.write(f"EV {t_send!r} {time.time()!r} {kind} {be} {cid}\n")
+
+
+async def flusher():
+    while not stop.is_set():
+        out.flush()
+        await asyncio.sleep(0.1)
+    out.flush()
+
+
+async def watchdog():
+    end = time.time() + cap
+    while time.time() < end and not os.path.exists(stopfile):
+        await asyncio.sleep(0.05)
+    stop.set()
+
+
+async def worker():
+    while not stop.is_set():
         counter[0] += 1
         cid = counter[0]
+        t_send = time.time()
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port), timeout=4)
         except Exception:
-            events.append((time.time(), "connectfail", "-"))
+            ev(t_send, "connectfail", "-", cid)
             await asyncio.sleep(0.02)
             continue
+        out.write(f"CONN {cid} {time.time()!r}\n")
         seq = 0
         try:
-            while time.time() < deadline:
+            while not stop.is_set():
                 marker = f"{cid}-{seq}"
                 writer.write(f"GET /{name}/{marker} HTTP/1.1\r\nHost: h\r\n"
                              f"Connection: keep-alive\r\n\r\n".encode())
@@ -253,7 +315,7 @@ async def worker(deadline):
                 while b"\r\n\r\n" not in head:
                     chunk = await asyncio.wait_for(reader.read(65536), timeout=4)
                     if not chunk:
-                        events.append((t_send, "missing", "-")); raise StopIteration
+                        ev(t_send, "missing", "-", cid); raise Dead
                     head += chunk
                 hdr, rest = head.split(b"\r\n\r\n", 1)
                 m = STATUS.match(hdr); code = int(m.group(1)) if m else 0
@@ -261,29 +323,29 @@ async def worker(deadline):
                 while len(rest) < need:
                     chunk = await asyncio.wait_for(reader.read(65536), timeout=4)
                     if not chunk:
-                        events.append((t_send, "truncated", "-")); raise StopIteration
+                        ev(t_send, "truncated", "-", cid); raise Dead
                     rest += chunk
                 if code != 200:
-                    events.append((t_send, f"http{code}", "-")); raise StopIteration
+                    ev(t_send, f"http{code}", "-", cid); raise Dead
                 got, _, be = rest[:need].decode("latin1").partition("|")
                 if got == marker:
-                    events.append((t_send, "ok", be or "?"))
+                    ev(t_send, "ok", be or "?", cid)
                 else:
                     mm = MARKER.match(got)
-                    events.append((t_send, "garbled" if not mm else
-                                   "crossed" if int(mm.group(1)) != cid else "wrongseq",
-                                   be or "?"))
-                    raise StopIteration
+                    ev(t_send, "garbled" if not mm else
+                       "crossed" if int(mm.group(1)) != cid else "wrongseq",
+                       be or "?", cid)
+                    raise Dead
                 seq += 1
                 await asyncio.sleep(0.004)
-        except StopIteration:
+        except Dead:
             pass
         except asyncio.TimeoutError:
-            events.append((time.time(), "timeout", "-"))
+            ev(t_send, "timeout", "-", cid)
         except (ConnectionResetError, BrokenPipeError):
-            events.append((time.time(), "reset", "-"))
+            ev(t_send, "reset", "-", cid)
         except Exception:
-            events.append((time.time(), "err", "-"))
+            ev(t_send, "err", "-", cid)
         finally:
             try:
                 writer.close()
@@ -292,40 +354,13 @@ async def worker(deadline):
 
 
 async def main():
-    t0 = time.time()
-    print(f"START {t0!r}", flush=True)
-    await asyncio.gather(*(worker(t0 + secs) for _ in range(clients)))
-    sys.stdout.write("".join(f"{t!r} {k} {b}\n" for t, k, b in events))
+    global stop
+    stop = asyncio.Event()
+    await asyncio.gather(*([worker() for _ in range(clients)]
+                           + [flusher(), watchdog()]), return_exceptions=True)
 
 
 asyncio.run(main())
-PYEOF
-
-cat > "$TMPD/an.py" <<'PYEOF'
-import sys
-from collections import Counter
-path = sys.argv[1]
-wins = [(s.split(":")[0], float(s.split(":")[1]), float(s.split(":")[2])) for s in sys.argv[2:]]
-ev = []
-for line in open(path):
-    p = line.split()
-    if len(p) != 3 or p[0] == "START":
-        continue
-    try:
-        ev.append((float(p[0]), p[1], p[2]))
-    except ValueError:
-        pass
-for label, a, b in wins:
-    k, be = Counter(), Counter()
-    for t, kind, bid in ev:
-        if a <= t < b:
-            k[kind] += 1
-            if kind == "ok" and bid != "-":
-                be[bid] += 1
-    tot = sum(k.values()); okn = k.get("ok", 0)
-    print(f"WINDOW {label} total={tot} ok={okn} fail={tot-okn} "
-          f"be:{','.join(f'{x}={y}' for x, y in sorted(be.items())) or 'none'} "
-          f"kinds:{','.join(f'{x}={y}' for x, y in sorted(k.items()) if x != 'ok') or 'none'}")
 PYEOF
 
 ctl() { python3 -c "
@@ -404,15 +439,13 @@ esac
 # fixed sleep was shorter than that whenever the machine was busy.
 if ! ready_http 127.0.0.1 $PX "/$NAME/ready" 20; then
     bad "setup" "the proxy never answered a request on $PX"
-    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; exit "$FAIL"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"; exit $((FAIL+HERR))
 fi
 
 if "$BIN" stats $NAME >/dev/null 2>&1; then ok; else
     bad "setup" "the proxy runtime is not up -- everything below is meaningless"
-    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; exit "$FAIL"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"; exit $((FAIL+HERR))
 fi
-
-field() { printf '%s\n' "$1" | grep "^WINDOW $2 " | grep -o "\b$3=[0-9]*" | cut -d= -f2 | head -1; }
 
 for F in $FAULTS; do
     echo "  -- fault: $F --"
@@ -423,82 +456,107 @@ for F in $FAULTS; do
     # imbalance that belongs to the test rather than to the proxy.
     sleep 7
 
+    EVF="$TMPD/ev_$F.txt"; STOPF="$TMPD/stop_$F"
+    : >"$EVF"
     # Warm-up, discarded: the first connections pay for pool fill.
-    python3 "$TMPD/drv.py" "$PX" "$NAME" 6 2 >/dev/null 2>&1 || true
+    python3 "$TMPD/drv.py" "$PX" "$NAME" 6 2 "$TMPD/nostop" >/dev/null 2>&1 || true
 
-    python3 "$TMPD/drv.py" "$PX" "$NAME" "$CLIENTS" "$((WIN * 3))" \
-        >"$TMPD/ev_$F.txt" 2>"$TMPD/drv_$F.err" &
+    python3 "$TMPD/drv.py" "$PX" "$NAME" "$CLIENTS" "$DRIVER_CAP" "$STOPF" \
+        >"$EVF" 2>"$TMPD/drv_$F.err" &
     LPID=$!
-    START=""
-    for _ in $(seq 1 40); do
-        START=$(head -1 "$TMPD/ev_$F.txt" 2>/dev/null | awk '{print $2}')
-        [ -n "$START" ] && break
-        sleep 0.2
-    done
+
+    # The healthy window opens on the first response, which is the earliest
+    # instant at which "the proxy is serving" is an observation rather than an
+    # assumption.  The old +1 s after the driver's start was standing in for it.
+    START=$(win_wait_backend "$EVF" any 0 "$ANCHOR_WAIT")
     if [ -z "$START" ]; then
-        bad "$F: driver started" "no START line -- $(head -3 "$TMPD/drv_$F.err" 2>/dev/null | tr '\n' ' ')"
-        kill $LPID 2>/dev/null; continue
+        bad "$F: the proxy serves the load" \
+            "no response in ${ANCHOR_WAIT}s -- $(head -3 "$TMPD/drv_$F.err" 2>/dev/null | tr '\n' ' ')"
+        : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
+    fi
+    if H_N=$(win_wait_events "$EVF" "$START" "$MIN_REQS" "$WIN" "$PHASE_CAP"); then ok; else
+        herr "$F: the healthy window carried enough traffic to judge" \
+             "${H_N:-0} requests in ${PHASE_CAP}s, wanted >= $MIN_REQS"
     fi
 
-    sleep "$WIN"
     R=$(ctl "$F" be2); FAULT_T=$(echo "$R" | awk '{print $2}')
-    # Sampled late in the fault window, after every reaction the proxy is
-    # configured for has had time to happen: health threshold 2 at 1 s, and a
-    # circuit that opens on the 3rd error.
-    sleep $((WIN - 2))
-    MIDSTATS=$("$BIN" stats $NAME 2>/dev/null)
-    sleep 2
+    if [ -z "${FAULT_T:-}" ]; then
+        bad "$F: fault timestamp readable" "the backend did not report when the fault took effect"
+        : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
+    fi
+
+    # The settled window opens when the daemon's own stats say it has noticed --
+    # the health check having marked the backend unhealthy, or the breaker
+    # having opened.  That is the event the old "+3 s" was guessing at, and it is
+    # also the assertion: a proxy that never notices never opens the window, and
+    # the bound expiring is reported as the failure it is rather than as a
+    # window full of errors.
+    NOTICE_T=$(win_wait_output "$ANCHOR_WAIT" \
+        '^healthy_backends:[012]$|^open_circuits:[1-9]' "$BIN" stats $NAME)
+    if [ -n "$NOTICE_T" ]; then ok; else
+        bad "$F: the proxy notices the backend is broken" \
+            "with one of three backends $F it still reports every backend healthy and no circuit open after ${ANCHOR_WAIT}s -- $("$BIN" stats $NAME 2>/dev/null | grep -E '^(backends|healthy_backends|open_circuits):' | tr '\n' ' ')"
+        NOTICE_T=$(win_now)
+    fi
+    if S_N=$(win_wait_events "$EVF" "$NOTICE_T" "$MIN_LATE" "$WIN_LATE" "$PHASE_CAP"); then ok; else
+        herr "$F: the settled window carried enough traffic to judge" \
+             "${S_N:-0} requests in ${PHASE_CAP}s, wanted >= $MIN_LATE"
+    fi
+
     R=$(ctl up be2); RESTORE_T=$(echo "$R" | awk '{print $2}')
-    wait $LPID 2>/dev/null
-
-    if [ -z "${FAULT_T:-}" ] || [ -z "${RESTORE_T:-}" ]; then
-        bad "$F: fault timestamps readable" "fault='${FAULT_T:-}' restore='${RESTORE_T:-}'"
-        continue
+    if [ -z "${RESTORE_T:-}" ]; then
+        bad "$F: restore timestamp readable" "the backend did not report when it came back"
+        : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
     fi
 
-    # The settled window starts 3 s after the fault: health threshold 2 at a 1 s
-    # interval, and a circuit that opens on the 3rd error, both land inside it.
-    OUT=$(python3 "$TMPD/an.py" "$TMPD/ev_$F.txt" \
-        "healthy:$(python3 -c "print($START+1)"):${FAULT_T}" \
-        "settled:$(python3 -c "print($FAULT_T+3)"):${RESTORE_T}" \
-        "restored:$(python3 -c "print($RESTORE_T+3)"):$(python3 -c "print($RESTORE_T+3600)")")
-    echo "$OUT" | sed 's/^/     /'
-
-    H_TOT=$(field "$OUT" healthy total);  H_OK=$(field "$OUT" healthy ok)
-    S_TOT=$(field "$OUT" settled total);  S_OK=$(field "$OUT" settled ok)
-    R_TOT=$(field "$OUT" restored total)
-    S_BE2=$(field "$OUT" settled be2);    R_BE2=$(field "$OUT" restored be2)
-
-    if [ -n "$H_TOT" ] && [ "$H_TOT" -ge "$MIN_REQS" ]; then ok; else
-        bad "$F: healthy window carried load" "only ${H_TOT:-<none>} requests, wanted >= $MIN_REQS"
+    # And the restored window opens on the repaired backend's first response.
+    # Reaching it is the claim -- a breaker that never half-opens never gets
+    # there, and that is what the bound catches.  The window after it is where
+    # "it is carrying its share again" is measured.
+    RETURN_T=$(win_wait_backend "$EVF" be2 "$RESTORE_T" "$ANCHOR_WAIT")
+    if [ -n "$RETURN_T" ]; then ok; else
+        bad "$F: the backend returns to rotation after it recovers" \
+            "it served nothing in the ${ANCHOR_WAIT}s after it came back"
+        RETURN_T=$(win_now)
     fi
+    if R_N=$(win_wait_events "$EVF" "$RETURN_T" "$MIN_LATE" "$WIN_LATE" "$PHASE_CAP"); then ok; else
+        herr "$F: the restored window carried enough traffic to judge" \
+             "${R_N:-0} requests in ${PHASE_CAP}s, wanted >= $MIN_LATE"
+    fi
+    REST_END=$(win_now)
+
+    : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""
+
+    OUT=$(win_report "$EVF" \
+        "healthy:$START:$FAULT_T" \
+        "settled:$NOTICE_T:$RESTORE_T" \
+        "restored:$RETURN_T:$REST_END")
+    printf '%s\n' "$OUT" | sed 's/^/     /'
+
+    H_TOT=$(win_field "$OUT" healthy total);  H_OK=$(win_field "$OUT" healthy ok)
+    S_TOT=$(win_field "$OUT" settled total);  S_OK=$(win_field "$OUT" settled ok)
+    R_TOT=$(win_field "$OUT" restored total)
+    H_RATE=$(win_field "$OUT" healthy rate); S_RATE=$(win_field "$OUT" settled rate)
+    S_BE2=$(win_field "$OUT" settled be2);    R_BE2=$(win_field "$OUT" restored be2)
+
     if [ -n "$H_TOT" ] && [ -n "$H_OK" ] && [ "$H_TOT" -eq "$H_OK" ] && [ "$H_TOT" -gt 0 ]; then ok; else
         bad "$F: nothing fails while all three backends are healthy" \
-            "${H_OK:-<none>} of ${H_TOT:-<none>} correct"
+            "${H_OK:-<none>} of ${H_TOT:-<none>} correct -- $(printf '%s\n' "$OUT" | grep '^WINDOW healthy' | sed 's/.*kinds://')"
+        # Not a tolerance and not rounded away: one lost request in fifteen
+        # thousand is still a client that asked and was never answered, and the
+        # only useful thing a test can add is what the loss looked like.
+        win_detail "$EVF" "$START" "$FAULT_T"
     fi
 
     # The broken backend must be out of rotation once the window has settled.
-    # Judged two ways, because neither alone is enough.  No successful response
-    # may carry its stamp -- but a backend that holds requests open produces no
-    # responses at all, so silence there is not evidence.  The daemon's own view
-    # settles it: either the health check marked it unhealthy or the breaker
-    # opened.  "backends:" is checked first because it is printed
-    # unconditionally: without it, an unreadable stats call and a healthy proxy
-    # produce the same empty strings and compare equal.
-    if [ "${S_BE2:-0}" -eq 0 ] 2>/dev/null; then ok; else
-        bad "$F: the broken backend serves no more responses" "it still served ${S_BE2} requests"
-    fi
-
-    if ! printf '%s\n' "$MIDSTATS" | grep -q '^backends:'; then
-        bad "$F: the daemon's view is readable" "stats printed no 'backends:' line -- the check below would compare two empty strings"
-    else
-        HB=$(printf '%s\n' "$MIDSTATS" | grep -o '^healthy_backends:[0-9]*' | cut -d: -f2)
-        OC=$(printf '%s\n' "$MIDSTATS" | grep -o '^open_circuits:[0-9]*' | cut -d: -f2)
-        OC=${OC:-0}     # printed only when non-zero, and 'backends:' proved the read
-        if { [ -n "$HB" ] && [ "$HB" -lt 3 ]; } || [ "$OC" -ge 1 ]; then ok; else
-            bad "$F: the proxy notices the backend is broken" \
-                "with one of three backends $F, it still reports healthy_backends=${HB:-<absent>} and open_circuits=$OC"
+    # The daemon's own view opened this window, so this is the other half of the
+    # same claim: no successful response may carry its stamp either.
+    if [ -n "$S_TOT" ] && [ "$S_TOT" -gt 0 ]; then
+        if [ "${S_BE2:-0}" -eq 0 ] 2>/dev/null; then ok; else
+            bad "$F: the broken backend serves no more responses" "it still served ${S_BE2} requests"
         fi
+    else
+        herr "$F: the broken backend serves no more responses" "the settled window is empty"
     fi
 
     # And the clients must stop noticing.  Not "zero": a breaker that half-opens
@@ -514,22 +572,30 @@ for F in $FAULTS; do
     # Throughput, not just success rate.  A backend that holds requests open
     # instead of refusing them consumes the client's connections one by one, so
     # the surviving two backends can look perfect while almost nothing gets
-    # through.  Two of three backends should carry well over half the load.
-    if [ -n "$H_TOT" ] && [ -n "$S_TOT" ] && [ "$H_TOT" -gt 0 ] && \
-       [ "$((S_TOT * 100 / H_TOT))" -ge 50 ]; then ok; else
+    # through.  Compared as rates, not as totals: the windows are as long as they
+    # needed to be to carry traffic, so their totals are not comparable and a
+    # settled window that simply ran longer would otherwise pass this.
+    if [ -n "$H_RATE" ] && [ -n "$S_RATE" ] && [ "$H_RATE" -gt 0 ] && \
+       [ "$((S_RATE * 100 / H_RATE))" -ge 50 ]; then ok; else
         bad "$F: throughput survives the loss of one backend" \
-            "${S_TOT:-<none>} requests in the settled window against ${H_TOT:-<none>} while healthy"
+            "${S_RATE:-<none>} requests a second in the settled window against ${H_RATE:-<none>} while healthy"
     fi
 
     if [ "${R_BE2:-0}" -gt 0 ] 2>/dev/null; then ok; else
-        bad "$F: the backend returns to rotation after it recovers" \
-            "it served ${R_BE2:-0} requests in ${R_TOT:-0} after restore"
+        if [ -n "$R_TOT" ] && [ "$R_TOT" -gt 0 ]; then
+            bad "$F: the recovered backend keeps taking traffic" \
+                "it served ${R_BE2:-0} of ${R_TOT} requests after it returned"
+        else
+            herr "$F: the recovered backend keeps taking traffic" "the restored window is empty"
+        fi
     fi
 done
 
 if "$BIN" stats $NAME >/dev/null 2>&1; then ok; else bad "runtime alive" "the proxy did not survive"; fi
 if kill -0 "$DPID" 2>/dev/null; then ok; else bad "daemon alive" "the daemon died"; fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
-exit "$FAIL"
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
+if [ "$FAIL" -eq 0 ] && [ "$HERR" -eq 0 ]; then echo "  OK"
+elif [ "$FAIL" -eq 0 ]; then echo "  NOT MEASURABLE -- this run could not put the question, see above"
+else echo "  FAILED"; fi
+exit $((FAIL+HERR))
