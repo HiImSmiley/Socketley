@@ -93,13 +93,27 @@ public:
     // to call on any doubt; there is no path that calls it per request.
     void publish_endpoints();
 
+    // Where the table goes besides the in-process runtimes.
+    //
+    // A runtime living in a worker process cannot be handed a shared_ptr, so it
+    // is handed the same table encoded onto its control socket instead.  The
+    // manager does not know that: it calls a sink, and the daemon decides what
+    // that means.  That is the boundary rule applied to the manager itself —
+    // what crosses is the answer, and the thing on the far side may as well be
+    // a socket, because for a worker it is one.
+    void set_endpoint_sink(std::function<void(const endpoint_table&)> sink);
+
     // Where a runtime sends a request meant for another runtime.  One per
     // daemon, attached to the event loop by daemon_start() and detached before
     // the ring goes; see shared/request_channel.h for why this is a channel and
     // not a call.
     //
-    // Its sink table is the second half of what publish_endpoints() builds: the
-    // endpoint table says where a runtime is, this says who answers for it.
+    // Its sink table is the third thing publish_endpoints() rebuilds: the
+    // endpoint table says where a runtime is, the endpoint sink carries that
+    // same table out of this address space, and this says who answers for it.
+    // Only in-process runtimes register here — a worker's placeholder has no
+    // interpreter to run a request on, and the only runtime that answers one is
+    // a cache, which does not split yet.
     request_channel& requests() { return m_requests; }
     const request_channel& requests() const { return m_requests; }
 
@@ -116,6 +130,8 @@ private:
     // Takes over an instance that has just left the map.  Called with the map
     // lock released.
     void retire(std::unique_ptr<runtime_instance> inst);
+
+    std::function<void(const endpoint_table&)> m_endpoint_sink;
 
     runtime_map runtimes;
 

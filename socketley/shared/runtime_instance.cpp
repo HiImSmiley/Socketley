@@ -81,6 +81,18 @@ bool runtime_instance::start(event_loop& loop)
     if (current != runtime_created && current != runtime_stopped)
         return false;
 
+    // A placeholder for a worker process arms nothing and binds nothing: the
+    // supervisor forks the child that does both.  Returning before
+    // register_owner() is what keeps has_armed_io() false for it, so removal
+    // can free it on the spot instead of retiring it to the graveyard — there
+    // is no completion the kernel could still deliver into this object.
+    if (m_out_of_process)
+    {
+        m_state.store(runtime_running, std::memory_order_release);
+        m_start_time = std::chrono::system_clock::now();
+        return true;
+    }
+
     if (m_external)
     {
         if (m_managed && !m_exec_path.empty())
@@ -161,6 +173,16 @@ bool runtime_instance::stop(event_loop& loop)
 {
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
+
+    // The child is not signalled here.  The supervisor owns it and takes it
+    // down through the control socket first, so that the worker stops its proxy
+    // while it still has a ring to cancel into; a SIGTERM from this side would
+    // race that and cost the connections a clean close.
+    if (m_out_of_process)
+    {
+        m_state.store(runtime_stopped, std::memory_order_release);
+        return true;
+    }
 
     if (m_external)
     {
@@ -543,6 +565,8 @@ pid_t runtime_instance::get_pid() const { return m_pid; }
 void runtime_instance::mark_managed(std::string exec_path) { m_managed = true; m_external = true; m_exec_path = std::move(exec_path); }
 bool runtime_instance::is_managed() const { return m_managed; }
 std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }
+void runtime_instance::mark_out_of_process() { m_out_of_process = true; }
+bool runtime_instance::is_out_of_process() const { return m_out_of_process; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
 

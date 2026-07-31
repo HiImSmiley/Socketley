@@ -1047,6 +1047,42 @@ is set. For TCP mode, any failed connection attempt is retried.
 Also retry non-idempotent methods (POST, PATCH). Use with caution \(em
 the request body is replayed to the next backend, which may cause
 duplicate side effects.
+.SS Process Isolation
+.TP
+.B \-\-out\-of\-process
+Run this proxy in a worker process supervised by the daemon, instead of
+inside the daemon itself. Off by default.
+.IP
+The daemon forks and execs itself, hands the worker its configuration and
+its routing table over a control socket, and keeps a placeholder for it in
+the runtime map. What the CLI shows is unchanged:
+.BR ps ,
+.BR ls ,
+.BR inspect ,
+.B stats
+and the Prometheus endpoint report the same figures they do for an
+in-process proxy, because the worker publishes them and the daemon stores
+them where an in-process runtime would have written them.
+.IP
+The port is bound in the worker; no descriptor is passed across the
+boundary. If the worker dies the daemon restarts it and the runtime stays
+.BR running ;
+if it dies more than five times in ten seconds the runtime is left
+.B failed
+rather than being forked in a loop.
+.IP
+Settable only at
+.BR create .
+.B edit
+rejects it, because honouring it would mean moving a configured runtime
+between address spaces underneath whatever already points at it.
+.IP
+Lua callbacks run inside the worker, against the worker's own state; a
+script that reaches for other runtimes through the management API does not
+find them there. See
+.B "Out-of-process proxies"
+under
+.BR LIMITATIONS .
 .SS mTLS Flags
 .TP
 .BI "\-\-client\-ca " "path"
@@ -3225,6 +3261,32 @@ Legacy services, third-party processes, fleet visibility for external apps.
 .B "Mixed"
 Embedded engine with daemon monitoring \(em maximum performance with fleet management.
 .SH LIMITATIONS
+.SS Out\-of\-process proxies
+.B \-\-out\-of\-process
+is the first step of moving the proxy out of the daemon, and what it does
+not yet cover is worth stating plainly.
+.PP
+A worker holds no runtime manager, so the cross\-runtime parts of the Lua
+management API \(em creating, listing or sending to other runtimes, and
+cache access by name \(em find nothing from inside one. Connection and
+request callbacks run normally against the worker's own state. Interactive
+mode
+.RB ( "start \-i" )
+is not offered for a proxy on either path.
+.PP
+Cross\-runtime pub/sub dispatch does not reach a worker: the daemon
+delivers it by calling into each instance, and a placeholder has no
+subscribers of its own.
+.PP
+The figures the daemon reports for a worker are as recent as the worker's
+last publish \(em a quarter of a second, and refreshed on demand before
+.B stats
+answers. An in\-process runtime's are read live. The values agree; their
+age does not.
+.PP
+Only the proxy can be split. The other runtimes still reach across
+runtime boundaries through pointers and cannot be moved until they route
+from pushed data the way the proxy now does.
 .SS TLS
 .B "TLS transport is not implemented."
 No runtime \(em server, client, proxy or cache \(em performs a TLS handshake.

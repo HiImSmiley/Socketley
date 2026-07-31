@@ -617,6 +617,11 @@ void runtime_manager::publish_endpoints()
     // Running only.  A cache that is merely configured has no store loaded, and
     // a request that arrives for it is better answered "no such target" than
     // served out of an empty one.
+    //
+    // A worker's placeholder answers null here like every non-cache runtime, so
+    // nothing registers for a runtime that lives in another process — which is
+    // right: the request channel delivers by calling a sink on this thread, and
+    // there is no object on this side to call.
     {
         std::shared_lock lock(mutex);
         m_requests.clear_sinks();
@@ -628,6 +633,18 @@ void runtime_manager::publish_endpoints()
                 m_requests.register_sink(name, sink);
         }
     }
+
+    // And to whatever lives outside this address space.  Last, and outside the
+    // lock: the sink writes to sockets, and holding the runtime map across a
+    // write to a process that may not be reading is how an unrelated runtime
+    // ends up waiting on a proxy's child.
+    if (m_endpoint_sink)
+        m_endpoint_sink(*tbl);
+}
+
+void runtime_manager::set_endpoint_sink(std::function<void(const endpoint_table&)> sink)
+{
+    m_endpoint_sink = std::move(sink);
 }
 
 const runtime_manager::runtime_map& runtime_manager::list() const

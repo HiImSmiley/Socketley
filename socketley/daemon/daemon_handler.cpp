@@ -13,6 +13,9 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../shared/cluster_discovery.h"
 #include "../shared/tls_context.h"
+#include "../shared/endpoint_table.h"
+#include "../shared/worker_protocol.h"
+#include "proxy_supervisor.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -61,6 +64,12 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
     m_accept_req = { this, nullptr, -1, 0, op_accept };
+
+    // Every republished table also goes to the workers.  Registered here rather
+    // than in setup() because the manager can publish before the listener is
+    // up — the boot-time restore does exactly that.
+    m_manager.set_endpoint_sink([this](const endpoint_table& tbl)
+                                { publish_endpoints_to_workers(tbl); });
 }
 
 daemon_handler::~daemon_handler()
@@ -169,6 +178,20 @@ void daemon_handler::start_accept()
 
 void daemon_handler::teardown()
 {
+    // The workers first.  Each is asked to shut down over its control socket
+    // and then signalled, so a child stops its proxy while it still has a ring
+    // of its own to cancel into.  Left to the destructor these would be orphans
+    // reparented to init, still bound to their ports, and the next daemon would
+    // fail to bind.
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->shutdown();
+    m_proxy_workers.clear();
+
+    // Nothing may call the sink once the workers are gone: it would encode a
+    // table for an empty map, which is harmless, but the manager outlives this
+    // handler and the lambda captures `this`.
+    m_manager.set_endpoint_sink(nullptr);
+
     // Reap managed children
     {
         std::shared_lock lock(m_manager.mutex);
@@ -765,6 +788,11 @@ int daemon_handler::cmd_create(const parsed_args& pa)
     if (m_persistence && !instance->get_test_mode() && !instance->is_lua_created())
         m_persistence->save_runtime(instance);
 
+    // After the save, because the supervisor describes the child with the same
+    // runtime_config the state file holds and reads it back off the instance.
+    if (autostart && !instance->get_test_mode())
+        reconcile_proxy_workers();
+
     return 0;
 }
 
@@ -845,6 +873,11 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
+    // Any proxy just moved into `running` with --out-of-process now needs its
+    // child.  Doing it here rather than waiting for the health timer is what
+    // makes `start` followed immediately by a request work.
+    reconcile_proxy_workers();
+
     return failed > 0 ? 1 : 0;
 }
 
@@ -865,6 +898,11 @@ int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
         if (m_manager.stop(n, m_loop) && m_persistence)
             m_persistence->set_was_running(n, false);
     }
+
+    // Takes down the children of everything that just stopped, before the
+    // command returns: `stop` has to mean the port is free by the time the CLI
+    // exits, whichever side the proxy was running on.
+    reconcile_proxy_workers();
     return 0;
 }
 
@@ -886,6 +924,12 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
         if (inst && inst->get_state() == runtime_running)
             m_manager.stop(n, m_loop);
     }
+
+    // Before the instances leave the map: the supervisor holds a pointer to the
+    // placeholder it writes stats into, and that pointer must be dropped while
+    // the object it names is still there.  Reconciling after the removal would
+    // read a name that no longer resolves and leave the child running.
+    reconcile_proxy_workers();
 
     for (const auto& n : names)
     {
@@ -2377,6 +2421,12 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
+    // Take whatever the workers have sent since the last tick, so an
+    // out-of-process proxy answers about now rather than about the last health
+    // timer.  Costs a non-blocking read per worker and nothing at all when
+    // there are none.
+    poll_proxy_workers();
+
     for (const auto& n : names)
     {
         auto* inst = m_manager.get(n);
@@ -2679,8 +2729,115 @@ void daemon_handler::start_health_timer()
     m_health_pending = true;
 }
 
+void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
+{
+    if (m_proxy_workers.empty())
+        return;
+
+    // Encoded once, sent to each: the table is the same for every worker, and
+    // building it per child would make a membership change cost more the more
+    // proxies are split out.
+    std::vector<worker_proto::endpoint_wire> names;
+    std::vector<worker_proto::endpoint_wire> groups;
+    names.reserve(tbl.name_count());
+    for (const auto& [name, ep] : tbl.names())
+        names.push_back({name, ep.host, ep.port});
+    for (const auto& [group, eps] : tbl.groups())
+        for (const auto& ep : eps)
+            groups.push_back({group, ep.host, ep.port});
+
+    const std::string payload = worker_proto::encode_endpoints(names, groups);
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->send_endpoints(payload);
+}
+
+void daemon_handler::poll_proxy_workers()
+{
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->poll();
+}
+
+void daemon_handler::reconcile_proxy_workers()
+{
+    // What the runtime map says should be running out of process.
+    std::vector<std::string> wanted;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [name, inst] : m_manager.list())
+        {
+            if (inst->get_type() != runtime_proxy || !inst->is_out_of_process())
+                continue;
+            if (inst->get_state() == runtime_running)
+                wanted.push_back(name);
+        }
+    }
+
+    // Children whose runtime has stopped, been removed or renamed.  Taken down
+    // before anything is started, so a rename that reuses a port does not have
+    // two children bound to it at once.
+    for (auto it = m_proxy_workers.begin(); it != m_proxy_workers.end();)
+    {
+        const bool still_wanted =
+            std::find(wanted.begin(), wanted.end(), it->first) != wanted.end();
+        if (still_wanted)
+        {
+            ++it;
+            continue;
+        }
+        it->second->shutdown();
+        it = m_proxy_workers.erase(it);
+    }
+
+    // Children that should exist and do not.
+    for (const auto& name : wanted)
+    {
+        if (m_proxy_workers.count(name))
+            continue;
+
+        auto* inst = m_manager.get(name);
+        if (!inst)
+            continue;
+
+        runtime_config cfg;
+        if (m_persistence)
+            cfg = m_persistence->read_from_instance(inst);
+        else
+            continue;   // nothing to describe the runtime with
+
+        auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
+        if (!sup->spawn(cfg))
+        {
+            LOG_ERROR("could not start out-of-process proxy worker");
+            inst->mark_failed();
+            continue;
+        }
+        sup->send_start();
+
+        // The child forked after the last publish, so it has no table yet.
+        m_proxy_workers.emplace(name, std::move(sup));
+        m_manager.publish_endpoints();
+    }
+}
+
 void daemon_handler::check_managed_health()
 {
+    // The children first: liveness, then whatever they have reported.  Both
+    // before the managed-runtime sweep below, which can return early.
+    for (auto& [worker_name, sup] : m_proxy_workers)
+    {
+        if (sup->check_liveness() && m_persistence)
+        {
+            // A child that died and was not restarted has moved the runtime to
+            // `failed`; that has to reach the state file or a daemon restart
+            // would bring back a runtime the operator was told had failed.
+            if (auto* inst = m_manager.get(worker_name))
+                m_persistence->save_runtime(inst);
+        }
+    }
+    poll_proxy_workers();
+    reconcile_proxy_workers();
+
+
     std::shared_lock lock(m_manager.mutex);
     for (auto& [name, inst] : m_manager.list())
     {
