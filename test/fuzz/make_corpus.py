@@ -658,6 +658,644 @@ def cache_seeds():
     return s
 
 
+# ──────────────────────── server / client op programs ────────────────────────
+#
+# fuzz_server_ops and fuzz_client_ops take a program, not a message: four bytes
+# per operation — opcode, and three argument bytes — run against a real runtime
+# on a real io_uring loop, with the lifetime invariants checked after every step.
+# So these seeds are programs, and each one is here because it is an *ordering*
+# a historical defect needed:
+#
+#   * a stop with a read still in the ring, then a start in the same breath
+#     (the reused request that armed twice, and the duplicated timer chains)
+#   * a client that resets mid-response          (the descriptor reissued under
+#                                                 a queued splice)
+#   * a runtime destroyed while a timer it armed is still counting down
+#     (the instance that was never freed)
+#   * a disconnect issued from inside the callback that is reading the message
+#     (the struct returned to the pool with a write still armed)
+#   * an upstream pointed at a dead port, then stopped while backing off
+#     (the reconnect timer nothing withdrew)
+#
+# The three leading bytes of an input are read as configuration *as well as* as
+# the first step, so the first operation of every program below is chosen for
+# what its bytes also say: bit 7 of byte 0 is UDP mode, bit 7 of byte 1 is the
+# tick timer, and byte 2 selects what the callbacks do.
+#
+# The tables below MUST stay in step with the enums in fuzz_server_ops.cpp and
+# fuzz_client_ops.cpp; the targets reduce every byte modulo their table, so a
+# mismatch does not corrupt anything, it just makes these seeds mean something
+# other than what they say.
+
+_SRV_OPS = [
+    "START", "STOP", "DESTROY",
+    "PUMP",
+    "CONNECT", "SEND", "RECV", "FIN", "ABORT",
+    "BROADCAST", "SEND_TO", "DISCONNECT",
+    "PIPE", "UNPIPE",
+    "GROUP",
+    "CONFIG",
+    "STATS",
+    "UPSTREAM",
+]
+_SRV = {n: i for i, n in enumerate(_SRV_OPS)}
+
+# Server payload selector.
+(P_EMPTY, P_LINE, P_FRAGMENT, P_TWO_LINES, P_CRLF, P_BIG_LINE, P_HUGE,
+ P_HTTP_ROOT, P_HTTP_BLOB, P_HTTP_KA, P_HTTP_TRAV, P_HTTP_PART,
+ P_WS_UPGRADE, P_WS_TEXT, P_WS_CLOSE, P_WS_FRAG,
+ P_RESP_PING, P_AUTH_OK, P_AUTH_BAD) = range(19)
+
+# Server CONFIG knobs: `a % 8`.
+(C_MAXCONN, C_IDLE, C_DRAIN, C_RATE, C_MODE, C_CB, C_HTTPCACHE, C_UDP) = range(8)
+
+# Callback behaviours, the value C_CB takes.
+(CB_INERT, CB_BROADCAST, CB_ANSWER, CB_DISCONNECT,
+ CB_ANSWER_DISCONNECT, CB_ON_DISCONNECT) = range(6)
+
+_CLI_OPS = [
+    "START", "STOP", "DESTROY", "PUMP",
+    "LISTEN_UP", "LISTEN_DOWN",
+    "ACCEPT", "PSEND", "PRECV", "PFIN", "PABORT",
+    "SEND", "CONFIG", "STATS",
+]
+_CLI = {n: i for i, n in enumerate(_CLI_OPS)}
+
+# Client payload selector.
+(Q_EMPTY, Q_LINE, Q_FRAGMENT, Q_TWO_LINES, Q_CRLF, Q_BIG_LINE, Q_HUGE,
+ Q_BINARY) = range(8)
+
+# Client CONFIG knobs: `a % 5`.
+(D_RECONNECT, D_MODE, D_CB, D_RATE, D_IDLE) = range(5)
+
+
+def sop(name, a=0, b=0, c=0):
+    return bytes([_SRV[name], a & 0xFF, b & 0xFF, c & 0xFF])
+
+
+def cop(name, a=0, b=0, c=0):
+    return bytes([_CLI[name], a & 0xFF, b & 0xFF, c & 0xFF])
+
+
+def server_seeds():
+    s = {}
+
+    # ── the plain shapes, so the mutator has somewhere to start ──
+    s["accept_line_close"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("PUMP", 3),
+        sop("RECV", 0), sop("ABORT", 0), sop("PUMP", 3), sop("STOP"))
+
+    s["many_clients"] = prog(
+        sop("START"),
+        sop("CONNECT", 0), sop("CONNECT", 1), sop("CONNECT", 2), sop("CONNECT", 3),
+        sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("SEND", 1, P_TWO_LINES), sop("SEND", 2, P_FRAGMENT),
+        sop("PUMP", 3), sop("BROADCAST", 0, P_LINE), sop("PUMP", 3),
+        sop("ABORT", 0), sop("ABORT", 1), sop("PUMP", 3), sop("STOP"))
+
+    # ── the orderings ──
+
+    # A stop with a read still armed, then a start in the same breath.  This is
+    # what `restart` does, and it is where the second accept chain and the second
+    # idle-sweep chain came from.
+    s["stop_start_with_read_armed"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_FRAGMENT),
+        sop("STOP"), sop("START"),
+        sop("CONNECT", 1), sop("PUMP", 3), sop("STOP"))
+
+    # No pump at all between the stop and the start: every completion the run
+    # produced is still in the ring when the next run arms over the top of it.
+    s["restart_without_draining"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("SEND", 0, P_LINE),
+        sop("STOP"), sop("START"), sop("STOP"), sop("START"), sop("STOP"))
+
+    # A client that resets in the middle of a response.  The descriptor is closed
+    # with a write still queued, and the next accept is what would take the
+    # number.
+    s["reset_mid_response"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("BROADCAST", 0, P_BIG_LINE),
+        sop("ABORT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("CONNECT", 2), sop("PUMP", 3), sop("STOP"))
+
+    # The splice path: a non-HTML file goes file → shared pipe → socket, and the
+    # client vanishes while it is in flight.
+    s["splice_then_reset"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_HTTP_BLOB), sop("PUMP", 1),
+        sop("ABORT", 0), sop("PUMP", 3),
+        sop("CONNECT", 1), sop("SEND", 1, P_HTTP_BLOB), sop("PUMP", 3), sop("STOP"))
+
+    # Two connections asking for the shared pipe at once: one gets the splice,
+    # the other falls back to the malloc-and-read path.
+    s["splice_contention"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("SEND", 0, P_HTTP_BLOB), sop("SEND", 1, P_HTTP_BLOB),
+        sop("PUMP", 3), sop("RECV", 0), sop("RECV", 1), sop("PUMP", 3), sop("STOP"))
+
+    # The async-file path, and a keep-alive request that reuses the connection.
+    s["http_file_keepalive"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_HTTP_KA), sop("PUMP", 3), sop("RECV", 0),
+        sop("SEND", 0, P_HTTP_KA), sop("PUMP", 3), sop("RECV", 0),
+        sop("SEND", 0, P_HTTP_TRAV), sop("PUMP", 3), sop("STOP"))
+
+    # Half a request line and then nothing, then a reset.
+    s["http_partial_then_reset"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_HTTP_PART), sop("PUMP", 3), sop("ABORT", 0),
+        sop("PUMP", 3), sop("STOP"))
+
+    # The disconnect is issued from inside the callback that is reading the
+    # message — the struct is closed by the handler that is still using it.
+    s["disconnect_from_callback"] = prog(
+        sop("CONFIG", C_CB, CB_DISCONNECT), sop("START"),
+        sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_TWO_LINES), sop("PUMP", 3),
+        sop("CONNECT", 1), sop("SEND", 1, P_LINE), sop("PUMP", 3), sop("STOP"))
+
+    # A write queued from the disconnect callback, which is the case close_conn()
+    # re-examines what is in flight for.
+    s["write_from_disconnect_callback"] = prog(
+        sop("CONFIG", C_CB, CB_ON_DISCONNECT), sop("START"),
+        sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("PUMP", 3),
+        sop("ABORT", 0), sop("PUMP", 3), sop("STOP"))
+
+    # WebSocket: upgrade, a frame, a fragment nobody continues, then a reset.
+    s["ws_upgrade_frames"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_WS_UPGRADE), sop("PUMP", 3), sop("RECV", 0),
+        sop("SEND", 0, P_WS_TEXT), sop("PUMP", 3),
+        sop("SEND", 0, P_WS_FRAG), sop("PUMP", 3),
+        sop("SEND", 0, P_WS_CLOSE), sop("PUMP", 3), sop("STOP"))
+
+    # Past the 1 MB partial cap with no framing in sight.
+    s["huge_partial"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_HUGE), sop("PUMP", 3),
+        sop("SEND", 0, P_HUGE), sop("PUMP", 3), sop("STOP"))
+
+    # A FIN that leaves the write side open, with a response still owed.
+    s["half_close_with_response_owed"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("FIN", 0),
+        sop("BROADCAST", 0, P_BIG_LINE), sop("PUMP", 3), sop("STOP"))
+
+    # More clients than the limit allows: the accept path closes them itself.
+    s["over_max_connections"] = prog(
+        sop("CONFIG", C_MAXCONN, 2), sop("START"),
+        sop("CONNECT", 0), sop("CONNECT", 1), sop("CONNECT", 2),
+        sop("CONNECT", 3), sop("CONNECT", 4), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("PUMP", 3), sop("STOP"))
+
+    # Zero-copy forwarding between two clients, and one of them leaving while it
+    # is paired.
+    s["pipe_pair_then_abort"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("PIPE", 0, 1), sop("SEND", 0, P_LINE), sop("PUMP", 3),
+        sop("ABORT", 1), sop("PUMP", 3), sop("SEND", 0, P_LINE),
+        sop("PUMP", 3), sop("STOP"))
+
+    # An upstream pointed at a port nothing listens on: the dial fails and the
+    # runtime arms a reconnect timer, which the stop then has to withdraw.
+    s["upstream_reconnect_timer"] = prog(
+        sop("UPSTREAM"), sop("START"), sop("PUMP", 3),
+        sop("STOP"), sop("START"), sop("PUMP", 3), sop("STOP"))
+
+    # Destroyed with everything still in flight.
+    s["destroy_mid_traffic"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("SEND", 0, P_BIG_LINE), sop("SEND", 1, P_HTTP_BLOB),
+        sop("DESTROY"), sop("START"), sop("CONNECT", 0), sop("PUMP", 3), sop("STOP"))
+
+    # The idle-sweep timer is armed at start and withdrawn at stop; arming it
+    # over several runs is what used to give the server a chain per restart.
+    s["idle_sweep_across_restarts"] = prog(
+        sop("CONFIG", C_IDLE, 1), sop("START"), sop("STOP"),
+        sop("START"), sop("STOP"), sop("START"), sop("PUMP", 3), sop("STOP"))
+
+    s["drain_on_stop"] = prog(
+        sop("CONFIG", C_DRAIN, 1), sop("START"),
+        sop("CONNECT", 0), sop("PUMP", 3), sop("SEND", 0, P_LINE),
+        sop("BROADCAST", 0, P_BIG_LINE), sop("STOP"), sop("PUMP", 3))
+
+    s["master_auth"] = prog(
+        sop("CONFIG", C_MODE, 3), sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_AUTH_BAD), sop("PUMP", 3),
+        sop("SEND", 0, P_AUTH_OK), sop("PUMP", 3),
+        sop("BROADCAST", 0, P_LINE), sop("PUMP", 3), sop("STOP"))
+
+    s["groups"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("GROUP", 0, 0, 0), sop("GROUP", 1, 0, 0), sop("GROUP", 0, 0, 2),
+        sop("PUMP", 3), sop("ABORT", 0), sop("PUMP", 3), sop("GROUP", 0, 0, 2),
+        sop("PUMP", 3), sop("STOP"))
+
+    s["rate_limited"] = prog(
+        sop("CONFIG", C_RATE, 1), sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_TWO_LINES), sop("SEND", 0, P_TWO_LINES),
+        sop("SEND", 0, P_TWO_LINES), sop("PUMP", 3), sop("STOP"))
+
+    s["stats_while_churning"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3), sop("STATS"),
+        sop("ABORT", 0), sop("STATS"), sop("PUMP", 3), sop("STATS"), sop("STOP"))
+
+    # ── UDP: bit 7 of the first byte of the input selects it, so the first step
+    #    carries it.  The recvmsg holds its own reference to the socket, so a
+    #    stop does not end it, and a restart binds a second socket to the same
+    #    port under SO_REUSEPORT. ──
+    udp_start = bytes([_SRV["START"] | 0x80, 0, 0, 0])
+    s["udp_datagrams"] = prog(
+        udp_start, sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_LINE), sop("PUMP", 3),
+        sop("SEND", 0, P_TWO_LINES), sop("PUMP", 3),
+        sop("BROADCAST", 0, P_LINE), sop("PUMP", 3), sop("STOP"))
+    s["udp_restart"] = prog(
+        udp_start, sop("CONNECT", 0), sop("SEND", 0, P_LINE),
+        sop("STOP"), sop("START"), sop("SEND", 0, P_LINE),
+        sop("PUMP", 3), sop("STOP"))
+
+    # ── the tick timer: bit 7 of the second byte.  It is a self-deleting
+    #    io_handler with a timer of its own, and a start makes a new one whether
+    #    or not the previous one has died. ──
+    tick_start = bytes([_SRV["START"], 0x80, 0, 0])
+    s["tick_across_restarts"] = prog(
+        tick_start, sop("STOP"), sop("START"), sop("STOP"),
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3), sop("STOP"))
+
+    return s
+
+
+def client_seeds():
+    s = {}
+
+    # ── the plain shapes ──
+    s["connect_read_close"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("PSEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("SEND", 0, Q_LINE), cop("PUMP", 3), cop("PRECV", 0),
+        cop("PABORT", 0), cop("PUMP", 3), cop("STOP"))
+
+    # ── the orderings ──
+
+    # One read request and one write request, reused across reconnects: a stop
+    # with either still in the ring, then a start in the same breath.
+    s["stop_start_with_read_armed"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("PSEND", 0, Q_FRAGMENT),
+        cop("STOP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 1),
+        cop("PSEND", 1, Q_LINE), cop("PUMP", 3), cop("STOP"))
+
+    # No pump between them at all.
+    s["restart_without_draining"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("STOP"), cop("START"),
+        cop("STOP"), cop("START"), cop("STOP"))
+
+    # The peer resets the connection while a write is queued behind a big one.
+    s["reset_mid_write"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("SEND", 0, Q_BIG_LINE), cop("SEND", 0, Q_BIG_LINE),
+        cop("PABORT", 0), cop("PUMP", 3), cop("SEND", 0, Q_LINE),
+        cop("PUMP", 3), cop("STOP"))
+
+    # Nothing is listening, so the dial is refused and a reconnect timer is
+    # armed.  That timer hangs off no descriptor: only teardown's withdrawal
+    # ends it, and until it reports the instance cannot be freed.
+    s["refused_then_stop"] = prog(
+        cop("START"), cop("PUMP", 3), cop("STOP"))
+
+    s["refused_then_destroy"] = prog(
+        cop("START"), cop("PUMP", 3), cop("DESTROY"),
+        cop("START"), cop("PUMP", 3), cop("STOP"))
+
+    # Connected, then the listener goes away and the peer resets: the runtime
+    # loses the socket and arms the reconnect timer, and is then destroyed with
+    # it still counting down.
+    s["lose_connection_then_destroy"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("PSEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("LISTEN_DOWN"), cop("PABORT", 0), cop("PUMP", 3),
+        cop("DESTROY"), cop("PUMP", 3))
+
+    # A FIN from the peer with the write side still open, and a send after it.
+    s["peer_half_close"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("PFIN", 0), cop("SEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("SEND", 0, Q_LINE), cop("PUMP", 3), cop("STOP"))
+
+    # Past MAX_PARTIAL_SIZE with no newline in it.
+    s["huge_partial"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("PSEND", 0, Q_HUGE), cop("PUMP", 3),
+        cop("PSEND", 0, Q_HUGE), cop("PUMP", 3), cop("STOP"))
+
+    # The runtime answers from inside the handler that delivered the message,
+    # which arms a write on a socket that handler may be about to lose.
+    s["echo_from_callback"] = prog(
+        cop("CONFIG", D_CB, 2), cop("LISTEN_UP"), cop("START"), cop("PUMP", 3),
+        cop("ACCEPT", 0), cop("PSEND", 0, Q_TWO_LINES), cop("PUMP", 3),
+        cop("PABORT", 0), cop("PUMP", 3), cop("STOP"))
+
+    # Sending from the disconnect callback: a send on a socket just lost.
+    s["send_from_disconnect_callback"] = prog(
+        cop("CONFIG", D_CB, 3), cop("LISTEN_UP"), cop("START"), cop("PUMP", 3),
+        cop("ACCEPT", 0), cop("PSEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("PABORT", 0), cop("PUMP", 3), cop("STOP"))
+
+    # Reconnect switched off: a dial that fails leaves the instance `failed`,
+    # and it has already armed I/O by then.
+    s["reconnect_disabled"] = prog(
+        cop("CONFIG", D_RECONNECT, 0), cop("START"), cop("PUMP", 3),
+        cop("STOP"), cop("START"), cop("PUMP", 3), cop("STOP"))
+
+    # The listener comes and goes underneath a running client.
+    s["listener_flapping"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("LISTEN_DOWN"), cop("PABORT", 0), cop("PUMP", 3),
+        cop("LISTEN_UP"), cop("PUMP", 3), cop("ACCEPT", 1),
+        cop("PSEND", 1, Q_LINE), cop("PUMP", 3), cop("STOP"))
+
+    # Write queue: several sends with nothing draining them.
+    s["queue_then_stop"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("SEND", 0, Q_BIG_LINE), cop("SEND", 0, Q_BIG_LINE),
+        cop("SEND", 0, Q_BIG_LINE), cop("SEND", 0, Q_BIG_LINE),
+        cop("STOP"), cop("PUMP", 3))
+
+    s["send_only_mode"] = prog(
+        cop("CONFIG", D_MODE, 2), cop("LISTEN_UP"), cop("START"), cop("PUMP", 3),
+        cop("ACCEPT", 0), cop("SEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("PSEND", 0, Q_LINE), cop("PUMP", 3), cop("STOP"))
+
+    # `edit --mode` has no "cannot change while running" guard, so a client
+    # started send-only can be switched to receiving underneath itself.  Every
+    # read this runtime submits comes from a completion, and send-only mode
+    # never armed one, so nothing starts it reading.
+    s["mode_out_then_in_while_connected"] = prog(
+        cop("CONFIG", D_MODE, 2), cop("LISTEN_UP"), cop("START"), cop("PUMP", 3),
+        cop("ACCEPT", 0), cop("SEND", 0, Q_LINE), cop("PUMP", 3),
+        cop("CONFIG", D_MODE, 1), cop("PUMP", 3),
+        cop("PSEND", 0, Q_LINE), cop("PUMP", 3), cop("STOP"))
+
+    s["stats_while_churning"] = prog(
+        cop("LISTEN_UP"), cop("START"), cop("PUMP", 3), cop("ACCEPT", 0),
+        cop("STATS"), cop("PABORT", 0), cop("STATS"), cop("PUMP", 3),
+        cop("STATS"), cop("STOP"))
+
+    # The tick timer: bit 7 of the second byte of the input.
+    tick_listen = bytes([_CLI["LISTEN_UP"], 0x80, 0, 0])
+    s["tick_across_restarts"] = prog(
+        tick_listen, cop("START"), cop("STOP"), cop("START"),
+        cop("PUMP", 3), cop("ACCEPT", 0), cop("STOP"))
+
+    return s
+
+
+# ───────────────────────── event_loop completion programs ────────────────────
+#
+# fuzz_event_loop does not take a protocol message either.  It reads its input
+# as a sequence of completions — six bytes per step: what to do, which owner or
+# request, which descriptor, what result, which CQE flags, and one auxiliary
+# byte — and feeds them to event_loop::dispatch_cqe(), checking the loop's own
+# accounting after every one.  So these seeds are orders of arrival, and each
+# one is here because it is the order a historical defect needed:
+#
+#   * a completion for an owner that deregistered after submitting it
+#   * the same, carrying a provided buffer, which the loop has to return itself
+#   * a multishot that reports with IORING_CQE_F_MORE and then without it
+#   * close_fd() with a read still outstanding, then the read, then the cancel
+#     acknowledgement it was waiting for
+#   * a timeout withdrawn with IORING_OP_TIMEOUT_REMOVE: two completions, one
+#     of which is counted and one of which is not
+#   * a fixed-file index released while a submission still names it
+#   * a handler that re-arms, closes its own descriptor, or deregisters itself
+#     from inside its own on_cqe
+#   * a splice, which names two descriptors and used to release only one
+#
+# The tables below MUST stay in step with the ones in fuzz_event_loop.cpp; the
+# target reduces every byte modulo its own table, so a mismatch does not corrupt
+# anything, it just makes these seeds mean something other than what they say.
+
+_EL_OPS = [
+    "ARM", "ARM_B",
+    "CQE", "CQE_B", "CQE_C",
+    "CQE_CANCEL", "CQE_NULL", "CQE_SIGNAL",
+    "REGISTER", "DEREGISTER",
+    "CLOSE_FD", "CANCEL_FD",
+    "TIMEOUT_REMOVE", "POLL_REMOVE",
+    "ALLOC_FIXED", "FREE_FIXED",
+    "RETURN_CQE_BUF", "REUSE_FD", "QUERY",
+]
+_EL_OP = {name: i for i, name in enumerate(_EL_OPS)}
+
+# submit_* helper selector, in the order of arm_kind in fuzz_event_loop.cpp.
+_EL_KINDS = [
+    "ACCEPT", "MSHOT_ACCEPT", "MSHOT_ACCEPT_DIRECT",
+    "READ", "WRITE", "WRITEV", "RECVMSG", "SENDMSG",
+    "TIMEOUT",
+    "READ_PROVIDED", "RECV_MULTISHOT",
+    "READ_FIXED", "WRITE_FIXED", "MSHOT_FIXED", "PROVIDED_FIXED", "SENDZC_FIXED",
+    "SENDZC", "SPLICE", "FILE_READ", "CONNECT", "POLL",
+    "READ_FIXED_BUF", "WRITE_FIXED_BUF",
+]
+_EL_KIND = {name: i for i, name in enumerate(_EL_KINDS)}
+
+# Result selector, in the order of RES_TABLE.
+_EL_RES = ["OK", "R1", "R15", "R64", "R4096", "R65535",
+           "EAGAIN", "ECANCELED", "ENOBUFS", "ECONNRESET", "EPIPE", "EBADF",
+           "EINVAL", "ENOENT", "EINTR", "EMFILE", "ETIME", "EFAULT", "MINUS1", "INTMIN"]
+_EL_R = {name: i for i, name in enumerate(_EL_RES)}
+
+# CQE flag bits, as the target decodes them.
+EL_MORE, EL_BUF, EL_NONEMPTY, EL_NOTIF = 1, 2, 4, 8
+
+# What the handler does from inside its own on_cqe, in the order of
+# handler_action.  NOWNERS is 5, NFDS 6, NFIXED 5, NREQS 12, 8 buffers a group.
+_EL_ACTIONS = ["NONE", "REARM", "CLOSE_FD", "DEREGISTER", "QUERY"]
+_EL_A = {name: i for i, name in enumerate(_EL_ACTIONS)}
+_EL_NACTIONS = len(_EL_ACTIONS)
+
+
+def el_aux(action="NONE", bid=0):
+    """One byte carrying both the handler action (mod 5) and a buffer id (mod 8)."""
+    want_a = _EL_A[action]
+    for v in range(256):
+        if v % _EL_NACTIONS == want_a and v % 8 == (bid % 8):
+            return v
+    raise ValueError("no aux byte for %s/%d" % (action, bid))
+
+
+def el_owner(owner):
+    """The byte that selects an owner; None means a submission with no owner."""
+    return 0 if owner is None else (owner % 5) + 1
+
+
+def el_step(op, a=0, b=0, c=0, d=0, e=0):
+    return bytes([_EL_OP[op], a & 0xFF, b & 0xFF, c & 0xFF, d & 0xFF, e & 0xFF])
+
+
+def el_arm(req, kind, owner=0, fd=0):
+    # `c` picks the owner and doubles as the fixed-slot index; `d` picks the
+    # descriptor and doubles as the buffer group.  Same coupling the target has.
+    return el_step("ARM", a=req, b=_EL_KIND[kind], c=el_owner(owner), d=fd)
+
+
+def el_cqe(req, res="OK", flags=0, action="NONE", bid=0):
+    return el_step("CQE", a=req, c=_EL_R[res], d=flags, e=el_aux(action, bid))
+
+
+def eventloop_seeds():
+    s = {}
+
+    # ── the plain shapes, so the mutator has somewhere to start ──
+    s["read_complete"] = el_arm(0, "READ", owner=0, fd=0) + el_cqe(0, "R64")
+    s["read_eof"] = el_arm(0, "READ", owner=0, fd=0) + el_cqe(0, "OK")
+    s["short_read"] = el_arm(0, "READ", owner=0, fd=0) + el_cqe(0, "R1")
+    s["write_epipe"] = el_arm(1, "WRITE", owner=1, fd=1) + el_cqe(1, "EPIPE")
+
+    # ── a completion for an owner that retired after submitting it ──
+    s["stale_owner"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_step("DEREGISTER", a=0)
+        + el_cqe(0, "R64")
+        + el_step("QUERY"))
+
+    # The same, one slot recycled underneath it: the retired owner's slot goes
+    # to a different handler before the completion lands.
+    s["stale_owner_slot_recycled"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_step("DEREGISTER", a=0)
+        + el_step("REGISTER", a=1)
+        + el_step("REGISTER", a=2)
+        + el_cqe(0, "R64")
+        + el_step("QUERY"))
+
+    # ── the provided-buffer leak: a discarded completion carrying a buffer ──
+    s["stale_owner_with_buffer"] = (
+        el_arm(0, "READ_PROVIDED", owner=0, fd=0)
+        + el_step("DEREGISTER", a=0)
+        + el_cqe(0, "R64", flags=EL_BUF, bid=3))
+    s["multishot_buffer_stream"] = (
+        el_arm(0, "RECV_MULTISHOT", owner=0, fd=1)
+        + el_cqe(0, "R64", flags=EL_MORE | EL_BUF, bid=1)
+        + el_cqe(0, "R64", flags=EL_MORE | EL_BUF, bid=2)
+        + el_step("DEREGISTER", a=0)
+        + el_cqe(0, "ENOBUFS", flags=EL_BUF, bid=3))
+    s["return_cqe_buf"] = (
+        el_arm(0, "READ_PROVIDED", owner=0, fd=0)
+        + el_step("RETURN_CQE_BUF", a=0, e=5)
+        + el_cqe(0, "R64"))
+
+    # ── multishot that stops without saying so ──
+    s["multishot_more_then_final"] = (
+        el_arm(2, "RECV_MULTISHOT", owner=1, fd=2)
+        + el_cqe(2, "R64", flags=EL_MORE)
+        + el_cqe(2, "R64", flags=EL_MORE)
+        + el_cqe(2, "ECANCELED"))
+    s["multishot_accept_stops"] = (
+        el_arm(3, "MSHOT_ACCEPT", owner=0, fd=3)
+        + el_cqe(3, "R4096", flags=EL_MORE)
+        + el_cqe(3, "EINVAL"))
+
+    # ── close_fd with something still armed, and the cancel it submits ──
+    s["close_with_read_armed"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_step("CLOSE_FD", a=0)
+        + el_cqe(0, "ECANCELED")
+        + el_step("CQE_CANCEL", a=0))
+    s["close_from_handler"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_cqe(0, "OK", action="CLOSE_FD"))
+    s["close_two_readers"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_arm(1, "WRITE", owner=0, fd=0)
+        + el_step("CLOSE_FD", a=0)
+        + el_cqe(0, "ECANCELED")
+        + el_cqe(1, "ECANCELED")
+        + el_step("CQE_CANCEL", a=0))
+    s["cancel_then_close"] = (
+        el_arm(0, "READ", owner=0, fd=1)
+        + el_step("CANCEL_FD", a=1)
+        + el_step("CLOSE_FD", a=1)
+        + el_cqe(0, "ECANCELED")
+        + el_step("CQE_CANCEL", a=1)
+        + el_step("CQE_CANCEL", a=1))
+
+    # ── a splice names two descriptors; only one used to be released ──
+    s["splice_two_targets"] = (
+        el_arm(4, "SPLICE", owner=2, fd=1)
+        + el_step("CLOSE_FD", a=1)
+        + el_cqe(4, "R4096")
+        + el_step("CQE_CANCEL", a=1))
+
+    # ── timeouts and the two completions a withdrawal produces ──
+    s["timeout_fires"] = el_arm(5, "TIMEOUT", owner=3) + el_cqe(5, "ETIME")
+    s["timeout_removed"] = (
+        el_arm(5, "TIMEOUT", owner=3)
+        + el_step("TIMEOUT_REMOVE", a=5)
+        + el_step("CQE_NULL")                    # the withdrawal's own answer
+        + el_cqe(5, "ECANCELED"))                # the timeout's, which is counted
+    s["poll_removed"] = (
+        el_arm(6, "POLL", owner=3, fd=2)
+        + el_step("POLL_REMOVE", a=6)
+        + el_step("CQE_NULL")
+        + el_cqe(6, "ECANCELED"))
+
+    # ── fixed-file indices, released while a submission still names them ──
+    s["fixed_free_while_armed"] = (
+        el_step("ALLOC_FIXED", a=0)
+        + el_arm(7, "READ_FIXED", owner=0, fd=0)
+        + el_step("FREE_FIXED", a=0)
+        + el_cqe(7, "ECANCELED"))
+    s["fixed_multishot_buffer"] = (
+        el_step("ALLOC_FIXED", a=0)
+        + el_arm(7, "MSHOT_FIXED", owner=0, fd=1)
+        + el_cqe(7, "R64", flags=EL_MORE | EL_BUF, bid=1)
+        + el_step("DEREGISTER", a=0)
+        + el_cqe(7, "OK", flags=EL_BUF, bid=2)
+        + el_step("FREE_FIXED", a=0))
+
+    # ── handlers acting from inside their own on_cqe ──
+    s["handler_rearms"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_cqe(0, "R64", action="REARM")
+        + el_cqe(0, "OK"))
+    s["handler_deregisters"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_arm(1, "WRITE", owner=0, fd=1)
+        + el_cqe(0, "OK", action="DEREGISTER")
+        + el_cqe(1, "R64"))
+    s["handler_queries"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_arm(1, "READ", owner=0, fd=0)
+        + el_cqe(0, "R64", action="QUERY")
+        + el_cqe(1, "R64", action="QUERY"))
+
+    # ── a descriptor number given away and taken back underneath a submission ──
+    s["number_reissued"] = (
+        el_arm(0, "READ", owner=0, fd=0)
+        + el_step("REUSE_FD", a=0)
+        + el_cqe(0, "EBADF"))
+
+    # ── a submission nobody owns, and the stop eventfd ──
+    s["no_owner"] = el_arm(0, "READ", owner=None, fd=0) + el_cqe(0, "R64")
+    s["stop_signal"] = el_step("CQE_SIGNAL")
+
+    # ── coverage floors ──
+    s["all_arm_kinds"] = b"".join(
+        el_arm(i % 12, k, owner=i % 5, fd=i % 6) + el_cqe(i % 12, "OK")
+        for i, k in enumerate(_EL_KINDS))
+    s["all_results"] = b"".join(
+        el_arm(0, "READ", owner=0, fd=0) + el_cqe(0, r) for r in _EL_RES)
+    s["all_ops"] = b"".join(el_step(name, a=1, b=3, c=1, d=1, e=1) for name in _EL_OPS)
+    s["one_step"] = el_step("QUERY")
+
+    return s
+
+
 # ─────────────────────────────────── driver ──────────────────────────────────
 
 
@@ -672,6 +1310,9 @@ KEPT_BUDGET = {
     "httpresp": 8,     # 0 kept
     "cache": 260,      # 240 kept: cache_store has far more reachable state than
                        # 37 hand-written programs can lay out
+    "eventloop": 24,   # 0 kept
+    "server": 8,       # 0 kept
+    "client": 8,       # 0 kept
 }
 
 
@@ -702,7 +1343,9 @@ def main(argv):
     over = 0
     for name, seeds in (("resp", resp_seeds()), ("ws", ws_seeds()),
                         ("http", http_seeds()), ("httpresp", httpresp_seeds()),
-                        ("cache", cache_seeds())):
+                        ("cache", cache_seeds()), ("server", server_seeds()),
+                        ("client", client_seeds()),
+                        ("eventloop", eventloop_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

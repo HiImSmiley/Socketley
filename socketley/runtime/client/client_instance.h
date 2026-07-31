@@ -1,7 +1,9 @@
 #pragma once
+#include <memory>
 #include <string>
 #include <string_view>
 #include <queue>
+#include <vector>
 #include <netinet/in.h>
 #include <linux/time_types.h>
 
@@ -9,9 +11,21 @@
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 
+// Everything the ring can name for one run of this runtime: the two requests it
+// reuses, the buffers the kernel reads out of and writes into, and the reconnect
+// timer.  It is one struct with a lifetime of its own — not a member of the
+// instance — because a stop does not end what the ring is carrying.
+//
+// stop() deregisters the owner, and from that moment the loop drops this
+// instance's completions rather than dispatching them: on_cqe does not run,
+// settle_stale() does not run, and the flags that say a request is occupied are
+// never lowered.  They must not simply be cleared either — the kernel really is
+// still writing into read_buf and reading out of write_buf.  So a run that finds
+// them still standing takes a fresh struct and leaves the old one to the ring;
+// see client_instance::setup().
 struct client_tcp_connection
 {
-    int fd;
+    int fd{-1};
     io_request read_req;
     io_request write_req;
     char read_buf[4096];
@@ -28,6 +42,15 @@ struct client_tcp_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+
+    // The reconnect timer.  It lives here rather than on the instance because it
+    // is the same kind of thing as the two requests above — storage the ring can
+    // name that outlives the stop which armed it — and because it hangs off no
+    // descriptor, so nothing a teardown closes can reach it.  Withdrawing it
+    // makes it report at once; it is still owed exactly one completion either
+    // way, and that completion is dropped if the runtime has stopped.
+    io_request timeout_req{};
+    struct __kernel_timespec timeout_ts{};
 };
 
 enum client_mode : uint8_t
@@ -93,7 +116,14 @@ private:
 
     client_mode m_mode;
     bool m_udp{false};
-    client_tcp_connection m_conn;
+    // The current run's I/O state, and the ones earlier runs left behind with
+    // something still in the ring.  A spent struct is not freed when it is
+    // replaced: the loop reads the request inside it in order to drop its
+    // completion, and the kernel may still be writing into its read buffer, so
+    // it has to outlive the ring's interest in it.  setup() releases them once
+    // owner_inflight() says nothing is left.  See client_tcp_connection.
+    std::unique_ptr<client_tcp_connection> m_conn;
+    std::vector<std::unique_ptr<client_tcp_connection>> m_conn_spent;
     // Which socket the requests in flight belong to.  There is one read request
     // and one write request on this instance and both are reused, and a closed
     // descriptor number comes straight back from the kernel on the next
@@ -114,11 +144,10 @@ private:
     // the only one that says anything new.
     bool m_write_queue_full{false};
 
-    // Reconnect state
+    // Reconnect state.  The request and the timespec live in m_conn — see
+    // there — because they are storage the ring can name.
     int m_reconnect_attempt{0};
     bool m_reconnect_pending{false};
-    io_request m_timeout_req{};
-    struct __kernel_timespec m_timeout_ts{};
 
     // DNS cache (avoids getaddrinfo on every reconnect)
     struct sockaddr_in m_cached_addr{};

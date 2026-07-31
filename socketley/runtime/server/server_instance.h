@@ -122,6 +122,31 @@ struct alignas(64) server_connection
     // 16KB read buffer — at the very end to keep hot fields in first cache lines
     char read_buf[READ_BUF_SIZE];
 
+    // What a struct owns that no container releases for it.
+    //
+    // Normally pool_release() does this, and every connection reaches it — but
+    // only by way of a completion.  A connection with a file read still in
+    // flight is put on the retired list, and if the runtime stops before that
+    // completion lands the loop drops it rather than dispatching it, so
+    // reap_retired() never runs and pool_release() never happens.  The struct is
+    // then freed with the instance, and the file's whole contents go with it:
+    // one malloc the size of the file served, per connection, held until the
+    // process exits.  The descriptors are the same story a level down.
+    //
+    // Reached only when the instance itself is going away, which runtime_manager
+    // does only once the ring owes it nothing — so no submission can still name
+    // either descriptor and a plain close is right, exactly as it is in reset().
+    ~server_connection()
+    {
+        free(file_buf);
+        if (file_fd >= 0)        close(file_fd);
+        if (splice_file_fd >= 0) close(splice_file_fd);
+    }
+
+    server_connection() = default;
+    server_connection(const server_connection&) = delete;
+    server_connection& operator=(const server_connection&) = delete;
+
     // Connection pool support: reset to initial state for reuse
     void reset(int new_fd)
     {
@@ -418,7 +443,23 @@ private:
     int m_listen_fd;
     struct sockaddr_in m_accept_addr;
     socklen_t m_accept_addrlen;
-    io_request m_accept_req;
+    // The request the current accept chain was armed with, and the ones earlier
+    // chains were armed with that the ring has not finished naming.
+    //
+    // One per chain rather than one per instance, because a stop does not end
+    // the chain it belongs to: teardown() closes the listener and close_fd()
+    // submits a cancel, both of which make the accept report, but reporting only
+    // puts a CQE in the ring — and nothing reaps the ring between a stop and the
+    // start that follows it.  See setup() for what arming a second submission on
+    // an occupied request costs.
+    //
+    // A spent request is not freed when it is replaced.  Its completion is
+    // dropped rather than dispatched — stop() deregistered the owner — but the
+    // loop reads the request in order to drop it, so the storage has to outlive
+    // the ring's interest in it.  setup() releases them once owner_inflight()
+    // says nothing is left.
+    std::unique_ptr<io_request> m_accept_req;
+    std::vector<std::unique_ptr<io_request>> m_accept_spent;
     event_loop* m_loop;
     // The same loop, kept across teardown.  A completion that arrives while we
     // are stopped may carry a provided buffer or a fixed-file slot that has to
@@ -494,11 +535,24 @@ private:
     static constexpr size_t MAX_UDP_PEERS = 10000;
     struct udp_peer { struct sockaddr_in addr; };
     int m_udp_fd{-1};
-    char m_udp_recv_buf[65536];
-    struct sockaddr_in m_udp_recv_addr{};
-    struct iovec m_udp_recv_iov{};
-    struct msghdr m_udp_recv_msg{};
-    io_request m_udp_recv_req{};
+    // Everything one recvmsg names: the request, the msghdr the kernel walks,
+    // the buffer it writes the datagram into and the sockaddr it writes the
+    // sender into.  Held apart from the instance and replaced per run, for the
+    // reason given for the accept request above: a stop deregisters this owner,
+    // so the completion that would lower m_udp_recv_armed is dropped rather
+    // than dispatched, and a start that follows before the ring is reaped would
+    // otherwise either arm a second recvmsg into the same buffer or — with the
+    // flag still standing — arm nothing at all and never receive again.
+    struct udp_recv_state
+    {
+        io_request         req{};
+        struct msghdr      msg{};
+        struct iovec       iov{};
+        struct sockaddr_in addr{};
+        char               buf[65536];
+    };
+    std::unique_ptr<udp_recv_state> m_udp_recv;
+    std::vector<std::unique_ptr<udp_recv_state>> m_udp_recv_spent;
     std::vector<udp_peer> m_udp_peers;
     std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
 

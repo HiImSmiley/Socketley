@@ -167,7 +167,7 @@ jobs:
         run: |
           python3 test/fuzz/make_corpus.py
           total=0
-          for d in resp ws http httpresp cache; do
+          for d in resp ws http httpresp cache server client; do
             n=$(find "test/fuzz/corpus/$d" -type f | wc -l)
             echo "corpus/$d: $n files"
             [ "$n" -gt 0 ] || { echo "corpus/$d is empty"; exit 1; }
@@ -182,9 +182,9 @@ jobs:
       - name: Build fuzz targets (GCC, ASan+UBSan)
         run: |
           ./bin/premake5 gmake2
-          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request
+          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request fuzz_server_ops fuzz_client_ops
           cd ..
-          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request; do
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request fuzz_server_ops fuzz_client_ops; do
             test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
           done
 
@@ -194,10 +194,19 @@ jobs:
         # ubuntu-24.04 ships clang-18 and libclang-rt-18-dev, so a failure to
         # build libFuzzer now means a real breakage, not an absent toolchain.
         #
-        # All five targets, including fuzz_http_request — which compiles the
-        # fifteen SDK translation units with clang because it cannot link
-        # premake's GCC/ASan archive (one process, one sanitizer runtime).  That
-        # is the expensive part of this job and the reason it is nightly.
+        # Every target, including the three that compile the fifteen SDK
+        # translation units with clang because they cannot link premake's
+        # GCC/ASan archive (one process, one sanitizer runtime):
+        # fuzz_http_request, and the two operation-sequence targets
+        # fuzz_server_ops and fuzz_client_ops, which drive a real
+        # server_instance and client_instance against a real io_uring loop.
+        # That is the expensive part of this job and the reason it is nightly.
+        #
+        # BUDGET.  run_fuzz.sh spends the per-target budget twice — libFuzzer
+        # then the replay driver — so the wall clock is 2 x targets x seconds.
+        # At the 600 s default that is already past timeout-minutes below with
+        # the targets that were here before these two; lower fuzz_seconds, or
+        # raise the timeout, rather than dropping a target.
         env:
           REQUIRE_LIBFUZZER: "1"
         run: bash test/fuzz/build_libfuzzer.sh

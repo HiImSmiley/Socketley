@@ -604,7 +604,7 @@ project "test_sdk_ws_client"
 -- bugs.  The TSan exclusion is not optional: ASan and TSan cannot coexist in one
 -- process, and these targets have no threads for TSan to look at anyway.
 --
--- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request
+-- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request
 
 local function fuzz_target_settings()
     targetdir ("bin/%{cfg.buildcfg}")
@@ -721,6 +721,38 @@ project "fuzz_http_response"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: event_loop completion handling as a scripted order of CQEs ───
+--
+-- Not a parser target either.  It decodes the fuzzer's bytes into a sequence of
+-- completions — op type, result, flags, owner slot, epoch — feeds them to
+-- event_loop::dispatch_cqe(), and checks the loop's own accounting after every
+-- one: the owner ledger, the per-descriptor counts, the provided-buffer groups.
+-- The order completions arrive in is the kernel's to choose and is where every
+-- lifetime defect this project found came from; this target makes that order an
+-- input.  See the header comment in test/fuzz/fuzz_event_loop.cpp.
+--
+-- It compiles event_loop.cpp directly rather than linking socketley_sdk: that
+-- file needs liburing and logging.h and nothing else of ours, so the target
+-- stays three translation units.  liburing is a link dependency only — the
+-- target never opens a ring.
+
+project "fuzz_event_loop"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+    links { "uring" }
+
+    files {
+        "test/fuzz/fuzz_event_loop.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/event_loop.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: proxy HTTP request line + header block ───
 --
 -- This one links the whole runtime.  parse_http_request_line and
@@ -754,6 +786,81 @@ project "fuzz_http_request"
     files {
         "test/fuzz/fuzz_http_request.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: server and client runtimes as operation sequences ───
+--
+-- Not parser targets and not even byte targets.  Each decodes the fuzzer's
+-- bytes into a program of lifecycle and connection operations — start, stop,
+-- destroy, connect, send, reset, restart — and runs it against a real runtime on
+-- a real io_uring event_loop, checking after every step that no completion can
+-- outlive its owner, that every arm has its disarm, that no descriptor number is
+-- named by a queued SQE after it was released, and that no connection struct
+-- goes back to its pool with anything armed on it.  See the header comment in
+-- test/fuzz/fuzz_runtime_ops.h for why none of that is reachable by mutating a
+-- byte buffer.
+--
+-- They link socketley_sdk for the same reason fuzz_http_request does — the code
+-- under test is the runtime — so they cost a full SDK build and belong in the
+-- nightly job rather than the per-push one.
+--
+-- One difference from the libFuzzer build: SOCKETLEY_INVARIANTS is not defined
+-- here.  These projects link the same socketley_sdk the daemon is built from, and
+-- defining it would put the checks in invariants.h into the shipped binary.  The
+-- clang build in test/fuzz/build_libfuzzer.sh compiles its own copy of the SDK
+-- and does define it, so the in-tree pool-safety and reachability assertions are
+-- live there.  The harness's own equivalents run in both.
+
+project "fuzz_server_ops"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files {
+        "test/fuzz/fuzz_server_ops.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_runtime_ops.h",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
+project "fuzz_client_ops"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files {
+        "test/fuzz/fuzz_client_ops.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_runtime_ops.h",
         "test/fuzz/fuzz_common.h"
     }
 

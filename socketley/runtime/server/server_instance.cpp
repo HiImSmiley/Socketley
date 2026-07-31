@@ -30,7 +30,9 @@ server_instance::server_instance(std::string_view name)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
-    m_accept_req = { this, nullptr, -1, 0, op_accept };
+    m_accept_req  = std::make_unique<io_request>();
+    *m_accept_req = { this, nullptr, -1, 0, op_accept };
+    m_udp_recv    = std::make_unique<udp_recv_state>();
 }
 
 server_instance::~server_instance()
@@ -973,6 +975,40 @@ bool server_instance::setup(event_loop& loop)
     m_loop = &loop;
     m_ring_loop = &loop;
 
+    // ── requests an earlier run armed and never saw the end of ──────────────
+    //
+    // The flags below say "this request is occupied, do not arm it again", and
+    // they are set when a request is armed and lowered by its completion.  Only
+    // by a completion the loop *delivers*, though — and stop() deregisters this
+    // owner, so from that moment the loop drops them instead.  on_cqe does not
+    // run, the flag is never lowered, and it survives into the next run: the
+    // start that follows declines to arm a request that is in fact free, and the
+    // thing it belongs to is off for the life of the process.  A client that
+    // comes up connected and permanently deaf is the same defect on the client
+    // runtime; here it is an idle sweep that never runs again, an accept backoff
+    // that can never re-arm, and a UDP socket nothing ever receives on.
+    //
+    // Leaving them standing across a stop is still right — the request really is
+    // occupied until its completion lands, delivered or dropped.  What was
+    // missing is anything that lowers them once it has.  The loop is the only
+    // thing that knows: owner_inflight() counts what is still in the ring for
+    // this handler over every registration it has ever held, whatever became of
+    // the completions.  Zero means every one of these requests is free.
+    //
+    // owner_table_full() is the case it cannot answer: a handler that never got
+    // a slot reads zero whatever it has outstanding, so a full table leaves the
+    // flags alone rather than clearing them on a zero that means "unknown".
+    if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
+    {
+        m_accept_armed         = false;
+        m_idle_sweep_armed     = false;
+        m_accept_backoff_armed = false;
+        m_udp_recv_armed       = false;
+        // Nothing in the ring names any of them any more.
+        m_accept_spent.clear();
+        m_udp_recv_spent.clear();
+    }
+
     // Cache config getters once at setup to avoid virtual calls on the hot path
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
@@ -1017,27 +1053,38 @@ bool server_instance::setup(event_loop& loop)
             return false;
         }
 
-        // Setup recvmsg structures
-        std::memset(&m_udp_recv_addr, 0, sizeof(m_udp_recv_addr));
-        m_udp_recv_iov.iov_base = m_udp_recv_buf;
-        m_udp_recv_iov.iov_len = sizeof(m_udp_recv_buf);
-        std::memset(&m_udp_recv_msg, 0, sizeof(m_udp_recv_msg));
-        m_udp_recv_msg.msg_name = &m_udp_recv_addr;
-        m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
-        m_udp_recv_msg.msg_iov = &m_udp_recv_iov;
-        m_udp_recv_msg.msg_iovlen = 1;
-
-        // Only if the previous run's recvmsg has completed.  It reads into
-        // m_udp_recv_buf and writes the sender into m_udp_recv_addr; a second
-        // one armed on the same msghdr gives the kernel two writers into one
-        // buffer and one sockaddr, and answers go to whichever peer landed
-        // there last.  If one is still armed it re-arms itself on the new
-        // socket when it completes.
-        if (!m_udp_recv_armed)
+        // The previous run's recvmsg reads into this struct's buffer and writes
+        // the sender into its sockaddr, and a stop does not end it: the socket
+        // holds a reference of its own, so close() does not, and the completion
+        // that would lower m_udp_recv_armed is dropped rather than dispatched
+        // once stop() has deregistered this owner.  Arming a second recvmsg on
+        // the same msghdr would give the kernel two writers into one buffer and
+        // one address, and answers would go to whichever peer landed there last;
+        // declining to arm one at all — which is what the flag used to make this
+        // do — left the restarted server bound to the port and receiving
+        // nothing, for good.
+        //
+        // So the old chain keeps its struct and this run takes a fresh one.  The
+        // old one is not freed: the kernel may still be writing into it, and the
+        // loop reads the request inside it to drop the completion.  setup()
+        // releases the spent ones once owner_inflight() says nothing is left.
+        if (m_udp_recv_armed)
         {
-            m_udp_recv_req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
-            arm_udp_recv();
+            m_udp_recv_spent.push_back(std::move(m_udp_recv));
+            m_udp_recv = std::make_unique<udp_recv_state>();
+            m_udp_recv_armed = false;
         }
+
+        // Setup recvmsg structures
+        m_udp_recv->iov.iov_base = m_udp_recv->buf;
+        m_udp_recv->iov.iov_len = sizeof(m_udp_recv->buf);
+        m_udp_recv->msg.msg_name = &m_udp_recv->addr;
+        m_udp_recv->msg.msg_namelen = sizeof(m_udp_recv->addr);
+        m_udp_recv->msg.msg_iov = &m_udp_recv->iov;
+        m_udp_recv->msg.msg_iovlen = 1;
+
+        m_udp_recv->req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
+        arm_udp_recv();
 
         return true;
     }
@@ -1086,22 +1133,55 @@ bool server_instance::setup(event_loop& loop)
     // cqe->res returns a fixed file index, not a real fd — setsockopt,
     // getpeername, and other syscalls require a real fd.  Instead, we
     // register the accepted fd into the fixed file table post-accept.
-    // The previous run's accept chain died with its listener: teardown()
-    // shuts the socket down, which completes every accept it holds.  Arming a
-    // fresh one here is therefore right; handle_accept() is what must not arm a
-    // second when that dead chain's last completion finally arrives.
     m_direct_accept = false;
-    if (event_loop::supports_multishot_accept())
+    m_multishot_active = event_loop::supports_multishot_accept();
+
+    // The previous run's accept chain does NOT reliably end before this line.
+    //
+    // teardown() shuts the listener down and close_fd() submits a cancel for
+    // it, both of which make the chain report — but reporting means a CQE in
+    // the ring, and nothing reaps the ring between a stop and the start that
+    // follows it.  `restart` is exactly that order, and so is any Lua callback
+    // that stops and starts a server: both run inside a single completion
+    // handler, and the ring is not looked at again until it returns.
+    //
+    // Arming a second submission on a request the ring is still carrying one for
+    // is the one thing that must not happen to any request here.  arm() stamps
+    // the owner identity into the request and there is one field for it, so the
+    // second submission overwrites the first's: the *old* completion then passes
+    // the check meant for the new one and the disarm it triggers lands on the new
+    // registration's slot.  Both halves of that are wrong and one of them is
+    // fatal.  The old slot is left owing a completion for ever, and
+    // runtime_manager waits on that count before it frees a removed runtime —
+    // about six megabytes per restart, held until the daemon exits, with one of
+    // the loop's 1024 owner slots gone each time.  Worse, the new slot has been
+    // discounted for an operation that is still in the ring: it can read zero
+    // while the accept is live, and an instance freed on the strength of that
+    // zero is a use-after-free the next time the chain reports.
+    //
+    // So the old chain keeps its request and this run takes a fresh one.  The
+    // old one is not freed here — the loop reads it to drop its completion, so
+    // it has to outlive the ring's interest in it, which is what m_accept_spent
+    // is for and what the sweep at the top of this function releases.
+    if (m_accept_armed)
     {
-        m_accept_req.type = op_multishot_accept;
-        m_accept_armed = loop.submit_multishot_accept(m_listen_fd, &m_accept_req);
-        m_multishot_active = true;
+        m_accept_spent.push_back(std::move(m_accept_req));
+        m_accept_req  = std::make_unique<io_request>();
+        *m_accept_req = { this, nullptr, -1, 0, op_accept };
+        m_accept_armed = false;
+    }
+
+    if (m_multishot_active)
+    {
+        m_accept_req->type = op_multishot_accept;
+        m_accept_armed = loop.submit_multishot_accept(m_listen_fd, m_accept_req.get());
     }
     else
     {
-        m_accept_req.type = op_accept;
-        m_accept_armed = loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen, &m_accept_req);
-        m_multishot_active = false;
+        m_accept_addrlen = sizeof(m_accept_addr);
+        m_accept_req->type = op_accept;
+        m_accept_armed = loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen,
+                                            m_accept_req.get());
     }
 
     // Build HTTP file cache if enabled
@@ -1156,7 +1236,7 @@ void server_instance::teardown(event_loop& loop)
         if (m_udp_fd >= 0)
         {
             // The recvmsg holds a reference to the socket, so close() does not
-            // end it — it stays armed on m_udp_recv_buf and m_udp_recv_addr.
+            // end it — it stays armed on m_udp_recv->buf and m_udp_recv->addr.
             // SO_REUSEPORT then makes that matter: once a restart binds a new
             // socket to the same port the kernel delivers datagrams to the old
             // one as well, and the completion used to arm a second recvmsg on
@@ -1167,7 +1247,7 @@ void server_instance::teardown(event_loop& loop)
             // the ring and returns — under SQPOLL without even a syscall — so
             // the close could and did run before the kernel had looked at either
             // the cancel or the recvmsg.  A recvmsg consumed after this number
-            // was reissued reads a stranger's datagram into m_udp_recv_buf, and
+            // was reissued reads a stranger's datagram into m_udp_recv->buf, and
             // a cancel consumed after it takes back a stranger's I/O.  close_fd
             // submits the cancel itself and holds the number until both have
             // reported.
@@ -1420,8 +1500,8 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         return_provided_buf(cqe);
         if (req == &m_idle_sweep_req)          m_idle_sweep_armed = false;
         else if (req == &m_accept_backoff_req) m_accept_backoff_armed = false;
-        else if (req == &m_udp_recv_req)       m_udp_recv_armed = false;
-        else if (req == &m_accept_req)         m_accept_armed = false;
+        else if (req == &m_udp_recv->req)       m_udp_recv_armed = false;
+        else if (req == m_accept_req.get()) m_accept_armed = false;
         return;
     }
 
@@ -1547,12 +1627,12 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (m_listen_fd >= 0 && !m_accept_armed)
                 {
                     if (m_multishot_active)
-                        m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                        m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, m_accept_req.get());
                     else
                     {
                         m_accept_addrlen = sizeof(m_accept_addr);
                         m_accept_armed = m_loop->submit_accept(m_listen_fd, &m_accept_addr,
-                                                               &m_accept_addrlen, &m_accept_req);
+                                                               &m_accept_addrlen, m_accept_req.get());
                     }
                 }
             }
@@ -1832,7 +1912,7 @@ resubmit_accept:
         {
             m_accept_armed = false;
             if (m_listen_fd >= 0)
-                m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, &m_accept_req);
+                m_accept_armed = m_loop->submit_multishot_accept(m_listen_fd, m_accept_req.get());
         }
     }
     else
@@ -1843,7 +1923,7 @@ resubmit_accept:
         {
             m_accept_addrlen = sizeof(m_accept_addr);
             m_accept_armed = m_loop->submit_accept(m_listen_fd, &m_accept_addr,
-                                                   &m_accept_addrlen, &m_accept_req);
+                                                   &m_accept_addrlen, m_accept_req.get());
         }
     }
 }
@@ -2186,6 +2266,33 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // proto_http: full HTTP request handling
     if (conn->proto == proto_http)
     {
+        // Not while this connection is still serving the last request.
+        //
+        // A static response lives in state this connection has exactly one of:
+        // one file_buf, one file_read_req, one splice pair, one shared pipe.
+        // Starting a second while the first is in flight overwrites all of it.
+        // serve_http() mallocs a new file_buf over the one the kernel is
+        // writing into — the old block is leaked and the buffer the kernel
+        // holds is no longer the one anybody will read — and it re-arms
+        // conn->file_read_req while a completion is still owed on it, which
+        // gives one request two live submissions and puts the loop's accounting
+        // out by one in each direction.  Then the first completion to land frees
+        // file_buf and nulls it, and the second builds a string_view over a null
+        // pointer: std::string throws logic_error out of a completion handler
+        // and the daemon terminates.  A client that pipelines two requests for a
+        // static file is all that takes.
+        //
+        // The guard has to be here and not at submit_next_read.  That one
+        // declines to arm a *one-shot* read while a file read is pending, which
+        // is enough for a one-shot read and nothing at all for a multishot recv:
+        // that is already armed and goes on delivering whatever the client sends
+        // for as long as the kernel keeps it alive.
+        //
+        // The bytes stay in partial and are parsed when the next read completes.
+        if (SOCKETLEY_UNLIKELY(conn->file_read_pending || conn->splice_pending ||
+                               conn->splice_in_pending || conn->splice_out_pending))
+            goto submit_next_read;
+
         // Wait for complete headers
         auto hdr_end = conn->partial.find("\r\n\r\n");
         if (hdr_end == std::string::npos)
@@ -3001,8 +3108,13 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         return;
     }
 
-    // Read error — send 404
-    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
+    // Read error — send 404.  A null buffer is treated as one: the caller that
+    // could produce it is guarded in handle_read, and answering 404 is what this
+    // function does with a read it cannot use.  Building the response out of it
+    // instead means std::string_view(nullptr, n), and std::string throws
+    // logic_error on that — from inside a completion handler, with no catch
+    // anywhere above it, which ends the process.
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || !conn->file_buf))
     {
         if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
         free(conn->file_buf);
@@ -3191,8 +3303,8 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     }
 }
 
-// One recvmsg at a time, always.  It reads into m_udp_recv_buf and writes the
-// sender into m_udp_recv_addr, both single-instance, so a second one armed
+// One recvmsg at a time, always.  It reads into m_udp_recv->buf and writes the
+// sender into m_udp_recv->addr, both single-instance, so a second one armed
 // beside it gives the kernel two writers into the same buffer and the same
 // sockaddr: datagrams interleave and replies go to the wrong peer.
 void server_instance::arm_udp_recv()
@@ -3202,8 +3314,8 @@ void server_instance::arm_udp_recv()
         m_udp_recv_armed = false;
         return;
     }
-    m_udp_recv_msg.msg_namelen = sizeof(m_udp_recv_addr);
-    m_udp_recv_armed = m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv_msg, &m_udp_recv_req);
+    m_udp_recv->msg.msg_namelen = sizeof(m_udp_recv->addr);
+    m_udp_recv_armed = m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv->msg, &m_udp_recv->req);
 }
 
 void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
@@ -3218,14 +3330,14 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     }
 
     // Register peer if new; skip processing if peer list is full
-    if (find_or_add_peer(m_udp_recv_addr) < 0)
+    if (find_or_add_peer(m_udp_recv->addr) < 0)
     {
         arm_udp_recv();
         return;
     }
 
     // Extract message — whole datagram = one message
-    std::string_view msg(m_udp_recv_buf, static_cast<size_t>(cqe->res));
+    std::string_view msg(m_udp_recv->buf, static_cast<size_t>(cqe->res));
 
     // Strip trailing newline if present
     if (!msg.empty() && msg.back() == '\n')

@@ -889,6 +889,188 @@ void event_loop::flush()
     }
 }
 
+// ─── one completion ─────────────────────────────────────────────────────────
+//
+// WHY THIS IS A FUNCTION RATHER THAN THE BODY OF THE LOOP BELOW
+//
+// The kernel chooses the order completions arrive in, and every lifetime defect
+// this project found in the last two days came from an order nobody had tried:
+// a completion for an owner that had already retired, a multishot that stopped
+// without saying so, a provided buffer attached to a completion nothing could
+// deliver.  Reproducing one of those needed a running daemon, a load generator
+// and a core dump.  The order itself, though, is just a sequence of CQEs, and a
+// sequence is something a fuzzer can *write* — if there is anything to hand it
+// to.
+//
+// There was not.  This decision lived inside io_uring_for_each_cqe, and a block
+// of code inside a loop is not a symbol: no test can call it, and neither the
+// explicit-instantiation trick nor the access-specifier one reaches it, because
+// both of those get at *functions*.  That is the same wall
+// runtime/proxy/http_response_framing.h was lifted over, and the same answer —
+// take what was already a self-contained decision and give it a name, so that
+// test/fuzz/fuzz_event_loop.cpp can feed it a completion the ring never
+// produced.
+//
+// Nothing about the decision changed in the move.  What it needs from the ring
+// is one field of the completion in front of it; everything else is this
+// object's own accounting, which is exactly what the fuzz target checks after
+// each step.  dispatch_ready() below is the same loop it always was, one call
+// shorter.
+event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
+{
+    // A cancel submitted by submit_cancel_fd() reports here.  It has no
+    // io_request — there is nothing to act on but "found it" or -ENOENT — but
+    // it *did* name a descriptor number, so the fact that it has now been
+    // consumed is exactly what close_fd() is waiting for.  It is told apart by
+    // the low bit, which no io_request address can have set: they are at least
+    // four-byte aligned, and the two removal helpers that also carry no request
+    // use a plain zero.
+    if (__builtin_expect((cqe->user_data & 1u) != 0, 0))
+    {
+        const uint32_t cfd = static_cast<uint32_t>(cqe->user_data >> 1);
+        if (m_fd_cancels && cfd < m_fd_table_size && m_fd_cancels[cfd] > 0)
+        {
+            --m_fd_cancels[cfd];
+            settle_deferred(cfd);
+        }
+        return cqe_outcome::next;
+    }
+
+    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+
+    if (__builtin_expect(req == &m_signal_req, 0))
+        return cqe_outcome::stop;
+
+    if (__builtin_expect(req != nullptr, 1))
+    {
+        // Being readable is not the same as being current.  The owner may have
+        // torn down since it submitted this, or the connection struct holding
+        // the request may have come back from a pool under a different owner
+        // entirely.  One indexed load and one compare settle it, and the answer
+        // is known before anything dereferences the handler.
+        const uint32_t tok = req->owner_token;
+
+        // Both of these are read before the dispatch, and that is not a
+        // convenience: on_cqe may free the storage the request lives in.  A
+        // handler is entitled to — this completion is the one that said the
+        // kernel was finished with it, and daemon_handler does exactly that
+        // when a CLI client hangs up, destroying the ipc_connection whose
+        // read_req this is.  Reading req->type afterwards was therefore a read
+        // of freed memory on every CLI disconnect.  It survived because the
+        // block was normally still mapped; churning server runtimes frees
+        // megabytes at a time, so the free that released the connection
+        // coalesced into the top chunk, glibc trimmed the heap back to the
+        // kernel, and the read landed on an unmapped page.
+        //
+        // Reading it early is also the more correct value: it is the type this
+        // submission was armed with, which is the counter arm() incremented,
+        // whatever a re-arm inside on_cqe may have written into the request
+        // since.
+        const uint8_t rtype = req->type;
+
+        // Read early for the same two reasons, and for a third: on_cqe very
+        // often re-arms this very request — the next read on the same
+        // connection, or the next leg of a splice onto a different descriptor —
+        // and arm() overwrites both fields.  The number to release is the one
+        // this completion is for, not the one the handler has just claimed.
+        const uint32_t rt1 = req->armed_target;
+        const uint32_t rt2 = req->armed_target2;
+
+        // What close_fd() discounts while the handler runs — see there.  Only
+        // for a completion that is the operation's last: with
+        // IORING_CQE_F_MORE the submission stays armed and is going to resolve
+        // its descriptor again, so it is not a number anyone may give away yet.
+        const bool final_cqe = (cqe->flags & IORING_CQE_F_MORE) == 0;
+        if (__builtin_expect(final_cqe, 1))
+        {
+            m_cqe_target  = rt1;
+            m_cqe_target2 = rt2;
+        }
+
+        if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
+                             && req->owner != nullptr, 1))
+            req->owner->on_cqe(cqe);
+        else
+            drop_completion(cqe, req);
+
+        m_cqe_target  = IO_TARGET_NONE;
+        m_cqe_target2 = IO_TARGET_NONE;
+
+        // IORING_CQE_F_MORE means the submission is still armed and will
+        // complete again; without it this was its last completion, delivered or
+        // dropped.  Accounting for the dropped ones too is the point: a slot
+        // that keeps looking armed is never reusable, and its owner can never
+        // be told it is quiescent.  cqe is the ring's own memory, so it stays
+        // readable whatever the handler did with its own.
+        if (__builtin_expect(final_cqe, 1))
+            disarm(tok, rtype, rt1, rt2);
+    }
+
+    return cqe_outcome::next;
+}
+
+// Batch-drain all available CQEs in one pass -- single io_uring_cq_advance.
+inline unsigned event_loop::dispatch_ready(bool& got_signal)
+{
+    struct io_uring_cqe* cqe;
+    unsigned head;
+    unsigned count = 0;
+    got_signal = false;
+
+    io_uring_for_each_cqe(&m_ring, head, cqe)
+    {
+        count++;
+        if (__builtin_expect(dispatch_cqe(cqe) == cqe_outcome::stop, 0))
+        {
+            got_signal = true;
+            break;
+        }
+    }
+
+    io_uring_cq_advance(&m_ring, count);
+
+    return count;
+}
+
+uint32_t event_loop::poll_completions(int timeout_ms)
+{
+    if (!m_ring_open)
+        return 0;
+
+    if (m_pending_submissions > 0)
+    {
+        io_uring_submit(&m_ring);
+        m_pending_submissions = 0;
+    }
+
+    struct io_uring_cqe* cqe = nullptr;
+    if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
+    {
+        if (timeout_ms <= 0)
+        {
+            // Peeking is not enough on its own.  With DEFER_TASKRUN the kernel
+            // only runs the task work that posts completions when the ring is
+            // entered, so a caller that never enters can watch an empty queue
+            // for ever while the work it is waiting for sits ready.
+            if (io_uring_get_events(&m_ring) < 0)
+                return 0;
+            if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
+                return 0;
+        }
+        else
+        {
+            struct __kernel_timespec ts{
+                timeout_ms / 1000,
+                static_cast<long long>(timeout_ms % 1000) * 1000000LL };
+            if (io_uring_wait_cqe_timeout(&m_ring, &cqe, &ts) < 0 || !cqe)
+                return 0;
+        }
+    }
+
+    bool got_signal = false;
+    return dispatch_ready(got_signal);
+}
+
 void event_loop::run()
 {
     m_running.store(true, std::memory_order_release);
@@ -916,116 +1098,8 @@ void event_loop::run()
                 break;
         }
 
-        // Batch-drain all available CQEs in one pass -- single io_uring_cq_advance.
-        // We prefetch the NEXT CQE's user_data while processing the current one,
-        // hiding the L2/L3 cache-miss latency on the io_request pointer.
-        unsigned head;
-        unsigned count = 0;
         bool got_signal = false;
-
-        io_uring_for_each_cqe(&m_ring, head, cqe)
-        {
-            count++;
-
-            // A cancel submitted by submit_cancel_fd() reports here.  It has no
-            // io_request — there is nothing to act on but "found it" or
-            // -ENOENT — but it *did* name a descriptor number, so the fact that
-            // it has now been consumed is exactly what close_fd() is waiting
-            // for.  It is told apart by the low bit, which no io_request
-            // address can have set: they are at least four-byte aligned, and
-            // the two removal helpers that also carry no request use a plain
-            // zero.
-            if (__builtin_expect((cqe->user_data & 1u) != 0, 0))
-            {
-                const uint32_t cfd = static_cast<uint32_t>(cqe->user_data >> 1);
-                if (m_fd_cancels && cfd < m_fd_table_size && m_fd_cancels[cfd] > 0)
-                {
-                    --m_fd_cancels[cfd];
-                    settle_deferred(cfd);
-                }
-                continue;
-            }
-
-            auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-
-            if (__builtin_expect(req == &m_signal_req, 0))
-            {
-                got_signal = true;
-                break;
-            }
-
-            if (__builtin_expect(req != nullptr, 1))
-            {
-                // Being readable is not the same as being current.  The owner
-                // may have torn down since it submitted this, or the connection
-                // struct holding the request may have come back from a pool
-                // under a different owner entirely.  One indexed load and one
-                // compare settle it, and the answer is known before anything
-                // dereferences the handler.
-                const uint32_t tok = req->owner_token;
-
-                // Both of these are read before the dispatch, and that is not a
-                // convenience: on_cqe may free the storage the request lives in.
-                // A handler is entitled to — this completion is the one that
-                // said the kernel was finished with it, and daemon_handler does
-                // exactly that when a CLI client hangs up, destroying the
-                // ipc_connection whose read_req this is.  Reading req->type
-                // afterwards was therefore a read of freed memory on every CLI
-                // disconnect.  It survived because the block was normally still
-                // mapped; churning server runtimes frees megabytes at a time, so
-                // the free that released the connection coalesced into the top
-                // chunk, glibc trimmed the heap back to the kernel, and the
-                // read landed on an unmapped page.
-                //
-                // Reading it early is also the more correct value: it is the
-                // type this submission was armed with, which is the counter
-                // arm() incremented, whatever a re-arm inside on_cqe may have
-                // written into the request since.
-                const uint8_t rtype = req->type;
-
-                // Read early for the same two reasons, and for a third: on_cqe
-                // very often re-arms this very request — the next read on the
-                // same connection, or the next leg of a splice onto a different
-                // descriptor — and arm() overwrites both fields.  The number to
-                // release is the one this completion is for, not the one the
-                // handler has just claimed.
-                const uint32_t rt1 = req->armed_target;
-                const uint32_t rt2 = req->armed_target2;
-
-                // What close_fd() discounts while the handler runs — see there.
-                // Only for a completion that is the operation's last: with
-                // IORING_CQE_F_MORE the submission stays armed and is going to
-                // resolve its descriptor again, so it is not a number anyone
-                // may give away yet.
-                const bool final_cqe = (cqe->flags & IORING_CQE_F_MORE) == 0;
-                if (__builtin_expect(final_cqe, 1))
-                {
-                    m_cqe_target  = rt1;
-                    m_cqe_target2 = rt2;
-                }
-
-                if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
-                                     && req->owner != nullptr, 1))
-                    req->owner->on_cqe(cqe);
-                else
-                    drop_completion(cqe, req);
-
-                m_cqe_target  = IO_TARGET_NONE;
-                m_cqe_target2 = IO_TARGET_NONE;
-
-                // IORING_CQE_F_MORE means the submission is still armed and
-                // will complete again; without it this was its last completion,
-                // delivered or dropped.  Accounting for the dropped ones too is
-                // the point: a slot that keeps looking armed is never reusable,
-                // and its owner can never be told it is quiescent.  cqe is the
-                // ring's own memory, so it stays readable whatever the handler
-                // did with its own.
-                if (__builtin_expect(final_cqe, 1))
-                    disarm(tok, rtype, rt1, rt2);
-            }
-        }
-
-        io_uring_cq_advance(&m_ring, count);
+        dispatch_ready(got_signal);
 
         if (__builtin_expect(got_signal, 0))
         {

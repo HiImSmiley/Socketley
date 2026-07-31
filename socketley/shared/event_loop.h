@@ -37,6 +37,21 @@ public:
     // process is about to give back.  Idempotent; the destructor calls it.
     void shutdown_ring();
 
+    // One pass of run()'s completion drain, without its loop and without its
+    // unbounded wait.  Dispatches every completion the ring has ready and
+    // returns how many; waits up to timeout_ms for the first one, or not at all
+    // when that is zero.
+    //
+    // This exists for a caller that owns the thread and cannot give it to run()
+    // — the operation-sequence fuzz targets, which have to interleave "arm
+    // something" and "let the ring report" under their own control.  It is the
+    // same body run() uses, deliberately: a harness with a drain loop of its own
+    // would be checking a dispatcher the daemon does not have.
+    //
+    // Not a substitute for run() in the daemon.  It never observes the stop
+    // eventfd, so nothing here ends on request_stop().
+    uint32_t poll_completions(int timeout_ms = 0);
+
     void request_stop();
     int get_signal_write_fd() const;
 
@@ -337,6 +352,19 @@ private:
     struct io_uring_sqe* get_sqe();
     void setup_eventfd();
     bool init_fd_tables();
+
+    // What run()'s drain loop must do after one completion.  `stop` is only
+    // ever the eventfd's own read reporting, which is how request_stop() ends
+    // the loop.  See the note above event_loop::dispatch_cqe in event_loop.cpp
+    // for why the decision below is a function at all.
+    enum class cqe_outcome : uint8_t { next, stop };
+    cqe_outcome dispatch_cqe(struct io_uring_cqe* cqe);
+
+    // Dispatch every completion currently in the ring and advance the queue.
+    // Returns how many were consumed; sets got_signal when one of them was the
+    // stop eventfd, in which case the ones behind it are deliberately left for
+    // the next pass rather than dispatched into a daemon that is shutting down.
+    unsigned dispatch_ready(bool& got_signal);
 
     // Stamp the owner identity and the descriptor(s) named onto a submission,
     // count it as outstanding and count it towards the next flush.  Every

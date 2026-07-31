@@ -22,7 +22,7 @@
 # Exit codes:  0 built   1 unavailable (or unavailable+required)   2 build failed
 #
 # Output: bin/fuzz-libfuzzer/{fuzz_resp,fuzz_ws_frame,fuzz_cache_ops,fuzz_http_response,
-#         fuzz_http_request}
+#         fuzz_event_loop,fuzz_http_request,fuzz_server_ops,fuzz_client_ops}
 #
 # ─── WHY THERE IS NO MEMORYSANITIZER BUILD HERE ─────────────────────────────
 #
@@ -42,12 +42,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$ROOT/bin/fuzz-libfuzzer"
 REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 
-# Which targets to build.  Default is all five.  The per-push CI job narrows
-# this to the four cheap ones, because fuzz_http_request drags in fifteen SDK
-# translation units and that is a nightly cost, not a per-push one.  Narrowing
-# is always an explicit decision by the caller — nothing here drops a target
-# because building it happened to fail.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request"
+# Which targets to build.  Default is all eight.  The per-push CI job narrows
+# this to the five cheap ones, because the three SDK-linking targets
+# (fuzz_http_request, fuzz_server_ops, fuzz_client_ops) drag in fifteen SDK
+# translation units between them and that is a nightly cost, not a per-push one.
+# Narrowing is always an explicit decision by the caller — nothing here drops a
+# target because building it happened to fail.
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -136,38 +137,71 @@ want fuzz_cache_ops && build fuzz_cache_ops \
 # which is why this one is in the per-push job and fuzz_http_request is not.
 want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_response.cpp"
 
-# ─── fuzz_http_request ──────────────────────────────────────────────────────
+# fuzz_event_loop needs one .cpp out of shared/, not the SDK: event_loop.cpp
+# includes liburing and logging.h and nothing else of ours, so this target is
+# two translation units and one system library.  It never opens a ring — see the
+# header of fuzz_event_loop.cpp for why handing its SQEs to a kernel would be a
+# hazard rather than a test — so -luring is a link-time dependency only and the
+# binary runs anywhere, including a container with io_uring blocked.
+want fuzz_event_loop && build fuzz_event_loop \
+    "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/event_loop.cpp" -luring
+
+# ─── the targets that link the runtime ──────────────────────────────────────
 #
-# This one needs the runtime: parse_http_request_line lives in
-# proxy_instance.cpp and there is no smaller unit that contains it.  It cannot
-# link premake's GCC archive — that archive is built with GCC's ASan, and one
-# process cannot host both GCC's and clang's sanitizer runtimes — so the SDK
-# sources are compiled here with clang as well.  That is a real cost (fifteen
-# translation units, the slowest being lua_context.cpp against sol2) so the
-# objects are cached in $SDK_OBJ and only rebuilt when a source is newer.
+# fuzz_http_request, fuzz_server_ops and fuzz_client_ops all need the runtime
+# itself.  parse_http_request_line lives in proxy_instance.cpp and there is no
+# smaller unit that contains it; the two operation-sequence targets drive a real
+# server_instance and client_instance against a real io_uring event_loop, which
+# is the whole point of them.  None of the three can link premake's GCC archive —
+# that archive is built with GCC's ASan, and one process cannot host both GCC's
+# and clang's sanitizer runtimes — so the SDK sources are compiled here with
+# clang as well.  That is a real cost (fifteen translation units, the slowest
+# being lua_context.cpp against sol2) so the objects are cached in $SDK_OBJ,
+# shared by all three, and only rebuilt when a source is newer.
+#
+# SOCKETLEY_INVARIANTS is defined for these objects and nowhere else.  It is what
+# makes the calls in socketley/shared/invariants.h live: the pool-safety check in
+# server_instance::pool_release and the reachability check in on_cqe compile to
+# nothing without it, and those two are half of what fuzz_server_ops exists to
+# assert.  It costs the shipped binary nothing, because the shipped binary is not
+# built from these objects.
 #
 # This does NOT make clang a build dependency of socketley.  These objects are
 # instrumented fuzzing artifacts under bin/; the shipped binary is still GCC's.
-if want fuzz_http_request; then
+if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops; then
 SDK_OBJ="$OUT/sdk-obj"
 mkdir -p "$SDK_OBJ"
 
 SDK_INC=(-I"$ROOT" -I"$ROOT/socketley" -I"$ROOT/include/linux" -I"$ROOT/test/fuzz"
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit")
+SDK_DEF=(-DSOCKETLEY_LINUX -DDEBUG -DSOCKETLEY_INVARIANTS)
+
+# The cache below is keyed on mtime alone, which says nothing about the flags an
+# object was built with.  Adding SOCKETLEY_INVARIANTS to the set would therefore
+# have been silently ignored for every source that had not changed since — the
+# targets would link objects with the invariant calls compiled out and report a
+# clean run for checks that were never in the binary.  So the flag set is
+# recorded next to the objects and a change to it empties the cache.
+SDK_STAMP="$SDK_OBJ/.flags"
+SDK_KEY="$CLANG|${SDK_DEF[*]}|c++23"
+if [ "$(cat "$SDK_STAMP" 2>/dev/null)" != "$SDK_KEY" ]; then
+    rm -f "$SDK_OBJ"/*.o
+    printf '%s' "$SDK_KEY" > "$SDK_STAMP"
+fi
 
 # The source list is read out of premake's generated makefile rather than
 # duplicated here, so a file added to the SDK cannot silently go un-fuzzed.
 SDK_MAKE="$ROOT/make/socketley_sdk.make"
 if [ ! -f "$SDK_MAKE" ]; then
-    echo "  fuzz_http_request: $SDK_MAKE not found — run ./bin/premake5 gmake2 first"
+    echo "  runtime targets: $SDK_MAKE not found — run ./bin/premake5 gmake2 first"
     rc=2
 else
     mapfile -t SDK_SRCS < <(grep -oE '\.\./[A-Za-z0-9_/.-]+\.cpp' "$SDK_MAKE" | sort -u | sed "s|^\.\./|$ROOT/|")
     if [ "${#SDK_SRCS[@]}" -eq 0 ]; then
-        echo "  fuzz_http_request: no sources parsed out of $SDK_MAKE"
+        echo "  runtime targets: no sources parsed out of $SDK_MAKE"
         rc=2
     else
-        echo "  fuzz_http_request: ${#SDK_SRCS[@]} SDK sources"
+        echo "  runtime targets: ${#SDK_SRCS[@]} SDK sources"
         sdk_objs=()
         sdk_fail=0
         for src in "${SDK_SRCS[@]}"; do
@@ -179,7 +213,7 @@ else
             if ! "$CLANG" -std=c++23 -g -O1 \
                     -fsanitize=fuzzer-no-link,address,undefined \
                     -fno-sanitize-recover=all -fno-omit-frame-pointer \
-                    -DSOCKETLEY_LINUX -DDEBUG "${SDK_INC[@]}" \
+                    "${SDK_DEF[@]}" "${SDK_INC[@]}" \
                     -c "$src" -o "$obj" 2>"$probe/sdk.err"; then
                 echo "  FAILED (SDK): ${src#"$ROOT/"}"
                 sed 's/^/    /' "$probe/sdk.err" | head -20
@@ -192,12 +226,17 @@ else
             rc=2
         else
             # -std=c++23 comes after FLAGS' -std=c++20 and therefore wins: the
-            # runtime headers this target pulls in need it, the two header-only
-            # targets do not.
-            build fuzz_http_request "$ROOT/test/fuzz/fuzz_http_request.cpp" \
-                "${sdk_objs[@]}" -std=c++23 "${SDK_INC[@]}" \
-                -DSOCKETLEY_LINUX -DDEBUG \
-                -L"$ROOT/thirdparty/luajit" -lluajit -luring -lssl -lcrypto -ldl -lpthread
+            # runtime headers these targets pull in need it, the header-only
+            # ones do not.
+            RT_LINK=(-std=c++23 "${SDK_INC[@]}" "${SDK_DEF[@]}"
+                     -L"$ROOT/thirdparty/luajit" -lluajit -luring -lssl -lcrypto -ldl -lpthread)
+
+            want fuzz_http_request && build fuzz_http_request \
+                "$ROOT/test/fuzz/fuzz_http_request.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
+            want fuzz_server_ops && build fuzz_server_ops \
+                "$ROOT/test/fuzz/fuzz_server_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
+            want fuzz_client_ops && build fuzz_client_ops \
+                "$ROOT/test/fuzz/fuzz_client_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
         fi
     fi
 fi
