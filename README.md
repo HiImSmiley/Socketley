@@ -1,8 +1,20 @@
 # Socketley
 
-A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style - with clustering, TLS, WebSocket, Lua scripting, and io_uring async I/O.
+A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style - with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 
 **[Documentation](https://hiimsmiley.github.io/Socketley/)**
+
+> **TLS is not implemented.** This line used to list TLS as a feature and the
+> feature list below promised "optional encryption for all runtime types". There
+> is no TLS transport in this codebase: no runtime performs a handshake, and the
+> OpenSSL wrapper in `socketley/shared/tls_context.cpp` is not driven by
+> anything. The `--tls`, `--cert`, `--key`, `--ca`, `--client-ca`,
+> `--client-cert` and `--client-key` flags therefore **fail closed** — they are
+> refused when you set them and again before a runtime with them starts, and a
+> runtime configured with any of them goes to the `failed` state instead of
+> listening. That is deliberate: a flag that errors out costs you an afternoon,
+> a flag that silently serves cleartext on a port you were told was encrypted is
+> a breach. Do not put socketley on an untrusted network expecting encryption.
 
 ## About Me and the Project
 
@@ -64,7 +76,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Master mode**:One client claims master, broadcasts to all; optional forwarding
 - **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
-- **TLS/SSL**:Optional encryption for all runtime types
+- **TLS/SSL**:*Not implemented.* The flags exist and are refused — see the note at the top
 - **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
 - **io_uring**:Multishot accept, SQPOLL, provided buffers, writev coalescing
 - **State persistence**:Runtime configs saved as JSON, auto-restored on daemon restart
@@ -302,7 +314,7 @@ bash test/benchmark/run_all.sh
 
 - Linux 5.19+ (for io_uring multishot accept)
 - liburing-dev
-- libssl-dev (for TLS and WebSocket)
+- libssl-dev (WebSocket handshake hashing; the TLS wrapper also links against it, but see the TLS note above)
 - GCC 12+ (C++23)
 
 ### Toolchain
