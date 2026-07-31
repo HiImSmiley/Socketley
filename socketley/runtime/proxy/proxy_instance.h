@@ -15,6 +15,7 @@
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/trace.h"
+#include "http_response_framing.h"
 
 class runtime_manager;
 
@@ -222,28 +223,16 @@ struct alignas(64) proxy_backend_connection
     // === COLD fields ===
     int pipe_to_client[2]{-1, -1};
 
-    // HTTP response tracking for connection pooling
-    bool http_headers_parsed{false};
-    bool http_has_content_length{false};
-    bool http_conn_close{false};
-    bool http_chunked{false};
-    bool http_no_body{false};      // 204/304/1xx: no message body
-    uint16_t http_status_code{0};
-    size_t http_body_remaining{0};
-
-    // At least one byte of this response has been forwarded already.  The
-    // header scan only ever looks at the chunk in front of it, so it can only
-    // be trusted on the *first* chunk: run it on a later one and it finds its
-    // "\r\n\r\n" somewhere inside the body and reads body bytes as a status
-    // line and headers.
-    bool http_response_bytes_seen{false};
-    // The length of this response could not be established with certainty —
-    // the header block straddled a read boundary, or it was framed in a way a
-    // backend and this proxy could read differently.  Deciding a response is
-    // over when it is not hands the socket to the pool with the tail of the
-    // previous answer still queued on it, and the next borrower reads someone
-    // else's response as the start of its own.  Never pool one of these.
-    bool http_frame_unknown{false};
+    // HTTP response tracking for connection pooling.  The whole of it lives in
+    // http_response_framing.h now — the scan, the completeness predicate and
+    // the state below — so that it can be reached without a daemon, a socket or
+    // an event loop.  test/fuzz/fuzz_http_response.cpp drives exactly this
+    // struct through exactly the function handle_backend_read calls.
+    //
+    // Being one object rather than nine loose members also means reset() clears
+    // it with a single assignment, so a field added here cannot be forgotten
+    // there and leak from one response into the next.
+    http_response_framing http_frame;
 
     // Set while pool_draining when the cancelled read turns out to have
     // delivered something other than the cancellation: data past the end of

@@ -604,7 +604,7 @@ project "test_sdk_ws_client"
 -- bugs.  The TSan exclusion is not optional: ASan and TSan cannot coexist in one
 -- process, and these targets have no threads for TSan to look at anyway.
 --
--- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request
+-- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request
 
 local function fuzz_target_settings()
     targetdir ("bin/%{cfg.buildcfg}")
@@ -692,6 +692,31 @@ project "fuzz_cache_ops"
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
         "socketley/runtime/cache/cache_store.cpp"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: proxy HTTP response framing + pooling decision ───
+--
+-- The counterpart to fuzz_http_request, and the cheap one.  The response parser
+-- used to be a block of statements inside handle_backend_read, reachable only
+-- from a running daemon; it is now runtime/proxy/http_response_framing.h, which
+-- includes <charconv> and <string_view> and nothing else.  So this target is
+-- three translation units like fuzz_resp, links no libraries, and belongs in
+-- the per-push job — unlike fuzz_http_request, which still needs the whole SDK.
+
+project "fuzz_http_response"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_http_response.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/proxy/http_response_framing.h"
     }
 
     fuzz_target_settings()

@@ -11,9 +11,9 @@
 #   * the unit tests
 #   * the full integration suite, guarded so that a suite which ran fewer tests
 #     than exist on disk fails instead of reporting a smaller success
-#   * a short coverage-guided fuzz run against the RESP and WebSocket parsers
-#     and against cache_store driven as an operation sequence, under
-#     clang/libFuzzer with ASan+UBSan
+#   * a short coverage-guided fuzz run against the RESP and WebSocket parsers,
+#     the proxy's HTTP response framing, and cache_store driven as an operation
+#     sequence, under clang/libFuzzer with ASan+UBSan
 #   * a clang -Wall -Wextra build of the whole tree, for the diagnostics GCC
 #     does not emit
 #
@@ -35,8 +35,10 @@
 #   * fuzz_http_request.  That target needs the runtime, which under clang means
 #     compiling fifteen SDK translation units with sanitizers (see the header
 #     comment in test/fuzz/fuzz_http_request.cpp).  That is a nightly cost, not
-#     a per-push one.  Consequence: a regression in the proxy's HTTP header
-#     handling is caught within a day, not within a push.
+#     a per-push one.  Consequence: a regression in the proxy's *request* header
+#     handling is caught within a day, not within a push.  The response side is
+#     covered here — fuzz_http_response needs no SDK at all, because that parser
+#     was lifted into runtime/proxy/http_response_framing.h.
 #   * MemorySanitizer.  Deliberately absent everywhere, not an oversight — it
 #     needs libc++ and every dependency (liburing, OpenSSL, LuaJIT) rebuilt with
 #     -fsanitize=memory or it reports a false positive per uninstrumented byte,
@@ -132,15 +134,17 @@ jobs:
         timeout-minutes: 12
 
       - name: Build fuzz targets (GCC replay floor, ASan+UBSan)
-        # The two header-only targets plus fuzz_cache_ops, which adds exactly one
-        # runtime translation unit (cache_store.cpp needs nothing but libc).  All
-        # three compile in seconds.  See the note above about fuzz_http_request,
-        # which does not.
+        # The two header-only targets, fuzz_cache_ops (which adds exactly one
+        # runtime translation unit — cache_store.cpp needs nothing but libc) and
+        # fuzz_http_response (which adds none: the proxy's response framing lives
+        # in a header that includes <charconv> and <string_view>).  All four
+        # compile in seconds.  See the note above about fuzz_http_request, which
+        # does not.
         run: |
           cd make
-          make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops
+          make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response
           cd ..
-          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops; do
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response; do
             test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
           done
 
@@ -153,13 +157,13 @@ jobs:
         # step pass because it did nothing.
         env:
           REQUIRE_LIBFUZZER: "1"
-          LIBFUZZER_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops
+          LIBFUZZER_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response
         run: bash test/fuzz/build_libfuzzer.sh
 
       - name: Seed corpus
         run: |
           python3 test/fuzz/make_corpus.py
-          for d in resp ws cache; do
+          for d in resp ws cache httpresp; do
             n=$(find "test/fuzz/corpus/$d" -type f | wc -l)
             echo "corpus/$d: $n files"
             [ "$n" -gt 0 ] || { echo "corpus/$d is empty — a fuzz run over it proves nothing"; exit 1; }
@@ -189,10 +193,21 @@ jobs:
         # stops being read.  The nightly runs the same target and is the one
         # that holds the truth.  Do not add an id here without adding the
         # matching entry to the nightly's KNOWN RED note.
+        #
+        # FUZZ_HTTPRESP_SKIP, by contrast, is not empty, and every id in it is a
+        # live finding in the proxy's response framing that this target raised on
+        # the day it was written (2026-07-31).  They are listed in full in the
+        # nightly's KNOWN RED note, which runs the same target with nothing
+        # demoted and is the record of what is open.  They are demoted *here* so
+        # that this job keeps catching new regressions instead of being red from
+        # the first push; remove an id the moment its defect is fixed.
         env:
-          FUZZ_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops
+          FUZZ_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response
           FUZZ_SEED: "1"
           REQUIRE_LIBFUZZER: "1"
+          FUZZ_HTTPRESP_SKIP: >-
+            pool-eol,pool-no-headers,pool-no-boundary,pool-1xx-chain,
+            pool-te,pool-cl-bad,pool-name-ws,pool-obs-fold
         run: bash test/fuzz/run_fuzz.sh 30 Sanitize
         timeout-minutes: 10
 

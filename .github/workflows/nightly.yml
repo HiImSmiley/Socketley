@@ -7,7 +7,7 @@
 #
 # ┌───────────────────┬────────────────────────────────────────────────────────┐
 # │ sanitizers        │ ASan+UBSan build, unit + integration suite             │
-# │ fuzz              │ long fuzz run, all four targets, corpus carry-over     │
+# │ fuzz              │ long fuzz run, all five targets, corpus carry-over     │
 # │ invariants        │ -DSOCKETLEY_INVARIANTS -DSOCKETLEY_INVARIANTS_WARN_ONLY│
 # │                   │ suite + the fast load harnesses                        │
 # │ load              │ Release build, the calibrated measurement harnesses    │
@@ -116,9 +116,16 @@ jobs:
           retention-days: 30
 
   # ───────────────────────────────────────────────────────────────────────────
-  # The long fuzz run.  All three targets, ASan+UBSan, with the corpus carried
-  # over from the previous night through the actions cache so each run starts
-  # where the last one stopped rather than from the seeds every time.
+  # The long fuzz run.  All five targets, ASan+UBSan, with the *working* corpus
+  # carried over from the previous night through the actions cache so each run
+  # starts where the last one stopped rather than from the seeds every time.
+  #
+  # The cache holds bin/fuzz-corpus, not test/fuzz/corpus.  libFuzzer writes what
+  # it discovers into the first corpus directory it is given, and that used to be
+  # the tracked seed directory — which is how test/fuzz/corpus/cache reached 6783
+  # committed files that nobody had read.  run_fuzz.sh now passes a working
+  # directory first and the seeds second (read-only), so the growth happens under
+  # bin/ and the repository keeps only what make_corpus.py generates.
   #
   # This job also builds the libFuzzer versions when clang can produce them.
   # The GCC replay driver always runs; libFuzzer runs on top when available.
@@ -149,7 +156,7 @@ jobs:
       - name: Restore fuzz corpus
         uses: actions/cache/restore@v4
         with:
-          path: test/fuzz/corpus
+          path: bin/fuzz-corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-
@@ -160,7 +167,7 @@ jobs:
         run: |
           python3 test/fuzz/make_corpus.py
           total=0
-          for d in resp ws http cache; do
+          for d in resp ws http httpresp cache; do
             n=$(find "test/fuzz/corpus/$d" -type f | wc -l)
             echo "corpus/$d: $n files"
             [ "$n" -gt 0 ] || { echo "corpus/$d is empty"; exit 1; }
@@ -168,13 +175,16 @@ jobs:
           done
           echo "total corpus: $total files"
           [ "$total" -ge 100 ] || { echo "corpus is implausibly small ($total) — refusing to call this a fuzz run"; exit 1; }
+          # And the working corpus, which is what actually grows.  Empty on the
+          # first run after this changed, and never empty again.
+          find bin/fuzz-corpus -type f 2>/dev/null | wc -l | xargs echo "carried-over working corpus:"
 
       - name: Build fuzz targets (GCC, ASan+UBSan)
         run: |
           ./bin/premake5 gmake2
-          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request
+          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request
           cd ..
-          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request; do
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request; do
             test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
           done
 
@@ -184,7 +194,7 @@ jobs:
         # ubuntu-24.04 ships clang-18 and libclang-rt-18-dev, so a failure to
         # build libFuzzer now means a real breakage, not an absent toolchain.
         #
-        # All four targets, including fuzz_http_request — which compiles the
+        # All five targets, including fuzz_http_request — which compiles the
         # fifteen SDK translation units with clang because it cannot link
         # premake's GCC/ASan archive (one process, one sanitizer runtime).  That
         # is the expensive part of this job and the reason it is nightly.
@@ -219,6 +229,70 @@ jobs:
         #
         # Do NOT silence this by dropping the target or setting FUZZ_SMUGGLING=0.
         # It goes green when parse_http_request_line is fixed.
+        #
+        # KNOWN RED (2026-07-31): fuzz_http_response fails on its first run,
+        # and it is not the harness.  This target was written on the day the
+        # response framing was lifted out of handle_backend_read, and it raised
+        # everything below within two million executions.  Each id is a
+        # RESP_FINDING in test/fuzz/fuzz_http_response.cpp, and each one ends the
+        # same way: a backend socket returns to the pool at an offset that is not
+        # a message boundary, so the next client to borrow it reads the tail of a
+        # stranger's response as the head of its own.
+        #
+        #   pool-eol / pool-no-headers / pool-no-boundary / pool-1xx-chain
+        #     One defect under four ids.  The 1xx branch of the scan clears
+        #     response_bytes_seen, which re-arms the assumption that the next read
+        #     begins a response.  It does not, when the backend flushed the
+        #     interim 1xx together with the head of the real response: the rest of
+        #     that header block arrives in the following read and is parsed as a
+        #     whole response, so the first surviving header line becomes the
+        #     status line and everything before the read boundary — the real
+        #     status, a Transfer-Encoding, a Connection: close — is invisible.
+        #     This is precisely the defect response_bytes_seen was added to
+        #     prevent, reintroduced by the reset.  Reproduced without the fuzzer:
+        #       read 1: "HTTP/1.1 100 Continue\r\n\r\n"
+        #               "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+        #       read 2: "Content-Length: 5\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n"
+        #     gives headers_parsed, chunked=false, Content-Length=5, and the
+        #     socket declared poolable with the chunked terminator still on it.
+        #     The same two reads without the leading 1xx correctly come out
+        #     unknown=true and not poolable.
+        #
+        #   pool-te
+        #     The Transfer-Encoding test is `size >= 7 && val[0..1] == "ch"` over
+        #     a value trimmed of spaces only.  "Transfer-Encoding:\tchunked" (a
+        #     tab), "identity" and "gzip" therefore all read as no transfer
+        #     coding, and with a Content-Length also present the response is
+        #     framed by that length — while the body is chunked, or runs to
+        #     connection close.  RFC 9112 Section 6.1: any transfer coding makes
+        #     Content-Length inoperative.
+        #     Seeds: httpresp/te_tab_value, cl_te_identity, cl_te_gzip.
+        #
+        #   pool-cl-bad
+        #     std::from_chars succeeds on a partial parse, so "Content-Length: 3x"
+        #     yields 3; two Content-Lengths that disagree silently resolve to the
+        #     last one.  RFC 9112 Section 6.3 requires both to be treated as
+        #     unrecoverable.
+        #     Seeds: httpresp/cl_trailing_junk, cl_twice_diff.
+        #
+        #   pool-name-ws / pool-obs-fold
+        #     The two header-block shapes RFC 9112 requires a recipient to refuse
+        #     rather than interpret: whitespace between a field name and its colon
+        #     (Section 5.1), and obsolete line folding (Section 5.2).  This proxy
+        #     interprets both, differently from a lenient backend, and pools.
+        #     Lower severity than the four above — they need an unusual backend
+        #     rather than a common one — but the same failure.
+        #     Seeds: httpresp/cl_space_before_colon, obs_fold_te.
+        #
+        # Two more are printed as observations rather than failures, because the
+        # cost is a failed request rather than crossed data: a Connection: close
+        # that is not the first token in its list is missed ("keep-alive, close"),
+        # and a response with no readable status code is framed by Content-Length
+        # although 1xx/204/304 cannot be ruled out.
+        #
+        # Do NOT silence any of this by setting FUZZ_HTTPRESP_SKIP here.  The
+        # per-push job carries the skip list so that it can still catch new
+        # regressions; this job is the record, and the record must stay honest.
         #
         # fuzz_cache_ops has no open findings.  FUZZ_CACHE_SKIP is deliberately
         # NOT set here — the per-push job is where it would go if one reopened;
@@ -269,7 +343,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: test/fuzz/corpus
+          path: bin/fuzz-corpus
           key: fuzz-corpus-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4

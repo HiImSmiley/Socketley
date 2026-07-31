@@ -6,7 +6,10 @@
 #   config   premake config directory under bin/ (default: Sanitize)
 #
 # Environment:
-#   FUZZ_CORPUS_ROOT   corpus root (default test/fuzz/corpus)
+#   FUZZ_CORPUS_ROOT   seed corpus root, READ ONLY (default test/fuzz/corpus)
+#   FUZZ_WORK_ROOT     where libFuzzer writes what it discovers
+#                      (default bin/fuzz-corpus, gitignored).  See the note
+#                      below on why these are two directories and not one.
 #   FUZZ_ARTIFACTS     where a crashing input is written (default bin/fuzz-artifacts)
 #   FUZZ_SEED          PRNG seed for the replay driver (default 1)
 #   FUZZ_SMUGGLING=0   downgrade the HTTP smuggling oracle to a warning (triage only)
@@ -14,6 +17,8 @@
 #                      from a failure to a printed observation.  Triage only:
 #                      it exists so a run can get past a known defect and look
 #                      for the next one.  See the header of fuzz_cache_ops.cpp.
+#   FUZZ_HTTPRESP_SKIP the same thing for fuzz_http_response; the ids are the
+#                      first argument of each RESP_FINDING in that file.
 #   REQUIRE_LIBFUZZER=1  a target with no libFuzzer binary is a failure rather
 #                      than a target that quietly ran the replay driver only.
 #                      Set this anywhere the runner is known to have clang —
@@ -24,16 +29,35 @@
 #                      set is a decision the caller states, never something that
 #                      happens because a binary quietly was not built.
 #
-# WHAT THIS COVERS.  The three parsers an unauthenticated peer can reach — RESP,
-# WebSocket frames, and the proxy's HTTP request line and header block — plus
-# cache_store driven as a sequence of operations, which is a different kind of
-# target: it checks accounting, eviction order and lifetime invariants after
-# every step rather than looking for a crash on one buffer.
+# WHAT THIS COVERS.  The four parsers an unauthenticated peer can reach — RESP,
+# WebSocket frames, the proxy's HTTP request line and header block, and the
+# proxy's response framing, which is the one that decides whether a backend
+# socket may be pooled — plus cache_store driven as a sequence of operations,
+# which is a different kind of target: it checks accounting, eviction order and
+# lifetime invariants after every step rather than looking for a crash on one
+# buffer.
 #
 # WHAT IT DOES NOT.  No io_uring, no connection lifecycle, no Lua, no command
 # dispatch between the RESP parser and the store, and no load() over a file that
-# save() did not write.  A green run here says these four survived the inputs
+# save() did not write.  A green run here says these five survived the inputs
 # tried; it says nothing about the code that calls them.
+#
+# ─── TWO CORPUS DIRECTORIES, ON PURPOSE ─────────────────────────────────────
+#
+# libFuzzer writes every input it finds interesting back into the *first*
+# corpus directory on its command line.  This script used to pass the tracked
+# seed directory there, so a nightly run added several thousand files to a
+# directory under version control: test/fuzz/corpus/cache went from 37 seeds to
+# 6783 files, none of them readable, none of them reviewed, and all of them in
+# the repository.  The seeds stopped being seeds.
+#
+# So the seed directory is now passed second — libFuzzer reads additional corpus
+# directories and never writes to them — and a working directory under bin/ is
+# passed first.  The working set is what grows during a run and what CI carries
+# between runs through actions/cache; the repository holds only what
+# make_corpus.py generates plus a handful of hand-added reproducers.  A future
+# run cannot swell the tracked set because it is not writable from libFuzzer's
+# point of view at all.
 #
 # WHY IT FAILS LOUDLY.  Three separate ways a fuzz step can pass while doing
 # nothing — missing binaries, an empty corpus, a target that exits 0 without
@@ -48,10 +72,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 BIN_DIR="$ROOT/bin/$CONFIG"
 CORPUS_ROOT="${FUZZ_CORPUS_ROOT:-$ROOT/test/fuzz/corpus}"
+WORK_ROOT="${FUZZ_WORK_ROOT:-$ROOT/bin/fuzz-corpus}"
 ARTIFACTS="${FUZZ_ARTIFACTS:-$ROOT/bin/fuzz-artifacts}"
 LIBFUZZ_DIR="$ROOT/bin/fuzz-libfuzzer"
 
-mkdir -p "$ARTIFACTS"
+mkdir -p "$ARTIFACTS" "$WORK_ROOT"
 
 # UBSan must abort rather than print-and-continue: a diagnostic on stderr in a
 # job nobody reads is the same as no check at all.
@@ -63,9 +88,10 @@ declare -A CORPUS=(
     [fuzz_ws_frame]=ws
     [fuzz_cache_ops]=cache
     [fuzz_http_request]=http
+    [fuzz_http_response]=httpresp
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request}"
 
 fail=0
 ran=0
@@ -82,6 +108,8 @@ for target in "${TARGETS[@]}"; do
         continue
     fi
     corpus="$CORPUS_ROOT/${CORPUS[$target]}"
+    work="$WORK_ROOT/${CORPUS[$target]}"
+    mkdir -p "$work"
 
     if [ ! -d "$corpus" ] || [ -z "$(ls -A "$corpus" 2>/dev/null)" ]; then
         echo "FAIL $target: corpus $corpus is missing or empty"
@@ -112,8 +140,12 @@ for target in "${TARGETS[@]}"; do
         # of a run, that was the entire budget: 141 executions in 90 seconds
         # with the lines on, 187,000 in 26 seconds with them off.  Every target
         # pays some of this; none of them needs the output.
+        # $work first, $corpus second.  libFuzzer writes new inputs only into
+        # the first directory; every further one is read-only additional
+        # corpus.  That is the whole of the mechanism keeping discoveries out of
+        # the tracked seed set — see the note at the top of this file.
         if ! FUZZ_ARTIFACTS="$ARTIFACTS" "$LIBFUZZ_DIR/$target" \
-                "$corpus" \
+                "$work" "$corpus" \
                 -max_total_time="$SECS" \
                 -print_final_stats=1 \
                 -print_funcs=0 \
@@ -134,7 +166,9 @@ for target in "${TARGETS[@]}"; do
     fi
 
     echo "--- $target (replay) ---"
-    if ! FUZZ_SECONDS="$SECS" FUZZ_ARTIFACTS="$ARTIFACTS" "$BIN_DIR/$target" "$corpus"; then
+    # The replay driver reads every path it is given and writes to none of them,
+    # so it gets both: the seeds, and whatever the libFuzzer half just found.
+    if ! FUZZ_SECONDS="$SECS" FUZZ_ARTIFACTS="$ARTIFACTS" "$BIN_DIR/$target" "$corpus" "$work"; then
         echo "FAIL $target (replay)"
         fail=$((fail + 1))
     fi

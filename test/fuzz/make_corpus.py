@@ -7,17 +7,39 @@ same file names with the same contents, so re-running never churns the tree.
 
 Every shape here is taken from traffic the project already produces:
 
-  RESP    test/unit/test_resp_parser.cpp, test/integration/test_cache*.sh,
-          test/benchmark/bench_cache_resp.sh
-  WS      test/unit/test_ws_parser.cpp, test/load/lib/wsharness.py
-  HTTP    test/load/lib/httpharness.py, test/integration/test_proxy_*.sh
-  CACHE   test/unit/test_cache_store.cpp — operation sequences rather than
-          protocol messages; see the section header further down
+  RESP     test/unit/test_resp_parser.cpp, test/integration/test_cache*.sh,
+           test/benchmark/bench_cache_resp.sh
+  WS       test/unit/test_ws_parser.cpp, test/load/lib/wsharness.py
+  HTTP     test/load/lib/httpharness.py, test/integration/test_proxy_*.sh
+  HTTPRESP test/load/lib/backend.py and the responses the proxy integration
+           tests' backends return; see the section header further down
+  CACHE    test/unit/test_cache_store.cpp — operation sequences rather than
+           protocol messages; see the section header further down
 
 plus, for each protocol, the boundary cases that a peer reaches by doing
 nothing more clever than stopping mid-message.  A corpus of only valid traffic
 teaches a mutator nothing about the error paths, and the error paths are where
 this project's defects live.
+
+WHAT ELSE IS TRACKED, AND WHAT IS NOT
+-------------------------------------
+Two kinds of file live in test/fuzz/corpus/ and no third kind:
+
+  * the seeds this script generates, named "<label>-<digest>"; and
+  * "found-<digest>" — a discovery kept because it reaches a coverage edge no
+    generated seed reaches, or a crash case somebody reduced by hand.
+
+Everything libFuzzer finds during a run goes to bin/fuzz-corpus/ instead, which
+is gitignored and is what CI carries between runs through actions/cache.  It
+used not to: run_fuzz.sh passed this directory to libFuzzer, libFuzzer writes
+its discoveries into the first corpus directory on its command line, and a few
+nights of that left 7158 unreadable files (30 MB) in the repository — 6746 of
+them in corpus/cache alone, against 37 seeds.  A corpus in the repository that
+nobody can read is not a corpus.
+
+KEPT_BUDGET below is the second half of that fix.  run_fuzz.sh no longer lets
+libFuzzer write here at all; this check catches it if some future runner does
+anyway, by failing when a set holds more hand-kept files than it is supposed to.
 
 Usage:  python3 test/fuzz/make_corpus.py [output-root]
         (default output root: the directory this script lives in, /corpus)
@@ -241,6 +263,141 @@ def http_seeds():
                      b" Transfer-Encoding: chunked\r\n\r\n")
     s["no_host"] = b"GET /px/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
     s["host_twice"] = b"GET /px/ HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"
+
+    return s
+
+
+# ──────────────────────────── HTTP responses ─────────────────────────────────
+#
+# fuzz_http_response reads its input as the byte stream a backend sends back,
+# and derives the read boundaries itself — so these seeds are whole responses,
+# and every one of them gets fed as one read, as two, and a byte at a time.
+#
+# What the target checks is the pooling decision, so the seeds are chosen for
+# what they imply about where the response ends: the shapes a working backend
+# produces, the shapes that make the end unknowable, and the ones where a
+# lenient backend and this proxy would put it in different places.
+
+
+def hresp(status, headers, body=b"", eol=b"\r\n"):
+    out = b"HTTP/1.1 " + status + eol
+    for h in headers:
+        out += h + eol
+    return out + eol + body
+
+
+def httpresp_seeds():
+    s = {}
+
+    # ── what the proxy integration tests and the load harness actually see ──
+    s["ok_body"] = hresp(b"200 OK", [b"Content-Length: 5", b"Content-Type: text/plain"], b"hello")
+    s["ok_empty"] = hresp(b"200 OK", [b"Content-Length: 0"])
+    s["ok_close"] = hresp(b"200 OK", [b"Content-Length: 2", b"Connection: close"], b"hi")
+    s["ok_keepalive"] = hresp(b"200 OK", [b"Content-Length: 2", b"Connection: keep-alive"], b"hi")
+    s["no_content"] = hresp(b"204 No Content", [])
+    s["not_modified"] = hresp(b"304 Not Modified", [b"ETag: \"x\""])
+    s["chunked"] = hresp(b"200 OK", [b"Transfer-Encoding: chunked"], b"5\r\nhello\r\n0\r\n\r\n")
+    s["continue_then_ok"] = (hresp(b"100 Continue", []) +
+                             hresp(b"200 OK", [b"Content-Length: 2"], b"ok"))
+    s["error_502"] = hresp(b"502 Bad Gateway", [b"Content-Length: 11"], b"bad gateway")
+    s["big_headers"] = hresp(b"200 OK", [b"X-Pad: " + b"p" * 4000, b"Content-Length: 1"], b"z")
+
+    # ── no boundary at all: HTTP/1.0-style close-delimited ──
+    # Nothing says where this ends short of EOF, so the socket is never at a
+    # message boundary and must never be pooled.
+    s["close_delimited"] = hresp(b"200 OK", [b"Content-Type: text/plain"], b"body with no length")
+
+    # ── the two defects that were found by reading, kept as regressions ──
+    # A bare LF between the two framing headers: one line to a CRLF-only
+    # splitter (name Content-Length, value "6"), two lines to a backend.
+    s["cl_lf_te"] = (b"HTTP/1.1 200 OK\r\nContent-Length: 6\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"5\r\nhello\r\n0\r\n\r\n")
+    # A header block long enough that a 64 KB read cannot hold it is not what
+    # splits one in practice — the backend flushing twice is.  The target
+    # supplies that; this seed just makes the block big enough to be worth
+    # splitting in several places.
+    s["split_bait"] = hresp(b"200 OK",
+                            [b"Content-Length: 4", b"X-A: " + b"a" * 200, b"X-B: " + b"b" * 200],
+                            b"body")
+
+    # ── Content-Length that two recipients read differently ──
+    s["cl_te_chunked"] = hresp(b"200 OK", [b"Content-Length: 6", b"Transfer-Encoding: chunked"],
+                               b"0\r\n\r\n")
+    s["cl_te_identity"] = hresp(b"200 OK", [b"Content-Length: 4", b"Transfer-Encoding: identity"],
+                                b"bodyandmore")
+    s["cl_te_gzip"] = hresp(b"200 OK", [b"Content-Length: 4", b"Transfer-Encoding: gzip"],
+                            b"bodyandmore")
+    s["te_tab_value"] = hresp(b"200 OK", [b"Content-Length: 4", b"Transfer-Encoding:\tchunked"],
+                              b"bodyandmore")
+    s["cl_twice_same"] = hresp(b"200 OK", [b"Content-Length: 3", b"Content-Length: 3"], b"abc")
+    s["cl_twice_diff"] = hresp(b"200 OK", [b"Content-Length: 3", b"Content-Length: 9"], b"abcdefghi")
+    s["cl_trailing_junk"] = hresp(b"200 OK", [b"Content-Length: 3x"], b"abcdefghi")
+    s["cl_leading_plus"] = hresp(b"200 OK", [b"Content-Length: +3"], b"abc")
+    s["cl_hex"] = hresp(b"200 OK", [b"Content-Length: 0x10"], b"abc")
+    s["cl_huge"] = hresp(b"200 OK", [b"Content-Length: 99999999999999999999999"], b"abc")
+    s["cl_space_before_colon"] = hresp(b"200 OK", [b"Content-Length : 9", b"Content-Length: 3"],
+                                       b"abcdefghi")
+    s["obs_fold_te"] = (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Any: v\r\n"
+                        b"\tTransfer-Encoding: chunked\r\n\r\nbodyandmore")
+
+    # ── Connection: close the parser can miss ──
+    # The value is matched on its first two characters, so a list that does not
+    # start with the close token reads as keep-alive.
+    s["close_second_in_list"] = hresp(b"200 OK", [b"Content-Length: 2", b"Connection: keep-alive, close"], b"hi")
+    s["close_upper"] = hresp(b"200 OK", [b"Content-Length: 2", b"Connection: CLOSE"], b"hi")
+
+    # ── status lines ──
+    s["status_no_reason"] = hresp(b"200", [b"Content-Length: 1"], b"x")
+    s["status_short_code"] = hresp(b"2 OK", [b"Content-Length: 1"], b"x")
+    s["status_no_space"] = b"HTTP/1.1\r\nContent-Length: 1\r\n\r\nx"
+    s["status_leading_space"] = b" HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx"
+    s["status_1xx_only"] = hresp(b"103 Early Hints", [b"Link: </s.css>; rel=preload"])
+    s["status_199"] = hresp(b"199 Weird", []) + hresp(b"200 OK", [b"Content-Length: 1"], b"x")
+
+    # ── the 1xx rescan, found by this target on 2026-07-31 ──
+    #
+    # The scan clears response_bytes_seen when it parses an interim 1xx, so the
+    # next read is treated as the head of a response again.  It is not, when the
+    # backend flushed the 1xx together with the first lines of the real
+    # response: the rest of that header block arrives in the following read and
+    # is parsed as a whole response, and everything before the read boundary —
+    # here the Transfer-Encoding — is never seen.  The socket is then declared
+    # poolable after five body bytes of a chunked stream.
+    #
+    # The trailing byte is not part of the response.  fuzz_http_response takes
+    # one of its read boundaries from the input's last byte (see cut list 2
+    # there), and 70 is the offset just past "Transfer-Encoding: chunked\r\n" —
+    # so this seed carries the read split that exposes it, rather than relying
+    # on the mutator to rediscover it.
+    s["interim_1xx_split"] = (b"HTTP/1.1 100 Continue\r\n\r\n"
+                              b"HTTP/1.1 200 OK\r\n"
+                              b"Transfer-Encoding: chunked\r\n"
+                              b"Content-Length: 5\r\n\r\n"
+                              b"5\r\nHELLO\r\n0\r\n\r\n"
+                              b"\x46")
+    # The same defect as the fuzzer first reduced it: with the real status line
+    # cut away, a bare CR inside the fragment is never measured by the
+    # CRLF-framing check either, because that check ran over the block the 1xx
+    # ended and not over this one.
+    s["interim_1xx_bare_cr"] = (b"HTTP/1.1 100 Continue\r\n\r\n"
+                                b"HTTP/1.1 200 OK\r0Content-Length: 2\r\n\r\nok")
+
+    # ── a second response behind the first: what a pooled socket must not carry ──
+    s["pipelined"] = (hresp(b"200 OK", [b"Content-Length: 2"], b"hi") +
+                      hresp(b"200 OK", [b"Content-Length: 2"], b"by"))
+    s["body_longer_than_cl"] = hresp(b"200 OK", [b"Content-Length: 2"], b"hi-and-then-some")
+    s["body_shorter_than_cl"] = hresp(b"200 OK", [b"Content-Length: 20"], b"short")
+
+    # ── boundaries a backend reaches by stopping early or being odd ──
+    s["headers_only"] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+    s["no_terminator"] = b"HTTP/1.1 200 OK\r\n"
+    s["partial_status"] = b"HTTP/1."
+    s["empty"] = b""
+    s["crlf_only"] = b"\r\n\r\n"
+    s["all_lf"] = b"HTTP/1.1 200 OK\nContent-Length: 2\n\nhi"
+    s["bare_cr"] = b"HTTP/1.1 200 OK\rContent-Length: 2\r\n\r\nhi"
+    s["header_no_colon"] = hresp(b"200 OK", [b"Content-Length: 2", b"GARBAGE"], b"hi")
+    s["nul_in_header"] = hresp(b"200 OK", [b"Content-Length: 2", b"X-N: a\x00b"], b"hi")
 
     return s
 
@@ -504,6 +661,20 @@ def cache_seeds():
 # ─────────────────────────────────── driver ──────────────────────────────────
 
 
+# How many files a set may hold that this script did not generate.  These are
+# the curated discoveries described above, plus headroom for a reduced crash
+# case.  The numbers are deliberately specific: a set that has grown past its
+# budget has had a fuzz run write into it, and that is the failure this catches.
+KEPT_BUDGET = {
+    "resp": 32,        # 22 kept: coverage edges the 40 generated seeds miss
+    "ws": 8,           # 0 kept
+    "http": 8,         # 0 kept
+    "httpresp": 8,     # 0 kept
+    "cache": 260,      # 240 kept: cache_store has far more reachable state than
+                       # 37 hand-written programs can lay out
+}
+
+
 def write_set(root, name, seeds):
     d = os.path.join(root, name)
     os.makedirs(d, exist_ok=True)
@@ -528,17 +699,34 @@ def write_set(root, name, seeds):
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
+    over = 0
     for name, seeds in (("resp", resp_seeds()), ("ws", ws_seeds()),
-                        ("http", http_seeds()), ("cache", cache_seeds())):
+                        ("http", http_seeds()), ("httpresp", httpresp_seeds()),
+                        ("cache", cache_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
-        print("%-6s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))
+        print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))
         if stale:
-            # Not deleted: a file here may be a reduced crash case someone added
-            # by hand, and silently removing those is how a regression corpus
-            # rots.  Named so it is a decision rather than an accident.
-            print("       %d file(s) not generated by this script: %s"
+            # Not deleted: a file here is a curated discovery or a reduced crash
+            # case someone added by hand, and silently removing those is how a
+            # regression corpus rots.  Named so it is a decision rather than an
+            # accident.
+            print("         %d kept file(s) this script did not generate: %s"
                   % (len(stale), ", ".join(stale[:8])))
+        budget = KEPT_BUDGET.get(name, 8)
+        if len(stale) > budget:
+            print("ERROR: corpus/%s holds %d files this script did not generate, "
+                  "budget is %d.\n"
+                  "       A fuzz run has written its discoveries into the tracked "
+                  "corpus.  They belong in bin/fuzz-corpus/ — check that "
+                  "run_fuzz.sh still passes the work directory first.\n"
+                  "       If they really are wanted, keep the ones that reach a "
+                  "new coverage edge (see the header of this file) and raise the "
+                  "budget deliberately."
+                  % (name, len(stale), budget), file=sys.stderr)
+            over += 1
+    if over:
+        return 2
     if total == 0:
         print("ERROR: generated no seeds at all", file=sys.stderr)
         return 2

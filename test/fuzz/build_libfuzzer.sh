@@ -21,7 +21,8 @@
 #
 # Exit codes:  0 built   1 unavailable (or unavailable+required)   2 build failed
 #
-# Output: bin/fuzz-libfuzzer/{fuzz_resp,fuzz_ws_frame,fuzz_cache_ops,fuzz_http_request}
+# Output: bin/fuzz-libfuzzer/{fuzz_resp,fuzz_ws_frame,fuzz_cache_ops,fuzz_http_response,
+#         fuzz_http_request}
 #
 # ─── WHY THERE IS NO MEMORYSANITIZER BUILD HERE ─────────────────────────────
 #
@@ -41,12 +42,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$ROOT/bin/fuzz-libfuzzer"
 REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 
-# Which targets to build.  Default is all three.  The per-push CI job narrows
-# this to the two header-only targets, because fuzz_http_request drags in
-# fifteen SDK translation units and that is a nightly cost, not a per-push one.
-# Narrowing is always an explicit decision by the caller — nothing here drops a
-# target because building it happened to fail.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request"
+# Which targets to build.  Default is all five.  The per-push CI job narrows
+# this to the four cheap ones, because fuzz_http_request drags in fifteen SDK
+# translation units and that is a nightly cost, not a per-push one.  Narrowing
+# is always an explicit decision by the caller — nothing here drops a target
+# because building it happened to fail.
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -127,6 +128,13 @@ want fuzz_ws_frame && build fuzz_ws_frame "$ROOT/test/fuzz/fuzz_ws_frame.cpp" -l
 # per-push job alongside the two parsers and fuzz_http_request does not.
 want fuzz_cache_ops && build fuzz_cache_ops \
     "$ROOT/test/fuzz/fuzz_cache_ops.cpp" "$ROOT/socketley/runtime/cache/cache_store.cpp"
+
+# fuzz_http_response is as cheap as the two parser targets even though it fuzzes
+# the proxy: the response framing was lifted out of handle_backend_read into
+# runtime/proxy/http_response_framing.h, which includes <charconv> and
+# <string_view> and nothing else.  One translation unit, no libraries, no SDK —
+# which is why this one is in the per-push job and fuzz_http_request is not.
+want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_response.cpp"
 
 # ─── fuzz_http_request ──────────────────────────────────────────────────────
 #

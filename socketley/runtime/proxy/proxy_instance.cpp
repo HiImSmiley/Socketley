@@ -216,15 +216,7 @@ void proxy_backend_connection::reset(int new_fd)
     // backend_pool_release() has already closed and cleared both.
     if (pipe_to_client[0] >= 0) { close(pipe_to_client[0]); pipe_to_client[0] = -1; }
     if (pipe_to_client[1] >= 0) { close(pipe_to_client[1]); pipe_to_client[1] = -1; }
-    http_headers_parsed = false;
-    http_has_content_length = false;
-    http_conn_close = false;
-    http_chunked = false;
-    http_no_body = false;
-    http_status_code = 0;
-    http_body_remaining = 0;
-    http_response_bytes_seen = false;
-    http_frame_unknown = false;
+    http_frame = {};
 }
 
 std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int fd)
@@ -1409,52 +1401,10 @@ void proxy_instance::rearm_accept()
         schedule_accept_backoff();
 }
 
-static bool header_name_equals(std::string_view line, const char* lower_name, size_t name_len)
-{
-    if (line.size() < name_len + 1 || line[name_len] != ':')
-        return false;
-    for (size_t i = 0; i < name_len; i++)
-    {
-        if ((line[i] | 0x20) != lower_name[i])
-            return false;
-    }
-    return true;
-}
-
-// Every line in an HTTP header block ends with CRLF and nothing else.  A bare
-// LF is *permitted* to be accepted by a recipient (RFC 7230 Section 3.5), and a
-// bare CR may be accepted or replaced with SP (RFC 9112 Section 2.2) — but
-// "permitted" is per recipient, and this proxy is not the only recipient.  It
-// hands the bytes on to a backend that makes the choice independently, and the
-// moment the two choose differently they disagree about where one request ends
-// and the next begins.  That is request smuggling, and it does not need the
-// backend to be wrong about anything: it only needs it to be lenient in a
-// place where we were strict, or the other way round.  So this proxy takes the
-// only position that requires no agreement at all — a header block that is not
-// strictly CRLF-framed is refused and never reaches a backend.
-//
-// `complete` says whether these bytes are the whole header block.  Until they
-// are, a CR as the final byte is just a CRLF that has been split across two
-// TCP segments and must not be judged yet; a bare LF needs no such care,
-// because the byte before it has already arrived.
-static bool http_eol_framing_ok(std::string_view bytes, bool complete)
-{
-    for (size_t i = 0; i < bytes.size(); i++)
-    {
-        if (bytes[i] == '\n')
-        {
-            if (i == 0 || bytes[i - 1] != '\r')
-                return false;   // bare LF
-        }
-        else if (bytes[i] == '\r')
-        {
-            const bool have_next = (i + 1 < bytes.size());
-            if (have_next ? (bytes[i + 1] != '\n') : complete)
-                return false;   // bare CR
-        }
-    }
-    return true;
-}
+// header_name_equals and http_eol_framing_ok used to live here.  Both are read
+// by the response side as well as the request side, and the response side now
+// lives in runtime/proxy/http_response_framing.h so that a fuzz target can call
+// it — so they moved there too rather than being declared in two places.
 
 // Walk one Transfer-Encoding field value left to right, carrying `chunked_seen`
 // across the field lines of one request.  False means a coding was applied
@@ -1507,35 +1457,13 @@ static bool te_line_codings_ok(std::string_view hdr_line, bool& chunked_seen)
     }
 }
 
-// Has this backend delivered a response whose end this proxy can point at?
-//
-// Both halves of the pooling decision ask this now, which is the whole point.
-// It used to be spelled out at the one call site that detaches a *finished*
-// connection — the path a successful keep-alive exchange takes — while every
-// teardown path reached the pool through backend_pool_eligible(), and that gate
-// never asked whether the response was over at all.  A pair torn down in the
-// middle of a response therefore looked poolable, and a socket pooled with the
-// tail of a response still on it hands that tail to the next borrower as the
-// head of its own answer: the crossed-delivery bug wearing a different hat.
+// backend_response_complete() moved to http_response_framing.h as
+// http_response_frame_complete(), alongside the scan that produces the state it
+// reads.  Both pooling paths still ask exactly one predicate; it is simply one
+// a test can call.
 static inline bool backend_response_complete(const proxy_backend_connection* bconn)
 {
-    // Either no response has started on this socket or its header block never
-    // resolved.  Both mean there is no message boundary to reuse from — and if
-    // a request has already gone out, its answer is still to come and would
-    // land on whoever borrows the socket next.
-    if (!bconn->http_headers_parsed || bconn->http_frame_unknown)
-        return false;
-    // A chunked response is not tracked to its terminating chunk, so "over"
-    // cannot be established for one at all.
-    if (bconn->http_chunked)
-        return false;
-    // 204/304: the framing rules say there is no body to wait for.
-    if (bconn->http_no_body)
-        return true;
-    // Everything else is over only once a declared length has run out.  A
-    // response framed by connection close has no boundary short of EOF, so it
-    // is not reusable by construction and correctly fails here.
-    return bconn->http_has_content_length && bconn->http_body_remaining == 0;
+    return http_response_frame_complete(bconn->http_frame);
 }
 
 void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* req)
@@ -2127,167 +2055,22 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // Forward to client
     forward_to_client(conn, {data_ptr, data_len});
 
-    // HTTP response tracking for connection pooling
+    // HTTP response tracking for connection pooling.
+    //
+    // The mirror image of request smuggling lives here.  What this decides is
+    // not what the client sees — every byte is forwarded either way, just
+    // above — but whether the backend socket may be handed to the pool once the
+    // response is judged finished.  Judge it finished early and the socket is
+    // pooled with the rest of the answer still coming, and the next request to
+    // borrow it reads the tail of a stranger's response as the head of its own.
+    //
+    // The scan itself is in runtime/proxy/http_response_framing.h.  It used to
+    // be a hundred and twenty lines here, in the middle of a completion
+    // handler, which meant nothing short of a running daemon could call it and
+    // it was the last parser in the tree with no fuzz target.  It is the same
+    // code, in a form test/fuzz/fuzz_http_response.cpp can drive directly.
     if (m_protocol == protocol_http)
-    {
-        // The mirror image of request smuggling lives here.  What this block
-        // decides is not what the client sees — every byte is forwarded either
-        // way — but whether the backend socket may be handed to the pool once
-        // the response is judged finished.  Judge it finished early and the
-        // socket is pooled with the rest of the answer still coming, and the
-        // next request to borrow it reads the tail of a stranger's response as
-        // the head of its own.
-        if (!conn->http_headers_parsed)
-        {
-            // Try to find response headers in this chunk (covers 99%+ of responses)
-            std::string_view sv(data_ptr, data_len);
-            auto hdr_end = sv.find("\r\n\r\n");
-
-            // Only the first chunk of a response can be scanned this way.  The
-            // scan never looked past the chunk in front of it, so a header
-            // block split across two reads left the first chunk with no
-            // "\r\n\r\n" and the second one matching somewhere inside the
-            // *body* — status line and headers then came out of body bytes, and
-            // a body that happens to contain a line like "Content-Length: 4"
-            // gave a length that runs out almost immediately.  Nothing here can
-            // recover the real framing after that point, so say so and let the
-            // socket be closed rather than pooled.
-            if (SOCKETLEY_UNLIKELY(conn->http_response_bytes_seen))
-            {
-                conn->http_frame_unknown = true;
-                goto proxy_backend_read_done;
-            }
-            conn->http_response_bytes_seen = true;
-
-            // Same rule as the request side, and for the same reason: a header
-            // block that is not strictly CRLF-framed is one this proxy and the
-            // backend can read differently.  Merged on a bare LF,
-            //   Content-Length: 6\nTransfer-Encoding: chunked
-            // is a single line whose name is Content-Length and whose value
-            // parses as 6, so the chunked flag never sets and the response is
-            // declared over after six body bytes of what is really a chunked
-            // stream.  There is nothing to reject on this side — the bytes are
-            // already on their way to the client — but the socket underneath
-            // must not be reused.
-            if (hdr_end != std::string_view::npos &&
-                SOCKETLEY_UNLIKELY(!http_eol_framing_ok(sv.substr(0, hdr_end), true)))
-            {
-                conn->http_frame_unknown = true;
-                goto proxy_backend_read_done;
-            }
-
-            if (hdr_end != std::string_view::npos)
-            {
-                conn->http_headers_parsed = true;
-                std::string_view headers(data_ptr, hdr_end);
-
-                // Parse status code from "HTTP/1.x NNN ..."
-                auto first_nl = headers.find("\r\n");
-                std::string_view status_line = (first_nl != std::string_view::npos)
-                    ? headers.substr(0, first_nl) : headers;
-                auto sp1 = status_line.find(' ');
-                if (sp1 != std::string_view::npos && sp1 + 3 <= status_line.size())
-                {
-                    uint16_t code = 0;
-                    auto [p, ec] = std::from_chars(status_line.data() + sp1 + 1,
-                                                    status_line.data() + sp1 + 4, code);
-                    if (ec == std::errc{})
-                        conn->http_status_code = code;
-                }
-
-                // 1xx informational: reset header state and continue waiting for real response
-                if (conn->http_status_code >= 100 && conn->http_status_code < 200)
-                {
-                    conn->http_headers_parsed = false;
-                    conn->http_status_code = 0;
-                    // The real response has not started yet, so the next chunk
-                    // is still a first chunk as far as the scan above is
-                    // concerned.  Without this an interim 1xx would make every
-                    // response behind it unframeable and cost the backend
-                    // connection its place in the pool.  (If the real response
-                    // shares this chunk with the 1xx it is still missed, as
-                    // before — that costs pooling, never correctness.)
-                    conn->http_response_bytes_seen = false;
-                    goto proxy_backend_read_done;
-                }
-
-                // 204 No Content, 304 Not Modified: no message body per RFC 7230
-                if (conn->http_status_code == 204 || conn->http_status_code == 304)
-                    conn->http_no_body = true;
-
-                // Parse Content-Length, Transfer-Encoding, Connection
-                size_t h_pos = (first_nl != std::string_view::npos) ? first_nl + 2 : 0;
-
-                while (h_pos < headers.size())
-                {
-                    auto nl = headers.find("\r\n", h_pos);
-                    if (nl == std::string_view::npos) nl = headers.size();
-                    auto line = headers.substr(h_pos, nl - h_pos);
-
-                    if (header_name_equals(line, "content-length", 14))
-                    {
-                        auto colon = line.find(':');
-                        if (colon != std::string_view::npos)
-                        {
-                            auto val = line.substr(colon + 1);
-                            while (!val.empty() && val[0] == ' ') val.remove_prefix(1);
-                            size_t cl_val = 0;
-                            auto [p, ec] = std::from_chars(val.data(), val.data() + val.size(), cl_val);
-                            if (ec == std::errc{})
-                            {
-                                conn->http_has_content_length = true;
-                                conn->http_body_remaining = cl_val;
-                            }
-                        }
-                    }
-                    else if (header_name_equals(line, "transfer-encoding", 17))
-                    {
-                        auto colon = line.find(':');
-                        if (colon != std::string_view::npos)
-                        {
-                            auto val = line.substr(colon + 1);
-                            while (!val.empty() && val[0] == ' ') val.remove_prefix(1);
-                            if (val.size() >= 7 && (val[0] | 0x20) == 'c' && (val[1] | 0x20) == 'h')
-                                conn->http_chunked = true;
-                        }
-                    }
-                    else if (header_name_equals(line, "connection", 10))
-                    {
-                        auto colon = line.find(':');
-                        if (colon != std::string_view::npos)
-                        {
-                            auto val = line.substr(colon + 1);
-                            while (!val.empty() && val[0] == ' ') val.remove_prefix(1);
-                            if (val.size() >= 5 && (val[0] | 0x20) == 'c' && (val[1] | 0x20) == 'l')
-                                conn->http_conn_close = true;
-                        }
-                    }
-
-                    h_pos = nl + 2;
-                }
-
-                // Deduct body bytes already received in this chunk
-                if (conn->http_has_content_length)
-                {
-                    size_t body_start = hdr_end + 4;
-                    size_t body_in_chunk = (data_len > body_start) ? data_len - body_start : 0;
-                    if (body_in_chunk >= conn->http_body_remaining)
-                        conn->http_body_remaining = 0;
-                    else
-                        conn->http_body_remaining -= body_in_chunk;
-                }
-            }
-        }
-        else if (conn->http_has_content_length && conn->http_body_remaining > 0)
-        {
-            if (data_len >= conn->http_body_remaining)
-                conn->http_body_remaining = 0;
-            else
-                conn->http_body_remaining -= data_len;
-        }
-    }
-
-proxy_backend_read_done:
+        http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
 
     // Return provided buffer after scanning
     if (is_provided)
@@ -2300,7 +2083,7 @@ proxy_backend_read_done:
     // the two drifted apart in exactly the way they were bound to.  It is one
     // shared predicate now, so a change to what "finished" means reaches the
     // teardown paths as well as this one.
-    if (m_protocol == protocol_http && !conn->http_conn_close &&
+    if (m_protocol == protocol_http && !conn->http_frame.conn_close &&
         !conn->closing && !conn->splice_active &&
         backend_response_complete(conn))
     {
@@ -3668,16 +3451,16 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     if (bconn->pipe_to_client[0] >= 0)
         return false;
     // Don't pool if backend signalled Connection: close
-    if (bconn->http_conn_close)
+    if (bconn->http_frame.conn_close)
         return false;
     // Where this response ended could not be established (see
-    // http_frame_unknown).  Reuse only works if both ends agree the stream is
+    // http_frame.unknown).  Reuse only works if both ends agree the stream is
     // back at a message boundary, and here we cannot say that it is — the
     // socket may still have the tail of this response on it, which the next
     // borrower would read as the first bytes of its own.  Every path that gives
     // a backend socket back to the pool comes through here, including the
     // teardown ones, so this is the one place the answer has to be no.
-    if (bconn->http_frame_unknown)
+    if (bconn->http_frame.unknown)
         return false;
     // The same argument one step earlier: a response that has not *finished*
     // leaves the socket at an offset just as surely as one whose framing could
