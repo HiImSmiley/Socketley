@@ -59,6 +59,17 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
+    # Kill by socket, not only by pid.  A CLI command run against a daemon that
+    # is not up yet -- or not up any more -- starts one of its own, detached from
+    # this shell; killing $DPID would leave that one running for good, holding
+    # this test's ports.  The socket path comes from mktemp, so matching on it
+    # can only ever hit daemons belonging to this run.
+    for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
+        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
+           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
     rm -rf "$TMPD"
 }
 trap cleanup EXIT
@@ -144,9 +155,51 @@ python3 "$TMPD/be.py" $CTRL be1:$BE1 be2:$BE2 be3:$BE3 be4:$BE4 >"$TMPD/be.log" 
 BEPID=$!
 for _ in $(seq 1 60); do grep -q ready "$TMPD/be.log" 2>/dev/null && break; sleep 0.1; done
 
+# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
+# Every CLI command auto-starts a daemon when the socket does not answer yet --
+# cli.cpp's ensure_daemon() forks, setsids and re-execs 'socketley daemon' -- so
+# polling 'ps' against the daemon this test has just launched races it and spawns
+# a second, orphaned one.  Whichever loses the bind exits, and when the loser is
+# $DPID the pid this test watches becomes a zombie while an orphan serves the
+# run: the FD0/FD1 samples below are then a corpse's.  Measured at 2 spawned
+# orphans in 30 startups of this sequence.
+cat > "$TMPD/waitsock.py" <<'PYEOF'
+import socket, sys, time
+
+path = sys.argv[1]
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.4)
+        s.connect(path)
+        s.close()
+        sys.exit(0)
+    except OSError:
+        time.sleep(0.02)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+sys.exit(1)
+PYEOF
+
 "$BIN" daemon >"$TMPD/daemon.log" 2>&1 &
 DPID=$!
-for _ in $(seq 1 60); do "$BIN" ps >/dev/null 2>&1 && break; sleep 0.1; done
+python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
+
+# The daemon that answers is the one this test launched.  A zombie $DPID has an
+# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
+# cannot tell the two apart -- so this looks at the descriptor table, which only
+# a live process has.  Said here rather than left to the FD0/FD1 check at the
+# end, which would report it as a descriptor problem long after the fact.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
+    ''|0|*[!0-9]*)
+        bad "setup" "pid $DPID is not a live process -- the daemon that answers is not the one this test launched" ;;
+    *) ok ;;
+esac
 
 # Group members are TCP proxies in the group, each in front of one backend --
 # the same shape as test_proxy_group_http.sh, so the member is a real runtime

@@ -143,6 +143,17 @@ cleanup() {
         done
         kill -9 "$DPID" 2>/dev/null || true
     fi
+    # Kill by socket, not only by pid.  A CLI command run against a daemon that
+    # is not up yet — or not up any more — starts one of its own, detached from
+    # this shell; killing $DPID would leave that one running for good, holding
+    # this test's ports.  The socket path comes from mktemp, so matching on it
+    # can only ever hit daemons belonging to this run.
+    for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
+        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
+           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
     # The reaping subshell (see below) exits normally, so waiting on it prints
     # nothing.  Its recorded status is how a signal death gets reported here —
     # in words, after the verdict.
@@ -254,7 +265,7 @@ assert_rss_bounded() {    # base final bound_kb
 # ── Harness ────────────────────────────────────────────────────────────────
 H="$TMPDIR_T/harness.py"
 cat >"$H" <<'PYEOF'
-"""Modes: waitport | serve | churn.
+"""Modes: waitport | waitsock | serve | churn.
 
 Each mode prints one machine-readable line.  A field the shell asks for and does
 not find must make the shell fail loudly — never compare equal to an equally
@@ -296,6 +307,29 @@ def connect_refused(port, deadline):
 
 if mode == "waitport":
     sys.exit(0 if connect_ok(int(sys.argv[2]), time.time() + float(sys.argv[3])) else 1)
+
+
+if mode == "waitsock":
+    # Wait for the daemon's IPC socket without going through the CLI: every CLI
+    # command starts a daemon of its own when the socket does not answer, which
+    # is exactly what must not happen while ours is still coming up.
+    path = sys.argv[2]
+    end = time.time() + float(sys.argv[3])
+    while time.time() < end:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.4)
+            s.connect(path)
+            s.close()
+            sys.exit(0)
+        except OSError:
+            time.sleep(0.02)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    sys.exit(1)
 
 
 def recv_lines(s, n):
@@ -560,7 +594,15 @@ if [ -z "$DPID" ]; then
     echo "  FAILED"
     exit 1
 fi
-for _ in $(seq 1 60); do "$BIN" ps >/dev/null 2>&1 && break; sleep 0.1; done
+# Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
+# command auto-starts a daemon when the socket does not answer yet — cli.cpp's
+# ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
+# 'ps' against the daemon this test has just launched races it and spawns a
+# second, orphaned one.  Whichever loses the bind exits, and when the loser is
+# $DPID the pid this test watches becomes a zombie while an orphan serves the
+# run: BASE_IDENT is then taken from a corpse and every /proc sample below reads
+# 'unreadable'.  Measured at 2 spawned orphans in 30 startups of this sequence.
+python3 "$H" waitsock "$SOCKETLEY_SOCKET" 8 || true
 BASE_IDENT=$(daemon_ident)
 
 TOTAL=$((TOTAL+1))
@@ -569,6 +611,19 @@ if "$BIN" ps >/dev/null 2>&1; then
 else
     FAIL=$((FAIL+1))
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
+fi
+
+# ...and the daemon answering is the one this test launched.  Without this a
+# zombie $DPID is only noticed at the very end, by the identity check and the
+# resource samples, which would describe it as "the daemon died during the
+# churn" when in fact it never survived its own startup.
+TOTAL=$((TOTAL+1))
+if [ "$BASE_IDENT" != "gone" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [setup]: pid $DPID is not a live process — the daemon that answers"
+    echo "        is not the one this test launched, so every /proc sample below is a corpse's"
 fi
 
 TOTAL=$((TOTAL+1))
@@ -697,9 +752,21 @@ fi
 # The daemon is not merely alive: it still creates and serves a runtime that
 # never existed during the churn.
 "$BIN" create cache final_probe -p "$FINAL_PORT" -s >/dev/null 2>&1 || true
-wait_port "$FINAL_PORT" 5 || true
+# Wait for the success signal — a completed round trip — and not for a deadline.
+# 'wait_port' alone proves nothing here: it returns as soon as the kernel accepts
+# a connection out of the listen backlog, which is true from the instant listen()
+# ran, while an event loop still winding down 45 cycles' worth of teardown may
+# not reach the new runtime's first read for a while.  Trying once after that
+# wait was a timing assumption; retrying until it answers is not, and a wedged or
+# dead daemon never answers and still fails, only later.
+FINAL_RT=""
+for _ in $(seq 1 60); do
+    FINAL_RT=$(python3 "$H" serve "$FINAL_PORT" 2>/dev/null || true)
+    [ "$FINAL_RT" = "SERVES_OK" ] && break
+    sleep 0.5
+done
 TOTAL=$((TOTAL+1))
-if [ "$(python3 "$H" serve "$FINAL_PORT" 2>/dev/null || true)" = "SERVES_OK" ]; then
+if [ "$FINAL_RT" = "SERVES_OK" ]; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

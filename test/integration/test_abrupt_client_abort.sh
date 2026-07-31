@@ -32,6 +32,10 @@
 #     '*_reset' is a healthy connection closed by the runtime.  Both are zero in
 #     a correct build; both are what a recycled descriptor number looks like
 #     from the victim's side
+#   - a daemon left wedged rather than crashed: after the storm a runtime that
+#     never existed during it is created and has to serve a real round trip.
+#     This waits for that success signal rather than for a deadline, so it fails
+#     only when the answer never comes at all, or comes back wrong
 #
 # WHAT IT DOES NOT CATCH
 #   - anything that needs the peer to vanish during a *write* the kernel has
@@ -84,6 +88,14 @@ LOAD_SECS=1.5       # almost all of this test's runtime
 MIN_ABORTS=100      # per runtime: fewer than this and the storm never happened
 MIN_OK=60           # per runtime: fewer than this and the zeroes prove nothing
 DRAIN_SECS=8        # how long a runtime may take to reap its dead connections
+# Budget for the post-storm runtime to serve its first request.  This is a
+# ceiling on patience, not a wait: the check returns the instant a round trip
+# succeeds, so a healthy daemon spends milliseconds here and only a wedged or
+# dead one spends the whole budget — and then still fails.  It is generous
+# because the daemon may legitimately still be reaping the storm's connections
+# when the new runtime is created, and "the event loop is busy" must not read as
+# "the daemon is broken".
+FINAL_SERVE_SECS=30
 
 # See the note in test_restart_under_load.sh.  Both samples are taken with both
 # runtimes created but stopped, so no listener and no pooled backend connection
@@ -113,6 +125,17 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
+    # Kill by socket, not only by pid.  A CLI command run against a daemon that
+    # is not up yet — or not up any more — starts one of its own, detached from
+    # this shell; killing $DPID would leave that one running for good, holding
+    # this test's ports.  The socket path comes from mktemp, so matching on it
+    # can only ever hit daemons belonging to this run.
+    for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
+        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
+           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
     rm -rf "$TMPDIR_T"
 }
 trap cleanup EXIT
@@ -253,6 +276,29 @@ if mode == "waitport":
     sys.exit(0 if connect_ok(int(sys.argv[2]), time.time() + float(sys.argv[3])) else 1)
 
 
+if mode == "waitsock":
+    # Wait for the daemon's IPC socket without going through the CLI: every CLI
+    # command starts a daemon of its own when the socket does not answer, which
+    # is exactly what must not happen while ours is still coming up.
+    path = sys.argv[2]
+    end = time.time() + float(sys.argv[3])
+    while time.time() < end:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(0.4)
+            s.connect(path)
+            s.close()
+            sys.exit(0)
+        except OSError:
+            time.sleep(0.02)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    sys.exit(1)
+
+
 def recv_lines(s, n):
     """Exactly n newline-terminated lines, or a reason.
 
@@ -321,6 +367,74 @@ if mode == "serve":
     except OSError:
         pass
     sys.exit(0)
+
+
+def serve_probe(port):
+    """One full cache round trip.  Returns (status, detail).
+
+    status is one of: ok, wrong, connect, reset, timeout.  'wrong' is kept
+    apart from every other outcome because it is the only one that is a defect
+    on its own — the runtime spoke, and said something else than the value just
+    written.  Everything else means it has not answered *yet*.
+    """
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=2)
+    except OSError as e:
+        return "connect", "errno=%s" % (e.errno,)
+    try:
+        s.settimeout(3)
+        s.sendall(b"set fk fv\nget fk\n")
+        lines, why = recv_lines(s, 2)
+        if lines is None:
+            return why, ""
+        if lines[0] == b"ok" and lines[1] == b"fv":
+            return "ok", ""
+        return "wrong", "set->%r get->%r" % (lines[0][:60], lines[1][:60])
+    except OSError as e:
+        return "reset", "errno=%s" % (e.errno,)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+if mode == "servewait":
+    # Wait for a *success signal*, not for a deadline: retry a complete set/get
+    # round trip until one lands or the budget is spent.  A connect proves
+    # nothing here — the kernel completes handshakes out of the listen backlog
+    # on its own, so a socket accepts from the instant listen() ran, while an
+    # event loop still reaping a storm of aborted connections may not reach the
+    # new runtime's first read for a while.  Only a returned value proves the
+    # daemon serves.
+    #
+    # Every line printed starts with a marker the shell dispatches on, so an
+    # empty capture (python itself failed) can never be mistaken for a pass.
+    port = int(sys.argv[2])
+    budget = float(sys.argv[3])
+    started = time.time()
+    end = started + budget
+    attempts = 0
+    last = "none"
+    while True:
+        attempts += 1
+        status, detail = serve_probe(port)
+        waited = time.time() - started
+        if status == "ok":
+            print("SERVES_OK attempts=%d waited=%.2fs" % (attempts, waited))
+            sys.exit(0)
+        if status == "wrong":
+            # It answered.  Retrying would only hide it.
+            print("SERVES_WRONG attempts=%d waited=%.2fs %s"
+                  % (attempts, waited, detail))
+            sys.exit(2)
+        last = status + ("(" + detail + ")" if detail else "")
+        if time.time() >= end:
+            break
+        time.sleep(0.05)
+    print("SERVES_NEVER attempts=%d waited=%.2fs last=%s"
+          % (attempts, time.time() - started, last))
+    sys.exit(1)
 
 CACHE_PORT = int(sys.argv[2])
 PROXY_PORT = int(sys.argv[3])
@@ -545,7 +659,15 @@ BEPID=$!
 
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
-for _ in $(seq 1 60); do "$BIN" ps >/dev/null 2>&1 && break; sleep 0.1; done
+# Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
+# command auto-starts a daemon when the socket does not answer yet — cli.cpp's
+# ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
+# 'ps' against the daemon this test has just launched races it and spawns a
+# second, orphaned one.  Whichever loses the bind exits, and when the loser is
+# $DPID the pid this test watches becomes a zombie while an orphan serves the
+# run: /proc/$DPID/fd is then empty and every resource sample below reads
+# 'unreadable'.  Measured at 2 spawned orphans in 30 startups of this sequence.
+python3 "$H" waitsock "$SOCKETLEY_SOCKET" 8 || true
 
 TOTAL=$((TOTAL+1))
 if "$BIN" ps >/dev/null 2>&1; then
@@ -553,6 +675,19 @@ if "$BIN" ps >/dev/null 2>&1; then
 else
     FAIL=$((FAIL+1))
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
+fi
+
+# ...and the daemon answering is the one this test launched.  A zombie $DPID
+# reads 'unreadable' in every /proc sample, so without this the run would report
+# its confusion at the very end, in the descriptor and memory checks, rather
+# than here where it happened.
+TOTAL=$((TOTAL+1))
+if [ "$(fd_count)" != "unreadable" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [setup]: pid $DPID is not a live process — the daemon that answers"
+    echo "        is not the one this test launched, so every /proc sample below is a corpse's"
 fi
 
 TOTAL=$((TOTAL+1))
@@ -679,15 +814,81 @@ assert_drained "$PROXY_NAME"
 
 # The daemon is not merely alive: it still creates and serves a runtime that
 # never existed during the storm.
-"$BIN" create cache ab_final -p "$FINAL_PORT" -s >/dev/null 2>&1 || true
-wait_port "$FINAL_PORT" 5 || true
+#
+# The wait here is on the success signal — a completed set/get against the new
+# runtime — and not on a deadline.  'wait_port' is deliberately not used: it
+# returns as soon as the kernel accepts a connection out of the listen backlog,
+# which happens the moment listen() ran and says nothing about whether the event
+# loop has got round to serving.  Creating a runtime immediately after 1.5s of
+# RST churn and giving it one 3s attempt was a timing assumption, and it lost
+# roughly one run in five.  The assertion is not weakened by this: a daemon that
+# is wedged or dead never produces the signal and still fails, only later.
+CREATE_LOG="$TMPDIR_T/ab_final.create"
+"$BIN" create cache ab_final -p "$FINAL_PORT" -s >"$CREATE_LOG" 2>&1 \
+    || echo "(create exited $?)" >>"$CREATE_LOG"
+
+# Everything known about the daemon at the moment the check gave up, printed
+# only on failure: whether the process is still there, what it thinks it is
+# running, and what it says about the runtime that would not answer.
+diagnose_final() {
+    local out
+    if kill -0 "$DPID" 2>/dev/null; then
+        echo "        daemon pid $DPID: alive"
+    else
+        echo "        daemon pid $DPID: GONE — it did not survive the storm"
+    fi
+    out=$(cat "$CREATE_LOG" 2>/dev/null || true)
+    echo "        create ab_final said: ${out:-<nothing, which is success>}"
+    out=$("$BIN" ls 2>&1 || true)
+    printf '%s\n' "        --- ls ---"
+    printf '%s\n' "${out:-<no output>}" | sed 's/^/        /'
+    out=$("$BIN" stats ab_final 2>&1 || true)
+    printf '%s\n' "        --- stats ab_final ---"
+    printf '%s\n' "${out:-<no output>}" | sed 's/^/        /'
+    out=$(tail -n 8 "$TMPDIR_T/daemon.log" 2>/dev/null || true)
+    printf '%s\n' "        --- daemon.log (tail) ---"
+    printf '%s\n' "${out:-<empty>}" | sed 's/^/        /'
+}
+
+FINAL_SERVE=$(python3 "$H" servewait "$FINAL_PORT" "$FINAL_SERVE_SECS" 2>&1 || true)
+# Sampled at the moment of judgement: 'create' is a CLI command, so if the storm
+# killed the daemon the create itself started a fresh one and the answer below
+# would come from a daemon that never saw the abuse.  A live $DPID is what makes
+# the round trip mean 'it survived' rather than 'something is listening'.
+FINAL_ALIVE=$(fd_count)
+# Dispatch on the marker line, not on the whole capture: stderr is merged in so
+# that a probe that died has something to show, and a stray warning ahead of the
+# marker must not turn a served round trip into 'never answered'.  No marker at
+# all falls through to the failure branch, which is the only safe direction.
+FINAL_MARK=$(printf '%s\n' "$FINAL_SERVE" | grep -m1 '^SERVES_' || true)
 TOTAL=$((TOTAL+1))
-if [ "$(python3 "$H" serve "$FINAL_PORT" 2>/dev/null || true)" = "SERVES_OK" ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [daemon still serves]: a freshly created runtime did not answer correctly"
-fi
+case "$FINAL_MARK" in
+    SERVES_OK*)
+        if [ "$FINAL_ALIVE" = "unreadable" ]; then
+            FAIL=$((FAIL+1))
+            echo "  FAIL [daemon still serves]: the answer was correct, but pid $DPID is gone —"
+            echo "        it came from a replacement daemon a CLI command started, not from the"
+            echo "        daemon that went through the storm"
+            diagnose_final
+        else
+            PASS=$((PASS+1))
+            echo "  final runtime: $FINAL_MARK"
+        fi
+        ;;
+    SERVES_WRONG*)
+        FAIL=$((FAIL+1))
+        echo "  FAIL [daemon still serves]: a freshly created runtime answered, but wrongly"
+        echo "        $FINAL_SERVE"
+        diagnose_final
+        ;;
+    *)
+        FAIL=$((FAIL+1))
+        echo "  FAIL [daemon still serves]: a freshly created runtime never answered"
+        echo "        within ${FINAL_SERVE_SECS}s — the daemon no longer serves what it creates"
+        echo "        ${FINAL_SERVE:-<no marker at all: the probe itself did not run>}"
+        diagnose_final
+        ;;
+esac
 "$BIN" remove ab_final >/dev/null 2>&1 || true
 
 # Back to the baseline's lifecycle state.
