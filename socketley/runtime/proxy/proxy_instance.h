@@ -106,6 +106,31 @@ struct alignas(64) proxy_client_connection
     std::string method;
     std::string path;
     std::string version;
+
+    // How the request whose header block was just parsed frames its own body.
+    // Written by parse_http_request_line, read once by rewrite_http_request.
+    size_t declared_body_len{0};
+    bool declared_body_chunked{false};
+
+    // How much of the current request's body has still to be forwarded, and
+    // whether that number means anything.
+    //
+    // Everything past the header terminator used to be forwarded verbatim, and
+    // "everything" is whatever the client chose to put there: a second request
+    // pipelined behind the first went to the backend without passing a single
+    // one of the checks in parse_http_request_line, which only ever looks at the
+    // first message in the buffer.  Putting the payload second was therefore
+    // enough to bypass the CL+TE rejection, the duplicate-Content-Length
+    // rejection and the whole of the framing scan.  Only the body a request
+    // actually declared may follow it; the rest stays buffered and is parsed as
+    // a request of its own.
+    //
+    // body_unbounded is the one case where no such number exists: a chunked
+    // request, which this proxy forwards byte for byte and never de-chunks (see
+    // rewrite_http_request).  Its body streams on as before.
+    size_t body_remaining{0};
+    bool body_unbounded{false};
+
     std::chrono::steady_clock::time_point last_activity{};
     int retries_remaining{0};
     size_t backend_idx{0};
@@ -433,6 +458,21 @@ private:
     // including when the report is only the withdrawal that put an end to it.
     void handle_client_abort(struct io_uring_cqe* cqe, io_request* req);
     void handle_health_cqe(struct io_uring_cqe* cqe, io_request* req);
+
+    // One pass over whatever is buffered on an HTTP client connection: parse a
+    // request if a whole header block is there, forward the part of a body that
+    // belongs to it, and re-arm the client read.
+    //
+    // Called from handle_client_read when bytes arrive, and — this is why it is
+    // a function rather than a block inside that handler — from
+    // reset_client_for_next_request, because a request pipelined behind the one
+    // just answered is already in the buffer and no further read will arrive to
+    // notice it: the client is waiting for its answer, not sending.
+    void drive_client_request(proxy_client_connection* conn, int fd);
+
+    // Puts a bound on a request held back behind the exchange in flight, so that
+    // a response this proxy cannot frame cannot strand one for ever.
+    void bound_pipelined_hold(proxy_client_connection* conn);
 
     // Returns http_request_parse::invalid for a request that must never reach a
     // backend, which is a verdict the old bool return could not express at all.

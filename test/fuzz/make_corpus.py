@@ -264,6 +264,69 @@ def http_seeds():
     s["no_host"] = b"GET /px/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
     s["host_twice"] = b"GET /px/ HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"
 
+    # Pipelined smuggling: a clean request first, the payload behind it.
+    #
+    # Every shape above puts the bad framing in the *first* message, which is
+    # the only one parse_http_request_line ever looks at.  These put it second,
+    # which used to be enough on its own: rewrite_http_request appended
+    # everything past the header terminator verbatim and cleared the buffer, so
+    # the second request went to the backend without passing one single check.
+    # No malformed byte anywhere in the first request is needed, and the peer
+    # chooses what the second one says.
+    _CLEAN = b"GET /px/a HTTP/1.1\r\nHost: h\r\n\r\n"
+    s["pipelined_cl_te"] = _CLEAN + (
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    s["pipelined_cl_twice"] = _CLEAN + (
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b"Content-Length: 7\r\n\r\nsmuggl")
+    s["pipelined_bare_lf"] = _CLEAN + (
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    s["pipelined_obs_fold"] = _CLEAN + (
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b" Transfer-Encoding: chunked\r\n\r\n")
+    s["pipelined_spaced_colon"] = _CLEAN + (
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length : 6\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n")
+
+    # A request with no headers at all, and a request behind it.  Found by
+    # fuzz_http_request once the oracle started walking every message: the first
+    # "\r\n\r\n" in this buffer IS the request line's own CRLF and the blank
+    # line, so the header block is empty — and rewrite_http_request, which
+    # searched the bytes behind the request line for another "\r\n\r\n", walked
+    # past the empty block and emitted the *next* request's fields as this
+    # one's.  The same mistake check_no_smuggling made about the same shape.
+    s["pipelined_after_no_headers"] = (
+        b"POST /px/ HTTP/1.1\r\n\r\n"
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+
+    # The same trick behind a *declared* body: the smuggled request starts one
+    # byte past where Content-Length says the first one ends, so a proxy that
+    # forwards the whole buffer hands it over and a proxy that forwards eleven
+    # bytes does not.
+    s["pipelined_after_body"] = (
+        b"POST /px/a HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nhello world"
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+
+    # A chunked request with bytes behind it.  The proxy never de-chunks, so it
+    # cannot say where this body ends and forwards it as an opaque stream — and
+    # the oracle stops walking here for the same reason.  The seed is kept
+    # because that is the one shape where the two must agree to stop, and a
+    # future attempt to bound a chunked body has to keep this input clean.
+    s["pipelined_after_chunked"] = (
+        b"POST /px/a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello\r\n0\r\n\r\n"
+        b"POST /px/b HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+
+    # Content-Length that is not a whole decimal.  from_chars would have stopped
+    # at the 'x' and reported 6, putting the boundary six bytes into a body the
+    # backend frames some other way.
+    s["cl_not_decimal"] = b"POST /px/ HTTP/1.1\r\nHost: h\r\nContent-Length: 6x\r\n\r\nhello!"
+
     return s
 
 

@@ -1,0 +1,9 @@
+GET /px/a HTTP/1.1
+Host: h
+
+POST /px/b HTTP/1.1
+Host: h
+Content-Length: 6
+Content-Length: 7
+
+smuggl

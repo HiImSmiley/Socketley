@@ -2007,6 +2007,11 @@ or more than one
 field
 .IP \(bu 2
 a
+.B Content\-Length
+that is not a whole decimal number
+.RB ( "Content\-Length: 6x" )
+.IP \(bu 2
+a
 .B Transfer\-Encoding
 whose final coding is not
 .B chunked
@@ -2016,6 +2021,26 @@ or
 .B chunked
 listed twice) \(em such a request has no determinable body length at all
 .RE
+.PP
+Every request on a connection is framed and checked on its own, including
+one pipelined behind another. Only the body a request declares travels
+with it: bytes past its
+.B Content\-Length
+are not body, and are held back and parsed as the next request rather
+than forwarded. Pipelining still works \(em a second request sent before
+the first is answered is served \(em but it is answered in turn, after
+the same checks, and a smuggling attempt hidden behind a clean request is
+refused exactly as it would be if it had been sent first. A request held
+this way is subject to the same 10 second deadline as a half\-arrived one:
+if the exchange in front of it never reaches an end this proxy can point
+at \(em a backend whose response is framed in a way it cannot read \(em the
+held request is answered
+.B 408 Request Timeout
+rather than left waiting. A
+.B chunked
+request is the one body this proxy cannot measure, because it never
+de\-chunks; its body is forwarded as an opaque stream, so a request
+pipelined behind a chunked one is framed by the backend alone.
 .PP
 Compliant clients emit none of these. A request whose header block is
 still arriving is held until the terminating blank line, subject to the

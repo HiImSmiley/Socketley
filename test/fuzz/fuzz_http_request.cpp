@@ -54,16 +54,27 @@
 //
 // ─── THE ORACLE ─────────────────────────────────────────────────────────────
 //
-// Beyond crashes, this target asserts one security property: the request the
-// proxy forwards must not carry both a Content-Length and a Transfer-Encoding
-// header when measured by a *strict* line splitter — one that treats a bare LF
-// as a line terminator, the way most backends do.
+// Beyond crashes, this target asserts one security property: nothing the proxy
+// forwards may be framed in a way the proxy and a backend can read differently.
+// Measured with a *strict* line splitter — one that treats a bare LF as a line
+// terminator, the way most backends do — and applied to EVERY message in the
+// forwarded bytes, not only the first.  Per message:
 //
-// parse_http_request_line's own check splits headers on CRLF only, so a peer
-// that separates the two headers with a bare LF presents them as one line to
-// the check and as two lines to the backend.  Reading the code says that gets
-// forwarded.  This target turns that reading into an executable claim rather
-// than a paragraph in a review.
+//   * the header block is strictly CRLF-framed (no bare LF, no bare CR)
+//   * no obs-fold continuation line
+//   * no whitespace between a field name and its colon
+//   * at most one Content-Length, and it is a whole decimal
+//   * never Content-Length together with Transfer-Encoding
+//
+// which is the same list parse_http_request_line enforces — the point being
+// that it enforces it on the first message in the buffer only, while a backend
+// applies it to every message on the connection.  A payload put second used to
+// slip past all five: rewrite_http_request appended everything past the header
+// terminator verbatim and cleared the buffer, so a clean request in front of a
+// CL+TE one was enough to hand the CL+TE one to a backend unchecked.  Both
+// halves are fixed now — the forwarded body is bounded by what the request
+// declared, and this oracle walks the whole stream — and the seeds under
+// corpus/http named pipelined_* are the shapes that used to get through.
 //
 // If this oracle fires on the first CI run, that is the finding, not a broken
 // test: read the reported input before touching the oracle.  FUZZ_SMUGGLING=0
@@ -73,6 +84,7 @@
 
 #include "runtime/proxy/proxy_instance.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -153,49 +165,228 @@ bool name_is(std::string_view line, std::string_view lower)
     return true;
 }
 
-// The forwarded bytes, judged by a backend's line rules.
-void check_no_smuggling(std::string_view forwarded, const uint8_t* raw, size_t raw_size)
+// Every line of a header block ends CRLF and nothing else.  A bare LF may be
+// accepted by a recipient and a bare CR may be accepted or turned into a space,
+// and "may" is per recipient: the proxy and the backend choose independently,
+// and the moment they choose differently they disagree about where one request
+// ends.  Written out here rather than borrowed from http_response_framing.h so
+// that the oracle does not judge the code under test with the code under test.
+bool crlf_framed(std::string_view block)
 {
-    size_t line_end = forwarded.find("\r\n");
+    for (size_t i = 0; i < block.size(); i++)
+    {
+        if (block[i] == '\n')
+        {
+            if (i == 0 || block[i - 1] != '\r')
+                return false;                       // bare LF
+        }
+        else if (block[i] == '\r')
+        {
+            if (i + 1 >= block.size() || block[i + 1] != '\n')
+                return false;                       // bare CR
+        }
+    }
+    return true;
+}
+
+// The verdict on one message in the forwarded stream, and how far past it the
+// next message begins.
+struct fwd_message
+{
+    const char* violation{nullptr};   // null when the message is unambiguous
+    bool terminated{false};           // header block ended with a blank line
+    bool chunked{false};
+    size_t content_length{0};
+    size_t body_offset{0};            // from the start of the message
+};
+
+// Judge one message of the forwarded stream the way a backend would, and say
+// where its body starts.  `msg` runs from the request line to the end of the
+// forwarded bytes; only the part up to the terminating blank line is judged.
+fwd_message judge_message(std::string_view msg)
+{
+    fwd_message out;
+
+    const size_t line_end = msg.find("\r\n");
     if (line_end == std::string_view::npos)
-        return;
-    std::string_view headers = forwarded.substr(line_end + 2);
+        return out;   // no request line here at all; nothing to frame
+
+    std::string_view rest = msg.substr(line_end + 2);
 
     // A request with no headers at all ends right here, and everything behind
     // it belongs to whatever comes next on the connection -- not to this
     // message.  Searching on for a "\r\n\r\n" instead would walk past the
     // empty block and read a *pipelined* request's fields as this one's, which
     // is a different finding wearing this one's name.
-    if (headers.compare(0, 2, "\r\n") == 0)
+    std::string_view headers;
+    if (rest.compare(0, 2, "\r\n") == 0)
+    {
         headers = {};
+        out.terminated = true;
+        out.body_offset = line_end + 2 + 2;
+    }
     else
     {
-        size_t hdr_end = headers.find("\r\n\r\n");
-        if (hdr_end != std::string_view::npos)
-            headers = headers.substr(0, hdr_end);
-    }
-
-    bool cl = false, te = false;
-    for (std::string_view line : strict_header_lines(headers))
-    {
-        if (name_is(line, "content-length"))    cl = true;
-        if (name_is(line, "transfer-encoding")) te = true;
-    }
-
-    if (cl && te)
-    {
-        if (smuggling_is_fatal())
+        const size_t hdr_end = rest.find("\r\n\r\n");
+        if (hdr_end == std::string_view::npos)
         {
-            FUZZ_CHECK(false,
-                       "the proxy forwarded a request carrying both Content-Length and "
-                       "Transfer-Encoding — RFC 7230 3.3.3 requires this to be rejected, and "
-                       "a backend that disagrees with the proxy about where one request ends "
-                       "is request smuggling");
+            headers = rest;                     // block never terminated
+            out.body_offset = msg.size();
         }
         else
         {
-            fuzz_observe("CL+TE survived the proxy's smuggling check (FUZZ_SMUGGLING=0)", raw, raw_size);
+            headers = rest.substr(0, hdr_end);
+            out.terminated = true;
+            out.body_offset = line_end + 2 + hdr_end + 4;
         }
+    }
+
+    // The request line counts.  A bare LF in it splits the message somewhere
+    // this side never looked, and the tail becomes a header line — or a request
+    // line — for the backend alone.
+    if (!crlf_framed(msg.substr(0, line_end + 2 + headers.size())))
+    {
+        out.violation = "a forwarded request's header block is not strictly CRLF-framed — "
+                        "a bare LF or bare CR is one this proxy and a backend are free to "
+                        "split differently, which is where the two stop agreeing about "
+                        "where a request ends";
+        return out;
+    }
+
+    unsigned cl_count = 0;
+    for (std::string_view line : strict_header_lines(headers))
+    {
+        // Obs-fold: a continuation line is more of the previous value to one
+        // recipient and a field of its own to another.
+        if (line[0] == ' ' || line[0] == '\t')
+        {
+            out.violation = "a forwarded request carries an obs-fold continuation line "
+                            "(RFC 9112 5.2), which a backend may unfold into a field this "
+                            "proxy never saw";
+            return out;
+        }
+
+        const size_t colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;                        // not a field line; both sides skip it
+
+        // Whitespace before the colon (RFC 9112 5.1): "Content-Length : 6" is
+        // not a Content-Length to a strict parser and is one to a lenient parser.
+        if (colon == 0 || line[colon - 1] == ' ' || line[colon - 1] == '\t')
+        {
+            out.violation = "a forwarded request has whitespace between a field name and "
+                            "its colon (RFC 9112 5.1) — a lenient backend honours the field "
+                            "and frames the body by it while this proxy ignored it";
+            return out;
+        }
+
+        if (name_is(line, "content-length"))
+        {
+            cl_count++;
+
+            // The value with its optional surrounding whitespace removed, and
+            // then digits only.  Not "skip every space": "6 6" would come out as
+            // 66 that way, which is a length neither end would have used.
+            std::string_view val = line.substr(colon + 1);
+            while (!val.empty() && (val.front() == ' ' || val.front() == '\t'))
+                val.remove_prefix(1);
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\t'))
+                val.remove_suffix(1);
+
+            out.content_length = 0;
+            bool whole_decimal = !val.empty();
+            for (char c : val)
+            {
+                if (c < '0' || c > '9') { whole_decimal = false; break; }
+                out.content_length = out.content_length * 10 + static_cast<size_t>(c - '0');
+                // Saturate rather than wrap.  Any length this large already runs
+                // past every byte that was forwarded, so the walk stops on it.
+                if (out.content_length > (size_t{1} << 40))
+                    out.content_length = size_t{1} << 40;
+            }
+            if (!whole_decimal)
+            {
+                out.violation = "a forwarded request's Content-Length is not a whole "
+                                "decimal (RFC 9112 6.3) — the two ends then take the "
+                                "body's length from different places";
+                return out;
+            }
+        }
+        else if (name_is(line, "transfer-encoding"))
+        {
+            out.chunked = true;
+        }
+    }
+
+    if (cl_count > 1)
+    {
+        out.violation = "a forwarded request carries two Content-Length fields (RFC 9112 "
+                        "6.3) — the message gives two answers to how long its body is and "
+                        "each recipient picks one";
+        return out;
+    }
+
+    if (cl_count > 0 && out.chunked)
+    {
+        out.violation = "a forwarded request carries both Content-Length and "
+                        "Transfer-Encoding — RFC 7230 3.3.3 requires this to be rejected, "
+                        "and a backend that disagrees with the proxy about where one "
+                        "request ends is request smuggling";
+        return out;
+    }
+
+    return out;
+}
+
+// The forwarded bytes, judged by a backend's line rules — every message in them,
+// not only the first.
+//
+// Judging only the first was the hole this oracle had.  A backend reads a
+// connection as a stream of messages: it frames one, and then it frames the
+// next out of whatever follows.  So a payload put *second* was never looked at
+// here, which is precisely the shape that used to get through the proxy —
+// rewrite_http_request appended everything past the header terminator verbatim
+// while parse_http_request_line validated only the message in front of it.  An
+// oracle that stopped at message one could not see that, and did not.
+void check_no_smuggling(std::string_view forwarded, const uint8_t* raw, size_t raw_size)
+{
+    // A stream of empty messages cannot occur — every step consumes at least a
+    // request line — but the walk is over attacker-chosen bytes and gets a
+    // ceiling rather than an argument.
+    for (unsigned index = 0; index < 64 && !forwarded.empty(); index++)
+    {
+        const fwd_message m = judge_message(forwarded);
+
+        if (m.violation)
+        {
+            if (smuggling_is_fatal())
+                FUZZ_CHECK(false, m.violation);
+            fuzz_observe(m.violation, raw, raw_size);
+            return;
+        }
+
+        // Nothing terminated the header block, so there is no message behind
+        // this one to walk to.
+        if (!m.terminated)
+            return;
+
+        std::string_view body_and_rest = forwarded.substr(m.body_offset);
+
+        // Chunked is where the walk has to stop, and honestly so.  The proxy
+        // never de-chunks and cannot point at the terminating chunk (the
+        // response side says the same thing in http_response_frame_complete),
+        // so it forwards a chunked body as an opaque stream — and this oracle
+        // cannot tell that stream's bytes from a message behind it either.
+        // Reading on would report body content as a smuggled request.
+        if (m.chunked)
+            return;
+
+        // The declared body eats the rest of what was forwarded: no further
+        // message begins inside these bytes.
+        if (m.content_length >= body_and_rest.size())
+            return;
+
+        forwarded = body_and_rest.substr(m.content_length);
     }
 }
 
@@ -224,10 +415,11 @@ proxy_instance& shared_proxy()
 }
 
 // Model of the order in which handle_client_read calls the two functions:
-// parse the request line, and once it succeeds rewrite everything buffered at
-// that moment.  Bytes that arrive after the rewrite are forwarded raw, which is
-// why they are appended to the result here — a smuggling check that only ran
-// over the first chunk did not run over them.
+// parse the request line, and once it succeeds rewrite what is buffered at that
+// moment.  Bytes that arrive after the rewrite go out through the body path,
+// which forwards only as much as the request declared — modelled at the end of
+// this function, because getting that boundary wrong in either direction is
+// what this target is about.
 std::string feed(std::string_view chunk1, std::string_view chunk2)
 {
     auto conn = std::make_unique<proxy_client_connection>();
@@ -287,12 +479,22 @@ std::string feed(std::string_view chunk1, std::string_view chunk2)
     FUZZ_CHECK(forwarded.compare(0, conn->method.size(), conn->method) == 0,
                "the rewritten request does not begin with the method that was parsed");
 
-    // Whatever had not arrived yet goes to the backend without ever passing
-    // through the checks above.  Appended only when it was not already folded
-    // into the buffer the rewrite ran over — otherwise it would be counted
-    // twice and the oracle would fire on a request that was in fact checked.
+    // Whatever had not arrived yet reaches the backend through
+    // handle_client_read's body path, which forwards only as much as the
+    // request declared and holds the rest back for the next parse.  Modelled
+    // here rather than appended whole: "everything left over goes out raw" is
+    // exactly the defect this target is about, and a model that keeps doing it
+    // would report a hole the handler no longer has.  Appended at all only when
+    // these bytes were not already folded into the buffer the rewrite ran over
+    // — otherwise they would be counted twice and the oracle would fire on a
+    // request that was in fact checked.
     if (!chunk2_buffered && !chunk2.empty())
-        forwarded.append(chunk2.data(), chunk2.size());
+    {
+        const size_t n = conn->body_unbounded
+            ? chunk2.size()
+            : std::min(conn->body_remaining, chunk2.size());
+        forwarded.append(chunk2.data(), n);
+    }
 
     return forwarded;
 }

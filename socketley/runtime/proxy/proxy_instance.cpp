@@ -162,6 +162,10 @@ void proxy_client_connection::reset(int new_fd)
     method.clear();
     path.clear();
     version.clear();
+    declared_body_len = 0;
+    declared_body_chunked = false;
+    body_remaining = 0;
+    body_unbounded = false;
     last_activity = {};
     retries_remaining = 0;
     backend_idx = 0;
@@ -1765,6 +1769,38 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
+    drive_client_request(conn, fd);
+}
+
+// A request pipelined behind the one now in flight waits for that exchange to
+// end, and what ends it is the response being judged finished.  There is a
+// shape where that judgement never comes: a backend whose header block straddles
+// a read boundary leaves http_response_framing::unknown set, so the pair is
+// never detached and this connection would sit holding a request nobody is ever
+// going to send it.  Measured with a backend that splits its status line from
+// its headers — the second response never arrives and the descriptor is held
+// until the peer gives up.
+//
+// Holding is only safe if something ends the hold, which is the same argument
+// PROXY_HEADER_TIMEOUT_SEC was added under.  So a whole request that cannot be
+// acted on gets the bound a half-arrived one gets: the sweep answers 408 and
+// closes, which at least tells the client its pipelined request was not served
+// instead of leaving it waiting on an answer that is never coming.
+void proxy_instance::bound_pipelined_hold(proxy_client_connection* conn)
+{
+    if (conn->closing || conn->partial.empty())
+        return;
+    // What is buffered is body, not a request; the body path forwards it.
+    if (conn->body_unbounded || conn->body_remaining > 0)
+        return;
+    arm_header_deadline(conn);
+}
+
+// See the declaration in proxy_instance.h for why this is reachable from two
+// places.  Everything below used to sit inline at the end of
+// handle_client_read; it is the same code, and the same order.
+void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
+{
     if (!conn->header_parsed)
     {
         // Slowloris / oversized header protection
@@ -1841,6 +1877,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         std::string rewritten = rewrite_http_request(conn, new_path);
         conn->saved_request = std::move(rewritten);
 
+        // Before the connect, because an asynchronous one returns out of this
+        // function below and the bound would never be armed for the commonest
+        // shape of all: both requests in the first read of a fresh connection.
+        bound_pipelined_hold(conn);
+
         bool ours = false;
         if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target, &ours)))
         {
@@ -1871,15 +1912,29 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (m_mesh.retry_count <= 0)
             conn->saved_request.clear();
     }
-    else
+    else if (conn->backend_fd >= 0 && !conn->partial.empty())
     {
-        // Subsequent data (request body) — forward as-is
-        if (conn->backend_fd >= 0)
+        // The rest of this request's body — and, possibly right behind it, the
+        // start of the next request on the connection.  Only the body may go out
+        // here.  This used to forward the whole buffer and clear it, which is
+        // the same hole rewrite_http_request had: bytes nothing has parsed,
+        // reaching a backend that parses them.
+        const size_t n = conn->body_unbounded
+            ? conn->partial.size()
+            : std::min(conn->body_remaining, conn->partial.size());
+        if (n > 0)
         {
-            forward_to_backend(conn, conn->partial);
-            conn->partial.clear();
+            forward_to_backend(conn, std::string_view(conn->partial.data(), n));
+            if (!conn->body_unbounded)
+                conn->body_remaining -= n;
+            conn->partial.erase(0, n);
         }
+        // Whatever is still buffered is the next request.  It waits for this
+        // one's response and is then parsed from the top — see
+        // reset_client_for_next_request.
     }
+
+    bound_pipelined_hold(conn);
 
 proxy_http_resubmit:
     if (SOCKETLEY_LIKELY(!conn->closing))
@@ -2224,6 +2279,7 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     bool has_te = false;
     bool te_chunked_final = false;
     unsigned cl_count = 0;
+    size_t cl_value = 0;
     size_t search_pos = 0;
     while (search_pos < headers.size())
     {
@@ -2252,7 +2308,21 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
             return http_request_parse::invalid;
 
         if (header_name_equals(hdr_line, "content-length", 14))
+        {
             cl_count++;
+            // The number, not merely the presence.  It is what bounds the body
+            // the proxy is willing to forward behind this header block, so a
+            // field it cannot read is a body it cannot end, and RFC 9112
+            // Section 6.3 already calls an invalid Content-Length unrecoverable.
+            // from_chars would have stopped at the first byte it could not use
+            // and reported success for what it read, so "6x" would have come
+            // back as 6 — a boundary six bytes into a body the backend frames
+            // differently, which is the disagreement this whole function exists
+            // to prevent.
+            if (SOCKETLEY_UNLIKELY(!http_whole_decimal(
+                    http_trim_ows(hdr_line.substr(colon + 1)), cl_value)))
+                return http_request_parse::invalid;
+        }
         else if (header_name_equals(hdr_line, "transfer-encoding", 17))
         {
             has_te = true;
@@ -2287,6 +2357,12 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     // Refusing is the only answer here that requires agreement with nobody.
     if (SOCKETLEY_UNLIKELY(has_te && !te_chunked_final))
         return http_request_parse::invalid;
+
+    // How long this request's body is, established from a header block that has
+    // just been proved to give exactly one answer to the question.  Everything
+    // past that is not this request's, and rewrite_http_request holds it back.
+    conn->declared_body_len = (cl_count == 1) ? cl_value : 0;
+    conn->declared_body_chunked = has_te;
 
     return http_request_parse::complete;
 }
@@ -2351,19 +2427,49 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // That is how Transfer-Encoding survived into the forwarded bytes even
     // though the block it came from was meant to have been rejected.
     //
-    // The npos fallbacks below are now unreachable for the same reason: the
-    // caller only gets here on http_request_parse::complete, which requires the
-    // "\r\n\r\n" to have arrived.  They are kept because being wrong about
-    // that used to mean forwarding a terminated request and then the client's
-    // real headers behind it, which the backend read as a second request.
-    std::string_view remaining(conn->partial.data() + pos + 2, conn->partial.size() - pos - 2);
-    auto hdr_end = remaining.find("\r\n\r\n");
-    std::string_view headers_section = (hdr_end != std::string_view::npos)
-        ? remaining.substr(0, hdr_end)
-        : remaining;
-    std::string_view body_section = (hdr_end != std::string_view::npos)
-        ? remaining.substr(hdr_end + 4)
-        : std::string_view{};
+    // The block is measured from the *same* terminator parse_http_request_line
+    // measured it from: the first "\r\n\r\n" in the whole buffer.  Searching the
+    // bytes behind the request line for another one is not the same question,
+    // and gets a different answer for a request that carries no headers at all —
+    // there the first "\r\n\r\n" *is* the request line's own CRLF followed by
+    // the blank line, so the block is empty and the search walks straight past
+    // it to the terminator of the *next* request in the buffer.  Everything in
+    // between was then emitted as this request's headers.
+    //
+    // Found by fuzz_http_request on "POST /px/ HTTP/1.1\r\n\r\n" followed by a
+    // pipelined request: the second request's fields — a bare-LF line and a
+    // Transfer-Encoding among them — came out on the first request's header
+    // block, having passed no check whatever, because the parser had correctly
+    // seen that block as empty and looked at nothing.  It is the same mistake
+    // check_no_smuggling made about the same shape (86c825a), on the other side
+    // of the seam.
+    //
+    // The npos fallback is unreachable: the caller only gets here on
+    // http_request_parse::complete, which requires the "\r\n\r\n" to have
+    // arrived.  It is kept because being wrong about that used to mean
+    // forwarding a terminated request and then the client's real headers behind
+    // it, which the backend read as a second request.
+    const auto hdr_end = conn->partial.find("\r\n\r\n");
+    std::string_view headers_section;
+    size_t body_off;
+    if (SOCKETLEY_UNLIKELY(hdr_end == std::string::npos))
+    {
+        headers_section = std::string_view(conn->partial.data() + pos + 2,
+                                           conn->partial.size() - pos - 2);
+        body_off = conn->partial.size();
+    }
+    else if (hdr_end <= pos)
+    {
+        headers_section = {};              // no headers at all
+        body_off = pos + 4;
+    }
+    else
+    {
+        headers_section = std::string_view(conn->partial.data() + pos + 2, hdr_end - pos - 2);
+        body_off = hdr_end + 4;
+    }
+    std::string_view body_section(conn->partial.data() + body_off,
+                                  conn->partial.size() - body_off);
 
     bool host_written = false;
     size_t h_pos = 0;
@@ -2440,10 +2546,52 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         result += "Connection: keep-alive\r\n";
 
     result += "\r\n";
-    if (!body_section.empty())
-        result += body_section;
 
-    conn->partial.clear();
+    // How much of what follows the header terminator belongs to *this* request.
+    //
+    // This used to be "all of it", and conn->partial was then cleared.  But the
+    // bytes behind a request are whatever the client chose to put there, and
+    // parse_http_request_line validates only the first message in the buffer —
+    // so a client that sent a clean request and pipelined a second one carrying
+    // Content-Length together with Transfer-Encoding got that second request
+    // handed to the backend verbatim.  Not one of the checks above ran on it:
+    // not CL+TE, not the duplicate Content-Length, not the bare-LF framing scan,
+    // not obs-fold, not whitespace before the colon.  Putting the payload second
+    // was the whole of the bypass, and it needed no malformed byte in the first
+    // request at all.
+    //
+    // A validated request declares its body length exactly once — the parser has
+    // just refused two Content-Lengths and refused Content-Length alongside
+    // Transfer-Encoding — so that length is known, and nothing beyond it is
+    // body.  What is beyond it stays in conn->partial and comes back through
+    // this same function as a request of its own, checks included.
+    size_t body_len;
+    if (conn->declared_body_chunked)
+    {
+        // Except for chunked, where there is no length to compute: this proxy
+        // forwards the body byte for byte and never de-chunks it, so it cannot
+        // point at the terminating chunk any more than the response side can
+        // (see http_response_frame_complete).  Its body streams on exactly as
+        // before — bounding it would mean guessing where it ends, and a guess
+        // that truncates a legitimate upload is worse than the case it closes.
+        body_len = body_section.size();
+        conn->body_unbounded = true;
+        conn->body_remaining = 0;
+    }
+    else
+    {
+        body_len = std::min(conn->declared_body_len, body_section.size());
+        conn->body_unbounded = false;
+        conn->body_remaining = conn->declared_body_len - body_len;
+    }
+
+    if (body_len > 0)
+        result.append(body_section.data(), body_len);
+
+    // Consume exactly what was forwarded.  body_off is the whole buffer on the
+    // unreachable npos path above, so that case still clears it.
+    conn->partial.erase(0, body_off + body_len);
+
     return result;
 }
 
@@ -4017,11 +4165,40 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->awaiting_response = false;
     cconn->awaiting_headers = false;
     cconn->client_conn_close = false;
-    cconn->partial.clear();
     cconn->method.clear();
     cconn->path.clear();
     cconn->version.clear();
+
+    // The answer arrived before the client had finished sending its body — an
+    // early 4xx, say.  Then what is buffered is the tail of that body rather
+    // than a request, there is no longer a backend to send it to, and reading it
+    // as a request line would answer 400 to bytes the client never meant as one.
+    // Unclassifiable, so dropped.
+    const bool body_owing = cconn->body_unbounded || cconn->body_remaining > 0;
+    cconn->declared_body_len = 0;
+    cconn->declared_body_chunked = false;
+    cconn->body_remaining = 0;
+    cconn->body_unbounded = false;
+    if (body_owing)
+        cconn->partial.clear();
     cconn->saved_request.clear();
+
+    // conn->partial is deliberately *not* cleared any more.  A request pipelined
+    // behind the one just answered is sitting in it: rewrite_http_request now
+    // forwards only the body its request declared and leaves the rest here,
+    // precisely so that the rest goes through the framing checks instead of
+    // round the back of them.  Dropping it here would turn that hold into a lost
+    // request and break pipelining outright — the point is that the second
+    // request is checked, not that it is discarded.
+    //
+    // Nothing else will come to wake it, either: the client is waiting for its
+    // answer, so there is no further read to trigger the parse.  Drive it here,
+    // down exactly the path a read would have taken.  This is the last statement
+    // of every branch that calls this function, because it can conclude that the
+    // pipelined request is malformed and take the connection down with it.
+    if (m_protocol == protocol_http && !cconn->partial.empty() &&
+        !cconn->closing && cconn->fd >= 0)
+        drive_client_request(cconn, cconn->fd);
 }
 
 bool proxy_instance::is_backend_available(size_t idx) const
