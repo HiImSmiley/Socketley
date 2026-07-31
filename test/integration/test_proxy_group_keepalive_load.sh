@@ -65,16 +65,22 @@ SEQ_REQS=8          # requests on the single deterministic connection
 
 # Twelve connections, paced.  Concurrency is what this test needs -- twelve
 # keep-alive connections interleaving through one gateway -- and rate is not.
-# A group-routed request is never pooled (proxy_instance.cpp says so, and
-# explains why: the group path leaves backend_idx pointing at the group entry,
-# so the pool would hand back a connection to a different member), which means
-# one TCP connection to a member per request.  Unpaced, twelve clients put ~2000
+#
+# The pace was forced on this test by a defect it then made visible: a
+# group-routed request was excluded from the backend pool, so every request
+# opened a fresh TCP connection to a member.  Unpaced, twelve clients put ~2000
 # of those a second through the gateway and a run of this test left ~26000
 # sockets in TIME_WAIT -- past the 16384 this kernel keeps
 # (net.ipv4.tcp_max_tw_buckets), after which connects to the gateway hang, the
 # gateway's own connects to its members hang, and the run measures a machine it
 # broke itself.  Measured: at 4 ms the table pinned at the ceiling and windows
 # went empty; at 20 ms the same run leaves ~8000 and every window fills.
+#
+# That defect is fixed -- the pool is keyed by endpoint now, so a group
+# connection is reused like any other and the same run peaks in the single
+# digits instead of at the ceiling.  The pace stays regardless, because it was
+# never the point: this test asks where requests go while membership changes,
+# and a burst answers that no better than a steady stream does.
 PACE=${PACE:-0.02}
 
 # Each window stays open until it has carried at least this much traffic and has
@@ -634,13 +640,51 @@ if kill -0 "$DPID" 2>/dev/null; then ok; else bad "daemon alive" "the daemon die
 # and the sweep that evicts them runs every 30 s, so a check here can only be
 # a ceiling, never "back to baseline".  An unreadable count is reported as
 # unreadable -- two numbers that are both empty compare equal.
+#
+# What the pool is holding is not a leak, and it has to be read rather than
+# assumed.  The old ceiling (FD0 + 4*CLIENTS + 40) was written while the group
+# path pooled nothing, so it was a bound on *not* pooling: once pooling worked
+# it read 122 against 98, and even a theoretically perfect pool of one socket
+# per client would have had four descriptors of room.  A bound no correct
+# implementation can satisfy tests nothing.
+#
+# Seven descriptors per pooled connection, because of what this test builds:
+# the members are themselves splicing TCP proxies inside this same daemon, so
+# one idle gateway->member socket also keeps that member's accepted socket, its
+# own backend socket, and the two pipes it splices them with.  /proc/PID/fd is
+# the whole daemon and counts all four runtimes; against plain servers the same
+# connection would cost three.  Slack stays a flat 40 either way -- it does not
+# scale with the pool, so a real leak of a few dozen descriptors is still red
+# no matter how many connections were legitimately retained.
+#
+# The count is read on both sides of the descriptor tally and the larger one
+# wins.  The load driver has been waited on, so nothing new is being opened and
+# the pool only shrinks from here -- but the idle sweep may fire between the two
+# readings, and charging fewer connections than the tally still includes is
+# exactly how this check would go red for the wrong reason.
+POOL_A_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_A_RC=$?
 FD1=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l)
+POOL_B_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_B_RC=$?
+# Absent means zero: the runtime only prints the line when the pool is non-empty.
+POOL_SED='s/^pooled_connections:\([0-9][0-9]*\)$/\1/p'
+POOL_A=$(printf '%s\n' "$POOL_A_RAW" | sed -n "$POOL_SED" | head -1)
+POOL_B=$(printf '%s\n' "$POOL_B_RAW" | sed -n "$POOL_SED" | head -1)
+POOLED=${POOL_A:-0}
+[ "${POOL_B:-0}" -gt "$POOLED" ] && POOLED=${POOL_B:-0}
+FD_CEIL=$((FD0 + 7 * POOLED + 40))
+
 if [ -z "$FD0" ] || [ -z "$FD1" ] || [ "$FD1" -eq 0 ] 2>/dev/null; then
     bad "descriptor count readable" "could not read /proc/$DPID/fd (baseline '${FD0:-}', now '${FD1:-}')"
-elif [ "$FD1" -le $((FD0 + 4 * CLIENTS + 40)) ]; then
+elif [ "$POOL_A_RC" -ne 0 ] || [ "$POOL_B_RC" -ne 0 ]; then
+    # Without the pool's size the ceiling cannot be computed at all, and a
+    # guess here would be indistinguishable from the bound this replaced.
+    herr "descriptors bounded after load" \
+        "the gateway did not answer stats, so what the pool is holding is unknown"
+elif [ "$FD1" -le "$FD_CEIL" ]; then
     ok
 else
-    bad "descriptors bounded after load" "baseline $FD0, now $FD1"
+    bad "descriptors bounded after load" \
+        "baseline $FD0, now $FD1, ceiling $FD_CEIL ($POOLED pooled connections at 7 descriptors each)"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
