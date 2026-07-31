@@ -2187,6 +2187,49 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     (cqe->res < 0) || !ce.client->response_started;
                 if (backend_failed)
                     note_backend_failure(ce.client);
+
+                // The backend went away before one byte of the answer did, and
+                // the client is still waiting for it.  Closing the client here
+                // told it nothing at all — the same silence the deadline sweep
+                // used to produce, and unlike that one this arrives instantly,
+                // so a client cannot even tell it apart from the proxy dying.
+                //
+                // The commonest way to reach this is a connection out of the
+                // pool that the backend had already closed: a server with a
+                // short keep-alive idle timeout hangs up while the socket sits
+                // idle, and acquire_pooled_backend deliberately skips its
+                // liveness probe under five seconds, so the next request is
+                // written into a socket that is already gone and reads EOF.
+                // Measured against a backend that hangs up 150 ms after
+                // answering: every second request was closed with no response
+                // at all.  That is older than the pool key this file changed
+                // today — the probe skip and this teardown are both unchanged
+                // since before it — but a group-routed request could not reach
+                // it while the group path was excluded from the pool, and now
+                // it can, so it is this change's business to answer for.
+                //
+                // A retry is the better answer where one is configured, and it
+                // is safe by the same test the retry path already applies:
+                // nothing has been sent to the client, so the exchange can
+                // start again elsewhere.  Where it is not configured, 502 says
+                // which half failed, which is the least a client needs to
+                // decide whether to try again.
+                if (m_protocol == protocol_http && backend_failed &&
+                    !ce.client->closing && !ce.client->response_started)
+                {
+                    auto* cconn = ce.client;
+                    // Detach the pair before either branch runs: a retry opens
+                    // a backend of its own, and this one is torn down on the
+                    // next line whatever happens.  Leaving the two pointing at
+                    // each other would let that teardown take the client with
+                    // it, which is the behaviour being removed.
+                    cconn->backend_fd = -1;
+                    conn->client_fd = -1;
+                    if (!try_retry(cconn))
+                        send_error(cconn, "502 Bad Gateway", "Bad Gateway\n");
+                    close_pair(-1, fd);
+                    return;
+                }
             }
         }
 
@@ -3034,11 +3077,22 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
             continue;
         }
 
-        // Skip the liveness probe for recently-idle connections — probability
-        // of a FIN/RST arriving in the first 5s is very low, and the syscall
-        // is expensive on the hot path.
-        if ((now - pb.idle_since) < std::chrono::seconds(5))
-            return pb.fd;
+        // Every socket is probed, however recently it went idle.  This used to
+        // skip anything under five seconds, on the argument that a FIN arriving
+        // that fast is unlikely and the syscall is expensive on the hot path.
+        // The first half is wrong wherever it matters: a backend with a short
+        // keep-alive idle timeout closes in well under five seconds by design,
+        // and a group member that is stopping closes immediately — and the
+        // proxy learns that a member has left through a published table that
+        // cannot arrive before the sockets do.  Measured against a backend that
+        // hangs up 150 ms after answering: every second request was written
+        // into a socket that was already gone, and the client got nothing at
+        // all for it.  The cost of being wrong is a whole request; the cost of
+        // asking is one non-blocking recv on a socket already in cache.
+        //
+        // It does not close the window — a FIN can still arrive between this
+        // probe and the write, and nothing can prevent that — which is why the
+        // read path answers rather than dropping when it does.
 
         // Quick liveness probe: if the remote has sent a RST/FIN while pooled,
         // recv(MSG_PEEK|MSG_DONTWAIT) returns 0 (FIN) or -1/ECONNRESET.
