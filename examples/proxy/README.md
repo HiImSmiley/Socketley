@@ -50,3 +50,27 @@ automatically without restarting the proxy.
 | `round-robin` | Sequential distribution (default) |
 | `random` | Random backend selection |
 | `lua` | Custom logic via `on_route()` callback |
+
+### Backend Response Deadline (HTTP Mode)
+
+Every HTTP proxy has `--backend-timeout` set to 2 seconds unless told otherwise.
+It bounds how long a backend may take to send the **first byte** of a response —
+not how long the response body may take, and not TCP mode, which has no request
+boundary to measure from. On expiry the request is retried if `--retry` allows
+it, answered `504 Gateway Timeout` otherwise, and the backend is charged an
+error so the circuit breaker can take it out of rotation.
+
+This is the only check that catches a backend which accepts connections and then
+never answers: a TCP health check connects to such a process quite happily.
+
+If a backend normally needs longer than 2 seconds to *begin* answering, raise the
+deadline or switch it off — otherwise working requests are cut short and a
+healthy backend gets circuit-broken:
+
+```bash
+socketley create proxy slowapi -p 8080 --backend 127.0.0.1:9001 \
+    --backend-timeout 30 -s      # 0 disables the deadline entirely
+```
+
+`--sidecar` does not set this flag, but it does enable the circuit breaker the
+expiry feeds, so pass `--backend-timeout` alongside it for slow applications.

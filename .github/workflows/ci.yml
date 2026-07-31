@@ -1,3 +1,63 @@
+# Per-push CI — the cheap half of the pipeline.
+#
+# This job used to build Release with LTO on every push, which took roughly
+# eight minutes before a single test ran.  The pipeline is now split by cost:
+# per-push is Debug and fast, nightly is sanitized and slow, and the Release
+# build happens on tags (release.yml) and in the nightly job.
+#
+# ─── WHAT THIS COVERS ───────────────────────────────────────────────────────
+#
+#   * a Debug build of the whole tree (no LTO, no -march=native)
+#   * the unit tests
+#   * the full integration suite, guarded so that a suite which ran fewer tests
+#     than exist on disk fails instead of reporting a smaller success
+#   * a short coverage-guided fuzz run against the RESP and WebSocket parsers
+#     and against cache_store driven as an operation sequence, under
+#     clang/libFuzzer with ASan+UBSan
+#   * a clang -Wall -Wextra build of the whole tree, for the diagnostics GCC
+#     does not emit
+#
+# ─── ON CLANG ───────────────────────────────────────────────────────────────
+#
+# clang is a TESTING toolchain here, not a build dependency.  socketley ships
+# built by GCC and nothing in this file changes that: the Debug build, the
+# integration suite and the release artifacts are all GCC's.  clang appears for
+# two things only — libFuzzer, which is a clang feature with no GCC equivalent,
+# and a second opinion on warnings.  A contributor does not need clang to build
+# or to run the test suite.
+#
+# ─── WHAT THIS DOES NOT COVER ───────────────────────────────────────────────
+#
+#   * ASan/UBSan on the daemon itself.  Only the fuzz targets are instrumented
+#     here; the integration suite runs an uninstrumented Debug build.  The
+#     sanitized suite is nightly.
+#   * TSan.  Nightly, and expected to be quiet — see the note in premake5.lua.
+#   * fuzz_http_request.  That target needs the runtime, which under clang means
+#     compiling fifteen SDK translation units with sanitizers (see the header
+#     comment in test/fuzz/fuzz_http_request.cpp).  That is a nightly cost, not
+#     a per-push one.  Consequence: a regression in the proxy's HTTP header
+#     handling is caught within a day, not within a push.
+#   * MemorySanitizer.  Deliberately absent everywhere, not an oversight — it
+#     needs libc++ and every dependency (liburing, OpenSSL, LuaJIT) rebuilt with
+#     -fsanitize=memory or it reports a false positive per uninstrumented byte,
+#     and LuaJIT's hand-written assembly cannot be instrumented at all.  See the
+#     longer note in test/fuzz/build_libfuzzer.sh.
+#   * the load harnesses.  They idle 60 s between passes by design and take tens
+#     of minutes.  Nightly.
+#   * the Release build.  Consequence: a change that only breaks under LTO or
+#     -march=native is caught nightly or at release time, not on push.
+#   * anything needing more than one machine, a real CA, or a kernel newer than
+#     the runner's.  io_uring feature probing differs between the runner kernel
+#     and a developer machine, so a green run here does not prove the fast paths
+#     that depend on newer io_uring opcodes were exercised at all.
+#
+# ─── FAILING LOUDLY ─────────────────────────────────────────────────────────
+#
+# Every step that could pass by doing nothing is guarded: the build checks that
+# the binaries it expects exist, the suite is wrapped in test/ci/assert_suite.sh
+# (which enforces a minimum test count), and the fuzz run refuses to start on an
+# empty corpus and refuses to report success on zero executed inputs.
+
 name: CI
 
 on:
@@ -6,9 +66,15 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
+    name: Debug build, tests, short fuzz
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -16,23 +82,203 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential liburing-dev libssl-dev netcat-openbsd bc libluajit-5.1-dev
-          cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" thirdparty/luajit/libluajit.a
+          sudo apt-get install -y build-essential liburing-dev libssl-dev \
+            netcat-openbsd bc libluajit-5.1-dev \
+            clang-18 libclang-rt-18-dev
+          # clang is for libFuzzer only — see the note at the top of this file.
+          # Not tolerant of failure: REQUIRE_LIBFUZZER=1 below depends on it,
+          # and a half-installed toolchain should fail here where the error is
+          # legible rather than three steps later.
+          clang++-18 --version
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
 
       - name: Generate Makefiles
         run: ./bin/premake5 gmake2
 
-      - name: Build (Release)
-        run: cd make && make config=release_x64 -j$(nproc)
+      - name: Build (Debug)
+        run: cd make && make config=debug_x64 -j"$(nproc)"
+
+      - name: Verify the build produced what the tests need
+        # A build step that "succeeded" without producing a binary is the most
+        # common source of a false green here: every later step then either
+        # skips silently or fails with a confusing error somewhere else.
+        run: |
+          missing=0
+          for b in socketley test_command_hashing test_cache_store test_resp_parser \
+                   test_name_resolver test_ws_parser; do
+            if [ ! -x "bin/Debug/$b" ]; then
+              echo "missing: bin/Debug/$b"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          ls -la bin/Debug/
 
       - name: Unit tests
         run: |
-          ./bin/Release/test_command_hashing
-          ./bin/Release/test_cache_store
-          ./bin/Release/test_resp_parser
-          ./bin/Release/test_name_resolver
-          ./bin/Release/test_ws_parser
+          set -e
+          for t in test_command_hashing test_cache_store test_resp_parser \
+                   test_name_resolver test_ws_parser; do
+            echo "--- $t ---"
+            ./bin/Debug/"$t"
+          done
 
-      - name: Integration tests
-        run: bash test/run_all.sh
-        timeout-minutes: 5
+      - name: Integration suite
+        env:
+          SOCKETLEY_CONFIG: Debug
+        run: bash test/ci/assert_suite.sh suite-debug.log
+        timeout-minutes: 12
+
+      - name: Build fuzz targets (GCC replay floor, ASan+UBSan)
+        # The two header-only targets plus fuzz_cache_ops, which adds exactly one
+        # runtime translation unit (cache_store.cpp needs nothing but libc).  All
+        # three compile in seconds.  See the note above about fuzz_http_request,
+        # which does not.
+        run: |
+          cd make
+          make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops
+          cd ..
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops; do
+            test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
+          done
+
+      - name: Build fuzz targets (clang + libFuzzer)
+        # The primary fuzzing path.  NOT continue-on-error and NOT best-effort:
+        # ubuntu-24.04 ships clang-18 and libclang-rt-18-dev, so if libFuzzer
+        # cannot be built here something is wrong with the image or the script
+        # and the job must say so.  REQUIRE_LIBFUZZER=1 turns "clang missing"
+        # from a silent downgrade into a failure — this pipeline has twice had a
+        # step pass because it did nothing.
+        env:
+          REQUIRE_LIBFUZZER: "1"
+          LIBFUZZER_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops
+        run: bash test/fuzz/build_libfuzzer.sh
+
+      - name: Seed corpus
+        run: |
+          python3 test/fuzz/make_corpus.py
+          for d in resp ws cache; do
+            n=$(find "test/fuzz/corpus/$d" -type f | wc -l)
+            echo "corpus/$d: $n files"
+            [ "$n" -gt 0 ] || { echo "corpus/$d is empty — a fuzz run over it proves nothing"; exit 1; }
+          done
+
+      - name: Short fuzz run
+        # 30 s per target per driver: coverage-guided libFuzzer first, then the
+        # GCC replay driver over the same corpus.  A regression check, not a
+        # campaign.  The replay half replays every seed (so a past crash stays
+        # fixed) and mutates from a fixed PRNG seed, so a failure there
+        # reproduces exactly on a laptop with the same command and FUZZ_SEED;
+        # the libFuzzer half writes any crash to bin/fuzz-artifacts/ and that
+        # file is the reproducer.
+        #
+        # REQUIRE_LIBFUZZER=1 again: without it, a missing libFuzzer binary
+        # would quietly reduce this step to the replay floor and still be green.
+        #
+        # No FUZZ_CACHE_SKIP: every cache_store finding this target knows how to
+        # raise is expected to hold, so fuzz_cache_ops runs here with nothing
+        # demoted.  The last entry, expire-over-limit, went away on 2026-07-31
+        # by relaxing the expectation rather than by changing the store — see
+        # the reasoning at OP_EXPIRE in test/fuzz/fuzz_cache_ops.cpp.
+        #
+        # The variable is for triage only, and it belongs here rather than in
+        # the nightly if it ever comes back: this job's value is catching a
+        # *new* regression on a push, and a job that is red before the push
+        # stops being read.  The nightly runs the same target and is the one
+        # that holds the truth.  Do not add an id here without adding the
+        # matching entry to the nightly's KNOWN RED note.
+        env:
+          FUZZ_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops
+          FUZZ_SEED: "1"
+          REQUIRE_LIBFUZZER: "1"
+        run: bash test/fuzz/run_fuzz.sh 30 Sanitize
+        timeout-minutes: 10
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-artifacts
+          path: |
+            suite-debug.log
+            bin/fuzz-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # A second compiler's opinion.
+  #
+  # The tree reached zero warnings under GCC -Wall -Wextra, which says the code
+  # is clean by GCC's lights and nothing about clang's.  The two disagree: clang
+  # has -Wunused-lambda-capture, -Wmisleading-indentation on different shapes,
+  # -Wunused-private-field and a stricter view of implicit conversions.  This
+  # job compiles every project source with clang and reports what it sees.
+  #
+  # Compile-only, no LTO, no link: the point is diagnostics, not an artifact.
+  # clang is NOT how socketley ships — see the note at the top of this file.
+  #
+  # Vendored headers come in through -isystem so sol2's and LuaJIT's warnings
+  # are not counted as this project's.  thirdparty/ is not ours to fix and its
+  # noise would drown the two lines that are.
+  #
+  # Currently advisory (continue-on-error).  It is deliberately not gating yet:
+  # turn this into a hard failure once the existing diagnostics are at zero,
+  # otherwise every unrelated PR goes red on warnings it did not introduce.
+  clang-warnings:
+    name: clang -Wall -Wextra (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 liburing-dev libssl-dev libluajit-5.1-dev
+          clang++-18 --version
+
+      - name: Compile every source with clang
+        run: |
+          mkdir -p /tmp/clangobj
+          : > clang-warnings.log
+          fail=0
+          count=0
+          for f in $(find socketley -name '*.cpp' | sort); do
+            count=$((count + 1))
+            clang++-18 -std=c++23 -Wall -Wextra -m64 -g -O0 -c "$f" \
+              -o "/tmp/clangobj/$(echo "$f" | tr '/' '_').o" \
+              -DSOCKETLEY_LINUX -DDEBUG \
+              -I. -Isocketley -Iinclude/linux \
+              -isystem thirdparty/sol2 -isystem thirdparty/luajit \
+              >> clang-warnings.log 2>&1 || fail=1
+          done
+          # A loop that compiled nothing must not report success.
+          [ "$count" -gt 0 ] || { echo "no sources found to compile"; exit 1; }
+          echo "compiled $count translation units with clang"
+
+          warns=$(grep -c 'warning:' clang-warnings.log || true)
+          echo "clang warnings: $warns"
+          echo "### clang: $count TUs, $warns warnings" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$warns" -gt 0 ]; then
+            grep -E 'warning:' clang-warnings.log | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+            grep -oE '\[-W[a-z0-9-]+\]' clang-warnings.log | sort | uniq -c | sort -rn
+          fi
+          # A hard error under clang is worth failing on even while warnings are
+          # advisory: it means the tree does not compile with a second compiler.
+          if [ "$fail" -ne 0 ]; then
+            echo "clang failed to compile at least one translation unit:"
+            grep -E 'error:' clang-warnings.log | head -30
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clang-warnings
+          path: clang-warnings.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -44,6 +44,9 @@ public:
     proxy& health_threshold(int n)                  { prx()->set_health_threshold(n); return *this; }
     proxy& circuit_threshold(int n)                 { prx()->set_circuit_threshold(n); return *this; }
     proxy& circuit_timeout(int seconds)             { prx()->set_circuit_timeout(seconds); return *this; }
+    // Seconds a backend may take to produce the first response byte; 0 = no
+    // deadline.  On by default — see mesh_config::backend_timeout.
+    proxy& backend_timeout(int seconds)             { prx()->set_backend_timeout(seconds); return *this; }
     proxy& retry_count(int n)                       { prx()->set_retry_count(n); return *this; }
     proxy& retry_all(bool v)                        { prx()->set_retry_all(v); return *this; }
     proxy& mesh_client_ca(std::string_view path)    { prx()->set_mesh_client_ca(path); return *this; }

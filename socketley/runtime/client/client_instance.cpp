@@ -26,8 +26,19 @@ client_instance::~client_instance()
     if (m_conn.fd >= 0)
     {
         shutdown(m_conn.fd, SHUT_RDWR);
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
     }
+}
+
+void client_instance::close_tracked(int fd)
+{
+    if (fd < 0)
+        return;
+    event_loop* lp = m_loop ? m_loop : m_ring_loop;
+    if (SOCKETLEY_LIKELY(lp != nullptr))
+        lp->close_fd(fd);
+    else
+        close(fd);
 }
 
 void client_instance::set_mode(client_mode mode)
@@ -100,7 +111,7 @@ bool client_instance::try_connect()
         m_cached_port = 0;
 
         // Need a new socket since connect() may have tainted the old one
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
         m_conn.fd = socket(AF_INET, m_udp ? (SOCK_DGRAM | SOCK_NONBLOCK) : (SOCK_STREAM | SOCK_NONBLOCK), 0);
         if (m_conn.fd < 0)
             return false;
@@ -129,7 +140,7 @@ bool client_instance::try_connect()
             int connect_ret = connect(m_conn.fd, reinterpret_cast<struct sockaddr*>(&lit), sizeof(lit));
             if (connect_ret < 0 && errno != EINPROGRESS)
             {
-                close(m_conn.fd);
+                close_tracked(m_conn.fd);
                 m_conn.fd = -1;
                 return false;
             }
@@ -149,7 +160,7 @@ bool client_instance::try_connect()
     struct addrinfo* result = nullptr;
     if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result)
     {
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
         m_conn.fd = -1;
         return false;
     }
@@ -169,7 +180,7 @@ bool client_instance::try_connect()
 
     if (connect_ret < 0 && errno != EINPROGRESS)
     {
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
         m_conn.fd = -1;
         return false;
     }
@@ -261,7 +272,7 @@ void client_instance::drop_connection()
     {
         invoke_on_disconnect(m_conn.fd);
         shutdown(m_conn.fd, SHUT_RDWR);
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
         m_conn.fd = -1;
     }
     m_connected = false;
@@ -357,14 +368,21 @@ void client_instance::teardown(event_loop& loop)
 
     if (m_conn.fd >= 0)
     {
-        // Cancel before closing, in that order — event_loop.h says why.  A read
-        // and a write can both be in flight on this socket, and closing alone
-        // leaves them armed on m_conn.read_buf and m_conn.write_buf, which the
-        // next start() would hand straight to a new socket.
-        loop.submit_cancel_fd(m_conn.fd);
-        loop.flush();
+        // A read and a write can both be in flight on this socket, and closing
+        // alone leaves them armed on m_conn.read_buf and m_conn.write_buf,
+        // which the next start() would hand straight to a new socket.
+        //
+        // Cancelling first was the old defence and it was half of one: flush()
+        // hands the SQE to the ring and returns, so nothing here waited for the
+        // kernel to look at either the cancel or the read.  This runtime is the
+        // clearest case of why that matters — one read request and one write
+        // request reused across reconnects, and a socket number the kernel
+        // hands straight back on the next connect(), so an unconsumed read
+        // resolved after the reconnect reads the *new* connection's bytes into
+        // a buffer the old completion still owns.  close_fd submits the cancel
+        // and holds the number until both have reported.
         shutdown(m_conn.fd, SHUT_RDWR);
-        close(m_conn.fd);
+        close_tracked(m_conn.fd);
         m_conn.fd = -1;
     }
 

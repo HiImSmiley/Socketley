@@ -223,6 +223,8 @@ static void restore_runtimes(state_persistence& persistence,
                     prx->set_circuit_threshold(cfg.circuit_threshold);
                 if (cfg.circuit_timeout != 30)
                     prx->set_circuit_timeout(cfg.circuit_timeout);
+                if (cfg.backend_timeout != 2)
+                    prx->set_backend_timeout(cfg.backend_timeout);
                 if (cfg.retry_count > 0)
                     prx->set_retry_count(cfg.retry_count);
                 if (cfg.retry_all)

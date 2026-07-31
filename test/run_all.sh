@@ -4,7 +4,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
-BIN_DIR="$ROOT/bin/Release"
+# Which build to test.  Defaults to Release, which is what this suite has always
+# used; the nightly sanitizer job sets SOCKETLEY_CONFIG=Sanitize so that both
+# halves of the suite — the unit tests and the integration tests — run against
+# the same instrumented binaries.  Setting only SOCKETLEY_BIN would have moved
+# the integration half and left the unit half pointing at bin/Release, which is
+# the split this variable exists to prevent.
+SOCKETLEY_CONFIG="${SOCKETLEY_CONFIG:-Release}"
+BIN_DIR="${SOCKETLEY_BIN_DIR:-$ROOT/bin/$SOCKETLEY_CONFIG}"
 PASS=0; FAIL=0
 DAEMON_PID=""
 
@@ -18,12 +25,12 @@ DAEMON_PID=""
 # explicitly to test an installed build on purpose.
 if [ -n "${SOCKETLEY_BIN:-}" ]; then
     SYS_BIN="$SOCKETLEY_BIN"
-elif [ -x "$ROOT/bin/Release/socketley" ]; then
-    SYS_BIN="$ROOT/bin/Release/socketley"
+elif [ -x "$BIN_DIR/socketley" ]; then
+    SYS_BIN="$BIN_DIR/socketley"
 else
     SYS_BIN="$(command -v socketley 2>/dev/null)"
 fi
-[ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $ROOT/bin/Release/, PATH)"; exit 1; }
+[ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $BIN_DIR/, PATH)"; exit 1; }
 echo "Testing binary: $SYS_BIN"
 
 # Use a fixed test socket path (avoids system-mode path resolution issues)

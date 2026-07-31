@@ -22,7 +22,24 @@ struct ipc_connection
     io_request read_req;
     io_request write_req;
     char read_buf[4096];
+
+    // Scratch for the command being processed.  Every cmd_* assigns to it
+    // outright and it is cleared before each one, so it must never be storage
+    // the ring is reading from: append_response() copies it into out_buf and
+    // that is the only thing a write SQE ever points at.
     std::string write_buf;
+
+    // The framed replies waiting to go out, and the one buffer a write is
+    // submitted from.  Untouched between a submission and its completion — see
+    // send_response() for what it cost when it was not.
+    std::string out_buf;
+    size_t write_off = 0;
+
+    // A write is in the ring naming out_buf.  While it is set no read is armed
+    // on this connection, so nothing can arrive that would want to rebuild the
+    // buffer underneath it.
+    bool write_pending = false;
+
     std::string partial;
 
     bool interactive = false;
@@ -47,8 +64,13 @@ public:
     static std::string socket_path;
 
 private:
+    using client_map = std::unordered_map<int, std::unique_ptr<ipc_connection>>;
+
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
+    void handle_write(struct io_uring_cqe* cqe, const io_request* req);
+    void close_client(client_map::iterator it);
+    void release_closing(const io_request* req);
 
     // Returns -1 if names resolved OK (caller should continue), otherwise the exit code to return.
     // conn == nullptr → stdout errors, conn != nullptr → conn->write_buf errors.
@@ -80,7 +102,11 @@ private:
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 
-    void send_response(ipc_connection* conn, int exit_code);
+    // Frame one command's reply into the connection's outgoing stream; submit
+    // the single write that carries all of them.  Split because a packet may
+    // hold several commands and only one write may be outstanding at a time.
+    void append_response(ipc_connection* conn, int exit_code);
+    bool send_response(ipc_connection* conn);
 
     runtime_manager& m_manager;
     event_loop& m_loop;
@@ -89,8 +115,17 @@ private:
     struct sockaddr_un m_accept_addr;
     socklen_t m_accept_addrlen;
     io_request m_accept_req;
+    bool m_accept_armed{false};
 
-    std::unordered_map<int, std::unique_ptr<ipc_connection>> m_clients;
+    client_map m_clients;
+
+    // Connections whose client hung up while the reply send_response() submitted
+    // for them was still in the ring.  They are gone as far as the daemon is
+    // concerned — closed and out of m_clients — but the kernel is still reading
+    // out_buf out of them and the completion still names write_req, so the
+    // storage is held until that write reports.  Normally empty: a reply is out
+    // long before the hangup unless it outgrew the socket buffer.
+    std::vector<std::unique_ptr<ipc_connection>> m_closing;
 
     state_persistence* m_persistence = nullptr;
     cluster_discovery* m_cluster = nullptr;
@@ -103,6 +138,14 @@ private:
     io_request m_health_req{};
     struct __kernel_timespec m_health_ts{};
     bool m_health_pending{false};
+
+    // teardown() has run.  Only the health timer cares: withdrawing it makes
+    // its completion arrive at once, and that completion is what re-arms the
+    // chain, so without this a teardown under a live ring would start the timer
+    // it just withdrew.  Cleared by setup().
+    bool m_torn_down{false};
+
     void start_health_timer();
+    void start_accept();
     void check_managed_health();
 };

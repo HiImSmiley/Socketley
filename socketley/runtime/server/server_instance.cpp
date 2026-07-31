@@ -35,10 +35,18 @@ server_instance::server_instance(std::string_view name)
 
 server_instance::~server_instance()
 {
-    if (m_listen_fd >= 0)
-        close(m_listen_fd);
-    if (m_udp_fd >= 0)
-        close(m_udp_fd);
+    close_tracked(m_listen_fd);
+    close_tracked(m_udp_fd);
+}
+
+void server_instance::close_tracked(int fd)
+{
+    if (fd < 0)
+        return;
+    if (SOCKETLEY_LIKELY(m_ring_loop != nullptr))
+        m_ring_loop->close_fd(fd);
+    else
+        close(fd);
 }
 
 std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
@@ -83,10 +91,16 @@ void server_instance::release_conn(std::unique_ptr<server_connection> conn)
     // close() did not really close it.  The table is 8192 entries and shared by
     // every server and cache on this loop, so one runtime bleeds all of them.
     //
-    // Doing this while a request is still in flight is safe for the same reason
-    // closing the socket is: the request took its own reference to the file when
-    // it was issued and keeps it until it completes.  This is also what teardown
-    // did before the retired list existed.
+    // Doing this while a request is still in flight was justified as safe "for
+    // the same reason closing the socket is: the request took its own reference
+    // to the file when it was issued".  That is true of a submission the kernel
+    // has already consumed and false of one it has not, which is the entire
+    // hazard — a fixed-file SQE carries the slot *index*, and an index handed
+    // straight back to the allocator is claimed by the next accept before the
+    // kernel ever looks at the SQE.  The call stays here, because the slot does
+    // have to go back on this path or a stopped runtime keeps it forever; what
+    // changed is that free_fixed_file_slot() now unregisters the file at once
+    // and releases the index only when nothing in the ring still names it.
     release_fixed_slot(conn.get());
 
     if (SOCKETLEY_UNLIKELY(conn_ops_pending(conn.get())))
@@ -151,7 +165,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->ws_origin.clear();
     conn->ws_protocol.clear();
     conn->ws_auth.clear();
-    if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
+    if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
     if (conn->file_buf) { free(conn->file_buf); conn->file_buf = nullptr; }
     conn->file_size = 0;
     conn->file_content_type.clear();
@@ -208,7 +222,7 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     remove_active_fd(fd);
     if (fd >= 0 && fd < MAX_FDS)
         m_conn_idx[fd] = nullptr;
-    close(fd);
+    close_tracked(fd);
 
     // The file a response is being served out of is this connection's, not the
     // pool's.  pool_release() closes it — but a connection with anything in
@@ -220,7 +234,7 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     // that is where the kernel is writing.
     if (SOCKETLEY_UNLIKELY(conn->file_fd >= 0))
     {
-        close(conn->file_fd);
+        close_tracked(conn->file_fd);
         conn->file_fd = -1;
     }
 
@@ -695,7 +709,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         struct stat st;
         if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
         {
-            close(ffd);
+            close_tracked(ffd);
             conn->write_queue.push(http_404_response(conn->http_keep_alive));
             if (!conn->write_pending)
                 flush_write_queue(conn);
@@ -739,7 +753,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         char* fbuf = static_cast<char*>(malloc(fsize));
         if (!fbuf)
         {
-            close(ffd);
+            close_tracked(ffd);
             conn->write_queue.push(http_404_response(conn->http_keep_alive));
             if (!conn->write_pending)
                 flush_write_queue(conn);
@@ -998,7 +1012,7 @@ bool server_instance::setup(event_loop& loop)
 
         if (bind(m_udp_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
         {
-            close(m_udp_fd);
+            close_tracked(m_udp_fd);
             m_udp_fd = -1;
             return false;
         }
@@ -1050,14 +1064,14 @@ bool server_instance::setup(event_loop& loop)
 
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
 
     if (listen(m_listen_fd, 4096) < 0)
     {
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
@@ -1146,11 +1160,18 @@ void server_instance::teardown(event_loop& loop)
             // SO_REUSEPORT then makes that matter: once a restart binds a new
             // socket to the same port the kernel delivers datagrams to the old
             // one as well, and the completion used to arm a second recvmsg on
-            // the same msghdr.  Cancel first, close second — event_loop.h says
-            // why that order and not the other one.
-            loop.submit_cancel_fd(m_udp_fd);
-            loop.flush();
-            close(m_udp_fd);
+            // the same msghdr.
+            //
+            // This used to cancel, flush and close, in that order, and the order
+            // was the whole defence.  It is not one: flush() hands the SQE to
+            // the ring and returns — under SQPOLL without even a syscall — so
+            // the close could and did run before the kernel had looked at either
+            // the cancel or the recvmsg.  A recvmsg consumed after this number
+            // was reissued reads a stranger's datagram into m_udp_recv_buf, and
+            // a cancel consumed after it takes back a stranger's I/O.  close_fd
+            // submits the cancel itself and holds the number until both have
+            // reported.
+            close_tracked(m_udp_fd);
             m_udp_fd = -1;
         }
         m_udp_peers.clear();
@@ -1159,7 +1180,8 @@ void server_instance::teardown(event_loop& loop)
         return;
     }
 
-    // Cancel, then shut down, then close — in that order, and all three.
+    // Shut down, then close — and the close is close_fd's, which is where the
+    // cancel now comes from.
     //
     // The cancel is what ends the accept chain.  A multishot accept holds its
     // own reference to the socket, so close() does not end it and the
@@ -1168,18 +1190,22 @@ void server_instance::teardown(event_loop& loop)
     // count to reach zero, so the whole instance was never freed: about 6 MB
     // per removed runtime, held until the daemon exited.
     //
-    // It has to be submitted before the close, too.  After close(), fget(fd)
-    // answers NULL and the cancel fails with -ENOENT — which is the same
-    // outcome as not submitting one.
+    // Submitting it before the close was necessary but never sufficient: after
+    // close(), fget(fd) answers NULL and the cancel fails -ENOENT, but a cancel
+    // the SQPOLL thread has not consumed *yet* is no better off — by the time it
+    // is, the number belongs to the next accepted connection and the cancel
+    // takes that connection's read away instead.  Holding the number until both
+    // the accept and the cancel have reported is what actually makes the order
+    // hold, and close_fd does that.
     //
-    // shutdown() then completes whatever the cancel did not reach, synchronously
-    // inside the syscall via the socket wait queue.
+    // shutdown() stays, and stays first: it ends the listen state — which is
+    // what takes this socket out of the SO_REUSEPORT group, so a restart's bind
+    // is not competing with it — and completes what the cancel did not reach,
+    // synchronously inside the syscall via the socket wait queue.
     if (m_listen_fd >= 0)
     {
-        loop.submit_cancel_fd(m_listen_fd);
-        loop.flush();
         shutdown(m_listen_fd, SHUT_RDWR);
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
     }
 
@@ -1214,15 +1240,15 @@ void server_instance::teardown(event_loop& loop)
         // placing their CQEs in the ring before we return from shutdown()).
         // This avoids the cancel-SQE fd-closed race described above.
         shutdown(fd, SHUT_RDWR);
-        close(fd);
+        close_tracked(fd);
 
         // The file read and the file→pipe splice target the file fd, not the
         // socket, so the shutdown above does not touch them.  Closing the file
         // ends them; the ops themselves keep the struct out of the pool until
         // their completions arrive, and file_buf stays allocated until then
         // because that is where the kernel is writing.
-        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
-        if (conn->splice_file_fd >= 0) { close(conn->splice_file_fd); conn->splice_file_fd = -1; }
+        if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
+        if (conn->splice_file_fd >= 0) { close_tracked(conn->splice_file_fd); conn->splice_file_fd = -1; }
         conn->splice_remaining = 0;
         conn->splice_pipe_pending = 0;
         conn->splice_pending = false;
@@ -1259,7 +1285,7 @@ void server_instance::teardown(event_loop& loop)
         {
             m_upstream_by_fd.erase(uc->fd);
             shutdown(uc->fd, SHUT_RDWR);
-            close(uc->fd);
+            close_tracked(uc->fd);
             uc->fd = -1;
         }
         uc->connected = false;
@@ -1291,8 +1317,8 @@ void server_instance::teardown(event_loop& loop)
     m_upstreams.clear();
 
     // Close splice pipe
-    if (m_splice_pipe[0] >= 0) { close(m_splice_pipe[0]); m_splice_pipe[0] = -1; }
-    if (m_splice_pipe[1] >= 0) { close(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
+    if (m_splice_pipe[0] >= 0) { close_tracked(m_splice_pipe[0]); m_splice_pipe[0] = -1; }
+    if (m_splice_pipe[1] >= 0) { close_tracked(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
     m_splice_busy = false;
 
     // The timers this server armed.  Everything above closed a descriptor and
@@ -1668,14 +1694,14 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         // Reject fds beyond our O(1) lookup table — they'd become zombie connections
         if (SOCKETLEY_UNLIKELY(client_fd >= MAX_FDS))
         {
-            close(client_fd);
+            close_tracked(client_fd);
             goto resubmit_accept;
         }
 
         // Max connections check
         if (SOCKETLEY_UNLIKELY(m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached))
         {
-            close(client_fd);
+            close_tracked(client_fd);
             goto resubmit_accept;
         }
 
@@ -2963,7 +2989,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // Client disconnected during file read — just clean up
     if (SOCKETLEY_UNLIKELY(conn->closing))
     {
-        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
+        if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
@@ -2978,7 +3004,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // Read error — send 404
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        if (conn->file_fd >= 0) { close(conn->file_fd); conn->file_fd = -1; }
+        if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
@@ -2999,7 +3025,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // Close the file fd — we're done with it
     if (conn->file_fd >= 0)
     {
-        close(conn->file_fd);
+        close_tracked(conn->file_fd);
         conn->file_fd = -1;
     }
 
@@ -3050,7 +3076,7 @@ void server_instance::splice_cleanup(server_connection* conn)
 
     if (conn->splice_file_fd >= 0)
     {
-        close(conn->splice_file_fd);
+        close_tracked(conn->splice_file_fd);
         conn->splice_file_fd = -1;
     }
     conn->splice_remaining = 0;
@@ -3702,7 +3728,7 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     if (connect(fd, reinterpret_cast<const struct sockaddr*>(&uc->cached_addr),
                 sizeof(uc->cached_addr)) < 0 && errno != EINPROGRESS)
     {
-        close(fd);
+        close_tracked(fd);
         return false;
     }
 
@@ -3765,7 +3791,7 @@ void server_instance::upstream_disconnect(upstream_connection* uc)
     {
         m_upstream_by_fd.erase(uc->fd);
         shutdown(uc->fd, SHUT_RDWR);
-        close(uc->fd);
+        close_tracked(uc->fd);
         uc->fd = -1;
     }
 

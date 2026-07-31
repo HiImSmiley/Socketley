@@ -75,27 +75,21 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
 
 // ─── Strings ───
 
+void cache_store::drop_expiry(std::string_view key)
+{
+    // Guarded on empty() to keep the common case — a cache with no TTLs at all
+    // — free of the lookup.  find() accepts a string_view through the
+    // transparent hash; erase() does not, so go through the iterator rather
+    // than allocating a std::string.
+    if (m_expiry.empty())
+        return;
+    auto eit = m_expiry.find(key);
+    if (eit != m_expiry.end())
+        m_expiry.erase(eit);
+}
+
 bool cache_store::set(std::string_view key, std::string_view value)
 {
-    // A plain SET discards any expiry the key already carried, as Redis
-    // specifies for SET without KEEPTTL.  Leaving it in place made a freshly
-    // written value inherit its predecessor's deadline and disappear at a time
-    // the writer had no reason to expect:
-    //
-    //   SET k v1 / EXPIRE k 2 / SET k v2   ->  v2 gone two seconds later
-    //
-    // SETEX, PSETEX and SET ... EX all assign the expiry after calling this, so
-    // they are unaffected.  Guarded on empty() to keep the common case — a cache
-    // with no TTLs at all — free of the lookup.
-    // find() accepts a string_view through the transparent hash; erase() does
-    // not, so go through the iterator rather than allocating a std::string.
-    if (!m_expiry.empty())
-    {
-        auto eit = m_expiry.find(key);
-        if (eit != m_expiry.end())
-            m_expiry.erase(eit);
-    }
-
     // Fast-path: key already exists as string (most common in benchmarks).
     // Check m_data first — this avoids the type-conflict cross-map lookups.
     auto it = m_data.find(key);
@@ -110,19 +104,25 @@ bool cache_store::set(std::string_view key, std::string_view value)
         {
             // The delta is between what the two values *cost*, not between their
             // lengths: 15 bytes to 16 is one byte of payload and a whole new
-            // 32-byte heap block.  Nothing is asked for when the buffer already
-            // charged for is big enough to take the new value in place.
+            // 48-byte heap block, because assign() reallocates to twice the old
+            // capacity rather than to fit.  Nothing is asked for when the buffer
+            // already charged for is big enough to take the new value in place.
             const size_t held = stored_string(it->second);
-            const size_t want = stored_string(value.size());
-            if (want > held && !check_memory(want - held))
+            const size_t want = rewritten_string(it->second, value.size());
+            if (want > held && !check_memory(want - held, key))
                 return false;
-            // check_memory may have evicted, and the victim can be this very
-            // key — the iterator is only safe to reuse after re-acquiring it.
+            // check_memory() will not take the key it was named, so `it` is
+            // still live.  Re-acquired all the same: that guarantee belongs to
+            // another function, and a stale iterator here writes through a
+            // freed node.
             it = m_data.find(key);
         }
 
         if (__builtin_expect(it != m_data.end(), 1))
         {
+            // Past the last refusal: the write is going ahead, so the key's old
+            // deadline goes.  See drop_expiry().
+            drop_expiry(key);
             track_sub(stored_string(it->second));
             // Use assign() instead of operator= to potentially reuse existing allocation
             it->second.assign(value.data(), value.size());
@@ -130,17 +130,19 @@ bool cache_store::set(std::string_view key, std::string_view value)
             touch_lru(key);
             return true;
         }
-        // Eviction took the key we were about to overwrite; fall through and
-        // insert it as a new one, which charges the full per-key cost.
+        // Unreachable while check_memory() honours the key it is named — but if
+        // it ever stops doing so, insert the key as a new one rather than write
+        // through a node that is gone.
     }
 
     // Slow path: new key — check type conflicts
     if (__builtin_expect(has_type_conflict_for_string(key), 0))
         return false;
 
-    if (__builtin_expect(!check_memory(stored_string(value.size()) + new_key_cost(key.size())), 0))
+    if (__builtin_expect(!check_memory(stored_string(value.size()) + new_key_cost(key.size()), key), 0))
         return false;
 
+    drop_expiry(key);
     auto [it2, inserted] = m_data.try_emplace(std::string(key), std::string(value));
     if (!inserted)
         it2->second = std::string(value);
@@ -237,7 +239,11 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(stored_string(val.size()) + list_elem_overhead))
+        // The key is named to check_memory() so that eviction cannot take it:
+        // `it` has to survive this call, and it did not — try_evict was free to
+        // pick this very list, and the emplace below then went through a freed
+        // node.  See check_memory().
+        if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
             return false;
         // Measured after it has been constructed in place, like every other add
         // here: what it costs is the buffer it ended up with.
@@ -251,7 +257,7 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead))
+    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
         return false;
 
     auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
@@ -267,7 +273,8 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        if (!check_memory(stored_string(val.size()) + list_elem_overhead))
+        // Named for the same reason as in lpush(): `it` must survive the call.
+        if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
             return false;
         // Same as lpush(): measured once it exists.
         const std::string& elem = it->second.emplace_back(val);
@@ -280,7 +287,7 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead))
+    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
         return false;
 
     auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
@@ -380,7 +387,8 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     auto it = m_sets.find(key);
     if (it != m_sets.end())
     {
-        if (!check_memory(stored_string(member.size()) + set_elem_overhead))
+        // Named for the same reason as in lpush(): `it` must survive the call.
+        if (!check_memory(stored_string(member.size()) + set_elem_overhead, key))
             return -1;
         auto [mit, inserted] = it->second.emplace(member);
         if (inserted)
@@ -395,7 +403,7 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     if (has_type_conflict_for_set(key))
         return -1;
 
-    if (!check_memory(stored_string(member.size()) + new_key_cost(key.size()) + set_elem_overhead))
+    if (!check_memory(stored_string(member.size()) + new_key_cost(key.size()) + set_elem_overhead, key))
         return -1;
 
     auto nit = m_sets.emplace(std::string(key), set_inner{}).first;
@@ -465,13 +473,29 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         auto fit = it->second.find(field);
         if (fit != it->second.end())
         {
+            // Overwriting a field has to clear the same bar as adding one.
+            // This path called check_memory nowhere at all, so a 5-byte field
+            // value could be replaced by a 100 KB one with maxmemory never
+            // consulted: 294 bytes in use before, 100305 after, against a
+            // configured 1200.  The same hole was closed for SET; the delta is
+            // between what the two values *cost*, not between their lengths.
+            if (__builtin_expect(m_max_memory != 0 && val.size() > fit->second.size(), 0))
+            {
+                const size_t held = stored_string(fit->second);
+                const size_t want = rewritten_string(fit->second, val.size());
+                if (want > held && !check_memory(want - held, key))
+                    return false;
+            }
             track_sub(stored_string(fit->second));
             fit->second = val;
             track_add(stored_string(fit->second));
         }
         else
         {
-            if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead))
+            // Named so that eviction cannot take this hash: `it` is held across
+            // the call and the emplace below writes through it.  See
+            // check_memory().
+            if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead, key))
                 return false;
             auto nfit = it->second.emplace(std::string(field), std::string(val)).first;
             ++m_hash_fields;
@@ -485,7 +509,7 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         return false;
 
     if (!check_memory(stored_string(field.size()) + stored_string(val.size())
-                      + new_key_cost(key.size()) + hash_field_overhead))
+                      + new_key_cost(key.size()) + hash_field_overhead, key))
         return false;
 
     auto nit = m_hashes.emplace(std::string(key), hash_inner{}).first;
@@ -733,6 +757,19 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
     auto [end, ec2] = std::to_chars(buf, buf + sizeof(buf), val);
     std::string_view sv(buf, static_cast<size_t>(end - buf));
 
+    if (it != m_data.end() && __builtin_expect(m_max_memory != 0 && sv.size() > it->second.size(), 0))
+    {
+        // The same bar SET has to clear, for the same reason: a counter that
+        // crosses the small-string limit — 15 digits to 16 — does not grow by a
+        // digit, it takes a 48-byte buffer.  This path consulted the limit only
+        // when it was creating the key.
+        const size_t held = stored_string(it->second);
+        const size_t want = rewritten_string(it->second, sv.size());
+        if (want > held && !check_memory(want - held, key))
+            return false;
+        it = m_data.find(key);   // see set(): named to check_memory, but not trusted here
+    }
+
     if (it != m_data.end())
     {
         track_sub(stored_string(it->second));
@@ -741,7 +778,7 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
     }
     else
     {
-        if (!check_memory(stored_string(sv.size()) + new_key_cost(key.size())))
+        if (!check_memory(stored_string(sv.size()) + new_key_cost(key.size()), key))
             return false;
         auto nit = m_data.emplace(std::string(key), std::string(sv)).first;
         track_add(entry_cost(nit->first, nit->second));
@@ -767,12 +804,15 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
             // What is asked for is the growth of the *allocation*, not the
             // length of the suffix: appending one byte to a full 4 KB buffer
             // buys another 4 KB, and appending into spare capacity buys nothing.
+            // rewritten_string() is what the buffer will be after the append,
+            // doubling included — asking for the length the result needs let an
+            // accepted APPEND land over the ceiling.
             const size_t held = stored_string(it->second);
-            const size_t want = stored_string(it->second.size() + suffix.size());
-            if (want > held && !check_memory(want - held))
+            const size_t want = rewritten_string(it->second, it->second.size() + suffix.size());
+            if (want > held && !check_memory(want - held, key))
                 return append_denied;
-            // check_memory may have evicted, and the victim can be this very
-            // key — the iterator is only safe to reuse after re-acquiring it.
+            // check_memory() will not take the key it was named, so `it` is
+            // still live.  Re-acquired all the same — see set().
             it = m_data.find(key);
         }
 
@@ -788,10 +828,14 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
             touch_lru(key);
             return it->second.size();
         }
-        // Eviction took the key we were appending to; fall through and create it.
+        // Unreachable while check_memory() honours the key it is named.  It did
+        // not, and this was the path taken: the append evicted the key it was
+        // appending to, recreated it here holding only the suffix, and returned
+        // that as a length.  The value that was there and its TTL were gone and
+        // the caller was told a number that looked like success.
     }
 
-    if (!check_memory(stored_string(suffix.size()) + new_key_cost(key.size())))
+    if (!check_memory(stored_string(suffix.size()) + new_key_cost(key.size()), key))
         return append_denied;
     auto nit = m_data.emplace(std::string(key), std::string(suffix)).first;
     track_add(entry_cost(nit->first, nit->second));
@@ -1213,7 +1257,14 @@ bool cache_store::load_v2(const char* data, size_t size)
         uint32_t len = 0;
         if (!read_u32(len)) return false;
         if (remaining() < len) return false;
-        out.assign(p, len);
+        // Constructed, not assign()ed into.  assign() onto a fresh std::string
+        // goes through libstdc++'s growth policy, which rounds a request under
+        // twice the old capacity up to twice it: 16..29 bytes came back holding
+        // 30, one whole malloc size class more than the live write paths spend
+        // on the same string.  A cache that reloaded its own dump therefore
+        // occupied more than the one that wrote it — reported correctly, and
+        // real, one 16-byte class per string of that length.
+        out = std::string(p, len);
         p += len;
         return true;
     };
@@ -1339,8 +1390,11 @@ bool cache_store::load_v2_stream(std::ifstream& file)
         uint32_t len = 0;
         file.read(reinterpret_cast<char*>(&len), sizeof(len));
         if (!file) return false;
-        out.resize(len);
-        file.read(out.data(), len);
+        // Sized on construction rather than resize()d into, for the reason
+        // given in load_v2(): growing a fresh string to 16..29 bytes buys 30.
+        std::string buf(len, '\0');
+        file.read(buf.data(), len);
+        out = std::move(buf);
         return file.good() || file.eof();
     };
 
@@ -1591,7 +1645,7 @@ void cache_store::touch_lru(std::string_view key)
     }
 }
 
-bool cache_store::try_evict(size_t needed)
+bool cache_store::try_evict(size_t needed, const std::string_view* protect)
 {
     if (m_eviction == evict_none)
         return false;
@@ -1600,18 +1654,46 @@ bool cache_store::try_evict(size_t needed)
     // stop far short of the limit the caller actually set.
     while (get_memory_used() + needed > m_max_memory && !m_lru_order.empty())
     {
+        // The key the caller is writing is not a candidate — see check_memory()
+        // for the three defects that came of it being one.  When it is the only
+        // thing left in the order there is nothing to take, and the write is
+        // refused rather than paid for with its own data.
+        const bool protect_resident = (protect != nullptr && m_lru_map.count(*protect) != 0);
+        const size_t candidates = m_lru_order.size() - (protect_resident ? 1 : 0);
+        if (candidates == 0)
+            break;
+
         // Both branches go through drop_lru() rather than unlinking the node and
         // erasing the map entry by hand.  That is the one place that knows what
         // leaving the LRU costs — it gives back the two copies of the key — and
         // an eviction path that skipped it would leak those bytes into the
         // reported figure for as long as the process ran.
-        auto node = m_lru_order.begin();
+        size_t skip = 0;
         if (m_eviction != evict_allkeys_lru)   // evict_allkeys_random
         {
             static thread_local std::mt19937 rng(std::random_device{}());
-            auto dist = std::uniform_int_distribution<size_t>(0, m_lru_order.size() - 1);
-            std::advance(node, dist(rng));
+            skip = std::uniform_int_distribution<size_t>(0, candidates - 1)(rng);
         }
+
+        // The LRU policy takes the front of the order and the random one the
+        // skip'th candidate; both walk from the front and step over the
+        // protected key if it is in their path.  The walk costs the random
+        // branch what std::advance cost it before, and the LRU branch stops on
+        // the first or second node.
+        auto node = m_lru_order.end();
+        for (auto n = m_lru_order.begin(); n != m_lru_order.end(); ++n)
+        {
+            if (protect_resident && std::string_view(*n) == *protect)
+                continue;
+            if (skip == 0)
+            {
+                node = n;
+                break;
+            }
+            --skip;
+        }
+        if (node == m_lru_order.end())
+            break;
         std::string victim = *node;
 
         const size_t order_before = m_lru_order.size();

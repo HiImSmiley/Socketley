@@ -170,8 +170,37 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
     }
 }
 
+void runtime_manager::enable_offthread_stats()
+{
+    m_offthread_stats.store(true, std::memory_order_relaxed);
+}
+
+void runtime_manager::publish_offthread_stats()
+{
+    if (!m_offthread_stats.load(std::memory_order_relaxed))
+        return;
+
+    // A shared lock, never an exclusive one.  Everything that mutates the map
+    // runs on this same thread, so a shared lock is enough to keep the map
+    // stable here, and taking it exclusively would make the event-loop thread
+    // wait on whatever a reader is in the middle of.  Each instance guards its
+    // own published text, and holds that guard for one move.
+    std::shared_lock lock(mutex);
+    for (auto& [name, instance] : runtimes)
+        instance->publish_offthread_stats();
+}
+
 size_t runtime_manager::reap_retired(const event_loop& loop)
 {
+    // The daemon's health timer is the only fixed-period call the manager gets
+    // on the event-loop thread, and the published figures have to be refreshed
+    // from that thread or not at all — see
+    // runtime_instance::publish_offthread_stats().  Hanging the sweep here
+    // rather than adding a second timer keeps it on the one caller that already
+    // ticks (every 2 s), and it costs nothing at all when nothing off-thread is
+    // reading.  Before the graveyard lock, because shared_mutex does not nest.
+    publish_offthread_stats();
+
     if (loop.owner_table_full())
         return 0;
 
@@ -326,18 +355,51 @@ void runtime_manager::stop_all(event_loop& loop)
 
 void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    // Snapshot pointers under a single read lock — avoids per-runtime re-lock overhead.
-    // Safe because on_publish_dispatch only invokes Lua subscribe callbacks which
-    // do not modify the runtime map (stop/remove go through the daemon handler).
-    std::vector<runtime_instance*> snapshot;
+    // Names, not pointers — the same shape as dispatch_cluster_events() below,
+    // for the same reason.  This used to snapshot a raw runtime_instance* for
+    // every runtime and then call on_publish_dispatch() on each with the lock
+    // released, on the strength of a comment asserting that subscribe callbacks
+    // do not modify the map.  Nothing enforced that, and socketley.remove is
+    // bound in the very VM those callbacks run in: one subscriber calling it
+    // left every pointer behind it in the snapshot naming an instance the
+    // manager had already taken out of the map, and a second removal — or the
+    // daemon's next reap — is all it takes for that storage to go.  Re-resolving
+    // the name means a runtime that left mid-dispatch is skipped rather than
+    // dereferenced.
+    //
+    // Only runtimes that have a Lua VM are collected.  on_publish_dispatch()'s
+    // whole body is "if (m_lua) m_lua->dispatch_publish(...)", so a runtime
+    // without one has nowhere to deliver to, and a PUBLISH on a daemon of plain
+    // C++ runtimes now costs one lock and a pointer test each instead of a
+    // string copy and a virtual call each.  If on_publish_dispatch() is ever
+    // overridden to do something that is not Lua, this filter has to go with it.
+    std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
-        snapshot.reserve(runtimes.size());
-        for (auto& [_, inst] : runtimes)
-            snapshot.push_back(inst.get());
+        names.reserve(runtimes.size());
+        for (auto& [n, inst] : runtimes)
+        {
+            if (inst->lua())
+                names.push_back(n);
+        }
     }
-    for (auto* inst : snapshot)
+
+    for (const auto& n : names)
+    {
+        // Re-resolve, then drop the lock again before the callback runs: a
+        // subscriber can call straight back into the manager, and remove() takes
+        // this same mutex exclusively — holding it across the callback would
+        // deadlock rather than dangle, which is not an improvement.
+        runtime_instance* inst;
+        {
+            std::shared_lock lock(mutex);
+            auto it = runtimes.find(n);
+            if (it == runtimes.end()) continue;
+            inst = it->second.get();
+        }
+
         inst->on_publish_dispatch(cache_name, channel, message);
+    }
 }
 
 void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector<cluster_event>& events)

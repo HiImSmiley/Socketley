@@ -303,7 +303,26 @@ bash test/benchmark/run_all.sh
 - Linux 5.19+ (for io_uring multishot accept)
 - liburing-dev
 - libssl-dev (for TLS and WebSocket)
-- GCC 12+ or Clang 15+ (C++23)
+- GCC 12+ (C++23)
+
+### Toolchain
+
+Socketley is built with **GCC**. That is the only compiler you need to build it,
+run the test suite, or produce a release binary — `make config=release_x64` is a
+GCC build start to finish.
+
+**Clang is not a build dependency.** It is used only as a *testing* toolchain,
+in two places, both optional and neither required to build or ship:
+
+- **libFuzzer** (`test/fuzz/build_libfuzzer.sh`) — coverage-guided fuzzing is a
+  clang feature with no GCC equivalent. Without clang the fuzz targets still
+  build and run through a GCC replay driver; you lose coverage guidance, not the
+  tests.
+- **A second opinion on warnings** — clang diagnoses things GCC does not, so CI
+  compiles the tree with `clang++-18 -Wall -Wextra` as an advisory check.
+
+If you are packaging, porting, or just building socketley, you can ignore clang
+entirely.
 
 ## License
 

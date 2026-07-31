@@ -398,21 +398,78 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     }
 #endif
 
-    // Parse host:port/path
+    // Parse host:port/path.
+    //
+    // The last colon is not the port separator: an IPv6 literal is full of
+    // colons. rfind(':') turned "[::1]:8443" into host "[::1]" — brackets and
+    // all, which no resolver and no certificate ever matches — and bare "::1"
+    // into host "::" with port 1. Either way the address never resolved, so
+    // the IP-literal branch of the certificate check below was unreachable
+    // from here.
+    //
+    // Two forms of the host come out of this: `host`, without brackets, which
+    // is what getaddrinfo(), SNI and the certificate verifier all expect, and
+    // `host_header`, which keeps them, because an unbracketed IPv6 address in
+    // a Host header cannot be told from host:port.
     int port = is_https ? 443 : 80;
-    std::string host, path;
-    auto slash = url.find('/');
-    std::string host_port = (slash != std::string::npos) ? url.substr(0, slash) : url;
-    path = (slash != std::string::npos) ? url.substr(slash) : "/";
-    auto colon = host_port.rfind(':');
-    if (colon != std::string::npos) {
-        host = host_port.substr(0, colon);
+    std::string host, host_header, path;
+    {
+        auto slash = url.find('/');
+        std::string authority = (slash != std::string::npos) ? url.substr(0, slash) : url;
+        path = (slash != std::string::npos) ? url.substr(slash) : "/";
+
+        std::string_view port_str;
+        if (!authority.empty() && authority.front() == '[')
         {
-            auto ps = host_port.substr(colon + 1);
-            std::from_chars(ps.data(), ps.data() + ps.size(), port);
+            auto rbracket = authority.find(']');
+            if (rbracket == std::string::npos) {
+                result["error"] = "malformed url: '[' with no matching ']'";
+                return result;
+            }
+            host = authority.substr(1, rbracket - 1);
+            if (rbracket + 1 < authority.size())
+            {
+                if (authority[rbracket + 1] != ':') {
+                    result["error"] = "malformed url: expected ':port' after ']'";
+                    return result;
+                }
+                port_str = std::string_view(authority).substr(rbracket + 2);
+            }
         }
-    } else {
-        host = host_port;
+        else
+        {
+            auto colon = authority.rfind(':');
+            // Exactly one colon is a port. More than one and no brackets is an
+            // unbracketed IPv6 literal — not strictly a legal URL, but it must
+            // not be silently cut in half either.
+            if (colon != std::string::npos && authority.find(':') == colon)
+            {
+                host     = authority.substr(0, colon);
+                port_str = std::string_view(authority).substr(colon + 1);
+            }
+            else
+                host = authority;
+        }
+
+        if (host.empty()) { result["error"] = "url has no host"; return result; }
+
+        if (!port_str.empty())
+        {
+            // A port that does not parse used to leave the default in place and
+            // quietly talk to the wrong service.
+            int parsed = 0;
+            auto [ptr, ec] = std::from_chars(port_str.data(),
+                                             port_str.data() + port_str.size(), parsed);
+            if (ec != std::errc{} || ptr != port_str.data() + port_str.size() ||
+                parsed < 1 || parsed > 65535)
+            {
+                result["error"] = "invalid port in url: " + std::string(port_str);
+                return result;
+            }
+            port = parsed;
+        }
+
+        host_header = (host.find(':') != std::string::npos) ? "[" + host + "]" : host;
     }
 
     // DNS resolve
@@ -479,7 +536,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     req.append(path);
     req.append(" HTTP/1.0\r\n");
     req.append("Host: ");
-    req.append(host);
+    req.append(host_header);
     req.append("\r\n");
     if (!body.empty())
     {
@@ -1000,7 +1057,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.create(type, name, config_table) → bool
-    sk["create"] = [owner, this](std::string type_str, std::string name, sol::optional<sol::table> config) -> bool {
+    sk["create"] = [owner](std::string type_str, std::string name, sol::optional<sol::table> config) -> bool {
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop) return false;

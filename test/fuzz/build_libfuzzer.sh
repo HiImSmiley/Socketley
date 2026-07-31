@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Build the fuzz targets against libFuzzer.
+#
+# ─── CLANG IS A TESTING TOOLCHAIN, NOT A BUILD DEPENDENCY ───────────────────
+#
+# Nobody needs clang to build socketley.  The shipped binary is built with GCC,
+# by premake, and that does not change.  clang is used here, and only here, to
+# produce coverage-guided fuzz binaries, because libFuzzer is a clang feature
+# and GCC has no equivalent.  If you are building socketley, ignore this file.
+#
+# libFuzzer is the *primary* fuzzing path: it is coverage-guided, so it explores
+# rather than replaying.  The GCC replay driver that premake builds
+# (bin/<config>/fuzz_*) remains as a floor for machines with no clang — it needs
+# nothing but the project's own compiler — but a run that silently fell back to
+# it has not fuzzed in any meaningful sense.  Set REQUIRE_LIBFUZZER=1 anywhere
+# the toolchain is known-good (CI runners) so that fallback cannot pass as a
+# real run.
+#
+#   ./test/fuzz/build_libfuzzer.sh              build if possible, skip if not
+#   REQUIRE_LIBFUZZER=1 ./test/fuzz/...         fail loudly if not possible
+#
+# Exit codes:  0 built   1 unavailable (or unavailable+required)   2 build failed
+#
+# Output: bin/fuzz-libfuzzer/{fuzz_resp,fuzz_ws_frame,fuzz_cache_ops,fuzz_http_request}
+#
+# ─── WHY THERE IS NO MEMORYSANITIZER BUILD HERE ─────────────────────────────
+#
+# MSan is the obvious next sanitizer to reach for and it is deliberately absent.
+# It reports a false positive for every byte that passes through code it did not
+# instrument, which means it needs libc++ *and* every dependency — liburing,
+# OpenSSL, LuaJIT — rebuilt with -fsanitize=memory.  LuaJIT in particular is
+# hand-written assembly that MSan cannot instrument at all.  That is a project
+# of its own, not a flag to add to this script; adding MSan without the
+# instrumented dependency stack produces a wall of noise that gets the whole
+# sanitizer switched off.  ASan+UBSan here, TSan in the nightly, is the set that
+# actually holds.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+OUT="$ROOT/bin/fuzz-libfuzzer"
+REQUIRE="${REQUIRE_LIBFUZZER:-0}"
+
+# Which targets to build.  Default is all three.  The per-push CI job narrows
+# this to the two header-only targets, because fuzz_http_request drags in
+# fifteen SDK translation units and that is a nightly cost, not a per-push one.
+# Narrowing is always an explicit decision by the caller — nothing here drops a
+# target because building it happened to fail.
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request"
+WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
+
+want() {
+    case " $WANT " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+for t in $WANT; do
+    case " $ALL_TARGETS " in
+        *" $t "*) ;;
+        *) echo "libfuzzer build: unknown target '$t' in LIBFUZZER_TARGETS"; exit 2 ;;
+    esac
+done
+
+unavailable() {
+    echo "libfuzzer build: $1"
+    if [ "$REQUIRE" = "1" ]; then
+        echo "libfuzzer build: REQUIRE_LIBFUZZER=1 was set, so this is a failure."
+        exit 1
+    fi
+    echo "libfuzzer build: skipping (the GCC replay targets still run)."
+    exit 1
+}
+
+CLANG="${CLANG:-}"
+if [ -z "$CLANG" ]; then
+    for c in clang++-19 clang++-18 clang++-17 clang++; do
+        command -v "$c" >/dev/null 2>&1 && { CLANG="$c"; break; }
+    done
+fi
+[ -n "$CLANG" ] || unavailable "no clang++ on PATH"
+
+# -fsanitize=fuzzer needs libclang_rt.fuzzer-*.a, which ships in a separate
+# package on Debian/Ubuntu (libclang-rt-<v>-dev).  Probe by compiling, not by
+# guessing at paths.
+probe="$(mktemp -d)"
+trap 'rm -rf "$probe"' EXIT
+cat > "$probe/p.cc" <<'EOF'
+#include <cstdint>
+#include <cstddef>
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t*, size_t) { return 0; }
+EOF
+if ! "$CLANG" -fsanitize=fuzzer,address,undefined "$probe/p.cc" -o "$probe/p" 2>"$probe/err"; then
+    echo "libfuzzer build: probe failed with $CLANG:"
+    sed 's/^/    /' "$probe/err" | head -10
+    unavailable "clang cannot link -fsanitize=fuzzer (install libclang-rt-*-dev)"
+fi
+
+echo "libfuzzer build: using $($CLANG --version | head -1)"
+mkdir -p "$OUT"
+
+FLAGS=(
+    -std=c++20 -g -O1
+    -fsanitize=fuzzer,address,undefined
+    -fno-sanitize-recover=all
+    -fno-omit-frame-pointer
+    -I"$ROOT/socketley"
+    -I"$ROOT/test/fuzz"
+)
+
+rc=0
+
+build() {
+    local name="$1"; shift
+    echo "  $name"
+    if ! "$CLANG" "${FLAGS[@]}" "$@" -o "$OUT/$name" 2>"$probe/$name.err"; then
+        echo "  FAILED: $name"
+        sed 's/^/    /' "$probe/$name.err" | head -30
+        rc=2
+    fi
+}
+
+want fuzz_resp     && build fuzz_resp "$ROOT/test/fuzz/fuzz_resp.cpp"
+want fuzz_ws_frame && build fuzz_ws_frame "$ROOT/test/fuzz/fuzz_ws_frame.cpp" -lssl -lcrypto
+
+# fuzz_cache_ops needs one .cpp out of the runtime, not the whole SDK:
+# cache_store.cpp includes nothing but libc headers, so it compiles here as
+# cheaply as a header-only target.  That is why this target belongs in the
+# per-push job alongside the two parsers and fuzz_http_request does not.
+want fuzz_cache_ops && build fuzz_cache_ops \
+    "$ROOT/test/fuzz/fuzz_cache_ops.cpp" "$ROOT/socketley/runtime/cache/cache_store.cpp"
+
+# ─── fuzz_http_request ──────────────────────────────────────────────────────
+#
+# This one needs the runtime: parse_http_request_line lives in
+# proxy_instance.cpp and there is no smaller unit that contains it.  It cannot
+# link premake's GCC archive — that archive is built with GCC's ASan, and one
+# process cannot host both GCC's and clang's sanitizer runtimes — so the SDK
+# sources are compiled here with clang as well.  That is a real cost (fifteen
+# translation units, the slowest being lua_context.cpp against sol2) so the
+# objects are cached in $SDK_OBJ and only rebuilt when a source is newer.
+#
+# This does NOT make clang a build dependency of socketley.  These objects are
+# instrumented fuzzing artifacts under bin/; the shipped binary is still GCC's.
+if want fuzz_http_request; then
+SDK_OBJ="$OUT/sdk-obj"
+mkdir -p "$SDK_OBJ"
+
+SDK_INC=(-I"$ROOT" -I"$ROOT/socketley" -I"$ROOT/include/linux" -I"$ROOT/test/fuzz"
+         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit")
+
+# The source list is read out of premake's generated makefile rather than
+# duplicated here, so a file added to the SDK cannot silently go un-fuzzed.
+SDK_MAKE="$ROOT/make/socketley_sdk.make"
+if [ ! -f "$SDK_MAKE" ]; then
+    echo "  fuzz_http_request: $SDK_MAKE not found — run ./bin/premake5 gmake2 first"
+    rc=2
+else
+    mapfile -t SDK_SRCS < <(grep -oE '\.\./[A-Za-z0-9_/.-]+\.cpp' "$SDK_MAKE" | sort -u | sed "s|^\.\./|$ROOT/|")
+    if [ "${#SDK_SRCS[@]}" -eq 0 ]; then
+        echo "  fuzz_http_request: no sources parsed out of $SDK_MAKE"
+        rc=2
+    else
+        echo "  fuzz_http_request: ${#SDK_SRCS[@]} SDK sources"
+        sdk_objs=()
+        sdk_fail=0
+        for src in "${SDK_SRCS[@]}"; do
+            obj="$SDK_OBJ/$(echo "${src#"$ROOT/"}" | tr '/' '_').o"
+            sdk_objs+=("$obj")
+            if [ -f "$obj" ] && [ "$obj" -nt "$src" ]; then
+                continue
+            fi
+            if ! "$CLANG" -std=c++23 -g -O1 \
+                    -fsanitize=fuzzer-no-link,address,undefined \
+                    -fno-sanitize-recover=all -fno-omit-frame-pointer \
+                    -DSOCKETLEY_LINUX -DDEBUG "${SDK_INC[@]}" \
+                    -c "$src" -o "$obj" 2>"$probe/sdk.err"; then
+                echo "  FAILED (SDK): ${src#"$ROOT/"}"
+                sed 's/^/    /' "$probe/sdk.err" | head -20
+                sdk_fail=1
+                break
+            fi
+        done
+
+        if [ "$sdk_fail" -ne 0 ]; then
+            rc=2
+        else
+            # -std=c++23 comes after FLAGS' -std=c++20 and therefore wins: the
+            # runtime headers this target pulls in need it, the two header-only
+            # targets do not.
+            build fuzz_http_request "$ROOT/test/fuzz/fuzz_http_request.cpp" \
+                "${sdk_objs[@]}" -std=c++23 "${SDK_INC[@]}" \
+                -DSOCKETLEY_LINUX -DDEBUG \
+                -L"$ROOT/thirdparty/luajit" -lluajit -luring -lssl -lcrypto -ldl -lpthread
+        fi
+    fi
+fi
+fi
+
+if [ "$rc" -ne 0 ]; then
+    echo "libfuzzer build: one or more targets failed to build"
+    exit "$rc"
+fi
+
+# A build step that produced nothing must not report success.  Checked per
+# requested target rather than by counting files: a count is satisfied by a
+# stale binary left over from a previous run, which is the same silent
+# degradation in a slower disguise.
+missing=0
+for t in $WANT; do
+    if [ ! -x "$OUT/$t" ]; then
+        echo "libfuzzer build: $t was requested but $OUT/$t does not exist"
+        missing=1
+    fi
+done
+[ "$missing" -eq 0 ] || exit 2
+
+echo "libfuzzer build: built [$WANT] in $OUT"
+exit 0

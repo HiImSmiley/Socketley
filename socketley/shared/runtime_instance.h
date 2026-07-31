@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <mutex>
 #include <sys/types.h>
 
 #ifndef SOCKETLEY_NO_LUA
@@ -120,11 +121,58 @@ public:
     std::string_view get_ca_path() const;
 
     // Stats
+    //
+    // get_stats() and get_connection_count() both read this instance's live
+    // connection tables — a server walks m_upstreams and m_active_fds, a cache
+    // walks m_clients — and the event-loop thread mutates those with no
+    // synchronisation whatsoever.  Both are therefore EVENT-LOOP THREAD ONLY.
+    // The four counters below are atomics and may be read from anywhere.
     virtual std::string get_stats() const;
     std::atomic<uint64_t> m_stat_total_connections{0};
     std::atomic<uint64_t> m_stat_total_messages{0};
     std::atomic<uint64_t> m_stat_bytes_in{0};
     std::atomic<uint64_t> m_stat_bytes_out{0};
+
+    // ── Off-thread view ─────────────────────────────────────────────────────
+    // What a reader that is not on the event-loop thread gets instead.
+    //
+    // The metrics endpoint runs on its own std::thread and used to call
+    // get_connection_count() — and get_stats() — from there, holding only
+    // runtime_manager::mutex.  That mutex guards the runtime *map*; it says
+    // nothing about what is inside a runtime.  Reading an unordered_map while
+    // another thread rehashes it is undefined, not merely stale: the walk
+    // follows bucket pointers that are being rewritten underneath it.
+    //
+    // So the figures are published instead.  The event-loop thread writes them
+    // through publish_offthread_stats(); everyone else reads them here.  They
+    // are as old as the last publish and no older, which is the price of not
+    // reading a container that is being rewritten.
+    std::atomic<uint64_t> m_stat_active_connections{0};
+
+    // Refresh both.  EVENT-LOOP THREAD ONLY — it makes exactly the
+    // unsynchronised reads this exists to keep off other threads.
+    //
+    // The get_stats() string is built before the lock is taken, so the only
+    // thing the lock covers is a move: a reader can never be made to wait on
+    // string construction, and the event-loop thread can never be made to wait
+    // on more than one string copy.
+    void publish_offthread_stats()
+    {
+        m_stat_active_connections.store(static_cast<uint64_t>(get_connection_count()),
+                                        std::memory_order_relaxed);
+        std::string detail = get_stats();
+        std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
+        m_stat_detail = std::move(detail);
+    }
+
+    // The last published get_stats() text.  Empty until the first publish, which
+    // is the same thing an instance with nothing to say returns, and callers
+    // already treat an empty result as "no detail".
+    std::string stat_detail_snapshot() const
+    {
+        std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
+        return m_stat_detail;
+    }
 
     // Lua hot-reload
     bool reload_lua_script();
@@ -244,6 +292,12 @@ protected:
     void print_bash_message(std::string_view msg) const;
 
 private:
+    // Guards m_stat_detail only, and is held for a single move or copy.  Its own
+    // lock rather than the manager's, so publishing never has to take the
+    // runtime map exclusively on the event-loop thread.
+    mutable std::mutex m_stat_detail_mutex;
+    std::string m_stat_detail;
+
     std::string m_name;
     std::string m_id;
     runtime_type m_type;

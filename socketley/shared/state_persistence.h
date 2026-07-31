@@ -75,6 +75,11 @@ struct runtime_config
     int health_threshold = 3;
     int circuit_threshold = 5;
     int circuit_timeout = 30;
+    // Mirrors mesh_config::backend_timeout, default and all: 0 is a meaningful
+    // value here ("no deadline"), so absence has to be told apart from it —
+    // which is why the reader asks for this default rather than treating 0 as
+    // "not set" the way the fields above do.
+    int backend_timeout = 2;
     int retry_count = 0;
     bool retry_all = false;
     std::string mesh_client_ca;

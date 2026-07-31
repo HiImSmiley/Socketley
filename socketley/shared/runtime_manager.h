@@ -7,6 +7,7 @@
 #include <shared_mutex>
 #include <functional>
 #include <vector>
+#include <atomic>
 
 #include "runtime_instance.h"
 
@@ -73,6 +74,24 @@ public:
     size_t reap_retired(const event_loop& loop);
     size_t retired_count() const;
 
+    // ── Off-thread stats ────────────────────────────────────────────────────
+    // Begin publishing every runtime's connection count and stats text for
+    // readers that are not on the event-loop thread — see
+    // runtime_instance::publish_offthread_stats() for why they cannot read the
+    // live figures themselves.
+    //
+    // Off until something asks, because publishing costs one get_stats() string
+    // per runtime per sweep and a daemon with no metrics endpoint has nobody to
+    // read it: metrics is disabled unless metrics_port is set in the config, and
+    // that is the only off-thread reader there is.  One-way — once on it stays
+    // on for the life of the daemon, so nothing has to reason about a reader
+    // that stopped between two sweeps.
+    void enable_offthread_stats();
+
+    // Refresh those figures for every runtime in the map.  EVENT-LOOP THREAD
+    // ONLY.  No-op unless enable_offthread_stats() has been called.
+    void publish_offthread_stats();
+
     // Cross-runtime pub/sub: dispatch a published message to all runtimes
     void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
 
@@ -109,6 +128,10 @@ private:
     // shutdown for whatever never completed.
     std::vector<std::unique_ptr<runtime_instance>> m_retired;
     size_t m_retired_warn_at = 32;
+
+    // Set by a reader on another thread, read by the event-loop thread on every
+    // sweep, so it has to be an atomic even though it only ever goes false→true.
+    std::atomic<bool> m_offthread_stats{false};
 
     cluster_discovery* m_cluster = nullptr;
 };

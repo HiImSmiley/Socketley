@@ -14,7 +14,10 @@
 #include <vector>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <fcntl.h>
 
 metrics_endpoint::metrics_endpoint(runtime_manager& mgr)
     : m_manager(mgr)
@@ -40,6 +43,8 @@ bool metrics_endpoint::start(uint16_t port)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
 
+    // Raw close, and every close in this file is: see serve_loop() for why none
+    // of these descriptors is the event loop's to hold.
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
         close(m_listen_fd);
@@ -54,6 +59,37 @@ bool metrics_endpoint::start(uint16_t port)
         return false;
     }
 
+    // The listener is polled, not blocked on, so accept() must be able to say
+    // "nothing after all": a connection reset between poll() reporting it and
+    // accept() collecting it takes the pending connection away again, and on a
+    // blocking listener that leaves the thread stuck in accept() until the next
+    // client happens along — which is exactly the state stop() must not have to
+    // wait for.
+    int flags = fcntl(m_listen_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(m_listen_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+
+    // Accepted sockets do not inherit O_NONBLOCK on Linux, so the read() and
+    // write_all() below stay the plain blocking calls they always were.
+
+    m_wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (m_wake_fd < 0)
+    {
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+
+    // From here on there is a second thread reading runtimes, and it must not
+    // touch a runtime's live connection tables — the event loop rewrites those
+    // with no synchronisation.  Ask the manager to start publishing the figures
+    // this endpoint needs; everything below reads only what it published.
+    m_manager.enable_offthread_stats();
+
     m_running.store(true, std::memory_order_release);
     m_start_time = std::chrono::steady_clock::now();
     m_thread = std::thread(&metrics_endpoint::serve_loop, this);
@@ -63,13 +99,49 @@ bool metrics_endpoint::start(uint16_t port)
 void metrics_endpoint::stop()
 {
     bool was = m_running.exchange(false, std::memory_order_acq_rel);
+
+    // Ring the bell, then wait, then close.  In that order, and the order is
+    // the point.
+    //
+    // This used to close m_listen_fd here to break serve_loop() out of the
+    // accept() it was blocked in, and only then join.  Closing a descriptor
+    // another thread is inside a syscall on does not reliably end that syscall
+    // — and worse, it frees the number immediately.  A runtime starting its
+    // listener in the same moment is handed that very number by the kernel,
+    // whose accept() then resolves to the runtime's socket: the metrics thread
+    // takes a connection meant for a server or a cache, reads the client's
+    // first bytes, answers with an HTTP 404, and closes it.  Nothing on either
+    // side can see why.  Plain descriptor reuse; the io_uring loop is not
+    // involved and neither is close_fd(), which is for descriptors the ring
+    // names and cannot help a thread blocked in a syscall of its own.
+    //
+    // The eventfd is the thing serve_loop() waits on alongside the listener, so
+    // this wakes it rather than pulling anything out from under it.  After the
+    // join nothing can be naming either descriptor, and closing them is
+    // ordinary.
+    if (m_wake_fd >= 0)
+    {
+        const uint64_t one = 1;
+        // Nothing to do if it fails: a full eventfd counter is already a
+        // pending wake, and the loop re-reads m_running on every pass anyway.
+        if (write(m_wake_fd, &one, sizeof(one)) < 0) {}
+    }
+
+    if (was && m_thread.joinable())
+        m_thread.join();
+
+    // Raw close — see serve_loop() for why none of this file's descriptors is
+    // the event loop's to hold.
     if (m_listen_fd >= 0)
     {
         close(m_listen_fd);
         m_listen_fd = -1;
     }
-    if (was && m_thread.joinable())
-        m_thread.join();
+    if (m_wake_fd >= 0)
+    {
+        close(m_wake_fd);
+        m_wake_fd = -1;
+    }
 }
 
 static void send_http_response(int fd, std::string_view content_type, std::string_view body)
@@ -100,6 +172,29 @@ void metrics_endpoint::serve_loop()
 {
     while (m_running.load(std::memory_order_acquire))
     {
+        // Both, always.  The listener alone is what left this thread parked in
+        // accept() with no way for stop() to reach it but closing the
+        // descriptor underneath it — see stop().
+        struct pollfd fds[2];
+        fds[0] = { m_listen_fd, POLLIN, 0 };
+        fds[1] = { m_wake_fd,   POLLIN, 0 };
+
+        int ready = poll(fds, 2, -1);
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        // stop() rang.  m_running is already false; leaving now is what lets it
+        // join, and only after that join does it close either descriptor.
+        if (fds[1].revents != 0)
+            break;
+
+        if ((fds[0].revents & POLLIN) == 0)
+            continue;
+
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
@@ -185,6 +280,19 @@ void metrics_endpoint::serve_loop()
             }
         }
 
+        // Raw close, and the right one.  This whole endpoint is deliberately
+        // outside the event loop: the descriptor came from an accept() on this
+        // thread, was read with read() and written with write_all(), and no SQE
+        // has ever named it — there is nothing queued that a reissued number
+        // could be redirected onto.
+        //
+        // Routing it through event_loop::close_fd() would also be wrong rather
+        // than merely unnecessary.  close_fd() reads and writes the loop's
+        // per-descriptor tables with no synchronisation, because everything else
+        // that touches them runs on the event-loop thread; calling it from here
+        // would be a plain data race against that thread for a descriptor the
+        // tables have no entry for.  metrics_endpoint holds no event_loop
+        // reference at all, and this is the reason to keep it that way.
         close(client_fd);
     }
 }
@@ -225,12 +333,21 @@ std::string metrics_endpoint::build_metrics() const
         snapshots.reserve(runtimes.size());
         for (const auto& [name, rt] : runtimes)
         {
+            // The published count, not get_connection_count().  This runs on
+            // m_thread, and that call walks the runtime's own connection tables
+            // — a server's m_upstreams and m_active_fds, a cache's m_clients —
+            // which the event loop mutates without synchronising at all.  The
+            // lock held here is the manager's, and it covers the runtime map,
+            // not the insides of a runtime: reading one of those maps while the
+            // event loop rehashes it is undefined, not just out of date.
+            // Published every 2 s by the event-loop thread, so this is up to
+            // that much older than the truth on top of the response cache.
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
                 rt->m_stat_total_connections.load(std::memory_order_relaxed),
                 rt->m_stat_total_messages.load(std::memory_order_relaxed),
                 rt->m_stat_bytes_in.load(std::memory_order_relaxed),
                 rt->m_stat_bytes_out.load(std::memory_order_relaxed),
-                rt->get_connection_count()});
+                static_cast<size_t>(rt->m_stat_active_connections.load(std::memory_order_relaxed))});
         }
     }
 
@@ -372,7 +489,8 @@ std::string metrics_endpoint::build_json_overview() const
             total_messages += rt->m_stat_total_messages.load(std::memory_order_relaxed);
             total_bytes_in += rt->m_stat_bytes_in.load(std::memory_order_relaxed);
             total_bytes_out += rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-            active_connections += rt->get_connection_count();
+            // Published, not live — see build_metrics().
+            active_connections += rt->m_stat_active_connections.load(std::memory_order_relaxed);
             if (rt->get_state() == runtime_running) running_count++;
         }
     }
@@ -420,13 +538,14 @@ std::string metrics_endpoint::build_json_runtimes() const
         snapshots.reserve(runtimes.size());
         for (const auto& [name, rt] : runtimes)
         {
+            // Published, not live — see build_metrics().
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
                 rt->get_port(),
                 rt->m_stat_total_connections.load(std::memory_order_relaxed),
                 rt->m_stat_total_messages.load(std::memory_order_relaxed),
                 rt->m_stat_bytes_in.load(std::memory_order_relaxed),
                 rt->m_stat_bytes_out.load(std::memory_order_relaxed),
-                rt->get_connection_count()});
+                static_cast<size_t>(rt->m_stat_active_connections.load(std::memory_order_relaxed))});
         }
     }
 
@@ -486,7 +605,8 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += "\",\"port\":";
     json_append_uint(j, rt->get_port());
     j += ",\"connections\":";
-    json_append_uint(j, rt->get_connection_count());
+    // Published, not live — see build_metrics().
+    json_append_uint(j, rt->m_stat_active_connections.load(std::memory_order_relaxed));
     j += ",\"messages_total\":";
     json_append_uint(j, rt->m_stat_total_messages.load(std::memory_order_relaxed));
     j += ",\"connections_total\":";
@@ -496,8 +616,16 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += ",\"bytes_out\":";
     json_append_uint(j, rt->m_stat_bytes_out.load(std::memory_order_relaxed));
 
-    // Add detailed stats if available
-    std::string stats = rt->get_stats();
+    // Add detailed stats if available.
+    //
+    // The published text, for the same reason as the count above and rather more
+    // urgently: get_stats() is overridden per type, and server_instance's
+    // override iterates m_upstreams outright while cache_instance's reads the
+    // store's key count, its channel count and its follower list — every one of
+    // them a container the event loop rewrites underneath this thread.  Empty
+    // until the first sweep after the endpoint started, which is the same thing
+    // this already prints nothing for.
+    std::string stats = rt->stat_detail_snapshot();
     if (!stats.empty())
     {
         j += ",\"stats\":\"";

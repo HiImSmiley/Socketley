@@ -466,6 +466,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.health_threshold = mesh.health_threshold;
             cfg.circuit_threshold = mesh.circuit_threshold;
             cfg.circuit_timeout = mesh.circuit_timeout;
+            cfg.backend_timeout = mesh.backend_timeout;
             cfg.retry_count = mesh.retry_count;
             cfg.retry_all = mesh.retry_all;
             cfg.mesh_client_ca = mesh.client_ca;
@@ -661,6 +662,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("circuit_threshold", cfg.circuit_threshold);
             if (cfg.circuit_timeout != 30)
                 append_int_field("circuit_timeout", cfg.circuit_timeout);
+            if (cfg.backend_timeout != 2)
+                append_int_field("backend_timeout", cfg.backend_timeout);
             if (cfg.retry_count > 0)
                 append_int_field("retry_count", cfg.retry_count);
             if (cfg.retry_all)
@@ -759,6 +762,9 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             { auto v = json_get_int(json, "health_threshold"); if (v > 0) cfg.health_threshold = v; }
             { auto v = json_get_int(json, "circuit_threshold"); if (v > 0) cfg.circuit_threshold = v; }
             { auto v = json_get_int(json, "circuit_timeout"); if (v > 0) cfg.circuit_timeout = v; }
+            // 0 means "no deadline" and is written out like any other value, so
+            // this one asks for the default on absence instead of rejecting 0.
+            cfg.backend_timeout = json_get_int(json, "backend_timeout", 2);
             cfg.retry_count = json_get_int(json, "retry_count");
             cfg.retry_all = json_get_bool(json, "retry_all");
             cfg.mesh_client_ca = json_get_string(json, "mesh_client_ca");

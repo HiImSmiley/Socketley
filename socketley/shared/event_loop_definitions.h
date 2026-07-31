@@ -50,6 +50,31 @@ inline uint32_t next_io_generation()
 // Outside every valid group id, so returning it is a no-op.
 inline constexpr uint8_t NO_BUF_GROUP = 0xFF;
 
+// ── Descriptor targets ──────────────────────────────────────────────────────
+// An SQE does not carry a file.  It carries a *number* — a raw descriptor, or
+// an index into the ring's fixed-file table — and the kernel resolves that
+// number to a file when it consumes the SQE.  With SQPOLL that happens on
+// another thread at a moment nothing here controls, and even without it this
+// loop batches a whole completion round before it submits.
+//
+// So a number that is given away between the submission and the consumption is
+// not a cancelled operation, it is a *redirected* one: the read, write or
+// splice lands on whatever now answers to that number.  This was measured on
+// the proxy — about 6% of healthy connections received an aborting client's
+// 8192 bytes spliced into the middle of their own stream, because the aborting
+// client's descriptor had been closed and reissued by the next accept while its
+// splice was still queued.  Giving the number away covers three moves, not one:
+// close() and let the next accept take it, hand it to a connection pool, or
+// free a fixed-file slot and let the next allocation have the index.
+//
+// event_loop counts, per number, the submissions that named it, and refuses all
+// three moves until that count is zero.  These are how a submission records
+// which number it named, so the count can be undone when the completion lands.
+// IO_TARGET_FIXED separates the two namespaces: fixed index 7 and raw
+// descriptor 7 are different things and must not share a counter.
+inline constexpr uint32_t IO_TARGET_NONE  = 0xFFFFFFFFu;
+inline constexpr uint32_t IO_TARGET_FIXED = 0x80000000u;
+
 enum op_type : uint8_t
 {
     op_accept                = 0,
@@ -151,4 +176,21 @@ struct io_request
     // completion carries IORING_CQE_F_BUFFER and only those helpers can produce
     // that.
     uint8_t buf_group{NO_BUF_GROUP};
+
+    // The number(s) this submission wrote into its SQE, in the encoding
+    // described above.  Written by event_loop::arm() from the argument the
+    // submit_* helper was called with — not from ::fd, which several helpers
+    // deliberately set to something else (submit_file_read names the file but
+    // records the socket, so the completion routes to the right connection).
+    //
+    // Two of them because splice names two: the pipe it reads from and the
+    // socket it writes into, and both have to be held.  The measured bug was on
+    // the second one.
+    //
+    // These are read by run() *before* the handler is dispatched, for the same
+    // reason ::type is: on_cqe may free the storage this request lives in, and
+    // may re-arm the request onto a different descriptor.  The value that has
+    // to be undone is the one that was armed.
+    uint32_t armed_target{IO_TARGET_NONE};
+    uint32_t armed_target2{IO_TARGET_NONE};
 };

@@ -317,6 +317,106 @@ TEST_CASE("cache_store eviction")
         CHECK_FALSE(store.exists("brandnew"));
     }
 
+    SUBCASE("a collection write does not evict the collection it is writing")
+    {
+        // sadd held an iterator into m_sets across check_memory(), and
+        // try_evict was free to pick the very set that iterator named: the
+        // emplace below then went through a freed node.  Two commands under
+        // --maxmemory are the whole reproducer, and it is reachable by any
+        // client that can write.  lpush, rpush and hset held theirs the same
+        // way.
+        REQUIRE(store.sadd("s", std::string(40, 'm')) == 1);
+        store.sadd("s", std::string(400, 'n'));   // was a use-after-free here
+
+        // Whatever the answer, the set that was written to has to still be the
+        // set that was there.
+        CHECK(store.sismember("s", std::string(40, 'm')));
+
+        std::string out;
+        REQUIRE(store.rpush("l", std::string(40, 'e')));
+        store.rpush("l", std::string(400, 'f'));
+        CHECK(store.llen("l") >= 1);
+        CHECK(store.lindex("l", 0) != nullptr);
+
+        REQUIRE(store.hset("h", "f", std::string(40, 'v')));
+        store.hset("h", "g", std::string(400, 'w'));
+        CHECK(store.hget("h", "f") != nullptr);
+    }
+
+    SUBCASE("a refused write leaves the key it refused to write alone")
+    {
+        REQUIRE(store.set("cfg", std::string(300, 'a')));
+
+        // try_evict chose "cfg" itself as the victim, and the write was refused
+        // anyway: the caller got an error *and* the value it already had was
+        // deleted, to make room for a write that never landed.
+        CHECK_FALSE(store.set("cfg", std::string(5000, 'b')));
+
+        std::string out;
+        REQUIRE(store.get("cfg", out));
+        CHECK(out.size() == 300);
+    }
+
+    SUBCASE("a refused APPEND does not take the value it was appending to")
+    {
+        REQUIRE(store.set("log", std::string(300, 'a')));
+        REQUIRE(store.set_expiry("log", 3600));
+
+        // This evicted "log", fell through to the create branch, stored the
+        // suffix on its own and returned 200 — a number the caller cannot tell
+        // from a successful append.  The 300 bytes that were there and the TTL
+        // went with it, and nothing said so.
+        CHECK(store.append("log", std::string(200, 'b')) == cache_store::append_denied);
+
+        std::string out;
+        REQUIRE(store.get("log", out));
+        CHECK(out.size() == 300);
+        CHECK(store.get_ttl("log") > 0);
+    }
+
+    SUBCASE("overwriting a hash field is checked against the limit")
+    {
+        store.set_eviction(evict_none);
+        store.set_max_memory(1200);
+        REQUIRE(store.hset("h", "f", "v"));
+        const size_t before = store.get_memory_used();
+
+        // Overwriting an existing field called check_memory nowhere at all, so
+        // this went straight in: 294 bytes in use before it, 100305 after,
+        // against a ceiling of 1200.  Adding a *new* field was checked; the
+        // same hole was closed for SET long ago.
+        CHECK_FALSE(store.hset("h", "f", std::string(100000, 'x')));
+
+        const std::string* got = store.hget("h", "f");
+        REQUIRE(got != nullptr);
+        CHECK(*got == "v");
+        CHECK(store.get_memory_used() == before);
+        CHECK(store.get_memory_used() <= 1200);
+    }
+
+    SUBCASE("an APPEND is charged for the buffer it actually buys")
+    {
+        store.set_eviction(evict_none);
+        store.set_max_memory(1600);
+        REQUIRE(store.set("k", std::string(1300, 'a')));
+
+        // libstdc++ reallocates to twice the old capacity rather than to fit,
+        // so a 32-byte suffix on a 1300-byte value buys a 2600-byte buffer.
+        // Admission asked for what the new *length* needs — 32 bytes — and the
+        // accepted write left the store at 2838 bytes against a 1600-byte
+        // ceiling.  What has to be asked for is the allocation.
+        CHECK(store.append("k", std::string(32, 'b')) == cache_store::append_denied);
+        CHECK(store.strlen_key("k") == 1300);
+        CHECK(store.get_memory_used() <= 1600);
+
+        // And the other side of it: an append that really does fit is still
+        // taken.  A refusal that is always right for the wrong reason is not a
+        // fix.
+        store.set_max_memory(100000);
+        CHECK(store.append("k", std::string(32, 'b')) == 1332);
+        CHECK(store.get_memory_used() <= 100000);
+    }
+
     SUBCASE("emptying a collection does not corrupt LRU order")
     {
         // Draining a list deletes the key.  That path used to erase the key
@@ -344,6 +444,46 @@ TEST_CASE("cache_store eviction")
     }
 }
 
+TEST_CASE("cache_store a refused SET leaves the key's TTL alone")
+{
+    // set() erased the key's expiry as its very first act — before the
+    // type-conflict check and before check_memory — so a SET that was then
+    // refused had still stripped the TTL off a key it never wrote.  The client
+    // is told the write failed and has every reason to believe nothing
+    // happened; the key it was told about now never expires.  Reachable through
+    // SET and GETSET.
+    SUBCASE("refused on the key's type")
+    {
+        cache_store store;
+        REQUIRE(store.hset("sess", "f", "v"));
+        REQUIRE(store.set_expiry("sess", 3600));
+
+        CHECK_FALSE(store.set("sess", "v"));
+        CHECK(store.get_ttl("sess") > 0);
+
+        std::string oldval;
+        CHECK_FALSE(store.getset("sess", "v", oldval));
+        CHECK(store.get_ttl("sess") > 0);
+    }
+
+    SUBCASE("refused for want of room")
+    {
+        cache_store store;
+        store.set_max_memory(600);
+        store.set_eviction(evict_none);
+        REQUIRE(store.set("k", std::string(100, 'a')));
+        REQUIRE(store.set_expiry("k", 3600));
+
+        CHECK_FALSE(store.set("k", std::string(5000, 'b')));
+        CHECK(store.get_ttl("k") > 0);
+
+        // ...and a SET that goes through still drops it, which is what SET
+        // without KEEPTTL means.
+        CHECK(store.set("k", std::string(100, 'c')));
+        CHECK(store.get_ttl("k") == -1);
+    }
+}
+
 TEST_CASE("cache_store load restores accounting and eviction order")
 {
     const std::string path = "/tmp/socketley-unit-load-" + std::to_string(::getpid()) + ".bin";
@@ -358,6 +498,13 @@ TEST_CASE("cache_store load restores accounting and eviction order")
         src.rpush("l", std::string(40, 'e'));
         src.sadd("s", std::string(40, 'm'));
         src.hset("h", "f", std::string(40, 'x'));
+        // 16..29 bytes is the one range where load() used to hand back a string
+        // that costs more than the one saved: it built them with assign() onto
+        // a fresh std::string, and libstdc++ rounds a request under twice the
+        // old capacity up to twice it, so 20 bytes came back holding 30.  The
+        // equality below is what caught it; every other length in this case
+        // round-trips exactly.
+        src.set(std::string(20, 'p'), std::string(20, 'q'));
         expected = src.get_memory_used();
         CHECK(src.save(path));
     }
@@ -366,7 +513,7 @@ TEST_CASE("cache_store load restores accounting and eviction order")
     dst.set_max_memory(1000000);          // limit is configured before the load, as the runtime does
     dst.set_eviction(evict_allkeys_lru);
     CHECK(dst.load(path));
-    CHECK(dst.size() == 23);
+    CHECK(dst.size() == 24);
 
     // load() inserted straight into the containers, so the restored data was
     // invisible to the accounting: same bytes resident, but reported as nothing.

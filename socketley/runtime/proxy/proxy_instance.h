@@ -22,6 +22,20 @@ enum proxy_protocol : uint8_t { protocol_http = 0, protocol_tcp = 1 };
 enum proxy_strategy : uint8_t { strategy_round_robin = 0, strategy_random = 1, strategy_lua = 2 };
 enum conn_side : uint8_t { conn_none = 0, conn_client, conn_backend };
 
+// What the bytes received from a client so far amount to.  This used to be a
+// bool where false meant "need more data", which left the smuggling check no
+// way to say "this request is malformed".  It signalled a rejection by
+// returning false — so the connection went back and asked for more bytes, and
+// no quantity of further bytes could ever make the request acceptable.  The
+// client got a 431 once the header limit was hit, or nothing at all until the
+// idle timeout, instead of being told its request was refused.
+enum class http_request_parse : uint8_t
+{
+    need_more,  // header block not complete yet — read again
+    complete,   // request line and header block parsed; safe to forward
+    invalid,    // ambiguous or self-contradictory framing — 400, never forward
+};
+
 struct backend_info
 {
     std::string address;
@@ -42,6 +56,18 @@ struct resolved_backend
 // The bottleneck is often the number of read syscalls — larger buffers
 // amortize the per-syscall overhead across more data.
 static constexpr size_t PROXY_READ_BUF_SIZE = 65536;
+
+// How long a client may take to finish the header block of a request once it
+// has started sending one.  Deliberately not a flag and deliberately not tied
+// to --idle-timeout: an operator who has never heard of either still gets this,
+// and --idle-timeout's default of 0 ("never") must not be able to switch off a
+// bound on half-finished requests.  Ten seconds is far outside anything a
+// working client does — a header block is one or two segments — and far inside
+// how long an attacker would like to hold the connection.  It bounds only the
+// gap between the first byte of a request and its terminating blank line;
+// neither an idle keep-alive connection between requests nor a slow body is
+// measured against it.
+static constexpr int PROXY_HEADER_TIMEOUT_SEC = 10;
 
 struct alignas(64) proxy_client_connection
 {
@@ -124,6 +150,30 @@ struct alignas(64) proxy_client_connection
     bool abort_watch_pending{false};
     io_request abort_req;
 
+    // A request has been handed to the backend and not one byte of the answer
+    // has come back yet.  Nothing else bounded that wait: a backend that accepts
+    // the connection and then stops answering fails no check anywhere — a TCP
+    // health probe connects to it happily, a request that never completes is
+    // never recorded as an error, so the breaker never opens, and the request
+    // simply stays open.  Measured: one still unanswered after 100 s, and under
+    // load the surviving backends looked perfect while throughput fell 99.7%,
+    // because every client connection that touched the stalled backend was
+    // consumed one by one.  See mesh_config::backend_timeout.
+    bool awaiting_response{false};
+    std::chrono::steady_clock::time_point response_deadline{};
+
+    // Bytes of a request have arrived and its header block is not finished yet.
+    // Holding for the terminating blank line is the correct framing behaviour —
+    // acting on half a header block is what request smuggling is made of — but
+    // holding is only safe if something ends the hold.  The 16 KiB limit does
+    // not: it is a limit on bytes, and a client that sends a request line and
+    // then stops sends no further bytes to be counted.  --idle-timeout does
+    // not either, because it defaults to 0, meaning never.  So the wait was
+    // bounded by nothing at all, and one connection per socket the attacker can
+    // open is the whole of slowloris.  See PROXY_HEADER_TIMEOUT_SEC.
+    bool awaiting_headers{false};
+    std::chrono::steady_clock::time_point header_deadline{};
+
     SKL_TRACE_FIELD(tr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
@@ -181,6 +231,20 @@ struct alignas(64) proxy_backend_connection
     uint16_t http_status_code{0};
     size_t http_body_remaining{0};
 
+    // At least one byte of this response has been forwarded already.  The
+    // header scan only ever looks at the chunk in front of it, so it can only
+    // be trusted on the *first* chunk: run it on a later one and it finds its
+    // "\r\n\r\n" somewhere inside the body and reads body bytes as a status
+    // line and headers.
+    bool http_response_bytes_seen{false};
+    // The length of this response could not be established with certainty —
+    // the header block straddled a read boundary, or it was framed in a way a
+    // backend and this proxy could read differently.  Deciding a response is
+    // over when it is not hands the socket to the pool with the tail of the
+    // previous answer still queued on it, and the next borrower reads someone
+    // else's response as the start of its own.  Never pool one of these.
+    bool http_frame_unknown{false};
+
     // Set while pool_draining when the cancelled read turns out to have
     // delivered something other than the cancellation: data past the end of
     // the response, an EOF, or an error.  Any of those leaves the stream at an
@@ -225,6 +289,16 @@ struct circuit_breaker
     state current{closed};
     int error_count{0};
     std::chrono::steady_clock::time_point opened_at{};
+
+    // Half-open means "one request finds out whether the backend is back".
+    // Availability alone could not express that: it answered yes to every
+    // selection, so the whole rotation poured into a backend that had just been
+    // taken out of it, and each timeout transition cost a burst of requests
+    // rather than the single probe the design intends.  The timestamp bounds it
+    // — a probe whose answer never arrives (the client went away first) must not
+    // block the backend out of rotation for good.
+    bool probe_in_flight{false};
+    std::chrono::steady_clock::time_point probe_started{};
 };
 
 // Service mesh configuration
@@ -240,6 +314,19 @@ struct mesh_config
     // Circuit breaker
     int circuit_threshold{5};    // errors to open circuit
     int circuit_timeout{30};     // seconds before half-open
+
+    // How long a backend may take to produce the first byte of a response
+    // before the request is given up on and the backend charged for it.  On by
+    // default, because the failure it covers — accepts, never answers — is
+    // invisible to everything else the proxy has: no error is ever recorded, so
+    // no breaker opens, and a TCP health check connects to such a backend just
+    // fine.  An operator who has not heard of this flag is the one who needs it,
+    // which is why --sidecar (health_tcp + circuit + retry) inherits it too.
+    //
+    // It measures time to the *first* byte, not the whole response, so a slow
+    // or streaming body is never cut short once the backend has started
+    // answering.  0 disables it and restores the old unbounded wait.
+    int backend_timeout{2};      // seconds, 0 = disabled
 
     // Retries
     int retry_count{0};          // 0 = disabled
@@ -311,6 +398,7 @@ public:
     void set_health_threshold(int threshold);
     void set_circuit_threshold(int threshold);
     void set_circuit_timeout(int seconds);
+    void set_backend_timeout(int seconds);
     void set_retry_count(int count);
     void set_retry_all(bool val);
     void set_mesh_client_ca(std::string_view path);
@@ -351,7 +439,9 @@ private:
     void handle_client_abort(struct io_uring_cqe* cqe, io_request* req);
     void handle_health_cqe(struct io_uring_cqe* cqe, io_request* req);
 
-    bool parse_http_request_line(proxy_client_connection* conn);
+    // Returns http_request_parse::invalid for a request that must never reach a
+    // backend, which is a verdict the old bool return could not express at all.
+    http_request_parse parse_http_request_line(proxy_client_connection* conn);
     std::string rewrite_http_request(proxy_client_connection* conn,
                                      std::string_view new_path);
 
@@ -366,6 +456,20 @@ private:
     // backend said nothing at all and must not be charged for it.
     bool connect_to_backend(proxy_client_connection* conn, const backend_info* target,
                             bool* resource_failure = nullptr);
+    // Every descriptor this runtime gives back to the kernel goes through here:
+    // client sockets, backend sockets, the listener, the connect socket, the
+    // splice pipes.  This is the runtime the crossed-delivery bug was measured
+    // on — a close does not withdraw an SQE that already carries the number, it
+    // only frees the number for the next accept, and the queued splice then
+    // writes into that connection instead.  event_loop::close_fd holds the
+    // number until nothing in the ring still names it, which is the general
+    // form of what close_pair does for one specific splice.
+    //
+    // m_retired_loop and not m_loop: descriptors are still closed after
+    // teardown has cleared m_loop, and that is exactly when the ring is most
+    // likely to be holding something.
+    void close_tracked(int fd);
+
     void close_pair(int client_fd, int backend_fd);
     inline void close_pair_close_backend(int backend_fd,
                                           proxy_backend_connection* bconn,
@@ -428,10 +532,38 @@ private:
 
     // Service mesh
     bool is_backend_available(size_t idx) const;
+    // Claim the single half-open probe when this selection is the one that
+    // gets it; a no-op for a backend whose circuit is closed.
+    void note_backend_selected(size_t idx);
     void health_check_sweep();
     void record_backend_error(size_t backend_idx);
     void record_backend_success(size_t backend_idx);
     bool try_retry(proxy_client_connection* conn);
+
+    // Start / stop the wait for a backend's first response byte.  Arming also
+    // starts the sweep below if it is not already running; a group-routed
+    // connection is timed just the same, it simply has no backend slot to
+    // charge when the deadline passes.
+    void arm_response_deadline(proxy_client_connection* conn);
+    void clear_response_deadline(proxy_client_connection* conn);
+    // Start the wait for the rest of a request's header block.  Idempotent: the
+    // deadline is set once per request and not pushed forward by later bytes,
+    // or a client dribbling one byte at a time would renew it for ever — which
+    // is the shape of the attack, not an accident of it.
+    void arm_header_deadline(proxy_client_connection* conn);
+    // Give up on every deadline that has passed: a backend that never answered
+    // is charged so the existing breaker opens and the request is retried
+    // elsewhere or answered 504; a client that never finished its header block
+    // gets 408 and its connection closed.  Both live on this one sweep because
+    // an armed io_uring timeout hangs off no descriptor and cannot be
+    // cancelled — a second chain would be a second thing to get wrong at
+    // teardown, for a check that costs one comparison on a loop that already
+    // walks every client.
+    void response_deadline_sweep();
+    // Idempotent, and armed on demand for the same reason as the idle sweep: a
+    // proxy with nothing outstanding must not keep a timer chain alive, because
+    // an io_uring timeout hangs off no descriptor and cannot be cancelled.
+    void arm_response_deadline_sweep();
 
     proxy_protocol m_protocol = protocol_http;
     proxy_strategy m_strategy = strategy_round_robin;
@@ -516,6 +648,14 @@ private:
     std::unique_ptr<timer_op> m_idle_sweep_timer;
     bool m_idle_sweep_armed{false};
     bool m_idle_sweep_warned{false};
+
+    // Backend response deadline sweep.  Runs at a fraction of the deadline so
+    // the overshoot stays small, and only while at least one request is
+    // actually outstanding — see arm_response_deadline_sweep().
+    static constexpr long RESPONSE_SWEEP_NSEC = 250000000L;   // 250 ms
+    std::unique_ptr<timer_op> m_response_sweep_timer;
+    bool m_response_sweep_armed{false};
+    bool m_response_sweep_warned{false};
 
     static constexpr int MAX_FDS = 65536;
     std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];

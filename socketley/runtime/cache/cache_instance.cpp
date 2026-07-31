@@ -29,8 +29,22 @@ cache_instance::cache_instance(std::string_view name)
 
 cache_instance::~cache_instance()
 {
-    if (m_listen_fd >= 0)
-        close(m_listen_fd);
+    close_tracked(m_listen_fd);
+}
+
+void cache_instance::close_tracked(int fd)
+{
+    if (fd < 0)
+        return;
+    // m_loop while running, m_retired_loop once teardown has cleared it — the
+    // descriptors closed after a stop are exactly the ones the ring is most
+    // likely to still be naming, so falling back to plain close() there would
+    // leave the hazard open on the worst case.
+    event_loop* lp = m_loop ? m_loop : m_retired_loop;
+    if (SOCKETLEY_LIKELY(lp != nullptr))
+        lp->close_fd(fd);
+    else
+        close(fd);
 }
 
 void cache_instance::retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count)
@@ -169,7 +183,7 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
     // connection that came in.
     detach_follower(fd);
     SKL_TRACE_CLOSE(conn, fd, reason);
-    close(fd);
+    close_tracked(fd);
     if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
     auto it = m_clients.find(fd);
     if (it != m_clients.end())
@@ -239,6 +253,9 @@ bool cache_instance::setup(event_loop& loop)
     }
 
     m_loop = &loop;
+    // Kept across teardown: a descriptor closed after a stop still has to be
+    // checked against the ring, and m_loop is null exactly then.
+    m_retired_loop = &loop;
 
     uint16_t port = get_port();
     if (port == 0)
@@ -268,14 +285,14 @@ bool cache_instance::setup(event_loop& loop)
 
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
 
     if (listen(m_listen_fd, 4096) < 0)
     {
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
@@ -391,23 +408,25 @@ void cache_instance::teardown(event_loop& /*loop*/)
     if (!m_persistent_path.empty())
         m_store.save(m_persistent_path);
 
-    // Shutdown the listen socket before closing — forces the pending multishot
-    // accept CQE to complete synchronously, before the deferred-delete timeout.
-    // Cancel before closing.  A multishot accept holds its own reference to
-        // the socket, so close() does not end it and the terminating completion
-        // never arrives — which leaves the loop counting one operation this
-        // owner still owes, forever.  reap_retired waits for that count to
-        // reach zero, so the whole instance was never freed: about 6 MB per
-        // removed runtime, held until the daemon exited.
-        if (m_listen_fd >= 0 && m_loop)
-        {
-            m_loop->submit_cancel_fd(m_listen_fd);
-            m_loop->flush();
-        }
-        if (m_listen_fd >= 0)
+    // Shutdown before closing.  A multishot accept holds its own reference to
+    // the socket, so close() does not end it and the terminating completion
+    // never arrives — which leaves the loop counting one operation this owner
+    // still owes, forever.  reap_retired waits for that count to reach zero, so
+    // the whole instance was never freed: about 6 MB per removed runtime, held
+    // until the daemon exited.  shutdown() also ends the listen state, which is
+    // what takes the socket out of the SO_REUSEPORT group so a restart's bind
+    // is not competing with it.
+    //
+    // The explicit cancel-and-flush that used to stand here is gone into
+    // close_fd, which submits the same cancel and — unlike a flush, which under
+    // SQPOLL does not even make a syscall — holds the descriptor number until
+    // both the accept and the cancel have actually reported.  Flushing and
+    // closing left both of them able to resolve the number after the next
+    // accept had taken it.
+    if (m_listen_fd >= 0)
     {
         shutdown(m_listen_fd, SHUT_RDWR);
-        close(m_listen_fd);
+        close_tracked(m_listen_fd);
         m_listen_fd = -1;
     }
 
@@ -455,7 +474,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
         // shutdown() before close() so an armed read or write is completed by
         // the kernel now rather than whenever the peer gets around to it.
         shutdown(fd, SHUT_RDWR);
-        close(fd);
+        close_tracked(fd);
         // Drop the subscriptions with the socket.  Leaving them in the store
         // let a connection that later landed on the same fd number inherit the
         // dead client's channels.
@@ -474,7 +493,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
         if (m_master->fd >= 0)
         {
             shutdown(m_master->fd, SHUT_RDWR);
-            close(m_master->fd);
+            close_tracked(m_master->fd);
             m_master->fd = -1;
         }
         io_request* owed[1];
@@ -756,13 +775,13 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         // Reject fds beyond our O(1) lookup table — they'd become zombie connections
         if (client_fd >= MAX_FDS)
         {
-            close(client_fd);
+            close_tracked(client_fd);
             goto cache_resubmit_accept;
         }
 
         if (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)
         {
-            close(client_fd);
+            close_tracked(client_fd);
             goto cache_resubmit_accept;
         }
 
@@ -1931,7 +1950,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 m_store.check_expiry(key);
                 if (!m_store.hset(key, field, val))
                 {
-                    rb.append("error: type conflict\n", 21);
+                    // hset() refuses for two unrelated reasons now that
+                    // overwriting a field is checked against maxmemory too; the
+                    // key's own type says which, as it does for SET.
+                    auto t = m_store.type(key);
+                    if (t == "none" || t == "hash")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
                     break;
                 }
             }
@@ -3355,7 +3381,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     m_store.check_expiry(args[1]);
                     if (!m_store.hset(args[1], args[i], args[i+1]))
                     {
-                        resp::encode_error_into(rb, "type conflict");
+                        // Same as SET: a memory refusal is not a type conflict,
+                        // and overwriting a field can now be refused for room.
+                        auto t = m_store.type(args[1]);
+                        if (t == "none" || t == "hash")
+                            resp::encode_error_into(rb,
+                                "OOM command not allowed when used memory > 'maxmemory'");
+                        else
+                            resp::encode_error_into(rb, "type conflict");
                         return;
                     }
                 }
@@ -4082,7 +4115,7 @@ bool cache_instance::connect_to_master()
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
     {
-        close(fd);
+        close_tracked(fd);
         return false;
     }
 
@@ -4090,14 +4123,14 @@ bool cache_instance::connect_to_master()
     {
         if (errno != EINPROGRESS)
         {
-            close(fd);
+            close_tracked(fd);
             return false;
         }
         // Wait for non-blocking connect to complete (up to 5s)
         struct pollfd pfd{fd, POLLOUT, 0};
         if (poll(&pfd, 1, 5000) <= 0 || !(pfd.revents & POLLOUT))
         {
-            close(fd);
+            close_tracked(fd);
             return false;
         }
         int sock_err = 0;
@@ -4105,7 +4138,7 @@ bool cache_instance::connect_to_master()
         getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &errlen);
         if (sock_err != 0)
         {
-            close(fd);
+            close_tracked(fd);
             return false;
         }
     }
@@ -4131,7 +4164,7 @@ bool cache_instance::connect_to_master()
         // drains.  Failing the connect outright keeps the follower visibly
         // unsynced rather than silently frozen at an empty dataset.
         LOG_ERROR("cache: read from master could not be armed — replication link not established");
-        close(fd);
+        close_tracked(fd);
         return false;
     }
     if (!m_loop)
@@ -4159,7 +4192,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         // the next attempt: nothing is in flight on it any more, and a fresh one
         // is what connect_to_master() hands back.
         if (link.fd >= 0)
-            close(link.fd);
+            close_tracked(link.fd);
         m_master.reset();
         return;
     }
@@ -4268,7 +4301,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             // advancing.
             LOG_ERROR("cache: read from master refused — the replication link is dropped");
             link.read_pending = false;
-            close(link.fd);
+            close_tracked(link.fd);
             m_master.reset();
         }
     }

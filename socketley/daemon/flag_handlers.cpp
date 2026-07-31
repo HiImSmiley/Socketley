@@ -560,6 +560,30 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             proxy->set_circuit_timeout(val);
             return 0;
         }
+        // How long a backend may take to produce the first byte of a response.
+        // Defaulted rather than opt-in: a backend that accepts and then stops
+        // answering is invisible to every other check the proxy has, so an
+        // operator who has never heard of this flag is exactly the one it has to
+        // protect.  0 is accepted and restores the old unbounded wait, but it is
+        // a decision someone has to take deliberately.
+        case fnv1a("--backend-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--backend-timeout requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val < 0)
+            {
+                std::cout << "invalid backend-timeout value\n";
+                return 1;
+            }
+            proxy->set_backend_timeout(val);
+            return 0;
+        }
         case fnv1a("--retry"):
         {
             if (i + 1 >= pa.count)
@@ -841,6 +865,31 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             instance->set_group(pa.args[++i]);
             return 0;
         }
+
+        // Same refusal as the create path, for the same reason — and this is
+        // the path that matters most, because `edit` is where an operator goes
+        // to put TLS on something that is already serving traffic.  Falling
+        // through to the generic "unknown flag" gave that operator the same
+        // exit status and a wrong explanation: it reads as a typo, so the
+        // answer to it is to try again with different spelling, not to go and
+        // terminate TLS somewhere else.  Flag-based `edit` refuses plenty of
+        // flags that the editor and `import` accept, so being refused here is
+        // not itself news; the reason is.
+        case fnv1a("--tls"):
+            std::cout << tls_not_implemented_error("--tls");
+            return 1;
+
+        case fnv1a("--cert"):
+            std::cout << tls_not_implemented_error("--cert");
+            return 1;
+
+        case fnv1a("--key"):
+            std::cout << tls_not_implemented_error("--key");
+            return 1;
+
+        case fnv1a("--ca"):
+            std::cout << tls_not_implemented_error("--ca");
+            return 1;
 
         default:
             return -1;
@@ -1133,6 +1182,26 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
             proxy->set_circuit_timeout(val);
             return 0;
         }
+        // 0 is accepted and means "no deadline" — see the create-path handler
+        // for why that is a choice an operator has to make explicitly.
+        case fnv1a("--backend-timeout"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--backend-timeout requires a value\n";
+                return 1;
+            }
+            int val;
+            auto sv = std::string_view(pa.args[++i]);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+            if (e != std::errc{} || val < 0)
+            {
+                std::cout << "invalid backend-timeout value\n";
+                return 1;
+            }
+            proxy->set_backend_timeout(val);
+            return 0;
+        }
         case fnv1a("--retry"):
         {
             if (i + 1 >= pa.count)
@@ -1154,6 +1223,20 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
+        // The mesh client-certificate flags, refused here as they are on the
+        // create path.  They live with the proxy rather than in the common
+        // edit handler because that is where they exist at all: a server or
+        // client runtime has no mesh_config, so "unknown flag" is the true
+        // answer there and this message would only be a different lie.
+        case fnv1a("--client-ca"):
+            std::cout << tls_not_implemented_error("--client-ca");
+            return 1;
+        case fnv1a("--client-cert"):
+            std::cout << tls_not_implemented_error("--client-cert");
+            return 1;
+        case fnv1a("--client-key"):
+            std::cout << tls_not_implemented_error("--client-key");
+            return 1;
         default:
             return -1;
     }

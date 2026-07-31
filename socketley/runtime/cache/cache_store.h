@@ -160,7 +160,38 @@ public:
             return true;
         if (__builtin_expect(get_memory_used() + needed <= m_max_memory, 1))
             return true;
-        return try_evict(needed);
+        return try_evict(needed, nullptr);
+    }
+
+    // The same admission check, asked on behalf of a named key: try_evict() may
+    // not choose that key as a victim.  Every write path uses this form and
+    // names the key it is about to write.
+    //
+    // Eviction was free to delete the very key the caller was writing, and that
+    // went wrong in three separate ways:
+    //
+    //   * lpush/rpush/sadd/hset hold an iterator into their container across
+    //     this call, and the write that follows then went through a freed node
+    //     — a use-after-free an unauthenticated client could reach with two
+    //     commands under --maxmemory;
+    //   * a write that was refused *anyway* had already destroyed the value it
+    //     refused to replace: the caller got an error and its data was gone,
+    //     evicted to make room for a write that never landed;
+    //   * APPEND, having lost the key that way, fell through to its create
+    //     branch, stored the suffix alone and reported that as a length — a
+    //     silent truncation, with the key's TTL gone with it.
+    //
+    // Excluding the target costs nothing.  What evicting it frees is exactly
+    // what re-creating it costs — the same key, the same overheads — so it can
+    // never turn a refusal into an acceptance; it could only ever make room the
+    // write immediately spends again, after throwing the old value away.
+    bool check_memory(size_t needed, std::string_view key)
+    {
+        if (__builtin_expect(m_max_memory == 0, 1))
+            return true;
+        if (__builtin_expect(get_memory_used() + needed <= m_max_memory, 1))
+            return true;
+        return try_evict(needed, &key);
     }
 
     // --- Replication dump ---
@@ -208,7 +239,27 @@ private:
     // touch_lru then appends a *second* node when the key comes back, so
     // eviction later drops a live key while walking the stale one.
     void drop_lru(std::string_view key);
-    bool try_evict(size_t needed);
+
+    // `protect`, when it is not null, names a key try_evict() may not take —
+    // the key the write that called it is about to touch.  See check_memory().
+    bool try_evict(size_t needed, const std::string_view* protect);
+
+    // Drop the key's expiry.  A plain SET discards any expiry the key already
+    // carried, as Redis specifies for SET without KEEPTTL.  Leaving it in place
+    // made a freshly written value inherit its predecessor's deadline and
+    // disappear at a time the writer had no reason to expect:
+    //
+    //   SET k v1 / EXPIRE k 2 / SET k v2   ->  v2 gone two seconds later
+    //
+    // SETEX, PSETEX and SET ... EX all assign the expiry after the write, so
+    // they are unaffected.
+    //
+    // Called at the point a write is known to be going ahead, never on the way
+    // in.  set() used to erase here as its very first act — before the
+    // type-conflict check and before check_memory — so a SET that was then
+    // *refused* had still stripped the TTL off a key it did not otherwise
+    // touch, and a key that was going to expire never did.
+    void drop_expiry(std::string_view key);
 
     // Structural cost of the containers, in bytes per entry.  Measured on this
     // toolchain (libstdc++ / glibc malloc, x86-64) with 500k short keys: an
@@ -305,6 +356,32 @@ private:
     static size_t stored_string(const std::string& s)
     {
         return s.capacity() <= sso_capacity ? s.size() : malloc_chunk(s.capacity() + 1);
+    }
+
+    // What an existing string will cost once it holds `new_len` bytes — the
+    // figure every write over an existing value has to be admitted against,
+    // because it is the buffer that write will actually leave behind.
+    //
+    // stored_string(len) is the wrong question here: it costs a string built to
+    // fit, and libstdc++ neither grows one to fit nor gives a buffer back.
+    // append(), assign() and operator= all reallocate to max(new length, twice
+    // the old capacity) when the value outgrows its buffer, and all of them
+    // keep the buffer when it does not.  Admitting on the length that comes out
+    // of the write let it land over the ceiling by whole size classes:
+    //
+    //   SET k <15 B> / SET k <16 B>   under maxmemory 400: asked for 17 bytes,
+    //                                 bought 33, and settled at 405
+    //   APPEND of 32 B onto 1300      asked for 32, bought a 2600-byte buffer
+    //
+    // Both directions matter.  Asking for the doubling refuses a write that
+    // would have exceeded the limit; charging the kept buffer stops a shrinking
+    // rewrite from looking like it freed memory it still holds.
+    static size_t rewritten_string(const std::string& s, size_t new_len)
+    {
+        const size_t cap = s.capacity();
+        if (new_len <= cap)                   // the buffer already paid for is kept
+            return cap <= sso_capacity ? new_len : malloc_chunk(cap + 1);
+        return malloc_chunk((new_len < 2 * cap ? 2 * cap : new_len) + 1);
     }
 
     // The LRU keeps two further copies of the key — one in the m_lru_order node,

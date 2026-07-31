@@ -274,6 +274,17 @@ private:
     // still be holding a provided buffer that has to go back to the ring.
     event_loop* m_retired_loop{nullptr};
 
+    // Every descriptor this runtime gives back to the kernel goes through here.
+    // A close does not withdraw an SQE that already carries the number; it only
+    // frees the number for the next accept, and the queued operation then lands
+    // on that connection instead.  See event_loop::close_fd, which holds the
+    // number until nothing in the ring still names it.
+    //
+    // m_retired_loop and not m_loop, for the same reason retire() uses it:
+    // descriptors are still closed after teardown has cleared m_loop, and that
+    // is exactly when the ring is most likely to be holding something.
+    void close_tracked(int fd);
+
     // Retire `storage`, waiting for the `count` requests in `owed` whose
     // completions the ring still owes us.  With nothing owed the object is
     // released here and now.

@@ -1,0 +1,9 @@
+GET /px/ HTTP/1.1
+Host: 127.0.0.1
+Keep-Alive: timeout=5
+TE: trailers
+Trailer: Expires
+Proxy-Authorization: Basic eA==
+Upgrade: h2c
+Connection: keep-alive
+

@@ -1,0 +1,556 @@
+# Nightly — the expensive half of the pipeline.
+#
+# Everything here is too slow to run on a push: sanitized builds, a long fuzz
+# campaign with corpus carry-over, load harnesses that idle 60 s between passes
+# by design, and a Release LTO build.  Split into independent jobs so one slow
+# job does not hide another's result and so a failure names its own area.
+#
+# ┌───────────────────┬────────────────────────────────────────────────────────┐
+# │ sanitizers        │ ASan+UBSan build, unit + integration suite             │
+# │ fuzz              │ long fuzz run, all four targets, corpus carry-over     │
+# │ invariants        │ -DSOCKETLEY_INVARIANTS -DSOCKETLEY_INVARIANTS_WARN_ONLY│
+# │                   │ suite + the fast load harnesses                        │
+# │ load              │ Release build, the calibrated measurement harnesses    │
+# │ tsan              │ TSan build + suite.  Expected to be quiet.             │
+# │ release-lto       │ compile-only smoke of the Release/LTO configuration    │
+# └───────────────────┴────────────────────────────────────────────────────────┘
+#
+# ─── WHAT THE NIGHTLY DOES NOT COVER ────────────────────────────────────────
+#
+#   * multi-machine anything: clustering across hosts, real DNS, real TLS peers.
+#   * kernel variation.  One runner image, one io_uring feature set.  Paths
+#     gated on newer opcodes may never execute here.
+#   * memory pressure.  The development machine has 3 GB and no swap and has
+#     produced defects that a runner with 16 GB will not reach.
+#   * timing comparability across runs.  GitHub runners are shared hardware;
+#     the load harnesses' own preflight reports when a batch started dirty, but
+#     it cannot make a noisy neighbour go away.  Treat a single bad nightly as a
+#     signal to re-run, and a run of bad nightlies as a defect.
+#   * proof of absence.  Several of the defects these harnesses were written for
+#     reproduced in one run out of forty.
+#   * MemorySanitizer.  Absent on purpose.  MSan reports a false positive for
+#     every byte that reaches it through code it did not instrument, so it is
+#     only usable with an instrumented libc++ *and* instrumented liburing,
+#     OpenSSL and LuaJIT — and LuaJIT is hand-written assembly that MSan cannot
+#     instrument at all.  Standing that stack up is a project in itself, and
+#     adding -fsanitize=memory without it produces noise that ends with the
+#     sanitizer being switched off entirely.  ASan+UBSan (here and in the fuzz
+#     job) plus TSan is the set that actually holds.  Reads of uninitialised
+#     memory are therefore NOT covered by this pipeline.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Seconds per fuzz target'
+        required: false
+        default: '600'
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  APT_PACKAGES: >-
+    build-essential liburing-dev libssl-dev netcat-openbsd bc libluajit-5.1-dev
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # ASan + UBSan over the whole suite.  This is the job that would have caught
+  # the memory-lifetime defects this project keeps finding by hand: a completion
+  # dispatched into a reused struct, a view into a buffer that has been
+  # returned.  UBSan is built with -fno-sanitize-recover=all so a finding aborts
+  # rather than printing and continuing.
+  # ───────────────────────────────────────────────────────────────────────────
+  sanitizers:
+    name: ASan + UBSan suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Build (Sanitize)
+        run: |
+          ./bin/premake5 gmake2
+          cd make && make config=sanitize_x64 -j"$(nproc)"
+
+      - name: Verify the build
+        run: |
+          for b in socketley test_command_hashing test_cache_store test_resp_parser \
+                   test_name_resolver test_ws_parser; do
+            test -x "bin/Sanitize/$b" || { echo "missing bin/Sanitize/$b"; exit 1; }
+          done
+          # Prove the binary is actually instrumented.  A Sanitize build that
+          # silently lost its flags runs the whole suite and finds nothing,
+          # which looks exactly like a clean run.
+          if ! nm -C bin/Sanitize/socketley 2>/dev/null | grep -q '__asan_'; then
+            echo "bin/Sanitize/socketley has no ASan symbols — it was not built with sanitizers."
+            exit 1
+          fi
+          echo "ASan symbols present."
+
+      - name: Integration suite (sanitized)
+        env:
+          SOCKETLEY_CONFIG: Sanitize
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:log_path=stderr:strict_string_checks=1:detect_stack_use_after_return=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: bash test/ci/assert_suite.sh suite-sanitize.log
+        timeout-minutes: 40
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-sanitize-log
+          path: suite-sanitize.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The long fuzz run.  All three targets, ASan+UBSan, with the corpus carried
+  # over from the previous night through the actions cache so each run starts
+  # where the last one stopped rather than from the seeds every time.
+  #
+  # This job also builds the libFuzzer versions when clang can produce them.
+  # The GCC replay driver always runs; libFuzzer runs on top when available.
+  # ───────────────────────────────────────────────────────────────────────────
+  fuzz:
+    name: Long fuzz run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # clang is required in this job: libFuzzer is the primary fuzzing
+          # path and REQUIRE_LIBFUZZER=1 below will fail without it.  It remains
+          # a testing toolchain — socketley itself is built by GCC, here and
+          # everywhere else.  No `||` fallback: a missing clang must fail here,
+          # where the error names the cause.
+          sudo apt-get install -y $APT_PACKAGES clang-18 libclang-rt-18-dev
+          clang++-18 --version
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      # Carry-over.  The key rotates per run so each night writes a new entry;
+      # restore-keys falls back to the most recent one, which is what makes the
+      # corpus grow instead of resetting.
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: test/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Seed corpus
+        # Always regenerated on top of whatever was restored: a cache that came
+        # back empty or corrupt must not turn into a fuzz run over nothing.
+        run: |
+          python3 test/fuzz/make_corpus.py
+          total=0
+          for d in resp ws http cache; do
+            n=$(find "test/fuzz/corpus/$d" -type f | wc -l)
+            echo "corpus/$d: $n files"
+            [ "$n" -gt 0 ] || { echo "corpus/$d is empty"; exit 1; }
+            total=$((total + n))
+          done
+          echo "total corpus: $total files"
+          [ "$total" -ge 100 ] || { echo "corpus is implausibly small ($total) — refusing to call this a fuzz run"; exit 1; }
+
+      - name: Build fuzz targets (GCC, ASan+UBSan)
+        run: |
+          ./bin/premake5 gmake2
+          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request
+          cd ..
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_request; do
+            test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
+          done
+
+      - name: Build fuzz targets (clang + libFuzzer)
+        # The primary path, and required here.  This used to be
+        # continue-on-error because the machine it was written on had no clang;
+        # ubuntu-24.04 ships clang-18 and libclang-rt-18-dev, so a failure to
+        # build libFuzzer now means a real breakage, not an absent toolchain.
+        #
+        # All four targets, including fuzz_http_request — which compiles the
+        # fifteen SDK translation units with clang because it cannot link
+        # premake's GCC/ASan archive (one process, one sanitizer runtime).  That
+        # is the expensive part of this job and the reason it is nightly.
+        env:
+          REQUIRE_LIBFUZZER: "1"
+        run: bash test/fuzz/build_libfuzzer.sh
+
+      - name: Long fuzz run
+        # Coverage-guided first, replay driver second, per target — so the
+        # budget below is spent twice per target.  libFuzzer writes the inputs
+        # it discovers back into test/fuzz/corpus/<name>, which is what the
+        # cache save step below carries into tomorrow's run: the corpus grows
+        # instead of resetting to the 118 seeds every night.
+        #
+        # REQUIRE_LIBFUZZER=1 here as well as at build time.  The build step
+        # proves the binaries were produced; this proves they were actually run.
+        #
+        # KNOWN RED (2026-07-30): fuzz_http_request fails immediately, on a
+        # seed, and it is not the harness.  Two separate findings in
+        # proxy_instance::parse_http_request_line:
+        #
+        #   1. A length underflow in the header-block string_view.  `pos` is the
+        #      first "\r\n" and `hdr_end` the first "\r\n\r\n"; when a request
+        #      carries no headers those are the same offset, so `hdr_end-pos-2`
+        #      wraps to SIZE_MAX-1 and the header scan reads off the heap.
+        #      `GET / HTTP/1.1\r\n\r\n` — 18 legal bytes — is enough.
+        #      Seeds: http/no_headers, http/no_headers_10.
+        #   2. The CL+TE smuggling check splits headers on CRLF only, so two
+        #      headers separated by a bare LF read as one line to the proxy and
+        #      as two to a backend, and the request is forwarded.
+        #      Seed: http/cl_te_lf_first.
+        #
+        # Do NOT silence this by dropping the target or setting FUZZ_SMUGGLING=0.
+        # It goes green when parse_http_request_line is fixed.
+        #
+        # fuzz_cache_ops has no open findings.  FUZZ_CACHE_SKIP is deliberately
+        # NOT set here — the per-push job is where it would go if one reopened;
+        # this one is the record of what is open, and the record is empty.  Each
+        # id below is a CACHE_FINDING in test/fuzz/fuzz_cache_ops.cpp:
+        #
+        #   expire-over-limit
+        #     Closed 2026-07-31, in the harness rather than in the store: the
+        #     expectation was wrong.  EXPIRE is not a denyoom command — a
+        #     command whose purpose is to let data expire must not fail because
+        #     there is too much data, and setting a TTL is how a caller reduces
+        #     pressure in the first place.  The check now allows an EXPIRE to
+        #     carry usage past maxmemory by the one m_expiry node it adds, and
+        #     by nothing else; the reasoning is written out at OP_EXPIRE.
+        #
+        #   uaf-collection-evict / refused-write-destroys-key /
+        #   append-self-evict / failed-set-drops-ttl / over-limit
+        #     Fixed 2026-07-31.  The first three were one defect wearing three
+        #     faces: try_evict was free to choose the very key the write in
+        #     progress named, so the collection writers wrote through a freed
+        #     node, a refused write had already destroyed the value it refused
+        #     to replace, and APPEND recreated its key holding only the suffix.
+        #     check_memory() now takes the key being written and try_evict()
+        #     will not take it.  failed-set-drops-ttl: set() dropped the expiry
+        #     before the checks that can refuse, so a refusal stripped a TTL off
+        #     a key it never wrote; it drops it at the point the write is going
+        #     ahead now.  over-limit: three rewrite paths (SET, HSET over an
+        #     existing field, APPEND) asked for what the resulting *length*
+        #     needs, while libstdc++ reallocates to twice the old capacity —
+        #     rewritten_string() is what they ask for now, and HSET over an
+        #     existing field asked for nothing at all.  The seeds that found
+        #     them are in test/fuzz/corpus/cache and stay there.
+        #
+        #   load-usage / mem-floor / mem-baseline / lru-order / key-vanished /
+        #   write-vanished / write-refused
+        #     Not currently firing.  They are the checks for the defects already
+        #     fixed by hand (the orphaned LRU node, the accounting that read 11x
+        #     low, the refusal reported as a success); they are here so those
+        #     stay fixed.
+        env:
+          FUZZ_SEED: ${{ github.run_number }}
+          FUZZ_SMUGGLING: "1"
+          REQUIRE_LIBFUZZER: "1"
+        run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
+        timeout-minutes: 60
+
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: test/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: nightly-fuzz-reproducers
+          path: bin/fuzz-artifacts/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The invariants build.
+  #
+  # socketley/shared/invariants.h states the two properties every defect of the
+  # family this project keeps hitting violates: a connection pair with nothing
+  # in flight will never be woken again, and a struct returned to a pool while
+  # the ring can still name it will be charged someone else's completion.  The
+  # checks compile to nothing unless SOCKETLEY_INVARIANTS is defined, and they
+  # reported nothing on their first hot run — which is not evidence that the
+  # invariants hold, only that that one run did not violate them.  Load is what
+  # makes them earn their keep, so they run here under the churn and restart
+  # harnesses rather than only under the integration suite.
+  #
+  # WARN_ONLY: a violation prints and the process carries on, so one violation
+  # does not mask everything after it.  The consequence is that a violation
+  # leaves no trace in any exit code — so both the suite wrapper and the step
+  # below grep the logs for it explicitly.  That grep is the whole point of this
+  # job; without it the job is decoration.
+  # ───────────────────────────────────────────────────────────────────────────
+  invariants:
+    name: Invariants (warn-only) under load
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Build (Debug + invariants, warn-only)
+        # The generated makefiles pass $(CPPFLAGS) through, which is how
+        # invariants.h documents turning itself on — no build system change.
+        run: |
+          ./bin/premake5 gmake2
+          cd make
+          make config=debug_x64 -j"$(nproc)" \
+            CPPFLAGS="-DSOCKETLEY_INVARIANTS -DSOCKETLEY_INVARIANTS_WARN_ONLY"
+
+      - name: Verify the invariants really are compiled in
+        # Without this the job is worthless: a CPPFLAGS that did not reach the
+        # compiler produces a binary with every check compiled out, which runs
+        # the whole suite and reports nothing — indistinguishable from a run
+        # where the invariants held.
+        run: |
+          test -x bin/Debug/socketley || { echo "no bin/Debug/socketley"; exit 1; }
+          if ! strings bin/Debug/socketley | grep -q 'nothing in flight on either half'; then
+            echo "The invariant messages are not in the binary: SOCKETLEY_INVARIANTS did not reach the compiler."
+            echo "This job would have reported success while checking nothing."
+            exit 1
+          fi
+          echo "Invariant checks are compiled in."
+
+      - name: Integration suite (invariants warn-only)
+        env:
+          SOCKETLEY_CONFIG: Debug
+        run: bash test/ci/assert_suite.sh suite-invariants.log
+        timeout-minutes: 15
+
+      - name: Load harnesses (invariants warn-only)
+        # The lifecycle harnesses only — the three measure_* ones exist to
+        # produce comparable timings and there is nothing to compare an
+        # invariants build against.  These three are the ones that churn
+        # connections and runtimes, which is what the invariants watch.
+        env:
+          SOCKETLEY_CONFIG: Debug
+          LOAD_SETTLE_SECS: "20"
+        run: |
+          set -o pipefail
+          bash test/load/run_all.sh restart_under_load runtime_churn_leak churn_repro \
+            2>&1 | tee load-invariants.log
+        timeout-minutes: 35
+
+      - name: Fail on any invariant violation
+        # WARN_ONLY means a violation cannot fail a process, so it has to fail
+        # here or it fails nowhere.
+        if: always()
+        run: |
+          found=0
+          for f in suite-invariants.log load-invariants.log; do
+            [ -f "$f" ] || continue
+            if grep -q '\[invariant\]' "$f"; then
+              echo "=== invariant violations in $f ==="
+              grep -n '\[invariant\]' "$f" | head -40
+              found=1
+            fi
+          done
+          if [ "$found" -eq 1 ]; then
+            echo
+            echo "An invariant stated in socketley/shared/invariants.h was violated."
+            echo "These are not warnings: each one is a connection that will never be woken"
+            echo "again, or a completion charged to the wrong connection."
+            exit 1
+          fi
+          echo "No invariant violations."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-invariants-logs
+          path: |
+            suite-invariants.log
+            load-invariants.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The calibrated load harnesses, against a Release build.
+  #
+  # These are the ones with the 60 s settle, the pinned cores and the discarded
+  # warm-ups.  They belong on a Release build and nowhere else: under ASan the
+  # timing changes by several times over, which makes the numbers incomparable
+  # with every measurement taken on the development machine — and comparability
+  # is the entire design of these harnesses.
+  #
+  # The runner has four cores, so pinning is available; if a future runner image
+  # has fewer, the harnesses say so loudly in their own output rather than
+  # quietly producing numbers that look like the pinned ones.
+  # ───────────────────────────────────────────────────────────────────────────
+  load:
+    name: Load harnesses (Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Build (Release)
+        run: |
+          ./bin/premake5 gmake2
+          cd make && make config=release_x64 -j"$(nproc)"
+          cd ..
+          test -x bin/Release/socketley || { echo "no bin/Release/socketley"; exit 1; }
+          test -x bin/Release/socketley_bench || { echo "no bin/Release/socketley_bench"; exit 1; }
+
+      - name: Report the measurement environment
+        # Recorded so a surprising result can be read against the machine it was
+        # produced on rather than guessed at afterwards.
+        run: |
+          echo "cores:  $(nproc)"
+          echo "cpu:    $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo "memory: $(free -m | awk '/^Mem:/{print $2 " MB"}')"
+          echo "kernel: $(uname -r)"
+          echo "load:   $(cat /proc/loadavg)"
+
+      - name: Load harnesses
+        run: |
+          set -o pipefail
+          bash test/load/run_all.sh 2>&1 | tee load-release.log
+        timeout-minutes: 100
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-load-log
+          path: load-release.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TSan.
+  #
+  # Expected to be quiet.  The event loop is single-threaded — one io_uring, one
+  # thread, every handler on it — so there is nothing for TSan to find today and
+  # a green run here proves almost nothing about correctness.  It proves the
+  # configuration builds, links and runs the suite, which is the whole point of
+  # standing it up now: the project is heading for one process per runtime and
+  # threads after that, and the day the first structure crosses a thread
+  # boundary is a bad day to also discover that the TSan build does not work.
+  #
+  # If TSan reports something before that work lands, it is a real finding —
+  # most likely a signal handler or an atomic used across the daemon's fork —
+  # and not noise to be suppressed.
+  # ───────────────────────────────────────────────────────────────────────────
+  tsan:
+    name: TSan (expected quiet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Build (TSan)
+        run: |
+          ./bin/premake5 gmake2
+          cd make && make config=tsan_x64 -j"$(nproc)"
+          cd ..
+          test -x bin/TSan/socketley || { echo "no bin/TSan/socketley"; exit 1; }
+          if ! nm -C bin/TSan/socketley 2>/dev/null | grep -q '__tsan_'; then
+            echo "bin/TSan/socketley has no TSan symbols — it was not built with -fsanitize=thread."
+            exit 1
+          fi
+          echo "TSan symbols present."
+
+      - name: Integration suite (TSan)
+        env:
+          SOCKETLEY_CONFIG: TSan
+          TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:log_path=stderr
+        run: bash test/ci/assert_suite.sh suite-tsan.log
+        timeout-minutes: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-tsan-log
+          path: suite-tsan.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Release/LTO compile smoke.  Per-push CI no longer builds Release, so without
+  # this a change that only breaks under -flto, -D_FORTIFY_SOURCE=2 or
+  # -fvisibility=hidden would not surface until a release tag.  Build only: the
+  # tests that matter run in the other jobs.
+  # ───────────────────────────────────────────────────────────────────────────
+  release-lto:
+    name: Release/LTO build smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
+          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
+          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
+          cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Build (Release) and fail on any warning
+        # The project's build contract is zero warnings under -Wall -Wextra.
+        # A warning that only appears under LTO or -D_FORTIFY_SOURCE=2 appears
+        # nowhere else in this pipeline.
+        run: |
+          ./bin/premake5 gmake2
+          cd make
+          set -o pipefail
+          make config=release_x64 -j"$(nproc)" 2>&1 | tee ../release-build.log
+          cd ..
+          if grep -E 'warning:|error:' release-build.log; then
+            echo
+            echo "The Release build is not warning-clean.  That is a build contract violation."
+            exit 1
+          fi
+          test -x bin/Release/socketley || { echo "no bin/Release/socketley"; exit 1; }
+          echo "Release build clean."
+
+      - name: Unit tests (Release)
+        run: |
+          set -e
+          for t in test_command_hashing test_cache_store test_resp_parser \
+                   test_name_resolver test_ws_parser; do
+            echo "--- $t ---"
+            ./bin/Release/"$t"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: nightly-release-build-log
+          path: release-build.log
+          if-no-files-found: warn
+          retention-days: 14

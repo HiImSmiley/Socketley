@@ -88,6 +88,9 @@ bool daemon_handler::is_running()
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
     bool alive = connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    // Raw close on purpose: this is a static probe with no event loop anywhere
+    // in reach, so no SQE can ever have named this number and there is nothing
+    // for close_fd() to hold it against.
     close(probe);
     return alive;
 }
@@ -106,6 +109,10 @@ bool daemon_handler::setup()
 
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        // Raw close on purpose: the first submission this descriptor can ever
+        // appear in is the accept at the bottom of this function, and the
+        // failure paths do not reach it.  The number provably never entered the
+        // ring, so there is nothing to hold it for.
         close(m_listen_fd);
         m_listen_fd = -1;
         return false;
@@ -116,18 +123,48 @@ bool daemon_handler::setup()
 
     if (listen(m_listen_fd, 16) < 0)
     {
+        // Raw close, same reason as the bind failure above: still no submission.
         close(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
 
-    m_loop.submit_accept(m_listen_fd,
-        reinterpret_cast<struct sockaddr_in*>(&m_accept_addr),
-        &m_accept_addrlen, &m_accept_req);
+    m_torn_down = false;
+
+    // The one submission the daemon cannot do without: refused here there is no
+    // way to reach it at all, so this is a failed setup rather than a daemon
+    // that comes up and answers nothing.
+    start_accept();
+    if (!m_accept_armed)
+    {
+        // Raw close, same reason as the two failures above: the accept is the
+        // only submission this number appears in and it did not reach the ring.
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
 
     start_health_timer();
 
     return true;
+}
+
+// Arm the accept that every CLI connection arrives through.
+//
+// Nothing re-arms this but its own completion, so a submission that never
+// reached the ring leaves the daemon deaf — running, holding its runtimes, and
+// answering no command until it is restarted.  The flag lets the health tick
+// pick the chain back up, the same shape as start_health_timer().
+void daemon_handler::start_accept()
+{
+    m_accept_addrlen = sizeof(m_accept_addr);
+    m_accept_armed = m_loop.submit_accept(m_listen_fd,
+        reinterpret_cast<struct sockaddr_in*>(&m_accept_addr),
+        &m_accept_addrlen, &m_accept_req);
+
+    if (!m_accept_armed)
+        LOG_ERROR("daemon accept refused: no new CLI connection can be served "
+                  "until it is re-armed");
 }
 
 void daemon_handler::teardown()
@@ -142,6 +179,44 @@ void daemon_handler::teardown()
         }
     }
 
+    // The health timer, which nothing below reaches.  A timeout hangs off no
+    // descriptor, so the close_fd() calls further down and the cancels they
+    // submit walk straight past it and the loop goes on owing this handler a
+    // completion for up to two seconds.  Every runtime teardown withdraws its
+    // own timers for exactly that reason; this is the daemon's own, and it was
+    // the last one left counting down.
+    //
+    // On the daemon's path this is a formality and known to be one, like the
+    // closes below: daemon.cpp ends the ring before it gets here, so the
+    // submission is refused and the timer died with the ring.  It is written
+    // for the destructor's path, which does not get to assume that ordering.
+    //
+    // What it does not buy is worth saying: a withdrawn timeout still reports
+    // once more, with -ECANCELED, carrying this same request.  Tearing a
+    // handler down under a live ring therefore still needs the handler to
+    // outlive that completion — this only makes it arrive now rather than two
+    // seconds from now.
+    //
+    // Once per teardown, not once per call: daemon.cpp tears down explicitly and
+    // the destructor does it again, and the second withdrawal would name a
+    // request the first one already took back.
+    if (m_health_pending && !m_torn_down)
+    {
+        // The answer is ignored on purpose, and this is the one place that is
+        // right: false means either the ring is already gone — the daemon's own
+        // path, where the timer went with it — or the submission was refused,
+        // and all that is left to do about the second is let the timer fire,
+        // which is what happened before this call existed.
+        if (!m_loop.submit_timeout_remove(&m_health_req)) {}
+
+        // m_health_pending stays set.  The withdrawn timeout is still owed
+        // exactly one completion carrying this request, and clearing the flag
+        // would let a later start_health_timer() hand the kernel a request it
+        // is already carrying one for.  on_cqe() clears it when that completion
+        // lands, and m_torn_down is what stops it starting the chain again.
+    }
+    m_torn_down = true;
+
     // Stop cluster discovery before closing IPC
     if (m_owned_cluster)
     {
@@ -151,6 +226,19 @@ void daemon_handler::teardown()
         m_manager.set_cluster_discovery(nullptr);
     }
 
+    // Through the loop, not close(): every one of these numbers has been named
+    // by an SQE — a read on each client, an accept on the listener — and a
+    // close that only frees the number lets the next accept inherit it while
+    // the old operation is still queued against it.
+    //
+    // On the daemon's own shutdown path this is a formality and known to be
+    // one: daemon.cpp ends the ring before it gets here, so close_fd() sees no
+    // ring and is exactly close(), and the accept that was armed on the
+    // listener died with the ring rather than with the descriptor.  It is
+    // written this way because teardown() is also the destructor's path and
+    // does not get to assume that ordering, and because the one arrangement
+    // that would be wrong — closing these while the ring is live — is the one
+    // close_fd() is free to handle.
     for (auto& [fd, conn] : m_clients)
     {
         if (conn->interactive)
@@ -159,15 +247,25 @@ void daemon_handler::teardown()
             if (inst)
                 inst->remove_interactive_fd(fd);
         }
-        close(fd);
+        m_loop.close_fd(fd);
     }
 
     m_clients.clear();
 
+    // Connections already handed to close_fd() in handle_read().  Their
+    // descriptors are the loop's business now — either still held for an
+    // operation that has not reported or already closed by the sweep in
+    // shutdown_ring() — so a second close here would be closing a number that
+    // may since have been reissued.  Only the storage is ours to drop, and
+    // nothing can still be pointing at it: reaching here means the ring is down
+    // (daemon shutdown) or nothing was ever submitted (setup failure).
+    m_closing.clear();
+
     if (m_listen_fd >= 0)
     {
-        close(m_listen_fd);
+        m_loop.close_fd(m_listen_fd);
         m_listen_fd = -1;
+        m_accept_armed = false;
     }
 
     unlink(socket_path.c_str());
@@ -188,11 +286,24 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             handle_read(cqe, req);
             break;
         case op_write:
+            handle_write(cqe, req);
             break;
         case op_timeout:
             if (req == &m_health_req)
             {
                 m_health_pending = false;
+
+                // The withdrawal teardown() submitted, answered.  There is
+                // nothing left to supervise and nothing to re-arm.
+                if (m_torn_down)
+                    break;
+
+                // The accept chain ends at a refused submission and only
+                // something outside it can restart one — this tick is the only
+                // thing that runs without a CLI connection to run for.
+                if (m_listen_fd >= 0 && !m_accept_armed)
+                    start_accept();
+
                 check_managed_health();
                 // Release the retired runtimes the ring has finished with.
                 // Removal reaps too, but only ever the ones retired before it —
@@ -210,8 +321,148 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
     }
 }
 
+// A write submitted by send_response() has reported.
+//
+// For a connection the daemon still owns this is where the exchange finishes:
+// the reply is out, the buffer is free to be rebuilt, and the read that was
+// deliberately left un-armed while the write was queued goes back in.  For one
+// that close_client() parked because the client hung up while its reply was
+// still in the ring, it is the only thing that can say the ring has finished
+// with the request and the buffer inside it.
+void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* req)
+{
+    auto it = m_clients.find(req->fd);
+    if (it == m_clients.end())
+    {
+        release_closing(req);
+        return;
+    }
+
+    auto* conn = it->second.get();
+    conn->write_pending = false;
+
+    // A failed send says the reply is not going to be delivered — -EPIPE is the
+    // ordinary form, a client that read what it wanted and hung up.  There is
+    // no one left to answer, so this connection goes rather than sitting in
+    // m_clients holding a descriptor with nothing armed on it.
+    if (cqe->res <= 0)
+    {
+        close_client(it);
+        return;
+    }
+
+    // send() is entitled to take less than it was given, and does as soon as a
+    // reply outgrows the socket buffer — `ls` over a few hundred runtimes, or a
+    // `dump` of any size.  The rest of it was simply dropped: the CLI reads
+    // until the NUL terminator that ends the reply, so it sat out its five
+    // second SO_RCVTIMEO and then reported the daemon as unreachable.
+    conn->write_off += static_cast<size_t>(cqe->res);
+    if (conn->write_off < conn->out_buf.size())
+    {
+        if (!send_response(conn))
+            close_client(it);
+        return;
+    }
+
+    conn->out_buf.clear();
+    conn->write_off = 0;
+
+    if (!m_loop.submit_read(conn->fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req))
+    {
+        LOG_ERROR("daemon: could not re-arm the read on a CLI connection after its "
+                  "reply went out; closing it");
+        close_client(it);
+    }
+}
+
+// Take a client connection down: its interactive registration, its descriptor,
+// then its storage.
+//
+// Reached from the client's own hangup and from every path where the daemon can
+// no longer finish the exchange — a reply that could not be queued, a send that
+// failed, a read that could not be re-armed.  All of them have the same
+// requirement: the connection must not be left in m_clients waiting for a
+// completion that is never coming.
+void daemon_handler::close_client(client_map::iterator it)
+{
+    auto* conn = it->second.get();
+    const int fd = conn->fd;
+
+    if (conn->interactive)
+    {
+        auto* inst = m_manager.get(conn->interactive_name);
+        if (inst)
+            inst->remove_interactive_fd(fd);
+    }
+
+    // The only close in this file that happens while the ring is live, and the
+    // only one where the number can still be spoken for.  A response is not
+    // written here — send_response() submits it — so a client that hangs up
+    // before draining a reply larger than the socket buffer leaves that write
+    // queued against this descriptor number.  close() would free the number
+    // with the write still in the queue, the next CLI connection would be
+    // handed it by accept, and that client would find somebody else's `ls`
+    // output spliced into its own reply.  Same shape as the proxy's crossed
+    // streams, one runtime up.
+    //
+    // close_fd() holds the number instead until the write reports, and
+    // discounts the completion we are inside — so on the ordinary path, where
+    // the reply went out long before the hangup, this is one indexed load and
+    // then the close it was always going to do.
+    m_loop.close_fd(fd);
+
+    // Whatever fd_inflight() still counts after that discount is that queued
+    // write, and it is pointing at write_req and out_buf inside this
+    // connection.  Erasing now would leave the ring holding a request that no
+    // longer exists and a buffer the kernel is still reading from; run() reads
+    // the request back out of the completion, so it would be reading freed
+    // memory, and the only reason that was survivable before is that the block
+    // was usually still mapped.  Park the connection instead and let the
+    // write's own completion release it.
+    if (m_loop.fd_inflight(fd) > 0)
+        m_closing.push_back(std::move(it->second));
+
+    m_clients.erase(it);
+}
+
+// The parked connection a write completion belongs to, if it is one of those.
+void daemon_handler::release_closing(const io_request* req)
+{
+    if (__builtin_expect(m_closing.empty(), 1))
+        return;
+
+    for (auto it = m_closing.begin(); it != m_closing.end(); ++it)
+    {
+        if ((*it)->fd != req->fd)
+            continue;
+
+        // Not "a completion arrived" but "nothing else names this number" —
+        // the same condition close_fd() releases the descriptor on, asked
+        // rather than assumed, because only the loop knows what is still queued
+        // against an fd this connection was parked for.
+        //
+        // With one write outstanding at a time it is this completion and no
+        // other, so the discount for the one in hand makes it zero.  It was not
+        // always: a client that pipelined two commands into one packet got two
+        // writes submitted through the one write_req, and releasing on the
+        // first of them handed the ring back the freed storage the parking
+        // exists to prevent.  send_response() is what ended that.
+        //
+        // The descriptor is still close_fd()'s to release, and it does that
+        // after this returns — which is why the number cannot have gone to a
+        // new client while this entry was still standing.
+        if (m_loop.fd_inflight((*it)->fd) == 0)
+            m_closing.erase(it);
+        return;
+    }
+}
+
 void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
 {
+    // This completion is the accept, spent.  Cleared before anything can fail
+    // so the re-arm below, and the health tick behind it, both see the truth.
+    m_accept_armed = false;
+
     int client_fd = cqe->res;
 
     if (client_fd >= 0)
@@ -221,16 +472,22 @@ void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
         conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
         conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
-        auto* ptr = conn.get();
-        m_clients[client_fd] = std::move(conn);
+        auto it = m_clients.insert_or_assign(client_fd, std::move(conn)).first;
+        auto* ptr = it->second.get();
 
-        m_loop.submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req);
+        // Refused, this connection never hears from the daemon again and the
+        // client waits out its own timeout for a command that was never even
+        // read.  Nothing is queued against the number, so close_client() closes
+        // it outright and the client gets an immediate EOF instead.
+        if (!m_loop.submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req))
+        {
+            LOG_ERROR("daemon: could not arm the read on an accepted CLI connection; "
+                      "closing it");
+            close_client(it);
+        }
     }
 
-    m_accept_addrlen = sizeof(m_accept_addr);
-    m_loop.submit_accept(m_listen_fd,
-        reinterpret_cast<struct sockaddr_in*>(&m_accept_addr),
-        &m_accept_addrlen, &m_accept_req);
+    start_accept();
 }
 
 void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
@@ -244,14 +501,23 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (cqe->res <= 0)
     {
-        if (conn->interactive)
-        {
-            auto* inst = m_manager.get(conn->interactive_name);
-            if (inst)
-                inst->remove_interactive_fd(fd);
-        }
-        close(fd);
-        m_clients.erase(it);
+        close_client(it);
+        return;
+    }
+
+    // Cannot happen, and checked because of what it would mean if it did: a read
+    // is only ever armed on a connection with no write outstanding, so reaching
+    // here with one would mean the daemon is about to rebuild out_buf — or, on
+    // the interactive path below, write to the socket directly — while the
+    // kernel is still reading the buffer.  That is precisely the defect
+    // send_response() was rewritten to make impossible; if it comes back, it
+    // comes back as a dropped connection and a line in the log, not as a
+    // corrupted reply.
+    if (SOCKETLEY_UNLIKELY(conn->write_pending))
+    {
+        LOG_ERROR("daemon: a CLI connection was read while its reply was still in "
+                  "the ring; closing it rather than rebuilding the buffer");
+        close_client(it);
         return;
     }
 
@@ -302,11 +568,18 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                     break;
             }
         }
-        m_loop.submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+
+        if (!m_loop.submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req))
+        {
+            LOG_ERROR("daemon: could not re-arm the read on an interactive CLI "
+                      "connection; closing it");
+            close_client(it);
+        }
         return;
     }
 
     size_t pos;
+    bool queued = false;
     while ((pos = conn->partial.find('\n')) != std::string::npos)
     {
         std::string line = conn->partial.substr(0, pos);
@@ -317,10 +590,24 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
         conn->write_buf.clear();
         int exit_code = process_command(conn, line);
-        send_response(conn, exit_code);
+        append_response(conn, exit_code);
+        queued = true;
     }
 
-    m_loop.submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    // One write for every command this packet held, and no read re-armed until
+    // it has reported — see send_response() for why the two are tied together.
+    if (queued)
+    {
+        if (!send_response(conn))
+            close_client(it);
+        return;
+    }
+
+    if (!m_loop.submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req))
+    {
+        LOG_ERROR("daemon: could not re-arm the read on a CLI connection; closing it");
+        close_client(it);
+    }
 }
 
 int daemon_handler::check_empty_names(const std::vector<std::string>& names,
@@ -2368,7 +2655,11 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
 
 void daemon_handler::start_health_timer()
 {
-    if (m_health_pending)
+    // m_health_pending means a completion is still owed on m_health_req — from
+    // a timer that is counting down, or from one teardown() withdrew.  Either
+    // way re-arming would hand the kernel a request it is already carrying one
+    // for.
+    if (m_health_pending || m_torn_down)
         return;
     m_health_req = { this, nullptr, -1, 0, op_timeout };
     m_health_ts = { 2, 0 };  // 2 seconds
@@ -2559,14 +2850,56 @@ int daemon_handler::cmd_dashboard(ipc_connection* conn)
     return 0;
 }
 
-void daemon_handler::send_response(ipc_connection* conn, int exit_code)
+// Frame one command's reply onto the end of the connection's outgoing stream:
+// exit code byte, payload, NUL terminator — what ipc_client.cpp reads back.
+//
+// The payload is copied out of write_buf rather than framed in place.  write_buf
+// is scratch that every cmd_* assigns to and that handle_read() clears before
+// each command; out_buf is the only thing a write SQE is ever given, and it is
+// appended to and never rebuilt.  The copy also drops the insert() this used to
+// do to put the exit code in front, which shifted the whole reply.
+void daemon_handler::append_response(ipc_connection* conn, int exit_code)
 {
-    conn->write_buf += '\0';
-    conn->write_buf.insert(0, 1, static_cast<char>(exit_code));
+    conn->out_buf += static_cast<char>(exit_code);
+    conn->out_buf += conn->write_buf;
+    conn->out_buf += '\0';
+}
 
-    conn->write_req.buffer = conn->write_buf.data();
-    conn->write_req.length = static_cast<uint32_t>(conn->write_buf.size());
+// Submit the one write that carries everything append_response() has framed,
+// starting from whatever a short write has already got out.
+//
+// One write outstanding per connection, and no read re-armed until it reports:
+// that is what makes the buffer safe, and it is the whole of the fix.  This used
+// to submit a write per command, out of the one write_req and the one write_buf.
+// A client that put `ls` and `ps` in a single packet therefore had the second
+// command clear and rebuild write_buf while the first write was still queued, so
+// the kernel sent whatever the reallocated string had become — freed memory as
+// often as not.  The one write_req carried both submissions at once, which left
+// the two completions indistinguishable and the loop's per-request bookkeeping
+// describing only the later of them.  And nothing linked the two SQEs, so the
+// kernel was free to put the second reply on the wire first, handing the CLI one
+// command's exit code in front of the other's output.
+//
+// False means the SQE never reached the ring.  Nothing will complete for this
+// connection, so the caller must take it down rather than leave a client waiting
+// on a reply that was never queued: what ended that wait before was the CLI's own
+// five second SO_RCVTIMEO, and it ended it with "failed to connect to daemon" on
+// a daemon that is running and healthy.
+bool daemon_handler::send_response(ipc_connection* conn)
+{
+    char* base = conn->out_buf.data() + conn->write_off;
+    const uint32_t len = static_cast<uint32_t>(conn->out_buf.size() - conn->write_off);
 
-    m_loop.submit_write(conn->fd, conn->write_buf.data(),
-        static_cast<uint32_t>(conn->write_buf.size()), &conn->write_req);
+    conn->write_req.buffer = base;
+    conn->write_req.length = len;
+
+    if (!m_loop.submit_write(conn->fd, base, len, &conn->write_req))
+    {
+        LOG_ERROR("daemon: a CLI reply could not be queued; closing the connection "
+                  "rather than leaving the client waiting for it");
+        return false;
+    }
+
+    conn->write_pending = true;
+    return true;
 }

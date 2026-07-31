@@ -5,6 +5,7 @@
 #include <sys/eventfd.h>
 #include <sys/utsname.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,10 @@ event_loop::~event_loop()
     shutdown_ring();
 
     if (m_eventfd >= 0) close(m_eventfd);
+
+    free(m_fd_armed);
+    free(m_fd_cancels);
+    free(m_fd_close_deferred);
 }
 
 void event_loop::shutdown_ring()
@@ -65,6 +70,43 @@ void event_loop::shutdown_ring()
     // knows what to do with that.
     m_ring_open = false;
     io_uring_queue_exit(&m_ring);
+
+    // Descriptors close_fd() is still holding because the ring named them.  The
+    // ring is gone now, so nothing can resolve a number any more and the reason
+    // to hold them is gone with it — this is the one point where that is true,
+    // which is why the sweep lives here and not in the destructor.
+    //
+    // Reaching here with any is not itself a bug: a daemon told to exit does
+    // not wait for every completion first.  It is reported all the same,
+    // because a count that grows run after run would mean operations that never
+    // report, and that is the one way this scheme leaks descriptors.
+    if (m_fd_close_deferred && m_fd_close_pending > 0)
+    {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "event loop: %u descriptor(s) were still held open for operations the ring "
+            "had not reported; closing them with the ring",
+            m_fd_close_pending);
+        LOG_INFO(msg);
+        for (uint32_t fd = 0; fd < m_fd_table_size; ++fd)
+        {
+            if ((m_fd_close_deferred[fd >> 6] >> (fd & 63)) & 1u)
+            {
+                m_fd_close_deferred[fd >> 6] &= ~(1ULL << (fd & 63));
+                close(static_cast<int>(fd));
+            }
+        }
+        m_fd_close_pending = 0;
+    }
+
+    // Same for fixed-file slots.  The table itself went with the ring, so the
+    // bits are only the allocator's idea of what is in use; clearing them keeps
+    // a loop that is somehow reused from starting out full.
+    for (uint32_t w = 0; w < BITMAP_WORDS; ++w)
+    {
+        m_file_bitmap[w] &= ~m_fixed_free_deferred[w];
+        m_fixed_free_deferred[w] = 0;
+    }
 }
 
 // Submit one accept SQE built the way submit_multishot_accept() would, against
@@ -319,10 +361,231 @@ uint32_t event_loop::owner_inflight(const io_handler* owner) const
     return total;
 }
 
+// The two encodings IO_TARGET_* describes, in the form the submit_* helpers
+// already have the number in.  A negative one means the caller had no
+// descriptor to name, which is not an error here — submit_timeout has none at
+// all, and a helper handed -1 would have been refused by the kernel anyway.
+static inline uint32_t raw_target(int fd)
+{
+    return fd >= 0 ? static_cast<uint32_t>(fd) : IO_TARGET_NONE;
+}
+
+static inline uint32_t fixed_target(int idx)
+{
+    return idx >= 0 ? (IO_TARGET_FIXED | static_cast<uint32_t>(idx)) : IO_TARGET_NONE;
+}
+
+// ── Per-descriptor accounting ───────────────────────────────────────────────
+// One counter per number an SQE can name, so the loop can answer "is anything
+// in the ring still going to resolve this number?" — the question every one of
+// close_fd(), fd_inflight() and free_fixed_file_slot() is really asking.
+//
+// It is kept here rather than in the runtimes on purpose.  Each runtime had its
+// own idea of what made a descriptor safe to give away, expressed as a list of
+// per-connection flags, and the lists disagreed: close_pair's client path was
+// missing both splice flags, the backend path was missing the zero-copy
+// notification, and none of them could see an operation that another struct had
+// armed *onto* their descriptor, which is exactly the shape of the one bug that
+// was measured.  Counting where the submission happens cannot have that class of
+// gap: the number counted is the number written into the SQE.
+
+inline void event_loop::target_ref(uint32_t target)
+{
+    if (__builtin_expect(target == IO_TARGET_NONE, 0))
+        return;
+
+    if (target & IO_TARGET_FIXED)
+    {
+        const uint32_t idx = target & ~IO_TARGET_FIXED;
+        if (__builtin_expect(idx < MAX_FIXED_FILES, 1) &&
+            m_fixed_armed[idx] != UINT16_MAX)
+            ++m_fixed_armed[idx];
+        return;
+    }
+
+    if (__builtin_expect(m_fd_armed != nullptr && target < m_fd_table_size, 1) &&
+        m_fd_armed[target] != UINT16_MAX)
+        ++m_fd_armed[target];
+}
+
+inline void event_loop::target_unref(uint32_t target)
+{
+    if (__builtin_expect(target == IO_TARGET_NONE, 0))
+        return;
+
+    if (target & IO_TARGET_FIXED)
+    {
+        const uint32_t idx = target & ~IO_TARGET_FIXED;
+        // Guarded, not assumed, for the same reason the owner counters are: an
+        // unmatched decrement wraps to 65535 and the number is never released
+        // again.  A saturated counter stops decrementing too, which is the
+        // conservative direction — it holds the number rather than freeing it
+        // early — and the ring is two thousand deep, so it cannot be reached.
+        if (__builtin_expect(idx < MAX_FIXED_FILES && m_fixed_armed[idx] > 0, 1) &&
+            m_fixed_armed[idx] != UINT16_MAX)
+        {
+            if (--m_fixed_armed[idx] == 0)
+                settle_deferred(target);
+        }
+        return;
+    }
+
+    if (__builtin_expect(m_fd_armed != nullptr && target < m_fd_table_size &&
+                         m_fd_armed[target] > 0, 1) &&
+        m_fd_armed[target] != UINT16_MAX)
+    {
+        if (--m_fd_armed[target] == 0)
+            settle_deferred(target);
+    }
+}
+
+// The last thing naming this number has reported.  Whatever was waiting on that
+// — a close, a slot going back to the allocator — happens now.
+void event_loop::settle_deferred(uint32_t target)
+{
+    if (target & IO_TARGET_FIXED)
+    {
+        const uint32_t idx = target & ~IO_TARGET_FIXED;
+        if (idx >= MAX_FIXED_FILES)
+            return;
+        const uint32_t w = idx / 64, bit = idx % 64;
+        if (!((m_fixed_free_deferred[w] >> bit) & 1u))
+            return;
+        m_fixed_free_deferred[w] &= ~(1ULL << bit);
+        m_file_bitmap[w] &= ~(1ULL << bit);
+        m_file_bitmap_hint = w;
+        return;
+    }
+
+    if (!m_fd_close_deferred || target >= m_fd_table_size)
+        return;
+    const uint32_t w = target >> 6, bit = target & 63;
+    if (!((m_fd_close_deferred[w] >> bit) & 1u))
+        return;
+    // Both counters, not just the one that reached zero: a cancel still in the
+    // ring names this number as surely as a read does, and one consumed after
+    // the number is reissued takes back the new owner's I/O.
+    if (m_fd_armed[target] != 0 || m_fd_cancels[target] != 0)
+        return;
+
+    m_fd_close_deferred[w] &= ~(1ULL << bit);
+    if (m_fd_close_pending > 0)
+        --m_fd_close_pending;
+    close(static_cast<int>(target));
+}
+
+void event_loop::close_fd(int fd)
+{
+    if (fd < 0)
+        return;
+
+    // No ring, no hazard: before init() nothing can have been submitted
+    // (get_sqe refuses), and after shutdown_ring() no SQE can resolve a number
+    // any more.  Holding one then would be a descriptor nothing will ever free,
+    // because the completion that would release it is never coming.
+    if (__builtin_expect(!m_ring_open, 0))
+    {
+        close(fd);
+        return;
+    }
+
+    // Above the table, so nothing was ever counted for it and nothing can be
+    // promised about it.  Only reachable if the process's file limit grew after
+    // init(), which nothing here does — said once so it is not silent if it
+    // ever starts happening.
+    if (__builtin_expect(!fd_tracked(fd) || !m_fd_armed, 0))
+    {
+        if (!m_fd_untracked_logged)
+        {
+            m_fd_untracked_logged = true;
+            LOG_WARN("event loop: a descriptor outside the tracked range was closed "
+                     "without checking the ring for operations naming it");
+        }
+        close(fd);
+        return;
+    }
+
+    const uint32_t t = static_cast<uint32_t>(fd);
+    if (__builtin_expect(m_fd_armed[t] == 0 && m_fd_cancels[t] == 0, 1))
+    {
+        // The common case by a wide margin: the caller closes a descriptor it
+        // has already seen every completion for.  One indexed load, then the
+        // close it was going to do anyway.
+        close(fd);
+        return;
+    }
+
+    // The second most common case, and the reason this is not simply "count is
+    // nonzero, hold it": a handler closing the very descriptor its completion
+    // was just delivered for.  Every teardown in the daemon that starts from a
+    // read of zero bytes looks like this.  That read is still counted here —
+    // run() disarms after the handler returns, not before, so that a handler
+    // cannot be shown a half-updated count — and treating it as an operation
+    // still to come would put a cancel and a full completion round trip on the
+    // most-travelled close path in the process, to withdraw something that has
+    // already reported.
+    //
+    // So the completion in hand is discounted.  The number still is not freed
+    // here — the disarm is a few instructions away and settle_deferred() does
+    // it there — but nothing is submitted for it.
+    uint32_t armed = m_fd_armed[t];
+    if (m_cqe_target  == t && armed > 0) --armed;
+    if (m_cqe_target2 == t && armed > 0) --armed;
+
+    const uint32_t w = t >> 6, bit = t & 63;
+    if ((m_fd_close_deferred[w] >> bit) & 1u)
+        return;  // already held; a second close would be a double close
+
+    m_fd_close_deferred[w] |= (1ULL << bit);
+    ++m_fd_close_pending;
+
+    // Nothing left to cancel: either only the completion in hand, or only a
+    // cancel of our own that has not reported yet — and a second cancel would
+    // just answer -ENOENT and cost another SQE.  Either way the number is
+    // released by whichever of them settles last.
+    if (armed == 0)
+        return;
+
+    // Something else really is outstanding.  Make it report now rather than
+    // whenever the peer gets around to it: a multishot accept and a poll each
+    // hold their own reference to the file, so neither shutdown() nor the close
+    // this is standing in for would ever end them, and without this the number
+    // would be held for the life of the runtime.  The cancel can only be
+    // submitted while the descriptor is still open — after a close, fget
+    // answers NULL and it fails -ENOENT — which is exactly the state holding
+    // the number keeps it in.
+    //
+    // If it does not reach the ring, the operations still end on their own and
+    // the number is released then; a listener's accept would not, and that
+    // descriptor is held until shutdown_ring() reports and sweeps it.
+    submit_cancel_fd(fd);
+}
+
+uint32_t event_loop::fd_inflight(int fd) const
+{
+    if (!fd_tracked(fd) || !m_fd_armed)
+        return 0;
+
+    const uint32_t t = static_cast<uint32_t>(fd);
+    uint32_t armed = m_fd_armed[t];
+
+    // Discounted exactly as close_fd() discounts it, and it matters more here.
+    // The proxy pools a backend socket from inside the completion of the read
+    // it cancelled to free it — that read is the reason this is being asked,
+    // and it has reported: its SQE was consumed to produce the completion in
+    // hand, so nothing queued can still resolve this number.  Counting it would
+    // mean the answer is never zero on the path that exists to reuse the
+    // socket, and every keep-alive connection would be thrown away instead of
+    // pooled.
+    if (m_cqe_target  == t && armed > 0) --armed;
+    if (m_cqe_target2 == t && armed > 0) --armed;
+    return armed;
+}
+
 // Stamp the owner identity onto the submission and count it as outstanding.
 // Reached from every submit_* helper on the path where the SQE was obtained,
 // so the count only ever includes submissions that were really queued.
-inline void event_loop::arm(io_request* req)
+inline void event_loop::arm(io_request* req, uint32_t target, uint32_t target2)
 {
     uint32_t tok = 0;
     if (__builtin_expect(req->owner != nullptr, 1))
@@ -340,10 +603,21 @@ inline void event_loop::arm(io_request* req)
     ++aslot.inflight;
     if (__builtin_expect(req->type < op_type_count, 1))
         ++aslot.by_type[req->type];
+
+    // Recorded on the request, because the completion is the only thing that
+    // will name this submission again and it carries nothing else.  Written
+    // here rather than by the helpers so that a helper physically cannot queue
+    // an SQE without the number in it being counted.
+    req->armed_target  = target;
+    req->armed_target2 = target2;
+    target_ref(target);
+    target_ref(target2);
+
     ++m_pending_submissions;
 }
 
-inline void event_loop::disarm(uint32_t token, uint8_t type)
+inline void event_loop::disarm(uint32_t token, uint8_t type,
+                               uint32_t target, uint32_t target2)
 {
     auto& slot = m_owners[token & OWNER_SLOT_MASK];
     // Guarded rather than assumed: an unmatched decrement would wrap the
@@ -358,6 +632,14 @@ inline void event_loop::disarm(uint32_t token, uint8_t type)
     // dropped so a later object at the same address is not mistaken for it.
     if (__builtin_expect(slot.inflight == 0 && slot.token == 0, 0))
         slot.handler = nullptr;
+
+    // Last, and after the handler has already run: settle_deferred() can close
+    // a descriptor, and doing that before on_cqe would hand the number away
+    // while the handler is still reading it out of the completion.  These are
+    // the numbers this submission named, saved before the dispatch — see
+    // io_request::armed_target.
+    target_unref(target);
+    target_unref(target2);
 }
 
 // The completion cannot be delivered.  Whatever the kernel attached to it still
@@ -377,9 +659,67 @@ void event_loop::return_cqe_buf(const struct io_uring_cqe* cqe, const io_request
     drop_completion(cqe, req);
 }
 
+// Descriptor tables, sized to the range of numbers this process can be handed.
+// RLIMIT_NOFILE is exactly that range, so a table this size cannot be indexed
+// out of by any descriptor open(), accept() or socket() returns — which is what
+// makes close_fd()'s guarantee hold by construction rather than by a cap picked
+// to look big enough.
+//
+// The floor is there because the tables are cheap and a tiny limit can be
+// raised out from under us.  The ceiling is there so the allocation stays
+// proportional to what the operator actually asked for: four bytes per possible
+// descriptor, so a daemon at the usual 1024-file limit spends 4 KB and one
+// deliberately configured for a million spends 4 MB — next to nothing beside
+// what a million open sockets cost the kernel.
+bool event_loop::init_fd_tables()
+{
+    // Idempotent: a second init() must not strand the counts the first one is
+    // already keeping, and the ring the second one builds inherits nothing from
+    // the first anyway.
+    if (m_fd_armed)
+        return true;
+
+    struct rlimit rl{};
+    uint64_t want = 4096;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        want = static_cast<uint64_t>(rl.rlim_cur);
+
+    if (want < 4096)    want = 4096;
+    if (want > 1048576) want = 1048576;
+
+    const uint32_t n = static_cast<uint32_t>(want);
+    const uint32_t words = (n + 63) / 64;
+
+    m_fd_armed          = static_cast<uint16_t*>(calloc(n, sizeof(uint16_t)));
+    m_fd_cancels        = static_cast<uint16_t*>(calloc(n, sizeof(uint16_t)));
+    m_fd_close_deferred = static_cast<uint64_t*>(calloc(words, sizeof(uint64_t)));
+
+    if (!m_fd_armed || !m_fd_cancels || !m_fd_close_deferred)
+    {
+        free(m_fd_armed);          m_fd_armed = nullptr;
+        free(m_fd_cancels);        m_fd_cancels = nullptr;
+        free(m_fd_close_deferred); m_fd_close_deferred = nullptr;
+        m_fd_table_size = 0;
+        return false;
+    }
+
+    m_fd_table_size = n;
+    return true;
+}
+
 bool event_loop::init()
 {
     bool initialized = false;
+
+    // Before the ring, so that no submission can ever be counted against a
+    // table that does not exist yet.  A failure here is fatal rather than
+    // degraded: without the tables every close is the old unchecked one, and a
+    // daemon quietly crossing connections is worse than one that does not start.
+    if (!init_fd_tables())
+    {
+        LOG_ERROR("event loop: could not allocate the descriptor tables");
+        return false;
+    }
 
     // IORING_SETUP_NO_SQARRAY requires kernel 6.6.  All it saves is one level of
     // indirection when submitting, so it must never cost us the far more valuable
@@ -587,6 +927,25 @@ void event_loop::run()
         {
             count++;
 
+            // A cancel submitted by submit_cancel_fd() reports here.  It has no
+            // io_request — there is nothing to act on but "found it" or
+            // -ENOENT — but it *did* name a descriptor number, so the fact that
+            // it has now been consumed is exactly what close_fd() is waiting
+            // for.  It is told apart by the low bit, which no io_request
+            // address can have set: they are at least four-byte aligned, and
+            // the two removal helpers that also carry no request use a plain
+            // zero.
+            if (__builtin_expect((cqe->user_data & 1u) != 0, 0))
+            {
+                const uint32_t cfd = static_cast<uint32_t>(cqe->user_data >> 1);
+                if (m_fd_cancels && cfd < m_fd_table_size && m_fd_cancels[cfd] > 0)
+                {
+                    --m_fd_cancels[cfd];
+                    settle_deferred(cfd);
+                }
+                continue;
+            }
+
             auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
 
             if (__builtin_expect(req == &m_signal_req, 0))
@@ -624,11 +983,35 @@ void event_loop::run()
                 // written into the request since.
                 const uint8_t rtype = req->type;
 
+                // Read early for the same two reasons, and for a third: on_cqe
+                // very often re-arms this very request — the next read on the
+                // same connection, or the next leg of a splice onto a different
+                // descriptor — and arm() overwrites both fields.  The number to
+                // release is the one this completion is for, not the one the
+                // handler has just claimed.
+                const uint32_t rt1 = req->armed_target;
+                const uint32_t rt2 = req->armed_target2;
+
+                // What close_fd() discounts while the handler runs — see there.
+                // Only for a completion that is the operation's last: with
+                // IORING_CQE_F_MORE the submission stays armed and is going to
+                // resolve its descriptor again, so it is not a number anyone
+                // may give away yet.
+                const bool final_cqe = (cqe->flags & IORING_CQE_F_MORE) == 0;
+                if (__builtin_expect(final_cqe, 1))
+                {
+                    m_cqe_target  = rt1;
+                    m_cqe_target2 = rt2;
+                }
+
                 if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
                                      && req->owner != nullptr, 1))
                     req->owner->on_cqe(cqe);
                 else
                     drop_completion(cqe, req);
+
+                m_cqe_target  = IO_TARGET_NONE;
+                m_cqe_target2 = IO_TARGET_NONE;
 
                 // IORING_CQE_F_MORE means the submission is still armed and
                 // will complete again; without it this was its last completion,
@@ -637,8 +1020,8 @@ void event_loop::run()
                 // and its owner can never be told it is quiescent.  cqe is the
                 // ring's own memory, so it stays readable whatever the handler
                 // did with its own.
-                if (__builtin_expect((cqe->flags & IORING_CQE_F_MORE) == 0, 1))
-                    disarm(tok, rtype);
+                if (__builtin_expect(final_cqe, 1))
+                    disarm(tok, rtype, rt1, rt2);
             }
         }
 
@@ -690,7 +1073,7 @@ bool event_loop::submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_
 
     io_uring_prep_accept(sqe, listen_fd, reinterpret_cast<struct sockaddr*>(addr), addrlen, 0);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(listen_fd));
     return true;
 }
 
@@ -711,7 +1094,7 @@ bool event_loop::submit_multishot_accept(int listen_fd, io_request* req)
         io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
     }
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(listen_fd));
     return true;
 }
 
@@ -741,7 +1124,7 @@ bool event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
         io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
     }
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(listen_fd));
     return true;
 }
 
@@ -754,7 +1137,7 @@ bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
     // avoids file-position locking, and enables MSG_NOSIGNAL
     io_uring_prep_recv(sqe, fd, buf, len, 0);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -767,7 +1150,7 @@ bool event_loop::submit_write(int fd, const char* buf, uint32_t len, io_request*
     // between our check and the actual send, without needing a global signal mask.
     io_uring_prep_send(sqe, fd, buf, len, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -778,7 +1161,7 @@ bool event_loop::submit_writev(int fd, struct iovec* iovs, uint32_t count, io_re
 
     io_uring_prep_writev(sqe, fd, iovs, count, 0);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -788,7 +1171,7 @@ bool event_loop::submit_sendmsg(int fd, struct msghdr* msg, io_request* req)
     if (!sqe) return false;
     io_uring_prep_sendmsg(sqe, fd, msg, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -799,7 +1182,7 @@ bool event_loop::submit_recvmsg(int fd, struct msghdr* msg, io_request* req)
 
     io_uring_prep_recvmsg(sqe, fd, msg, 0);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -810,7 +1193,7 @@ bool event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
 
     io_uring_prep_timeout(sqe, ts, 0, 0);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, IO_TARGET_NONE);
     return true;
 }
 
@@ -840,6 +1223,9 @@ bool event_loop::submit_timeout_remove(io_request* target)
 
 bool event_loop::submit_cancel_fd(int fd)
 {
+    if (fd < 0)
+        return false;
+
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
@@ -848,8 +1234,32 @@ bool event_loop::submit_cancel_fd(int fd)
     // (e.g. a write when read is also pending) to arrive after the deferred-
     // delete timeout fires and the owning object is freed.
     io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_ALL);
-    // Null user_data so the cancel-result CQE is silently discarded by event_loop::run()
-    io_uring_sqe_set_data(sqe, nullptr);
+
+    // Tagged with the descriptor rather than left null.  The answer still does
+    // not matter — "found it" or -ENOENT, and nothing acts on either — but the
+    // arrival does: this SQE names a descriptor number the kernel resolves when
+    // it consumes it, so until it reports, that number is no safer to give away
+    // than one with a read on it.  Closing first and letting the next accept
+    // take the number turns this into a cancel of *that* connection's I/O,
+    // which surfaces as a healthy read completing -ECANCELED with nothing in
+    // the logs to explain it.
+    //
+    // The low bit is what tells run() this is not an io_request pointer.  It
+    // carries no request deliberately: there is no storage to keep alive for
+    // it, and giving it one would mean a per-descriptor allocation on every
+    // teardown path.
+    if (fd_tracked(fd) && m_fd_cancels && m_fd_cancels[fd] != UINT16_MAX)
+    {
+        ++m_fd_cancels[fd];
+        sqe->user_data = (static_cast<__u64>(static_cast<uint32_t>(fd)) << 1) | 1u;
+    }
+    else
+    {
+        // Outside the table, so there is nothing to balance: keep the old
+        // behaviour of a completion run() throws away.
+        io_uring_sqe_set_data(sqe, nullptr);
+    }
+
     m_pending_submissions++;
     return true;
 }
@@ -864,7 +1274,7 @@ bool event_loop::submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, 
     io_uring_prep_recv(sqe, fixed_idx, buf, len, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -876,7 +1286,7 @@ bool event_loop::submit_write_fixed_file(int fixed_idx, const char* buf, uint32_
     io_uring_prep_send(sqe, fixed_idx, buf, len, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -888,7 +1298,7 @@ bool event_loop::submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uin
     io_uring_prep_writev(sqe, fixed_idx, iovs, count, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -899,7 +1309,7 @@ bool event_loop::submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io
     io_uring_prep_sendmsg(sqe, fixed_idx, msg, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -919,7 +1329,7 @@ bool event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_
     // Recorded on the request because a completion never names its group, and
     // the loop may end up having to return the buffer itself.
     req->buf_group = static_cast<uint8_t>(group_id);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -937,7 +1347,7 @@ bool event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_i
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
     req->buf_group = static_cast<uint8_t>(group_id);
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -950,7 +1360,7 @@ bool event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint3
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
-    arm(req);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
@@ -986,7 +1396,7 @@ bool event_loop::submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t
     io_uring_prep_read_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_fixed_buf;
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -998,7 +1408,7 @@ bool event_loop::submit_write_fixed_buf(int fd, const char* buf, uint32_t len, u
     io_uring_prep_write_fixed(sqe, fd, buf, len, 0, buf_idx);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_write_fixed_buf;
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1007,9 +1417,54 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     if (group_id >= MAX_BUF_GROUPS)
         return false;
 
-    // Already registered -- reuse
+    // A group is per runtime *type*, not per instance, and that stays: the id is
+    // a compile-time constant in each runtime's header (server 1, proxy 2,
+    // cache 3, client 4).  A group per instance is not on the table — there are
+    // MAX_BUF_GROUPS of them, eight, so it would cap the daemon at eight
+    // runtimes in total, and the pools are not small either: a proxy's is
+    // 512 x 64 KB = 32 MB, a server's 1024 x 16 KB = 16 MB, so ten proxies with
+    // private pools would pin 320 MB before taking a single connection.
+    //
+    // What was wrong was the silence.  A second instance of a type asked for its
+    // own geometry and was handed the first one's without a word: two caches on
+    // one daemon share 512 buffers sized by whichever started first, and an
+    // operator who raised SOCKETLEY_CACHE_BUF_SIZE for the larger of the two got
+    // the smaller one's 4 KB with nothing to read that off.  Sharing is the
+    // answer; being quiet about it is not.
     if (m_buf_rings[group_id].ring)
+    {
+        const auto& existing = m_buf_rings[group_id];
+        if (existing.buf_count != buf_count || existing.buf_size != buf_size)
+        {
+            // Reported rather than refused.  Refusing means answering false, and
+            // every caller reads that as "no provided buffers on this loop" and
+            // drops to the slower per-connection read path for its whole life —
+            // a real throughput loss inflicted to punish a configuration that
+            // still works.  The instance runs on the pool that exists, and the
+            // operator is told which geometry actually applies to it.
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                "buffer group %u already exists as %u x %u bytes; this runtime asked for "
+                "%u x %u and will run on the existing pool. Buffer geometry is per runtime "
+                "type and is set by whichever instance of that type started first",
+                static_cast<unsigned>(group_id), existing.buf_count, existing.buf_size,
+                buf_count, buf_size);
+            LOG_WARN(msg);
+        }
+        else if (logger::g_level <= log_debug)
+        {
+            // Even a matching re-registration is worth a line: the pool is now
+            // carrying two instances' traffic on one set of buffers, and running
+            // it dry is a whole-type symptom, not a per-instance one.
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                "buffer group %u shared with an already-running runtime of the same type "
+                "(%u x %u bytes)",
+                static_cast<unsigned>(group_id), existing.buf_count, existing.buf_size);
+            LOG_DEBUG(msg);
+        }
         return true;
+    }
 
     int ret;
     struct io_uring_buf_ring* br = io_uring_setup_buf_ring(&m_ring, buf_count, group_id, 0, &ret);
@@ -1069,7 +1524,7 @@ bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
     io_uring_sqe_set_data(sqe, req);
     req->type = op_read_provided;
     req->buf_group = static_cast<uint8_t>(group_id);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1148,7 +1603,7 @@ bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* re
     io_uring_sqe_set_data(sqe, req);
     req->type = op_recv_multishot;
     req->buf_group = static_cast<uint8_t>(group_id);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1160,7 +1615,7 @@ bool event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_reques
     io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_send_zc;
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1176,7 +1631,7 @@ bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;
-    arm(req);
+    arm(req, raw_target(fd_in), raw_target(fd_out));
     return true;
 }
 
@@ -1189,7 +1644,7 @@ bool event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t
     io_uring_prep_read(sqe, file_fd, buf, len, offset);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_file_read;
-    arm(req);
+    arm(req, raw_target(file_fd));
     return true;
 }
 
@@ -1200,7 +1655,7 @@ bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
 
     io_uring_prep_poll_add(sqe, fd, mask);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1236,7 +1691,7 @@ bool event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t l
 
     io_uring_prep_connect(sqe, fd, addr, len);
     io_uring_sqe_set_data(sqe, req);
-    arm(req);
+    arm(req, raw_target(fd));
     return true;
 }
 
@@ -1313,16 +1768,40 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
         return;
     uint32_t w = idx / 64;
     uint32_t bit = idx % 64;
-    m_file_bitmap[w] &= ~(1ULL << bit);
-    // Update hint to this word since it now has a free slot
-    m_file_bitmap_hint = w;
 
-    // Unregister the fd from the kernel's fixed file table
+    // Unregister first, and unconditionally.  This is what drops the kernel's
+    // reference to the socket; until it runs the descriptor's own close() has
+    // not really closed anything.  It is safe to do with submissions still
+    // queued against the index — they resolve to nothing and fail -EBADF, which
+    // is a completion the owner already handles.
     int neg = -1;
     if (m_files_registered)
     {
         if (io_uring_register_files_update(&m_ring, idx, &neg, 1) < 0) {}
     }
+
+    // The index itself is a different matter.  Handing it straight back to the
+    // allocator while an SQE still names it is the redirection this whole file
+    // is about, one level up from descriptor numbers: the next accept takes the
+    // slot, points it at its own socket, and the previous connection's queued
+    // read is delivered from — or its write into — a stranger.  Neither the
+    // unregister above nor the connection's close() prevents it; the SQE
+    // carries the index and the kernel looks it up when it consumes it.
+    //
+    // So the bit stays set until the count says nothing names it.  Callers are
+    // not asked to check: release_fixed_slot() runs on the teardown path with
+    // reads still armed by design, and every one of them had reasoned that the
+    // request "took its own reference when it was issued" — true of a submission
+    // the kernel has consumed, and the entire question is the ones it has not.
+    if (m_fixed_armed[idx] > 0)
+    {
+        m_fixed_free_deferred[w] |= (1ULL << bit);
+        return;
+    }
+
+    m_file_bitmap[w] &= ~(1ULL << bit);
+    // Update hint to this word since it now has a free slot
+    m_file_bitmap_hint = w;
 }
 
 bool event_loop::enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer)

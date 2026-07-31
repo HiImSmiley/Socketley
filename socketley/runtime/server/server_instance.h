@@ -337,6 +337,19 @@ private:
     void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
+    // Every descriptor this runtime gives back to the kernel goes through here
+    // — sockets, listeners, the files an HTTP response is served out of, the
+    // splice pipes.  A close does not withdraw an SQE that already carries the
+    // number; it only frees the number for the next accept to take, and the
+    // queued operation then lands on that connection instead.  See
+    // event_loop::close_fd, which holds the number until nothing in the ring
+    // still names it.
+    //
+    // m_ring_loop and not m_loop, for the same reason release_fixed_slot uses
+    // it: descriptors are still closed after teardown has cleared m_loop, and
+    // that is exactly when the ring is most likely to be holding something.
+    void close_tracked(int fd);
+
     // Is anything the kernel is holding still naming this struct?  Every close
     // path asks this one question now.  Each used to assemble its own list of
     // flags, and the lists disagreed: the zero-copy notification was missing

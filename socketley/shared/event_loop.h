@@ -95,6 +95,55 @@ public:
     // one.
     void return_cqe_buf(const struct io_uring_cqe* cqe, const io_request* req);
 
+    // ── Descriptor lifetime ─────────────────────────────────────────────────
+    // The only safe way to close a descriptor this loop has ever submitted for.
+    //
+    // An SQE carries a descriptor *number*; the kernel resolves it when it
+    // consumes the SQE, which under SQPOLL is another thread at a moment
+    // nothing here can observe.  close() does not withdraw a queued operation —
+    // it only frees the number, and the next accept takes it, so the queued
+    // operation is redirected onto a stranger.  That is not a theory: on the
+    // proxy it put an aborting client's 8192 bytes into the middle of 6% of
+    // healthy connections' streams, and the pairing checks on the forwarding
+    // path could not see it because they were right when they ran.
+    //
+    // Neither flush() nor submit_cancel_fd() is a defence.  flush() hands the
+    // SQE to the ring and returns; under SQPOLL it does not even make a
+    // syscall, so it says nothing about consumption.  And a cancel is itself an
+    // SQE naming that same number, so it inherits the whole problem: closing
+    // before it is consumed lets it cancel whatever inherited the number
+    // instead — a healthy connection's read completing -ECANCELED for no
+    // reason anyone can trace.
+    //
+    // This closes the descriptor now when nothing in the ring names it, and
+    // otherwise holds the number — the descriptor stays open, so every queued
+    // operation still resolves to the file it was submitted for — and closes it
+    // from disarm() once the last of them has reported.  Submitting a cancel
+    // for the ones that would not end on their own is part of the same step,
+    // and that cancel is counted like any other submission, so the number
+    // outlives it too.
+    //
+    // Call it for every descriptor the loop may name, including ones it
+    // probably does not: with nothing armed it is exactly close(), so a
+    // needless call costs one indexed load.  shutdown() first where the caller
+    // already does — it is what makes a socket's pending reads and writes
+    // report at once, and holding the number does not change that.
+    void close_fd(int fd);
+
+    // Operations still in the ring that named this descriptor.  Zero is the
+    // condition for giving the *number* to someone else without closing it: a
+    // connection pool handing the socket to the next request, a fixed-file slot
+    // going back to the allocator.  Same hazard as close, same answer.
+    //
+    // Cancels are deliberately not counted here, only in what close_fd() waits
+    // for.  A cancel that lands on a number still bound to the same file is a
+    // no-op for a pool — the file did not change — but a caller that pools a
+    // descriptor with a cancel of its own outstanding must know that cancel has
+    // already run, or IORING_ASYNC_CANCEL_ALL will take back the *next*
+    // request's I/O on that socket.  detach_and_pool_backend has that proof and
+    // says so; nothing else submits a cancel it does not close behind.
+    uint32_t fd_inflight(int fd) const;
+
     // Batched submissions - these queue SQEs without submitting
     // The submit_* helpers return false when no SQE could be obtained even after
     // flushing the ring.  Nothing is queued in that case, so a caller that has
@@ -167,11 +216,35 @@ public:
     bool buffers_registered() const { return m_bufs_registered; }
 
     // Provided buffer ring API
+    //
+    // A group belongs to a runtime *type*, not to an instance: the ids are
+    // compile-time constants in the runtime headers and there are only
+    // MAX_BUF_GROUPS of them, so every server on this loop draws from one pool,
+    // every proxy from another, and so on.  The first instance of a type to
+    // reach here therefore decides the geometry for all of them; a later one
+    // asking for a different buf_count or buf_size gets the pool that already
+    // exists and a WARN saying so, rather than the silent substitution this used
+    // to perform.  True means there is a usable pool under group_id — not that
+    // it is the one this caller asked for.
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
     bool submit_read_provided(int fd, uint16_t group_id, io_request* req);
-    // Cancel all pending io_uring ops for a fd (user_data=null, CQE is ignored).
-    // Submit this BEFORE close(fd) to guarantee the kernel generates cancellation
-    // CQEs before any subsequently-submitted timeout/cleanup SQE fires.
+    // Cancel every pending operation on a descriptor in one SQE
+    // (IORING_ASYNC_CANCEL_ALL — without it only one is taken back per SQE, and
+    // the second completion arrives after whatever was waiting on the first has
+    // given up and freed itself).
+    //
+    // This is itself an SQE naming a descriptor number, so it is subject to the
+    // hazard it is usually submitted to help with: consumed after the number
+    // has been reissued, it cancels the new owner's operations.  It is
+    // therefore counted against that descriptor exactly like a read or a write,
+    // and close_fd() holds the number until it has reported.  Its completion
+    // carries no io_request — there is nothing to act on but "found it" or
+    // -ENOENT — so run() recognises it by a tag in the user_data and does the
+    // accounting without dispatching anything.
+    //
+    // Callers rarely need this directly: close_fd() submits one when, and only
+    // when, the descriptor has something armed.  Use it on its own only to take
+    // an operation back from a descriptor that is *staying* open.
     bool submit_cancel_fd(int fd);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
@@ -198,6 +271,20 @@ public:
 
     // Allocate a slot in the registered file table, returns index or -1
     int alloc_fixed_file_slot();
+
+    // Give a slot back.  The file behind it is unregistered at once — until
+    // that happens the kernel still holds a reference to the socket and its
+    // close() did not really close it — but the *index* is only returned to the
+    // allocator once nothing in the ring still names it.
+    //
+    // A fixed-file SQE carries the index, not the file, and the kernel resolves
+    // it when it consumes the SQE, so an index handed straight back is the same
+    // redirection as a reissued descriptor number one level up: the next
+    // connection allocates the slot, points it at its own socket, and the
+    // previous connection's queued read lands there.  Nothing has ever measured
+    // this one — the fixed-file path is only taken when the accept registered a
+    // slot — but it is the same construction and it costs one counter to be rid
+    // of.
     void free_fixed_file_slot(uint32_t idx);
 
     // Splice: zero-copy data transfer between two fds through a pipe.
@@ -226,7 +313,12 @@ public:
     // or a write armed on the same socket alone.
     bool submit_poll_remove(io_request* target);
 
-    // Flush all pending submissions (single syscall)
+    // Hand every queued SQE to the ring.  Not a barrier, and in particular not
+    // a licence to close a descriptor one of them names: under SQPOLL this is a
+    // tail update with no syscall at all, and it returns long before the kernel
+    // thread has looked at anything.  Several teardowns used to read as
+    // "cancel, flush, close" and take the flush for the guarantee that made the
+    // order safe.  It never was one — close_fd() is.
     void flush();
 
     struct io_uring* get_ring();
@@ -244,14 +336,29 @@ public:
 private:
     struct io_uring_sqe* get_sqe();
     void setup_eventfd();
+    bool init_fd_tables();
 
-    // Stamp the owner identity onto a submission, count it as outstanding and
-    // count it towards the next flush.  Every submit_* helper ends with this.
-    void arm(io_request* req);
+    // Stamp the owner identity and the descriptor(s) named onto a submission,
+    // count it as outstanding and count it towards the next flush.  Every
+    // submit_* helper ends with this, and passes the number it wrote into the
+    // SQE — encoded per IO_TARGET_* — rather than req->fd, which is a routing
+    // hint several helpers deliberately set to a different descriptor.
+    void arm(io_request* req, uint32_t target, uint32_t target2 = IO_TARGET_NONE);
     // One completion for that submission has landed and no more will follow.
-    void disarm(uint32_t token, uint8_t type);
+    void disarm(uint32_t token, uint8_t type, uint32_t target, uint32_t target2);
     // A completion nobody can act on any more.
     void drop_completion(const struct io_uring_cqe* cqe, const io_request* req);
+
+    // ── Per-descriptor accounting ───────────────────────────────────────────
+    // One counter per number a submission can name, and the release that number
+    // is waiting for.  See close_fd() for what the counters are protecting.
+    void target_ref(uint32_t target);
+    void target_unref(uint32_t target);
+    // Perform a close or a slot release that was waiting on the count.
+    void settle_deferred(uint32_t target);
+
+    bool fd_tracked(int fd) const
+    { return fd >= 0 && static_cast<uint32_t>(fd) < m_fd_table_size; }
 
     struct io_uring m_ring{};
     std::atomic<bool> m_running;
@@ -282,6 +389,46 @@ private:
     static constexpr uint32_t BITMAP_WORDS = MAX_FIXED_FILES / 64;
     uint64_t m_file_bitmap[BITMAP_WORDS]{};
     uint32_t m_file_bitmap_hint{0};  // hint for next scan start
+
+    // ── Descriptor tables ───────────────────────────────────────────────────
+    // Submissions still in the ring that named each raw descriptor, and the two
+    // bits per descriptor that say what is waiting on that count: a close, and
+    // a cancel of our own we have not seen report yet.  Sized from
+    // RLIMIT_NOFILE at init(), because that is exactly the range of numbers the
+    // kernel can hand this process.
+    //
+    // uint16 is not a guess: a descriptor cannot have more submissions
+    // outstanding than the ring is deep, and the ring is two thousand entries.
+    // Two bytes per possible descriptor keeps a daemon at the usual 1024-file
+    // limit under 3 KB of tables.
+    uint16_t* m_fd_armed{nullptr};
+    uint16_t* m_fd_cancels{nullptr};
+    uint64_t* m_fd_close_deferred{nullptr};
+    uint32_t  m_fd_table_size{0};
+    // Descriptors currently held open only because the ring still names them.
+    // Reported at shutdown if any are left, because a number that never drains
+    // is the one failure mode this scheme has and it is otherwise invisible.
+    uint32_t  m_fd_close_pending{0};
+    // Said once: a descriptor above the table cannot be tracked, so it is closed
+    // the old way and the hazard is open again for it.  Only reachable if the
+    // process's file limit rose after init(), which nothing here does.
+    bool      m_fd_untracked_logged{false};
+
+    // The same two things for fixed-file table indices: submissions in the ring
+    // naming each slot, and whether the slot is waiting to go back to the
+    // allocator.
+    uint16_t m_fixed_armed[MAX_FIXED_FILES]{};
+    uint64_t m_fixed_free_deferred[BITMAP_WORDS]{};
+
+    // The descriptor(s) named by the completion currently being dispatched, and
+    // only while it is the last completion that submission will produce.  A
+    // handler closing the descriptor it was just called about is the ordinary
+    // teardown in every runtime here, and that operation is still counted while
+    // the handler runs; close_fd() discounts it rather than making the most
+    // common close in the process pay for a cancel round trip.  IO_TARGET_NONE
+    // outside a dispatch.
+    uint32_t m_cqe_target{IO_TARGET_NONE};
+    uint32_t m_cqe_target2{IO_TARGET_NONE};
 
     static constexpr uint16_t MAX_BUF_GROUPS = 8;
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};

@@ -77,6 +77,13 @@ private:
     // Lose the socket and start the reconnect clock.  Every path that gets here
     // does the same five things; they used to do them each in their own copy.
     void drop_connection();
+    // Every descriptor this runtime gives back to the kernel goes through here.
+    // A close does not withdraw an SQE that already carries the number, and this
+    // runtime reuses one read request and one write request across reconnects,
+    // so the number really does come straight back — see event_loop::close_fd.
+    // m_ring_loop and not m_loop: sockets are dropped after teardown has cleared
+    // m_loop, which is when the ring is most likely to still hold something.
+    void close_tracked(int fd);
     // Account for a completion that is not ours to act on any more.
     void settle_stale(struct io_uring_cqe* cqe, io_request* req);
     // Hand a provided buffer back when we drop the completion carrying it.  The

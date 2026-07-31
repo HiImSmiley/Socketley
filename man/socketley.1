@@ -282,14 +282,22 @@ patterns, or a mix. With
 shows stats for all runtimes.
 .TP
 .BI "restart " "name " "[flags]"
-Stop and start a runtime in one step, preserving all flags.
-Equivalent to
+Stop and start a runtime in one step. The runtime keeps the
+configuration it already has. Equivalent to
 .B stop
 followed by
 .B start
-with the same arguments. Any additional flags are passed to the
-.B start
-command.
+with the same arguments: the extra flags are handed to
+.BR start ,
+which understands only
+.BR \-i ,
+so they do not reconfigure anything. To restart with a changed setting,
+.B edit
+first:
+.nf
+socketley edit api \-p 9001
+socketley restart api
+.fi
 .TP
 .BI "reload " "name|pattern" "..."
 Restart one or more running runtimes (stop + start). Accepts multiple
@@ -314,8 +322,57 @@ prints all runtimes.
 .TP
 .BI "edit " "name " "[flags]"
 Edit a runtime's configuration. When called with flags (e.g. \-p 9001),
-applies changes directly like
-.BR create .
+applies the changes directly. The flags accepted here are a subset of the
+ones
+.B create
+takes: the common settings
+.RB ( \-p ,
+.BR \-b / \-bp / \-bt / \-bpt ,
+.BR \-\-log ,
+.BR \-w ,
+.BR \-\-max\-connections ,
+.BR \-\-rate\-limit ,
+.BR \-\-global\-rate\-limit ,
+.BR \-\-idle\-timeout ,
+.BR \-g ),
+the server and client flags, and the proxy mesh flags
+.RB ( \-\-strategy ,
+.BR \-\-health\-* ,
+.BR \-\-circuit\-* ,
+.BR \-\-backend\-timeout ,
+.BR \-\-retry ,
+.BR \-\-retry\-all ).
+Anything else \(em including
+.BR \-\-lua ,
+.BR \-\-drain ,
+.BR \-\-reconnect ,
+the proxy's
+.BR \-\-backend ,
+.B \-\-protocol
+and
+.BR \-\-sidecar ,
+and every cache flag \(em is refused with
+.B "unknown flag"
+and exit status 1; change those through the editor or
+.BR import ,
+which reach the full field set.
+The TLS flags are the exception to that wording: editing is the usual way to
+put encryption on something already running, so
+.BR \-\-tls ,
+.BR \-\-cert ,
+.BR \-\-key ,
+.BR \-\-ca ,
+and on a proxy
+.BR \-\-client\-ca ,
+.B \-\-client\-cert
+and
+.BR \-\-client\-key ,
+are refused with the same message
+.B create
+gives \(em TLS transport is not implemented \(em rather than
+.BR "unknown flag" .
+Exit status is 1 either way; only the reason differs. See
+.BR LIMITATIONS .
 When called without flags (or with only \-r/\-\-reload),
 opens the runtime's JSON configuration in
 .BR $VISUAL ,
@@ -433,6 +490,7 @@ health_path	string	HTTP health check path (default "/health")
 health_threshold	number	Failures to mark unhealthy (default 3)
 circuit_threshold	number	Errors to open circuit (default 5)
 circuit_timeout	number	Seconds before half-open (default 30)
+backend_timeout	number	Seconds for the first response byte (default 2, 0 = off)
 retry	number	Retry count (0 = disabled)
 retry_all	bool	Also retry non-idempotent methods
 client_ca	string	\fB(rejected)\fR mTLS is not implemented
@@ -500,10 +558,11 @@ With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
 .BR \-\-group .
 .RE
 .TP
-.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fIcolumns\fR]
+.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fB\-\-silent\fR | \fB\-s\fR] [\fIcolumns\fR]
 List only running runtimes. Same format as
 .BR ls .
 With \fB\-\-json\fR, outputs a JSON array (includes uptime field).
+With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
 .RS
 .PP
 .B Column selectors:
@@ -891,6 +950,39 @@ Seconds before an open circuit transitions to
 In half-open state, a single probe request is allowed through \(em if it
 succeeds, the circuit closes (fully healthy); if it fails, the circuit
 re-opens. Default: 30.
+.TP
+.BI "\-\-backend\-timeout " "seconds"
+How long a backend may take to produce the
+.I first
+byte of a response before the request is given up on. The request is
+then retried on another backend if
+.B \-\-retry
+allows it, and answered
+.B 504 Gateway Timeout
+otherwise; either way the backend is charged with an error, so the
+circuit breaker above opens and takes it out of rotation. Default: 2.
+Set to 0 to wait indefinitely.
+.IP
+This is the only thing that notices a backend which accepts connections
+and then stops answering. Such a backend passes a TCP health check, and
+a request that never completes is recorded as neither success nor
+failure, so without a deadline it keeps its full share of the rotation
+and every request routed to it is held until the client gives up. HTTP
+mode only \(em TCP mode has no request/response framing to measure. Only
+the wait for the first byte is bounded, so a slow or streaming response
+body is never cut short once the backend has begun answering.
+.IP
+The 2-second default applies whether or not the flag is given. If any
+endpoint behind this proxy normally needs longer than that to
+.I begin
+answering \(em a report that is computed on demand, a cold cache, a long
+query \(em raise
+.B \-\-backend\-timeout
+to cover it or set it to
+.B 0
+to disable the deadline. Left at the default, such an endpoint has its
+requests cut off at 2 seconds and is charged an error each time, which
+opens the circuit breaker on a backend that is working correctly.
 .SS Retry Flags
 .TP
 .BI "\-\-retry " "n"
@@ -933,11 +1025,30 @@ Individual flags can still be specified alongside
 .B \-\-sidecar
 to override the defaults (e.g.
 .BR "\-\-sidecar \-\-health\-check http \-\-health\-path /ready" ).
+.IP
+.B \-\-sidecar
+does not set
+.BR \-\-backend\-timeout ,
+but it runs into it: the deadline is 2 seconds by default, and the
+circuit breaker
+.B \-\-sidecar
+turns on is what the expiry is charged to. Five slow requests in a row
+open the circuit for 30 seconds. Add
+.BI "\-\-backend\-timeout " seconds
+alongside
+.B \-\-sidecar
+whenever the application behind it can take longer than 2 seconds to
+send its first response byte, or
+.B \-\-backend\-timeout 0
+to switch the deadline off.
 .PP
 Example:
 .nf
 socketley create proxy myapp \-\-sidecar \-\-backend 127.0.0.1:3000 \\
     -p 8080 \-\-health\-check tcp -s
+
+socketley create proxy slowapp \-\-sidecar \-\-backend 127.0.0.1:3000 \\
+    -p 8080 \-\-backend\-timeout 30 -s
 .fi
 .SH CACHE FLAGS
 .TP
@@ -983,7 +1094,8 @@ Connect via TCP and send commands (newline-terminated, all lowercase).
 .B Strings:
 .TP
 .BI "set " "key value"
-Store a key-value pair. Returns "ok" or "error: type conflict".
+Store a key-value pair. Returns "ok", "error: type conflict", or
+"error: out of memory".
 .TP
 .BI "get " "key"
 Retrieve value. Returns value or "nil".
@@ -1086,7 +1198,8 @@ Return all members (multi-line, "end" terminator).
 .B Hashes (nested key-value maps):
 .TP
 .BI "hset " "key field value"
-Set hash field. Returns "ok" or "error: type conflict".
+Set hash field. Returns "ok", "error: type conflict", or
+"error: out of memory".
 .TP
 .BI "hget " "key field"
 Get hash field value. Returns value or "nil".
@@ -1152,6 +1265,8 @@ Save cache to file (uses --persistent path if omitted).
 Load cache from file.
 .PP
 Type enforcement: a key can only hold one data type. Writing to a key of a different type returns "error: type conflict".
+Under \fB--maxmemory\fR a write that does not fit is refused with "error: out of memory" (RESP: "OOM command not allowed when used memory > 'maxmemory'"), and the key it would have written is left exactly as it was.
+That includes a write over a key that already exists: overwriting a value, appending to it or replacing a hash field is checked against the limit like any other write.
 Multi-line responses (lrange, smembers, hgetall) terminate with "end\n".
 .SS RESP Protocol (Redis Compatibility)
 The cache supports the RESP2 wire protocol for compatibility with Redis clients
@@ -1587,7 +1702,9 @@ Multiple subscriptions to the same channel are all fired in registration order.
 .B socketley.http(opts) \(-> table
 Synchronous HTTP/HTTPS client.
 .B WARNING:
-Blocks the event loop thread. Use only in
+Blocks the event loop thread \(em the wait is bounded, but it is not
+asynchronous: the whole exchange completes before any other runtime in
+the daemon is served again. Use only in
 .BR on_start / on_stop
 or low-frequency
 .B on_tick
@@ -1611,11 +1728,28 @@ body    string  Response body
 error   string  Error message on failure
 .fi
 .PP
-HTTPS uses OpenSSL with
-.B SSL_VERIFY_NONE
-(no certificate validation) — suitable for trusted internal services.
-For external HTTPS with cert validation, use
-.BR "io.popen(\"curl -s ...\")" .
+.I timeout_ms
+is one deadline for the whole exchange \(em connect, TLS handshake,
+request and response are all measured against it \(em not a separate
+timeout per operation. Name resolution is the exception: it runs before
+the deadline is armed and has no bound of its own. A response is refused
+once it exceeds 8 MB rather than buffered without limit.
+.PP
+HTTPS uses OpenSSL and validates the peer. The certificate chain is
+verified against the system CA store, and the certificate must have been
+issued to the host in the URL \(em a host name is matched against the
+certificate's DNS names with partial wildcards refused, an address
+literal against its IP SAN. TLS 1.2 is the minimum accepted protocol
+version. Failure of either check aborts the request with the reason in
+.IR error ,
+and there is no option to disable it, so a service presenting a
+self-signed or private-CA certificate must have that CA in the trust
+store OpenSSL reads (overridable with
+.B SSL_CERT_FILE
+or
+.BR SSL_CERT_DIR ).
+If no CA store is available at all the call fails immediately with
+.BR "no system CA store available" .
 .SS Runtime Management API
 Create, start, stop, and remove runtimes from Lua scripts:
 .nf
@@ -1811,10 +1945,103 @@ All requests fail immediately without attempting a connection. After
 seconds, the circuit moves to half-open.
 .TP
 .B half-open
-A single probe request is allowed through. If it succeeds, the circuit
-returns to
+A single probe request is allowed through \(em one, not one per
+selection: while that probe is outstanding the backend is unavailable to
+everyone else. If it succeeds, the circuit returns to
 .BR closed .
 If it fails, the circuit re-opens.
+.SS Response Deadline
+A backend that accepts connections and then stops answering fails no
+check: a TCP health probe connects to it successfully, and a request
+that never completes is counted as neither an error nor a success, so
+the circuit breaker has nothing to open on.
+.B \-\-backend\-timeout
+(default 2 seconds) bounds the wait for the first byte of a response and
+records the expiry as a backend error, which is what puts such a backend
+through the breaker like any other failure. The request is retried
+elsewhere if
+.B \-\-retry
+allows it and answered
+.B 504 Gateway Timeout
+otherwise.
+.PP
+The deadline is on by default and only covers the wait for the first
+byte, so a large or streaming response body is unaffected. An endpoint
+that legitimately needs more than 2 seconds to start answering has to be
+given a longer
+.B \-\-backend\-timeout
+or
+.BR "\-\-backend\-timeout 0" ;
+otherwise the proxy treats it as hung. It applies to HTTP mode only \(em
+in TCP mode there is no request boundary to measure from.
+.SS Request Framing
+In HTTP mode the proxy is strict about how a request's header block is
+framed, and refuses anything it and a backend could read differently.
+The proxy forwards bytes to a backend that parses them independently; if
+the two disagree about where a request ends, the next request on the
+same connection starts in the wrong place, which is request smuggling.
+Normalising the request instead would mean guessing which way the
+backend will read it, so the proxy declines to guess.
+.PP
+A request is answered
+.B 400 Bad Request
+and its connection is closed, without contacting any backend, when the
+header block contains any of:
+.RS
+.IP \(bu 2
+a bare LF or a bare CR \(em every line must end with CRLF
+.IP \(bu 2
+whitespace between a field name and its colon
+.RB ( "Content\-Length : 6" )
+.IP \(bu 2
+a continuation (obs\-fold) line, i.e. one starting with a space or tab
+.IP \(bu 2
+a field line with no colon
+.IP \(bu 2
+both
+.B Content\-Length
+and
+.BR Transfer\-Encoding ,
+or more than one
+.B Content\-Length
+field
+.IP \(bu 2
+a
+.B Transfer\-Encoding
+whose final coding is not
+.B chunked
+.RB ( "Transfer\-Encoding: gzip" ,
+.BR "Transfer\-Encoding: chunked, gzip" ,
+or
+.B chunked
+listed twice) \(em such a request has no determinable body length at all
+.RE
+.PP
+Compliant clients emit none of these. A request whose header block is
+still arriving is held until the terminating blank line, subject to the
+16 KiB header limit
+.RB ( "431 Request Header Fields Too Large" )
+and a 10 second header deadline
+.RB ( "408 Request Timeout" ).
+.PP
+The header deadline starts at the first byte of a request and ends when
+its header block does. It is fixed, is not configurable, and is
+deliberately independent of
+.BR \-\-idle\-timeout ,
+which defaults to 0 (never) and so cannot be relied on to end a
+half\-sent request: a client that sends a request line and then stops
+sends no further bytes for the 16 KiB limit to count, and would
+otherwise hold its connection, its descriptor and its 64 KB buffer for
+as long as it liked. Neither an idle keep\-alive connection between
+requests nor a slow request body is measured against it \(em only the
+gap between a request's first byte and its terminating blank line.
+.PP
+The same strictness is applied to backend responses, but only to decide
+whether the backend connection may be reused: a response whose length
+cannot be established with certainty \(em because its header block was
+split across reads, or was not strictly CRLF-framed \(em is forwarded to
+the client unchanged, and its connection is closed instead of returned
+to the pool.
 .SS Retries
 When
 .B \-\-retry
@@ -1851,6 +2078,19 @@ socketley create proxy myapp \-\-sidecar \\
 The proxy listens on port 8080 and forwards to the local application on
 port 3000. Unhealthy backends are automatically removed, and the circuit
 breaker prevents thundering-herd retries during outages.
+.PP
+.B \-\-sidecar
+does not change
+.BR \-\-backend\-timeout ,
+which is 2 seconds by default and charges its expiry to the circuit
+breaker that
+.B \-\-sidecar
+enables. If the application can take longer than that to send its first
+response byte, say so explicitly:
+.nf
+socketley create proxy myapp \-\-sidecar \-\-backend\-timeout 30 \\
+    \-\-backend 127.0.0.1:3000 -p 8080 -s
+.fi
 .SH RUNTIME STATES
 .TP
 .B created
@@ -2916,6 +3156,14 @@ Embedded engine with daemon monitoring \(em maximum performance with fleet manag
 No runtime \(em server, client, proxy or cache \(em performs a TLS handshake.
 The OpenSSL wrapper in the source tree is not wired into any I/O path.
 .PP
+One outbound exception exists and is not transport:
+.B socketley.http()
+in a Lua callback speaks HTTPS, with the certificate chain and the host
+name verified and TLS 1.2 as the minimum version (see
+.BR "Global Functions" ).
+That is a client call a script makes; it encrypts nothing that socketley
+itself serves or forwards.
+.PP
 Earlier releases accepted the TLS flags, stored them, persisted them, showed
 them in
 .BR "socketley inspect" ,
@@ -2935,6 +3183,15 @@ and
 are rejected by
 .B create
 with exit status 1 and a message naming the flag.
+.IP \(bu 2
+flag-based
+.B edit
+rejects the same flags with the same message. It is a subset of
+.BR create ,
+so most flags it does not accept come back as
+.BR "unknown flag" ;
+these do not, because adding TLS to a live runtime is exactly what an
+operator would be attempting.
 .IP \(bu 2
 .B import
 rejects any JSON document that sets the corresponding fields.
