@@ -6,30 +6,38 @@
 typedef struct ssl_ctx_st SSL_CTX;
 typedef struct ssl_st SSL;
 
-// ─── TLS transport is not implemented ───
+// ─── What this build can honour ───
 //
-// The tls_context below is a complete OpenSSL wrapper, but nothing constructs
-// one.  No runtime feeds socket bytes through it and no runtime performs a
-// handshake, so a runtime "configured with TLS" listened in cleartext while
-// inspect reported it as encrypted, and a proxy pointed at an HTTPS backend
-// sent a plaintext request line.  The first of those is the dangerous one: an
-// operator who asks for encryption and is told they have it has no way to
-// notice they do not.
+// One role has a handshake behind it: a **server runtime's own listener**.  It
+// terminates TLS here — accept, handshake and record layer all driven by
+// io_uring completions through the memory BIO pair below, see
+// server_instance's tls_feed/tls_flush.
 //
-// So the flags fail closed.  Every TLS option is refused at the point it is
-// given and again before a runtime starts, and stays refused until some
-// runtime actually drives the handshake.  A flag that errors out is a bad
-// afternoon; a flag that silently serves cleartext is a breach.
+// Nothing else does.  A client runtime's outbound socket, a proxy's backend
+// leg and mesh mTLS still connect in cleartext, and a runtime "configured with
+// TLS" on one of those paths would listen or dial in the clear while inspect
+// reported it as encrypted.  That is the dangerous shape: an operator who asks
+// for encryption and is told they have it has no way to notice they do not.
 //
-// Returns the name of the first TLS option set in the given configuration, or
-// nullptr if none is.  The returned pointer is a string literal.
-const char* tls_requested_option(bool tls,
-                                 std::string_view cert_path,
-                                 std::string_view key_path,
-                                 std::string_view ca_path,
-                                 std::string_view mesh_client_ca = {},
-                                 std::string_view mesh_client_cert = {},
-                                 std::string_view mesh_client_key = {});
+// So those flags fail closed, and stay refused until some runtime actually
+// drives the handshake for them.  A flag that errors out is a bad afternoon; a
+// flag that silently serves cleartext is a breach.
+//
+// tls_config_refusal is the single question every place a TLS configuration is
+// about to take effect asks — flag parsing, `edit`, `import`, and the last
+// gate before a runtime is started.  It returns the refusal text,
+// newline-terminated, or an empty string when the configuration is one this
+// build can honour.  A half-written server configuration (--tls with no
+// certificate, a certificate with no --tls) is refused too: a listener that
+// came up out of one could only serve cleartext.
+std::string tls_config_refusal(bool is_server_listener,
+                               bool tls,
+                               std::string_view cert_path,
+                               std::string_view key_path,
+                               std::string_view ca_path,
+                               std::string_view mesh_client_ca = {},
+                               std::string_view mesh_client_cert = {},
+                               std::string_view mesh_client_key = {});
 
 // The refusal text for `option`, newline-terminated.  Used both on stdout
 // (create/edit) and in the IPC response buffer (start/import) so the wording a

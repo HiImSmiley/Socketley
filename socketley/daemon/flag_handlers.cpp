@@ -182,26 +182,51 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // TLS flags are refused here rather than stored.  Accepting them made
-        // `create` report success and `inspect` show the certificate, while the
-        // listener never handshook and answered plaintext — see the gate in
-        // shared/tls_context.h.  Failing at the point the flag is typed is the
-        // only place the operator is still looking.
+        // ── TLS ──
+        // Stored for a server runtime, which terminates TLS on its own
+        // listener, and refused for every other runtime type, which does not
+        // and would answer cleartext on an endpoint `inspect` reports as
+        // encrypted.  Failing at the point the flag is typed is the only place
+        // the operator is still looking.
+        //
+        // Whether the *set* is complete — --tls with a key pair, a key pair
+        // with --tls — cannot be decided here, because the flag that completes
+        // it may be further along the command line.  cmd_create asks that once
+        // parsing is done, and runtime_instance::start() asks it again for
+        // configurations that never went through a command line at all.
         case fnv1a("--tls"):
-            std::cout << tls_not_implemented_error("--tls");
-            return 1;
+            if (instance->get_type() != runtime_server)
+            {
+                std::cout << tls_not_implemented_error("--tls");
+                return 1;
+            }
+            instance->set_tls(true);
+            return 0;
 
         case fnv1a("--cert"):
-            std::cout << tls_not_implemented_error("--cert");
-            return 1;
-
         case fnv1a("--key"):
-            std::cout << tls_not_implemented_error("--key");
-            return 1;
-
         case fnv1a("--ca"):
-            std::cout << tls_not_implemented_error("--ca");
-            return 1;
+        {
+            const uint32_t which = pa.hashes[i];
+            const char* flag = which == fnv1a("--cert") ? "--cert"
+                             : which == fnv1a("--key")  ? "--key"
+                                                        : "--ca";
+            if (instance->get_type() != runtime_server)
+            {
+                std::cout << tls_not_implemented_error(flag);
+                return 1;
+            }
+            if (i + 1 >= pa.count)
+            {
+                std::cout << flag << " requires a file\n";
+                return 1;
+            }
+            const std::string_view path = pa.args[++i];
+            if (which == fnv1a("--cert"))     instance->set_cert_path(path);
+            else if (which == fnv1a("--key")) instance->set_key_path(path);
+            else                              instance->set_ca_path(path);
+            return 0;
+        }
 
         case fnv1a("--group"):
         case fnv1a("-g"):
@@ -874,30 +899,51 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Same refusal as the create path, for the same reason — and this is
-        // the path that matters most, because `edit` is where an operator goes
-        // to put TLS on something that is already serving traffic.  Falling
-        // through to the generic "unknown flag" gave that operator the same
-        // exit status and a wrong explanation: it reads as a typo, so the
-        // answer to it is to try again with different spelling, not to go and
-        // terminate TLS somewhere else.  Flag-based `edit` refuses plenty of
-        // flags that the editor and `import` accept, so being refused here is
-        // not itself news; the reason is.
+        // Same rule as the create path — and this is the path that matters
+        // most, because `edit` is where an operator goes to put TLS on
+        // something that is already serving traffic.  A server runtime takes
+        // them; every other type is refused with the reason rather than
+        // falling through to the generic "unknown flag", which gave that
+        // operator the same exit status and a wrong explanation: it reads as a
+        // typo, so the answer to it is to try again with different spelling,
+        // not to go and terminate TLS somewhere else.
+        //
+        // The edit takes effect at the next start; the completeness check for
+        // the resulting set is made there, on whatever the runtime is carrying
+        // by then, and not on this one flag.
         case fnv1a("--tls"):
-            std::cout << tls_not_implemented_error("--tls");
-            return 1;
+            if (instance->get_type() != runtime_server)
+            {
+                std::cout << tls_not_implemented_error("--tls");
+                return 1;
+            }
+            instance->set_tls(true);
+            return 0;
 
         case fnv1a("--cert"):
-            std::cout << tls_not_implemented_error("--cert");
-            return 1;
-
         case fnv1a("--key"):
-            std::cout << tls_not_implemented_error("--key");
-            return 1;
-
         case fnv1a("--ca"):
-            std::cout << tls_not_implemented_error("--ca");
-            return 1;
+        {
+            const uint32_t which = pa.hashes[i];
+            const char* flag = which == fnv1a("--cert") ? "--cert"
+                             : which == fnv1a("--key")  ? "--key"
+                                                        : "--ca";
+            if (instance->get_type() != runtime_server)
+            {
+                std::cout << tls_not_implemented_error(flag);
+                return 1;
+            }
+            if (i + 1 >= pa.count)
+            {
+                std::cout << flag << " requires a file\n";
+                return 1;
+            }
+            const std::string_view path = pa.args[++i];
+            if (which == fnv1a("--cert"))     instance->set_cert_path(path);
+            else if (which == fnv1a("--key")) instance->set_key_path(path);
+            else                              instance->set_ca_path(path);
+            return 0;
+        }
 
         default:
             return -1;

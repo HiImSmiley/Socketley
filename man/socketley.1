@@ -105,19 +105,22 @@ is a high-performance Linux daemon and CLI that manages network runtimes
 (servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
-.B "TLS is not implemented."
-No runtime performs a TLS handshake. The
-.BR \-\-tls ,
-.BR \-\-cert ,
-.BR \-\-key ,
-.BR \-\-ca ,
+.B "TLS terminates on a server listener only."
+A
+.B server
+runtime encrypts its own listening port with
+.BR \-\-tls " " \-\-cert " " \-\-key ,
+and verifies client certificates with
+.BR \-\-ca .
+No other role performs a handshake: a client runtime's outbound socket, a
+proxy's backend leg and the mesh
 .BR \-\-client\-ca ,
-.BR \-\-client\-cert
+.B \-\-client\-cert
 and
 .B \-\-client\-key
-flags are rejected with exit status 1, and a runtime carrying any of them
+options are rejected with exit status 1, and a runtime carrying any of them
 (for example one restored from a state file written by an older release)
-refuses to start. See
+refuses to start rather than running in cleartext. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -356,20 +359,29 @@ and every cache flag \(em is refused with
 and exit status 1; change those through the editor or
 .BR import ,
 which reach the full field set.
-The TLS flags are the exception to that wording: editing is the usual way to
-put encryption on something already running, so
+The TLS flags are the exception to that wording. Editing is the usual way to
+put encryption on something already running, so on a
+.B server
+runtime
 .BR \-\-tls ,
 .BR \-\-cert ,
-.BR \-\-key ,
-.BR \-\-ca ,
-and on a proxy
+.B \-\-key
+and
+.B \-\-ca
+are accepted here and take effect at the runtime's next start. An edit that
+would leave the set incomplete \(em a certificate with no
+.BR \-\-tls ,
+.B \-\-tls
+with no key pair \(em is refused and changes nothing, so a mistyped flag
+cannot leave a runtime half-configured.
+On any other runtime type, and for the proxy's
 .BR \-\-client\-ca ,
 .B \-\-client\-cert
 and
 .BR \-\-client\-key ,
-are refused with the same message
+they are refused with the same message
 .B create
-gives \(em TLS transport is not implemented \(em rather than
+gives \(em no handshake exists behind them \(em rather than
 .BR "unknown flag" .
 Exit status is 1 either way; only the reason differs. See
 .BR LIMITATIONS .
@@ -446,10 +458,10 @@ rate_limit	number	Messages/sec per connection (0 = unlimited)
 global_rate_limit	number	Messages/sec across all connections (0 = unlimited)
 idle_timeout	number	Close idle connections after N seconds (0 = disabled)
 drain	bool	Graceful shutdown (flush writes before close)
-tls	bool	\fB(rejected)\fR TLS is not implemented
-cert_path	string	\fB(rejected)\fR TLS is not implemented
-key_path	string	\fB(rejected)\fR TLS is not implemented
-ca_path	string	\fB(rejected)\fR TLS is not implemented
+tls	bool	Terminate TLS on the listener \fB(server only)\fR
+cert_path	string	PEM certificate \fB(server only, needs tls)\fR
+key_path	string	PEM private key \fB(server only, needs tls)\fR
+ca_path	string	Client CA for mutual TLS \fB(server only, needs tls)\fR
 target	string	Client target host:port \fB(requires restart)\fR
 cache_name	string	Connected cache runtime name
 group	string	Group tag for dynamic proxy discovery
@@ -697,12 +709,39 @@ but flushes all pending write queues before closing connections.
 .BI "\-\-key " "file"
 .TQ
 .BI "\-\-ca " "file"
-.B "Not implemented \(em rejected."
-These flags exist only to be refused. No runtime performs a TLS handshake,
-so accepting them would produce a listener serving cleartext on a port that
-.B socketley inspect
-describes as encrypted. Each exits with status 1 and a message naming the
-flag. See
+.B "Server runtimes only."
+Terminate TLS on this runtime's own listening port.
+.B \-\-tls
+turns encryption on and requires both
+.BI \-\-cert " file"
+(a PEM certificate, chain allowed) and
+.BI \-\-key " file"
+(its PEM private key).
+.BI \-\-ca " file"
+additionally enables mutual TLS: a client must then present a certificate
+signed by that CA, and one that does not is rejected during the handshake.
+.PP
+Certificates are read when the runtime starts, so
+.B reload
+is how a renewed certificate is installed. A certificate that cannot be
+loaded, a key that does not match it, and any incomplete combination
+(\c
+.B \-\-tls
+without a key pair, a key pair without
+.BR \-\-tls )
+are refused: the runtime goes to the
+.B failed
+state and nothing binds the port. There is no fallback to cleartext on any
+path.
+.PP
+On a
+.BR client ", " proxy " or " cache
+runtime these flags are rejected with exit status 1 \(em nothing there
+performs a handshake. They are also refused on a server combined with
+.B \-\-udp
+(that would need DTLS) or with
+.B \-\-upstream
+(the upstream leg would still dial in cleartext). See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -2050,6 +2089,16 @@ allows it and answered
 .B 504 Gateway Timeout
 otherwise.
 .PP
+The deadline covers the handshake as well as the answer: a backend that
+never completes its connect inside it is answered
+.B 504 Gateway Timeout
+too, rather than the client being closed without a response. A request
+routed through an
+.B @group
+backend is charged to the member it actually reached, so a group member
+that stalls is taken out of rotation by the same breaker as a listed
+backend.
+.PP
 The deadline is on by default and only covers the wait for the first
 byte, so a large or streaming response body is unaffected. An endpoint
 that legitimately needs more than 2 seconds to start answering has to be
@@ -2361,20 +2410,43 @@ socketley create cache leader -p 9000 -s
 socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
 .fi
 .PP
-Encrypted server \(em not supported. TLS is not implemented, and the flags
-below are rejected rather than silently ignored:
+Encrypted server. The listener terminates TLS itself; everything above it \(em
+line protocol, HTTP, WebSocket, RESP \(em runs on the decrypted stream, so
+this same runtime serves
+.B https://
+and
+.B wss://
+on the one port:
 .PP
 .nf
-socketley create server secure -p 9000 \\
+socketley create server secure -p 9443 \\
     --tls --cert server.pem --key server-key.pem -s
-# --tls: TLS transport is not implemented -- no runtime performs a
-#        handshake, so this would serve cleartext on a port reported
-#        as encrypted
-# exit status 1
+curl --cacert server.pem https://localhost:9443/
 .fi
 .PP
-Put a TLS terminator (nginx, HAProxy, stunnel) in front and have it forward
-to a socketley listener on loopback.
+Mutual TLS \(em a client must present a certificate signed by the given CA:
+.PP
+.nf
+socketley create server mtls -p 9443 \\
+    --tls --cert server.pem --key server-key.pem \\
+    --ca trusted-clients.pem -s
+.fi
+.PP
+Renewing a certificate: the files are read at start, so
+.B reload
+picks up a new one.
+.PP
+.nf
+socketley reload secure
+.fi
+.PP
+An incomplete configuration is refused rather than served in the clear:
+.PP
+.nf
+socketley create server oops -p 9443 --tls --cert server.pem
+# --tls: a TLS listener needs --key <file> to go with --cert
+# exit status 1
+.fi
 .PP
 Graceful shutdown (drain pending writes):
 .PP
@@ -2483,8 +2555,10 @@ socketley create proxy gateway -p 8080 \\
     \-\-retry 3 \-\-circuit\-threshold 10 -s
 .fi
 .PP
-Proxy with mTLS \(em not supported. Every one of these flags is rejected;
-the proxy speaks plaintext to clients and to backends:
+Proxy with mTLS \(em not supported. TLS terminates on a
+.B server
+listener only; a proxy speaks plaintext to clients and to backends, so every
+one of these flags is rejected rather than stored:
 .PP
 .nf
 socketley create proxy secure \-p 8443 \\
@@ -2492,7 +2566,7 @@ socketley create proxy secure \-p 8443 \\
     \-\-client\-ca trusted\-clients.pem \\
     \-\-client\-cert backend\-client.pem \-\-client\-key backend\-client\-key.pem \\
     \-\-backend 10.0.0.1:9000 -s
-# --tls: TLS transport is not implemented -- ...
+# --tls: TLS transport is not implemented for this runtime -- ...
 # exit status 1
 .fi
 .PP
@@ -2921,7 +2995,7 @@ All boilerplate (event loop, runtime manager, signal handling) is internal.
 server(uint16_t port)
 
 // Config (all return server& for chaining)
-tls(cert, key)         // NOT IMPLEMENTED - sets fields, no handshake
+tls(cert, key)         // terminates TLS on this listener
 max_connections(n)     rate_limit(r)
 global_rate_limit(r)   idle_timeout(s)       lua(path)
 mode(m)                udp()                 http_dir(path)
@@ -2952,7 +3026,7 @@ loop()     -> event_loop&
 client(string_view host, uint16_t port)
 
 // Config
-tls()  tls_ca(ca)  // NOT IMPLEMENTED - set fields, no handshake
+tls()  tls_ca(ca)  // NOT IMPLEMENTED - a client dials in cleartext
 reconnect(max)     mode(m)            udp()
 lua(path)          tick_interval(ms)
 
@@ -2973,7 +3047,7 @@ proxy(uint16_t port)
 
 // Config
 backend(addr)      strategy(s)        protocol(p)
-tls(cert, key)     // NOT IMPLEMENTED - sets fields, no handshake
+tls(cert, key)     // NOT IMPLEMENTED - refused, no handshake here
 max_connections(n) idle_timeout(s)
 lua(path)          group(g)
 
@@ -2989,7 +3063,7 @@ cache(uint16_t port)
 // Config
 persistent(path)   max_memory(bytes)   eviction(policy)
 resp()             mode(m)
-tls(cert, key)     // NOT IMPLEMENTED - sets fields, no handshake
+tls(cert, key)     // NOT IMPLEMENTED - refused, no handshake here
 max_connections(n) idle_timeout(s)     replicate(target)
 lua(path)          group(g)
 
@@ -3108,8 +3182,8 @@ set_on_tick(function<void(double dt_ms)>)
 .nf
 set_port(uint16_t)            set_event_loop(event_loop*)
 set_runtime_manager(mgr*)     set_cache_name(string_view)
-// set_tls / set_cert_path / set_key_path / set_ca_path store their
-// argument and nothing reads it: NOT IMPLEMENTED, no handshake.
+// set_tls / set_cert_path / set_key_path / set_ca_path are honoured
+// on a server runtime and refused on every other type (see LIMITATIONS).
 set_max_connections(uint32_t)
 set_rate_limit(double)        set_idle_timeout(uint32_t)
 set_log_file(string_view)     set_group(string_view)
@@ -3296,9 +3370,33 @@ Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route
 from pushed data the way the proxy now does.
 .SS TLS
-.B "TLS transport is not implemented."
-No runtime \(em server, client, proxy or cache \(em performs a TLS handshake.
-The OpenSSL wrapper in the source tree is not wired into any I/O path.
+.B "One role terminates TLS: a server runtime's own listener."
+Created with
+.BR "\-\-tls \-\-cert " file " \-\-key " file ,
+a
+.B server
+accepts, handshakes and moves records itself. OpenSSL never touches the
+socket: each connection gets a memory BIO pair, the ciphertext is carried in
+and out by the same io_uring submissions as every other byte in the daemon,
+and the handshake advances one completion at a time so nothing blocks the
+event loop. Protocol detection, WebSocket, HTTP and RESP all run on the
+decrypted stream, so
+.B wss://
+and
+.B https://
+work on a listener configured this way.
+.BI \-\-ca " file"
+adds mutual TLS \(em a client must present a certificate signed by that CA.
+.PP
+.B "Nothing else does."
+A client runtime's outbound socket, a proxy's leg to its backends and the
+mesh client-certificate options have no handshake behind them, and their
+flags are refused rather than stored. Two server combinations are refused
+for the same reason:
+.B \-\-udp
+(DTLS is not implemented) and
+.B \-\-upstream
+(the upstream connection would still be made in cleartext).
 .PP
 One outbound exception exists and is not transport:
 .B socketley.http()
@@ -3308,8 +3406,8 @@ name verified and TLS 1.2 as the minimum version (see
 That is a client call a script makes; it encrypts nothing that socketley
 itself serves or forwards.
 .PP
-Earlier releases accepted the TLS flags, stored them, persisted them, showed
-them in
+Earlier releases accepted the TLS flags on every runtime type, stored them,
+persisted them, showed them in
 .BR "socketley inspect" ,
 and then encrypted nothing. A proxy created with
 .B "\-\-tls \-\-cert \-\-key"
@@ -3318,49 +3416,68 @@ and a proxy aimed at an HTTPS backend sent a plaintext request line the
 backend logged as a failed handshake. An operator asking for encryption was
 told they had it.
 .PP
-The flags now fail closed:
+Everything that is not implemented therefore fails closed, and so does every
+configuration that is incomplete:
 .IP \(bu 2
-.BR \-\-tls ", " \-\-cert ", " \-\-key ", " \-\-ca ", " \-\-client\-ca ", "
-.B \-\-client\-cert
-and
-.B \-\-client\-key
-are rejected by
+.BR \-\-tls ", " \-\-cert ", " \-\-key " and " \-\-ca
+on a
+.BR client ", " proxy " or " cache
+runtime, and
+.BR \-\-client\-ca ", " \-\-client\-cert " and " \-\-client\-key
+anywhere, are rejected by
 .B create
 with exit status 1 and a message naming the flag.
 .IP \(bu 2
+on a
+.B server
+runtime the same flags are accepted, but only as a complete set.
+.B \-\-tls
+without a certificate and key, or a certificate without
+.BR \-\-tls ,
+is refused and no runtime is created \(em either would describe a listener
+that could only serve cleartext.
+.IP \(bu 2
 flag-based
 .B edit
-rejects the same flags with the same message. It is a subset of
+applies the same rule, and restores the previous TLS settings if the edit
+would leave them incomplete. It is a subset of
 .BR create ,
 so most flags it does not accept come back as
 .BR "unknown flag" ;
-these do not, because adding TLS to a live runtime is exactly what an
+these do not, because changing TLS on a live runtime is exactly what an
 operator would be attempting.
 .IP \(bu 2
 .B import
-rejects any JSON document that sets the corresponding fields.
+applies the same rule to the JSON document's fields.
 .IP \(bu 2
-.B start
-and
-.B reload
-refuse a runtime that is carrying any of them \(em which is how a runtime
-restored from a state file written by an older release is caught \(em with
-exit status 1. Nothing is brought up.
+.BR start ", " reload
+and the daemon's own boot-time restore refuse a runtime carrying a
+configuration that cannot be honoured \(em which is how one restored from a
+state file written by an older release is caught. Nothing is brought up; the
+runtime goes to
+.BR failed .
+.IP \(bu 2
+a certificate or key that cannot be read, or a key that does not match its
+certificate, fails the runtime at start. The port is never bound.
 .PP
-To clear the settings from such a runtime, dump its configuration, delete the
-TLS fields, and import it back (see
+To clear the settings from a runtime whose configuration is refused, dump it,
+delete the TLS fields, and import it back (see
 .BR import ).
 .PP
-.B "Two paths are not yet gated:"
-a runtime marked
-.B was_running
-in a state file is auto\-started at daemon boot without passing through the
-.B start
-check, and the embedded C++ SDK calls the engine directly rather than through
-the daemon. Both still come up in cleartext if configured with TLS.
+The embedded C++ SDK reaches the same gate: its
+.B start()
+goes through
+.BR runtime_manager::start ,
+so
+.B server().tls(cert, key)
+terminates TLS exactly as the daemon-managed runtime does, and the same
+call on a client, proxy or cache fails the runtime instead of running in
+cleartext.
 .PP
-For encrypted transport today, terminate TLS in a front-end proxy (nginx,
-HAProxy, stunnel) and have it forward to socketley over loopback or an
+For encrypted transport on a
+.BR client ", " proxy " or " cache
+\(em or on a server's upstream connections \(em terminate TLS in a front-end
+proxy (nginx, HAProxy, stunnel) and have it forward over loopback or an
 otherwise trusted network path.
 .SH EXIT STATUS
 .TP

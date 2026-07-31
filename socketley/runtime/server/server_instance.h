@@ -15,9 +15,20 @@
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
+#include "../../shared/tls_context.h"
 #include <linux/time_types.h>
 
 class runtime_manager;
+
+// Where a TLS connection is in its handshake.  A plaintext connection is
+// tls_conn_none and has no SSL at all; there is deliberately no way back from
+// tls_conn_handshake to tls_conn_none, because "give up and carry on in
+// cleartext" is the one outcome a TLS listener must never produce.
+enum tls_conn_state : uint8_t {
+    tls_conn_none      = 0,  // plaintext connection, ssl == nullptr
+    tls_conn_handshake = 1,  // records crossing, no application data yet
+    tls_conn_ready     = 2   // handshake complete, application data flowing
+};
 
 enum proto_state : uint8_t {
     proto_unknown     = 0,
@@ -53,6 +64,29 @@ struct alignas(64) server_connection
     bool http_keep_alive{false};
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
+
+    // === TLS session ===
+    // Non-null only on a listener configured with --tls.  OpenSSL never sees
+    // this socket: the session is fed ciphertext a read completion delivered
+    // and drained of ciphertext that a write submission carries, so nothing
+    // the kernel holds ever names it or its memory BIOs — every byte is copied
+    // into or out of a buffer this struct owns before any SQE is built.
+    //
+    // Who may free this: this struct, and nothing else.  It is released in
+    // pool_release() on the way back to the pool, in reset() as a second line
+    // of defence for a struct coming back out, and in ~server_connection for
+    // one that reaches neither because the runtime stopped with its
+    // completions still outstanding.  Because no completion can name the
+    // session, freeing it never has to wait on the ring — unlike the write
+    // batch and the file buffer beside it.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    // The peer's close_notify, remembered rather than acted on.  The read that
+    // carries it can carry the last request ahead of it, and marking the
+    // connection closing before that request is parsed answers it with a
+    // dropped connection; handle_read applies this once the parse is done.
+    bool tls_peer_closed{false};
+
     io_request read_req;
     io_request write_req;
 
@@ -157,6 +191,11 @@ struct alignas(64) server_connection
         free(file_buf);
         if (file_fd >= 0)        close(file_fd);
         if (splice_file_fd >= 0) close(splice_file_fd);
+        // The session, for a struct that never reached pool_release() — a
+        // retired connection whose completion was dropped when the runtime
+        // stopped.  Safe here for the same reason it is safe anywhere: no
+        // submission ever named it.
+        tls_context::free_ssl(ssl);
     }
 
     server_connection() = default;
@@ -169,6 +208,14 @@ struct alignas(64) server_connection
         fd = new_fd;
         fixed_idx = -1;
         direct_fd = false;
+        // pool_release() already did this; repeated here because a struct
+        // leaving the pool must not carry the previous connection's session
+        // under any circumstances, and this is the last point at which that
+        // can still be true.
+        tls_context::free_ssl(ssl);
+        ssl = nullptr;
+        tls_state = tls_conn_none;
+        tls_peer_closed = false;
         read_req = {};
         write_req = {};
         write_queue.clear();
@@ -493,6 +540,38 @@ private:
     void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                  bool even_when_closing = false);
     void flush_write_queue(server_connection* conn);
+
+    // ── TLS record layer ────────────────────────────────────────────────────
+    // OpenSSL does no I/O here.  These two move bytes between a connection's
+    // memory BIO pair and the buffers io_uring reads into and writes out of,
+    // so the handshake happens one completion at a time and nothing blocks the
+    // event loop.  Everything above them — protocol detection, WebSocket,
+    // HTTP, RESP, Lua — sees the same plaintext it always did.
+
+    // Ciphertext a read completion delivered, in.  Drives the handshake while
+    // one is running and appends whatever plaintext comes out to conn->partial.
+    // Marks the connection closing on anything terminal (a failed handshake, a
+    // buffer cap exceeded, a broken record); a peer's orderly close_notify
+    // lands in tls_peer_closed instead, so the request it arrived with is
+    // still answered.  There is no path from here back to plaintext.
+    void tls_feed(server_connection* conn, const char* data, size_t len);
+
+    // Plaintext queue → SSL → one write submission of ciphertext, and the only
+    // thing that puts handshake records or alerts on the wire.  Submits at most
+    // one write, exactly as the cleartext path does; the rest waits for that
+    // completion.
+    void tls_flush(server_connection* conn);
+
+    // Has this connection bytes to send that the ring has not been given?  For
+    // a TLS connection the write queue is only half the answer — a handshake
+    // record or a session ticket sits in the write BIO with the queue empty.
+    bool conn_has_output(const server_connection* conn) const;
+
+    // The listener's TLS context, or null when this server serves cleartext.
+    // Rebuilt by setup() on every start so that `reload` is how a renewed
+    // certificate is installed; sessions already handed out hold their own
+    // reference to the old SSL_CTX and are unaffected.
+    std::unique_ptr<tls_context> m_tls;
     void submit_conn_read(server_connection* conn);
     void release_fixed_slot(server_connection* conn);
 

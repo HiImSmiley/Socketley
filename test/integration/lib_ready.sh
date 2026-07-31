@@ -106,6 +106,40 @@ sys.exit(1)
 PY
 }
 
+# ready_tls HOST PORT CAFILE [SERVERNAME] [TIMEOUT_S]
+#
+# A TLS handshake completes and the server's certificate verifies against
+# CAFILE.  "nc -z" is worth even less against a TLS listener than against a
+# plain one: the socket is accepted before a single record has crossed, and
+# the handshake it then has to complete is spread over several io_uring
+# completions.  A test that starts measuring at "connected" is measuring
+# against a listener that has not yet proved it can terminate anything.
+#
+# Verification is part of the check on purpose.  An unverified handshake would
+# also succeed against a listener serving the wrong certificate, which is one
+# of the two ways this feature can be wrong in a way nobody notices.
+ready_tls() {
+    local host=$1 port=$2 cafile=$3 servername=${4:-localhost} timeout=${5:-15}
+    python3 - "$host" "$port" "$cafile" "$servername" "$timeout" <<'PY'
+import socket, ssl, sys, time
+host, port, cafile, servername, timeout = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5]))
+ctx = ssl.create_default_context(cafile=cafile)
+ctx.check_hostname = True
+deadline = time.time() + timeout
+while time.time() < deadline:
+    try:
+        with socket.create_connection((host, port), 0.5) as raw:
+            with ctx.wrap_socket(raw, server_hostname=servername) as tls:
+                if tls.version():
+                    sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(0.05)
+sys.exit(1)
+PY
+}
+
 # ready_resp HOST PORT [TIMEOUT_S]
 #
 # A cache answers PING with +PONG.  Proves the RESP path is up, not merely the

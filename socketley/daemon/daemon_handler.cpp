@@ -32,17 +32,22 @@
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 
-// The TLS options a runtime is carrying, or nullptr if it is carrying none.
+// Why this runtime's TLS configuration cannot be honoured, or an empty string
+// if it can.
 //
-// The parse gate in flag_handlers.cpp stops these being set by `create`, but an
-// instance can also be configured from a state file written before the gate
-// existed, so the check is repeated wherever a runtime is about to go live.
-// Without it a state file from an older daemon still brings up a listener that
-// answers cleartext on a port `inspect` describes as encrypted.
-static const char* instance_tls_option(const runtime_instance* inst)
+// The parse gate in flag_handlers.cpp stops the unsupported options being set
+// by `create`, but an instance can also be configured from a state file written
+// before that gate existed, so the check is repeated wherever a runtime is
+// about to go live.  Without it a state file from an older daemon still brings
+// up a listener that answers cleartext on a port `inspect` describes as
+// encrypted.
+//
+// A server runtime terminates TLS on its own listener, so a complete server
+// configuration passes; every other role is still refused.  See tls_context.h.
+static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
-        return nullptr;
+        return {};
 
     std::string_view mesh_ca, mesh_cert, mesh_key;
     if (inst->get_type() == runtime_proxy)
@@ -53,9 +58,10 @@ static const char* instance_tls_option(const runtime_instance* inst)
         mesh_key  = mesh.client_key;
     }
 
-    return tls_requested_option(inst->get_tls(), inst->get_cert_path(),
-                                inst->get_key_path(), inst->get_ca_path(),
-                                mesh_ca, mesh_cert, mesh_key);
+    return tls_config_refusal(inst->get_type() == runtime_server,
+                              inst->get_tls(), inst->get_cert_path(),
+                              inst->get_key_path(), inst->get_ca_path(),
+                              mesh_ca, mesh_cert, mesh_key);
 }
 
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
@@ -775,6 +781,20 @@ int daemon_handler::cmd_create(const parsed_args& pa)
         }
     }
 
+    // The TLS options are checked as a set, once every flag has been seen.
+    // Individually they are meaningless — --tls says nothing about whether a
+    // certificate was also given, and the flag that completes the set may come
+    // later on the command line — so this is the first point at which the
+    // question can be answered.  Refusing here rather than at the next start
+    // keeps the runtime from being created at all, which is what an operator
+    // who mistyped one flag of three wants.
+    if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
     if (autostart && !instance->get_test_mode())
     {
         if (!m_manager.start(name, m_loop))
@@ -842,9 +862,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // Refuse to bring up a listener that would serve cleartext under a
             // configuration promising encryption.  Reached by runtimes restored
             // from a state file written before TLS was gated at parse time.
-            if (const char* opt = instance_tls_option(inst))
+            if (const std::string msg = instance_tls_refusal(inst); !msg.empty())
             {
-                conn->write_buf += std::string(n) + ": " + tls_not_implemented_error(opt);
+                conn->write_buf += std::string(n) + ": " + msg;
                 ++failed;
                 continue;
             }
@@ -2115,6 +2135,16 @@ int daemon_handler::cmd_edit(const parsed_args& pa)
     runtime_type type = instance->get_type();
     bool is_running = instance->get_state() == runtime_running;
 
+    // What the runtime's TLS configuration was before this edit.  The flags
+    // are applied one at a time as they are parsed, but they only mean
+    // anything as a set — and a set that comes out incomplete has to leave no
+    // trace, or an operator who mistyped `--key` is left with a runtime whose
+    // in-memory configuration no longer matches its state file.
+    const bool        tls_before  = instance->get_tls();
+    const std::string cert_before(instance->get_cert_path());
+    const std::string key_before(instance->get_key_path());
+    const std::string ca_before(instance->get_ca_path());
+
     for (size_t i = 2; i < pa.count; ++i)
     {
         int result = parse_common_edit_flags(instance, pa, i, is_running);
@@ -2148,6 +2178,16 @@ int daemon_handler::cmd_edit(const parsed_args& pa)
 
         if (result > 0)
             return result;
+    }
+
+    if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
+    {
+        instance->set_tls(tls_before);
+        instance->set_cert_path(cert_before);
+        instance->set_key_path(key_before);
+        instance->set_ca_path(ca_before);
+        std::cout << msg;
+        return 1;
     }
 
     if (m_persistence)
@@ -2220,21 +2260,24 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // Same refusal as the create path: a config carrying TLS is rejected before
-    // anything is applied or written back to the state file.  Note the check is
-    // on what the incoming JSON *sets* — a config that omits the TLS fields is
-    // accepted, which is how an operator clears them from a runtime restored
-    // out of an older state file (dump, drop the fields, import).
-    if (const char* opt = tls_requested_option(cfg.tls, cfg.cert_path, cfg.key_path,
-                                               cfg.ca_path, cfg.mesh_client_ca,
-                                               cfg.mesh_client_cert, cfg.mesh_client_key))
-    {
-        conn->write_buf = tls_not_implemented_error(opt);
-        return 1;
-    }
-
     bool is_running = instance->get_state() == runtime_running;
     runtime_type type = instance->get_type();
+
+    // Same gate as the create path: a config carrying TLS this build cannot
+    // honour is rejected before anything is applied or written back to the
+    // state file.  Note the check is on what the incoming JSON *sets* — a
+    // config that omits the TLS fields is accepted, which is how an operator
+    // clears them from a runtime restored out of an older state file (dump,
+    // drop the fields, import).
+    if (const std::string msg = tls_config_refusal(type == runtime_server,
+                                                   cfg.tls, cfg.cert_path, cfg.key_path,
+                                                   cfg.ca_path, cfg.mesh_client_ca,
+                                                   cfg.mesh_client_cert, cfg.mesh_client_key);
+        !msg.empty())
+    {
+        conn->write_buf = msg;
+        return 1;
+    }
 
     // Handle rename
     std::string old_name(name);
@@ -2460,9 +2503,9 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         // reload is a stop followed by a start, so it is a start: refuse
         // before touching the runtime rather than tearing it down and
         // bringing it back up in cleartext.
-        if (const char* opt = instance_tls_option(inst))
+        if (const std::string msg = instance_tls_refusal(inst); !msg.empty())
         {
-            conn->write_buf += std::string(n) + ": " + tls_not_implemented_error(opt);
+            conn->write_buf += std::string(n) + ": " + msg;
             ++refused;
             continue;
         }

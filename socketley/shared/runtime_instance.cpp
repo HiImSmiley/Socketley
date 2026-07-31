@@ -135,15 +135,21 @@ bool runtime_instance::start(event_loop& loop)
     // us which.  Erring towards "armed" costs a retired object; erring the
     // other way costs the daemon.
     // Last gate before anything is armed, and the only one the daemon's own
-    // restore path also passes through: the flag handlers refuse TLS at create
-    // time, but a state file written before that gate existed carries
-    // was_running and is auto-started at boot without going near them.  Serving
-    // cleartext on a port the operator asked to encrypt — and which inspect
-    // still reports as encrypted — is worse than refusing to come up.
-    if (const char* opt = tls_requested_option(get_tls(), get_cert_path(), get_key_path(),
-                                               get_ca_path(), {}, {}, {}))
+    // restore path also passes through: the flag handlers refuse the TLS
+    // options they cannot honour at create time, but a state file written
+    // before that gate existed carries was_running and is auto-started at boot
+    // without going near them.  Serving cleartext on a port the operator asked
+    // to encrypt — and which inspect still reports as encrypted — is worse than
+    // refusing to come up.
+    //
+    // A server runtime is the one role that terminates TLS, so a complete
+    // server configuration passes here and is honoured by server_instance's
+    // setup().  Everything else is still refused; see tls_context.h.
+    if (const std::string msg = tls_config_refusal(get_type() == runtime_server,
+                                                   get_tls(), get_cert_path(),
+                                                   get_key_path(), get_ca_path());
+        !msg.empty())
     {
-        const std::string msg = tls_not_implemented_error(opt);
         LOG_ERROR(msg.c_str());
         m_state.store(runtime_failed, std::memory_order_release);
         return false;

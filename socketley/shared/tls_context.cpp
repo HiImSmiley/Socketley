@@ -16,38 +16,74 @@
 #include <cstring>
 #include <iostream>
 
-// ─── TLS refusal gate ───
-// See the header for why these exist.  They deliberately live next to the
-// unused OpenSSL wrapper: whoever wires the handshake up will be reading this
-// file, and deleting the gate is part of that work.
-
-const char* tls_requested_option(bool tls,
-                                 std::string_view cert_path,
-                                 std::string_view key_path,
-                                 std::string_view ca_path,
-                                 std::string_view mesh_client_ca,
-                                 std::string_view mesh_client_cert,
-                                 std::string_view mesh_client_key)
-{
-    // Order matters only for the error message: report the flag the operator
-    // most likely typed first.
-    if (tls)                        return "--tls";
-    if (!cert_path.empty())         return "--cert";
-    if (!key_path.empty())          return "--key";
-    if (!ca_path.empty())           return "--ca";
-    if (!mesh_client_ca.empty())    return "--client-ca";
-    if (!mesh_client_cert.empty())  return "--client-cert";
-    if (!mesh_client_key.empty())   return "--client-key";
-    return nullptr;
-}
+// ─── TLS configuration gate ───
+// See the header for what this build honours and what it still refuses.  It
+// deliberately lives next to the OpenSSL wrapper: whoever wires up the next
+// role — the proxy's backend leg, a client runtime's outbound socket — will be
+// reading this file, and narrowing the gate is part of that work.
 
 std::string tls_not_implemented_error(std::string_view option)
 {
     std::string msg(option);
-    msg += ": TLS transport is not implemented -- no runtime performs a "
-           "handshake, so this would serve cleartext on a port reported as "
-           "encrypted\n";
+    msg += ": TLS transport is not implemented for this runtime -- only a "
+           "server runtime's own listener performs a handshake, so this would "
+           "run in cleartext on an endpoint reported as encrypted\n";
     return msg;
+}
+
+std::string tls_config_refusal(bool is_server_listener,
+                               bool tls,
+                               std::string_view cert_path,
+                               std::string_view key_path,
+                               std::string_view ca_path,
+                               std::string_view mesh_client_ca,
+                               std::string_view mesh_client_cert,
+                               std::string_view mesh_client_key)
+{
+    // Mesh mTLS configures the proxy's *backend* connections.  Nothing dials
+    // one over TLS whatever runtime is holding the option, so these are
+    // refused before the per-role question is even asked.
+    if (!mesh_client_ca.empty())    return tls_not_implemented_error("--client-ca");
+    if (!mesh_client_cert.empty())  return tls_not_implemented_error("--client-cert");
+    if (!mesh_client_key.empty())   return tls_not_implemented_error("--client-key");
+
+    if (!tls && cert_path.empty() && key_path.empty() && ca_path.empty())
+        return {};   // no TLS asked for, nothing to refuse
+
+    if (!is_server_listener)
+    {
+        // Order matters only for the message: name the flag the operator most
+        // likely typed.
+        if (tls)                 return tls_not_implemented_error("--tls");
+        if (!cert_path.empty())  return tls_not_implemented_error("--cert");
+        if (!key_path.empty())   return tls_not_implemented_error("--key");
+        return tls_not_implemented_error("--ca");
+    }
+
+#if !SOCKETLEY_HAS_TLS
+    return "--tls: this binary was built without the OpenSSL development "
+           "headers, so it has no record layer to serve a TLS listener with\n";
+#else
+    // A listener that terminates TLS needs something to terminate it with.
+    // Half a configuration is refused rather than half-honoured, in both
+    // directions: --tls without a key pair could only ever fall back to
+    // cleartext, and a certificate without --tls is an operator who believes
+    // the port is encrypted and has not turned it on.
+    if (!tls)
+    {
+        std::string msg(!cert_path.empty() ? "--cert"
+                      : !key_path.empty()  ? "--key"
+                                           : "--ca");
+        msg += ": needs --tls as well -- on its own it configures a "
+               "certificate for a listener that would still accept cleartext\n";
+        return msg;
+    }
+    if (cert_path.empty())
+        return "--tls: a TLS listener needs --cert <file> and --key <file>\n";
+    if (key_path.empty())
+        return "--tls: a TLS listener needs --key <file> to go with --cert\n";
+    return {};
+#endif
 }
 
 tls_context::tls_context() = default;

@@ -4,17 +4,26 @@ A high-performance Linux daemon and CLI that manages network runtimes (servers, 
 
 **[Documentation](https://hiimsmiley.github.io/Socketley/)**
 
-> **TLS is not implemented.** This line used to list TLS as a feature and the
-> feature list below promised "optional encryption for all runtime types". There
-> is no TLS transport in this codebase: no runtime performs a handshake, and the
-> OpenSSL wrapper in `socketley/shared/tls_context.cpp` is not driven by
-> anything. The `--tls`, `--cert`, `--key`, `--ca`, `--client-ca`,
-> `--client-cert` and `--client-key` flags therefore **fail closed** — they are
-> refused when you set them and again before a runtime with them starts, and a
-> runtime configured with any of them goes to the `failed` state instead of
-> listening. That is deliberate: a flag that errors out costs you an afternoon,
-> a flag that silently serves cleartext on a port you were told was encrypted is
-> a breach. Do not put socketley on an untrusted network expecting encryption.
+> **TLS: server listeners only.** A `server` runtime terminates TLS on its own
+> port — accept, handshake and record layer all driven by the io_uring event
+> loop, with OpenSSL behind a memory BIO pair so it never touches a socket.
+> Everything above it runs on the decrypted stream, so one listener serves
+> `https://` and `wss://` too. `--ca` adds mutual TLS.
+>
+> **No other role has a handshake behind it.** A client runtime's outbound
+> socket, a proxy's leg to its backends, and the mesh `--client-*` options are
+> all still cleartext, so those flags **fail closed** — refused when you set
+> them, refused again before the runtime starts. So is any incomplete server
+> configuration (`--tls` with no key pair, a certificate with no `--tls`, a key
+> that does not match its certificate): the runtime goes to `failed` and the
+> port is never bound. A flag that errors out costs you an afternoon; a flag
+> that silently serves cleartext on a port you were told was encrypted is a
+> breach.
+
+```bash
+socketley create server secure -p 9443 --tls --cert server.pem --key server-key.pem -s
+curl --cacert server.pem https://localhost:9443/
+```
 
 ## About Me and the Project
 
@@ -76,7 +85,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Master mode**:One client claims master, broadcasts to all; optional forwarding
 - **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
-- **TLS/SSL**:*Not implemented.* The flags exist and are refused — see the note at the top
+- **TLS/SSL**:Server listeners terminate TLS (incl. mutual TLS); every other role is refused — see the note at the top
 - **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
 - **io_uring**:Multishot accept, SQPOLL, provided buffers, writev coalescing
 - **State persistence**:Runtime configs saved as JSON, auto-restored on daemon restart
@@ -314,7 +323,7 @@ bash test/benchmark/run_all.sh
 
 - Linux 5.19+ (for io_uring multishot accept)
 - liburing-dev
-- libssl-dev (WebSocket handshake hashing; the TLS wrapper also links against it, but see the TLS note above)
+- libssl-dev (TLS on server listeners, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
 
 ### Toolchain
