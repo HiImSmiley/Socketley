@@ -375,6 +375,12 @@ public:
     void set_strategy(proxy_strategy s);
     void set_runtime_manager(runtime_manager* mgr);
 
+    // The manager's name/group → endpoint snapshot.  This is the only thing the
+    // proxy needs to know about the other runtimes in the daemon, and it
+    // arrives as data rather than as a pointer it may dereference — see
+    // shared/endpoint_table.h for what that buys.
+    void set_endpoints(std::shared_ptr<const endpoint_table> tbl) override;
+
     proxy_protocol get_protocol() const;
     proxy_strategy get_strategy() const;
     const std::vector<backend_info>& get_backends() const;
@@ -558,6 +564,12 @@ private:
     proxy_strategy m_strategy = strategy_round_robin;
     std::vector<backend_info> m_backends;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
+
+    // The last snapshot the manager published.  Immutable, shared with every
+    // other runtime holding the same one, and read on the connection path with
+    // no lock — which is the point.  Null until the first publish, which the
+    // manager does before it starts anything.
+    std::shared_ptr<const endpoint_table> m_endpoints;
 
     // ─── Retired I/O ───────────────────────────────────────────────────────
     //

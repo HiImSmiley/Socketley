@@ -30,18 +30,35 @@ bool runtime_manager::create(runtime_type type, std::string_view name)
         return false;
 
     runtimes.emplace(std::string(name), std::move(instance));
+    lock.unlock();
+
+    // A name that can be routed to exists now, even if it has no port yet.
+    publish_endpoints();
     return true;
 }
 
 bool runtime_manager::start(std::string_view name, event_loop& loop)
 {
-    std::shared_lock lock(mutex);
+    // Before, because a proxy resolves its backends inside setup(): the table
+    // has to be in its hands by the time start() below reaches that code.
+    publish_endpoints();
 
-    auto it = runtimes.find(name);
-    if (it == runtimes.end())
-        return false;
+    bool started = false;
+    {
+        std::shared_lock lock(mutex);
 
-    return it->second->start(loop);
+        auto it = runtimes.find(name);
+        if (it == runtimes.end())
+            return false;
+
+        started = it->second->start(loop);
+    }
+
+    // And after, because this runtime is now a member others may route to.
+    if (started)
+        publish_endpoints();
+
+    return started;
 }
 
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
@@ -80,6 +97,9 @@ bool runtime_manager::stop(std::string_view name, event_loop& loop)
         }
     }
 
+    // This runtime is no longer a routable group member, nor are any children
+    // that went down with it.  One publish covers the lot.
+    publish_endpoints();
     return true;
 }
 
@@ -264,6 +284,10 @@ bool runtime_manager::remove(std::string_view name)
     }
 
     retire(std::move(inst));
+
+    // The name is free and the endpoint is gone; a proxy still routing to it
+    // would otherwise keep the old port until the next membership change.
+    publish_endpoints();
     return true;
 }
 
@@ -302,6 +326,9 @@ bool runtime_manager::rename(std::string_view old_name, std::string_view new_nam
     runtimes.erase(it);
     instance->set_name(new_name);
     runtimes.emplace(std::string(new_name), std::move(instance));
+    lock.unlock();
+
+    publish_endpoints();
     return true;
 }
 
@@ -404,6 +431,12 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
 
 void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector<cluster_event>& events)
 {
+    // A remote daemon joined, left, or its groups changed — which is exactly
+    // when the remote half of the endpoint table is stale.  Republish before
+    // any Lua runs, so a callback that opens a connection routes on the new
+    // membership rather than the one that just expired.
+    publish_endpoints();
+
     // Snapshot names under read lock — same pattern as dispatch_publish().
     // Re-lookup each name before invoking callbacks so that if a prior callback
     // removed/stopped a runtime, we safely skip it instead of dereferencing
@@ -527,16 +560,54 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 #endif
 }
 
-std::vector<runtime_instance*> runtime_manager::get_by_group(std::string_view group) const
+void runtime_manager::publish_endpoints()
 {
-    std::shared_lock lock(mutex);
-    std::vector<runtime_instance*> result;
-    for (const auto& [_, inst] : runtimes)
+    auto tbl = std::make_shared<endpoint_table>();
+
     {
-        if (inst->get_group() == group && inst->get_state() == runtime_running)
-            result.push_back(inst.get());
+        std::shared_lock lock(mutex);
+        for (const auto& [name, inst] : runtimes)
+        {
+            const uint16_t port = inst->get_port();
+            if (port == 0)
+                continue;
+
+            // By name: no state filter, because this is what a backend given as
+            // a bare runtime name resolves to, and that resolution happens while
+            // the proxy itself is starting — before the target may have.
+            tbl->set_name(name, runtime_endpoint{"127.0.0.1", port});
+
+            // By group: running only, which is what get_by_group() filtered on.
+            // A member that is merely configured has nothing listening.
+            const std::string_view group = inst->get_group();
+            if (!group.empty() && inst->get_state() == runtime_running)
+                tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
+        }
     }
-    return result;
+
+    // Remote members, from the cluster's last scan.  Same filter as
+    // cluster_discovery::get_remote_group(), which this replaces on the
+    // connection path: running, with a port, and reached at the host the remote
+    // daemon advertised.
+    if (m_cluster)
+    {
+        for (const auto& daemon : m_cluster->get_all_daemons())
+        {
+            for (const auto& rt : daemon.runtimes)
+            {
+                if (!rt.group.empty() && rt.state == "running" && rt.port > 0)
+                    tbl->add_to_group(rt.group, runtime_endpoint{rt.host, rt.port});
+            }
+        }
+    }
+
+    // Hand the finished table out.  Immutable from here on, so every runtime
+    // holds the same one and none of them copies it.
+    {
+        std::shared_lock lock(mutex);
+        for (const auto& [_, inst] : runtimes)
+            inst->set_endpoints(tbl);
+    }
 }
 
 const runtime_manager::runtime_map& runtime_manager::list() const

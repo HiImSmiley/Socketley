@@ -10,36 +10,13 @@
 #include <atomic>
 
 #include "runtime_instance.h"
+// runtime_string_hash / runtime_string_equal live here now, with the table
+// whose lookups they exist for.
+#include "endpoint_table.h"
 
 class event_loop;
 class cluster_discovery;
 struct cluster_event;
-
-// Transparent hash for heterogeneous lookup (avoids string copies on find)
-struct runtime_string_hash
-{
-    using is_transparent = void;
-
-    size_t operator()(std::string_view sv) const noexcept
-    {
-        return std::hash<std::string_view>{}(sv);
-    }
-
-    size_t operator()(const std::string& s) const noexcept
-    {
-        return std::hash<std::string_view>{}(s);
-    }
-};
-
-struct runtime_string_equal
-{
-    using is_transparent = void;
-
-    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-};
 
 class runtime_manager
 {
@@ -103,8 +80,17 @@ public:
     void stop_children(std::string_view parent_name, event_loop& loop);
     void remove_children(std::string_view parent_name, event_loop& loop);
 
-    // Group query: return all running instances with the given group tag
-    std::vector<runtime_instance*> get_by_group(std::string_view group) const;
+    // Build the name/group → endpoint snapshot and hand it to every runtime
+    // that asked for one.  EVENT-LOOP THREAD ONLY, like every other push into a
+    // running instance.
+    //
+    // This replaced get_by_group(), which returned live runtime_instance
+    // pointers so that the proxy could read a port off each one — a runtime
+    // reaching into other runtimes, on the connection path, under this mutex.
+    // Call it wherever membership changes: create, start, stop, remove, rename,
+    // and whenever the cluster's view of a remote daemon moves.  Cheap enough
+    // to call on any doubt; there is no path that calls it per request.
+    void publish_endpoints();
 
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);

@@ -22,6 +22,7 @@
 class event_loop;
 class lua_context;
 class runtime_manager;
+class endpoint_table;
 
 class runtime_instance : public io_handler
 {
@@ -216,6 +217,13 @@ public:
     void set_event_loop(event_loop* loop);
     runtime_manager* get_runtime_manager() const;
     event_loop* get_event_loop() const;
+
+    // A new name/group → endpoint snapshot, pushed by the manager whenever
+    // membership changes.  Ignored by default: only the proxy forwards to other
+    // runtimes, and this is the whole of what it needs to know about them — a
+    // host and a port, which is what would arrive over a socket if this runtime
+    // lived in its own process.  See shared/endpoint_table.h.
+    virtual void set_endpoints(std::shared_ptr<const endpoint_table>) {}
 
     // Lua integration
     bool load_lua_script(std::string_view path);

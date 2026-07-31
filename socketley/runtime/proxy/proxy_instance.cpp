@@ -412,6 +412,15 @@ void proxy_instance::clear_backends() { m_backends.clear(); }
 void proxy_instance::set_protocol(proxy_protocol p) { m_protocol = p; }
 void proxy_instance::set_strategy(proxy_strategy s) { m_strategy = s; }
 void proxy_instance::set_runtime_manager(runtime_manager* mgr) { runtime_instance::set_runtime_manager(mgr); }
+
+void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
+{
+    // Straight assignment, on the event-loop thread.  A connection already
+    // being routed keeps the table it started with: the pool it built is a copy
+    // of the endpoints, and the shared_ptr it came from stays alive as long as
+    // anything holds it.
+    m_endpoints = std::move(tbl);
+}
 proxy_protocol proxy_instance::get_protocol() const { return m_protocol; }
 proxy_strategy proxy_instance::get_strategy() const { return m_strategy; }
 const std::vector<backend_info>& proxy_instance::get_backends() const { return m_backends; }
@@ -502,18 +511,18 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return true;
     }
 
-    if (!get_runtime_manager())
+    // A bare runtime name.  This used to call runtime_manager::get() and read
+    // get_port() off the instance it returned; the manager now publishes that
+    // number instead, so nothing here holds a pointer into another runtime.
+    if (!m_endpoints)
         return false;
 
-    auto* inst = get_runtime_manager()->get(b.address);
-    if (!inst)
+    const runtime_endpoint* ep = m_endpoints->find_name(b.address);
+    if (!ep || ep->port == 0)
         return false;
 
-    uint16_t port = inst->get_port();
-    if (port == 0)
-        return false;
-
-    b.resolved_host = "127.0.0.1";
+    b.resolved_host = ep->host;
+    const uint16_t port = ep->port;
     b.resolved_port = port;
     b.cached_addr.sin_family = AF_INET;
     b.cached_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -2616,25 +2625,21 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     {
         if (b.is_group)
         {
-            auto* mgr = get_runtime_manager();
-            if (mgr)
+            // Local and remote members both come out of the published snapshot.
+            // This used to take the manager's mutex here, walk every runtime in
+            // the daemon, and read a port off each matching *instance pointer* —
+            // once per connection, on the connection path, from inside another
+            // runtime's object.  Nothing crossed but a host and a port, which is
+            // what the table carries; the walk and the lock are now done once
+            // per membership change instead of once per connection, and the
+            // proxy no longer needs a manager at all to route.
+            if (m_endpoints)
             {
-                std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
-
-                auto members = mgr->get_by_group(group_name);
-                for (auto* inst : members)
+                const std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+                if (const auto* members = m_endpoints->find_group(group_name))
                 {
-                    uint16_t port = inst->get_port();
-                    if (port > 0)
-                        pool.push_back({"127.0.0.1", port});
-                }
-
-                auto* cd = mgr->get_cluster_discovery();
-                if (cd)
-                {
-                    auto remotes = cd->get_remote_group(group_name);
-                    for (auto& ep : remotes)
-                        pool.push_back({std::move(ep.host), ep.port});
+                    for (const auto& ep : *members)
+                        pool.push_back({ep.host, ep.port});
                 }
             }
         }
