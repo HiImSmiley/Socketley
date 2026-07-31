@@ -419,6 +419,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.group = instance->get_group();
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
+    cfg.out_of_process = instance->is_out_of_process();
     cfg.external_runtime = instance->is_external();
     if (cfg.external_runtime)
     {
@@ -589,6 +590,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_str_field("owner", cfg.owner);
     if (cfg.child_policy != 0)
         append_int_field("child_policy", cfg.child_policy);
+    if (cfg.out_of_process)
+        append_bool_field("out_of_process", true);
     if (cfg.external_runtime)
     {
         append_bool_field("external_runtime", true);
@@ -731,6 +734,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.group = json_get_string(json, "group");
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
+    cfg.out_of_process = json_get_bool(json, "out_of_process");
     cfg.external_runtime = json_get_bool(json, "external_runtime");
     cfg.managed = json_get_bool(json, "managed");
     cfg.exec_path = json_get_string(json, "exec_path");

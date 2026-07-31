@@ -42,6 +42,11 @@ struct runtime_config
     std::string owner;
     int child_policy = 0; // 0 = stop, 1 = remove
 
+    // Out-of-process: the runtime is served by a worker process the daemon
+    // supervises.  Persisted because was_running auto-restart has to bring a
+    // runtime back where it was running, not merely bring it back.
+    bool out_of_process = false;
+
     // External (attach) mode
     bool external_runtime = false;
     bool managed = false;

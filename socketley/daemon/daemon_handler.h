@@ -14,6 +14,8 @@ class event_loop;
 class runtime_manager;
 class state_persistence;
 class cluster_discovery;
+class endpoint_table;
+class proxy_supervisor;
 struct cluster_event;
 
 struct ipc_connection
@@ -148,4 +150,28 @@ private:
     void start_health_timer();
     void start_accept();
     void check_managed_health();
+
+    // ── Out-of-process proxies ──────────────────────────────────────────────
+    // One supervisor per proxy created with --out-of-process, keyed by runtime
+    // name.  Owned here rather than by the instance because the supervisor
+    // outlives a stop: `stop` takes the child down but the runtime stays in the
+    // map, and `start` must bring a new one up against the same record.
+    std::unordered_map<std::string, std::unique_ptr<proxy_supervisor>> m_proxy_workers;
+
+    // Bring the children into line with what the runtime map says.  Called from
+    // the health timer and straight after any command that moves a runtime's
+    // state, so the CLI never has to wait a tick to see the effect.
+    //
+    // Reconciling beats intercepting: a runtime's state is moved from `create
+    // --start`, `start`, `stop`, `remove`, `reload`, an ownership cascade and
+    // the boot-time restore, and a rule applied in one place cannot be
+    // forgotten at the seventh call site.
+    void reconcile_proxy_workers();
+
+    // Drain every worker's control socket so the figures are current.  Called
+    // before the commands that print them.
+    void poll_proxy_workers();
+
+    // Encode the manager's endpoint table and push it to every worker.
+    void publish_endpoints_to_workers(const endpoint_table& tbl);
 };

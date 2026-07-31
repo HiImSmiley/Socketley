@@ -441,6 +441,10 @@ void proxy_instance::set_mesh_client_key(std::string_view path) { m_mesh.client_
 
 size_t proxy_instance::get_connection_count() const
 {
+    // A placeholder for a proxy running in its own process has no clients of
+    // its own; the count it should answer with is the one the worker reported.
+    if (worker_backed())
+        return static_cast<size_t>(m_stat_active_connections.load(std::memory_order_relaxed));
     return m_client_count;
 }
 
@@ -4875,6 +4879,14 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
 
 std::string proxy_instance::get_stats() const
 {
+    // Out-of-process: the text was built by the worker, on the worker's
+    // event-loop thread, walking the connection tables that only that thread
+    // may walk.  Returning it verbatim is what makes `stats` and `inspect`
+    // answer identically on both paths — and rebuilding it here from this
+    // object's own empty containers is precisely the wrong answer.
+    if (worker_backed())
+        return stat_detail_snapshot();
+
     std::string base = runtime_instance::get_stats();
     // Use char buffer for integer formatting to avoid ostringstream overhead in stats path
     char num_buf[32];

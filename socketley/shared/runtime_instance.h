@@ -175,6 +175,48 @@ public:
         return m_stat_detail;
     }
 
+    // ── Figures pushed from a worker process ────────────────────────────────
+    // When a runtime runs in its own process the daemon keeps a placeholder
+    // instance for it — the thing that holds its name, port and state — and the
+    // placeholder has no connections of its own to count.  Its figures arrive
+    // over the control socket instead and land here.
+    //
+    // They land in exactly the fields an off-thread reader already uses, and
+    // that is the point: the metrics endpoint reads m_stat_active_connections
+    // and stat_detail_snapshot() and needs no idea that the runtime is not in
+    // this address space.  A worker is the off-thread reader's case with the
+    // boundary made physical, so it reuses the answer rather than inventing a
+    // second one.
+    void set_worker_stats(std::string detail, uint64_t active)
+    {
+        m_stat_active_connections.store(active, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
+            m_stat_detail = std::move(detail);
+        }
+        // Published after the detail it promises, with a release so a reader
+        // that sees the flag also sees the text.  Setting it first would let
+        // the first `stats` after a worker starts print nothing at all.
+        m_worker_backed.store(true, std::memory_order_release);
+    }
+
+    // True once a worker has reported at least once.  Read by the placeholder's
+    // get_stats()/get_connection_count() to answer from the pushed figures
+    // rather than from its own empty containers.
+    //
+    // An atomic rather than something under m_stat_detail_mutex: this is read
+    // by get_connection_count(), which an in-process proxy calls on its own
+    // accept path, and putting a lock acquisition there would make every
+    // connection pay for a branch that is false in every in-process daemon.
+    bool worker_backed() const
+    {
+        return m_worker_backed.load(std::memory_order_acquire);
+    }
+
+    // Straight to `failed`, for a supervisor that has decided a child is not
+    // coming back.  Not a transition any runtime makes to itself.
+    void mark_failed() { m_state.store(runtime_failed, std::memory_order_release); }
+
     // Lua hot-reload
     bool reload_lua_script();
     std::string_view get_lua_script_path() const;
@@ -207,6 +249,19 @@ public:
     void mark_managed(std::string exec_path);
     bool is_managed() const;
     std::string_view get_exec_path() const;
+
+    // Out-of-process — this instance is a placeholder for a runtime living in a
+    // worker process the daemon supervises.  Distinct from external/managed on
+    // purpose: those describe a foreign program the daemon merely starts and
+    // signals, whereas this one is the same binary on the other end of a
+    // control socket, and it is persisted, inspected and cascaded exactly like
+    // an in-process runtime.  Overloading `external` for it would have made
+    // `inspect` and the state file start describing it as something it is not.
+    //
+    // What it changes here is only that start()/stop() must not touch the ring:
+    // the port is bound in the worker, and the placeholder owns no I/O at all.
+    void mark_out_of_process();
+    bool is_out_of_process() const;
 
     enum class child_policy { stop, remove };
     void set_child_policy(child_policy p);
@@ -305,6 +360,7 @@ private:
     // runtime map exclusively on the event-loop thread.
     mutable std::mutex m_stat_detail_mutex;
     std::string m_stat_detail;
+    std::atomic<bool> m_worker_backed{false};
 
     std::string m_name;
     std::string m_id;
@@ -372,6 +428,7 @@ private:
     bool m_lua_created = false;
     bool m_external = false;
     bool m_managed = false;
+    bool m_out_of_process = false;
     std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;

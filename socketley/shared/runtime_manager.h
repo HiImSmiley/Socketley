@@ -92,6 +92,16 @@ public:
     // to call on any doubt; there is no path that calls it per request.
     void publish_endpoints();
 
+    // Where the table goes besides the in-process runtimes.
+    //
+    // A runtime living in a worker process cannot be handed a shared_ptr, so it
+    // is handed the same table encoded onto its control socket instead.  The
+    // manager does not know that: it calls a sink, and the daemon decides what
+    // that means.  That is the boundary rule applied to the manager itself —
+    // what crosses is the answer, and the thing on the far side may as well be
+    // a socket, because for a worker it is one.
+    void set_endpoint_sink(std::function<void(const endpoint_table&)> sink);
+
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);
 
@@ -105,6 +115,8 @@ private:
     // Takes over an instance that has just left the map.  Called with the map
     // lock released.
     void retire(std::unique_ptr<runtime_instance> inst);
+
+    std::function<void(const endpoint_table&)> m_endpoint_sink;
 
     runtime_map runtimes;
 

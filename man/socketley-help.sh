@@ -471,6 +471,8 @@ flags_options() {
     echo "│                          │ (default: 2, 0 = wait forever)        │"
     echo "│ --retry <n>              │ Retry count on 5xx/connection error   │"
     echo "│ --retry-all              │ Retry all methods (not just idempot.) │"
+    echo "│ --out-of-process         │ Run in a supervised worker process    │"
+    echo "│                          │ (create only; default: in-daemon)     │"
     echo "│ --client-ca <file>       │ REJECTED: mTLS is not implemented     │"
     echo "│ --client-cert <file>     │ REJECTED: mTLS is not implemented     │"
     echo "│ --client-key <file>      │ REJECTED: mTLS is not implemented     │"

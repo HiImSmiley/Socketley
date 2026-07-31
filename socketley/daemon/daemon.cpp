@@ -6,6 +6,7 @@
 #include "../shared/logging.h"
 #include "../shared/paths.h"
 #include "../shared/state_persistence.h"
+#include "../shared/runtime_config_apply.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -136,6 +137,11 @@ static void restore_runtimes(state_persistence& persistence,
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
                                   : runtime_instance::child_policy::stop);
 
+        // A proxy that was created out-of-process comes back out-of-process.
+        // Before start(), which reads it to decide whether to arm anything.
+        if (cfg.out_of_process)
+            instance->mark_out_of_process();
+
         // External (attached) runtimes: mark as external so start() skips io_uring setup
         if (cfg.external_runtime)
         {
@@ -206,35 +212,10 @@ static void restore_runtimes(state_persistence& persistence,
             {
                 auto* prx = static_cast<proxy_instance*>(instance);
                 prx->set_runtime_manager(&manager);
-                prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
-                prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
-                for (const auto& b : cfg.backends)
-                    prx->add_backend(b);
-                // Restore mesh config
-                if (cfg.health_check > 0)
-                    prx->set_health_check(static_cast<mesh_config::health_type>(cfg.health_check));
-                if (cfg.health_interval != 5)
-                    prx->set_health_interval(cfg.health_interval);
-                if (!cfg.health_path.empty())
-                    prx->set_health_path(cfg.health_path);
-                if (cfg.health_threshold != 3)
-                    prx->set_health_threshold(cfg.health_threshold);
-                if (cfg.circuit_threshold != 5)
-                    prx->set_circuit_threshold(cfg.circuit_threshold);
-                if (cfg.circuit_timeout != 30)
-                    prx->set_circuit_timeout(cfg.circuit_timeout);
-                if (cfg.backend_timeout != 2)
-                    prx->set_backend_timeout(cfg.backend_timeout);
-                if (cfg.retry_count > 0)
-                    prx->set_retry_count(cfg.retry_count);
-                if (cfg.retry_all)
-                    prx->set_retry_all(true);
-                if (!cfg.mesh_client_ca.empty())
-                    prx->set_mesh_client_ca(cfg.mesh_client_ca);
-                if (!cfg.mesh_client_cert.empty())
-                    prx->set_mesh_client_cert(cfg.mesh_client_cert);
-                if (!cfg.mesh_client_key.empty())
-                    prx->set_mesh_client_key(cfg.mesh_client_key);
+                // Shared with the proxy worker, which rebuilds a proxy from the
+                // same runtime_config arriving over its control socket.  One
+                // list, so the two cannot drift.
+                apply_proxy_config(*prx, cfg);
                 break;
             }
             case runtime_cache:

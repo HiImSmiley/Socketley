@@ -605,6 +605,14 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
+        // Run this proxy in a worker process the daemon supervises, instead of
+        // inside the daemon.  Off by default: the in-process path is what every
+        // existing deployment is running and what the load figures were taken
+        // against, and this is the first step of the move rather than the end
+        // of it.  Create-time only — see parse_proxy_edit_flags.
+        case fnv1a("--out-of-process"):
+            proxy->mark_out_of_process();
+            return 0;
         // mTLS is TLS: with no handshake anywhere in the proxy these only ever
         // decorated `inspect` output.  Refused for the same reason as --tls.
         case fnv1a("--client-ca"):
@@ -1223,6 +1231,13 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
+        // Refused rather than ignored.  Honouring it would mean moving a
+        // configured runtime from one address space to another underneath
+        // whatever is already pointing at it, and quietly dropping it would
+        // leave the operator believing a proxy is isolated when it is not.
+        case fnv1a("--out-of-process"):
+            std::cout << "--out-of-process can only be set when the proxy is created\n";
+            return 1;
         // The mesh client-certificate flags, refused here as they are on the
         // create path.  They live with the proxy rather than in the common
         // edit handler because that is where they exist at all: a server or

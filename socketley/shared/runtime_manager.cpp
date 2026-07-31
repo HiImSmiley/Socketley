@@ -608,6 +608,18 @@ void runtime_manager::publish_endpoints()
         for (const auto& [_, inst] : runtimes)
             inst->set_endpoints(tbl);
     }
+
+    // And to whatever lives outside this address space.  Outside the lock: the
+    // sink writes to sockets, and holding the runtime map across a write to a
+    // process that may not be reading is how an unrelated runtime ends up
+    // waiting on a proxy's child.
+    if (m_endpoint_sink)
+        m_endpoint_sink(*tbl);
+}
+
+void runtime_manager::set_endpoint_sink(std::function<void(const endpoint_table&)> sink)
+{
+    m_endpoint_sink = std::move(sink);
 }
 
 const runtime_manager::runtime_map& runtime_manager::list() const

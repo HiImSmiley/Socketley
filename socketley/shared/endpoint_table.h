@@ -107,6 +107,14 @@ public:
     size_t name_count()  const { return m_by_name.size(); }
     size_t group_count() const { return m_by_group.size(); }
 
+    // For a reader that has to send the whole table somewhere rather than ask
+    // it questions — the daemon encoding it onto a worker's control socket.
+    // Const throughout: the table is immutable once published, and a caller
+    // able to walk it mutably could change what another runtime is already
+    // routing from.
+    const transparent_map<runtime_endpoint>& names() const { return m_by_name; }
+    const transparent_map<std::vector<runtime_endpoint>>& groups() const { return m_by_group; }
+
 private:
     transparent_map<runtime_endpoint>              m_by_name;
     transparent_map<std::vector<runtime_endpoint>> m_by_group;
