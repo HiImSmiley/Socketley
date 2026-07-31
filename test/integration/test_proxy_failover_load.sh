@@ -53,6 +53,7 @@
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_ready.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-failover-XXXXXX)
@@ -395,8 +396,16 @@ esac
     --backend "127.0.0.1:$BE1,127.0.0.1:$BE2,127.0.0.1:$BE3" --protocol http \
     --health-check tcp --health-interval 1 --health-threshold 2 \
     --circuit-threshold 3 --circuit-timeout 5 --retry 2 -s >/dev/null 2>&1 || true
-for _ in $(seq 1 60); do nc -z 127.0.0.1 $PX 2>/dev/null && break; sleep 0.1; done
-sleep 0.5
+# Not "the port accepts, now wait half a second and hope".  A request that
+# comes back 200 has gone through the proxy, been routed to a backend that
+# passed its health checks, and been answered -- which is what the windows
+# below measure.  With --health-interval 1 --health-threshold 2 a backend is
+# not in rotation for up to two seconds after the listener is armed, and the
+# fixed sleep was shorter than that whenever the machine was busy.
+if ! ready_http 127.0.0.1 $PX "/$NAME/ready" 20; then
+    bad "setup" "the proxy never answered a request on $PX"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; exit "$FAIL"
+fi
 
 if "$BIN" stats $NAME >/dev/null 2>&1; then ok; else
     bad "setup" "the proxy runtime is not up -- everything below is meaningless"

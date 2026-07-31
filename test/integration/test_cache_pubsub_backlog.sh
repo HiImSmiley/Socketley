@@ -13,6 +13,7 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_ready.sh"
 PORT=19320
 NAME=backlogcache
 MSGS="${MSGS:-6000}"
@@ -98,8 +99,9 @@ DAEMON_PID=$!
 sleep 0.5
 
 "$BIN" create cache "$NAME" -p "$PORT" -s >/dev/null 2>&1 || true
-for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.1; done
-sleep 0.3
+# PING/+PONG, not an accepted connection: a cache accepts before it has
+# finished loading and can answer.
+ready_resp 127.0.0.1 "$PORT" 20 || true
 
 OUT=$(timeout 60 python3 "$TMPD/slowsub.py" "$PORT" "$MSGS" 2>&1 || true)
 DELIVERED=$(printf '%s\n' "$OUT" | sed -n 's/^delivered=//p')

@@ -515,6 +515,12 @@ struct world
     // static so that it is created and destroyed with the input, which keeps
     // libFuzzer's malloc/free counts balanced — see observe_once().
     std::string     scratch;
+
+    // Filled by verify_model() for the step it is checking: the keys the model
+    // still held that the store no longer has.  Reset per step, judged by
+    // check_evictable().
+    size_t          victims = 0;
+    int             victim_idx[NKEYS] = {};
 };
 
 bool eviction_active(const world& w)
@@ -687,6 +693,8 @@ void verify_model(world& w, bool evict_possible)
     cache_store& s = w.store;
     size_t model_keys = 0;
 
+    w.victims = 0;
+
     for (int i = 0; i < NKEYS; i++)
     {
         shadow_entry&          e  = w.sh[i];
@@ -710,6 +718,15 @@ void verify_model(world& w, bool evict_possible)
             CACHE_FINDING("key-vanished", evict_possible,
                           "a key disappeared on a step that cannot evict — with no memory limit "
                           "(or no eviction policy) nothing may silently remove a live key");
+
+            // Remember which key went, for check_evictable() after the step.
+            // `evict_possible` on its own says only that eviction was *allowed*
+            // on this step; it says nothing about which keys it was allowed to
+            // take, so a store that discarded a key eviction could never have
+            // chosen satisfied this check as readily as one that behaved.
+            if (w.victims < NKEYS)
+                w.victim_idx[w.victims++] = i;
+
             e.clear();
             continue;
         }
@@ -798,6 +815,27 @@ void verify_model(world& w, bool evict_possible)
 
     CACHE_CHECK(s.size() == model_keys,
                 "size() does not match the number of keys the model expects to be present");
+
+    // ── eviction had to be necessary, key by key ──
+    //
+    // "key-vanished" above asks only whether eviction was *permitted* on this
+    // step.  That is one bit for the whole step, so once a limit and a policy
+    // were configured, a store that evicted a single key and one that emptied
+    // itself were indistinguishable to it — and over-eviction is not a
+    // theoretical worry here, it is how a cache turns into a slow database
+    // under load.
+    //
+    // The stronger statement: eviction runs until the store is back under its
+    // limit and stops.  So the last key it took had to be needed, and putting
+    // the cheapest victim back must leave the store over the limit.  Measured
+    // with the model's floor, which is a *lower* bound on what that key cost —
+    // so the real key was at least this big, and if even this much would not
+    // have fitted, none of it would have.  One-sided on purpose: the check can
+    // only fire when the store freed more than any accounting of its own could
+    // justify.
+    // The victims themselves are judged by the caller, which has the LRU
+    // snapshot taken before the step — see the note at check_evictable() for
+    // why that is the sharp question and how much memory the store used is not.
 }
 
 // ───────────────── eviction order (the other half of invariant 4) ───────────
@@ -822,6 +860,48 @@ void snapshot_lru(world& w, lru_snapshot& snap)
         if (i >= 0)
             snap.pos[i] = p;
         p++;
+    }
+}
+
+// Which keys eviction was allowed to take, as opposed to how many.
+//
+// "key-vanished" in verify_model() asks only whether eviction was *permitted*
+// on this step — one bit for the whole step.  Once a limit and a policy were
+// configured it accepted any key disappearing, from anywhere, which is a good
+// deal weaker than the property it stands for.  The two sharp statements, both
+// of them free of arithmetic:
+//
+//   * Eviction takes from m_lru_order and nowhere else.  A key that was live
+//     but *not in that order* is one try_evict() could not have reached, so if
+//     it is gone, something else dropped it — and the store has no other
+//     mechanism that may.  This is the shape of the defect that once left an
+//     orphaned LRU node behind: order and map coming apart, in the other
+//     direction.
+//   * The key the step is writing is protected: check_memory() passes it to
+//     try_evict() precisely so that it cannot be chosen, which is what stopped
+//     the collection writers from working through a freed node.  If it went
+//     anyway, that protection is not holding.
+//
+// Deliberately not phrased in bytes.  The obvious "it should have stopped once
+// it was back under the limit" cannot be checked from out here: the store evicts
+// against an *estimate* of what the write will cost, and the model's floor is a
+// lower bound on what a key cost, so the two disagree by margins wide enough to
+// swallow the property.  These two do not depend on either number.
+void check_evictable(world& w, const lru_snapshot& snap, int wrote_key)
+{
+    for (size_t v = 0; v < w.victims; v++)
+    {
+        const int i = w.victim_idx[v];
+
+        CACHE_FINDING("evict-not-candidate", !(snap.present[i] && snap.pos[i] < 0),
+                      "a key vanished that was not in the eviction order — try_evict() takes "
+                      "from m_lru_order and nothing else may remove a live key, so the order "
+                      "and the map have come apart");
+
+        CACHE_FINDING("evict-wrote-key", i != wrote_key,
+                      "eviction took the very key the step was writing, although check_memory() "
+                      "names it precisely so that try_evict() will not choose it — the write "
+                      "then works through storage that has been freed");
     }
 }
 
@@ -1020,6 +1100,36 @@ bool run_step(world& w, const step& s)
     const bool   can_evict    = eviction_active(w);
     const size_t usage_before = w.store.get_memory_used();
 
+    // Is a refusal excusable at all?  "A limit is configured" was the old
+    // answer, and it is far too generous: with an eviction policy set, a store
+    // refuses a write only when eviction cannot make room for it.  Redis
+    // returns OOM on that condition and no other.
+    //
+    // Evaluated after the write returned, and deliberately not in bytes.  Two
+    // attempts at this were written in bytes first and both had to be thrown
+    // away, because they called correct refusals defects: the store admits
+    // against an *estimate* of what a write will cost, the model knows only a
+    // lower bound on what it did cost, and the gap between them is wider than
+    // the property.  hset() pays for a field, a value and a node; the model
+    // counted a key and a value.
+    //
+    // The arithmetic-free statement is exact.  try_evict() loops until the
+    // store is back under its limit — in which case the write is admitted, not
+    // refused — or until it has no candidate left.  The key being written is
+    // never a candidate: check_memory() names it precisely so that eviction
+    // cannot choose it, which is what stopped the collection writers from
+    // working through a freed node.  So a refusal under an active policy means
+    // the eviction order held nothing but that key; anything else still in it
+    // is room the store was allowed to take and did not.
+    auto refusal_excusable = [&]() -> bool {
+        if (!had_limit)  return false;   // nothing may be refused for memory at all
+        if (!can_evict)  return true;    // nothing may be freed to make room
+        for (const std::string& lk : w.store.m_lru_order)
+            if (lk != k)
+                return false;            // a candidate was still standing there
+        return true;
+    };
+
     lru_snapshot snap{};
     const bool lru_policy = (w.max_mem != 0 && w.evic == evict_allkeys_lru);
     if (lru_policy)
@@ -1069,8 +1179,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", conflict || had_limit,
-                              "set() refused a write with no memory limit configured and no type conflict");
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "set() refused a write that it had room for after eviction, with no type conflict");
                 check_failed_write_kept_ttl(w, ki,
                     "a SET that was refused (wrong type, or no room under maxmemory) still erased "
                     "the key's expiry — the caller got an error and the key it named is now immortal");
@@ -1098,8 +1208,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", existed || conflict || had_limit,
-                              "setnx() refused to create a key that did not exist, with no limit configured");
+                CACHE_FINDING("write-refused", existed || conflict || refusal_excusable(),
+                              "setnx() refused to create a key that did not exist, and had room for it after eviction");
             }
             break;
         }
@@ -1126,8 +1236,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", conflict || had_limit,
-                              "getset() refused a write with no limit configured and no type conflict");
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "getset() refused a write that it had room for after eviction, with no type conflict");
                 check_failed_write_kept_ttl(w, ki,
                     "a GETSET that was refused still erased the key's expiry — it forwards to set(), "
                     "which drops the TTL before it can fail");
@@ -1150,8 +1260,8 @@ bool run_step(world& w, const step& s)
             }
             else if (r == cache_store::append_denied)
             {
-                CACHE_FINDING("write-refused", had_limit,
-                              "append() reported a memory refusal with no memory limit configured");
+                CACHE_FINDING("write-refused", refusal_excusable(),
+                              "append() reported a memory refusal for a write it had room for after eviction");
             }
             else
             {
@@ -1251,8 +1361,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", conflict || !numeric || had_limit,
-                              "incr() refused an integer value with no memory limit configured");
+                CACHE_FINDING("write-refused", conflict || !numeric || refusal_excusable(),
+                              "incr() refused an integer value it had room for after eviction");
             }
             break;
         }
@@ -1416,8 +1526,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", conflict || had_limit,
-                              "a push was refused with no memory limit configured and no type conflict");
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "a push was refused that it had room for after eviction, with no type conflict");
             }
             break;
         }
@@ -1482,8 +1592,8 @@ bool run_step(world& w, const step& s)
             {
                 // -1 is both "wrong type" and "no room": the same conflation
                 // append() used to have between a refusal and a success.
-                CACHE_FINDING("write-refused", conflict || had_limit,
-                              "sadd() returned -1 with no memory limit configured and no type conflict");
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "sadd() returned -1 that it had room for after eviction, with no type conflict");
             }
             break;
         }
@@ -1528,8 +1638,8 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_FINDING("write-refused", conflict || had_limit,
-                              "hset() was refused with no memory limit configured and no type conflict");
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "hset() was refused that it had room for after eviction, with no type conflict");
             }
             break;
         }
@@ -1675,6 +1785,8 @@ bool run_step(world& w, const step& s)
 
     // ── invariants 1, 2 and 4 ──
     verify_model(w, evict_possible);
+    if (lru_policy)
+        check_evictable(w, snap, wrote_key);
     check_structure(w.store);
     return false;
 }

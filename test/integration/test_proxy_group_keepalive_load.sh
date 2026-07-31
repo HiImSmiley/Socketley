@@ -30,6 +30,7 @@
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_ready.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-grpka-XXXXXX)
@@ -208,8 +209,13 @@ esac
 "$BIN" create proxy kam2 -p $M2 --backend "127.0.0.1:$BE2" --protocol tcp -g $GRP -s >/dev/null 2>&1 || true
 "$BIN" create proxy kam3 -p $M3 --backend "127.0.0.1:$BE3" --protocol tcp -g $GRP -s >/dev/null 2>&1 || true
 "$BIN" create proxy "$GW_NAME" -p $GW --backend "@$GRP" --protocol http -s >/dev/null 2>&1 || true
-for _ in $(seq 1 60); do nc -z 127.0.0.1 $GW 2>/dev/null && break; sleep 0.1; done
-sleep 0.5
+# A 200 through the gateway proves the group resolved to at least one member
+# and that member answered.  An accepted connection proves only that the
+# gateway is listening, which it does before any member is routable.
+if ! ready_http 127.0.0.1 $GW "/$GW_NAME/ready" 20; then
+    bad "setup" "the gateway never answered a request on $GW"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; exit "$FAIL"
+fi
 
 if "$BIN" stats "$GW_NAME" >/dev/null 2>&1; then ok; else
     bad "setup" "the gateway runtime is not up -- everything below is meaningless"

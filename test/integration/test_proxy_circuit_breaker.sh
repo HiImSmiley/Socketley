@@ -12,6 +12,7 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_ready.sh"
 OK_BE=19901; OK_PROXY=19900
 BAD_BE=19911; BAD_PROXY=19910
 PASS=0; FAIL=0; TOTAL=0
@@ -105,8 +106,8 @@ start_backend failing "$BAD_BE" || { echo "  SKIP: failing backend did not start
 
 "$BIN" create proxy cb_ok  -p "$OK_PROXY"  --backend "127.0.0.1:$OK_BE"  -s 2>&1 || true
 "$BIN" create proxy cb_bad -p "$BAD_PROXY" --backend "127.0.0.1:$BAD_BE" -s 2>&1 || true
-for _ in $(seq 1 50); do nc -z 127.0.0.1 "$OK_PROXY" 2>/dev/null && break; sleep 0.1; done
-sleep 0.5
+# The healthy proxy has to answer before the breaker cases mean anything.
+ready_http 127.0.0.1 "$OK_PROXY" "/cb_ok/ready" 20 || true
 
 # circuit_threshold defaults to 5, so twelve requests are well past it.
 read ok200 ok503 <<< "$(count_codes "$OK_PROXY" cb_ok 12)"

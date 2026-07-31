@@ -24,6 +24,7 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_ready.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 # Own daemon, socket and state directory: against the shared one this test does
@@ -192,8 +193,8 @@ fi
 # forwarding, so the marker has to sit behind it.
 "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http -s 2>&1 || true
-for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PX_PORT" 2>/dev/null && break; sleep 0.1; done
-sleep 0.3
+# A real request through the proxy, not an accepted connection and a guess.
+ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 
 TOTAL=$((TOTAL+1))
 if "$BIN" stats "$PX_NAME" >/dev/null 2>&1; then
