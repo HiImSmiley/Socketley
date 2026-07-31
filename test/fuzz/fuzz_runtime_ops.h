@@ -29,9 +29,11 @@
 //
 //  1. NO COMPLETION OUTLIVES ITS OWNER.  An instance is destroyed only once
 //     event_loop::owner_inflight() says the ring owes it nothing.  If that count
-//     will not reach zero within the drain budget, the breakdown says which
-//     operation kind is holding it and that is the finding — it is precisely the
-//     shape of the un-withdrawn timer that used to keep 6 MB per removed runtime
+//     will not reach zero within the drain budget — a short one first, then a
+//     hard bound no scheduling delay can explain, because a slow completion and
+//     an absent one are different claims — the breakdown says which operation
+//     kind is holding it and that is the finding.  It is precisely the shape of
+//     the un-withdrawn timer that used to keep 6 MB per removed runtime
 //     resident until the daemon exited.  Once an instance *is* destroyed the
 //     harness keeps pumping: a completion that arrives for freed storage is read
 //     by the loop before anything is dispatched, so ASan reports it.
@@ -283,23 +285,78 @@ struct ring_watch
         }
     }
 
-    // Invariant 1.  Pump until the ring owes this owner nothing, or until the
-    // budget runs out.  Returns true when it drained.
+    // Invariant 1.  Pump until the ring owes this owner nothing.  Returns true
+    // when it drained.
     //
-    // The budget is deliberately short.  The failure this is looking for is an
-    // operation that will *never* report — a timer nobody withdrew, a multishot
-    // accept nobody cancelled — and those do not become fine if you wait longer,
-    // they become a thirty-second stall in the manager's graveyard.
+    // Two bounds, because "this operation is slow" and "this operation is never
+    // coming" are different claims and only the second is a defect.  The first
+    // bound is short, so the overwhelmingly common case — everything already
+    // drained — costs nothing.  When it expires the drain escalates to a bound
+    // generous enough that no scheduling delay can explain it, and only an
+    // owner still outstanding at *that* point is reported.
+    //
+    // The short bound used to be the whole test, and it produced a finding on a
+    // loaded machine and none on an idle one: a multishot accept's cancellation
+    // was landing three to twenty-nine milliseconds after a thirty millisecond
+    // budget, measured over five reproductions.  That is a budget racing the
+    // scheduler, not a completion that never arrives, and this invariant is
+    // about the second.  An operation that is genuinely stuck does not become
+    // fine if you wait longer, which is why the escalation is bounded too.
     bool drain_owner(const io_handler* owner, int budget_ms)
     {
         if (!loop || !owner)
             return true;
-        for (int i = 0; i < budget_ms && loop->owner_inflight(owner) != 0; i++)
+        if (pump_until_idle(owner, budget_ms))
+            return true;
+
+        const int hard  = hard_drain_ms();
+        const int extra = hard > budget_ms ? hard - budget_ms : 0;
+        if (extra > 0 && pump_until_idle(owner, extra))
+        {
+            note_late_drain(budget_ms);
+            return true;
+        }
+        return false;
+    }
+
+    // One pumping pass, up to ms milliseconds of waiting.  Returns true when the
+    // owner is idle.
+    bool pump_until_idle(const io_handler* owner, int ms)
+    {
+        for (int i = 0; i < ms && loop->owner_inflight(owner) != 0; i++)
             loop->poll_completions(1);
         // One last non-blocking pass, so a completion that landed inside the
         // final wait is dispatched rather than counted against the owner.
         loop->poll_completions(0);
         return loop->owner_inflight(owner) == 0;
+    }
+
+    // How long a drain may take in total before it is a defect rather than a
+    // delay.  Two seconds: two orders of magnitude above the delays this has
+    // actually been measured at, and still far below what a stuck operation
+    // costs, which is unbounded.  Overridable so a slower machine can raise it
+    // without editing the oracle.
+    static int hard_drain_ms()
+    {
+        static const int ms = [] {
+            const char* e = std::getenv("FUZZ_DRAIN_MS");
+            const int   v = e ? std::atoi(e) : 0;
+            return v > 0 ? v : 2000;
+        }();
+        return ms;
+    }
+
+    // A drain that needed the escalation is not a failure, but it is worth
+    // seeing: it is the early shape of a latency regression, and absorbing it
+    // silently is how the next one goes unnoticed.  Rate-limited like
+    // fuzz_observe(), for the same reason.
+    static void note_late_drain(int short_budget_ms)
+    {
+        static unsigned long reported = 0;
+        if (reported++ < 5)
+            std::fprintf(stderr,
+                         "[fuzz] observation: an owner drained only after its %d ms budget "
+                         "expired — slow, not stuck\n", short_budget_ms);
     }
 
     // Report what is holding an owner that would not drain.  A count says the
