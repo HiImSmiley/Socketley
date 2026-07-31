@@ -534,6 +534,11 @@ flags_options() {
     echo "  reuse: a response whose length cannot be established is forwarded"
     echo "  unchanged and its connection closed instead of pooled."
     echo ""
+    echo "  Reuse covers an @group backend too. A pooled connection is filed"
+    echo "  under the endpoint it was opened to, never under the group, so it"
+    echo "  goes back only to a request routed to that same member; a member"
+    echo "  that leaves the group has its pooled connections closed at once."
+    echo ""
 
     echo -e "${BOLD}Daemon Flags (cluster mode):${NC}"
     echo "┌────────────────────────┬─────────────────────────────────────┐"

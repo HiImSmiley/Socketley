@@ -2152,6 +2152,14 @@ cannot be established with certainty \(em because its header block was
 split across reads, or was not strictly CRLF-framed \(em is forwarded to
 the client unchanged, and its connection is closed instead of returned
 to the pool.
+.PP
+Reuse covers an
+.B @group
+backend as well as a listed one. A pooled connection is filed under the
+endpoint it was opened to, never under the group, so it is only ever
+handed back to a request routed to that same member; a member that leaves
+the group has its pooled connections closed at once rather than left to
+the idle sweep.
 .SS Retries
 When
 .B \-\-retry

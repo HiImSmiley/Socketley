@@ -28,6 +28,39 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
                                           bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
 
 
+// Which endpoint a client's current backend socket is connected to.  Returns
+// false when that cannot be established, and then the socket must not be
+// pooled: a pooled connection is handed to whoever asks for the same endpoint
+// next, so a key that is a guess is a crossed delivery waiting to happen.
+//
+// backend_idx answers this only for a plain backend.  A group-routed request
+// picks one member per request and leaves the index pointing at the group
+// entry, whose resolved_host is deliberately empty — the endpoint that was
+// actually chosen is recorded on the connection.
+static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
+                                       const std::vector<backend_info>& backends,
+                                       std::string_view& host, uint16_t& port)
+{
+    if (!cconn)
+        return false;
+    if (cconn->backend_from_group)
+    {
+        host = cconn->backend_host;
+        port = cconn->backend_port;
+    }
+    else
+    {
+        if (cconn->backend_idx >= backends.size())
+            return false;
+        const auto& b = backends[cconn->backend_idx];
+        if (b.is_group)
+            return false;  // routed to a group without the per-request endpoint
+        host = b.resolved_host;
+        port = b.resolved_port;
+    }
+    return !host.empty() && port != 0;
+}
+
 // Socket buffer sizes: 256KB gives good throughput for bulk transfers
 static constexpr int SOCK_BUF_SIZE = 256 * 1024;
 
@@ -207,6 +240,8 @@ void proxy_backend_connection::reset(int new_fd)
     pool_draining = false;
     pool_abandoned = false;
     pool_backend_idx = 0;
+    pool_host.clear();
+    pool_port = 0;
     client_fd = -1;
     write_batch_count = 0;
     read_req = {};
@@ -424,6 +459,62 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // of the endpoints, and the shared_ptr it came from stays alive as long as
     // anything holds it.
     m_endpoints = std::move(tbl);
+
+    // Whatever the pool still holds to a member that is no longer in the group
+    // is dead weight: selection will never ask for that endpoint again, so the
+    // socket would sit there until the idle sweep reached it a minute later —
+    // and the runtime on the other end is usually stopping, which is what took
+    // it out of the group.  Holding its socket open keeps it in TIME_WAIT
+    // negotiations it has no reason to be in and keeps a descriptor at both
+    // ends for nothing.
+    drop_departed_endpoints();
+}
+
+// Called only when the membership snapshot changes, which is per control
+// action rather than per request.
+void proxy_instance::drop_departed_endpoints()
+{
+    // No table is not the same answer as an empty group: without one there is
+    // nothing to say an endpoint has departed, and a pool emptied on no
+    // evidence is a pool that pays for every request again.
+    if (m_backends.empty() || !m_endpoints)
+        return;
+
+    const auto still_a_member = [this](std::string_view host, uint16_t port) {
+        for (const auto& b : m_backends)
+        {
+            if (!b.is_group)
+            {
+                // A plain backend is not membership; it is configuration, and
+                // it does not change under us.
+                if (b.resolved_port == port && b.resolved_host == host)
+                    return true;
+                continue;
+            }
+            const std::string_view group(b.address.data() + 1, b.address.size() - 1);
+            if (const auto* members = m_endpoints->find_group(group))
+                for (const auto& ep : *members)
+                    if (ep.port == port && ep.host == host)
+                        return true;
+        }
+        return false;
+    };
+
+    for (auto& pool : m_backend_pool)
+    {
+        pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                  [&](const pooled_backend& pb) {
+                                      if (still_a_member(pb.host, pb.port))
+                                          return false;
+                                      if (pb.fd >= 0)
+                                      {
+                                          shutdown(pb.fd, SHUT_RDWR);
+                                          close_tracked(pb.fd);
+                                      }
+                                      return true;
+                                  }),
+                   pool.end());
+    }
 }
 proxy_protocol proxy_instance::get_protocol() const { return m_protocol; }
 proxy_strategy proxy_instance::get_strategy() const { return m_strategy; }
@@ -2858,10 +2949,17 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     return &m_scratch_backend;
 }
 
-// Try to get a pooled backend connection for the given backend index
-int proxy_instance::acquire_pooled_backend(size_t backend_idx)
+// Try to get a pooled backend connection for the given endpoint.
+//
+// The index picks the shelf and the endpoint picks the socket.  For a plain
+// backend every socket on the shelf has the same peer and the comparison is a
+// formality; for a group entry the shelf holds sockets to every member that
+// has been used, and handing one of them to a request routed elsewhere would
+// deliver it to the wrong runtime.
+int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view host,
+                                           uint16_t port)
 {
-    if (backend_idx >= m_backend_pool.size())
+    if (backend_idx >= m_backend_pool.size() || host.empty() || port == 0)
         return -1;
 
     auto& pool = m_backend_pool[backend_idx];
@@ -2870,11 +2968,16 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx)
 
     auto now = std::chrono::steady_clock::now();
 
-    // Try from the back (most recently idle) — better chance of being alive
-    while (!pool.empty())
+    // Try from the back (most recently idle) — better chance of being alive.
+    // Entries for other endpoints are stepped over rather than dropped: they
+    // belong to somebody else's peer and are the idle sweep's business.
+    for (size_t scan = pool.size(); scan-- > 0; )
     {
-        auto pb = pool.back();
-        pool.pop_back();
+        if (pool[scan].port != port || pool[scan].host != host)
+            continue;
+
+        auto pb = std::move(pool[scan]);
+        pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(scan));
 
         // Check if stale
         if ((now - pb.idle_since) > std::chrono::seconds(POOL_IDLE_TIMEOUT_SEC))
@@ -2947,10 +3050,21 @@ void proxy_instance::arm_idle_sweep()
 // comes through here — close_pair_close_backend, detach_and_pool_backend and
 // finish_pool_drain — so this is where it is decided whether the socket may
 // change hands at all.
-void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx)
+void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
+                                     std::string_view host, uint16_t port)
 {
     if (backend_fd < 0 || backend_idx >= m_backend_pool.size())
         return;
+
+    // A socket with no endpoint on it cannot be given back to one.  Callers
+    // establish the key through backend_endpoint_of and only pool when it
+    // answered; this is the backstop, and it closes rather than files.
+    if (host.empty() || port == 0)
+    {
+        shutdown(backend_fd, SHUT_RDWR);
+        close_tracked(backend_fd);
+        return;
+    }
 
     // Pooling is the third way to give a descriptor away, next to closing it
     // and freeing its fixed-file slot, and it has the same hazard even though
@@ -2985,7 +3099,8 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx)
         pool.pop_back();
     }
 
-    pool.push_back({backend_fd, backend_idx, std::chrono::steady_clock::now()});
+    pool.push_back({backend_fd, backend_idx, std::string(host), port,
+                    std::chrono::steady_clock::now()});
 
     // Something is in the pool now, so there is something for the sweep to
     // reclaim.  No-op while it is already running.
@@ -3014,13 +3129,20 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     int bfd = -1;
 
-    // Try connection pool first (both TCP and HTTP, non-group backends).
-    // A group-routed connection must not touch the pool: its backend_idx still
-    // points at the group entry, so it would hand back a connection to some
-    // other endpoint entirely.
-    if (!target->is_group && !conn->backend_from_group && conn->backend_idx < m_backend_pool.size())
+    // Try connection pool first — for a group-routed request too.  What the
+    // pool is asked for is an idle socket to *this endpoint*, which is a
+    // question the group path can answer as precisely as any other: the member
+    // it just selected is on the connection.  Asking by index alone could not,
+    // which is why this used to be skipped altogether and why an @group gateway
+    // paid for a TCP handshake, and left a TIME_WAIT behind, on every request.
     {
-        bfd = acquire_pooled_backend(conn->backend_idx);
+        std::string_view host;
+        uint16_t port = 0;
+        if (backend_endpoint_of(conn, m_backends, host, port) &&
+            conn->backend_idx < m_backend_pool.size())
+        {
+            bfd = acquire_pooled_backend(conn->backend_idx, host, port);
+        }
     }
 
     if (bfd >= 0)
@@ -3641,12 +3763,21 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
         return false;
     if (!cconn)
         return false;
-    // Group-routed connections carry a per-connection endpoint that backend_idx
-    // does not describe; pooling one would file it under an unrelated backend.
-    if (cconn->backend_from_group)
+    // The key is read off the client, so the client has to be this socket's
+    // own.  Every caller passes the pair it is tearing down, but close_pair
+    // takes two descriptor numbers rather than a pair, and a caller that gets
+    // them from different connections would otherwise file this socket under
+    // an endpoint it was never opened to.  Cheap, and it makes the key's
+    // provenance a checked fact instead of a caller's promise.
+    if (bconn->client_fd != cconn->fd)
         return false;
-    size_t idx = cconn->backend_idx;
-    if (idx >= backends.size() || backends[idx].is_group)
+    // A group-routed connection is poolable — under the member it actually
+    // reached, which is what backend_endpoint_of returns and what
+    // release_to_pool files it by.  Refusing here is what made an @group
+    // gateway open a fresh TCP connection for every single request.
+    std::string_view host;
+    uint16_t port = 0;
+    if (!backend_endpoint_of(cconn, backends, host, port))
         return false;
     return true;
 }
@@ -3656,15 +3787,20 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
                                                       proxy_backend_connection* bconn,
                                                       proxy_client_connection* cconn)
 {
-    // Check pool eligibility
-    bool can_pool = cconn && backend_pool_eligible(bconn, cconn, m_backends, m_protocol);
+    // Check pool eligibility.  The endpoint comes out of the same predicate
+    // that approved the socket, so the two cannot disagree about which peer it
+    // is being filed under.
+    std::string_view host;
+    uint16_t port = 0;
+    bool can_pool = cconn && backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
+                    backend_endpoint_of(cconn, m_backends, host, port);
 
     m_conn_idx[backend_fd] = {};
 
     if (can_pool)
     {
         // Release fd to pool — pool takes ownership, don't close
-        release_to_pool(backend_fd, cconn->backend_idx);
+        release_to_pool(backend_fd, cconn->backend_idx, host, port);
     }
     else
     {
@@ -4015,6 +4151,24 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
         bconn->pool_draining = true;
         bconn->pool_abandoned = false;
         bconn->pool_backend_idx = cconn->backend_idx;
+        // Read now, while the pair is still a pair.  The client is released
+        // three lines below and may be routed to a different member of the
+        // same group before the cancellation lands, taking the endpoint this
+        // socket belongs to with it.
+        {
+            std::string_view dh;
+            uint16_t dp = 0;
+            if (backend_endpoint_of(cconn, m_backends, dh, dp))
+            {
+                bconn->pool_host.assign(dh);
+                bconn->pool_port = dp;
+            }
+            else
+            {
+                bconn->pool_host.clear();
+                bconn->pool_port = 0;
+            }
+        }
 
         // The client is released immediately — it has its full response and
         // should not wait a round trip for the backend's paperwork.  Its next
@@ -4052,13 +4206,20 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     }
 
     // Nothing is in flight, so the socket can be handed over here and now — but
-    // only if it may be pooled at all.  This used to pool it unconditionally,
-    // under cconn->backend_idx, which describes nothing for a group-routed
-    // connection: the group path leaves the index at 0.  The socket of a group
-    // member would have been filed under whatever sits in slot 0 and handed to
-    // the next request routed there.
-    const bool can_pool = backend_pool_eligible(bconn, cconn, m_backends, m_protocol);
+    // only if it may be pooled at all, and only under the endpoint it actually
+    // reached.  This used to pool it unconditionally under cconn->backend_idx,
+    // which describes nothing for a group-routed connection: the group path
+    // leaves the index on the group entry, so the socket of one member would
+    // have been handed to the next request routed to any of them.
+    std::string_view host;
+    uint16_t port = 0;
+    const bool can_pool = backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
+                          backend_endpoint_of(cconn, m_backends, host, port);
     const size_t b_idx = cconn->backend_idx;
+    // The view points into the client (group route) or into m_backends (plain
+    // one); neither is touched between here and the release, but the copy
+    // costs nothing and outlives the argument about which.
+    const std::string host_key(host);
 
     // Clear tracking
     m_conn_idx[backend_fd] = {};
@@ -4066,7 +4227,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
 
     if (can_pool)
     {
-        release_to_pool(backend_fd, b_idx);
+        release_to_pool(backend_fd, b_idx, host_key, port);
     }
     else
     {
@@ -4138,9 +4299,10 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
     // range, so asking it to pool one it will refuse leaks the descriptor
     // silently — this is the last owner the fd has.
     if (SOCKETLEY_LIKELY(!conn->pool_abandoned &&
-                         conn->pool_backend_idx < m_backend_pool.size()))
+                         conn->pool_backend_idx < m_backend_pool.size() &&
+                         !conn->pool_host.empty() && conn->pool_port != 0))
     {
-        release_to_pool(fd, conn->pool_backend_idx);
+        release_to_pool(fd, conn->pool_backend_idx, conn->pool_host, conn->pool_port);
     }
     else
     {

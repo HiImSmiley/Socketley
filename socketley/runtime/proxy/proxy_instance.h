@@ -268,8 +268,12 @@ struct alignas(64) proxy_backend_connection
     bool pool_abandoned{false};
     // The client is detached the moment draining starts and is free to be
     // routed somewhere else before the cancellation lands, so the pool this
-    // connection belongs to cannot be read off it later.
+    // connection belongs to cannot be read off it later.  The endpoint goes
+    // with the index for the reason given on pooled_backend: with a group
+    // backend the index names a set, not a socket's peer.
     size_t pool_backend_idx{0};
+    std::string pool_host;
+    uint16_t pool_port{0};
 
     SKL_TRACE_FIELD(tr)
 
@@ -383,6 +387,13 @@ struct pooled_backend
 {
     int fd;
     size_t backend_idx;             // which backend_info this connects to
+    // Where this socket actually goes.  The index alone does not say it: a
+    // group entry stands for every member of the group at once, so a socket
+    // filed under it would be handed to the next request routed to *any*
+    // member — a connection to one runtime carrying another's request.  The
+    // pool key is the endpoint, and the index only picks the shelf.
+    std::string host;
+    uint16_t port;
     std::chrono::steady_clock::time_point idle_since;
 };
 
@@ -519,11 +530,19 @@ private:
     void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
 
     // Connection pool: reuse idle backend connections
-    int acquire_pooled_backend(size_t backend_idx);
-    void release_to_pool(int backend_fd, size_t backend_idx);
+    // Both take the endpoint as well as the index: a pooled socket goes back
+    // only to the peer it was opened to.  See pooled_backend.
+    int acquire_pooled_backend(size_t backend_idx, std::string_view host, uint16_t port);
+    void release_to_pool(int backend_fd, size_t backend_idx,
+                         std::string_view host, uint16_t port);
     // Start the periodic sweep if it is not already running.  Idempotent; see
     // the definition for why it is armed on demand rather than always.
     void arm_idle_sweep();
+    // Close what the pool holds to endpoints the published membership no longer
+    // lists, and forget the breakers that described them.  Membership is the
+    // only thing that can make a pooled socket unreachable while it is still
+    // healthy, so this runs where membership arrives and nowhere else.
+    void drop_departed_endpoints();
 
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
