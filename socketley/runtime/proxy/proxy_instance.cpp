@@ -466,7 +466,10 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // and the runtime on the other end is usually stopping, which is what took
     // it out of the group.  Holding its socket open keeps it in TIME_WAIT
     // negotiations it has no reason to be in and keeps a descriptor at both
-    // ends for nothing.
+    // ends for nothing.  The breakers go the same way and for the same reason:
+    // a verdict about an endpoint that is no longer being routed to has nothing
+    // left to say, and dropping it here is what keeps that map the size of the
+    // group rather than the size of its history.
     drop_departed_endpoints();
 }
 
@@ -514,6 +517,19 @@ void proxy_instance::drop_departed_endpoints()
                                       return true;
                                   }),
                    pool.end());
+    }
+
+    for (auto it = m_group_breakers.begin(); it != m_group_breakers.end(); )
+    {
+        const std::string_view key(it->first);
+        const auto colon = key.rfind(':');
+        uint16_t port = 0;
+        if (colon != std::string_view::npos)
+            std::from_chars(key.data() + colon + 1, key.data() + key.size(), port);
+        if (colon == std::string_view::npos || !still_a_member(key.substr(0, colon), port))
+            it = m_group_breakers.erase(it);
+        else
+            ++it;
     }
 }
 proxy_protocol proxy_instance::get_protocol() const { return m_protocol; }
@@ -780,6 +796,10 @@ bool proxy_instance::setup(event_loop& loop)
     m_backend_health.resize(m_backends.size());
     m_circuit_breakers.clear();
     m_circuit_breakers.resize(m_backends.size());
+    // A previous run's verdicts about group members do not carry over: the
+    // membership may be entirely different by now, and an endpoint left open
+    // would be refused for circuit_timeout after a restart that fixed it.
+    m_group_breakers.clear();
 
     // Initialize connection pool (one pool per backend)
     m_backend_pool.clear();
@@ -1384,7 +1404,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 // Charging it for our own full ring took the one healthy backend
                 // out of rotation after circuit_threshold connections and then
                 // refused every client that followed.
-                if (have_target && !ours) record_backend_error(ptr->backend_idx);
+                if (have_target && !ours) note_backend_failure(ptr);
                 close_pair(client_fd, -1);
                 goto proxy_resubmit_accept;
             }
@@ -1739,7 +1759,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             bool ours = false;
             if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target, &ours)))
             {
-                if (!ours) record_backend_error(conn->backend_idx);
+                if (!ours) note_backend_failure(conn);
                 close_pair(fd, -1);
                 return;
             }
@@ -1980,7 +2000,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         bool ours = false;
         if (SOCKETLEY_UNLIKELY(!connect_to_backend(conn, target, &ours)))
         {
-            if (!ours) record_backend_error(conn->backend_idx);
+            if (!ours) note_backend_failure(conn);
             if (!try_retry(conn))
             {
                 send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
@@ -2153,18 +2173,20 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
         {
             auto& ce = m_conn_idx[conn->client_fd];
-            // Not for a group-routed connection: backend_idx names no backend
-            // there — the group path picks an endpoint per request and leaves
-            // the index at 0 — so the failure of a group member would be
-            // charged to whatever occupies slot 0, and with a direct backend
-            // listed alongside the group that is a healthy backend being taken
-            // out of rotation for somebody else's fault.
-            if (ce.side == conn_client && !ce.client->backend_from_group)
+            // Charged to whichever breaker describes this connection's backend.
+            // Reading backend_idx unconditionally is what took a healthy direct
+            // backend out of rotation for a group member's fault: the group
+            // path leaves the index pointing at the group entry, so every
+            // member's failure landed on whatever occupied that slot.  Skipping
+            // group-routed connections stopped that, at the price of a group
+            // member never being charged at all; a breaker per member is what
+            // lets the failure be recorded where it belongs.
+            if (ce.side == conn_client)
             {
                 const bool backend_failed =
                     (cqe->res < 0) || !ce.client->response_started;
                 if (backend_failed)
-                    record_backend_error(ce.client->backend_idx);
+                    note_backend_failure(ce.client);
             }
         }
 
@@ -2186,8 +2208,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // doing its job, and cutting it short would be a new defect rather
             // than a fix for this one.
             clear_response_deadline(ce.client);
-            if (!ce.client->backend_from_group)
-                record_backend_success(ce.client->backend_idx);
+            note_backend_success(ce.client);
         }
     }
 
@@ -2895,6 +2916,26 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     if (pool.empty())
         return nullptr;
 
+    // Members the breaker has taken out of rotation come off the list before
+    // anything is selected from it — the same order the indexed path uses, and
+    // for the same reason: choosing first and checking afterwards means either
+    // sending the request to a member already judged broken, or biasing the
+    // round-robin by skipping a turn.  Costs one empty-map test while every
+    // member is healthy, which is the normal case.
+    if (m_mesh.circuit_threshold > 0 && !m_group_breakers.empty())
+    {
+        pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                  [this](const resolved_backend& rb) {
+                                      return !group_endpoint_available(rb.host, rb.port);
+                                  }),
+                   pool.end());
+        // Every member is out.  Answering 503 now is what the indexed path does
+        // with its last backend open, and it is the honest answer: there is
+        // nowhere to send this request.  The breakers expire on their own.
+        if (pool.empty())
+            return nullptr;
+    }
+
     resolved_backend* selected = &pool[0];
 
     if (pool.size() > 1)
@@ -2939,6 +2980,9 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     conn->backend_from_group = true;
     conn->backend_host = m_scratch_backend.resolved_host;
     conn->backend_port = m_scratch_backend.resolved_port;
+    // Claim the single half-open probe if this selection is the one that gets
+    // it — the group counterpart of note_backend_selected().
+    note_group_selected(conn->backend_host, conn->backend_port);
     if (inet_pton(AF_INET, m_scratch_backend.resolved_host.c_str(),
                   &m_scratch_backend.cached_addr.sin_addr) == 1)
     {
@@ -3260,7 +3304,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (bfd < 0)
+    {
+        // Out of descriptors is our shortage, not the backend's.
+        ours();
         return false;
+    }
 
     if (SOCKETLEY_UNLIKELY(bfd >= MAX_FDS))
     {
@@ -3357,6 +3405,32 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     if (cr < 0 && errno != EINPROGRESS)
     {
+        // Which of the two ends failed decides whether the breaker hears about
+        // it.  A refusal, an unreachable host or a handshake that timed out is
+        // the backend's answer and belongs in its tally.  EADDRNOTAVAIL —
+        // "cannot assign requested address", the local ephemeral port range
+        // exhausted — and the out-of-memory family are this machine running
+        // short, and the backend has not been asked anything at all.
+        //
+        // Measured while the machine's port table was full: a gateway charged
+        // its own shortage to every member of the group in turn, opened all
+        // three breakers, and then answered 503 to everything for a full
+        // circuit_timeout — a local resource problem turned into a verdict
+        // about three healthy runtimes.  This is the same rule handle_accept
+        // already applies to a full ring.
+        switch (errno)
+        {
+        case EADDRNOTAVAIL:
+        case EADDRINUSE:
+        case ENOBUFS:
+        case ENOMEM:
+        case EMFILE:
+        case ENFILE:
+            ours();
+            break;
+        default:
+            break;
+        }
         close_tracked(bfd);
         return false;
     }
@@ -4767,7 +4841,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         // breaker: a descriptor that vanished under us (see above), and a retry
         // that failed on our own resources rather than on a refusal.
         if (fd_ours && !retry_ours)
-            record_backend_error(conn->backend_idx);
+            note_backend_failure(conn);
 
         if (m_protocol == protocol_http)
         {
@@ -5044,23 +5118,44 @@ void proxy_instance::response_deadline_sweep()
 
         conn->awaiting_response = false;
 
-        // Charged to the backend, so the breaker that already exists opens and
-        // takes it out of rotation — the same route a refusal or a reset takes.
-        // A group-routed connection has no slot to charge: the group path picks
-        // an endpoint per request and leaves backend_idx at 0.
-        if (!conn->backend_from_group)
-            record_backend_error(conn->backend_idx);
+        // Charged to the backend, so the breaker opens and takes it out of
+        // rotation — the same route a refusal or a reset takes.  A group-routed
+        // connection is charged to the member it actually reached rather than
+        // to backend_idx, which names the whole group; before there was a
+        // breaker per member this had to be skipped altogether, and a group
+        // member that accepted connections and never answered them kept its
+        // full third of the traffic indefinitely.
+        note_backend_failure(conn);
 
         // The handshake itself never finished — the backend is not refusing and
         // not answering, it is swallowing SYNs.  try_retry() must not be used
         // here: it does not look at connect_pending, so it would overwrite
         // connect_fd (leaking the socket the poll is still watching) and arm a
-        // second operation on the one connect_req.  close_pair is the path that
-        // already knows how to withdraw a connect in flight, and it is what the
-        // abort watch uses for exactly this state.
+        // second operation on the one connect_req.
+        //
+        // This used to call close_pair() and be done, which closed the client
+        // without writing a byte to it.  That is the one outcome a client
+        // cannot act on: no status, no framing error, nothing to distinguish a
+        // proxy that has gone away from a backend that has, so a keep-alive
+        // client cannot even tell whether re-sending the request is safe.  It
+        // is also silent in every log and every metric on the client's side.
+        // A backend that never completed its handshake inside the deadline is
+        // precisely what 504 means, and saying so costs one write.
+        //
+        // The connect is withdrawn by hand rather than by close_pair because
+        // the client has to outlive it: close_tracked() cancels the POLLOUT
+        // armed on the socket and holds the descriptor number until that
+        // cancellation has been consumed, so nothing inherits it early.  The
+        // completion still arrives — handle_connect finds connect_fd already
+        // cleared, treats it as a failed connect, and its send_error is a
+        // no-op against a connection that is already closing.  connect_pending
+        // deliberately stays set: it is what tells client_pool_release the
+        // struct is still owed a completion and must be retired, not reused.
         if (conn->connect_pending)
         {
-            close_pair(cfd, conn->backend_fd);
+            close_tracked(conn->connect_fd);
+            conn->connect_fd = -1;
+            send_error(conn, "504 Gateway Timeout", "Gateway Timeout\n");
             continue;
         }
 
@@ -5077,13 +5172,11 @@ void proxy_instance::response_deadline_sweep()
         arm_response_deadline_sweep();
 }
 
-void proxy_instance::record_backend_error(size_t backend_idx)
+// One breaker's state machine, over the breaker rather than over an index —
+// group members reach it through a map and plain backends through a vector, and
+// the rules must not be able to drift apart between the two.
+static inline void breaker_record_error(circuit_breaker& cb, int threshold)
 {
-    if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
-        return;
-
-    auto& cb = m_circuit_breakers[backend_idx];
-
     if (cb.current == circuit_breaker::half_open)
     {
         // Half-open probe failed -> back to open
@@ -5094,20 +5187,15 @@ void proxy_instance::record_backend_error(size_t backend_idx)
     }
 
     cb.error_count++;
-    if (cb.error_count >= m_mesh.circuit_threshold && cb.current == circuit_breaker::closed)
+    if (cb.error_count >= threshold && cb.current == circuit_breaker::closed)
     {
         cb.current = circuit_breaker::open;
         cb.opened_at = std::chrono::steady_clock::now();
     }
 }
 
-void proxy_instance::record_backend_success(size_t backend_idx)
+static inline void breaker_record_success(circuit_breaker& cb)
 {
-    if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
-        return;
-
-    auto& cb = m_circuit_breakers[backend_idx];
-
     if (cb.current == circuit_breaker::half_open)
     {
         // Half-open probe succeeded -> close circuit
@@ -5125,6 +5213,152 @@ void proxy_instance::record_backend_success(size_t backend_idx)
     cb.error_count = 0;
 }
 
+// "host:port" in a caller-owned buffer.  Written out rather than hashed
+// because a hash collision here would take a healthy member out of rotation
+// for its neighbour's failures, and returned as a view so a lookup on the
+// selection path allocates nothing.  Empty when the host will not fit, which
+// every caller reads as "no breaker" — the safe answer, since it can only
+// leave an endpoint in rotation, never remove one wrongly.
+static inline std::string_view endpoint_key(char* buf, size_t cap,
+                                            std::string_view host, uint16_t port)
+{
+    if (host.empty() || port == 0 || host.size() + 8 > cap)
+        return {};
+    std::memcpy(buf, host.data(), host.size());
+    size_t n = host.size();
+    buf[n++] = ':';
+    auto [p, ec] = std::to_chars(buf + n, buf + cap, port);
+    if (ec != std::errc())
+        return {};
+    return std::string_view(buf, static_cast<size_t>(p - buf));
+}
+
+void proxy_instance::record_backend_error(size_t backend_idx)
+{
+    if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
+        return;
+
+    breaker_record_error(m_circuit_breakers[backend_idx], m_mesh.circuit_threshold);
+}
+
+void proxy_instance::record_backend_success(size_t backend_idx)
+{
+    if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
+        return;
+
+    breaker_record_success(m_circuit_breakers[backend_idx]);
+}
+
+void proxy_instance::record_group_error(std::string_view host, uint16_t port)
+{
+    char buf[320];
+    const auto key = endpoint_key(buf, sizeof(buf), host, port);
+    if (key.empty())
+        return;
+
+    auto it = m_group_breakers.find(key);
+    if (it == m_group_breakers.end())
+        it = m_group_breakers.emplace(std::string(key), circuit_breaker{}).first;
+
+    breaker_record_error(it->second, m_mesh.circuit_threshold);
+}
+
+void proxy_instance::record_group_success(std::string_view host, uint16_t port)
+{
+    if (m_group_breakers.empty())
+        return;
+
+    char buf[320];
+    const auto key = endpoint_key(buf, sizeof(buf), host, port);
+    if (key.empty())
+        return;
+
+    auto it = m_group_breakers.find(key);
+    if (it == m_group_breakers.end())
+        return;  // never failed — nothing to clear, and nothing to remember
+
+    breaker_record_success(it->second);
+
+    // An endpoint with a clean record needs no entry.  Erasing it is what keeps
+    // this map the size of the *broken* part of the group rather than a tally
+    // of every member that has ever been in it — the group's membership is not
+    // the proxy's to bound.
+    if (it->second.current == circuit_breaker::closed && it->second.error_count == 0)
+        m_group_breakers.erase(it);
+}
+
+bool proxy_instance::group_endpoint_available(std::string_view host, uint16_t port)
+{
+    char buf[320];
+    const auto key = endpoint_key(buf, sizeof(buf), host, port);
+    if (key.empty())
+        return true;
+
+    auto it = m_group_breakers.find(key);
+    if (it == m_group_breakers.end())
+        return true;
+
+    auto& cb = it->second;
+    const auto now = std::chrono::steady_clock::now();
+
+    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::open))
+    {
+        if ((now - cb.opened_at) < std::chrono::seconds(m_mesh.circuit_timeout))
+            return false;
+        // Expired — one request may go and find out whether it is back.
+        cb.current = circuit_breaker::half_open;
+        cb.probe_in_flight = false;
+    }
+
+    // Half-open means exactly one request, for the reason given on
+    // is_backend_available: saying yes to every selection pours the whole
+    // rotation into a member that has just been taken out of it, and against
+    // one that stalls rather than refuses, that is a burst of full deadlines.
+    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) && cb.probe_in_flight &&
+        (now - cb.probe_started) < std::chrono::seconds(m_mesh.circuit_timeout))
+        return false;
+
+    return true;
+}
+
+void proxy_instance::note_group_selected(std::string_view host, uint16_t port)
+{
+    if (m_group_breakers.empty())
+        return;
+
+    char buf[320];
+    const auto key = endpoint_key(buf, sizeof(buf), host, port);
+    if (key.empty())
+        return;
+
+    auto it = m_group_breakers.find(key);
+    if (it == m_group_breakers.end())
+        return;
+
+    auto& cb = it->second;
+    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) && !cb.probe_in_flight)
+    {
+        cb.probe_in_flight = true;
+        cb.probe_started = std::chrono::steady_clock::now();
+    }
+}
+
+void proxy_instance::note_backend_failure(proxy_client_connection* conn)
+{
+    if (conn->backend_from_group)
+        record_group_error(conn->backend_host, conn->backend_port);
+    else
+        record_backend_error(conn->backend_idx);
+}
+
+void proxy_instance::note_backend_success(proxy_client_connection* conn)
+{
+    if (conn->backend_from_group)
+        record_group_success(conn->backend_host, conn->backend_port);
+    else
+        record_backend_success(conn->backend_idx);
+}
+
 bool proxy_instance::try_retry(proxy_client_connection* conn)
 {
     if (conn->retries_remaining <= 0 || m_mesh.retry_count <= 0)
@@ -5132,6 +5366,15 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
 
     // Never retry after response data has started flowing to the client
     if (conn->response_started)
+        return false;
+
+    // Nor after the client has been answered and is on its way out.  The
+    // deadline sweep now answers a connect that timed out with a 504 and lets
+    // the cancelled handshake report afterwards; handle_connect reads that
+    // report as a failed connect and would otherwise open a fresh backend
+    // connection to serve a request that has already been answered — and then
+    // deliver the second answer into a half-closed socket.
+    if (conn->closing)
         return false;
 
     // Only retry idempotent methods unless retry_all is set
@@ -5300,6 +5543,26 @@ std::string proxy_instance::get_stats() const
             out += (cb.current == circuit_breaker::open ? "open" : "half_open");
             out += '\n';
         }
+    }
+
+    // A group member has no index to be named by, so it is named by its
+    // endpoint.  Without this an operator looking at a gateway answering 503
+    // has nothing to look at: the breaker that is refusing the request would
+    // not appear anywhere in the output.  Healthy members leave no entry, so
+    // this line is absent while the group is working.
+    for (const auto& [key, cb] : m_group_breakers)
+    {
+        if (cb.current == circuit_breaker::closed)
+            continue;
+        out += "member_";
+        // host_port, not host:port — every other line here is one key, one
+        // colon, one value, and a second colon in the middle of a key is the
+        // kind of thing a reader gets wrong once and then forever.
+        for (const char c : key)
+            out += (c == ':' ? '_' : c);
+        out += "_circuit:";
+        out += (cb.current == circuit_breaker::open ? "open" : "half_open");
+        out += '\n';
     }
 
     return out;

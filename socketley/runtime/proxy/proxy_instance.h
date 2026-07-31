@@ -592,12 +592,30 @@ private:
     void health_check_sweep();
     void record_backend_error(size_t backend_idx);
     void record_backend_success(size_t backend_idx);
+
+    // The same three, for an endpoint reached through an @group backend.  Such
+    // an endpoint has no index to be charged: membership is published by the
+    // manager and changes while the proxy runs, and one backend_idx stands for
+    // the whole group at once.  So a group member's failures went nowhere and
+    // nothing could take it out of rotation — a member that refused every
+    // connection, or accepted and never answered, kept its full share of the
+    // traffic for as long as it was in the group.
+    void record_group_error(std::string_view host, uint16_t port);
+    void record_group_success(std::string_view host, uint16_t port);
+    bool group_endpoint_available(std::string_view host, uint16_t port);
+    void note_group_selected(std::string_view host, uint16_t port);
+    // Charge whichever breaker describes this connection's backend.  Reading
+    // backend_idx unconditionally is how a healthy backend listed alongside a
+    // group ended up carrying a group member's failures.
+    void note_backend_failure(proxy_client_connection* conn);
+    void note_backend_success(proxy_client_connection* conn);
+
     bool try_retry(proxy_client_connection* conn);
 
     // Start / stop the wait for a backend's first response byte.  Arming also
     // starts the sweep below if it is not already running; a group-routed
-    // connection is timed just the same, it simply has no backend slot to
-    // charge when the deadline passes.
+    // connection is timed just the same and is charged to the member it
+    // reached — see record_group_error.
     void arm_response_deadline(proxy_client_connection* conn);
     void clear_response_deadline(proxy_client_connection* conn);
     // Start the wait for the rest of a request's header block.  Idempotent: the
@@ -747,6 +765,23 @@ private:
     mesh_config m_mesh{};
     std::vector<backend_health> m_backend_health;
     std::vector<circuit_breaker> m_circuit_breakers;
+
+    // Breakers for endpoints behind an @group backend, keyed by "host:port".
+    // A map rather than a vector because the set is the group's membership,
+    // which the proxy does not own and which changes under it.  An entry
+    // appears only when an endpoint fails and is erased again when it is
+    // healthy, so steady membership churn leaves nothing behind and a group
+    // that works costs one empty-map test per request.
+    struct endpoint_key_hash
+    {
+        using is_transparent = void;
+        size_t operator()(std::string_view s) const noexcept
+        {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    std::unordered_map<std::string, circuit_breaker, endpoint_key_hash,
+                       std::equal_to<>> m_group_breakers;
     std::unique_ptr<timer_op> m_health_check_timer;
 
     // Async health checks.  One probe object per backend per sweep, held by
