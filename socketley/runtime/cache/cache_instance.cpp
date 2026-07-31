@@ -29,6 +29,14 @@ cache_instance::cache_instance(std::string_view name)
 
 cache_instance::~cache_instance()
 {
+    // Normally already gone: the manager rebuilds the whole sink table on every
+    // membership change, and removing a runtime is one.  This is the case that
+    // does not go through the manager — an instance built and dropped by a
+    // test, or one whose removal raced a rebuild — where a stale entry would be
+    // a pointer into this object after it is freed.
+    if (auto* mgr = get_runtime_manager())
+        mgr->requests().drop_sink(this);
+
     close_tracked(m_listen_fd);
 }
 
@@ -1315,13 +1323,77 @@ static bool parse_int_sv(std::string_view sv, int& out)
     return ec == std::errc{} && ptr == sv.data() + sv.size();
 }
 
+// A request payload is a newline-delimited command stream, and not one command.
+//
+// That is what would arrive on this cache's own port, so it is what the request
+// channel carries: the same framing, the same interpreter, the same answers
+// concatenated in the same order.  A caller with one command sends one line and
+// gets one answer, which is the whole of what `cache <cmd>` through a server
+// needs.  A caller with a stream of them — the server's `--cache` auto-store,
+// which produces one `set` per message a client sends — sends them together and
+// pays for one queue entry instead of one per message.  Without that, a client
+// pushing a megabyte down a socket in one write posts a request per line, and
+// the queue's cap turns into dropped writes: measured at 88% loss on a 200 000
+// message burst before this was batched.
+void cache_instance::serve_request(std::string_view payload, std::string& out)
+{
+    // The re-entrant case: a command that publishes reaches Lua, and a Lua
+    // callback can ask this cache another question from inside the first.  Rare
+    // enough to pay full price for, and it must not share the buffer.
+    if (SOCKETLEY_UNLIKELY(m_serving))
+    {
+        client_connection nested{};
+        nested.fd = -1;
+        nested.rl_max = 0;
+        run_request_lines(&nested, payload);
+        out.append(nested.response_buf);
+        return;
+    }
+
+    if (!m_request_conn)
+        m_request_conn = std::make_unique<client_connection>();
+
+    struct serving_guard
+    {
+        bool& flag;
+        ~serving_guard() { flag = false; }
+    } guard{m_serving};
+    m_serving = true;
+
+    auto* conn = m_request_conn.get();
+    conn->fd = -1;
+    conn->rl_max = 0;
+    conn->rl_tokens = 0.0;
+    conn->response_buf.clear();
+    run_request_lines(conn, payload);
+    out.append(conn->response_buf);
+}
+
+void cache_instance::run_request_lines(client_connection* conn, std::string_view payload)
+{
+    size_t start = 0;
+    while (start <= payload.size())
+    {
+        size_t nl = payload.find('\n', start);
+        std::string_view line = (nl == std::string_view::npos)
+            ? payload.substr(start) : payload.substr(start, nl - start);
+
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (!line.empty())
+            process_command(conn, line);
+
+        if (nl == std::string_view::npos)
+            break;
+        start = nl + 1;
+    }
+}
+
 std::string cache_instance::execute(std::string_view line)
 {
-    client_connection dummy{};
-    dummy.fd = -1;
-    dummy.rl_max = 0;
-    process_command(&dummy, line);
-    return std::move(dummy.response_buf);
+    std::string out;
+    serve_request(line, out);
+    return out;
 }
 
 // Zero-allocation integer append for text-mode responses
@@ -2752,11 +2824,6 @@ bool cache_instance::lua_persist(std::string_view key)
     if (m_mode == cache_mode_readonly)
         return false;
     return m_store.persist(key);
-}
-
-bool cache_instance::store_direct(std::string_view key, std::string_view value)
-{
-    return m_store.set(key, value);
 }
 
 uint32_t cache_instance::get_size() const

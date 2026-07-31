@@ -11,6 +11,7 @@
 
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
+#include "../../shared/request_channel.h"
 #include "cache_store.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
@@ -99,7 +100,7 @@ enum cache_mode : uint8_t
     cache_mode_admin     = 2   // all incl. FLUSH, LOAD
 };
 
-class cache_instance : public runtime_instance
+class cache_instance : public runtime_instance, public request_sink
 {
 public:
     cache_instance(std::string_view name);
@@ -180,6 +181,18 @@ public:
     // Interactive mode: execute a command and return response
     std::string execute(std::string_view line);
 
+    // ── request_sink ────────────────────────────────────────────────────────
+    // Answer a command that reached this cache from another runtime.  Same
+    // interpreter as a socket client's, deliberately: a request that arrives
+    // over the channel and the same request typed at the cache's own port have
+    // to mean the same thing, mode checks and replication included.
+    //
+    // The caller is the request channel, never the runtime that asked — this
+    // runs inside a completion the channel owns, so nothing here is on anybody
+    // else's message path.  See shared/request_channel.h.
+    void serve_request(std::string_view payload, std::string& out) override;
+    request_sink* as_request_sink() override { return this; }
+
     // Maxmemory / Eviction
     void set_max_memory(size_t bytes);
     size_t get_max_memory() const;
@@ -206,9 +219,6 @@ public:
     uint64_t m_stat_get_misses{0};
     uint64_t m_stat_keys_expired{0};
 
-    // Direct store access (for server --cache integration)
-    bool store_direct(std::string_view key, std::string_view value);
-
     // Cache management (for cmd_action)
     uint32_t get_size() const;
     size_t store_memory_used() const;
@@ -227,6 +237,9 @@ private:
 #endif
 
     void process_command(client_connection* conn, std::string_view line);
+    // Run every line of a request payload through process_command, in order.
+    // See serve_request() for why a payload is a stream and not a command.
+    void run_request_lines(client_connection* conn, std::string_view payload);
     void process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
 
@@ -477,6 +490,19 @@ private:
     // setting the flag without arming the timer leaves expired keys to be
     // reclaimed only when something happens to touch them.
     void mark_ttl_keys();
+
+    // The connection serve_request() and execute() answer through.
+    //
+    // A client_connection carries a 4 KB read buffer and half a dozen strings,
+    // and both of those entry points used to build one on the stack per call.
+    // That was fine while the only caller was an interactive CLI command; the
+    // server's `--cache` auto-store now comes through here once per message, so
+    // the object is made once and reset instead.  m_serving is the re-entrancy
+    // guard: a command that publishes reaches Lua, and Lua can ask this cache
+    // another question from inside the first one, which would otherwise write
+    // two answers into one buffer.
+    std::unique_ptr<client_connection> m_request_conn;
+    bool m_serving{false};
 
     // Connection struct pool — reuse allocations to avoid malloc/free per connect/disconnect
     static constexpr size_t CONN_POOL_INIT = 32;

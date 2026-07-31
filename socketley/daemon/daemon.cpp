@@ -286,6 +286,12 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         return 1;
     }
 
+    // Give the cross-runtime request channel its ring.  Until this happens it
+    // refuses every request, so it has to come before any runtime is restored
+    // — a server with --cache posts on its first message, and the first message
+    // can arrive inside restore.  See shared/request_channel.h.
+    manager.requests().attach(loop);
+
     // Create state persistence
     state_persistence persistence(paths.state_dir.string());
 
@@ -335,6 +341,13 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // runtime this stopped submitted into an unmapped submission queue — a
     // segfault on every SIGTERM that found a runtime still running.
     manager.stop_all(loop);
+
+    // Still with a live ring, and after stop_all so that nothing can post
+    // again: every request the channel is still carrying is answered `dropped`
+    // and its owner registration goes back.  A request left queued here is an
+    // origin waiting on a reply that the ring, about to be unmapped, can no
+    // longer produce a wakeup for.
+    manager.requests().detach();
 
     // Nothing more will be submitted, so the ring can go — and it has to go
     // before anything is freed, because until it does the kernel may still be

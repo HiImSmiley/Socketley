@@ -804,6 +804,15 @@ Link this server to an existing cache runtime. Clients can then send
 which are executed against the linked cache and the response returned to
 the sender only. Normal messages are still processed according to the
 server's mode.
+.IP
+The command is not executed on the connection that asked for it. The
+server hands it to the daemon and answers when the reply comes back, one
+turn of the event loop later, so a
+.B cache
+command costs a round trip that the same command typed at the cache's own
+port does not. See
+.B Cache Access via Server
+below for what that guarantees and what it costs.
 .SS Multi-Protocol Auto-Detection
 Server connections automatically detect the protocol from the first bytes
 received. No flags are needed \(em all four protocols coexist on the same
@@ -854,6 +863,46 @@ socketley create server api -p 9000 --cache store -s
 # Client sends: "cache set foo bar" → receives "ok"
 # Client sends: "cache get foo" → receives "bar"
 .fi
+.PP
+The request is asynchronous. The server does not run the cache's command
+interpreter itself \(em it posts the command and answers the client when
+the reply arrives, which is the next turn of the daemon's event loop.
+That is a round trip the synchronous version did not pay, on the order of
+tens of microseconds on loopback; it is what allows the cache to be a
+different process later without anything on the client's side changing.
+Nothing else waits on it: the server keeps serving every other connection
+while the reply is outstanding.
+.PP
+What holds:
+.RS
+.IP \(bu 2
+Replies on one connection come back in request order, so a client may
+pipeline
+.B cache
+commands and match answers to questions positionally.
+.IP \(bu 2
+A command addressed to a cache that is not running is answered with an
+.B error:
+line rather than with silence.
+.IP \(bu 2
+A client that shuts down its write side after asking still receives its
+answer: the connection is held open until every reply it is owed has been
+written.
+.RE
+.PP
+What does not: nothing is promised about the order of a
+.B cache
+reply against other traffic on the same connection. A broadcast goes to
+every client except the sender and a cache reply goes to the sender
+alone, so there is no interleaving to define.
+.PP
+A connection may have at most 4096 unanswered
+.B cache
+commands outstanding, and the daemon at most 32768 across all of them. A
+client that pipelines past its share is disconnected rather than refused
+in place: a refusal written now would arrive ahead of the answers already
+queued in front of it, and a client that cannot tell which answer belongs
+to which question has no protocol left.
 .PP
 Default port: 8000
 .SH CLIENT FLAGS

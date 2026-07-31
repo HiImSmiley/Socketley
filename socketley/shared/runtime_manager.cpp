@@ -608,6 +608,26 @@ void runtime_manager::publish_endpoints()
         for (const auto& [_, inst] : runtimes)
             inst->set_endpoints(tbl);
     }
+
+    // The other half of the same snapshot: not where a runtime is, but who
+    // answers a request addressed to its name.  Rebuilt wholesale for the same
+    // reason and at the same moments — a name that has just been taken, freed
+    // or renamed must not still resolve to the object it used to mean.
+    //
+    // Running only.  A cache that is merely configured has no store loaded, and
+    // a request that arrives for it is better answered "no such target" than
+    // served out of an empty one.
+    {
+        std::shared_lock lock(mutex);
+        m_requests.clear_sinks();
+        for (const auto& [name, inst] : runtimes)
+        {
+            if (inst->get_state() != runtime_running)
+                continue;
+            if (auto* sink = inst->as_request_sink())
+                m_requests.register_sink(name, sink);
+        }
+    }
 }
 
 const runtime_manager::runtime_map& runtime_manager::list() const

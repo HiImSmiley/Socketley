@@ -14,6 +14,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
+#include "../../shared/request_channel.h"
 #include <linux/time_types.h>
 
 class runtime_manager;
@@ -103,6 +104,21 @@ struct alignas(64) server_connection
     // Master auth attempt tracking
     uint8_t auth_failures{0};
 
+    // Cache requests this connection has asked for and not been answered yet.
+    //
+    // A count and not a queue: the request channel answers one origin in the
+    // order it posted, so a reply is written the moment it arrives and the wire
+    // order is the request order without anything having to be held.  What this
+    // is for is the cap — a client pipelining `cache` commands can post them far
+    // faster than the channel drains, and an unbounded backlog is a
+    // memory-exhaustion path reachable from one socket.
+    //
+    // Nothing in flight points into this struct: the channel copies the payload
+    // and carries a cookie, so the connection can be closed and pooled with
+    // requests still queued, and the stale reply is dropped by the generation
+    // check in on_request_reply().
+    uint32_t cache_pending{0};
+
     // WebSocket fragment reassembly (zero-alloc, in-place compaction in partial)
     size_t ws_frag_len{0};
     uint8_t ws_frag_opcode{0};
@@ -187,6 +203,7 @@ struct alignas(64) server_connection
         rl_tokens = 0.0;
         rl_max = 0.0;
         auth_failures = 0;
+        cache_pending = 0;
         ws_frag_len = 0;
         ws_frag_opcode = 0;
         pipe_peer_fd = -1;
@@ -262,7 +279,7 @@ struct upstream_connection
     bool has_cached_addr{false};
 };
 
-class server_instance : public runtime_instance
+class server_instance : public runtime_instance, public request_origin
 {
 public:
     server_instance(std::string_view name);
@@ -352,7 +369,54 @@ public:
     void lua_upstream_broadcast(std::string_view msg);
     std::vector<int> lua_upstreams() const;
 
+    // ── request_origin ──────────────────────────────────────────────────────
+    // An answer from the linked cache, one turn of the event loop after the
+    // command that asked for it.  The cookie names the connection that asked
+    // and the identity it had at the time; a client that has gone since — or a
+    // struct the pool has already handed to somebody else — fails that compare
+    // and the answer is dropped rather than written into a stranger's stream.
+    void on_request_reply(uint64_t cookie, request_status st,
+                          std::string_view reply) override;
+
 private:
+    // Ask the linked cache something on behalf of `conn`.  `silent` is the
+    // auto-store: it wants no answer and is not charged to the connection,
+    // because the client never asked for it.
+    void post_cache_request(server_connection* conn, std::string_view payload, bool silent);
+
+    // How many unanswered cache requests one connection may have.  Well above
+    // what a single 16 KB read can hold in `cache get k` lines, so ordinary
+    // pipelining never meets it; a client that keeps going past it is closed,
+    // which is the same answer this runtime already gives a client that outruns
+    // its own write queue.  Refusing in place is not an option — the refusal
+    // would overtake the answers already queued ahead of it, and a client that
+    // cannot tell which answer belongs to which question has no protocol left.
+    static constexpr uint32_t MAX_CACHE_PENDING = 4096;
+
+    // ── the --cache auto-store ──────────────────────────────────────────────
+    // Every message a linked server receives is written to the cache under an
+    // incrementing key.  That used to be one m_store.set() through a pointer to
+    // the cache object; it is a request now, and a request per message is the
+    // wrong granularity: one 16 KB read is two thousand messages, and posting
+    // two thousand entries for it fills the channel's queue faster than a turn
+    // of the loop can drain it.  Measured on a 200 000 message burst, that was
+    // 88% of the writes dropped.
+    //
+    // So the lines are accumulated here and posted together — the channel
+    // carries a command stream, which is what would go over the cache's socket
+    // anyway.  One entry per read instead of one per message, and the loss goes
+    // away because the queue is nowhere near its cap.
+    //
+    // Flushed at every point where the batch could otherwise be stranded: the
+    // end of a read, the end of a datagram, a stop, and immediately before any
+    // command the client is waiting on — that last one so a client which sends
+    // a message and then asks the cache for it by key sees its own write.
+    std::string m_cache_store_batch;
+    // Flush at this size rather than only at the end of a read, so a single
+    // enormous read cannot build an unbounded batch.
+    static constexpr size_t CACHE_STORE_BATCH_BYTES = 32 * 1024;
+    void flush_cache_store();
+
     void handle_accept(struct io_uring_cqe* cqe);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
@@ -420,7 +484,14 @@ private:
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
     void remove_active_fd(int fd);
-    void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg);
+    // `even_when_closing` is for an answer that was already promised.  A
+    // connection normally stops accepting output the moment it is marked
+    // closing — the conversation is over and anything produced after that is
+    // computed and thrown away — but a cache reply was asked for before the
+    // client half-closed, and its socket is still open precisely because that
+    // answer is owed.  Nothing else may set it.
+    void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+                 bool even_when_closing = false);
     void flush_write_queue(server_connection* conn);
     void submit_conn_read(server_connection* conn);
     void release_fixed_slot(server_connection* conn);

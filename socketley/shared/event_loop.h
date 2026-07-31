@@ -177,6 +177,21 @@ public:
     bool submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
     bool submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
+    // A submission that does nothing but report.  The completion arrives on the
+    // next pass of the drain, so this is how a handler asks the loop to come
+    // back to it once the current one has unwound — no descriptor, no timer, no
+    // wait.  request_channel uses it to get a cross-runtime request off the
+    // stack of the handler that made it.
+    //
+    // Cheaper than a zero-length timeout, which is the obvious alternative: a
+    // timeout arms an hrtimer and is charged to the kernel's timer wheel, and
+    // its completion carries -ETIME that every caller then has to ignore.  This
+    // one is consumed and reported in the same pass the SQE is read.
+    //
+    // Counted like every other submission, so an owner with one outstanding is
+    // not quiescent and its storage may not be freed.
+    bool submit_nop(io_request* req);
+
     // Withdraw a timeout that submit_timeout() put in the ring, named by the
     // request it was submitted with — a timeout hangs off no descriptor, so
     // there is nothing else to name it by, and neither close() nor

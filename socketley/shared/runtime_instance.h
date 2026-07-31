@@ -23,6 +23,7 @@ class event_loop;
 class lua_context;
 class runtime_manager;
 class endpoint_table;
+class request_sink;
 
 class runtime_instance : public io_handler
 {
@@ -224,6 +225,13 @@ public:
     // host and a port, which is what would arrive over a socket if this runtime
     // lived in its own process.  See shared/endpoint_table.h.
     virtual void set_endpoints(std::shared_ptr<const endpoint_table>) {}
+
+    // Whether this runtime can answer requests other runtimes address to its
+    // name, and through what.  Null by default: only a cache can, and it is the
+    // manager — not the asking runtime — that puts the answer in the request
+    // channel's table, on the same membership changes that republish the
+    // endpoints.  See shared/request_channel.h.
+    virtual request_sink* as_request_sink() { return nullptr; }
 
     // Lua integration
     bool load_lua_script(std::string_view path);

@@ -38,13 +38,30 @@
 // nothing listens on, which is the reconnect-timer path.  And UDP, which is a
 // different socket, a different completion and a different restart hazard.
 //
+// And cache requests: `server --cache` posts the client's command to the
+// daemon's request_channel and answers when the reply comes back, so between
+// the question and the answer there is a window in which the connection that
+// asked can be closed, its descriptor reissued and its struct handed to the
+// next client.  That is the exact shape of defect this target exists for, so
+// the alphabet reaches it directly — see the OP_CACHE and PL_CACHE_* notes
+// below, and the stub sink that stands in for a cache runtime.
+//
 // ─── WHAT IT DOES NOT COVER ─────────────────────────────────────────────────
 //
-// Lua (the C++ callbacks stand in for it), TLS, routing between runtimes — that
-// needs a runtime_manager and a second instance — direct-descriptor accept, and
-// anything that depends on a timer longer than the drain budget actually
-// elapsing: the idle sweep is thirty seconds and the accept backoff a hundred
-// milliseconds, so this target sees them armed and withdrawn but never fired.
+// Lua (the C++ callbacks stand in for it), TLS, routing between runtimes,
+// direct-descriptor accept, and anything that depends on a timer longer than
+// the drain budget actually elapsing: the idle sweep is thirty seconds and the
+// accept backoff a hundred milliseconds, so this target sees them armed and
+// withdrawn but never fired.
+//
+// The cache behind a cache request is a stub and not a cache_instance, on
+// purpose.  What is under test is the server's half — the cookie that has to
+// survive the connection it names being reused, the cap, the deferred close —
+// and a stub can be made to answer nothing, answer enormously, or reach back
+// into the server from inside the request, none of which a real cache would do
+// on demand.  That the stub can stand in at all is the property the change was
+// for: the server holds no pointer to a cache and never did know what was on
+// the other end.
 
 #include <algorithm>
 #include <cerrno>
@@ -77,7 +94,9 @@
 #include "shared/event_loop.h"
 #include "shared/event_loop_definitions.h"
 #include "shared/logging.h"
+#include "shared/request_channel.h"
 #include "shared/runtime_instance.h"
+#include "shared/runtime_manager.h"
 #include "shared/write_queue.h"
 
 // Reaching inside the class, for the same reason and by the same means as
@@ -125,6 +144,20 @@ enum payload_id : uint8_t
     PL_RESP_PING,
     PL_AUTH_OK,
     PL_AUTH_BAD,
+    // ── cache requests ──────────────────────────────────────────────────────
+    // One command, two pipelined, and a burst larger than the per-connection
+    // cap.  The burst is the one that matters: the cap is the only thing
+    // between one socket and an unbounded queue, and what the server does at it
+    // (close, rather than answer out of order) is a decision with a wire-
+    // visible consequence.
+    PL_CACHE_ONE,
+    PL_CACHE_TWO,
+    PL_CACHE_BURST,
+    // "cache" with nothing after it, and a cache command glued to an ordinary
+    // message: the prefix test is a starts_with on a hot path and both of these
+    // sit on its edges.
+    PL_CACHE_BARE,
+    PL_CACHE_MIXED,
     PL_COUNT
 };
 
@@ -135,8 +168,9 @@ struct payload
     const char* name;
 };
 
-std::string* g_big_line = nullptr;
-std::string* g_huge     = nullptr;
+std::string* g_big_line    = nullptr;
+std::string* g_huge        = nullptr;
+std::string* g_cache_burst = nullptr;
 
 const payload& payload_at(int i)
 {
@@ -150,6 +184,14 @@ const payload& payload_at(int i)
         g_big_line = new std::string(20000, 'L');
         g_big_line->push_back('\n');
         g_huge     = new std::string(256 * 1024, 'H');
+
+        // Past server_instance::MAX_CACHE_PENDING on its own, so one send is
+        // enough to walk a connection into the cap without the harness having
+        // to arrange a burst out of many steps.
+        g_cache_burst = new std::string();
+        g_cache_burst->reserve(5000 * 14);
+        for (int i = 0; i < 5000; i++)
+            g_cache_burst->append("cache get k\n");
 
         auto set = [](payload_id id, const char* d, size_t n, const char* nm) {
             table[id] = { d, n, nm };
@@ -197,6 +239,16 @@ const payload& payload_at(int i)
         static const char auth_bad[] = "AUTH wrong\n";
         set(PL_AUTH_OK,  auth_ok,  sizeof(auth_ok)  - 1, "auth-ok");
         set(PL_AUTH_BAD, auth_bad, sizeof(auth_bad) - 1, "auth-bad");
+
+        static const char cache_one[]   = "cache get k\n";
+        static const char cache_two[]   = "cache set k v\ncache get k\n";
+        static const char cache_bare[]  = "cache\ncache \n";
+        static const char cache_mixed[] = "hello\ncache get k\nworld\n";
+        set(PL_CACHE_ONE,   cache_one,   sizeof(cache_one)   - 1, "cache-one");
+        set(PL_CACHE_TWO,   cache_two,   sizeof(cache_two)   - 1, "cache-two");
+        set(PL_CACHE_BURST, g_cache_burst->data(), g_cache_burst->size(), "cache-burst");
+        set(PL_CACHE_BARE,  cache_bare,  sizeof(cache_bare)  - 1, "cache-bare");
+        set(PL_CACHE_MIXED, cache_mixed, sizeof(cache_mixed) - 1, "cache-mixed");
         built = true;
     }
     return table[i % PL_COUNT];
@@ -215,6 +267,12 @@ enum op_code : uint8_t
     OP_CONFIG,
     OP_STATS,
     OP_UPSTREAM,
+    // Move the cache the server is linked to: attach or detach the name, take
+    // the stub sink out of the channel's table or put it back, and change what
+    // it answers.  Each of those is a moment a request already in the queue has
+    // to survive — the sink it was posted for can be gone by the time it is
+    // drained, which is precisely why the lookup happens at drain time.
+    OP_CACHE,
     OP_COUNT
 };
 
@@ -225,6 +283,22 @@ struct step
 
 step   g_prog[MAX_STEPS];
 size_t g_steps = 0;
+
+// What the stub cache answers.  Named here because print_program() has to say
+// it, and the two that matter are the last two: an empty answer is the one the
+// server must not write a bare newline for, and "reach back into the server" is
+// the request being served while the runtime that asked is torn down under it.
+const char* sink_mode_name(int m)
+{
+    switch (m % 5)
+    {
+        case 0:  return "short-line";
+        case 1:  return "no-trailing-newline";
+        case 2:  return "64KB";
+        case 3:  return "empty";
+        default: return "reach-back-into-the-server";
+    }
+}
 
 const char* cb_mode_name(int m)
 {
@@ -277,6 +351,10 @@ void print_program()
                                              (s.a % 8) == 5 ? cb_mode_name(s.b) : ""); break;
             case OP_STATS:      std::fputs("rt.publish_offthread_stats();\n", stderr); break;
             case OP_UPSTREAM:   std::fputs("rt.add_upstream_target(\"127.0.0.1:9\");  // nothing listens\n", stderr); break;
+            case OP_CACHE:      std::fprintf(stderr, "cache: link=%s sink=%s answer=%s\n",
+                                             (s.a & 1) ? "\"fuzz-cache\"" : "\"\"",
+                                             (s.b & 1) ? "registered" : "withdrawn",
+                                             sink_mode_name(s.c)); break;
             default:            std::fprintf(stderr, "/* op %u */\n", s.op); break;
         }
     }
@@ -287,6 +365,26 @@ void print_program()
 
 event_loop*        g_loop = nullptr;
 fuzzrt::ring_watch g_watch;
+
+// ─────────────────────────── the stub cache ─────────────────────────────────
+//
+// A request_sink and nothing else.  It stands where a cache_instance would, and
+// the only reason it can is that the server does not know the difference: what
+// crosses the boundary is a command and an answer, both of them bytes.
+//
+// The manager is real, because it owns the channel and because it is the thing
+// that publishes who answers for a name — the same object the daemon uses, with
+// an empty runtime map.
+runtime_manager* g_mgr = nullptr;
+constexpr const char* CACHE_NAME = "fuzz-cache";
+
+int g_sink_mode = 0;
+
+struct stub_cache : request_sink
+{
+    void serve_request(std::string_view payload, std::string& out) override;
+};
+stub_cache g_sink;
 
 // Instances the loop would not stop owing anything.  They are kept rather than
 // freed, exactly as runtime_manager keeps them, and retried on later inputs.
@@ -400,6 +498,56 @@ bool cb_on_auth(int)
 
 void cb_on_tick(double) {}
 
+// ─────────────────────────── the stub cache, answering ──────────────────────
+
+void stub_cache::serve_request(std::string_view payload, std::string& out)
+{
+    switch (g_sink_mode % 5)
+    {
+        case 0:
+            out.append("ok\n");
+            break;
+        case 1:
+            // No trailing newline: the server has to add one, and it has to
+            // look at the last byte of a string it did not build to decide.
+            out.append("no-newline");
+            break;
+        case 2:
+            out.append(64 * 1024, 'R');
+            out.push_back('\n');
+            break;
+        case 3:
+            // Nothing at all.  An empty answer must produce no write — a bare
+            // newline here would be a reply the client never asked for and
+            // would shift every later answer by one line.
+            break;
+        default:
+        {
+            // The sharp one.  Serving a request reaches back into the runtime
+            // that asked, from inside the channel's own completion: it
+            // broadcasts, it disconnects a client, and one time in eight it
+            // stops the server outright.  The reply is then delivered to an
+            // origin that has been torn down since the request was taken off
+            // the queue, which is the case drain() re-checks origin_live() for
+            // and the reason it does so *after* the sink has run rather than
+            // before.
+            auto* rt = live_rt();
+            if (rt)
+            {
+                rt->lua_broadcast("from-the-cache\n");
+                std::vector<int> fds = rt->lua_clients();
+                if (!fds.empty() && (payload.size() & 1))
+                    rt->lua_disconnect(fds[payload.size() % fds.size()]);
+                static unsigned n = 0;
+                if ((++n & 7) == 0)
+                    rt->stop(*g_loop);
+            }
+            out.append("reentrant\n");
+            break;
+        }
+    }
+}
+
 // ─────────────────────────── instance construction ──────────────────────────
 
 std::unique_ptr<server_instance> make_instance(world& w)
@@ -408,6 +556,11 @@ std::unique_ptr<server_instance> make_instance(world& w)
     rt->set_port(w.port);
     rt->set_udp(w.udp);
     rt->set_event_loop(g_loop);
+    // The manager is how a runtime reaches the request channel, exactly as in
+    // the daemon.  The cache link starts on so that an input that never issues
+    // an OP_CACHE still exercises the request path.
+    rt->set_runtime_manager(g_mgr);
+    rt->set_cache_name(CACHE_NAME);
     rt->set_on_client_message(cb_on_client_message);
     rt->set_on_connect(cb_on_connect);
     rt->set_on_disconnect(cb_on_disconnect);
@@ -510,6 +663,18 @@ void check_instance(server_instance* rt, bool deep)
                    "nothing — the completion that would free it is never coming, so no accept "
                    "chain can ever be armed on this request again");
     }
+
+    // A cache request is owed a reply and the reply is what lowers the count,
+    // so a connection carrying one has something that will wake it.  A pooled
+    // struct must not: the count goes into the pool with the struct, and the
+    // next client to take it would inherit a backlog it never created and be
+    // closed at the cap for somebody else's traffic.  reset() clears it, so
+    // this is a check that reset() is actually reached.
+    for (const auto& up : rt->m_conn_pool)
+        RT_FINDING("pool-cache-pending", up->cache_pending == 0,
+                   "a connection struct is in the pool still counting cache requests it "
+                   "was never answered for — the next client to take it inherits the "
+                   "backlog and is closed at the cap for traffic it never sent");
 
     if (deep)
     {
@@ -839,6 +1004,25 @@ void run_step(world& w, const step& s)
                 w.rt->add_upstream_target("127.0.0.1:9");
             break;
 
+        case OP_CACHE:
+            if (w.rt)
+                w.rt->set_cache_name((s.a & 1) ? CACHE_NAME : "");
+            // Withdrawing the sink is what the manager does when the cache is
+            // stopped or removed, and it is legal at any moment — including
+            // with requests already queued against the name.  Those must be
+            // answered "no such target", not served through a pointer that has
+            // been taken out of the table.
+            if (s.b & 1)
+            {
+                g_mgr->requests().register_sink(CACHE_NAME, &g_sink);
+            }
+            else
+            {
+                g_mgr->requests().drop_sink(&g_sink);
+            }
+            g_sink_mode = s.c % 5;
+            break;
+
         default:
             break;
     }
@@ -911,6 +1095,14 @@ void init_once()
     }
     g_watch.loop = g_loop;
 
+    // Never freed, like everything else here that survives an input: the
+    // channel is an io_handler registered with the loop and the loop is
+    // process-wide.  Reachable from this pointer, so LeakSanitizer does not
+    // count it.
+    g_mgr = new runtime_manager();
+    g_mgr->requests().attach(*g_loop);
+    g_mgr->requests().register_sink(CACHE_NAME, &g_sink);
+
     fuzzrt::skip_env() = "FUZZ_SERVER_SKIP";
     fuzzrt::print_program_hook() = print_program;
 }
@@ -947,6 +1139,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     w.udp    = (data[0] & 0x80) != 0;
     w.tick   = (data[1] & 0x80) != 0;
     g_cb_mode = data[2] % 6;
+
+    // The cache stub starts registered and in its plainest mode for every
+    // input, so that replaying one input on its own reproduces what it did
+    // inside a longer run.  OP_CACHE moves it from there.
+    g_mgr->requests().register_sink(CACHE_NAME, &g_sink);
+    g_sink_mode = data[3] % 5;
+
     w.rt     = make_instance(w);
 
     size_t off = 0;
@@ -973,6 +1172,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
     retire_instance(w, "end of input");
     drain_ticks(w);
+
+    // The request channel must not be left carrying work.
+    //
+    // An entry that survives this input names an origin that has just been
+    // destroyed, so the next input's drain would reach through a pointer into
+    // freed storage — ASan would report it, but one input later and with the
+    // program that caused it already gone.  Asserting it here catches it while
+    // the sequence that produced it is still printable, and says which of the
+    // two it was: a missed drop_origin, or a queue with no wakeup coming.
+    for (int i = 0; i < 8 && g_mgr->requests().pending() > 0; i++)
+        g_loop->poll_completions(1);
+    RT_FINDING("channel-backlog", g_mgr->requests().pending() == 0,
+               "the request channel is still carrying cross-runtime requests after every "
+               "runtime this input created is gone — either no wakeup is coming for them "
+               "or the origins they name have already been freed");
 
     // Only meaningful with nothing stuck: an instance in the graveyard is one
     // that was already reported, and the descriptors it is holding are the same

@@ -31,6 +31,17 @@ socketley create cache admin -p 9002 --mode admin -s
 ### Cache Integration
 Using cache with server/client via Lua.
 
+### Cache Access via Server (`server-cache-access.sh`)
+A server created with `--cache <name>` lets its own clients reach that cache:
+any message beginning `cache ` is run against the linked cache and the answer
+goes back to the sender alone.
+
+The request is asynchronous — the server posts the command and answers when the
+reply arrives, one turn of the event loop later, rather than running the cache's
+interpreter on the connection that asked. Replies on one connection come back in
+request order, so commands can be pipelined; a cache that is not running is
+answered with an `error:` line rather than with silence.
+
 ## Key Concepts
 
 ### Cache Operations

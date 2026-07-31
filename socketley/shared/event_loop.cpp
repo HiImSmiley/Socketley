@@ -1271,6 +1271,17 @@ bool event_loop::submit_timeout(struct __kernel_timespec* ts, io_request* req)
     return true;
 }
 
+bool event_loop::submit_nop(io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_nop(sqe);
+    io_uring_sqe_set_data(sqe, req);
+    arm(req, IO_TARGET_NONE);
+    return true;
+}
+
 bool event_loop::submit_timeout_remove(io_request* target)
 {
     if (!target)

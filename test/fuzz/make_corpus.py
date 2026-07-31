@@ -760,6 +760,7 @@ _SRV_OPS = [
     "CONFIG",
     "STATS",
     "UPSTREAM",
+    "CACHE",
 ]
 _SRV = {n: i for i, n in enumerate(_SRV_OPS)}
 
@@ -767,7 +768,9 @@ _SRV = {n: i for i, n in enumerate(_SRV_OPS)}
 (P_EMPTY, P_LINE, P_FRAGMENT, P_TWO_LINES, P_CRLF, P_BIG_LINE, P_HUGE,
  P_HTTP_ROOT, P_HTTP_BLOB, P_HTTP_KA, P_HTTP_TRAV, P_HTTP_PART,
  P_WS_UPGRADE, P_WS_TEXT, P_WS_CLOSE, P_WS_FRAG,
- P_RESP_PING, P_AUTH_OK, P_AUTH_BAD) = range(19)
+ P_RESP_PING, P_AUTH_OK, P_AUTH_BAD,
+ P_CACHE_ONE, P_CACHE_TWO, P_CACHE_BURST,
+ P_CACHE_BARE, P_CACHE_MIXED) = range(24)
 
 # Server CONFIG knobs: `a % 8`.
 (C_MAXCONN, C_IDLE, C_DRAIN, C_RATE, C_MODE, C_CB, C_HTTPCACHE, C_UDP) = range(8)
@@ -988,6 +991,86 @@ def server_seeds():
     s["tick_across_restarts"] = prog(
         tick_start, sop("STOP"), sop("START"), sop("STOP"),
         sop("START"), sop("CONNECT", 0), sop("PUMP", 3), sop("STOP"))
+
+    # ── cache requests: the window between a question and its answer ──
+    #
+    # `server --cache` posts the client's command to the daemon's request
+    # channel and answers when the reply comes back, a turn of the loop later.
+    # Everything below is an ordering that puts something in that window.
+
+    # The plain shape, so the mutator has somewhere to start.
+    s["cache_ask_and_read"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_TWO), sop("PUMP", 3),
+        sop("RECV", 0), sop("PUMP", 3), sop("STOP"))
+
+    # The client resets between the question and the answer.  Its descriptor
+    # goes straight back to the kernel and the next connect takes it, so the
+    # reply is delivered into the window where the number means somebody else.
+    s["cache_abort_before_reply"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_ONE),
+        sop("ABORT", 0),
+        sop("CONNECT", 1), sop("PUMP", 3),
+        sop("SEND", 1, P_CACHE_ONE), sop("PUMP", 3), sop("RECV", 1),
+        sop("PUMP", 3), sop("STOP"))
+
+    # A half-close: nothing of this connection's is in the ring while the reply
+    # is queued, so the close has to be held until the answer is written.
+    s["cache_half_close"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_TWO), sop("FIN", 0), sop("PUMP", 3),
+        sop("RECV", 0), sop("PUMP", 3), sop("STOP"))
+
+    # Past the per-connection cap in one write, which is the only path that
+    # closes a connection for asking too much.
+    s["cache_burst_past_cap"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_BURST), sop("PUMP", 3),
+        sop("RECV", 0), sop("PUMP", 3), sop("STOP"))
+
+    # The sink withdrawn with requests already queued against its name, which is
+    # what a `stop` on the cache does.  They must be answered, not served
+    # through a table entry the manager has taken back.
+    s["cache_sink_withdrawn_mid_flight"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_TWO),
+        sop("CACHE", 1, 0, 0),
+        sop("PUMP", 3), sop("RECV", 0),
+        sop("CACHE", 1, 1, 0), sop("PUMP", 3), sop("STOP"))
+
+    # The runtime stopped and destroyed with requests in the queue: the origin
+    # is revoked and the storage it names is freed, in that order or not at all.
+    s["cache_destroy_with_requests_queued"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_BURST),
+        sop("STOP"), sop("DESTROY"),
+        sop("START"), sop("CONNECT", 1), sop("PUMP", 3), sop("STOP"))
+
+    # The sink reaching back into the server from inside the request it is
+    # serving — broadcasting, disconnecting, and now and then stopping the very
+    # runtime that asked.  Mode 4 of the stub; see fuzz_server_ops.cpp.
+    s["cache_sink_reenters_the_server"] = prog(
+        sop("CACHE", 1, 1, 4),
+        sop("START"), sop("CONNECT", 0), sop("CONNECT", 1), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_TWO), sop("SEND", 1, P_CACHE_MIXED),
+        sop("PUMP", 3), sop("RECV", 0), sop("RECV", 1),
+        sop("PUMP", 3), sop("STOP"))
+
+    # The auto-store: ordinary messages become a batched `set` per read, and a
+    # cache command behind them has to see its own writes.
+    s["cache_autostore_then_ask"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_TWO_LINES), sop("SEND", 0, P_BIG_LINE),
+        sop("SEND", 0, P_CACHE_ONE), sop("PUMP", 3),
+        sop("RECV", 0), sop("PUMP", 3), sop("STOP"))
+
+    # The link taken away and put back while traffic is going through it.
+    s["cache_link_toggled"] = prog(
+        sop("START"), sop("CONNECT", 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_ONE), sop("CACHE", 0, 1, 0), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_ONE), sop("CACHE", 1, 1, 3), sop("PUMP", 3),
+        sop("SEND", 0, P_CACHE_BARE), sop("PUMP", 3), sop("STOP"))
 
     return s
 

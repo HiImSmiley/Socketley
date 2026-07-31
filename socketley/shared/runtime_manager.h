@@ -13,6 +13,7 @@
 // runtime_string_hash / runtime_string_equal live here now, with the table
 // whose lookups they exist for.
 #include "endpoint_table.h"
+#include "request_channel.h"
 
 class event_loop;
 class cluster_discovery;
@@ -92,6 +93,16 @@ public:
     // to call on any doubt; there is no path that calls it per request.
     void publish_endpoints();
 
+    // Where a runtime sends a request meant for another runtime.  One per
+    // daemon, attached to the event loop by daemon_start() and detached before
+    // the ring goes; see shared/request_channel.h for why this is a channel and
+    // not a call.
+    //
+    // Its sink table is the second half of what publish_endpoints() builds: the
+    // endpoint table says where a runtime is, this says who answers for it.
+    request_channel& requests() { return m_requests; }
+    const request_channel& requests() const { return m_requests; }
+
     const runtime_map& list() const;
     runtime_instance* get(std::string_view name);
 
@@ -114,6 +125,12 @@ private:
     // shutdown for whatever never completed.
     std::vector<std::unique_ptr<runtime_instance>> m_retired;
     size_t m_retired_warn_at = 32;
+
+    // Declared after the map on purpose.  The channel holds pointers to
+    // instances the map owns, and members are destroyed in reverse order of
+    // declaration — so this one goes first, and its queue is emptied while the
+    // runtimes it names are still alive.
+    request_channel m_requests;
 
     // Set by a reader on another thread, read by the event-loop thread on every
     // sweep, so it has to be an atomic even though it only ever goes false→true.

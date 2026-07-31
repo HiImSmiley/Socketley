@@ -7,7 +7,9 @@
 #include "../../shared/invariants.h"
 #include "../../shared/logging.h"
 #include "../../cli/command_hashing.h"
-#include "../cache/cache_instance.h"
+// Deliberately not cache_instance.h.  Everything this runtime needs of a cache
+// now goes through shared/request_channel.h as bytes; the day it included the
+// other runtime's header was the day it could hold a pointer to one.
 #include "../cache/resp_parser.h"
 
 #include <unistd.h>
@@ -37,6 +39,13 @@ server_instance::server_instance(std::string_view name)
 
 server_instance::~server_instance()
 {
+    // The last word on the cache requests this server made.  teardown() already
+    // does it, but a runtime can be destroyed without ever having been stopped
+    // — `create` then `remove` — and the channel would then be holding a
+    // pointer into this object's storage with a reply still to deliver.
+    if (auto* mgr = get_runtime_manager())
+        mgr->requests().drop_origin(this);
+
     close_tracked(m_listen_fd);
     close_tracked(m_udp_fd);
 }
@@ -198,6 +207,29 @@ void server_instance::return_provided_buf(struct io_uring_cqe* cqe)
 // notification came to be checked in three of them and forgotten in two.
 void server_instance::close_conn(server_connection* conn, bool notify_disconnect)
 {
+    // An answer from the cache is still owed to this client.
+    //
+    // Every caller here has already asked whether the ring still names the
+    // struct, and it does not — a cache request is queued in the channel, not
+    // in the ring, so nothing on this connection's behalf is armed while it
+    // waits.  That is exactly the case a request/response client produces: ask,
+    // shut down the write side, wait for the line.  Closing now throws away an
+    // answer the client is still holding its socket open for, which the
+    // synchronous version of this path could not do because it had already
+    // written the answer before it ever saw the FIN.
+    //
+    // This always ends.  The channel promises exactly one reply for every
+    // request it accepted, `dropped` included if it is torn down underneath us,
+    // and the reply that brings the count to zero comes back here to finish the
+    // close it deferred.  A runtime that stops first revokes its queued
+    // requests and empties m_clients itself, so nothing is left waiting on a
+    // reply that is no longer coming.
+    if (SOCKETLEY_UNLIKELY(conn->cache_pending > 0))
+    {
+        conn->closing = true;
+        return;
+    }
+
     const int fd = conn->fd;
 
     // This connection may still be holding the shared splice pipe.  No splice op
@@ -1231,6 +1263,28 @@ bool server_instance::setup(event_loop& loop)
 
 void server_instance::teardown(event_loop& loop)
 {
+    // The requests this server is owed answers for go first.  Everything below
+    // closes the connections those replies would have gone to, so a queued
+    // request whose origin has stopped is discarded rather than served: the
+    // answer has nowhere to go, and computing it is work the cache does not
+    // have to do.
+    //
+    // Then, and deliberately after, whatever the last read produced for the
+    // cache.  A stop is not a reason to throw away messages that arrived before
+    // it, and posting on this side of the revocation is what keeps the batch
+    // out of the sweep that has just run.  The store is performed on the next
+    // turn of the loop whether or not this runtime is still up — the channel
+    // serves the request before it asks whether anyone is left to answer.  A
+    // `remove` in the same loop iteration as the `stop` does take it back with
+    // the instance, which is the one message this can lose and the only place
+    // it can lose one.
+    if (auto* mgr = get_runtime_manager())
+    {
+        mgr->requests().drop_origin(this);
+        flush_cache_store();
+    }
+    m_cache_store_batch.clear();
+
     if (m_udp)
     {
         if (m_udp_fd >= 0)
@@ -1313,6 +1367,17 @@ void server_instance::teardown(event_loop& loop)
             m_conn_idx[fd] = nullptr;
 
         conn->closing = true;
+
+        // The cache requests this connection was waiting on were revoked above,
+        // so nothing is owed to it any more.  Clearing the count says so.
+        //
+        // Leaving it standing put a struct in the pool still counting replies
+        // that were never coming, and the next client to be handed that struct
+        // inherited the backlog: it would be closed at MAX_CACHE_PENDING for
+        // traffic somebody else sent, sooner the more often the server had been
+        // restarted.  reset() clears it on the way out of the pool, which is why
+        // this was invisible until a fuzz run walked the pool at rest.
+        conn->cache_pending = 0;
 
         // Shutdown the connection before closing it.  Like for the listen fd,
         // shutdown() completes any pending io_uring read/write ops synchronously
@@ -1679,8 +1744,14 @@ void server_instance::inv_check_reachable(int fd, const char* where)
         skl_inv::half h{};
         if (!c) return h;
         h.present   = true;
+        // A cache request counts.  Nothing of this connection's is in the ring
+        // while one is outstanding — the request lives in the channel's queue —
+        // but the channel's own wakeup is, and the reply it produces comes back
+        // here.  So the connection has something that will wake it, which is
+        // what the invariant is about.
         h.in_flight = c->read_pending || c->write_pending || c->zc_notif_pending ||
-                      c->file_read_pending || c->splice_in_pending || c->splice_out_pending;
+                      c->file_read_pending || c->splice_in_pending || c->splice_out_pending ||
+                      c->cache_pending > 0;
         h.queued    = !c->write_queue.empty();
         h.closing   = c->closing;
         h.fd        = c->fd;
@@ -2459,6 +2530,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
 submit_next_read:
+    // Everything this read produced for the cache goes now.  One post for the
+    // whole buffer instead of one per line, and — because every path above
+    // reaches this label — nothing is left sitting in the batch waiting for a
+    // message that may never come.
+    if (SOCKETLEY_UNLIKELY(!m_cache_store_batch.empty()))
+        flush_cache_store();
+
     // Only submit next read if connection is not closing and no file read pending
     if (SOCKETLEY_LIKELY(m_loop && !conn->closing))
     {
@@ -2517,6 +2595,149 @@ static inline __attribute__((always_inline)) bool check_rate_limit(server_connec
     return true;
 }
 
+// ─── Cache requests ─────────────────────────────────────────────────────────
+//
+// What the channel hands back with a reply is one 64-bit cookie and nothing
+// else, so everything needed to find the client that asked has to fit in it:
+// the descriptor in the low half and the identity the connection had when it
+// asked in the high half.  Both are required.  The descriptor alone finds a
+// connection; the generation is what says it is the *same* connection, because
+// a client that aborts mid-request has its number reissued by the next accept
+// and its struct handed on by the pool.  That is exactly the shape of the
+// completion-after-teardown defects this runtime has been finding all week, and
+// it is answered here the same way on_cqe answers it.
+//
+// A request made on nobody's behalf — the auto-store, or a UDP datagram, which
+// has no connection at all — uses a descriptor of -1, which no index can
+// resolve, so its reply is dropped without ever looking anything up.
+static constexpr uint64_t CACHE_COOKIE_NO_CONN = 0xFFFFFFFFull;
+
+static inline uint64_t cache_cookie(const server_connection* conn, bool silent)
+{
+    if (!conn || silent)
+        return CACHE_COOKIE_NO_CONN;
+    return (static_cast<uint64_t>(conn->generation) << 32)
+         | static_cast<uint64_t>(static_cast<uint32_t>(conn->fd));
+}
+
+void server_instance::flush_cache_store()
+{
+    if (SOCKETLEY_LIKELY(m_cache_store_batch.empty()))
+        return;
+
+    // Cleared whatever happens.  A batch the channel would not take is lost —
+    // it is counted there as such — and holding on to it would only make the
+    // next flush larger and no more likely to be taken.
+    post_cache_request(nullptr, m_cache_store_batch, true);
+    m_cache_store_batch.clear();
+}
+
+void server_instance::post_cache_request(server_connection* conn,
+                                         std::string_view payload, bool silent)
+{
+    const std::string_view cname = get_cache_name();
+    if (cname.empty())
+        return;
+
+    auto* mgr = get_runtime_manager();
+    if (SOCKETLEY_UNLIKELY(!mgr))
+        return;
+
+    // The cap, and the one place it is enforced.  Charged only to requests the
+    // client asked for: the auto-store is the server's own doing and closing a
+    // connection over it would punish a client for a feature it never used.
+    // The store is still bounded — by the channel's own queue, which refuses
+    // below.
+    if (!silent && conn)
+    {
+        if (SOCKETLEY_UNLIKELY(conn->cache_pending >= MAX_CACHE_PENDING))
+        {
+            conn->closing = true;
+            return;
+        }
+    }
+
+    const auto cls = silent ? request_class::background : request_class::client;
+    if (!mgr->requests().post(this, cache_cookie(conn, silent), cname, payload, cls))
+    {
+        // The channel took nothing, so no reply is coming for this one.
+        //
+        // A command the client is waiting on cannot simply be dropped and
+        // cannot be answered here either — an error written now would arrive
+        // ahead of the answers already queued in front of it, and the client
+        // would match the wrong reply to the wrong question.  Closing says the
+        // same thing without lying about the order.
+        //
+        // The auto-store just goes.  Nobody asked for it and nobody is waiting
+        // on it, and it only reaches here once the channel's background share
+        // is full, which is a burst larger than the loop can drain in a turn.
+        // The channel counts every one of these; it is loss, not a no-op.
+        if (!silent && conn)
+            conn->closing = true;
+        return;
+    }
+
+    if (!silent && conn)
+        ++conn->cache_pending;
+}
+
+void server_instance::on_request_reply(uint64_t cookie, request_status st,
+                                       std::string_view reply)
+{
+    const int      fd  = static_cast<int>(static_cast<int32_t>(cookie & 0xFFFFFFFFull));
+    const uint32_t gen = static_cast<uint32_t>(cookie >> 32);
+
+    if (fd < 0 || fd >= MAX_FDS)
+        return;   // the auto-store, or a datagram: nobody is waiting on this
+
+    auto* conn = m_conn_idx[fd];
+    if (!conn || conn->generation != gen)
+        return;   // the client that asked is gone, and its number may already
+                  // belong to somebody who never asked anything
+
+    if (SOCKETLEY_LIKELY(conn->cache_pending > 0))
+        --conn->cache_pending;
+
+    // Written even when the connection is marked closing.  That flag normally
+    // means "the conversation is over, anything produced now is thrown away",
+    // and for output this runtime decided to send that is right.  This is not
+    // that: the client asked for this line and its socket is open only because
+    // the answer is owed — a request/response client that half-closes after
+    // asking is marked closing by the FIN and is still sitting there reading.
+    if (SOCKETLEY_LIKELY(m_loop != nullptr))
+    {
+        std::string text;
+        if (SOCKETLEY_LIKELY(st == request_status::ok))
+        {
+            text.assign(reply);
+        }
+        else
+        {
+            // Said out loud rather than swallowed.  A client whose `cache get`
+            // went to a runtime that has since stopped used to receive nothing
+            // at all and wait for a line that was never coming.
+            const char* why = request_status_text(st);
+            text.reserve(8 + std::char_traits<char>::length(why));
+            text.append("error: ").append(why);
+        }
+
+        if (!text.empty())
+        {
+            if (text.back() != '\n')
+                text.push_back('\n');
+            send_to(conn, std::make_shared<const std::string>(std::move(text)), true);
+        }
+    }
+
+    // The close close_conn() deferred, if this was the last answer owed and
+    // nothing else is armed.  Whichever operation is still outstanding owns the
+    // teardown otherwise: its completion handler asks the same question and
+    // finds it answered, exactly as on every other path here.
+    if (SOCKETLEY_UNLIKELY(conn->closing) && conn->cache_pending == 0
+        && !conn_ops_pending(conn))
+        close_conn(conn);
+}
+
 void server_instance::process_message(server_connection* sender, std::string_view msg)
 {
     // Rate limit check (per-connection)
@@ -2569,43 +2790,47 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     if (sender)
         invoke_on_client_message(sender->fd, msg);
 
-    // Cache command interception: "cache <cmd>" → execute against linked cache, respond to sender only
+    // Cache command interception: "cache <cmd>" → asked of the linked cache and
+    // answered to the sender alone, one turn of the event loop later.  This
+    // used to run the cache's own interpreter here, on this stack, through a
+    // pointer to the cache object; see shared/request_channel.h for why it does
+    // not any more and what that costs.
     if (SOCKETLEY_UNLIKELY(sender && msg.size() > 6 && msg[0] == 'c' && msg.starts_with("cache ")))
     {
-        auto cname = get_cache_name();
-        if (!cname.empty() && get_runtime_manager())
-        {
-            auto* cache_rt = get_runtime_manager()->get(cname);
-            if (cache_rt && cache_rt->get_type() == runtime_cache &&
-                cache_rt->get_state() == runtime_running)
-            {
-                auto* cache = static_cast<cache_instance*>(cache_rt);
-                std::string resp = cache->execute(msg.substr(6));
-                if (!resp.empty())
-                {
-                    if (resp.back() != '\n')
-                        resp += '\n';
-                    auto resp_msg = std::make_shared<const std::string>(std::move(resp));
-                    send_to(sender, resp_msg);
-                }
-            }
-        }
+        // Ahead of the command, so that a client which sends a message and then
+        // asks the cache for it by key sees its own write.  One queue, drained
+        // in order, so posting the batch first is all the ordering needs.
+        flush_cache_store();
+        post_cache_request(sender, msg.substr(6), false);
         return; // Cache commands are never broadcast
     }
 
-    // Store in cache if configured
-    auto cache_name = get_cache_name();
-    if (!cache_name.empty() && get_runtime_manager())
+    // Store in cache if configured.  Appended to the batch rather than posted;
+    // see m_cache_store_batch for why the granularity matters.
+    if (SOCKETLEY_UNLIKELY(!get_cache_name().empty()))
     {
-        auto* cache_rt = get_runtime_manager()->get(cache_name);
-        if (cache_rt && cache_rt->get_type() == runtime_cache &&
-            cache_rt->get_state() == runtime_running)
-        {
-            auto* cache = static_cast<cache_instance*>(cache_rt);
-            char key_buf[24];
-            auto [key_end, key_ec] = std::to_chars(key_buf, key_buf + sizeof(key_buf), ++m_message_counter);
-            cache->store_direct(std::string_view(key_buf, key_end - key_buf), msg);
-        }
+        char key_buf[24];
+        auto [key_end, key_ec] = std::to_chars(key_buf, key_buf + sizeof(key_buf), ++m_message_counter);
+        const auto key_len = static_cast<size_t>(key_end - key_buf);
+
+        auto& batch = m_cache_store_batch;
+        const size_t line_start = batch.size();
+        batch.append("set ", 4).append(key_buf, key_len).push_back(' ');
+        batch.append(msg);
+        batch.push_back('\n');
+
+        // A newline inside the value would end the line early and turn the rest
+        // of the message into a command of its own.  The cache's own text
+        // protocol is line-based and cannot carry one either — a client typing
+        // `set k a<newline>b` at the cache's port stores "a" — so flattening is
+        // what going through the protocol means rather than around it.  Only
+        // the WebSocket and RESP paths can produce one; the line parser cannot.
+        for (size_t i = line_start; i + 1 < batch.size(); i++)
+            if (SOCKETLEY_UNLIKELY(batch[i] == '\n' || batch[i] == '\r'))
+                batch[i] = ' ';
+
+        if (SOCKETLEY_UNLIKELY(batch.size() >= CACHE_STORE_BATCH_BYTES))
+            flush_cache_store();
     }
 
     switch (m_mode)
@@ -2825,9 +3050,10 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
     }
 }
 
-void server_instance::send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg)
+void server_instance::send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+                              bool even_when_closing)
 {
-    if (SOCKETLEY_UNLIKELY(!m_loop || conn->closing))
+    if (SOCKETLEY_UNLIKELY(!m_loop || (conn->closing && !even_when_closing)))
         return;
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
@@ -3350,6 +3576,12 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     if (!msg.empty())
         process_message(nullptr, msg);
 
+    // A datagram is its own read, so this is where its cache batch goes.  Not
+    // reachable through the label in handle_read: UDP has no connection and
+    // does not go near it.
+    if (SOCKETLEY_UNLIKELY(!m_cache_store_batch.empty()))
+        flush_cache_store();
+
     // Resubmit for next datagram
     arm_udp_recv();
 }
@@ -3495,6 +3727,22 @@ std::string server_instance::get_stats() const
         for (const auto& [_, uc] : m_upstreams)
             if (uc->connected) ++connected;
         out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n";
+    }
+    // The cross-runtime request queue, and in particular what it had to throw
+    // away.  Daemon-wide rather than per-server, but this is where anyone
+    // linked to a cache will look: a `--cache` auto-store batch that could not
+    // be queued is a run of messages that are not in the cache, and a figure
+    // nobody can see is a loss nobody can act on.
+    if (!get_cache_name().empty())
+    {
+        if (const auto* mgr = get_runtime_manager())
+        {
+            const auto& rq = mgr->requests();
+            out << "cache_requests:" << rq.stat_posted() << "\n"
+                << "cache_requests_pending:" << rq.pending() << "\n"
+                << "cache_requests_refused:" << rq.stat_refused() << "\n"
+                << "cache_store_batches_dropped:" << rq.stat_dropped_bg() << "\n";
+        }
     }
     return out.str();
 }
