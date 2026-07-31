@@ -160,9 +160,20 @@ void check_no_smuggling(std::string_view forwarded, const uint8_t* raw, size_t r
     if (line_end == std::string_view::npos)
         return;
     std::string_view headers = forwarded.substr(line_end + 2);
-    size_t hdr_end = headers.find("\r\n\r\n");
-    if (hdr_end != std::string_view::npos)
-        headers = headers.substr(0, hdr_end);
+
+    // A request with no headers at all ends right here, and everything behind
+    // it belongs to whatever comes next on the connection -- not to this
+    // message.  Searching on for a "\r\n\r\n" instead would walk past the
+    // empty block and read a *pipelined* request's fields as this one's, which
+    // is a different finding wearing this one's name.
+    if (headers.compare(0, 2, "\r\n") == 0)
+        headers = {};
+    else
+    {
+        size_t hdr_end = headers.find("\r\n\r\n");
+        if (hdr_end != std::string_view::npos)
+            headers = headers.substr(0, hdr_end);
+    }
 
     bool cl = false, te = false;
     for (std::string_view line : strict_header_lines(headers))
