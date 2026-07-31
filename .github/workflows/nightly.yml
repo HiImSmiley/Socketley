@@ -212,87 +212,112 @@ jobs:
         # REQUIRE_LIBFUZZER=1 here as well as at build time.  The build step
         # proves the binaries were produced; this proves they were actually run.
         #
-        # KNOWN RED (2026-07-30): fuzz_http_request fails immediately, on a
-        # seed, and it is not the harness.  Two separate findings in
-        # proxy_instance::parse_http_request_line:
+        # CLOSED 2026-07-31 (commit 5061394): fuzz_http_request used to fail
+        # immediately, on a seed.  Two findings in
+        # proxy_instance::parse_http_request_line, both of them reachable from
+        # the network by an unauthenticated client:
         #
         #   1. A length underflow in the header-block string_view.  `pos` is the
         #      first "\r\n" and `hdr_end` the first "\r\n\r\n"; when a request
         #      carries no headers those are the same offset, so `hdr_end-pos-2`
-        #      wraps to SIZE_MAX-1 and the header scan reads off the heap.
-        #      `GET / HTTP/1.1\r\n\r\n` — 18 legal bytes — is enough.
+        #      wrapped to SIZE_MAX-1 and the header scan read off the heap.
+        #      `GET / HTTP/1.1\r\n\r\n` — 18 legal bytes — was enough.
         #      Seeds: http/no_headers, http/no_headers_10.
-        #   2. The CL+TE smuggling check splits headers on CRLF only, so two
+        #   2. The CL+TE smuggling check split headers on CRLF only, so two
         #      headers separated by a bare LF read as one line to the proxy and
-        #      as two to a backend, and the request is forwarded.
+        #      as two to a backend, and the request was forwarded.
         #      Seed: http/cl_te_lf_first.
         #
-        # Do NOT silence this by dropping the target or setting FUZZ_SMUGGLING=0.
-        # It goes green when parse_http_request_line is fixed.
+        # The seeds stay.  Do NOT drop the target or set FUZZ_SMUGGLING=0 — the
+        # only thing keeping those two fixed is this job running them nightly.
         #
-        # KNOWN RED (2026-07-31): fuzz_http_response fails on its first run,
-        # and it is not the harness.  This target was written on the day the
-        # response framing was lifted out of handle_backend_read, and it raised
-        # everything below within two million executions.  Each id is a
-        # RESP_FINDING in test/fuzz/fuzz_http_response.cpp, and each one ends the
-        # same way: a backend socket returns to the pool at an offset that is not
-        # a message boundary, so the next client to borrow it reads the tail of a
-        # stranger's response as the head of its own.
+        # CLOSED 2026-07-31: fuzz_http_response used to fail on its first run.
+        # This target was written on the day the response framing was lifted out
+        # of handle_backend_read, and it raised everything below within two
+        # million executions; all eight were fixed the same week in
+        # http_response_framing.h, and the fixed parser then ran 4.9 million
+        # executions with nothing new.  Each id is a RESP_FINDING in
+        # test/fuzz/fuzz_http_response.cpp, and each one ended the same way: a
+        # backend socket returned to the pool at an offset that is not a message
+        # boundary, so the next client to borrow it read the tail of a stranger's
+        # response as the head of its own.  What they were, and what the fix was:
         #
         #   pool-eol / pool-no-headers / pool-no-boundary / pool-1xx-chain
-        #     One defect under four ids.  The 1xx branch of the scan clears
-        #     response_bytes_seen, which re-arms the assumption that the next read
-        #     begins a response.  It does not, when the backend flushed the
+        #     One defect under four ids.  The 1xx branch of the scan cleared
+        #     response_bytes_seen, which re-armed the assumption that the next
+        #     read begins a response.  It does not, when the backend flushed the
         #     interim 1xx together with the head of the real response: the rest of
-        #     that header block arrives in the following read and is parsed as a
-        #     whole response, so the first surviving header line becomes the
+        #     that header block arrived in the following read and was parsed as a
+        #     whole response, so the first surviving header line became the
         #     status line and everything before the read boundary — the real
-        #     status, a Transfer-Encoding, a Connection: close — is invisible.
-        #     This is precisely the defect response_bytes_seen was added to
+        #     status, a Transfer-Encoding, a Connection: close — was invisible.
+        #     That is precisely the defect response_bytes_seen was added to
         #     prevent, reintroduced by the reset.  Reproduced without the fuzzer:
         #       read 1: "HTTP/1.1 100 Continue\r\n\r\n"
         #               "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
         #       read 2: "Content-Length: 5\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n"
-        #     gives headers_parsed, chunked=false, Content-Length=5, and the
+        #     gave headers_parsed, chunked=false, Content-Length=5, and the
         #     socket declared poolable with the chunked terminator still on it.
-        #     The same two reads without the leading 1xx correctly come out
-        #     unknown=true and not poolable.
+        #     FIX: the scan walks forward through interim blocks inside the chunk
+        #     it was given instead of handing the problem to the next one.  The
+        #     flag is cleared only when an interim block ends exactly on the read
+        #     boundary — the one case where the next chunk really does begin a
+        #     response — and anything left over behind a 1xx makes the framing
+        #     unknown.  A stream of nothing but interim blocks (eight, matching
+        #     the reference framer) is unknown too.
         #
         #   pool-te
-        #     The Transfer-Encoding test is `size >= 7 && val[0..1] == "ch"` over
+        #     The Transfer-Encoding test was `size >= 7 && val[0..1] == "ch"` over
         #     a value trimmed of spaces only.  "Transfer-Encoding:\tchunked" (a
         #     tab), "identity" and "gzip" therefore all read as no transfer
-        #     coding, and with a Content-Length also present the response is
+        #     coding, and with a Content-Length also present the response was
         #     framed by that length — while the body is chunked, or runs to
         #     connection close.  RFC 9112 Section 6.1: any transfer coding makes
         #     Content-Length inoperative.
+        #     FIX: values are trimmed of tabs as well as spaces and read as the
+        #     comma-separated lists they are, and *any* non-empty
+        #     Transfer-Encoding now blocks pooling, not only a chunked one.
         #     Seeds: httpresp/te_tab_value, cl_te_identity, cl_te_gzip.
         #
         #   pool-cl-bad
         #     std::from_chars succeeds on a partial parse, so "Content-Length: 3x"
-        #     yields 3; two Content-Lengths that disagree silently resolve to the
-        #     last one.  RFC 9112 Section 6.3 requires both to be treated as
+        #     yielded 3; two Content-Lengths that disagree silently resolved to
+        #     the last one.  RFC 9112 Section 6.3 requires both to be treated as
         #     unrecoverable.
+        #     FIX: the value must be a whole decimal field with no trailing bytes
+        #     and no overflow, and a second Content-Length that disagrees with the
+        #     first makes the framing unknown instead of overwriting it.
         #     Seeds: httpresp/cl_trailing_junk, cl_twice_diff.
         #
         #   pool-name-ws / pool-obs-fold
         #     The two header-block shapes RFC 9112 requires a recipient to refuse
         #     rather than interpret: whitespace between a field name and its colon
         #     (Section 5.1), and obsolete line folding (Section 5.2).  This proxy
-        #     interprets both, differently from a lenient backend, and pools.
+        #     interpreted both, differently from a lenient backend, and pooled.
         #     Lower severity than the four above — they need an unusual backend
         #     rather than a common one — but the same failure.
+        #     FIX: either shape makes the framing unknown.
         #     Seeds: httpresp/cl_space_before_colon, obs_fold_te.
         #
-        # Two more are printed as observations rather than failures, because the
-        # cost is a failed request rather than crossed data: a Connection: close
-        # that is not the first token in its list is missed ("keep-alive, close"),
-        # and a response with no readable status code is framed by Content-Length
-        # although 1xx/204/304 cannot be ruled out.
+        # Two more were printed as observations rather than failures, because the
+        # cost was a failed request rather than crossed data, and both are fixed
+        # as well: a Connection: close that is not the first token in its list was
+        # missed ("keep-alive, close"), now found by the same list parser as
+        # above; and a response with no readable status code was framed by
+        # Content-Length although 1xx/204/304 could not be ruled out — the status
+        # line is now required to be "HTTP/x.y NNN" with the code delimited, and
+        # anything else is unknown.
         #
-        # Do NOT silence any of this by setting FUZZ_HTTPRESP_SKIP here.  The
-        # per-push job carries the skip list so that it can still catch new
-        # regressions; this job is the record, and the record must stay honest.
+        # A ninth was found by the fixed parser and fixed with it: the walk over
+        # interim blocks skipped their headers entirely, so a 1xx carrying
+        # "Content-Length: HTTP/1.1 100 Continue" let the response behind it be
+        # framed and pooled as though the backend had been perfectly clear.  Every
+        # block's headers are checked for shape now; only the final block's values
+        # are used.
+        #
+        # Do NOT set FUZZ_HTTPRESP_SKIP here.  If one of these reopens, the skip
+        # goes in the per-push job so that it keeps catching new regressions;
+        # this job is the record, and the record must stay honest.
         #
         # fuzz_cache_ops has no open findings.  FUZZ_CACHE_SKIP is deliberately
         # NOT set here — the per-push job is where it would go if one reopened;

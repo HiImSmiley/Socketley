@@ -194,20 +194,16 @@ jobs:
         # that holds the truth.  Do not add an id here without adding the
         # matching entry to the nightly's KNOWN RED note.
         #
-        # FUZZ_HTTPRESP_SKIP, by contrast, is not empty, and every id in it is a
-        # live finding in the proxy's response framing that this target raised on
-        # the day it was written (2026-07-31).  They are listed in full in the
-        # nightly's KNOWN RED note, which runs the same target with nothing
-        # demoted and is the record of what is open.  They are demoted *here* so
-        # that this job keeps catching new regressions instead of being red from
-        # the first push; remove an id the moment its defect is fixed.
+        # No FUZZ_HTTPRESP_SKIP either, and that is new.  It carried all eight
+        # ids this target raised on the day it was written (2026-07-31); every
+        # one of them was fixed in http_response_framing.h on 2026-07-31 and the
+        # variable went away with them.  If one has to come back, it goes here
+        # and nowhere else — a per-push job that is red before the push stops
+        # being read — and it goes into the nightly's record at the same time.
         env:
           FUZZ_TARGETS: fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response
           FUZZ_SEED: "1"
           REQUIRE_LIBFUZZER: "1"
-          FUZZ_HTTPRESP_SKIP: >-
-            pool-eol,pool-no-headers,pool-no-boundary,pool-1xx-chain,
-            pool-te,pool-cl-bad,pool-name-ws,pool-obs-fold
         run: bash test/fuzz/run_fuzz.sh 30 Sanitize
         timeout-minutes: 10
 
