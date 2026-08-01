@@ -80,14 +80,14 @@ private:
         const parsed_args& pa, const char* verb, ipc_connection* conn) const;
 
     int process_command(ipc_connection* conn, std::string_view line);
-    int cmd_create(const parsed_args& pa);
+    int cmd_create(ipc_connection* conn, const parsed_args& pa);
     int cmd_start(ipc_connection* conn, const parsed_args& pa);
     int cmd_stop(ipc_connection* conn, const parsed_args& pa);
     int cmd_remove(ipc_connection* conn, const parsed_args& pa);
     int cmd_ls(ipc_connection* conn, const parsed_args& pa);
     int cmd_ps(ipc_connection* conn, const parsed_args& pa);
     int cmd_send(const parsed_args& pa);
-    int cmd_edit(const parsed_args& pa);
+    int cmd_edit(ipc_connection* conn, const parsed_args& pa);
     int cmd_dump(ipc_connection* conn, const parsed_args& pa);
     int cmd_import(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);

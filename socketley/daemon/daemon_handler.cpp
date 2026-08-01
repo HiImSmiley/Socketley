@@ -59,6 +59,54 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
                               mesh_ca, mesh_cert, mesh_key);
 }
 
+// Everything `create` prints, delivered to the client that typed it.
+//
+// cmd_create and every flag parser it calls report their refusals on std::cout,
+// which is the daemon's stdout — /dev/null in any daemon a user actually starts.
+// So a mistyped flag, a port that will not parse, a TLS set with a key and no
+// certificate, an impossible CPU set: all of them answered exit code 1 and not
+// one word about why.  The command's own reply channel is conn->write_buf, and
+// nothing was putting them there.
+//
+// Rewriting seventeen hundred lines of parser to take a connection would be the
+// thorough fix.  This is the one that reaches every one of them at once and
+// leaves them printing the way they read: cout is borrowed for the length of the
+// command and given back.  Safe on this thread because it is the only one that
+// writes cout — the metrics endpoint has its own thread and logs to stderr —
+// and the swap is undone by the destructor whatever the command does.
+namespace
+{
+
+class cout_to_reply
+{
+public:
+    explicit cout_to_reply(ipc_connection* conn)
+        : m_conn(conn), m_saved(std::cout.rdbuf(m_buf.rdbuf())) {}
+
+    ~cout_to_reply()
+    {
+        std::cout.rdbuf(m_saved);
+        std::string text = m_buf.str();
+        if (text.empty())
+            return;
+        // No connection means the command came from somewhere with no reply
+        // channel — the boot-time restore, a Lua call.  Those keep the old
+        // behaviour rather than losing the text entirely.
+        if (m_conn) m_conn->write_buf += text;
+        else        std::cout << text;
+    }
+
+    cout_to_reply(const cout_to_reply&) = delete;
+    cout_to_reply& operator=(const cout_to_reply&) = delete;
+
+private:
+    ipc_connection*   m_conn;
+    std::ostringstream m_buf;
+    std::streambuf*   m_saved;
+};
+
+}   // namespace
+
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     : m_manager(manager), m_loop(loop), m_listen_fd(-1)
 {
@@ -670,14 +718,14 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
 
     switch (pa.hashes[0])
     {
-        case fnv1a("create"):     return cmd_create(pa);
+        case fnv1a("create"):     return cmd_create(conn, pa);
         case fnv1a("start"):     return cmd_start(conn, pa);
         case fnv1a("stop"):      return cmd_stop(conn, pa);
         case fnv1a("remove"):    return cmd_remove(conn, pa);
         case fnv1a("ls"):        return cmd_ls(conn, pa);
         case fnv1a("ps"):        return cmd_ps(conn, pa);
         case fnv1a("send"):      return cmd_send(pa);
-        case fnv1a("edit"):      return cmd_edit(pa);
+        case fnv1a("edit"):      return cmd_edit(conn, pa);
         case fnv1a("show"):
         case fnv1a("dump"):      return cmd_dump(conn, pa);
         case fnv1a("import"):    return cmd_import(conn, pa);
@@ -698,8 +746,10 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
     }
 }
 
-int daemon_handler::cmd_create(const parsed_args& pa)
+int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
 {
+    const cout_to_reply reply_guard(conn);
+
     if (pa.count < 3)
     {
         std::cout << "usage: create <type> <name> [flags]\n";
@@ -2111,8 +2161,12 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     }
 }
 
-int daemon_handler::cmd_edit(const parsed_args& pa)
+int daemon_handler::cmd_edit(ipc_connection* conn, const parsed_args& pa)
 {
+    // Same reason as cmd_create: every refusal below, and every one the flag
+    // parsers print, went to the daemon's stdout and never to the client.
+    const cout_to_reply reply_guard(conn);
+
     if (pa.count < 3)
     {
         std::cout << "usage: edit <name> [flags]\n";
