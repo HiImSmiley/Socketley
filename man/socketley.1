@@ -2768,7 +2768,8 @@ gap between a request's first byte and its terminating blank line.
 The same strictness is applied to backend responses, but only to decide
 whether the backend connection may be reused: a response whose length
 cannot be established with certainty \(em because its header block was
-split across reads, or was not strictly CRLF-framed \(em is forwarded to
+split across reads, or was not strictly CRLF-framed, or because more
+bytes arrived than the length it declared \(em is forwarded to
 the client unchanged, and its connection is closed instead of returned
 to the pool.
 .PP

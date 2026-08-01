@@ -346,6 +346,45 @@ struct http_response_framing
     bool unknown{false};
 };
 
+// Fold `avail` bytes of message body into the countdown, and answer the one
+// question the pool cares about besides the countdown itself: did more arrive
+// than this response had left?
+//
+// The end of a response is a place this scan can point at in exactly two
+// shapes — a declared Content-Length that is not overridden by a transfer
+// coding, and a 204/304, which has no body whatever the headers claim.  Those
+// are also the only two http_response_frame_complete() will call finished, so
+// they are the only two where "past the end" means anything; everything else is
+// already unpoolable for a reason of its own.
+//
+// A byte past that end is a byte nobody asked for.  The proxy sends one request
+// down a backend socket and waits for its answer, so nothing legitimate follows
+// the last byte of that answer in the same breath: what is there is a second
+// response the backend flushed behind the first, or a body longer than the
+// length it declared, or the socket is simply not carrying what we think.  In
+// every case the stream now sits at an offset the next request cannot start
+// from — which is precisely what finish_pool_drain concludes when such bytes
+// turn up in a *later* completion, where it sets pool_abandoned.  Where they
+// arrive is the peer's choice of when to flush and nothing else; the verdict
+// cannot depend on it.
+//
+// The bytes themselves are already on their way to the client either way (see
+// the note at the top of this file).  What this decides is only whether the
+// socket underneath may change hands, and the answer is no.
+inline void http_response_consume_body(http_response_framing& st, size_t avail)
+{
+    const bool bounded = st.no_body ||
+                         (st.has_content_length && !st.chunked && !st.transfer_encoding);
+    const size_t left = st.no_body ? 0
+                                   : (st.has_content_length ? st.body_remaining : 0);
+
+    if (SOCKETLEY_UNLIKELY(bounded && avail > left))
+        st.unknown = true;
+
+    if (st.has_content_length)
+        st.body_remaining = (avail >= st.body_remaining) ? 0 : st.body_remaining - avail;
+}
+
 // Fold one read's worth of response bytes into the framing state.
 //
 // `chunk` is exactly what came off the socket in one completion, in order, and
@@ -357,13 +396,7 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
     // Past the header block: nothing left to read, only a length to count down.
     if (st.headers_parsed)
     {
-        if (st.has_content_length && st.body_remaining > 0)
-        {
-            if (chunk.size() >= st.body_remaining)
-                st.body_remaining = 0;
-            else
-                st.body_remaining -= chunk.size();
-        }
+        http_response_consume_body(st, chunk.size());
         return;
     }
 
@@ -513,16 +546,16 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
         st.chunked            = h.chunked;
         st.conn_close         = h.conn_close;
 
-        // Deduct body bytes already received in this chunk.
-        if (st.has_content_length)
-        {
-            const size_t body_start = base + hdr_end + 4;
-            const size_t body_in_chunk = (chunk.size() > body_start) ? chunk.size() - body_start : 0;
-            if (body_in_chunk >= st.body_remaining)
-                st.body_remaining = 0;
-            else
-                st.body_remaining -= body_in_chunk;
-        }
+        // Deduct body bytes already received in this chunk — and notice when
+        // there are more of them than the response had room for, which is the
+        // shape a backend produces by flushing a whole answer and the head of
+        // the next one in a single write.  This used to count down to zero and
+        // drop the excess, so a socket sitting in the middle of somebody's
+        // second response was filed in the pool as though it were idle at a
+        // message boundary.
+        const size_t body_start = base + hdr_end + 4;
+        const size_t body_in_chunk = (chunk.size() > body_start) ? chunk.size() - body_start : 0;
+        http_response_consume_body(st, body_in_chunk);
         return;
     }
 }

@@ -368,12 +368,12 @@ jobs:
         #     low, the refusal reported as a success); they are here so those
         #     stay fixed.
         #
-        # KNOWN RED 2026-08-01: fuzz_proxy_ops.  Two findings left demoted
-        # below, so the target runs past them looking for the next one.  Each
-        # has a seed in test/fuzz/corpus/proxy that reproduces it on its own in
-        # well under a second, and each id comes off this list the day its
-        # defect is fixed — an id left here after the fix silences the check
-        # that would catch it coming back.
+        # KNOWN RED 2026-08-01: fuzz_proxy_ops.  One finding left demoted below,
+        # so the target runs past it looking for the next one.  It has a seed in
+        # test/fuzz/corpus/proxy that reproduces it on its own in well under a
+        # second, and the id comes off this list the day the defect is fixed —
+        # an id left here after the fix silences the check that would catch it
+        # coming back.
         #
         #   answer-lost-to-a-half-close
         #     Seed: proxy/client_fin_after_a_whole_request.  A client sends a
@@ -400,24 +400,37 @@ jobs:
         #     corpus.
         #
         #   pool-off-boundary
-        #     Seed: proxy/response_with_a_tail.  A backend flushes a complete
-        #     response and the head of a second one in a single write.  The scan
-        #     in http_response_scan_chunk counts the declared body down to zero
-        #     and drops the excess on the floor without setting `unknown`, so
-        #     the socket is filed in the pool although the peer is mid-message.
-        #     finish_pool_drain already reasons the other way about bytes past
-        #     the end of a response — it sets pool_abandoned — but only for
-        #     bytes that arrive in a later completion.
+        #     Fixed 2026-08-01, and off this list for that reason.
+        #     http_response_scan_chunk counted a declared body down to zero and
+        #     dropped the excess without setting `unknown`, so a backend that
+        #     flushed a whole response and the head of a second one in one write
+        #     got its socket filed in the pool mid-message.  Bytes past the
+        #     declared end set `unknown` now wherever in the stream of
+        #     completions they arrive, which is what finish_pool_drain already
+        #     concluded for the later ones.  Its seed,
+        #     proxy/response_with_a_tail, stays in the corpus.
         #
         # STILL RED ON MUTATION, AND NOT FOR A DEFECT.  The whole seed corpus
-        # replays clean with only the ids above demoted.  Mutation past them
-        # does not, and what it reaches are shapes where the oracle is stated
+        # replays clean with only the id above demoted.  Mutation past it does
+        # not, and what it reaches are three shapes where the oracle is stated
         # over the harness's *own* backend while the program decides
         # independently when that backend reads and when it answers.  Written
         # down here so the next person recognises them instead of re-diagnosing
-        # them; neither is demoted, because a demoted id would also silence the
+        # them; none is demoted, because a demoted id would also silence the
         # real defect that shares its name.
         #
+        #   * pool-off-boundary, where the backend starts a *new* message on a
+        #     socket the proxy had already filed correctly at a boundary.  The
+        #     finding's own words — "was filed in the pool somewhere other than
+        #     a message boundary" — are not what happened: the filing was right
+        #     and the state changed afterwards.  The proxy cannot notice,
+        #     either, because nothing may be armed on a pooled socket — the
+        #     pooled-fd-armed check in the same file forbids exactly that — so
+        #     the earliest it can act is when it next reaches for the socket,
+        #     which is where the probe above now refuses it.  The two invariants
+        #     cannot both be satisfied; reconciling them is a change to the
+        #     harness and is deliberately not made here.
+        #     Reaches it in well under a minute of blind mutation.
         #   * crosstalk, where the harness backend answers an unread request
         #     late, on a socket that has since been reused, so the mark on the
         #     wire is the harness's own bookkeeping rather than a misrouted
@@ -452,7 +465,7 @@ jobs:
           FUZZ_SEED: ${{ github.run_number }}
           FUZZ_SMUGGLING: "1"
           REQUIRE_LIBFUZZER: "1"
-          FUZZ_PROXY_SKIP: "answer-lost-to-a-half-close,pool-off-boundary"
+          FUZZ_PROXY_SKIP: "answer-lost-to-a-half-close"
         run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
         timeout-minutes: 60
 
