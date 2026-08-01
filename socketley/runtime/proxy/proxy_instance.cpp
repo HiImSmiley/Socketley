@@ -1978,17 +1978,22 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         //     one run of test_proxy_group_keepalive_load, on a check whose
         //     whole ceiling is 40 descriptors of slack.
         //
-        //     So the three disjuncts below are the three states in which the
-        //     client has not had its answer, and each of them has something
-        //     that ends it.  A request waiting on a connect and a request whose
-        //     first byte has not come back are both being timed by
-        //     --backend-timeout, and response_deadline_sweep answers 502/504
-        //     and closes when that expires.  A response already arriving is
-        //     bounded by the backend read that is genuinely armed for the rest
-        //     of it, and completing it runs reset_client_for_next_request,
-        //     which closes on client_eof.  Nothing is held for a connection
-        //     that has been answered — close_pair still defers on the write
-        //     queue, so the tail of that answer goes out first either way.
+        //     So the two disjuncts below are the two states in which a request
+        //     has gone and its answer has not arrived: it has not reached a
+        //     backend yet, or a backend is attached and has not finished
+        //     answering.  Nothing is held for a connection that has been
+        //     answered — close_pair still defers on the write queue, so the
+        //     tail of that answer goes out before the descriptor does.
+        //
+        //     What ends the hold in each: reset_client_for_next_request on the
+        //     completed response, which closes on client_eof; and
+        //     response_deadline_sweep with 502/504 when --backend-timeout
+        //     expires.  With --backend-timeout 0 there is no sweep and the wait
+        //     is unbounded — which is what that value is documented to mean,
+        //     and it is the SAME unbounded wait a client that never half-closed
+        //     already gets on such a proxy.  That is the bound this hold claims
+        //     and the only one it needs: a half-closed client is held no longer
+        //     than one that did not half-close, whatever the timeout is set to.
         //
         // TCP mode is deliberately not held: it has no request and no response
         // to be owed one, and a byte pipe whose client has finished writing has
@@ -2000,10 +2005,20 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 m_conn_idx[conn->backend_fd].side == conn_backend)
                 b = m_conn_idx[conn->backend_fd].backend;
 
+            // "A request left this connection for a backend and its answer has
+            // not come back."  Stated out of the exchange itself, and
+            // deliberately NOT out of awaiting_response: that flag is only ever
+            // set by arm_response_deadline, which returns without setting it
+            // when --backend-timeout is 0.  Nought is a documented value that
+            // means "wait as long as it takes", so a predicate resting on that
+            // flag reads "nothing is owed" for every request on such a proxy —
+            // and that is the one configuration where nothing else would catch
+            // it either, because with no deadline there is no sweep to answer
+            // 502/504 in its place.  A guard that switches off with an optional
+            // feature is how the guard above this one came to be unreachable.
             const bool answer_owed =
-                conn->connect_pending ||        // the request has not reached a backend yet
-                conn->awaiting_response ||      // it has, and not one byte has come back
-                (b && conn->response_started && !backend_response_complete(b));
+                conn->connect_pending ||   // the request has not reached a backend yet
+                (b && !(conn->response_started && backend_response_complete(b)));
 
             if (answer_owed)
             {
