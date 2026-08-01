@@ -34,6 +34,15 @@
 #                      named here must exist or the run fails — narrowing the
 #                      set is a decision the caller states, never something that
 #                      happens because a binary quietly was not built.
+#   FUZZ_PROXY_MATRIX  the pinned proxy configurations the seed corpus is
+#                      replayed over, ';'-separated (default: the three below).
+#                      Empty skips the sweep entirely — for a triage run only;
+#                      CI must not, because the sweep is the only thing holding
+#                      6de09db's predicate down.  See THE CONFIGURATION MATRIX.
+#   FUZZ_MATRIX_SECONDS  mutation budget per matrix entry (default 0 = replay
+#                      the seeds and stop).  Raise it for a manual dig into one
+#                      configuration; leaving it at 0 is what makes the sweep
+#                      cost seconds rather than minutes.
 #
 # WHAT THIS COVERS.  The four parsers an unauthenticated peer can reach — RESP,
 # WebSocket frames, the proxy's HTTP request line and header block, and the
@@ -68,6 +77,60 @@
 # make_corpus.py generates plus a handful of hand-added reproducers.  A future
 # run cannot swell the tracked set because it is not writable from libFuzzer's
 # point of view at all.
+#
+# ─── THE CONFIGURATION MATRIX ───────────────────────────────────────────────
+#
+# Every seed in test/fuzz/corpus/proxy starts from the default proxy
+# configuration.  Only the operation stream differs between them, so 64 seeds
+# are 64 programs against one proxy — and a defect that exists only in another
+# configuration is invisible to all 64 however long they are mutated.
+#
+# That is not hypothetical.  6de09db is a half-closed client losing its answer
+# on a proxy running --backend-timeout 0: the predicate deciding whether an
+# answer was still owed rested on a flag that arm_response_deadline() never sets
+# when the deadline is switched off, and with no deadline there is no sweep to
+# answer 502/504 in its place either.  The seed for exactly that loss —
+# proxy/client_fin_after_a_whole_request — replays clean on a broken build,
+# because it does not pin the value.  It was found by hand-editing
+# fuzz_proxy_ops.cpp to hard-code the timeout, and a defect found that way stays
+# fixed only for as long as somebody remembers to do it again.
+#
+# So the corpus is replayed once more per pinned configuration.  FUZZ_PROXY_CONFIG
+# builds every instance with those values and refuses OP_CONFIG for them, so the
+# configuration is a property of the run and the input cannot leave it.  Which
+# configurations, and why these:
+#
+#   backend-timeout=0        The response deadline off.  No 502/504 sweep, and
+#                            an unbounded wait — the one setting that has
+#                            already hidden a defect here.
+#   circuit-threshold=0      The breaker off.  A backend that fails is dialled
+#                            again for ever instead of being taken out, so
+#                            every failure path is walked rather than
+#                            short-circuited after the fifth.
+#   both at once             Where the two removals meet: no deadline to end a
+#                            wait and no breaker to stop the retrying.
+#
+# Those two are chosen and the other knobs are not, on one rule: a setting whose
+# *disabling* value removes a guarantee, and which is on by default so the
+# corpus has never run without it.  retries, max-connections and idle-timeout
+# all default to 0 already — the corpus runs with them off on every seed, and
+# pinning them off would be a second copy of the default run.
+#
+# WHAT IT COSTS.  Replay only, seeds only, zero mutation budget: about a second
+# per entry for all 64 seeds on a developer box, three entries, so a few seconds
+# on a job that already spends 2 x 9 x 600.  It is deliberately not given a
+# libFuzzer pass — that would be a full budget per configuration and would put
+# this job past its timeout.
+#
+# WHAT IT THEREFORE CANNOT SEE.  A defect that needs both a non-default
+# configuration *and* a program no seed contains.  The sweep is a guarantee that
+# the curated cases still hold in each configuration, not a search inside it.
+# FUZZ_MATRIX_SECONDS turns each entry into a mutation run for a manual dig.
+#
+# WHY THE WORK CORPUS IS NOT IN IT.  The matrix replays the tracked seeds and
+# nothing else: it has to cost the same every night, and $work grows without
+# bound through actions/cache.  The work corpus is already replayed once, under
+# the default configuration, in the step above.
 #
 # WHY IT FAILS LOUDLY.  Three separate ways a fuzz step can pass while doing
 # nothing — missing binaries, an empty corpus, a target that exits 0 without
@@ -106,6 +169,13 @@ declare -A CORPUS=(
 )
 
 read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops}"
+
+# The pinned configurations the proxy seed corpus is replayed over, on top of
+# the default run.  ';' separated because the values themselves are comma
+# separated.  See THE CONFIGURATION MATRIX above for why these three.
+PROXY_MATRIX_DEFAULT='backend-timeout=0;circuit-threshold=0;backend-timeout=0,circuit-threshold=0'
+PROXY_MATRIX="${FUZZ_PROXY_MATRIX-$PROXY_MATRIX_DEFAULT}"
+MATRIX_SECONDS="${FUZZ_MATRIX_SECONDS:-0}"
 
 fail=0
 ran=0
@@ -187,6 +257,30 @@ for target in "${TARGETS[@]}"; do
         fail=$((fail + 1))
     fi
     ran=$((ran + 1))
+
+    # ── the configuration matrix ──
+    # Seeds only, and each entry replayed with the configuration pinned for the
+    # whole run.  This is what makes "the corpus is clean" a claim about more
+    # than one proxy: see THE CONFIGURATION MATRIX at the top of this file for
+    # which values and why, and for what it costs.
+    if [ "$target" = "fuzz_proxy_ops" ] && [ -n "$PROXY_MATRIX" ]; then
+        old_ifs="$IFS"
+        IFS=';'
+        read -r -a matrix <<< "$PROXY_MATRIX"
+        IFS="$old_ifs"
+        for pin in "${matrix[@]}"; do
+            [ -z "$pin" ] && continue
+            echo "--- $target (replay, pinned: $pin) ---"
+            if ! FUZZ_SECONDS="$MATRIX_SECONDS" FUZZ_ITERS="${FUZZ_MATRIX_ITERS:-0}" \
+                 FUZZ_PROXY_CONFIG="$pin" FUZZ_ARTIFACTS="$ARTIFACTS" \
+                 "$BIN_DIR/$target" "$corpus"; then
+                echo "FAIL $target (replay, pinned: $pin)"
+                echo "     reproduce: FUZZ_PROXY_CONFIG=$pin $BIN_DIR/$target <input>"
+                fail=$((fail + 1))
+            fi
+            ran=$((ran + 1))
+        done
+    fi
 done
 
 echo "=============================================="

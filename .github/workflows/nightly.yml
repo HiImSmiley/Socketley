@@ -567,6 +567,40 @@ jobs:
         # was: -DSOCKETLEY_INVARIANTS_WARN_ONLY is the only lever that exists,
         # it would take the same assertions out of fuzz_server_ops and
         # fuzz_client_ops with it, and it stays deliberately unset.
+        #
+        # ─── THE PROXY CONFIGURATION MATRIX ─────────────────────────────────
+        #
+        # Added 2026-08-01.  Every seed in test/fuzz/corpus/proxy starts from
+        # the default proxy configuration — only the operation stream differs —
+        # so 64 seeds are 64 programs against one proxy, and a defect that lives
+        # in another configuration is invisible to all of them however long they
+        # are mutated.  6de09db is that defect: a half-closed client losing its
+        # answer on --backend-timeout 0, where the predicate deciding whether an
+        # answer was owed rested on a flag arm_response_deadline() never sets
+        # when the deadline is off, and with no deadline there is no sweep to
+        # answer 502/504 in its place.  proxy/client_fin_after_a_whole_request —
+        # the seed for exactly that loss — replays clean on a build with the
+        # predicate broken.  It was found by hand-editing the target.
+        #
+        # run_fuzz.sh now replays the proxy seed corpus once more per pinned
+        # configuration: FUZZ_PROXY_CONFIG builds every instance with the values
+        # and refuses OP_CONFIG for them, so the input cannot leave the
+        # configuration the entry is about.  Three entries, chosen on one rule —
+        # a setting whose disabling value removes a guarantee, and which is on
+        # by default so the corpus has never run without it:
+        # backend-timeout=0, circuit-threshold=0, and both together.  retries,
+        # max-connections and idle-timeout all default to 0, so the corpus
+        # already runs with them off on every seed.
+        #
+        # Measured: with the predicate of 6de09db put back as it was, the
+        # default run stays green and the backend-timeout=0 entry fails on
+        # proxy/client_fin_after_a_whole_request.  That is the whole point of
+        # the entry, and it is why FUZZ_PROXY_MATRIX must not be emptied here.
+        # Cost is about a second per entry — replay only, seeds only, no
+        # mutation budget — against a job that already spends 2 x 9 x 600.
+        # What it cannot see: a defect needing both a non-default configuration
+        # and a program no seed contains.  FUZZ_MATRIX_SECONDS turns an entry
+        # into a mutation run for a manual dig.
         env:
           FUZZ_SEED: ${{ github.run_number }}
           FUZZ_SMUGGLING: "1"

@@ -418,6 +418,104 @@ const char* backend_shape_name(int s)
     }
 }
 
+// ─── a configuration the input cannot move ──────────────────────────────────
+//
+// Every seed in this corpus starts from the default proxy configuration; only
+// the operation stream drifts.  That is a hole with a name on it: the defect
+// 6de09db fixed — a half-closed client losing its answer — was reachable only
+// with --backend-timeout 0, because the predicate that decided whether an
+// answer was still owed rested on a flag arm_response_deadline() never sets
+// when the deadline is switched off.  Nothing in the corpus pins that value,
+// including proxy/client_fin_after_a_whole_request, which is the seed for
+// exactly that loss.  It was found by editing this file to hard-code the
+// timeout and replaying by hand, and a defect found that way stays fixed only
+// for as long as somebody remembers to do it again.
+//
+// OP_CONFIG can *reach* 0 by mutation, and that is not the same thing.  A
+// mutation reaching it puts the value there partway through a program, on a
+// runtime that has already run under the default; the configuration a defect
+// lives in is the one the runtime was built with and never left.  Worse, the
+// value is one byte of the mutator's choosing in a program that has to reach a
+// half-close and a whole request as well — so it is reachable in principle and
+// vanishingly rare in practice, which is the worst of both.
+//
+// So the configuration is a dimension of the *run*, not of the input.
+// FUZZ_PROXY_CONFIG pins any of the numeric knobs for the whole run: the
+// instance is built with them, OP_CONFIG cannot move them afterwards, and the
+// corpus replays unchanged underneath.  run_fuzz.sh sweeps the values that
+// disable a guarantee — see the matrix there for which, and why those.
+//
+//   FUZZ_PROXY_CONFIG="backend-timeout=0"
+//   FUZZ_PROXY_CONFIG="backend-timeout=0,circuit-threshold=0"
+//
+// The names are the CLI flags they correspond to, so a finding can be
+// reproduced against a real daemon by reading them straight across.
+struct pinned_config
+{
+    bool has_backend_timeout{false};    int backend_timeout{0};
+    bool has_circuit_threshold{false};  int circuit_threshold{0};
+    bool has_retries{false};            int retries{0};
+    bool has_max_connections{false};    int max_connections{0};
+    bool has_idle_timeout{false};       int idle_timeout{0};
+    bool any{false};
+    char text[192]{};
+};
+
+pinned_config g_pin;
+
+// Refuse rather than ignore.  A misspelt knob that silently pinned nothing
+// would make a matrix entry a second copy of the default run, reported green,
+// and the whole point of the entry is that it is a different configuration.
+void parse_pinned_config()
+{
+    const char* env = std::getenv("FUZZ_PROXY_CONFIG");
+    if (!env || !*env)
+        return;
+
+    std::snprintf(g_pin.text, sizeof(g_pin.text), "%s", env);
+
+    std::string spec(env);
+    size_t at = 0;
+    while (at < spec.size())
+    {
+        size_t comma = spec.find(',', at);
+        if (comma == std::string::npos)
+            comma = spec.size();
+        std::string item = spec.substr(at, comma - at);
+        at = comma + 1;
+        if (item.empty())
+            continue;
+
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos)
+        {
+            std::fprintf(stderr, "fuzz_proxy_ops: FUZZ_PROXY_CONFIG item '%s' is not "
+                                 "<knob>=<value>\n", item.c_str());
+            std::exit(2);
+        }
+        const std::string key = item.substr(0, eq);
+        const int val = std::atoi(item.c_str() + eq + 1);
+
+        if (key == "backend-timeout")        { g_pin.has_backend_timeout = true;   g_pin.backend_timeout = val; }
+        else if (key == "circuit-threshold") { g_pin.has_circuit_threshold = true; g_pin.circuit_threshold = val; }
+        else if (key == "retries")           { g_pin.has_retries = true;           g_pin.retries = val; }
+        else if (key == "max-connections")   { g_pin.has_max_connections = true;   g_pin.max_connections = val; }
+        else if (key == "idle-timeout")      { g_pin.has_idle_timeout = true;      g_pin.idle_timeout = val; }
+        else
+        {
+            std::fprintf(stderr, "fuzz_proxy_ops: FUZZ_PROXY_CONFIG knob '%s' is not one of "
+                                 "backend-timeout, circuit-threshold, retries, "
+                                 "max-connections, idle-timeout\n", key.c_str());
+            std::exit(2);
+        }
+        g_pin.any = true;
+    }
+
+    if (g_pin.any)
+        std::fprintf(stderr, "fuzz_proxy_ops: pinned configuration %s "
+                             "(OP_CONFIG cannot move these)\n", g_pin.text);
+}
+
 void print_program()
 {
     std::fprintf(stderr,
@@ -426,6 +524,15 @@ void print_program()
         "// \"client\" is a harness socket dialling the proxy's listener;\n"
         "// \"backend\" is a harness listener the proxy dials, and \"bsock\" one\n"
         "// of the connections it accepted there.\n", g_steps);
+
+    // Which configuration this program ran in.  Without it a reproducer from a
+    // matrix entry is a program that does not reproduce, because the thing that
+    // made it fail is not in the bytes.
+    if (g_pin.any)
+        std::fprintf(stderr,
+                     "// PINNED CONFIGURATION: %s\n"
+                     "//   reproduce with: FUZZ_PROXY_CONFIG=%s <target> <input>\n",
+                     g_pin.text, g_pin.text);
 
     for (size_t i = 0; i < g_steps; i++)
     {
@@ -2040,6 +2147,21 @@ std::unique_ptr<proxy_instance> make_instance(world& w)
     rt->set_on_connect(cb_on_connect);
     rt->set_on_disconnect(cb_on_disconnect);
 
+    // The pinned configuration, applied to every instance this input builds —
+    // including the ones OP_DESTROY creates — so that a program cannot leave
+    // the configuration the run is about by restarting the runtime.  OP_CONFIG
+    // is refused for the same knobs; see run_step().
+    if (g_pin.has_backend_timeout)
+        rt->set_backend_timeout(g_pin.backend_timeout);
+    if (g_pin.has_circuit_threshold)
+        rt->set_circuit_threshold(g_pin.circuit_threshold);
+    if (g_pin.has_retries)
+        rt->set_retry_count(g_pin.retries);
+    if (g_pin.has_max_connections)
+        rt->set_max_connections(static_cast<uint32_t>(g_pin.max_connections));
+    if (g_pin.has_idle_timeout)
+        rt->set_idle_timeout(static_cast<uint32_t>(g_pin.idle_timeout));
+
     // The two legs, independently.  Nothing but a refused start may leave a leg
     // that asked for encryption running in cleartext, so a setup() that returns
     // false here is the runtime doing its job and the program simply gets
@@ -2541,17 +2663,36 @@ void run_step(world& w, const step& s)
         case OP_CONFIG:
             if (w.rt)
             {
+                // A knob the run pinned is not a knob the program owns.  The
+                // op is still decoded and still printed — the program is what
+                // it is — it simply does not land, so a configuration the
+                // matrix is sweeping cannot be left partway through an input.
                 switch (s.a % 8)
                 {
                     case 0: w.rt->set_strategy(static_cast<proxy_strategy>(s.b % 3)); break;
                     case 1:
-                        w.rt->set_retry_count(s.b % 3);
-                        w.rt->set_retry_all((s.b & 4) != 0);
+                        if (!g_pin.has_retries)
+                        {
+                            w.rt->set_retry_count(s.b % 3);
+                            w.rt->set_retry_all((s.b & 4) != 0);
+                        }
                         break;
-                    case 2: w.rt->set_circuit_threshold(s.b % 4); break;
-                    case 3: w.rt->set_backend_timeout(s.b % 3); break;
-                    case 4: w.rt->set_max_connections(s.b % 6); break;
-                    case 5: w.rt->set_idle_timeout(s.b & 1); break;
+                    case 2:
+                        if (!g_pin.has_circuit_threshold)
+                            w.rt->set_circuit_threshold(s.b % 4);
+                        break;
+                    case 3:
+                        if (!g_pin.has_backend_timeout)
+                            w.rt->set_backend_timeout(s.b % 3);
+                        break;
+                    case 4:
+                        if (!g_pin.has_max_connections)
+                            w.rt->set_max_connections(s.b % 6);
+                        break;
+                    case 5:
+                        if (!g_pin.has_idle_timeout)
+                            w.rt->set_idle_timeout(s.b & 1);
+                        break;
                     case 6:
                         g_hook_mode = s.b % 4;
                         g_hook_drops = (g_hook_mode % 4) == 3;
@@ -2665,6 +2806,9 @@ void init_once()
     // on a socket the program deliberately reset, and report it as a finding in
     // the runtime.
     signal(SIGPIPE, SIG_IGN);
+
+    // Before anything is built, because make_instance() reads it.
+    parse_pinned_config();
 
     g_graveyard = new std::vector<std::unique_ptr<proxy_instance>>();
     write_lua_script();
