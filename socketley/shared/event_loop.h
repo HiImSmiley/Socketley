@@ -21,6 +21,23 @@ public:
     explicit event_loop(uint32_t queue_depth = 2048);
     ~event_loop();
 
+    // ── Ring policy ─────────────────────────────────────────────────────────
+    // Both take effect at init() and only there.  io_uring fixes a ring's flags
+    // when the ring is created and offers no way to change them afterwards, so
+    // these are not settings a running daemon can be asked to change — and that
+    // is also why neither is a per-runtime choice today: every in-process
+    // runtime shares this one ring, created before the first `create` command
+    // has been read.
+    //
+    // Calling either after init() is a no-op and says so in the log rather than
+    // leaving the caller believing a ring changed shape.
+    //
+    // SQPOLL costs a kernel thread per ring for as long as the ring exists, and
+    // that thread spins on the submission queue whether or not anything is
+    // being submitted.  It is therefore off unless asked for.
+    void set_sqpoll(bool on);
+    void set_cpus(const cpu_set_spec& cpus);
+
     bool init();
     void run();
 
@@ -360,13 +377,33 @@ public:
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
 
     // Feature queries
+    //
+    // sqpoll_enabled() is what the ring actually got, which is not the same as
+    // what was asked for: SQPOLL needs a kernel that will grant it, and a
+    // request that was refused must not be reported back as if it had been
+    // honoured.  sqpoll_requested() is the asking side, so the two can be shown
+    // apart when they differ.
     bool sqpoll_enabled() const { return m_sqpoll_enabled; }
+    bool sqpoll_requested() const { return m_sqpoll_requested; }
     bool direct_accept_supported() const { return m_direct_accept_supported; }
+
+    // The CPU set this loop was configured with, and the one CPU the SQPOLL
+    // kernel thread was pinned to (-1 when there is none, either because the
+    // set is unrestricted or because SQPOLL is off).
+    const cpu_set_spec& cpus() const { return m_cpus; }
+    int sq_thread_cpu() const { return m_sq_thread_cpu; }
+
+    // Whether the loop thread's affinity was actually narrowed.  False for an
+    // unrestricted set and for a sched_setaffinity that the kernel refused —
+    // the difference between "not asked" and "asked and did not get" belongs to
+    // the caller, not to a log line nobody reads.
+    bool affinity_applied() const { return m_affinity_applied; }
 
 private:
     struct io_uring_sqe* get_sqe();
     void setup_eventfd();
     bool init_fd_tables();
+    void apply_cpu_affinity();
 
     // What run()'s drain loop must do after one completion.  `stop` is only
     // ever the eventfd's own read reporting, which is how request_stop() ends
@@ -415,6 +452,12 @@ private:
     // because an unknown ioprio bit makes the kernel refuse every accept.
     bool m_accept_poll_first{false};
     bool m_sqpoll_enabled{false};
+    // Asked for, as opposed to granted.  Set before init() by set_sqpoll() or,
+    // when nothing called that, from the environment inside init().
+    bool m_sqpoll_requested{false};
+    bool m_affinity_applied{false};
+    cpu_set_spec m_cpus{};
+    int m_sq_thread_cpu{-1};
     bool m_send_zc_supported{false};
     bool m_recv_multishot_supported{false};
     bool m_files_registered{false};

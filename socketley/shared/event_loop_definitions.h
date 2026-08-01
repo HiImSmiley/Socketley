@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <string>
+#include <string_view>
+#include <unistd.h>
 
 // Branch prediction hints for hot-path optimization
 #ifndef SOCKETLEY_LIKELY
@@ -10,6 +13,214 @@
 #endif
 
 class event_loop;
+
+// ── CPU set ─────────────────────────────────────────────────────────────────
+// Which CPUs a loop's I/O may run on: the thread that drives the ring, and —
+// when SQPOLL is on — the kernel thread that polls its submission queue.
+//
+// One value covers both because they are one question.  A ring is a queue
+// between one thread and the kernel; asking "how many rings" only ever reduces
+// to "how many I/O threads", and two rings on one thread are strictly worse
+// than one, so there is no count to configure here.  What is left to say is
+// where that thread's work is allowed to land, and that is a set of CPUs.
+//
+// `all` is the `max` spelling: no restriction, and no sched_setaffinity call at
+// all, which is not the same as a mask with every bit set — a mask would pin
+// the thread to the CPUs online *now* and keep it off any that come online
+// later.
+struct cpu_set_spec
+{
+    // A mask is the shape the kernel wants and 64 covers every machine this
+    // daemon has ever been run on.  A wider one would be a bitset in a struct
+    // that is copied into every runtime; when a 65-CPU box turns up, parsing
+    // says so rather than silently dropping the high half — see parse_cpu_set.
+    static constexpr uint32_t max_cpus = 64;
+
+    bool     all{true};
+    uint64_t mask{0};
+
+    bool empty() const { return !all && mask == 0; }
+
+    // Lowest CPU in the set, or -1 when there is no single one to name.  This is
+    // what an SQPOLL ring is pinned to: io_uring takes a CPU *number* for the
+    // poller, not a mask, so the set bounds the loop thread and its lowest
+    // member carries the poller.  Documented rather than hidden, because a user
+    // who writes --cpus 0-3 and finds one kernel thread on CPU 0 deserves to
+    // have been told.
+    int first() const
+    {
+        if (all || mask == 0) return -1;
+        return __builtin_ctzll(mask);
+    }
+
+    uint32_t count() const
+    {
+        return all ? 0u : static_cast<uint32_t>(__builtin_popcountll(mask));
+    }
+
+    // `max`, or the shortest of the two spellings that round-trips through
+    // parse_cpu_set: a single unbroken run prints as a range, anything else as
+    // a list.  This is what `stats` shows, so it has to be a string the user
+    // could have typed.
+    std::string to_string() const
+    {
+        if (all) return "max";
+        if (mask == 0) return "none";
+
+        std::string out;
+        uint32_t i = 0;
+        bool first_group = true;
+        while (i < max_cpus)
+        {
+            if (!(mask & (1ull << i))) { ++i; continue; }
+            uint32_t start = i;
+            while (i + 1 < max_cpus && (mask & (1ull << (i + 1)))) ++i;
+            if (!first_group) out += ',';
+            first_group = false;
+            out += std::to_string(start);
+            if (i > start)
+            {
+                out += '-';
+                out += std::to_string(i);
+            }
+            ++i;
+        }
+        return out;
+    }
+};
+
+// How many CPUs this machine has.  The bound an impossible set is impossible
+// against; a separate function so the parser can be tested against a number the
+// caller chooses.
+inline uint32_t online_cpu_count()
+{
+    const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? static_cast<uint32_t>(n) : 1u;
+}
+
+// Parse `max`, a range `A-B`, or a comma-separated list whose elements are
+// single CPUs or ranges: `0`, `0-3`, `0,1,2,3`, `0-1,3`.
+//
+// False — with a reason in `err` — for anything else, and deliberately for the
+// two answers that are tempting to paper over:
+//
+//   * a CPU number this machine does not have.  Falling back to "all" here is
+//     the failure that made this function exist: an operator pins a runtime to
+//     CPU 7 on a four-core box, reads no complaint, and believes it is pinned.
+//   * a set that comes out empty (`--cpus ""`, `--cpus 3-1`).  Empty is not a
+//     synonym for unrestricted; it is a set on which nothing can be scheduled,
+//     and the only honest answer to it is a refusal.
+//
+// `ncpus` is the machine's CPU count.
+inline bool parse_cpu_set(std::string_view spec, uint32_t ncpus,
+                          cpu_set_spec& out, std::string& err)
+{
+    out = cpu_set_spec{};
+
+    if (spec.empty())
+    {
+        err = "empty CPU set";
+        return false;
+    }
+
+    if (spec == "max")
+    {
+        out.all = true;
+        out.mask = 0;
+        return true;
+    }
+
+    if (ncpus > cpu_set_spec::max_cpus)
+        ncpus = cpu_set_spec::max_cpus;
+
+    auto parse_num = [&](std::string_view s, uint32_t& v) -> bool
+    {
+        if (s.empty()) return false;
+        uint64_t acc = 0;
+        for (char c : s)
+        {
+            if (c < '0' || c > '9') return false;
+            acc = acc * 10 + static_cast<uint64_t>(c - '0');
+            if (acc > cpu_set_spec::max_cpus) return false;   // no wrap, no silent truncation
+        }
+        v = static_cast<uint32_t>(acc);
+        return true;
+    };
+
+    uint64_t mask = 0;
+    size_t pos = 0;
+    while (pos <= spec.size())
+    {
+        const size_t comma = spec.find(',', pos);
+        const std::string_view item = spec.substr(pos, comma == std::string_view::npos
+                                                          ? std::string_view::npos
+                                                          : comma - pos);
+        if (item.empty())
+        {
+            err = "empty element in CPU set";
+            return false;
+        }
+
+        const size_t dash = item.find('-');
+        uint32_t lo = 0, hi = 0;
+        if (dash == std::string_view::npos)
+        {
+            if (!parse_num(item, lo))
+            {
+                err = std::string("not a CPU number: ") + std::string(item);
+                return false;
+            }
+            hi = lo;
+        }
+        else
+        {
+            if (!parse_num(item.substr(0, dash), lo) ||
+                !parse_num(item.substr(dash + 1), hi))
+            {
+                err = std::string("not a CPU range: ") + std::string(item);
+                return false;
+            }
+            if (hi < lo)
+            {
+                err = std::string("descending CPU range: ") + std::string(item);
+                return false;
+            }
+        }
+
+        if (hi >= ncpus)
+        {
+            err = "CPU " + std::to_string(hi) + " does not exist on this machine ("
+                + std::to_string(ncpus) + " online)";
+            return false;
+        }
+
+        for (uint32_t c = lo; c <= hi; ++c)
+            mask |= (1ull << c);
+
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+        if (pos == spec.size())
+        {
+            err = "trailing comma in CPU set";
+            return false;
+        }
+    }
+
+    if (mask == 0)
+    {
+        err = "empty CPU set";
+        return false;
+    }
+
+    out.all = false;
+    out.mask = mask;
+    return true;
+}
+
+inline bool parse_cpu_set(std::string_view spec, cpu_set_spec& out, std::string& err)
+{
+    return parse_cpu_set(spec, online_cpu_count(), out, err);
+}
 
 class io_handler
 {

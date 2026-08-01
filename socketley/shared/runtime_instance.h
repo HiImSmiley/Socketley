@@ -264,6 +264,36 @@ public:
     void mark_out_of_process();
     bool is_out_of_process() const;
 
+    // ── Ring policy ─────────────────────────────────────────────────────────
+    // What this runtime's I/O was asked to run as: which CPUs, and whether its
+    // ring carries a submission poller.
+    //
+    // A request, not a result.  A ring's flags are fixed when the ring is
+    // created, and a runtime does not create one — the process it lives in
+    // does, before any runtime configuration has been read.  So these say what
+    // was asked for; the loop says what was granted, and `stats` prints the
+    // loop's answer.  cmd_create refuses a request the runtime's loop cannot
+    // meet rather than storing one that will never come true.
+    //
+    // Both survive the split unchanged: when a runtime owns its own process the
+    // same two values become that process's ring parameters, and the check
+    // moves from "does the daemon's ring match" to "build the worker's ring
+    // like this".
+    //
+    // Asked-for and not-asked-for are separate states, and the separation is
+    // load-bearing rather than tidy.  Without it "no flag given" is stored as
+    // the default value of the flag, so a plain `create` on a daemon whose ring
+    // does carry a poller reads as an explicit --no-sqpoll and is refused —
+    // a user who never typed a ring flag being lectured about one.  A request
+    // that was never made is not a request to keep the default; it is no
+    // request, and nothing is checked against it.
+    void set_cpus(const cpu_set_spec& cpus);
+    const cpu_set_spec& get_cpus() const;
+    bool has_cpus_request() const;
+    void set_sqpoll(bool on);
+    bool get_sqpoll() const;
+    bool has_sqpoll_request() const;
+
     enum class child_policy { stop, remove };
     void set_child_policy(child_policy p);
     child_policy get_child_policy() const;
@@ -453,6 +483,13 @@ private:
     std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;
+
+    // Ring policy, as requested.  The values are only meaningful when the
+    // matching _set flag is true; until then nothing was asked for.
+    cpu_set_spec m_cpus{};
+    bool m_cpus_set = false;
+    bool m_sqpoll = false;
+    bool m_sqpoll_set = false;
 
     // Runtime manager / event loop (base class)
     runtime_manager* m_runtime_manager = nullptr;

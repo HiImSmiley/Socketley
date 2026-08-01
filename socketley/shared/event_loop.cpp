@@ -6,6 +6,7 @@
 #include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -707,6 +708,84 @@ bool event_loop::init_fd_tables()
     return true;
 }
 
+void event_loop::set_sqpoll(bool on)
+{
+    if (m_ring_open)
+    {
+        LOG_WARN("event loop: SQPOLL cannot be changed on a ring that already exists");
+        return;
+    }
+    m_sqpoll_requested = on;
+}
+
+void event_loop::set_cpus(const cpu_set_spec& cpus)
+{
+    if (m_ring_open)
+    {
+        LOG_WARN("event loop: the CPU set cannot be changed on a ring that already exists");
+        return;
+    }
+    m_cpus = cpus;
+}
+
+namespace
+{
+
+// A boolean written by a human into an environment variable.  Absent is false;
+// anything that is not one of these is false and says so, because a daemon that
+// silently reads SOCKETLEY_SQPOLL=yes as "off" is a support ticket.
+bool env_flag(const char* name, bool& out)
+{
+    const char* v = getenv(name);
+    if (!v || !*v) return false;
+
+    const std::string_view s{v};
+    if (s == "1" || s == "true" || s == "on"  || s == "yes") { out = true;  return true; }
+    if (s == "0" || s == "false"|| s == "off" || s == "no")  { out = false; return true; }
+
+    char msg[160];
+    snprintf(msg, sizeof(msg), "event loop: %s=%s is not a boolean, ignoring", name, v);
+    LOG_WARN(msg);
+    return false;
+}
+
+}   // namespace
+
+// Narrow this thread to the configured set.  Called from init(), before the
+// ring is built.
+//
+// "max" deliberately makes no call at all rather than setting a mask with every
+// online CPU in it: those are not the same thing.  A full mask is a snapshot,
+// and it would keep the loop off any CPU that comes online afterwards — an
+// unrestricted thread is one the scheduler is still free to place anywhere.
+void event_loop::apply_cpu_affinity()
+{
+    m_affinity_applied = false;
+    if (m_cpus.all || m_cpus.mask == 0)
+        return;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (uint32_t c = 0; c < cpu_set_spec::max_cpus; ++c)
+        if (m_cpus.mask & (1ull << c))
+            CPU_SET(c, &set);
+
+    if (sched_setaffinity(0, sizeof(set), &set) == 0)
+    {
+        m_affinity_applied = true;
+        return;
+    }
+
+    // Not fatal: a cpuset or a container can forbid the move, and a loop on the
+    // wrong CPU still serves traffic.  It must not be reported as applied,
+    // though — that is the difference between a tuning knob and a lie, and
+    // affinity_applied() exists so `stats` can tell them apart.
+    char msg[192];
+    snprintf(msg, sizeof(msg), "event loop: could not pin the I/O thread to CPUs %s (%s)",
+             m_cpus.to_string().c_str(), strerror(errno));
+    LOG_WARN(msg);
+}
+
 bool event_loop::init()
 {
     bool initialized = false;
@@ -721,6 +800,41 @@ bool event_loop::init()
         return false;
     }
 
+    // ── Where the policy comes from ─────────────────────────────────────────
+    // A ring is created before the process it belongs to has read any runtime
+    // configuration — the daemon's in daemon_start(), a worker's before its
+    // config frame arrives — so the only thing that can reach it in time is the
+    // environment it was launched with.  A worker inherits the daemon's, which
+    // is why one daemon-level setting today reaches every ring in the tree.
+    //
+    // Explicit set_sqpoll()/set_cpus() win; these fill in for a caller that made
+    // no choice.
+    if (!m_sqpoll_requested)
+        env_flag("SOCKETLEY_SQPOLL", m_sqpoll_requested);
+
+    if (m_cpus.all)
+    {
+        if (const char* cpus_env = getenv("SOCKETLEY_CPUS"); cpus_env && *cpus_env)
+        {
+            cpu_set_spec parsed;
+            std::string err;
+            if (parse_cpu_set(cpus_env, parsed, err))
+                m_cpus = parsed;
+            else
+            {
+                char msg[224];
+                snprintf(msg, sizeof(msg),
+                         "event loop: SOCKETLEY_CPUS=%s rejected (%s), leaving the "
+                         "I/O thread unpinned", cpus_env, err.c_str());
+                LOG_WARN(msg);
+            }
+        }
+    }
+
+    // Narrowing this thread happens before the ring is built, so that anything
+    // the ring allocates is allocated on a CPU the loop will actually run on.
+    apply_cpu_affinity();
+
     // IORING_SETUP_NO_SQARRAY requires kernel 6.6.  All it saves is one level of
     // indirection when submitting, so it must never cost us the far more valuable
     // SINGLE_ISSUER / DEFER_TASKRUN modes: each setup below is retried without it
@@ -732,7 +846,20 @@ bool event_loop::init()
     {
         if (initialized) break;
 
-    // Priority 1: SQPOLL + SINGLE_ISSUER (avoids submit syscalls, needs root)
+    // ── Priority 1: SQPOLL + SINGLE_ISSUER, and only when asked ─────────────
+    // This used to be tried first and unconditionally, so every ring in the
+    // process tree came with a kernel thread spinning on its submission queue —
+    // one per ring, held for the ring's whole life, whether or not anything was
+    // ever submitted into it.  A daemon holding a single idle cache paid for it;
+    // with a runtime per process it would be paid once per runtime, which on a
+    // small box is three kernel threads polling three empty queues.
+    //
+    // What it buys, when it is bought deliberately, is that a submission is a
+    // store to the tail and nothing else — no io_uring_enter, no syscall at all
+    // on the hot path.  That is worth a core to a runtime saturating a link and
+    // worth nothing to a runtime waiting for its next connection, and only the
+    // operator knows which one this is.
+    if (m_sqpoll_requested)
     {
         struct io_uring_params params{};
         params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER
@@ -770,19 +897,31 @@ bool event_loop::init()
             if (iend != idle_env && ms >= 0)
                 params.sq_thread_idle = static_cast<uint32_t>(ms);
         }
-        // Optional CPU affinity for the SQPOLL kernel thread.
-        // Pin to a dedicated core to avoid cross-core cache misses on the SQ.
-        // Set SOCKETLEY_SQPOLL_CPU=<N> in the environment before starting the daemon.
-        const char* sq_cpu_env = getenv("SOCKETLEY_SQPOLL_CPU");
-        if (sq_cpu_env)
+        // Where the poller runs.  The CPU set governs it: pinning it inside the
+        // same set as the loop thread is the point of naming a set at all —
+        // otherwise the two halves of one ring sit on opposite ends of the
+        // machine and every submission crosses a cache line between them.
+        //
+        // io_uring takes a single CPU number here, not a mask, so a set with
+        // several members puts the poller on its lowest.  That asymmetry is
+        // real and is reported by `stats` as sq_thread_cpu rather than left for
+        // someone to discover in /proc.
+        //
+        // SOCKETLEY_SQPOLL_CPU still overrides, for pinning the poller outside
+        // the set the loop thread runs on — the one arrangement --cpus cannot
+        // express, and the one a NUMA box sometimes wants.
+        int sq_cpu = m_cpus.first();
+        if (const char* sq_cpu_env = getenv("SOCKETLEY_SQPOLL_CPU"); sq_cpu_env)
         {
             char* end;
-            long cpu = strtol(sq_cpu_env, &end, 10);
+            const long cpu = strtol(sq_cpu_env, &end, 10);
             if (end != sq_cpu_env && cpu >= 0)
-            {
-                params.flags |= IORING_SETUP_SQ_AFF;
-                params.sq_thread_cpu = static_cast<uint32_t>(cpu);
-            }
+                sq_cpu = static_cast<int>(cpu);
+        }
+        if (sq_cpu >= 0)
+        {
+            params.flags |= IORING_SETUP_SQ_AFF;
+            params.sq_thread_cpu = static_cast<uint32_t>(sq_cpu);
         }
         // Oversized CQ: 4x SQ depth avoids CQ overflow under burst
         params.flags |= IORING_SETUP_CQSIZE;
@@ -790,7 +929,29 @@ bool event_loop::init()
         if (io_uring_queue_init_params(m_queue_depth, &m_ring, &params) == 0)
         {
             m_sqpoll_enabled = true;
+            m_sq_thread_cpu = sq_cpu;
             initialized = true;
+        }
+        else if (sq_cpu >= 0)
+        {
+            // SQ_AFF is refused on its own by some kernels and by a cpuset the
+            // process is not allowed to leave.  Retry unpinned before giving up
+            // on SQPOLL altogether: a poller on the wrong CPU is still a poller,
+            // and the alternative is silently answering "no SQPOLL" to an
+            // operator who asked for it and only got the pinning wrong.
+            params.flags &= ~static_cast<unsigned>(IORING_SETUP_SQ_AFF);
+            params.sq_thread_cpu = 0;
+            if (io_uring_queue_init_params(m_queue_depth, &m_ring, &params) == 0)
+            {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "event loop: SQPOLL could not be pinned to CPU %d, "
+                         "running it unpinned", sq_cpu);
+                LOG_WARN(msg);
+                m_sqpoll_enabled = true;
+                m_sq_thread_cpu = -1;
+                initialized = true;
+            }
         }
     }
 
@@ -818,6 +979,14 @@ bool event_loop::init()
         if (io_uring_queue_init(m_queue_depth, &m_ring, 0) < 0)
             return false;
     }
+
+    // Asked for and not granted.  Worth a line of its own because the fallback
+    // is silent otherwise and looks exactly like a machine that is simply slow:
+    // every measurement taken to justify turning SQPOLL on would have been taken
+    // without it.
+    if (m_sqpoll_requested && !m_sqpoll_enabled)
+        LOG_WARN("event loop: SQPOLL was requested but the kernel refused it; "
+                 "running without a submission poller");
 
     // The ring exists from here on, and only from here: everything below and
     // every submission afterwards may reach into it.
@@ -1084,7 +1253,10 @@ void event_loop::run()
         // landed (common at high throughput), skip the blocking wait entirely.
         if (m_pending_submissions > 0)
         {
-            if (__builtin_expect(m_sqpoll_enabled, 1))
+            // The hint points at the default now that SQPOLL is opt-in: most
+            // rings in most processes take the submit_and_wait branch, and the
+            // one that does not is the one someone deliberately configured.
+            if (SOCKETLEY_UNLIKELY(m_sqpoll_enabled))
                 io_uring_submit(&m_ring);  // SQPOLL: tail update only, no syscall
             else
                 io_uring_submit_and_wait(&m_ring, 1);

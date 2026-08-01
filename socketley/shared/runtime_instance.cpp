@@ -585,6 +585,12 @@ void runtime_instance::mark_out_of_process() { m_out_of_process = true; }
 bool runtime_instance::is_out_of_process() const { return m_out_of_process; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
+void runtime_instance::set_cpus(const cpu_set_spec& cpus) { m_cpus = cpus; m_cpus_set = true; }
+const cpu_set_spec& runtime_instance::get_cpus() const { return m_cpus; }
+bool runtime_instance::has_cpus_request() const { return m_cpus_set; }
+void runtime_instance::set_sqpoll(bool on) { m_sqpoll = on; m_sqpoll_set = true; }
+bool runtime_instance::get_sqpoll() const { return m_sqpoll; }
+bool runtime_instance::has_sqpoll_request() const { return m_sqpoll_set; }
 
 void runtime_instance::set_runtime_manager(runtime_manager* mgr) { m_runtime_manager = mgr; }
 void runtime_instance::set_event_loop(event_loop* loop) { m_event_loop = loop; }
@@ -681,6 +687,37 @@ std::string runtime_instance::get_stats() const
     append_u64(m_stat_bytes_in.load(std::memory_order_relaxed));
     out += "\nbytes_out:";
     append_u64(m_stat_bytes_out.load(std::memory_order_relaxed));
+
+    // ── How this runtime's I/O is running ───────────────────────────────────
+    // Read from the loop, not from what was asked for.  A runtime whose polling
+    // mode or CPU set can only be inferred from the command line that created it
+    // is one nobody can debug: the kernel refuses an SQPOLL ring on some
+    // configurations and a cpuset can refuse the pinning, and in both cases the
+    // request and the result differ with nothing on screen to say so.
+    //
+    // The three fields are the ring's, so an out-of-process runtime reports its
+    // worker's ring here — this string is built inside the worker and pushed —
+    // which is exactly the figure that is wanted once every runtime has one.
+    out += "\nsqpoll:";
+    if (m_event_loop)
+    {
+        out += m_event_loop->sqpoll_enabled() ? "on"
+             : m_event_loop->sqpoll_requested() ? "off(refused)" : "off";
+        out += "\ncpus:";
+        out += m_event_loop->cpus().to_string();
+        if (!m_event_loop->cpus().all && !m_event_loop->affinity_applied())
+            out += "(not applied)";
+        out += "\nsq_thread_cpu:";
+        const int sq_cpu = m_event_loop->sq_thread_cpu();
+        if (sq_cpu >= 0) out += std::to_string(sq_cpu);
+        else             out += "-";
+    }
+    else
+    {
+        // No loop yet — a runtime created and not started.  Saying so beats
+        // printing the defaults as if they had been chosen.
+        out += "unknown\ncpus:unknown\nsq_thread_cpu:-";
+    }
     out += '\n';
 
     return out;

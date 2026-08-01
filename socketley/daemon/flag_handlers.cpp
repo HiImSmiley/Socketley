@@ -240,6 +240,56 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        // ── Where this runtime's I/O runs ────────────────────────────────────
+        // --cpus takes `max`, a range, or a list: max | 0-3 | 0,1,2,3 | 0-1,3.
+        //
+        // A set this machine cannot satisfy is refused here rather than rounded
+        // up to "all".  Pinning to a CPU that does not exist is the mistake this
+        // flag makes easy — a config written for a 16-core box, deployed on a
+        // four-core one — and the silent version of it is worse than the loud
+        // one: the runtime runs, it just runs nowhere near where its operator
+        // believes, and every measurement taken afterwards is measuring
+        // something else.
+        //
+        // There is deliberately no --rings to go with this.  A ring is a queue
+        // between one thread and the kernel, so a count of rings is only ever a
+        // count of I/O threads wearing a disguise, and two rings on one thread
+        // are strictly worse than one — more submission state, no more
+        // parallelism.  The honest knob is which CPUs the thread may use, and
+        // that is this one.
+        case fnv1a("--cpus"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--cpus requires a CPU set: max | 0-3 | 0,1,2,3\n";
+                return 1;
+            }
+            cpu_set_spec cpus;
+            std::string err;
+            if (!parse_cpu_set(pa.args[++i], cpus, err))
+            {
+                std::cout << "invalid --cpus value: " << err << "\n";
+                return 1;
+            }
+            instance->set_cpus(cpus);
+            return 0;
+        }
+
+        // Opt in to the io_uring submission poller for this runtime's ring.
+        //
+        // It costs a kernel thread that spins on the submission queue for as
+        // long as the ring exists, which is why it is not the default and why it
+        // is per runtime rather than per daemon: a runtime saturating a link
+        // wants its submissions to be a store to a tail pointer, and the three
+        // idle ones next to it want their core back.
+        case fnv1a("--sqpoll"):
+            instance->set_sqpoll(true);
+            return 0;
+
+        case fnv1a("--no-sqpoll"):
+            instance->set_sqpoll(false);
+            return 0;
+
         default:
             return -1;
     }
@@ -963,6 +1013,18 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             else                              instance->set_ca_path(path);
             return 0;
         }
+
+        // Neither is editable, and the reason is not a policy this daemon
+        // chose: io_uring fixes a ring's flags and its poller's CPU when the
+        // ring is created and offers nothing to change them with afterwards.
+        // Accepting the edit would store a value that the next `stats` would
+        // then contradict.
+        case fnv1a("--cpus"):
+        case fnv1a("--sqpoll"):
+        case fnv1a("--no-sqpoll"):
+            std::cout << "the ring's CPU set and polling mode are fixed when the "
+                         "ring is created; recreate the runtime to change them\n";
+            return 1;
 
         default:
             return -1;
