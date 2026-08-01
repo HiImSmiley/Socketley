@@ -409,6 +409,28 @@ jobs:
         #     answer becomes the head of that client's response.  Measured by
         #     the harness's marks: client[1] received the answer to client[0]'s
         #     request.
+        #
+        # And a fourth, which FUZZ_PROXY_SKIP cannot reach, because it is not
+        # one of the harness's checks: it is socketley/shared/invariants.h
+        # aborting on its own account, and SKL_INV_PAIR has no id and no
+        # demotion.  Seed: proxy/found-55a07a18, 32 bytes, both legs over TLS.
+        #
+        #     [invariant] nothing in flight on either half — this pair will
+        #     never be woken again | at proxy::on_cqe
+        #     | a: fd=-1 present=0 queued=0 closing=0
+        #     | b: fd=11 present=1 queued=1 closing=1
+        #
+        # A backend half that is closing with bytes still in its write queue and
+        # nothing at all in flight: no completion is coming, so the queue never
+        # goes out and the descriptor is held until the runtime stops.  It
+        # reproduces only in the clang build, because that is the one that
+        # defines SOCKETLEY_INVARIANTS — the GCC replay half of the same target
+        # runs the same input clean.  Consequence, until it is fixed: the
+        # libFuzzer half of fuzz_proxy_ops aborts on this input.  The only lever
+        # that exists is -DSOCKETLEY_INVARIANTS_WARN_ONLY at build time, and it
+        # would take the same assertions out of fuzz_server_ops and
+        # fuzz_client_ops as well, which is a worse trade than a red job — so it
+        # is deliberately NOT set here.
         env:
           FUZZ_SEED: ${{ github.run_number }}
           FUZZ_SMUGGLING: "1"

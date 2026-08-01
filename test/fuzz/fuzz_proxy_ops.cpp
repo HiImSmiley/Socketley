@@ -74,6 +74,11 @@
 // operations, because the orderings between those and the client's are where the
 // defects were.
 //
+// Both legs can be encrypted, independently, and the harness speaks OpenSSL
+// directly at each end rather than through shared/tls_context.h — see the note
+// above write_tls_material() for why a peer built on the record layer under
+// test would report a clean handshake whatever that layer did.
+//
 // Two things the harness reaches inside for, and both are the clock.  A backend
 // response deadline is two seconds and a header deadline ten, so an input that
 // waited for either would be the whole budget; OP_DEADLINE moves the deadlines
@@ -94,6 +99,10 @@
 //     written by write_lua_script() below.
 //   * a proxy in its own process (proxy_worker).  That is a supervision
 //     boundary, not an ordering, and the ordering is what this is for.
+//   * mutual TLS on the listener (--client-ca), a rejected certificate, and a
+//     handshake that fails halfway.  One certificate is generated and both
+//     ends accept it; a peer that presents the wrong one, or none, is a second
+//     certificate this does not make.
 
 #include <algorithm>
 #include <cerrno>
@@ -930,7 +939,14 @@ bool tls_available()
 // entitled to reach.
 bool tls_handshake(SSL* ssl, bool accept_side)
 {
-    for (int i = 0; i < 48; i++)
+    // A stopped runtime dispatches nothing, so no number of rounds can finish a
+    // handshake against one — but the attempt still has to be made and still has
+    // to fail, because a client whose handshake failed must end up mute rather
+    // than fall back to cleartext.  Skipping it would let such a client send a
+    // plaintext request into a TLS listener, be closed for it, and be reported
+    // as a request that went unanswered.
+    const int rounds = live_rt() ? 48 : 6;
+    for (int i = 0; i < rounds; i++)
     {
         ERR_clear_error();
         const int r = accept_side ? SSL_accept(ssl) : SSL_connect(ssl);
