@@ -1662,6 +1662,13 @@ Called when message sent.
 .TP
 .B on_route(method, path)
 Proxy only. Custom backend selection. Returns backend index (0-based).
+Answers only "where does this go"; to accept or refuse a request before any
+backend is chosen, see
+.BR "Proxy Filter Chain" .
+.TP
+.B filters
+Proxy only. Not a callback but an array of them: see
+.BR "Proxy Filter Chain" .
 .TP
 .B on_proxy_request(client_id, data) \(-> string | nil
 Proxy only. Called for every chunk forwarded from a client to a backend.
@@ -1788,6 +1795,107 @@ Cluster only. Called when a remote daemon becomes stale or disappears.
 .TP
 .B on_group_change(group, members)
 Cluster only. Called when the member count of a group changes.
+.SS Proxy Filter Chain
+Proxy only, HTTP mode only.
+.B filters
+is a global array of functions run in order on each request \fIbefore\fR a
+backend is selected. Each filter either says nothing \(em carry on to the next
+\(em or returns the answer, which ends the request there.
+.PP
+The ordering is the point. A request a filter refuses never reaches backend
+selection, so no endpoint is resolved, no circuit breaker's half-open probe is
+claimed, no pooled socket is spent and no connection is opened. This is where
+authentication, rate limiting and header rewriting belong;
+.B on_route
+runs after a backend has already been chosen and answers a different question.
+.PP
+The chain is independent of
+.BR \-\-strategy .
+It runs whatever picks the backend afterwards, and on a proxy with no
+.B on_route
+at all. A proxy whose script declares no
+.B filters
+array pays nothing: the chain is guarded by the same callback mask as every
+other hook.
+.PP
+Each filter is called with one argument:
+.nf
+method      string   HTTP method ("GET", "POST", ...)
+path        string   Request path as the client sent it, this proxy's
+                     prefix included \(em the same path on_route sees
+version     string   HTTP version (e.g. "HTTP/1.1")
+client_id   number   File descriptor of the client; pass it to
+                     self.peer_ip() to identify the peer
+headers     table    Request headers. Names are lowercased, values
+                     are trimmed, and a field sent more than once is
+                     joined with ", ".
+.fi
+.PP
+And returns one of three things:
+.TP
+.B nil
+(or nothing) \(em this filter has no opinion; the next one runs.
+.TP
+.BI "{ status = " N ", body = " string ", headers = " table " }"
+The answer. The chain stops, the request is never forwarded, and this response
+goes to the client.
+.I status
+must be 200\-599.
+.I body
+and
+.I headers
+are optional. The connection is closed afterwards, as it is for every other
+response the proxy writes itself.
+.TP
+.BI "{ set_headers = " table " }"
+Carry on, with these headers set on the request that goes to the backend. A
+header set here replaces one the client sent under the same name rather than
+joining it, and is emitted with a lowercased name.
+.PP
+A filter that returns anything else, or that raises an error, refuses the
+request with 500. A filter that did not say "carry on" is never treated as
+though it had. An entry in
+.B filters
+that is not a function refuses the whole script at load time, for the same
+reason: a silently dropped filter looks exactly like one that admits everybody.
+.PP
+Names a filter may not set are dropped, with a line on stderr:
+.B Content\-Length
+and
+.B Transfer\-Encoding
+on either side, because the proxy forwards exactly the body the parsed request
+declared and a filter that could change the length would make the proxy and the
+backend disagree about where the request ends;
+.B Host
+on the request, because the proxy rewrites it to the endpoint it selected; and
+the hop-by-hop set
+.RB ( Connection ", " Keep\-Alive ", " TE ", " Trailer ", " Upgrade ", " Proxy\-* ).
+So is any name that is not a bare token and any value carrying CR or LF \(em a
+filter is frequently echoing something the client supplied.
+.PP
+Filters run on the event loop thread. Whatever a filter does, every request on
+the proxy waits for: no blocking, no synchronous I/O, no long loops.
+.PP
+Example:
+.nf
+filters = {
+    function(req)
+        if not req.headers["authorization"] then
+            return {
+                status  = 401,
+                body    = "authentication required\\n",
+                headers = {["WWW-Authenticate"] = "Bearer"},
+            }
+        end
+        return {set_headers = {["x-authenticated-user"] = "alice"}}
+    end,
+}
+.fi
+.IP
+See
+.B examples/proxy/filter\-chain.lua
+for authentication, per-IP rate limiting and header rewriting as three filters
+in one chain.
 .SS Runtime Methods (in Lua)
 .nf
 self.name      -- Runtime name (read-only)

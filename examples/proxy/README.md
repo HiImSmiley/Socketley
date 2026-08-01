@@ -28,6 +28,10 @@ Dynamic backend discovery using runtime groups (`-g` and `@group`).
 ### Multi-Backend Lua
 Custom routing logic with Lua scripts.
 
+### Filter Chain
+Authentication, per-IP rate limiting and header rewriting as a chain of filters
+that runs *before* a backend is chosen — so a refused request never opens one.
+
 ## Key Concepts
 
 ### Path-Based Routing (HTTP Mode)

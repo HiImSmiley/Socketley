@@ -46,7 +46,16 @@ runtimes = {
 | `on_stop()` | Runtime stopped | none |
 | `on_message(msg)` | Message received (claims handling; no default broadcast) | message string |
 | `on_send(msg)` | Message sent | message string |
-| `on_route(method, path)` | HTTP request (proxy) | method, path |
+| `on_route(method, path)` | HTTP request (proxy), *after* a backend is needed | method, path |
+| `filters = {fn, ...}` | HTTP request (proxy), *before* backend selection | req table |
+
+`filters` is an array, not a single callback: each function runs in order and
+either says nothing (carry on) or returns the answer, ending the request before
+any backend is selected, resolved or connected to. That is where
+authentication, rate limiting and header rewriting belong — `on_route` only
+answers "where does this go", and runs once the proxy is already committed to
+sending it somewhere. See `examples/proxy/filter-chain.lua` and
+`socketley(1)`, section "Proxy Filter Chain".
 
 ### Runtime Methods
 ```lua
