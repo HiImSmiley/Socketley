@@ -63,15 +63,22 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
 
 // "The ring still owes this half a completion."
 //
-// One statement of it, used by everything that has to answer the question:
-// whether a half-closed client may be held for its answer, and whether a
-// teardown may be deferred until a completion finishes it.  Both are promises
-// that something will come back, and a promise nothing keeps is how a pair ends
-// up holding its descriptors until the runtime stops.
+// One statement of it, for the question a deferred teardown asks: may this
+// descriptor be held back, because something will come back and finish what is
+// queued on it?  A deferral without that is a promise nothing keeps, and a
+// promise nothing keeps is how a pair ends up holding its descriptors until the
+// runtime stops.
 //
 // Deliberately the same predicate inv_check_pair asserts on — see
 // shared/invariants.h.  The invariant is the specification for these two; if
 // they ever disagree with it, they are the ones that are wrong.
+//
+// It answers that question and no other.  In particular it does not answer
+// "does this client still have an answer coming", which is what deciding to
+// hold a half-closed client turns on: a backend read stays armed across
+// completions under multishot recv, so this reads true for a backend that owes
+// nothing at all.  handle_client_read asks that one for itself, out of the
+// state that describes the exchange rather than the ring.
 static inline bool client_op_in_flight(const proxy_client_connection* c)
 {
     return c->read_pending || c->write_pending || c->zc_notif_pending ||
@@ -1904,23 +1911,34 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             return;
         }
 
-        // A zero-length completion is end of stream only when the socket is
-        // actually drained.  IORING_CQE_F_SOCK_NONEMPTY says the opposite: the
-        // multishot recv ended while data is still queued.  Treating that as
-        // EOF tears the connection down under a client that is still writing,
-        // and its next write fails for data the proxy simply never collected.
-        if (cqe->res == 0 && (cqe->flags & IORING_CQE_F_SOCK_NONEMPTY) && !conn->closing)
-        {
-            SKL_TRACE_ADD(conn, multishot_ends, 1);
-            if (!conn->read_pending)
-                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot,
-                                                       m_use_provided_bufs, BUF_GROUP_ID)))
-                {
-                    close_pair(fd, conn->backend_fd);
-                    return;
-                }
-            return;
-        }
+        // IORING_CQE_F_SOCK_NONEMPTY on a zero-length completion does NOT mean
+        // there is data left to collect, and this is the one place it must not
+        // be read that way.
+        //
+        // recv() on a stream socket returns 0 for exactly one reason: the peer
+        // has shut its write side.  It hands back everything queued before it
+        // will ever return 0, so "ended while data is still queued" is not a
+        // shape `res == 0` can have.  The flag is set anyway, because what the
+        // kernel puts in msg_inq is tcp_inq_hint() — rcv_nxt minus copied_seq —
+        // and the FIN carries a sequence number of its own.  So the completion
+        // that reports end of stream reports one byte outstanding, and that byte
+        // is the FIN.  FIONREAD on the same socket in the same instant reads 0:
+        // tcp_inq() subtracts the FIN and tcp_inq_hint() does not.  Measured on
+        // every clean half-close this proxy sees: res=0, flags=0x4, FIONREAD=0.
+        //
+        // Re-arming on that was therefore not a guard against losing a request,
+        // it was a loop: the read is armed on a socket at end of stream, the
+        // kernel completes it immediately with res=0 and the same flag, and the
+        // pair is never torn down and never reaches anything below.  Measured at
+        // 1.35 million iterations on a single connection in one run of
+        // test_proxy_group_keepalive_load, with the descriptors of the pair —
+        // and of every runtime splicing behind it — held until the proxy
+        // stopped.
+        //
+        // The genuine "the socket still has data" signal comes with res > 0 and
+        // no IORING_CQE_F_MORE, which is a multishot that ended with the socket
+        // non-empty, and the re-arm for it is further down where the data is
+        // consumed.  Here res is zero, which is end of stream and nothing else.
 
         // A clean EOF from the client means it will send no more — not that we
         // may throw away what it already sent, or the answer to it.  The
@@ -1941,11 +1959,36 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         //     gets the answer to the request already in flight and nothing
         //     else: reset_client_for_next_request closes rather than waiting
         //     for a second request that by definition cannot come;
-        //   * and it is held only while the pair is REACHABLE — while the
-        //     connect or the backend still owes a completion.  Without that
-        //     test this branch would be the very defect it is fixing: a pair
-        //     with nothing in flight, which nothing will ever wake, holding two
-        //     descriptors until the runtime stops.
+        //   * and it is held only while an answer is genuinely OWED.  That is
+        //     the question, and "does the ring owe this backend a completion"
+        //     is not it: under multishot recv a backend read is armed
+        //     essentially all of the time — detach_and_pool_backend says so
+        //     itself, three hundred lines down, and pools the socket on exactly
+        //     that basis — so backend_op_in_flight() reads true for a backend
+        //     sitting idle with its answer long since delivered, and the hold
+        //     became unconditional.  What that cost: a client that sends
+        //     `Connection: close`, is answered, and then closes.  Its pair is
+        //     deliberately never detached (see handle_backend_read: a client
+        //     that asked for the connection to close is not put back in the
+        //     keep-alive pool), so reset_client_for_next_request is never
+        //     called for it and the hold below has nothing that can ever end
+        //     it.  The pair was held — client socket, backend socket, and the
+        //     splice pipes of every runtime behind it — until the proxy
+        //     stopped.  Measured: 13 pairs and 110 descriptors left over from
+        //     one run of test_proxy_group_keepalive_load, on a check whose
+        //     whole ceiling is 40 descriptors of slack.
+        //
+        //     So the three disjuncts below are the three states in which the
+        //     client has not had its answer, and each of them has something
+        //     that ends it.  A request waiting on a connect and a request whose
+        //     first byte has not come back are both being timed by
+        //     --backend-timeout, and response_deadline_sweep answers 502/504
+        //     and closes when that expires.  A response already arriving is
+        //     bounded by the backend read that is genuinely armed for the rest
+        //     of it, and completing it runs reset_client_for_next_request,
+        //     which closes on client_eof.  Nothing is held for a connection
+        //     that has been answered — close_pair still defers on the write
+        //     queue, so the tail of that answer goes out first either way.
         //
         // TCP mode is deliberately not held: it has no request and no response
         // to be owed one, and a byte pipe whose client has finished writing has
@@ -1957,7 +2000,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 m_conn_idx[conn->backend_fd].side == conn_backend)
                 b = m_conn_idx[conn->backend_fd].backend;
 
-            if (conn->connect_pending || (b && backend_op_in_flight(b)))
+            const bool answer_owed =
+                conn->connect_pending ||        // the request has not reached a backend yet
+                conn->awaiting_response ||      // it has, and not one byte has come back
+                (b && conn->response_started && !backend_response_complete(b));
+
+            if (answer_owed)
             {
                 conn->client_eof = true;
                 return;
