@@ -142,6 +142,29 @@ static void restore_runtimes(state_persistence& persistence,
         if (cfg.out_of_process)
             instance->mark_out_of_process();
 
+        // What this runtime asked its I/O to run as.  Restored before start(),
+        // which is where the request meets the ring: this daemon's ring was
+        // created from the environment it was launched with, and there is no
+        // reason that has to be the environment the request was accepted under.
+        //
+        // A set this machine no longer has is dropped with a warning rather
+        // than refused: the alternative is a daemon that will not restore a
+        // runtime because the box it was moved to has fewer cores, and the
+        // request is a requirement about the ring, not about this runtime's
+        // ability to exist.  Dropping it means start() checks nothing, which is
+        // the same position a runtime that never asked is in.
+        if (!cfg.cpus.empty())
+        {
+            cpu_set_spec spec;
+            std::string err;
+            if (parse_cpu_set(cfg.cpus, spec, err))
+                instance->set_cpus(spec);
+            else
+                LOG_WARN("restore: this machine cannot satisfy a persisted --cpus set");
+        }
+        if (cfg.sqpoll_set)
+            instance->set_sqpoll(cfg.sqpoll);
+
         // External (attached) runtimes: mark as external so start() skips io_uring setup
         if (cfg.external_runtime)
         {
@@ -238,16 +261,102 @@ static void restore_runtimes(state_persistence& persistence,
         if (!cfg.was_running)
             continue;
 
+        // Named, because the reason start() gives is printed by start() and a
+        // daemon restoring several runtimes would otherwise report a refusal
+        // with nothing to attach it to.  The runtime is left in `failed`, where
+        // `ls` and `stats` show it — a restore that could not honour what a
+        // runtime asked for must not read as a restore that worked.
         if (!manager.start(cfg.name, loop))
-            LOG_WARN("restore: could not start runtime");
+            LOG_WARN(("restore: could not start runtime " + cfg.name).c_str());
         else
             LOG_DEBUG("restored runtime");
     }
 }
 
-int daemon_start(runtime_manager& manager, event_loop& loop,
-                 int /*argc*/, char** /*argv*/)
+// The daemon's own command line: the ring policy, and nothing else yet.
+//
+// These are the process's settings rather than a runtime's, because a ring is
+// fixed when it is created and the process creates one before it has read a
+// single runtime's configuration.  Until now the only thing that could reach
+// init() in time was the environment, so SOCKETLEY_SQPOLL and SOCKETLEY_CPUS
+// were the whole interface — and `socketley daemon` dropped every argument it
+// was handed without a word.  `socketley daemon --sqpoll` started a daemon
+// with no poller and exited 0, which is the shape of trap this flag exists to
+// avoid one level down: a setting accepted and not applied.
+//
+// The environment still works and still means the same thing; the supervisor
+// forks workers with it and a worker has no command line of its own to carry
+// it.  A flag beats it when both are given, because a flag is typed for this
+// one run and an exported variable is usually not typed at all.
+//
+// Returns false when the command line cannot be honoured, having said why.
+// Unknown arguments are refused rather than ignored: an argument the daemon
+// does not understand is either a typo or a setting the operator believes is
+// in effect, and both are worth an exit code.
+static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
 {
+    // argv[0] is the binary and argv[1] is "daemon"; both are ours, not the
+    // operator's.  A daemon started with no arguments at all takes this loop
+    // once and decides nothing, which is what leaves the environment in charge.
+    for (int i = 2; i < argc; ++i)
+    {
+        const std::string_view arg = argv[i];
+
+        switch (fnv1a(arg))
+        {
+            case fnv1a("--sqpoll"):
+                loop.set_sqpoll(true);
+                break;
+
+            case fnv1a("--no-sqpoll"):
+                loop.set_sqpoll(false);
+                break;
+
+            case fnv1a("--cpus"):
+            {
+                if (i + 1 >= argc)
+                {
+                    std::cout << "--cpus requires a CPU set: max | 0-3 | 0,1,2,3\n";
+                    return false;
+                }
+                cpu_set_spec cpus;
+                std::string err;
+                if (!parse_cpu_set(argv[++i], cpus, err))
+                {
+                    // The same refusal `create --cpus` gives, for the same
+                    // reason: a set this machine cannot satisfy is never
+                    // rounded up to "all", because a daemon running nowhere
+                    // near where its operator believes makes every measurement
+                    // taken afterwards a measurement of something else.
+                    std::cout << "invalid --cpus value: " << err << "\n";
+                    return false;
+                }
+                loop.set_cpus(cpus);
+                break;
+            }
+
+            default:
+                std::cout << "unknown daemon flag: " << arg << "\n"
+                          << "  socketley daemon takes --sqpoll, --no-sqpoll and "
+                             "--cpus <set>.\n"
+                          << "  Runtime flags belong on `create`; this command "
+                             "configures the process's ring.\n";
+                return false;
+        }
+    }
+
+    return true;
+}
+
+int daemon_start(runtime_manager& manager, event_loop& loop,
+                 int argc, char** argv)
+{
+    // Before anything else, including the "is one already running" check: a
+    // command line the daemon cannot honour is worth an exit code whether or
+    // not this process was going to be the one serving the socket.
+    if (!parse_daemon_flags(argc, argv, loop))
+        return 1;
+
     // Resolve paths (system vs dev mode)
     auto paths = socketley_paths::resolve();
 

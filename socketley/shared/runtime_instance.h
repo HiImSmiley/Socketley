@@ -294,6 +294,19 @@ public:
     bool get_sqpoll() const;
     bool has_sqpoll_request() const;
 
+    // Why this runtime's request cannot be honoured on `loop`'s ring, or an
+    // empty string when it can.  Newline-terminated, and it names the daemon
+    // setting that would satisfy the request rather than only saying no.
+    //
+    // Asked in two places, which is the point of it being one function.
+    // `create` asks so a refusal reaches the client that typed the flag; start()
+    // asks because the request outlives the daemon that accepted it — the state
+    // file carries it, and a ring is created before any of it is read, so the
+    // ring a restored runtime meets is not necessarily the ring its request was
+    // checked against.  Two copies of this text would drift, and the half that
+    // drifted would be the one nobody reads until a restart.
+    std::string ring_policy_refusal(const event_loop& loop) const;
+
     enum class child_policy { stop, remove };
     void set_child_policy(child_policy p);
     child_policy get_child_policy() const;

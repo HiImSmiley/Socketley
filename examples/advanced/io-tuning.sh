@@ -63,7 +63,7 @@ cat <<'NOTE'
 To run a daemon with a poller, pinned to CPUs 0 and 1:
 
     socketley daemon stop
-    SOCKETLEY_SQPOLL=1 SOCKETLEY_CPUS=0-1 socketley daemon &
+    socketley daemon --sqpoll --cpus 0-1 &
 
     socketley create cache hot -p 9100 --sqpoll --cpus 0-1 -s
     socketley stats hot | grep -E '^(sqpoll|cpus|sq_thread_cpu):'
@@ -71,8 +71,22 @@ To run a daemon with a poller, pinned to CPUs 0 and 1:
     #   cpus:0-1
     #   sq_thread_cpu:0
 
+The environment says the same thing and is what a supervised worker process
+inherits, since a worker has no command line of its own:
+
+    SOCKETLEY_SQPOLL=1 SOCKETLEY_CPUS=0-1 socketley daemon &
+
+A flag wins when both are given.  `socketley daemon` refuses an argument it does
+not understand rather than starting and ignoring it, which is what it used to do
+— `socketley daemon --sqpoll` once started a daemon with no poller and exited 0.
+
 Worth it for a runtime that is saturating a link: submitting work becomes a
 store to a queue tail with no system call at all.  Worth nothing for a runtime
 waiting for its next connection, which is what the kernel thread would be
 spinning for.
+
+Both flags are stored with the runtime, so the requirement outlives the daemon
+that accepted it.  Restart the daemon without --sqpoll/--cpus and `hot` does not
+come back up: it lands in `failed` with the reason in the log, rather than
+starting on a ring that does not meet what it asked for.
 NOTE

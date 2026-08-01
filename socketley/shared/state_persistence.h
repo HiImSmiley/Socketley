@@ -47,6 +47,27 @@ struct runtime_config
     // runtime back where it was running, not merely bring it back.
     bool out_of_process = false;
 
+    // Ring policy: what this runtime's --cpus / --sqpoll asked its I/O to run
+    // as.  See runtime_instance.h — these are a request, not a result, and the
+    // daemon refuses one its ring cannot meet.
+    //
+    // Persisted because the refusal is the whole value of the request.  A ring
+    // belongs to a process, so dropping these across a restart never changed
+    // where a restored runtime's I/O ran; what it dropped was the operator's
+    // stated requirement, and with it the refusal that would have said the new
+    // ring does not meet it.  A daemon restarted without SOCKETLEY_CPUS brought
+    // a runtime created with --cpus 0-1 back up on an unpinned ring, reported
+    // cpus:max, and said nothing.
+    //
+    // `cpus` is stored as it would be typed — max | 0-3 | 0,1,2,3 — because
+    // cpu_set_spec::to_string() round-trips through parse_cpu_set and a state
+    // file a human can read is worth more here than a bitmask.  Empty means no
+    // request was made, which is not the same as a request for the default:
+    // see the note on has_cpus_request() in runtime_instance.h.
+    std::string cpus;
+    bool sqpoll = false;
+    bool sqpoll_set = false;
+
     // External (attach) mode
     bool external_runtime = false;
     bool managed = false;

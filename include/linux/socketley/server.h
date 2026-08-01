@@ -30,6 +30,16 @@ public:
     server& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
     }
+    // The CA that certificates presented *by clients* must be signed by —
+    // mutual TLS on this server's listener, so it needs tls(cert, key) as well.
+    //
+    // The name is the proxy header's, and deliberately: on a listener this
+    // setting means the same thing on both roles, and proxy::client_ca() was
+    // already spelled this way.  tls_ca() below is the older spelling of the
+    // same thing, kept because it is published, and it differs only in also
+    // switching TLS on — which a listener cannot use on its own anyway, since a
+    // TLS listener with no certificate is refused at start.
+    server& client_ca(std::string_view ca) { raw()->set_ca_path(ca); return *this; }
     server& tls_ca(std::string_view ca)    { raw()->set_tls(true); raw()->set_ca_path(ca); return *this; }
     server& max_connections(uint32_t n)    { raw()->set_max_connections(n); return *this; }
     server& rate_limit(double r)           { raw()->set_rate_limit(r); return *this; }

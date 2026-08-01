@@ -11,6 +11,9 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .br
 .B socketley
 .B daemon
+.RB [ \-\-sqpoll | \-\-no\-sqpoll ]
+.RB [ \-\-cpus
+.IR set ]
 .br
 .B socketley
 .B daemon
@@ -169,6 +172,30 @@ Creates IPC socket at /run/socketley/socketley.sock (system install) or
 /tmp/socketley.sock (development mode).
 On startup, restores persisted runtime configurations. Runtimes that were
 running when the daemon last stopped are auto-started.
+.PP
+Takes
+.BR \-\-sqpoll ,
+.B \-\-no\-sqpoll
+and
+.BI \-\-cpus " set"
+\(em the ring settings described under
+.BR "COMMON FLAGS" ,
+here shaping the ring this daemon is about to create rather than stating what a
+runtime requires of one. They are the command-line spelling of
+.B SOCKETLEY_SQPOLL
+and
+.BR SOCKETLEY_CPUS ,
+and a flag wins when both are given. Any other argument is refused: this command
+used to ignore its command line entirely, so
+.B socketley daemon \-\-sqpoll
+started a daemon with no poller and exited 0.
+.IP
+They cannot be combined with
+.B \-\-name
+or
+.BR \-\-cluster ,
+which address a daemon that is already running \(em a ring's flags are fixed when
+the ring is created, so there would be nothing left for them to change.
 .TP
 .BI "daemon \-\-name " "name " "[\-\-cluster " "dir" "]"
 Configure the running daemon for cluster mode. These flags are sent as IPC
@@ -814,13 +841,23 @@ one daemon shares that daemon's ring. So these two flags state what a runtime
 requires, and
 .B create
 refuses a requirement the ring it would run on does not meet, naming the
+.B socketley daemon
+flag or the
 .B SOCKETLEY_SQPOLL
-or
+/
 .B SOCKETLEY_CPUS
-setting that would. They cannot be changed with
+setting that would satisfy it. They cannot be changed with
 .BR edit .
 The values in force are reported by
 .BR "socketley stats" .
+.IP
+Both are persisted with the runtime, and the same refusal is made again when a
+persisted runtime is restored: a daemon restarted without the setting that
+satisfied a runtime's requirement leaves that runtime
+.BR failed ,
+with the reason in the daemon log, rather than starting it on a ring that does
+not meet it and reporting the ring it got. A runtime that asked for neither flag
+records neither and is never refused for one.
 .TP
 .B \-\-tls
 .TQ
@@ -3185,6 +3222,13 @@ is read once at daemon startup and cannot be changed afterwards. The per-runtime
 flag states what a runtime requires and is refused at
 .B create
 time when this daemon's ring does not provide it.
+.IP
+.B "socketley daemon \-\-sqpoll"
+and
+.B \-\-no\-sqpoll
+say the same thing on the command line and win when both are given. The variable
+remains the only route into a worker process, which has no command line of its
+own and inherits the daemon's environment.
 .TP
 .B SOCKETLEY_CPUS=\fImax\fR|\fI0\-3\fR|\fI0,1,2,3\fR
 The set of CPUs the daemon's I/O thread may run on, and \(em when SQPOLL is on \(em
@@ -3196,6 +3240,11 @@ online now.
 A CPU this machine does not have, or a set that comes out empty, is refused and
 the daemon runs unpinned with a warning; it is never rounded up to
 .BR max .
+.IP
+.BI "socketley daemon \-\-cpus " set
+says the same thing on the command line and wins when both are given. There the
+same impossible set is refused outright and the daemon does not start, because a
+flag typed for this one run is a requirement rather than an inherited default.
 .TP
 .B SOCKETLEY_SQPOLL_IDLE_MS
 How long the io_uring SQPOLL kernel thread keeps polling the submission queue
@@ -3478,6 +3527,8 @@ server(uint16_t port)
 
 // Config (all return server& for chaining)
 tls(cert, key)         // terminates TLS on this listener
+client_ca(ca)          // mutual TLS on it: clients must present a certificate
+                       // (tls_ca(ca) is the older spelling; it also sets tls)
 max_connections(n)     rate_limit(r)
 global_rate_limit(r)   idle_timeout(s)       lua(path)
 mode(m)                udp()                 http_dir(path)
@@ -3508,8 +3559,11 @@ loop()     -> event_loop&
 client(string_view host, uint16_t port)
 
 // Config
-tls()  tls_ca(ca)  // NOT IMPLEMENTED - a client dials in cleartext,
-                   // so start() refuses rather than dialling
+tls()              // dial over TLS; the host from the constructor is pinned
+                   // and the chain verified against the system trust store
+tls_ca(ca)         // verify against that CA instead of the system store
+client_cert(c, k)  // the certificate this client presents when the peer asks
+                   // for one - the client half of mutual TLS; needs tls()
 reconnect(max)     mode(m)            udp()
 lua(path)          tick_interval(ms)
 
