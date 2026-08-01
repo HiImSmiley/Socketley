@@ -86,6 +86,8 @@ examples/
 - `udp-echo.sh` - Fire-and-forget UDP messaging
 
 ### Advanced
+- `io-tuning.sh` - `--cpus` and `--sqpoll`: where a runtime's I/O runs, and
+  whether its ring carries a polling kernel thread
 - `microservices.lua` - Microservice architecture
 - `high-availability.lua` - HA setup with failover
 - `logging-pipeline.lua` - Centralized logging

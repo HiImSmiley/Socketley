@@ -300,6 +300,36 @@ bytes in/out, and type-specific counters. Accepts multiple names, glob
 patterns, or a mix. With
 .BR * ,
 shows stats for all runtimes.
+.IP
+Three of the fields describe how the runtime's I/O is running rather than what
+it has done, and all three are read from the ring itself rather than from what
+was asked for \(em a kernel can refuse an SQPOLL ring and a cpuset can refuse
+the pinning, and a runtime whose real polling mode and CPU set cannot be read
+back is one nobody can debug:
+.RS
+.TP
+.B sqpoll
+.BR on ,
+.BR off ,
+or
+.B off(refused)
+when a poller was asked for and the kernel would not give one.
+.TP
+.B cpus
+The CPU set in force, in the same spelling
+.B \-\-cpus
+accepts, with
+.B (not applied)
+appended when the pinning was attempted and refused.
+.TP
+.B sq_thread_cpu
+The CPU the polling kernel thread was pinned to, or
+.B \-
+when there is no poller or it is unpinned.
+.RE
+.IP
+For a runtime running in its own process these describe that process's ring, not
+the daemon's.
 .TP
 .BI "restart " "name " "[flags]"
 Stop and start a runtime in one step. The runtime keeps the
@@ -734,6 +764,63 @@ check for idle connections. 0 means disabled (default).
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener
 but flushes all pending write queues before closing connections.
+.TP
+.BI "\-\-cpus " "set"
+The CPUs this runtime's I/O may run on. Accepts
+.BR max ,
+a range such as
+.BR 0\-3 ,
+or a list such as
+.B 0,1,2,3
+whose elements may themselves be ranges
+.RB ( 0\-1,3 ).
+Default
+.BR max ,
+which applies no pinning at all \(em not a mask of the CPUs that are online now,
+so a CPU that comes online later is still available to the loop.
+.IP
+A CPU this machine does not have, a descending range, or a set that comes out
+empty is refused when the runtime is created. It is never quietly rounded up to
+.BR max :
+a config written for a sixteen-core machine and deployed on a four-core one
+would otherwise run nowhere near where its author believes, and every
+measurement taken afterwards would be measuring something else.
+.IP
+There is deliberately no
+.B \-\-rings
+to go with this. A ring is a queue between one thread and the kernel, so a count
+of rings is only ever a count of I/O threads wearing a disguise, and two rings on
+one thread are strictly worse than one \(em more submission state to keep, no
+more parallelism. What is left to configure is which CPUs the thread may use.
+.TP
+.B \-\-sqpoll
+.TQ
+.B \-\-no\-sqpoll
+Whether this runtime's ring carries an io_uring submission-queue polling kernel
+thread.
+.B \-\-no\-sqpoll
+is the default.
+.IP
+With it, submitting work is a store to a queue tail and costs no system call;
+without it, each batch costs one
+.BR io_uring_enter (2).
+The price is a kernel thread per ring, spinning on that queue for as long as the
+ring exists whether or not anything is being submitted \(em worth a core to a
+runtime saturating a link, worth nothing to one waiting for its next connection.
+.IP
+A ring's polling mode and its CPU set are fixed by the kernel when the ring is
+created, and a ring belongs to a process, not to a runtime: every runtime inside
+one daemon shares that daemon's ring. So these two flags state what a runtime
+requires, and
+.B create
+refuses a requirement the ring it would run on does not meet, naming the
+.B SOCKETLEY_SQPOLL
+or
+.B SOCKETLEY_CPUS
+setting that would. They cannot be changed with
+.BR edit .
+The values in force are reported by
+.BR "socketley stats" .
 .TP
 .B \-\-tls
 .TQ
@@ -3079,10 +3166,44 @@ Path to the IPC socket. Overrides the default lookup
 then
 .BR /tmp/socketley.sock ).
 .TP
+.B SOCKETLEY_SQPOLL=1
+Give every io_uring ring in this daemon \(em its own, and every worker process it
+forks \(em a submission-queue polling kernel thread. Unset by default, which means
+no such thread exists.
+.IP
+SQPOLL makes a submission a store to a queue tail with no system call at all,
+which is worth having on a runtime that is saturating a link. It costs one
+kernel thread per ring, held for as long as the ring exists and spinning on the
+queue whether or not anything is being submitted, which is worth nothing at all
+on a runtime that is waiting for its next connection. It was previously always
+on; on a machine running several mostly-idle runtimes that was a polling thread
+each, doing nothing.
+.IP
+A ring's polling mode is fixed by the kernel when the ring is created, so this
+is read once at daemon startup and cannot be changed afterwards. The per-runtime
+.B \-\-sqpoll
+flag states what a runtime requires and is refused at
+.B create
+time when this daemon's ring does not provide it.
+.TP
+.B SOCKETLEY_CPUS=\fImax\fR|\fI0\-3\fR|\fI0,1,2,3\fR
+The set of CPUs the daemon's I/O thread may run on, and \(em when SQPOLL is on \(em
+the set whose lowest member carries the polling kernel thread. Default
+.BR max ,
+which applies no pinning at all rather than a mask of the CPUs that happen to be
+online now.
+.IP
+A CPU this machine does not have, or a set that comes out empty, is refused and
+the daemon runs unpinned with a warning; it is never rounded up to
+.BR max .
+.TP
 .B SOCKETLEY_SQPOLL_IDLE_MS
 How long the io_uring SQPOLL kernel thread keeps polling the submission queue
 before it sleeps, in milliseconds. Default
 .BR 10 .
+Has no effect unless
+.B SOCKETLEY_SQPOLL
+is set.
 Any periodic timer that fires faster than this window prevents the thread from
 ever sleeping, which costs a full CPU core even at zero traffic. Raising it only
 helps workloads that sit idle for long stretches and then burst; under sustained
@@ -3122,8 +3243,12 @@ default. Trades CPU for lower receive latency on busy links.
 .TP
 .B SOCKETLEY_SQPOLL_CPU=\fIN\fR
 Pin the SQPOLL kernel thread to CPU
-.IR N .
-Avoids cross-core cache misses on the submission queue; unset by default.
+.IR N ,
+overriding the CPU
+.B SOCKETLEY_CPUS
+would have chosen for it. Unset by default. Needed only for the one arrangement
+.B SOCKETLEY_CPUS
+cannot express \(em a poller deliberately outside the set its loop thread runs on.
 .TP
 .B SOCKETLEY_CONFIG
 Path to the daemon configuration file.
