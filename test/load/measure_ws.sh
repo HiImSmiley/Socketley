@@ -18,6 +18,34 @@
 #
 # FAILS WHEN:  any round reports any failure kind, or the upgrade never worked.
 #              The original always exited 0.
+#
+# ─── THIS HARNESS HAS NEVER PRODUCED A MEASUREMENT ──────────────────────────
+#
+# It reports NO DATA on the probe, on the runner and on a developer box, and it
+# has done so since it was written — the nightly could not build between
+# 2026-07-28 and 2026-08-01, so 2026-08-01's run (30719890629) is the first time
+# anyone saw the result.  What actually happens, taken apart stage by stage
+# against a Release build on 2026-08-02:
+#
+#   * the upgrade SUCCEEDS.  The proxy returns "HTTP/1.1 101 Switching
+#     Protocols" with the backend's Sec-WebSocket-Accept, for GET /pxw and for
+#     GET /pxw/ alike.
+#   * the first data frame is never echoed.  The client sends one masked text
+#     frame and waits; nothing comes back and the connection is not closed, so
+#     wsharness.py records "timeout" — which is what the probe sees.
+#   * the same two clients sending the same frames straight to the backend,
+#     bypassing the proxy, are echoed correctly.
+#
+# So the failure is downstream of the handshake, not in it: the proxy has no
+# Upgrade path at all — no occurrence of 101, "Switching Protocols" or any
+# notion of a tunnel anywhere in socketley/runtime/proxy/ — so it relays the
+# 101 as an ordinary HTTP response and then goes back to expecting a request on
+# a connection that now carries frames.  Whether the proxy owes a WebSocket
+# tunnel is a product question and is NOT decided here.
+#
+# The verdict below therefore stays NO DATA, which is true: nothing was
+# measured.  Its wording used to add "harness or setup is broken", which is not
+# true and sent the reader to this file instead of to the proxy.
 
 HARNESS_NAME="measure_ws"
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -44,7 +72,7 @@ trap cleanup EXIT
 echo "=== Proxy WebSocket path — $PASSES passes of $ROUNDS rounds ==="
 announce_environment
 
-pin_load python3 "$LIB/wsharness.py" --mode backend --port "$BE" >"$RUNDIR/backend.log" 2>&1 &
+start_load_bg python3 "$LIB/wsharness.py" --mode backend --port "$BE" >"$RUNDIR/backend.log" 2>&1
 BPID=$!
 sleep 1
 kill -0 "$BPID" 2>/dev/null || {
@@ -59,7 +87,9 @@ sleep 1.5
 
 if ! out="$(pin_load python3 "$LIB/wsharness.py" --mode drive --port "$PX" --prefix /pxw/ --clients 2 --count 2 2>&1)"; then
     echo "  probe output: $out"
-    nothing_measured "not one WebSocket upgrade succeeded — harness or setup is broken, nothing was measured"
+    echo "  A 'timeout' here is the known state described at the top of this file:"
+    echo "  the upgrade completes and the frames after it are not relayed."
+    nothing_measured "the probe did not complete one WebSocket exchange through the proxy"
 fi
 
 total_bad=0
