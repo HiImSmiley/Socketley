@@ -941,3 +941,75 @@ project "test_sdk_cache_client"
         buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
+
+-- ─── Test: connection identity and the two transfer mechanisms ───
+
+project "test_conn_transfer"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/doctest",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files { "test/unit/test_conn_transfer.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Benchmark: the two cross-runtime transports against the in-process relay ───
+
+project "bench_conn_transfer"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files { "test/benchmark/bench_conn_transfer.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}

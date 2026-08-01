@@ -8,6 +8,7 @@
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 
 #include "proxy_instance.h"
@@ -63,12 +64,15 @@ public:
         // instead of raising SIGPIPE.
         signal(SIGPIPE, SIG_IGN);
 
-        if (!m_loop.init())
-        {
-            LOG_ERROR("proxy worker: could not initialise io_uring");
-            return 2;
-        }
-
+        // No ring yet.  io_uring fixes a ring's flags when the ring is created
+        // and offers no way to change them afterwards, so whatever is going to
+        // decide this worker's ring — SQPOLL, a CPU set — has to have arrived
+        // before init() runs.  The only thing that ever tells a worker anything
+        // is its config frame, and this used to init() several hundred
+        // microseconds before the first byte of that frame was read: a
+        // per-runtime ring setting could be parsed, stored, and would then be
+        // silently ignored, because set_sqpoll()/set_cpus() on an open ring are
+        // no-ops by contract.  on_config() builds the ring now.
         set_nonblocking(m_fd);
         send_hello();
 
@@ -80,7 +84,17 @@ public:
             // is not spinning.  run() is not usable here: it owns the thread
             // until the ring stops, and the control socket has to be serviced
             // between completions.
-            m_loop.poll_completions(20);
+            //
+            // Before the ring exists poll_completions() returns at once no
+            // matter what timeout it is handed, so the wait has to come from
+            // somewhere else or this loop is a spinning core for as long as the
+            // config takes to arrive.  Waiting on the control socket is the
+            // right place for it anyway: the frame is the only thing that can
+            // happen to a worker in that window.
+            if (m_loop.ring_open())
+                m_loop.poll_completions(20);
+            else
+                wait_for_control(20);
 
             if (!pump_control())
                 break;
@@ -110,6 +124,15 @@ private:
         const int fl = fcntl(fd, F_GETFL, 0);
         if (fl >= 0)
             if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
+    }
+
+    // Block until the control socket has something or the timeout runs out.
+    // Only used before there is a ring; afterwards the ring's own wait covers
+    // it, and the control socket is drained between completions.
+    void wait_for_control(int timeout_ms) const
+    {
+        struct pollfd pfd{m_fd, POLLIN, 0};
+        if (::poll(&pfd, 1, timeout_ms) < 0) {}
     }
 
     void send_hello()
@@ -220,6 +243,27 @@ private:
         if (m_proxy)
         {
             LOG_WARN("proxy worker: ignoring config for an already-configured worker");
+            return;
+        }
+
+        // The ring, at the first and only moment where both halves hold: the
+        // config has been parsed, so anything in it that shapes a ring can be
+        // applied, and nothing has submitted yet, so applying it is still
+        // allowed.  Any set_sqpoll()/set_cpus() this worker is ever given goes
+        // between the parse above and the init below — that gap is the whole
+        // point of building the ring here instead of in run().
+        //
+        // Nothing is passed today, so the ring lands on the same environment
+        // the daemon was launched with, exactly as before.
+        //
+        // Guarded on ring_open() rather than on reaching here once: a config
+        // that got as far as the ring and then failed to build a proxy leaves
+        // m_proxy null, and a second config frame must not build a second ring
+        // over the first.
+        if (!m_loop.ring_open() && !m_loop.init())
+        {
+            LOG_ERROR("proxy worker: could not initialise io_uring");
+            m_done = true;
             return;
         }
 

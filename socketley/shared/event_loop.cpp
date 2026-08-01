@@ -803,11 +803,15 @@ bool event_loop::init()
     }
 
     // ── Where the policy comes from ─────────────────────────────────────────
-    // A ring is created before the process it belongs to has read any runtime
-    // configuration — the daemon's in daemon_start(), a worker's before its
-    // config frame arrives — so the only thing that can reach it in time is the
-    // environment it was launched with.  A worker inherits the daemon's, which
-    // is why one daemon-level setting today reaches every ring in the tree.
+    // The daemon's ring is created in daemon_start(), before any runtime
+    // configuration has been read, so the only thing that can reach it in time
+    // is the environment it was launched with.
+    //
+    // A worker's is not: proxy_worker builds its ring on the config frame and
+    // not before, precisely so that a per-runtime ring policy has somewhere to
+    // arrive.  Until such a setting exists the worker inherits the daemon's
+    // environment and lands in the same place, but the ordering no longer
+    // forbids the setting.
     //
     // Explicit set_sqpoll()/set_cpus() win; these fill in for a caller that made
     // no choice.  "No choice" is the explicit-marker and not the value: `daemon

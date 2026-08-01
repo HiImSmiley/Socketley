@@ -1,5 +1,12 @@
 -- Sub-server for chess rapid mode
 -- Receives forwarded clients from lobby, can send back through owner
+--
+-- client_id here is opaque.  A connection routed in from the lobby lives in the
+-- lobby, not here, so its id is a handle rather than a descriptor -- pass it
+-- back to self.send/self.owner_send and do not read anything into the number.
+-- A handle whose connection has closed makes owner_send return false, which is
+-- the answer a script wants: the alternative, which this used to do, was to
+-- write into whoever inherited the descriptor.
 
 function on_client_message(client_id, msg)
     if msg == "status" then

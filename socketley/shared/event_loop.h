@@ -30,7 +30,10 @@ public:
     // has been read.
     //
     // Calling either after init() is a no-op and says so in the log rather than
-    // leaving the caller believing a ring changed shape.
+    // leaving the caller believing a ring changed shape.  Which is why a
+    // process that will be told what shape its ring should be has to hold init()
+    // until it has been told: see proxy_worker, which builds its ring on the
+    // config frame.
     //
     // SQPOLL costs a kernel thread per ring for as long as the ring exists, and
     // that thread spins on the submission queue whether or not anything is
@@ -393,6 +396,14 @@ public:
     bool sqpoll_enabled() const { return m_sqpoll_enabled; }
     bool sqpoll_requested() const { return m_sqpoll_requested; }
     bool direct_accept_supported() const { return m_direct_accept_supported; }
+
+    // Whether a ring exists right now.  False before init() and again after
+    // shutdown_ring().  A caller that defers init() until it knows what shape
+    // the ring should be — a worker waiting for its config frame — needs to be
+    // able to ask, because until this is true poll_completions() returns
+    // immediately however long a timeout it was given, and a drain loop written
+    // against it would spin a core on nothing.
+    bool ring_open() const { return m_ring_open; }
 
     // The CPU set this loop was configured with, and the one CPU the SQPOLL
     // kernel thread was pinned to (-1 when there is none, either because the

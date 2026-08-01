@@ -77,7 +77,35 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
     // A new connection is a new identity even when it inherits the struct and
     // the descriptor number of the one before it.
     conn->generation = next_io_generation();
+
+    // The name another runtime is allowed to hold.  Minted here rather than at
+    // the first route, so that a connection has one identity for its whole life
+    // and not one that appears when somebody first asks: `routed` can be set
+    // and cleared several times, and a name that came and went with it would
+    // let two spells of routing share a name.
+    conn->ref_serial = m_serials.next();
+    if (fd >= 0)
+        m_conn_by_serial[conn->ref_serial] = fd;
     return conn;
+}
+
+uint64_t server_instance::owner_key() const
+{
+    // get_id() is assigned after construction — daemon.cpp does it when the
+    // runtime is created or restored — so this cannot be a constructor's job.
+    // Recomputed while it is still zero rather than cached unconditionally, so
+    // a runtime that is asked for a ref before it has an id does not cache the
+    // invalid answer for ever.
+    if (m_owner_key == 0)
+        m_owner_key = conn_owner_key(get_id());
+    return m_owner_key;
+}
+
+conn_ref server_instance::ref_for_fd(int fd) const
+{
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd])
+        return {};
+    return conn_ref{owner_key(), m_conn_idx[fd]->ref_serial};
 }
 
 bool server_instance::conn_ops_pending(const server_connection* conn) const
@@ -271,6 +299,16 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     // first turned every one of these calls into a no-op and left closed
     // descriptors in the broadcast list for the rest of the run.
     remove_active_fd(fd);
+
+    // The serial stops resolving here, and this is the moment that matters:
+    // close_tracked() below hands the number back to the kernel, which will
+    // reissue it to the next accept.  Anyone still holding this connection's
+    // name — a sub-server's Lua that kept the id it was given — now gets a
+    // clean refusal from write_to_ref() instead of a write into whoever
+    // inherited the number.
+    if (conn->ref_serial != 0)
+        m_conn_by_serial.erase(conn->ref_serial);
+
     if (fd >= 0 && fd < MAX_FDS)
         m_conn_idx[fd] = nullptr;
     close_tracked(fd);
@@ -1015,7 +1053,7 @@ size_t server_instance::get_connection_count() const
     size_t upstream_connected = 0;
     for (const auto& [_, uc] : m_upstreams)
         if (uc->connected) ++upstream_connected;
-    return m_active_fds.size() + m_forwarded_clients.size() + upstream_connected;
+    return m_active_fds.size() + m_forwarded.size() + upstream_connected;
 }
 
 bool server_instance::setup(event_loop& loop)
@@ -1031,6 +1069,14 @@ bool server_instance::setup(event_loop& loop)
 
     m_loop = &loop;
     m_ring_loop = &loop;
+
+    // Fix this runtime's half of every conn_ref it is about to mint.  The id it
+    // is derived from is assigned at construction and replaced only once, by
+    // the restore path, immediately after — long before a listener exists.
+    // Resolving it here rather than on first use means every name this runtime
+    // hands out over one run carries the same owner, even if something were to
+    // change the id underneath it.
+    owner_key();
 
     // ── requests an earlier run armed and never saw the end of ──────────────
     //
@@ -1618,22 +1664,53 @@ void server_instance::teardown(event_loop& loop)
     m_multishot_active = false;
     m_master_fd = -1;
 
-    // Clean up forwarded client entries on parent servers
-    for (auto& [fwd_fd, parent_name] : m_forwarded_clients)
+    // Tell every origin that what it routed here has nowhere to go.  This used
+    // to reach into the origin's private route table and delete an entry by
+    // descriptor number, which worked only because both runtimes were the same
+    // class in the same process; it is a message now, named by the same
+    // conn_ref the route was made with.
+    for (auto& [handle, fc] : m_forwarded)
     {
+        (void)handle;
         auto* mgr = get_runtime_manager();
         if (mgr)
         {
-            auto* parent = mgr->get(parent_name);
-            if (parent && parent->get_type() == runtime_server)
-            {
-                auto* psrv = static_cast<server_instance*>(parent);
-                psrv->m_routes.erase(fwd_fd);
-            }
+            auto* origin = mgr->get(fc.origin);
+            if (origin && origin->get_type() == runtime_server)
+                static_cast<server_instance*>(origin)->drop_route(fc.ref);
         }
     }
-    m_forwarded_clients.clear();
+    m_forwarded.clear();
+    m_forwarded_by_ref.clear();
+
+    // And the other direction: every connection this runtime had routed away is
+    // being closed by the stop, so the runtime holding its name has to be told.
+    //
+    // Nothing told it before.  A stop does not go through close_conn — it walks
+    // m_clients and clears the index directly — so unroute_client never ran for
+    // any of these, and the target kept an entry per routed connection naming a
+    // runtime that had gone.  Harmless in that owner_send answered false on
+    // them, and unbounded: a parent restarted a hundred times left a hundred
+    // connections' worth of them behind, and its own connection count reported
+    // them as live.
+    {
+        auto* mgr = get_runtime_manager();
+        for (const auto& [serial, target_name] : m_routes)
+        {
+            if (!mgr) break;
+            auto* target = mgr->get(target_name);
+            if (target && target->get_type() == runtime_server)
+                static_cast<server_instance*>(target)->release_routed(
+                    conn_ref{owner_key(), serial});
+        }
+    }
+
+    // Our own side: whatever we had routed away, and the serial index that
+    // resolves a name to a descriptor.  Both describe connections that are
+    // being closed as this runtime stops, so a name minted before the stop must
+    // not resolve after it.
     m_routes.clear();
+    m_conn_by_serial.clear();
     m_groups.clear();
 
     // Zeroize password memory
@@ -3002,7 +3079,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     // Check if this client is routed to a sub-server (cached flag avoids map lookup)
     if (sender && SOCKETLEY_UNLIKELY(sender->routed))
     {
-        auto rit = m_routes.find(sender->fd);
+        auto rit = m_routes.find(sender->ref_serial);
         if (rit != m_routes.end())
         {
             auto* mgr = get_runtime_manager();
@@ -3012,8 +3089,12 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 if (target && target->get_type() == runtime_server &&
                     target->get_state() == runtime_running)
                 {
+                    // The name, not the descriptor.  In one process this is the
+                    // same call it always was; the argument is what changed,
+                    // and it is the argument that decides whether the same call
+                    // still means anything once the target is elsewhere.
                     auto* sub = static_cast<server_instance*>(target);
-                    sub->process_forwarded_message(sender->fd, msg, get_name());
+                    sub->deliver_routed(conn_ref{owner_key(), sender->ref_serial}, msg);
                 }
             }
             return;
@@ -3228,17 +3309,21 @@ void server_instance::lua_broadcast(std::string_view msg)
     auto full_msg = std::make_shared<const std::string>(std::move(buf));
     broadcast(full_msg, -1);  // -1 = don't exclude anyone
 
-    // Also send to forwarded clients through their parent servers
-    for (auto& [fwd_fd, parent_name] : m_forwarded_clients)
+    // Also reach the connections routed here, each through the runtime that
+    // owns it.  A ref that no longer resolves is dropped there rather than
+    // written somewhere — which is the difference between a broadcast that
+    // misses a departed client and one that reaches a stranger.
+    for (auto& [handle, fc] : m_forwarded)
     {
+        (void)handle;
         auto* mgr = get_runtime_manager();
         if (mgr)
         {
-            auto* parent = mgr->get(parent_name);
-            if (parent && parent->get_type() == runtime_server &&
-                parent->get_state() == runtime_running)
+            auto* origin = mgr->get(fc.origin);
+            if (origin && origin->get_type() == runtime_server &&
+                origin->get_state() == runtime_running)
             {
-                static_cast<server_instance*>(parent)->send_to_client(fwd_fd, msg);
+                static_cast<server_instance*>(origin)->write_to_ref(fc.ref, msg);
             }
         }
     }
@@ -4052,38 +4137,17 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
     if (!m_loop || m_udp)
         return;
 
-    // Check direct connection first
-    if (client_id >= 0 && client_id < MAX_FDS && m_conn_idx[client_id])
-    {
-        auto* conn = m_conn_idx[client_id];
-        if (conn->closing)
-            return;
-
-        std::string buf;
-        buf.reserve(msg.size() + 1);
-        buf.append(msg);
-        if (buf.empty() || buf.back() != '\n')
-            buf.push_back('\n');
-        auto full_msg = std::make_shared<const std::string>(std::move(buf));
-        send_to(conn, full_msg);
-        return;
-    }
-
-    // Check forwarded clients (send through parent server)
-    auto fit = m_forwarded_clients.find(client_id);
-    if (fit != m_forwarded_clients.end())
-    {
-        auto* mgr = get_runtime_manager();
-        if (mgr)
-        {
-            auto* parent = mgr->get(fit->second);
-            if (parent && parent->get_type() == runtime_server &&
-                parent->get_state() == runtime_running)
-            {
-                static_cast<server_instance*>(parent)->send_to_client(client_id, msg);
-            }
-        }
-    }
+    // This used to try its own connection table first and fall back to the
+    // forwarded one, which is only unambiguous while the two ranges cannot
+    // overlap — and they overlap by construction the moment the two runtimes
+    // are separate processes, because both number their descriptors from zero.
+    // A forwarded id that happened to equal one of this runtime's own
+    // descriptors delivered to the wrong client, silently.
+    //
+    // The two ranges cannot meet now, so there is no order to get right:
+    // send_to_client() reads which kind of id this is and asks the right
+    // runtime.
+    send_to_client(client_id, msg);
 }
 
 std::string server_instance::get_stats() const
@@ -4124,74 +4188,115 @@ std::string server_instance::get_stats() const
 
 // ─── Client Routing ───
 
-bool server_instance::route_client(int client_fd, std::string_view target_name)
+// ── The Lua-facing half ─────────────────────────────────────────────────────
+
+bool server_instance::route_client(int client_id, std::string_view target_name)
 {
+    // A connection that was routed *here* is not ours to route on.  It used to
+    // be indistinguishable from one of our own — both were "an int" — so this
+    // was reachable and did something incoherent: it wrote a route for a
+    // descriptor number belonging to a third runtime.
+    if (is_conn_handle(client_id))
+        return false;
+
+    const conn_ref ref = ref_for_fd(client_id);
+    if (!ref.valid())
+        return false;
+
     auto* mgr = get_runtime_manager();
     if (!mgr) return false;
 
     auto* target = mgr->get(target_name);
     if (!target || target->get_type() != runtime_server) return false;
 
+    // Our own bookkeeping first, the notification second.  accept_routed runs
+    // the target's on_connect, and a script is allowed to answer that by
+    // closing the connection — which frees the struct m_conn_idx[client_id]
+    // points at.  Touching that pointer afterwards would be a read of a pooled
+    // connection at best.
     auto* sub = static_cast<server_instance*>(target);
-    m_routes[client_fd] = std::string(target_name);
+    m_routes[ref.serial] = std::string(target_name);
+    m_conn_idx[client_id]->routed = true;
 
-    // Update cached route flag on connection
-    if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd])
-        m_conn_idx[client_fd]->routed = true;
+    if (sub->accept_routed(ref, get_name()) >= 0)
+        return true;
 
-    sub->m_forwarded_clients[client_fd] = std::string(get_name());
-    sub->invoke_on_connect(client_fd);
-    return true;
+    // Refused.  Undo, and find the connection by name rather than by the
+    // descriptor we were given: nothing ran in between here, but the rule that
+    // a descriptor is not an identity does not get suspended for rollback.
+    m_routes.erase(ref.serial);
+    if (auto it = m_conn_by_serial.find(ref.serial); it != m_conn_by_serial.end())
+    {
+        const int fd = it->second;
+        if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd] &&
+            m_conn_idx[fd]->ref_serial == ref.serial)
+            m_conn_idx[fd]->routed = false;
+    }
+    return false;
 }
 
-bool server_instance::unroute_client(int client_fd)
+bool server_instance::unroute_client(int client_id)
 {
-    auto it = m_routes.find(client_fd);
+    if (is_conn_handle(client_id))
+        return false;
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return false;
+
+    const uint64_t serial = m_conn_idx[client_id]->ref_serial;
+    auto it = m_routes.find(serial);
     if (it == m_routes.end()) return false;
 
-    // Clear cached route flag on connection
-    if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd])
-        m_conn_idx[client_fd]->routed = false;
+    // Everything read out of the map and the map left consistent before
+    // anything else is called.  release_routed runs the target's on_disconnect,
+    // a script may answer that by unrouting again, and a second pass through
+    // here holding `it` would be using an erased iterator.
+    const std::string target_name = it->second;
+    m_routes.erase(it);
+    m_conn_idx[client_id]->routed = false;
 
     auto* mgr = get_runtime_manager();
     if (mgr)
     {
-        auto* target = mgr->get(it->second);
+        auto* target = mgr->get(target_name);
         if (target && target->get_type() == runtime_server)
-        {
-            auto* sub = static_cast<server_instance*>(target);
-            sub->invoke_on_disconnect(client_fd);
-            sub->m_forwarded_clients.erase(client_fd);
-        }
+            static_cast<server_instance*>(target)->release_routed(
+                conn_ref{owner_key(), serial});
     }
-    m_routes.erase(it);
     return true;
 }
 
-std::string_view server_instance::get_client_route(int client_fd) const
+std::string_view server_instance::get_client_route(int client_id) const
 {
-    auto it = m_routes.find(client_fd);
+    if (is_conn_handle(client_id) || client_id < 0 || client_id >= MAX_FDS ||
+        !m_conn_idx[client_id])
+        return {};
+
+    auto it = m_routes.find(m_conn_idx[client_id]->ref_serial);
     if (it == m_routes.end()) return {};
     return it->second;
 }
 
-void server_instance::process_forwarded_message(int client_fd, std::string_view msg,
-                                                  std::string_view /*parent_name*/)
+void server_instance::send_to_client(int client_id, std::string_view msg)
 {
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
-    invoke_on_client_message(client_fd, msg);
-    invoke_on_message(msg);
-}
+    // A handle names a connection that lives somewhere else, so the write is
+    // asked of whoever owns it rather than performed here.
+    if (SOCKETLEY_UNLIKELY(is_conn_handle(client_id)))
+    {
+        auto it = m_forwarded.find(client_id);
+        if (it == m_forwarded.end()) return;
 
-void server_instance::remove_forwarded_client(int client_fd)
-{
-    m_forwarded_clients.erase(client_fd);
-}
+        auto* mgr = get_runtime_manager();
+        if (!mgr) return;
+        auto* origin = mgr->get(it->second.origin);
+        if (!origin || origin->get_type() != runtime_server ||
+            origin->get_state() != runtime_running) return;
 
-void server_instance::send_to_client(int client_fd, std::string_view msg)
-{
-    if (SOCKETLEY_UNLIKELY(client_fd < 0 || client_fd >= MAX_FDS || !m_conn_idx[client_fd])) return;
-    auto* conn = m_conn_idx[client_fd];
+        static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
+        return;
+    }
+
+    if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return;
+    auto* conn = m_conn_idx[client_id];
     if (SOCKETLEY_UNLIKELY(conn->closing)) return;
 
     std::string buf;
@@ -4202,20 +4307,152 @@ void server_instance::send_to_client(int client_fd, std::string_view msg)
     send_to(conn, shared);
 }
 
-bool server_instance::owner_send(int client_fd, std::string_view msg)
+bool server_instance::owner_send(int client_id, std::string_view msg)
 {
-    auto owner_name = get_owner();
-    if (owner_name.empty()) return false;
+    // Resolved through what was actually routed here, not through get_owner()
+    // and a number.  The old form took any integer, looked up the configured
+    // owner, and wrote into that runtime's connection table at that index — so
+    // a sub-server could write to any of the owner's clients, including the one
+    // that had inherited the descriptor number of the client this id used to
+    // name.  A handle that names nothing here now answers false.
+    auto it = m_forwarded.find(client_id);
+    if (it == m_forwarded.end())
+        return false;
 
     auto* mgr = get_runtime_manager();
     if (!mgr) return false;
 
-    auto* parent = mgr->get(owner_name);
-    if (!parent || parent->get_type() != runtime_server ||
-        parent->get_state() != runtime_running) return false;
+    auto* origin = mgr->get(it->second.origin);
+    if (!origin || origin->get_type() != runtime_server ||
+        origin->get_state() != runtime_running) return false;
 
-    static_cast<server_instance*>(parent)->send_to_client(client_fd, msg);
+    return static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
+}
+
+// ── The cross-runtime half ──────────────────────────────────────────────────
+
+int server_instance::accept_routed(const conn_ref& ref, std::string_view origin_name)
+{
+    if (!ref.valid())
+        return -1;
+
+    // Idempotent.  A route asked for twice is one route, and answering with the
+    // handle already in use means a caller that lost the first answer can ask
+    // again — which is what a retry over a socket looks like.
+    if (auto it = m_forwarded_by_ref.find(ref); it != m_forwarded_by_ref.end())
+        return it->second;
+
+    const int handle = alloc_handle();
+    if (handle < 0)
+        return -1;
+
+    m_forwarded.emplace(handle, forwarded_client{ref, std::string(origin_name)});
+    m_forwarded_by_ref.emplace(ref, handle);
+
+    // The script hears about a client, and the integer it is handed is one it
+    // can hand back — to owner_send, to send_to, to anything taking a client
+    // id.  What it cannot do is collide with one of this runtime's own
+    // descriptors, which is what used to make the two indistinguishable.
+    invoke_on_connect(handle);
+    return handle;
+}
+
+void server_instance::release_routed(const conn_ref& ref)
+{
+    auto it = m_forwarded_by_ref.find(ref);
+    if (it == m_forwarded_by_ref.end())
+        return;
+
+    const int handle = it->second;
+
+    // The name goes first, so a second release for the same connection — which
+    // is what an origin retrying, or a script unrouting from inside its own
+    // on_disconnect, looks like — finds nothing and does not fire the callback
+    // twice.  The handle stays resolvable across the callback, so a script that
+    // answers a disconnect by writing gets a clean false out of write_to_ref
+    // rather than a lookup into an empty table.
+    m_forwarded_by_ref.erase(it);
+    invoke_on_disconnect(handle);
+    m_forwarded.erase(handle);
+}
+
+void server_instance::deliver_routed(const conn_ref& ref, std::string_view msg)
+{
+    auto it = m_forwarded_by_ref.find(ref);
+    if (it == m_forwarded_by_ref.end())
+        return;
+
+    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    invoke_on_client_message(it->second, msg);
+    invoke_on_message(msg);
+}
+
+bool server_instance::write_to_ref(const conn_ref& ref, std::string_view msg)
+{
+    // Someone else's name for one of our connections.  Three things have to
+    // hold and the descriptor version checked none of them: that the name is
+    // ours to resolve at all, that it still resolves, and that what it resolves
+    // to is the same connection it named when it was minted.
+    if (!ref.valid() || ref.owner != owner_key())
+        return false;
+
+    auto it = m_conn_by_serial.find(ref.serial);
+    if (it == m_conn_by_serial.end())
+        return false;
+
+    const int fd = it->second;
+    if (fd < 0 || fd >= MAX_FDS)
+        return false;
+
+    auto* conn = m_conn_idx[fd];
+    if (!conn || conn->ref_serial != ref.serial || conn->closing)
+        return false;
+
+    std::string buf;
+    buf.reserve(msg.size() + 1);
+    buf.append(msg);
+    if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
+    auto shared = std::make_shared<const std::string>(std::move(buf));
+    send_to(conn, shared);
     return true;
+}
+
+void server_instance::drop_route(const conn_ref& ref)
+{
+    if (ref.owner != owner_key())
+        return;
+
+    if (m_routes.erase(ref.serial) == 0)
+        return;
+
+    // And the cached flag on the connection itself, which the previous version
+    // of this cleanup left set: the read path then took the routed branch on
+    // every message, found nothing, and fell through — a lookup per message for
+    // the rest of the connection's life, for a route that no longer existed.
+    auto it = m_conn_by_serial.find(ref.serial);
+    if (it == m_conn_by_serial.end())
+        return;
+    const int fd = it->second;
+    if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd] &&
+        m_conn_idx[fd]->ref_serial == ref.serial)
+        m_conn_idx[fd]->routed = false;
+}
+
+int server_instance::alloc_handle()
+{
+    // Handles are 32-bit and start high, so the counter has about two billion
+    // routes in it before it runs out.  A daemon that reaches that is still
+    // owed a correct answer rather than a negative handle that would read as
+    // "not a handle" everywhere it is tested.
+    for (int tries = 0; tries < 1024; ++tries)
+    {
+        if (m_next_handle < conn_handle_base)
+            m_next_handle = conn_handle_base;
+        const int h = m_next_handle++;
+        if (m_forwarded.find(h) == m_forwarded.end())
+            return h;
+    }
+    return -1;
 }
 
 bool server_instance::owner_broadcast(std::string_view msg)

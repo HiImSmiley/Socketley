@@ -1853,7 +1853,15 @@ Called when message received with sender identification (server only).
 Fires alongside on_message for backward compatibility.
 .TP
 .B on_connect(client_id)
-Called when a client connects (server/client). The client_id is the file descriptor.
+Called when a client connects (server/client). Also called on a sub\-server when
+a connection is routed to it. The client_id is opaque: for this runtime's own
+clients it is the file descriptor, and for a connection routed here from another
+runtime it is a handle above 16777216 that names the connection wherever it
+lives. Pass it back to
+.BR self.send() ,
+.BR self.owner_send() ,
+or anything else taking a client_id; do not compare it against a descriptor or
+assume anything about its value.
 .TP
 .B on_disconnect(client_id)
 Called when a client disconnects (server/client).
@@ -2319,9 +2327,24 @@ self.unroute(client_id)            -- Stop forwarding
 self.get_route(client_id)          -- Get current route (string or nil)
 
 -- Server: owner-targeted sending (sub-server only)
-self.owner_send(client_id, msg)    -- Send to owner's client by fd
+self.owner_send(client_id, msg)    -- Send to a connection routed here, through
+                                   -- the runtime that owns it. Returns false if
+                                   -- that connection has gone.
 self.owner_broadcast(msg)          -- Broadcast to all owner's clients
 .fi
+.PP
+.B self.owner_send()
+takes only a client_id this runtime was actually given \(em one that arrived
+through
+.BR self.route() ,
+reported by
+.BR on_connect() .
+It answers
+.B false
+for anything else, including a client_id whose connection has since closed. It
+used to take any number and write it into the owner's connection table as a
+descriptor index, so a script holding an id past its connection's life wrote
+into whichever client had inherited that descriptor.
 .SS Global Functions
 .TP
 .B socketley.log(msg)
