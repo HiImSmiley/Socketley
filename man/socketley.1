@@ -3342,6 +3342,54 @@ resolution includes both local and remote group members
 On graceful shutdown, the daemon deletes its file
 .RE
 .PP
+.B Restarting a node, and name conflicts:
+.PP
+A name is one node's.  Two daemons publishing one file would give every peer an
+endpoint set belonging to neither, and split traffic for
+.I api1
+between two machines that each believe they are api1 \(em so a daemon that finds
+its name held by a live entry is refused
+.BR --cluster ,
+and told so.
+.PP
+A node that was killed and restarted is not that case.  Every restart policy
+this project documents \(em a container restart, a redeploy, systemd's
+.BR "Restart=on-failure" ,
+a crash loop \(em brings the node back in a second or two, well inside the 10s
+threshold, and it meets its own entry still fresh.  It reclaims it.
+.PP
+The entry says who wrote it: the advertised host, the daemon's control socket
+path, the kernel boot id, and the pid.  A fresh entry may be taken over only
+when the first three are this daemon's own, and that is a proof rather than a
+guess \(em a unix socket path admits one process at a time, and everything else
+that reaches a daemon connects to that path instead of binding it.  So on one
+machine, under one hostname, whoever holds the path
+.I is
+the daemon; an entry carrying our own three was written by a process that is
+gone.  A different machine has a different boot id, and a fresh entry cannot
+predate a reboot.  The pid is published for the operator and never used to
+decide: a restarted container's pid namespace is new.
+.PP
+What this cannot tell apart is two containers on
+.I one
+host given the
+.I same
+hostname and both on the default socket path.  Their entries are identical, and
+so is the address every peer would dial for either of them.
+.PP
+A daemon that could not join keeps serving \(em it is a working server that is
+not in a cluster \(em and says so in three places: the exit status of the
+command, an
+.B ERROR
+line in its log naming the holder, and every
+.B socketley cluster
+subcommand, which reports
+.B "cluster mode is off"
+with the reason instead of the same "not in cluster mode" a daemon that was
+never given
+.B --cluster
+reports.  Clustering is never accepted and silently not applied.
+.PP
 .B Docker Compose example:
 .PP
 A complete, working one is

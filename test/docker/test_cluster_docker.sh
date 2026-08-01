@@ -34,6 +34,13 @@
 # staleness from the proxy's own circuit breaker ejecting a backend that had
 # stopped answering, and the volume view is what makes it a cluster claim.
 #
+# And the restart that a deployment actually performs: killed and brought back
+# INSIDE the staleness window, so the node meets its own entry still fresh under
+# its own name.  Only this shape produces it — the container comes back with a
+# new pid namespace and a new pid, the same hostname, and the same default
+# socket path — and it is the normal recovery path of every restart policy this
+# project documents.  Test 5.
+#
 # Prerequisites: docker, docker compose.  bash for /dev/tcp; no netcat.
 # Usage: bash test/docker/test_cluster_docker.sh
 #        DOCKER="sudo -n docker" bash test/docker/test_cluster_docker.sh
@@ -307,14 +314,92 @@ else
     printf '%s\n' "$CONVERGED_REPLIES" | sed 's/^/          /'
 fi
 
-# ─── Test 5: a graceful shutdown is not the same mechanism ────────────────────
+# ─── Test 5: killed and restarted INSIDE the staleness window ─────────────────
+#
+# Test 4 restarts a node whose entry has long since aged out, which is the easy
+# half and not the one a deployment meets.  A container restart, a systemd
+# `Restart=on-failure`, a redeploy and a crash loop all come back in a second or
+# two — well inside the 10s threshold — and the node then finds its OWN file
+# still fresh in the volume under its own name.
+#
+# That used to be refused with "name may already be in use", and the refusal was
+# quiet in the worst way: the daemon went on serving, in no group, invisible to
+# every peer, with nothing but an exit code to say so.  Under this node.sh's
+# `set -e` the container dies instead, which is why the assertion below is
+# mostly "did it come back at all".
+#
+# Only reachable in this shape: the restarted container gets a NEW pid namespace
+# and a new pid, keeps its hostname, and comes back on the same default socket
+# path.  test/integration/test_cluster.sh cannot produce that arrangement.
+
+echo "  Test 5: a node restarted inside the staleness window rejoins"
+
+READY_BEFORE=$(ready_count api2 api2)
+dc kill -s SIGKILL api2 >/dev/null 2>&1
+dc start api2 >/dev/null 2>&1
+
+RESTARTED=0
+if wait_ready api2 api2 $((READY_BEFORE + 1)) 60; then
+    ok "api2 came back up and reported ready"
+    RESTARTED=1
+else
+    bad "api2 never came back — a node refused its own name takes the container"
+    bad "down under set -e, which is what this assertion is for"
+fi
+
+# Proof that the window was actually reached.  Without it a slow machine turns
+# this test into test 4 again: the entry ages out during the restart, the rejoin
+# succeeds for a reason that has nothing to do with the rule under test, and the
+# run reports a pass it did not earn.
+#
+# Polled, not read once.  The node's "ready" line is echoed by node.sh straight
+# to the container's stdout, while the daemon's log reaches it by way of a file
+# and the `tail -f` following it — so the reclaim line lands a moment AFTER the
+# line this test waited on, and reading immediately catches the log one entry
+# short.  Measured at well under a second; the deadline is generous.
+RECLAIM_DEADLINE=$((SECONDS + 15))
+RECLAIMED=0
+while [ "$SECONDS" -lt "$RECLAIM_DEADLINE" ]; do
+    LOG_API2=$(dc logs --no-log-prefix api2 2>/dev/null)
+    if printf '%s\n' "$LOG_API2" | grep -q 'reclaiming "api2" from this node'; then
+        RECLAIMED=1
+        break
+    fi
+    sleep 0.5
+done
+
+if [ "$RECLAIMED" -eq 1 ]; then
+    ok "the rejoin went through the reclaim path — its own entry was still fresh"
+    printf '%s\n' "$LOG_API2" | grep 'reclaiming "api2"' | sed 's/^/        /'
+else
+    bad "no reclaim in api2's log: either the entry aged out before the restart"
+    bad "got there (this run tested nothing), or the rejoin took another path"
+    printf '%s\n' "$LOG_API2" | tail -12 | sed 's/^/          /'
+fi
+
+if printf '%s\n' "$LOG_API2" | grep -q "name may already be in use\|cluster mode not enabled"; then
+    bad "api2 was refused its own name inside the window"
+else
+    ok "api2 was not refused its own name"
+fi
+
+if [ "$RESTARTED" -eq 1 ]; then
+    if converge "$REJOIN_DEADLINE" has_web2; then
+        ok "api2 was taking traffic again ${CONVERGED_AT}s after the restart"
+    else
+        bad "api2 rejoined the volume but never took traffic again"
+        printf '%s\n' "$CONVERGED_REPLIES" | sed 's/^/          /'
+    fi
+fi
+
+# ─── Test 6: a graceful shutdown is not the same mechanism ────────────────────
 #
 # The man page distinguishes "graceful shutdown → file deleted → immediate"
 # from "container killed → stale heartbeat → ~10 seconds".  Asserting the
 # removal happens well inside the 10s threshold is what tells the two apart:
 # aged out would take longer than this bound allows.
 
-echo "  Test 5: a graceful stop unpublishes rather than going stale"
+echo "  Test 6: a graceful stop unpublishes rather than going stale"
 dc stop -t 10 api2 >/dev/null 2>&1
 STARTED=$SECONDS
 GONE=0
@@ -332,9 +417,9 @@ else
     bad "api2's file was still on the volume 6s after SIGTERM (it aged out instead)"
 fi
 
-# ─── Test 6: nothing crashed ──────────────────────────────────────────────────
+# ─── Test 7: nothing crashed ──────────────────────────────────────────────────
 
-echo "  Test 6: no crashes in container logs"
+echo "  Test 7: no crashes in container logs"
 LOGS=$(dc logs 2>&1)
 CRASH=$(printf '%s\n' "$LOGS" | grep -i "segfault\|sigsegv\|core dumped\|terminate called\|Assertion.*failed")
 if [ -z "$CRASH" ]; then

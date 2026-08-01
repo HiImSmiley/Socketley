@@ -308,14 +308,10 @@ void daemon_handler::teardown()
     }
     m_torn_down = true;
 
-    // Stop cluster discovery before closing IPC
-    if (m_owned_cluster)
-    {
-        m_owned_cluster->stop();
-        m_owned_cluster.reset();
-        m_cluster = nullptr;
-        m_manager.set_cluster_discovery(nullptr);
-    }
+    // Stop cluster discovery before closing IPC.  This is the graceful path the
+    // man page's stale-detection table calls "file deleted, peers drop it at
+    // once", so it has to reach unpublish().
+    stop_cluster();
 
     // Through the loop, not close(): every one of these numbers has been named
     // by an SQE — a read on each client, an accept on the listener — and a
@@ -756,6 +752,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("attach"):    return cmd_attach(conn, pa);
         case fnv1a("add"):       return cmd_add(conn, pa);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
+        case fnv1a("cluster-status"): return cmd_cluster_status(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
@@ -3017,12 +3014,94 @@ int daemon_handler::cmd_cluster_dir(ipc_connection* conn)
 {
     if (!m_cluster)
     {
-        conn->write_buf = "daemon is not in cluster mode (use: daemon --name <n> --cluster <dir>)\n";
+        conn->write_buf = cluster_off_reason();
         return 1;
     }
 
     conn->write_buf = std::string(m_cluster->get_cluster_dir()) + "\n";
     return 0;
+}
+
+// The local half of `socketley cluster`.  Everything else that command prints
+// it reads off the shared directory, which is exactly the view a node excluded
+// from the cluster does not appear in — so the one fact the directory can never
+// carry is whether THIS daemon is in it, and why not.
+//
+// Always exits 0: "clustering is off" is an answer, not a failure to answer.
+int daemon_handler::cmd_cluster_status(ipc_connection* conn)
+{
+    std::string out;
+
+    if (m_cluster)
+    {
+        out += "cluster:on\n";
+        out += "name:"  + std::string(m_cluster->get_daemon_name())  + "\n";
+        out += "dir:"   + std::string(m_cluster->get_cluster_dir())  + "\n";
+        out += "host:"  + std::string(m_cluster->get_cluster_addr()) + "\n";
+        conn->write_buf = std::move(out);
+        return 0;
+    }
+
+    out += "cluster:off\n";
+    out += "name:" + (m_daemon_name.empty() ? std::string("-") : m_daemon_name) + "\n";
+    out += "dir:"  + (m_cluster_want_dir.empty() ? std::string("-") : m_cluster_want_dir) + "\n";
+    if (!m_cluster_error.empty())
+        out += "error:" + m_cluster_error + "\n";
+
+    conn->write_buf = std::move(out);
+    return 0;
+}
+
+void daemon_handler::stop_cluster()
+{
+    if (!m_owned_cluster)
+        return;
+
+    m_owned_cluster->stop();
+    m_owned_cluster.reset();
+    m_cluster = nullptr;
+    m_manager.set_cluster_discovery(nullptr);
+}
+
+bool daemon_handler::start_cluster(const std::string& name, const std::string& dir)
+{
+    stop_cluster();
+
+    m_cluster_want_dir = dir;
+
+    auto cd = std::make_unique<cluster_discovery>(name, dir, socket_path, m_manager);
+    cd->set_event_callback([this](const std::vector<cluster_event>& events) {
+        m_manager.dispatch_cluster_events(events);
+    });
+
+    if (!cd->start(m_loop))
+    {
+        m_cluster_error = cd->last_error();
+        return false;
+    }
+
+    m_owned_cluster = std::move(cd);
+    m_cluster = m_owned_cluster.get();
+    m_manager.set_cluster_discovery(m_cluster);
+    m_cluster_error.clear();
+    return true;
+}
+
+// The sentence an operator gets from every surface that can be asked about
+// clustering after the fact.  A daemon that was never given --cluster and a
+// daemon that was given it and could not honour it are two different states,
+// and reporting them with one message is how "accepted and not applied" hides.
+std::string daemon_handler::cluster_off_reason() const
+{
+    if (m_cluster_error.empty())
+        return "daemon is not in cluster mode (use: daemon --name <n> --cluster <dir>)\n";
+
+    return "cluster mode is off: " + m_cluster_error + "\n"
+           "  this daemon is serving normally, but it publishes nothing into "
+         + m_cluster_want_dir + " and no peer can see it.\n"
+           "  give it a name no live daemon holds, or wait for the holder's "
+           "heartbeat to age out, then: daemon --name <n> --cluster "
+         + m_cluster_want_dir + "\n";
 }
 
 int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
@@ -3055,38 +3134,45 @@ int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // If cluster is active, restart it with the new name
+    // If cluster is active, restart it with the new name.
+    //
+    // A rename that the cluster cannot honour is refused whole: the daemon goes
+    // back to the name it had and republishes under it.  It used to keep the
+    // new name, with clustering off and its old entry already deleted, so a
+    // rejected rename cost the node its membership under a name that was never
+    // in dispute.
     if (m_owned_cluster)
     {
-        std::string cluster_dir(m_owned_cluster->get_cluster_dir());
-
-        m_owned_cluster->stop();
-        m_owned_cluster.reset();
-        m_cluster = nullptr;
-        m_manager.set_cluster_discovery(nullptr);
+        const std::string cluster_dir(m_owned_cluster->get_cluster_dir());
+        const std::string old_name = m_daemon_name;
 
         m_daemon_name = new_name;
+        if (start_cluster(new_name, cluster_dir))
+            return 0;
 
-        m_owned_cluster = std::make_unique<cluster_discovery>(
-            m_daemon_name, cluster_dir, m_manager);
+        const std::string why = m_cluster_error;
+        m_daemon_name = old_name;
 
-        m_owned_cluster->set_event_callback([this](const std::vector<cluster_event>& events) {
-            m_manager.dispatch_cluster_events(events);
-        });
-
-        if (!m_owned_cluster->start(m_loop))
+        if (start_cluster(old_name, cluster_dir))
         {
-            conn->write_buf = "name updated but failed to restart cluster (name may already be in use)\n";
-            m_owned_cluster.reset();
-            return 1;
+            conn->write_buf = "rename refused: " + why + "\n"
+                "  the daemon is still \"" + old_name + "\" and still in the cluster.\n";
         }
-
-        m_cluster = m_owned_cluster.get();
-        m_manager.set_cluster_discovery(m_cluster);
-        return 0;
+        else
+        {
+            conn->write_buf = "rename refused: " + why + "\n"
+                "  and \"" + old_name + "\" could not be reclaimed either: "
+                + m_cluster_error + "\n"
+                "  cluster mode is now off; no peer can see this daemon.\n";
+        }
+        return 1;
     }
 
+    // Not clustered, so nothing to republish.  Any standing refusal named the
+    // old name and stops describing this daemon here; `cluster ls` goes back to
+    // the plain "not in cluster mode" until --cluster is issued afresh.
     m_daemon_name = new_name;
+    m_cluster_error.clear();
     return 0;
 }
 
@@ -3111,32 +3197,19 @@ int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& 
 
     std::string cluster_dir(pa.args[1]);
 
-    // Stop existing cluster discovery if any
-    if (m_owned_cluster)
+    // A flag that cannot be honoured is refused with the reason named, the same
+    // way --sqpoll and --tls are, and it is refused loudly enough to survive the
+    // exit code: the log says it, and every `socketley cluster` subcommand says
+    // it afterwards.  What is never on offer is accepting --cluster and running
+    // without it.
+    if (!start_cluster(m_daemon_name, cluster_dir))
     {
-        m_owned_cluster->stop();
-        m_owned_cluster.reset();
-        m_cluster = nullptr;
-        m_manager.set_cluster_discovery(nullptr);
-    }
-
-    // Create new cluster discovery
-    m_owned_cluster = std::make_unique<cluster_discovery>(
-        m_daemon_name, cluster_dir, m_manager);
-
-    m_owned_cluster->set_event_callback([this](const std::vector<cluster_event>& events) {
-        m_manager.dispatch_cluster_events(events);
-    });
-
-    if (!m_owned_cluster->start(m_loop))
-    {
-        conn->write_buf = "failed to start cluster discovery (name may already be in use)\n";
-        m_owned_cluster.reset();
+        conn->write_buf = "cluster mode not enabled: " + m_cluster_error + "\n"
+            "  this daemon keeps serving, but it publishes nothing into "
+            + cluster_dir + " and no peer can see it.\n";
         return 1;
     }
 
-    m_cluster = m_owned_cluster.get();
-    m_manager.set_cluster_discovery(m_cluster);
     return 0;
 }
 

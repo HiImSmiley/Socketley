@@ -145,15 +145,34 @@ const char* state_str(runtime_state s)
     }
 }
 
+// The kernel's boot id: one value per boot of the machine, the same in every
+// container on it.  Empty when /proc is not there, which makes every claim
+// foreign and every conflict a refusal — the safe direction.
+std::string read_boot_id()
+{
+    std::ifstream f("/proc/sys/kernel/random/boot_id");
+    if (!f.is_open())
+        return {};
+
+    std::string id;
+    std::getline(f, id);
+    while (!id.empty() && (id.back() == '\n' || id.back() == '\r' || id.back() == ' '))
+        id.pop_back();
+    return id;
+}
+
 } // namespace cd_detail
 
 // ─── cluster_discovery implementation ───
 
 cluster_discovery::cluster_discovery(std::string_view daemon_name,
                                      std::string_view cluster_dir,
+                                     std::string_view socket_path,
                                      runtime_manager& manager)
     : m_daemon_name(daemon_name)
     , m_cluster_dir(cluster_dir)
+    , m_socket_path(socket_path)
+    , m_boot_id(cd_detail::read_boot_id())
     , m_manager(manager)
 {
     char buf[256];
@@ -168,37 +187,118 @@ cluster_discovery::~cluster_discovery()
     stop();
 }
 
-bool cluster_discovery::start(event_loop& loop)
+bool cluster_discovery::read_claim_file(const std::string& path,
+                                        node_claim& out, int64_t& heartbeat) const
 {
     using namespace cd_detail;
+
+    std::ifstream f(path);
+    if (!f.is_open())
+        return false;
+
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    const std::string content = ss.str();
+
+    heartbeat = json_get_number(content, "heartbeat");
+    out.host  = json_get_string(content, "host");
+    out.sock  = json_get_string(content, "sock");
+    out.boot  = json_get_string(content, "boot");
+    out.pid   = json_get_number(content, "pid");
+    return true;
+}
+
+// ─── "me, again" versus "somebody else" ─────────────────────────────────────
+//
+// The hazard a duplicate name creates is two LIVE daemons publishing one file:
+// their peers then see an endpoint set that belongs to neither, and traffic for
+// `api1` splits between two machines that both believe they are api1.  So the
+// question a restarting node has to answer is not "is this file mine" in some
+// sentimental sense — it is "can the daemon that wrote it still be running".
+//
+// Three fields answer that, and they only have to answer it for a file whose
+// heartbeat is FRESH; anything older than the staleness threshold is dropped by
+// every peer anyway and is not a claim on anything.
+//
+//   boot   The machine's current boot id.  A fresh file with a different one
+//          was written seconds ago by a kernel that is not this one, so it is
+//          another machine — a reboot cannot have happened inside the window.
+//
+//   host   The address the writer advertised, which is what peers dial.  In the
+//          documented deployment this is the container's hostname and it
+//          survives a restart, a redeploy and a crash loop.
+//
+//   sock   The writer's control socket path.  This is the load-bearing one: a
+//          unix socket path can be bound by exactly one process at a time, and
+//          every other way into this daemon connects to that path rather than
+//          binding it.  So on one machine, under one hostname, whoever holds
+//          that path IS the daemon — and we hold it, or we would not be here.
+//          A fresh file carrying our triple was therefore written by a process
+//          that no longer exists.
+//
+// pid is published for the operator and for the message below, never for the
+// decision: a restarted container's pid namespace is new, so the old pid is
+// both meaningless and likely to have been handed to us.
+//
+// What this cannot tell apart: two containers on ONE host that were both given
+// the SAME hostname and both run on the default socket path.  Their triples are
+// identical and no file on the volume can separate them.  It is also the case
+// where the distinction has no meaning to a peer, since both advertise the same
+// address — the two would be interchangeable to every proxy in the cluster.
+bool cluster_discovery::claim_is_ours(const node_claim& c) const
+{
+    if (c.host.empty() || c.sock.empty() || c.boot.empty())
+        return false;   // written before claims existed, or by something else
+
+    return c.host == m_cluster_addr
+        && c.sock == m_socket_path
+        && c.boot == m_boot_id;
+}
+
+bool cluster_discovery::start(event_loop& loop)
+{
+    m_last_error.clear();
     m_loop = &loop;
 
     // Ensure cluster directory exists
     std::error_code ec;
     fs::create_directories(m_cluster_dir, ec);
 
-    // Check for duplicate daemon name: if a file with our name already exists
-    // and has a fresh heartbeat, another daemon is using this name.
-    std::string our_path = m_cluster_dir + "/" + m_daemon_name + ".json";
-    {
-        std::ifstream f(our_path);
-        if (f.is_open())
-        {
-            std::ostringstream ss;
-            ss << f.rdbuf();
-            std::string content = ss.str();
+    // A file under our name with a fresh heartbeat is either this node's own
+    // previous incarnation — a restart inside the staleness window, which is
+    // what every container restart, redeploy and crash loop looks like — or a
+    // second daemon claiming a name that is taken.  The first must rejoin; the
+    // second must be refused, and refused without touching the file, because
+    // the holder is live and deleting it would blind its peers.
+    const std::string our_path = m_cluster_dir + "/" + m_daemon_name + ".json";
+    node_claim held;
+    int64_t hb = 0;
 
-            int64_t hb = json_get_number(content, "heartbeat");
-            if (hb > 0)
+    if (read_claim_file(our_path, held, hb) && hb > 0)
+    {
+        const time_t age = std::time(nullptr) - static_cast<time_t>(hb);
+        if (age <= STALE_THRESHOLD_SEC)
+        {
+            if (!claim_is_ours(held))
             {
-                time_t now = std::time(nullptr);
-                if ((now - static_cast<time_t>(hb)) <= STALE_THRESHOLD_SEC)
-                {
-                    LOG_ERROR("cluster: daemon name already in use");
-                    m_loop = nullptr;
-                    return false;
-                }
+                m_last_error = "daemon name \"" + m_daemon_name + "\" is held in "
+                    + m_cluster_dir + " by host=" + (held.host.empty() ? "?" : held.host)
+                    + " sock=" + (held.sock.empty() ? "?" : held.sock)
+                    + " pid=" + std::to_string(held.pid)
+                    + ", last heartbeat " + std::to_string(static_cast<long long>(age))
+                    + "s ago; that daemon is another one, not this one restarting";
+                LOG_ERROR(("cluster: " + m_last_error).c_str());
+                LOG_ERROR("cluster: cluster mode is OFF for this daemon — it publishes "
+                          "nothing, joins no group and is invisible to every peer");
+                m_loop = nullptr;
+                return false;
             }
+
+            LOG_WARN(("cluster: reclaiming \"" + m_daemon_name +
+                      "\" from this node's previous incarnation (pid " +
+                      std::to_string(held.pid) + ", heartbeat " +
+                      std::to_string(static_cast<long long>(age)) +
+                      "s ago) — same host, same control socket, same boot").c_str());
         }
     }
 
@@ -249,7 +349,21 @@ std::string cluster_discovery::build_publish_json() const
     json += json_escape(m_daemon_name);
     json += "\",\"host\":\"";
     json += json_escape(m_cluster_addr);
-    json += "\",\"heartbeat\":";
+
+    // The claim.  A reader of this directory needs none of it; the daemon that
+    // finds this file under its own name on the next boot needs all of it.
+    json += "\",\"sock\":\"";
+    json += json_escape(m_socket_path);
+    json += "\",\"boot\":\"";
+    json += json_escape(m_boot_id);
+    json += "\",\"pid\":";
+
+    char pid_buf[16];
+    auto [pidend, pidec] = std::to_chars(pid_buf, pid_buf + sizeof(pid_buf),
+                                         static_cast<int64_t>(getpid()));
+    json.append(pid_buf, static_cast<size_t>(pidend - pid_buf));
+
+    json += ",\"heartbeat\":";
 
     char ts_buf[24];
     auto now = static_cast<int64_t>(std::time(nullptr));
@@ -316,7 +430,12 @@ void cluster_discovery::publish()
     }
 
     if (std::rename(tmp_path.c_str(), path.c_str()) != 0)
+    {
         LOG_WARN("cluster: could not rename state file");
+        return;
+    }
+
+    m_published = true;
 }
 
 void cluster_discovery::scan()
@@ -491,10 +610,36 @@ void cluster_discovery::scan()
         m_event_callback(events);
 }
 
+// Delete this daemon's file — and only this daemon's file.
+//
+// Two ways in, and both used to be wrong.  A refused start() left the caller
+// holding an object it then reset, and ~cluster_discovery() came here and
+// unlinked the entry of the live peer the refusal had just declined to
+// overwrite.  The peer republished two seconds later, so the damage looked like
+// a blip; the real cost was that the very next attempt found no file and was
+// allowed in, which is how a guard against two daemons sharing a name let two
+// daemons share a name on the second try.
+//
+// So: nothing to remove unless we wrote something, and nothing to remove if the
+// name has meanwhile been taken by someone whose claim is not ours.
 void cluster_discovery::unpublish()
 {
-    std::string path = m_cluster_dir + "/" + m_daemon_name + ".json";
+    if (!m_published)
+        return;
+
+    const std::string path = m_cluster_dir + "/" + m_daemon_name + ".json";
+
+    node_claim held;
+    int64_t hb = 0;
+    if (read_claim_file(path, held, hb) && !claim_is_ours(held))
+    {
+        LOG_WARN("cluster: leaving the state file alone on shutdown — it is no "
+                 "longer ours");
+        return;
+    }
+
     unlink(path.c_str());
+    m_published = false;
 }
 
 bool cluster_discovery::parse_daemon_json(const std::string& json, remote_daemon& out) const

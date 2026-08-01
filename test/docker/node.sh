@@ -83,12 +83,19 @@ tail -f -n +1 "$LOG" &
 trap 'kill -TERM "$DPID" 2>/dev/null || true' TERM INT
 
 # Not guarded, on purpose.  The daemon name and the cluster directory are not
-# persisted, so this runs on every boot including a restart — and it can fail:
-# a node that is killed and brought back inside the 10s staleness window finds
-# its own file still fresh in the cluster directory and is refused with
-# "name may already be in use".  The daemon then keeps running with cluster
-# mode off, which is the quiet half of the failure; under `set -e` this node
-# goes down instead, loudly, which is the half worth having.
+# persisted, so this runs on every boot including a restart.
+#
+# A node killed and brought back inside the 10s staleness window finds its own
+# file still fresh in the cluster directory.  It reclaims it: the entry carries
+# the writer's advertised host, control socket path and kernel boot id, and this
+# container comes back with all three the same, which is only true of a daemon
+# that no longer exists — a unix socket path admits one process at a time.  The
+# daemon logs the reclaim at WARN and carries on.
+#
+# What is still refused, and must be, is a genuinely different daemon claiming a
+# name a live one holds: it exits non-zero here and takes the node down under
+# `set -e`, which is the loud half and the one worth having.  It never comes up
+# with cluster mode quietly off.
 socketley daemon --name "$NODE_NAME" --cluster "$CLUSTER_DIR"
 
 # ─── The second boot is not the first ────────────────────────────────────────

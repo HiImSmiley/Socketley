@@ -28,6 +28,21 @@
 # The gateway proxy's @api backend resolves to every runtime in group `api` on
 # every live node, local or remote.
 #
+# ─── ON RESTARTING A NODE ────────────────────────────────────────────────────
+#
+# `docker compose restart api1` brings the node back in about a second, which is
+# well inside the 10s staleness threshold, so it meets its own entry still fresh
+# on the volume under its own name.  It reclaims it: the entry records the
+# writer's advertised host, control socket path and boot id, this container
+# comes back with all three the same, and only a daemon that no longer exists
+# can leave that behind — a unix socket path admits one process at a time.  The
+# reclaim is logged at WARN and the `--cluster` line below succeeds.
+#
+# A genuinely different daemon claiming a name a live one holds is still
+# refused, with the holder named in the log and in every `socketley cluster`
+# subcommand, and it exits non-zero here so `set -e` takes the node down rather
+# than leaving it up and invisible to its peers.
+#
 # ─── ON THE READINESS LOOP ───────────────────────────────────────────────────
 #
 # `socketley daemon --name X --cluster D` is NOT a second daemon.  It is a

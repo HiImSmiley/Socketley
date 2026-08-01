@@ -44,17 +44,38 @@ struct remote_daemon
     std::vector<remote_runtime> runtimes;
 };
 
+// Who wrote a cluster file.
+//
+// The name in the filename says which node the entry is for; this says which
+// *process* put it there, and it is the whole basis of telling "me, restarted"
+// from "somebody else with my name".  See the comment above claim_is_ours().
+struct node_claim
+{
+    std::string host;   // advertised address — gethostname(2)
+    std::string sock;   // the daemon's control socket path
+    std::string boot;   // /proc/sys/kernel/random/boot_id
+    int64_t     pid = 0;
+};
+
 class cluster_discovery : public io_handler
 {
 public:
     cluster_discovery(std::string_view daemon_name,
                       std::string_view cluster_dir,
+                      std::string_view socket_path,
                       runtime_manager& manager);
     ~cluster_discovery() override;
 
     // Start the publish/scan timer cycle.
-    // Returns false if a daemon with the same name is already active in the cluster.
+    //
+    // Returns false when the name is held by a daemon this one cannot prove is
+    // itself, in which case nothing has been written or deleted and
+    // last_error() says who holds it and why the claim was not honoured.
     bool start(event_loop& loop);
+
+    // Why the last start() refused, as one line and no trailing newline.
+    // Empty after a start() that succeeded.
+    const std::string& last_error() const { return m_last_error; }
 
     // Stop and unpublish (graceful shutdown)
     void stop();
@@ -101,11 +122,31 @@ private:
     // Parse a remote daemon's JSON file into remote_daemon struct
     bool parse_daemon_json(const std::string& json, remote_daemon& out) const;
 
+    // Read <dir>/<name>.json's claim and heartbeat.  False when there is no
+    // readable file there; a file with none of the claim fields (written by a
+    // daemon from before they existed) yields an empty claim, which is never
+    // ours.
+    bool read_claim_file(const std::string& path, node_claim& out, int64_t& heartbeat) const;
+
+    // True when this daemon can prove the claim is one of its own earlier
+    // incarnations — see the comment on the definition.
+    bool claim_is_ours(const node_claim& c) const;
+
     std::string m_daemon_name;
     std::string m_cluster_dir;
     std::string m_cluster_addr;   // advertised host for remote daemons
+    std::string m_socket_path;    // this daemon's control socket
+    std::string m_boot_id;        // this machine's current boot
     runtime_manager& m_manager;
     event_loop* m_loop = nullptr;
+
+    // This object wrote the name's file at least once.  unpublish() will not
+    // remove a file it never created: the refusal path resets the object, and
+    // that runs the destructor.
+    bool m_published = false;
+
+    // One line saying why start() refused.
+    std::string m_last_error;
 
     // Timer
     io_request m_timer_req{};

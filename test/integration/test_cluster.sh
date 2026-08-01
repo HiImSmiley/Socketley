@@ -29,6 +29,10 @@ mkdir -p "$CLUSTER_DIR"
 SOCK_NODE1="$TMPD/node1.sock"
 SOCK_NODE2="$TMPD/node2.sock"
 SOCK_GW="$TMPD/gw.sock"
+# Tests 7 and 8 run their own little cluster — see the header above them.
+SOCK_WIT="$TMPD/witness.sock"
+SOCK_RJ="$TMPD/rejoin.sock"
+SOCK_IN="$TMPD/intruder.sock"
 NODE1_PORT=19301
 NODE2_PORT=19302
 GW_PORT=19310
@@ -87,6 +91,9 @@ cleanup() {
     daemon_sweep "$SOCK_NODE1"
     daemon_sweep "$SOCK_NODE2"
     daemon_sweep "$SOCK_GW"
+    daemon_sweep "$SOCK_WIT"
+    daemon_sweep "$SOCK_RJ"
+    daemon_sweep "$SOCK_IN"
     rm -rf "$TMPD"
 }
 trap cleanup EXIT
@@ -257,6 +264,207 @@ fi
 # node1 should still be healthy
 assert_contains "$OUT" "node1"
 assert_not_contains "$(echo "$OUT" | grep node1)" "stale"
+
+# ─── Tests 7 and 8: reclaiming a name, and not being able to steal one ────────
+#
+# The two directions of one rule, and they need a cluster of their own: these
+# tests kill and restart a daemon on purpose, and the daemons above share a
+# state directory, so a restart up there would have one node restoring another
+# node's runtimes onto ports that are already taken.  Three fresh daemons, three
+# HOMEs, one fresh cluster directory, nothing borrowed.
+#
+#   witness   joins and stays.  It is the peer, and the point: a node that
+#             cannot join is not merely unhappy, it is missing from everyone
+#             else's view, and only another daemon can testify to that.
+#   rejoin1   the node that gets killed and comes back inside the window.
+#   intruder  a second, different, live daemon that wants the name rejoin1.
+#
+# What used to happen here, on the same machine, in the same second:
+#
+#   - rejoin1 restarted inside the 10s staleness window found its own file
+#     still fresh and was refused with "name may already be in use".  Its
+#     daemon then went on serving with cluster mode off — no group, no peer
+#     could see it, and nothing but an exit code said so.
+#   - intruder, a genuinely different daemon, was refused once and then let in
+#     on the second attempt, because the refusal path deleted the file it had
+#     just declined to overwrite.  Two live daemons then published one name.
+#
+# The rule that separates them: a fresh file may be taken over only when its
+# claim — advertised host, control socket path, kernel boot id — is this
+# daemon's own.  A unix socket path admits one process at a time, so a fresh
+# file carrying our own triple was written by a process that is gone.
+
+WIT_HOME="$TMPD/hwit"; RJ_HOME="$TMPD/hrj"; IN_HOME="$TMPD/hin"
+mkdir -p "$WIT_HOME" "$RJ_HOME" "$IN_HOME"
+RJ_DIR="$TMPD/cluster2"; mkdir -p "$RJ_DIR"
+RJ_PORT=19303
+
+wit() { HOME="$WIT_HOME" SOCKETLEY_SOCKET="$SOCK_WIT" "$BIN" "$@"; }
+rj()  { HOME="$RJ_HOME"  SOCKETLEY_SOCKET="$SOCK_RJ"  "$BIN" "$@"; }
+intr(){ HOME="$IN_HOME"  SOCKETLEY_SOCKET="$SOCK_IN"  "$BIN" "$@"; }
+
+# spawn_daemon HOME SOCKET LOG -> sets SPAWNED_PID
+#
+# By count of "daemon started", not by presence: the node in test 7 boots twice
+# into the same log, and "has the line appeared" is already true the second
+# time.  That returns instantly, before the socket is bound, and the readiness
+# wait becomes a race the test loses at its own startup.
+spawn_daemon() {
+    local h=$1 s=$2 l=$3 i n want
+    n=$(grep -c "daemon started" "$l" 2>/dev/null || true)
+    [ -n "$n" ] || n=0
+    want=$((n + 1))
+
+    HOME="$h" SOCKETLEY_SOCKET="$s" "$BIN" daemon >>"$l" 2>&1 &
+    SPAWNED_PID=$!
+    for i in $(seq 1 100); do
+        n=$(grep -c "daemon started" "$l" 2>/dev/null || true)
+        [ -n "$n" ] || n=0
+        [ "$n" -ge "$want" ] && break
+        sleep 0.1
+    done
+    if [ ! -S "$s" ] || ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
+        echo "  FATAL: daemon never came up on $s"
+        tail -5 "$l" 2>/dev/null | sed 's/^/         /'
+        exit 2
+    fi
+}
+
+echo "  Test 7: a node reclaiming its own name after a restart"
+
+spawn_daemon "$WIT_HOME" "$SOCK_WIT" "$TMPD/witness.log"; DAEMON_PIDS+=($SPAWNED_PID)
+wit daemon --name witness --cluster "$RJ_DIR"
+
+spawn_daemon "$RJ_HOME" "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID=$SPAWNED_PID
+DAEMON_PIDS+=($RJ_PID)
+rj daemon --name rejoin1 --cluster "$RJ_DIR"
+create_ok "runtime on the rejoining node created" \
+    rj create server clst_rj -p "$RJ_PORT" -g rejoingroup -s
+sleep 3
+
+TOTAL=$((TOTAL+1))
+if [ -f "$RJ_DIR/rejoin1.json" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: rejoin1 never published before it was killed"
+fi
+
+# SIGKILL, so the file is left behind with a frozen heartbeat — the shape a
+# crashed container, a `Restart=on-failure` and a `docker kill` all leave.
+HB_BEFORE=$(grep -o '"heartbeat":[0-9]*' "$RJ_DIR/rejoin1.json" 2>/dev/null | cut -d: -f2 || true)
+kill -9 "$RJ_PID" 2>/dev/null || true
+wait "$RJ_PID" 2>/dev/null || true
+rm -f "$SOCK_RJ"
+spawn_daemon "$RJ_HOME" "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID2=$SPAWNED_PID
+DAEMON_PIDS+=($RJ_PID2)
+
+# The test has to have reached the hole it is aiming at.  If the machine was
+# slow enough that the entry aged out on its own, a rejoin proves nothing —
+# every build rejoins once the heartbeat is stale.
+AGE=$(( $(date +%s) - ${HB_BEFORE:-0} ))
+if [ "$AGE" -ge 10 ]; then
+    echo "  FATAL: the staleness window closed (${AGE}s) before the restart got"
+    echo "         there; this run would pass without testing anything."
+    exit 2
+fi
+
+RC=0
+RJOUT=$(rj daemon --name rejoin1 --cluster "$RJ_DIR" 2>&1) || RC=$?
+TOTAL=$((TOTAL+1))
+if [ "$RC" -eq 0 ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: rejoin refused ${AGE}s into the 10s window (exit $RC)"
+    echo "  GOT: $RJOUT"
+fi
+
+# Up and serving is not the same as in the cluster, and the gap between them is
+# the whole defect: assert both, from the peer's side.
+TOTAL=$((TOTAL+1))
+if rj ls 2>/dev/null | grep -q "clst_rj"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: the restarted daemon is not even serving its runtime"
+fi
+
+sleep 4
+OUT=$(wit cluster ls 2>&1 || true)
+TOTAL=$((TOTAL+1))
+if echo "$OUT" | grep '^rejoin1' | grep -qv "stale"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: the witness cannot see rejoin1 after its restart"
+    echo "  GOT: $OUT"
+fi
+
+OUT=$(wit cluster group rejoingroup 2>&1 || true)
+assert_contains "$OUT" "clst_rj"
+
+echo "  Test 8: a different daemon may not take a live node's name"
+
+# The target is `witness`, whose daemon has been up throughout and has never
+# been killed — so nothing here depends on how test 7 went, and the holder is
+# unambiguously a second, live, different daemon.  Same machine and same
+# hostname as the intruder; what tells them apart is the control socket, and a
+# unix socket path admits one process at a time.
+spawn_daemon "$IN_HOME" "$SOCK_IN" "$TMPD/intruder.log"; DAEMON_PIDS+=($SPAWNED_PID)
+
+RC=0
+intr daemon --name witness --cluster "$RJ_DIR" >/dev/null 2>&1 || RC=$?
+TOTAL=$((TOTAL+1))
+if [ "$RC" -ne 0 ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: a second live daemon was allowed to claim the name witness"
+fi
+
+# Checked with no sleep in front of it, and that is the point: the holder
+# republishes on its own 2s timer, so a refusal that deletes the entry looks
+# like nothing at all one cycle later.  The refusal used to reset the discovery
+# object, whose destructor unlinked the very file the refusal had just declined
+# to overwrite — which is what let the retry below in.
+TOTAL=$((TOTAL+1))
+if [ -f "$RJ_DIR/witness.json" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: the refused daemon deleted the live holder's cluster entry"
+fi
+
+RC=0
+intr daemon --name witness --cluster "$RJ_DIR" >/dev/null 2>&1 || RC=$?
+TOTAL=$((TOTAL+1))
+if [ "$RC" -ne 0 ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: the same claim was refused once and granted on the retry —"
+    echo "        two live daemons now publish one name"
+fi
+
+# A daemon that could not join says so when asked, rather than reporting the
+# same thing as a daemon that was never asked to.
+OUT=$(intr cluster ls 2>&1 || true)
+assert_contains "$OUT" "cluster mode is off"
+
+# And both live holders are still holders, seen from the witness.
+sleep 3
+OUT=$(wit cluster ls 2>&1 || true)
+for who in witness rejoin1; do
+    TOTAL=$((TOTAL+1))
+    if echo "$OUT" | grep "^$who" | grep -qv "stale"; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  FAIL: $who lost its membership to a daemon that was refused"
+        echo "  GOT: $OUT"
+    fi
+done
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 

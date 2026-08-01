@@ -317,7 +317,8 @@ static int cluster_show(const std::string& dir, std::string_view daemon_name)
     return 0;
 }
 
-static int cluster_stats(const std::string& dir)
+static int cluster_stats(const std::string& dir, const std::string& local_name,
+                         const std::string& local_host)
 {
     auto daemons = load_cluster_dir(dir);
 
@@ -342,6 +343,13 @@ static int cluster_stats(const std::string& dir)
         }
     }
 
+    // This node's own line first.  Everything under it is read off the shared
+    // directory and therefore describes the cluster as seen from outside; a
+    // daemon that is not in the cluster is missing from all of it, and a
+    // summary that starts at "Daemons:" gives an operator no way to notice.
+    std::cout << "Node: " << local_name
+              << " (" << local_host << ") — cluster on, dir " << dir << "\n";
+
     std::cout << "Daemons: " << daemons.size()
               << " (" << healthy << " healthy, " << stale << " stale)\n";
     std::cout << "Runtimes: " << total_runtimes
@@ -363,7 +371,8 @@ static int cluster_stats(const std::string& dir)
     return 0;
 }
 
-static int cluster_watch(const std::string& dir)
+static int cluster_watch(const std::string& dir, const std::string& local_name,
+                         const std::string& local_host)
 {
     while (true)
     {
@@ -372,36 +381,78 @@ static int cluster_watch(const std::string& dir)
         std::cout << "Cluster: " << dir << "\n\n";
         cluster_ps(dir);
         std::cout << "\n";
-        cluster_stats(dir);
+        cluster_stats(dir, local_name, local_host);
         std::cout << "\n(refreshing every 2s, Ctrl+C to stop)\n";
         usleep(2000000);
     }
     return 0;
 }
 
+namespace {
+
+// One `key:value` line out of the daemon's cluster-status reply.
+std::string status_field(std::string_view body, std::string_view key)
+{
+    size_t pos = 0;
+    while (pos <= body.size())
+    {
+        size_t eol = body.find('\n', pos);
+        std::string_view line = body.substr(pos,
+            eol == std::string_view::npos ? std::string_view::npos : eol - pos);
+
+        if (line.size() > key.size() && line.compare(0, key.size(), key) == 0 &&
+            line[key.size()] == ':')
+            return std::string(line.substr(key.size() + 1));
+
+        if (eol == std::string_view::npos)
+            break;
+        pos = eol + 1;
+    }
+    return {};
+}
+
+} // namespace
+
 // ─── Main dispatch ───
 
 int cli_cluster(int argc, char** argv)
 {
-    // Query daemon for cluster directory
-    std::string dir;
-    int rc = ipc_send("cluster-dir", dir);
+    // Ask the daemon about itself, not the directory about the daemon.  This
+    // command used to open with `cluster-dir`, which answers "not in cluster
+    // mode" for a daemon that was never given --cluster and for one that was
+    // given it and refused — and those are not the same thing to anybody
+    // holding a node that is up, serving and in no group.
+    std::string status;
+    int rc = ipc_send("cluster-status", status);
     if (rc < 0)
     {
         std::cerr << "failed to connect to daemon\n";
         return 2;
     }
-    if (rc != 0)
+
+    if (status_field(status, "cluster") != "on")
     {
-        // daemon returned error (e.g. not in cluster mode)
-        if (!dir.empty())
-            std::cerr << dir;
-        return rc;
+        std::string err = status_field(status, "error");
+        if (err.empty())
+        {
+            std::cerr << "daemon is not in cluster mode "
+                         "(use: daemon --name <n> --cluster <dir>)\n";
+            return 1;
+        }
+
+        std::string dir = status_field(status, "dir");
+        std::cerr << "cluster mode is off: " << err << "\n"
+                  << "  this daemon is serving, but it publishes nothing into "
+                  << dir << " and no peer can see it.\n"
+                  << "  give it a name no live daemon holds, or wait for the "
+                     "holder's heartbeat to age out,\n"
+                  << "  then: socketley daemon --name <n> --cluster " << dir << "\n";
+        return 1;
     }
 
-    // Trim trailing newline
-    while (!dir.empty() && (dir.back() == '\n' || dir.back() == '\r'))
-        dir.pop_back();
+    std::string dir        = status_field(status, "dir");
+    std::string local_name = status_field(status, "name");
+    std::string local_host = status_field(status, "host");
 
     std::string subcmd;
     int i = 2;
@@ -440,10 +491,10 @@ int cli_cluster(int argc, char** argv)
             return cluster_show(dir, argv[i + 1]);
 
         case fnv1a("stats"):
-            return cluster_stats(dir);
+            return cluster_stats(dir, local_name, local_host);
 
         case fnv1a("watch"):
-            return cluster_watch(dir);
+            return cluster_watch(dir, local_name, local_host);
 
         default:
             std::cerr << "unknown cluster subcommand: " << subcmd << "\n";

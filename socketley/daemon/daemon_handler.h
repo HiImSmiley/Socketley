@@ -98,9 +98,22 @@ private:
     int cmd_attach(ipc_connection* conn, const parsed_args& pa);
     int cmd_add(ipc_connection* conn, const parsed_args& pa);
     int cmd_cluster_dir(ipc_connection* conn);
+    int cmd_cluster_status(ipc_connection* conn);
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
     int cmd_dashboard(ipc_connection* conn);
+
+    // Bring cluster discovery up under NAME in DIR, replacing whatever is
+    // running.  On failure nothing is left running and m_cluster_error says
+    // why, in the words the operator gets.
+    bool start_cluster(const std::string& name, const std::string& dir);
+    void stop_cluster();
+
+    // What the daemon says about clustering when it is off: the flag it was
+    // given and could not honour.  Nothing here is a substitute for the reply
+    // to the command that failed — it is what `socketley cluster ...` reports
+    // afterwards, when the exit code has long been thrown away.
+    std::string cluster_off_reason() const;
 
     std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
 
@@ -134,6 +147,13 @@ private:
     std::unique_ptr<cluster_discovery> m_owned_cluster;
     std::string m_daemon_name;
     uint16_t m_metrics_port{0};
+
+    // The last --cluster this daemon was given and refused, and why.  Kept so
+    // that a node running with clustering off can say so when asked, instead of
+    // reporting the same "not in cluster mode" as a daemon that was never
+    // asked to join one.
+    std::string m_cluster_error;
+    std::string m_cluster_want_dir;
 
     // Health monitoring for managed runtimes, and the periodic reap of retired
     // runtime instances — see the op_timeout branch of on_cqe().
