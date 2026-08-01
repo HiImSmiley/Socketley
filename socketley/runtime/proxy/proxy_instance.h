@@ -12,6 +12,7 @@
 #include <sys/uio.h>
 
 #include "../../shared/runtime_instance.h"
+#include "../../shared/route_table.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/tls_context.h"
@@ -169,6 +170,14 @@ struct alignas(64) proxy_client_connection
     // would carry the first one's identity.  Empty — and never touched — on a
     // proxy whose script declares no chain.
     std::vector<std::pair<std::string, std::string>> filter_headers;
+
+    // Names a filter asked to be taken *off* the request, lowercased, applied
+    // by the same loop in rewrite_http_request that applies the ones above.
+    // Same lifetime rules and the same ban list: a filter that could remove
+    // Content-Length or Transfer-Encoding would change how the message is
+    // framed, and a proxy that frames a request differently from its backend
+    // is the whole of request smuggling.
+    std::vector<std::string> filter_removed_headers;
 
     std::chrono::steady_clock::time_point last_activity{};
     int retries_remaining{0};
@@ -587,6 +596,43 @@ private:
     // does not reach this function at all.
     bool run_request_filters(proxy_client_connection* conn);
 
+    // ── Declared routes ─────────────────────────────────────────────────────
+    //
+    // What this proxy's backends say they will answer, folded out of the
+    // published snapshot whenever that snapshot changes and never on a request.
+    // Empty on a proxy none of whose backends declares anything — which is
+    // every proxy that existed before this — and an empty table is checked with
+    // one `empty()` test on the request path.
+    //
+    // One rule folds several backends into one table, and route_table::
+    // merge_alternative gives it: nothing may be refused that either of them
+    // might have served.  A single backend that declares nothing therefore
+    // leaves this empty.
+    void rebuild_route_view();
+
+    // The gate.  Returns true when this request has been answered here and the
+    // caller must return at once; false means "no declaration covers this, or
+    // it covers it and allows it" — carry on and forward.
+    //
+    // Runs on the path the *backend* will see (this proxy's prefix already
+    // stripped), because that is the path the declaration is written in: it
+    // lives in the handler's script and can only speak about the handler's own
+    // paths.
+    //
+    // Above the filter chain and far above backend selection: this is the
+    // cheapest refusal there is — two string comparisons against a table
+    // already in hand — and everything it prevents (a Lua call, an endpoint
+    // resolution, a pooled socket, a connect, a round trip, the handler's own
+    // work) begins after it.  Anything it answers goes out through
+    // queue_final_response like every other response this proxy writes itself.
+    bool enforce_declared_route(proxy_client_connection* conn, std::string_view path);
+
+    // Whether the request whose header block is buffered on this connection
+    // carries a given field name.  Used only by the OPTIONS branch above, to
+    // tell a CORS preflight from a plain OPTIONS.
+    static bool request_has_header(const proxy_client_connection* conn,
+                                   const char* lower_name, size_t len);
+
     // The tail shared by every response this proxy writes itself: queue it,
     // mark the connection closing, flush what can be flushed, and half-close
     // the read direction so the teardown actually happens (see send_error for
@@ -782,6 +828,14 @@ private:
     // no lock — which is the point.  Null until the first publish, which the
     // manager does before it starts anything.
     std::shared_ptr<const endpoint_table> m_endpoints;
+
+    // What that snapshot says this proxy's own backends will answer, merged
+    // once per publication by rebuild_route_view().  A copy rather than a
+    // pointer into the snapshot because it is a *union* over several backends
+    // and so belongs to no single one of them; it is written only on the
+    // publish path and read only on the request path, both on the event-loop
+    // thread — the same discipline as m_endpoints above.
+    route_table m_routes;
 
     // ─── Retired I/O ───────────────────────────────────────────────────────
     //

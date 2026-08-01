@@ -2052,6 +2052,20 @@ response the proxy writes itself.
 Carry on, with these headers set on the request that goes to the backend. A
 header set here replaces one the client sent under the same name rather than
 joining it, and is emitted with a lowercased name.
+.TP
+.BI "{ remove_headers = { " name ", " name ", ... } }"
+Carry on, with these headers taken off the request before it goes to the
+backend \(em every occurrence of each name, so a field the client sent twice is
+removed entirely. For a header the backend must never see whatever the client
+sent: an internal trust header a caller forged, a cookie with no business past
+the edge.
+.I set_headers
+and
+.I remove_headers
+may appear in the same table. A name that is both set and removed takes the
+later of the two statements, exactly as two
+.I set_headers
+for one name resolve.
 .PP
 A filter that returns anything else, or that raises an error, refuses the
 request with 500. A filter that did not say "carry on" is never treated as
@@ -2060,7 +2074,7 @@ though it had. An entry in
 that is not a function refuses the whole script at load time, for the same
 reason: a silently dropped filter looks exactly like one that admits everybody.
 .PP
-Names a filter may not set are dropped, with a line on stderr:
+Names a filter may not set \fIor remove\fR are dropped, with a line on stderr:
 .B Content\-Length
 and
 .B Transfer\-Encoding
@@ -2097,6 +2111,137 @@ See
 .B examples/proxy/filter\-chain.lua
 for authentication, per-IP rate limiting and header rewriting as three filters
 in one chain.
+.SS Declared Routes
+.B routes
+is a global array in which a runtime states what it will answer: a path, and
+the methods allowed on it. It is declared in the \fIhandler's\fR script and
+published to the proxies that forward to that runtime, which then refuse those
+methods at the edge \(em before any endpoint is resolved, any socket is taken
+from the pool and any connection is opened.
+.PP
+The declaration lives with the handler on purpose. Configured on the proxy, a
+method list is a second copy of something the handler already states in its own
+code, in another runtime and soon in another process, and two copies drift: the
+handler grows
+.BR PATCH ,
+the gateway goes on refusing it, and the 405 is explicable from neither side
+alone. Nothing is configured on the proxy; editing the handler's script and
+running
+.B socketley reload\-lua
+changes what the gateway enforces.
+.PP
+.nf
+routes = {
+    { path = "/endpoint/login", methods = {"POST", "GET"} },
+    { path = "/static/*",       methods = {"GET"} },
+}
+.fi
+.PP
+.B path
+is the path as the \fIhandler\fR sees it \(em the proxy's own
+.BI / name /
+prefix already stripped \(em and a query string is not part of it. A trailing
+.B *
+makes it a literal prefix; that is the whole of the pattern language. Exact
+matches win over prefixes, and the longest prefix wins among prefixes.
+.B methods
+is a list of method names; a bare string is accepted for a single one. The
+declaration is uppercased when the script loads, so
+.B "methods = {\(dqpost\(dq}"
+declares POST. The method a client sends is compared as sent \(em RFC 9110 9.1
+makes the method token case-sensitive, and a request for
+.B post
+is one the handler would refuse too.
+.PP
+What the proxy does with it:
+.TP
+A declared method
+is forwarded, as always.
+.TP
+An undeclared method on a declared path
+is answered
+.B 405 Method Not Allowed
+with an
+.B Allow
+header listing what would have worked. No backend is involved.
+.TP
+.B HEAD
+is allowed wherever
+.B GET
+is (RFC 9110 9.3.2) \(em a handler that serves GET serves HEAD whether or not it
+listed it.
+.TP
+.B OPTIONS
+is never refused. A plain OPTIONS \(em "what may I do here", RFC 9110 9.3.7 \(em
+is answered
+.B 204
+with
+.B Allow
+out of the declaration. A CORS \fIpreflight\fR (an OPTIONS carrying
+.B Origin
+and
+.BR Access\-Control\-Request\-Method )
+is always forwarded to the handler instead: the declaration says nothing about
+origins, and an answer without
+.B Access\-Control\-Allow\-Origin
+breaks the preflight exactly as a 405 would \(em the real request is never sent
+and the browser reports a CORS error. A handler that declares
+.B OPTIONS
+itself always gets it.
+.TP
+A path nobody declared
+is forwarded, whatever the method. A declaration speaks about the paths it names
+and says nothing about the others; it is not a whitelist, and declaring one
+route does not hide the rest.
+.TP
+A backend given as \fIhost:port\fR
+has no declaration and never will \(em the published snapshot is keyed by
+runtime name and by group. Such a backend is forwarded to as before.
+.PP
+For a proxy with several backends, or an
+.BI @ group
+backend, one rule covers both halves of the fold: nothing may be refused that
+\fIeither\fR possible target might have served. A path only some of them declare
+is dropped \(em a runtime that never mentioned it may well serve it. A path all
+of them declare keeps the \fIunion\fR of their methods, since the proxy does not
+know which target a request will reach. One backend or group member that
+declares nothing therefore leaves that proxy enforcing nothing at all, silently
+and on purpose: it has said nothing about what it answers, so nothing can be
+refused on its account.
+.PP
+.B "Edge rejection is not input validation."
+The proxy can confirm the method is one the handler declared. It cannot confirm
+the body is a well-formed login, and it is not the only way in: a socketley
+server listens on its own port, and a request that arrives there passed no edge
+at all. A handler that stops checking its input because "the gateway checks" is
+safe only for as long as every request comes through the gateway, which is a
+property of the deployment and not of the code. Declare routes to save the
+round trip and to say what you mean; go on validating.
+.PP
+.B socketley stats \fIproxy\fR
+reports
+.B declared_routes
+\(em how many routes that proxy is actually enforcing. It is the first thing to
+look at when a method that should be refused is not: a backend that declares
+nothing, a backend named by address, a script that failed to load and a proxy
+whose handler had not started yet all look identical from the client side, and
+all of them read 0 here.
+.PP
+A malformed entry refuses the script at load time, with the reason on stderr,
+rather than being dropped: a declaration that is not the one in the file is
+invisible from both sides. A
+.B routes
+table with no entry at index 1 is refused too \(em it is an array, and
+.B routes = {["/a"] = {"GET"}}
+would otherwise load and declare nothing.
+.PP
+A proxy runtime running in a worker process of its own does not receive route
+declarations yet and forwards every method; the declaration is enforced by
+proxies running inside the daemon.
+.IP
+See
+.B examples/proxy/declared\-routes.lua
+for a handler that declares an AJAX endpoint and the gateway in front of it.
 .SS Runtime Methods (in Lua)
 .nf
 self.name      -- Runtime name (read-only)

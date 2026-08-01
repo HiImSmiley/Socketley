@@ -32,6 +32,13 @@ Custom routing logic with Lua scripts.
 Authentication, per-IP rate limiting and header rewriting as a chain of filters
 that runs *before* a backend is chosen — so a refused request never opens one.
 
+### Declared Routes
+A handler states the paths it answers and the methods allowed on each; the
+daemon publishes that declaration to the proxies in front of it, which refuse an
+undeclared method at the edge with `405` and an `Allow` header. Declared in the
+handler's script, not on the proxy — a method list written down in two runtimes
+is one truth in two places, and two places drift.
+
 ## Key Concepts
 
 ### Path-Based Routing (HTTP Mode)

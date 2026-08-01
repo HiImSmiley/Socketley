@@ -2630,6 +2630,13 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
                 srv->rebuild_http_cache();
         }
     }
+
+    // A script is where a runtime's route declaration lives, so reloading one
+    // can change what it says it will answer.  Without this the proxies in
+    // front of it would go on enforcing the declaration from the previous
+    // version of the file — the exact drift publishing exists to prevent, and
+    // the worst kind, because the two copies came from the same script.
+    m_manager.publish_endpoints();
     return 0;
 }
 

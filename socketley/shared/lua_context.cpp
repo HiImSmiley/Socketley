@@ -289,6 +289,132 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     }
     if (!m_filters.empty()) m_callback_mask |= CB_FILTERS;
 
+    // The route declaration.  `routes` is an array of { path, methods }, and it
+    // states what this runtime will answer — see shared/route_table.h for why
+    // it lives here rather than in the proxy that enforces it.
+    //
+    //   routes = {
+    //       { path = "/endpoint/login", methods = { "POST", "GET" } },
+    //       { path = "/static/*",       methods = { "GET" } },
+    //   }
+    //
+    // A malformed entry refuses the script, as a malformed filter does.  The
+    // failure mode is the opposite one — a dropped declaration fails open, and
+    // the gateway simply forwards what it would have refused — but it is still
+    // a runtime whose published routes are not the ones written in the file,
+    // and the operator has no way to see that from either side.  A script that
+    // will not load is visible at the moment it is written.
+    m_routes.clear();
+    {
+        sol::object robj = m_lua["routes"];
+        if (robj.valid() && robj != sol::nil)
+        {
+            if (!robj.is<sol::table>())
+            {
+                std::cerr << "[lua] `routes` must be a table of { path, methods } entries"
+                          << std::endl;
+                return false;
+            }
+            sol::table rt = robj.as<sol::table>();
+            for (size_t i = 1;; ++i)
+            {
+                sol::object entry = rt[i];
+                if (!entry.valid() || entry == sol::nil)
+                    break;
+                if (!entry.is<sol::table>())
+                {
+                    std::cerr << "[lua] routes[" << i << "] is not a table" << std::endl;
+                    return false;
+                }
+                sol::table e = entry.as<sol::table>();
+
+                sol::optional<std::string> path = e["path"];
+                if (!path)
+                {
+                    std::cerr << "[lua] routes[" << i << "] has no `path`" << std::endl;
+                    return false;
+                }
+
+                // A single string is accepted where a table of one is meant.
+                // `methods = "POST"` is what everyone writes first, and the
+                // alternative to reading it is a script that loads with the
+                // route silently dropped.
+                std::vector<std::string> methods;
+                sol::object mobj = e["methods"];
+                if (mobj.valid() && mobj.is<std::string>())
+                {
+                    methods.push_back(mobj.as<std::string>());
+                }
+                else if (mobj.valid() && mobj.is<sol::table>())
+                {
+                    sol::table mt = mobj.as<sol::table>();
+                    for (size_t j = 1;; ++j)
+                    {
+                        sol::object m = mt[j];
+                        if (!m.valid() || m == sol::nil)
+                            break;
+                        if (!m.is<std::string>())
+                        {
+                            std::cerr << "[lua] routes[" << i << "].methods[" << j
+                                      << "] is not a string" << std::endl;
+                            return false;
+                        }
+                        methods.push_back(m.as<std::string>());
+                    }
+                }
+                else
+                {
+                    std::cerr << "[lua] routes[" << i << "] (" << *path
+                              << ") has no `methods` list — a route that named no method "
+                                 "would refuse every request at the edge" << std::endl;
+                    return false;
+                }
+
+                const char* why = nullptr;
+                switch (m_routes.add(*path, methods))
+                {
+                    case route_table::add_result::ok:         break;
+                    case route_table::add_result::bad_path:
+                        why = "`path` must start with '/' and carry no space, query or fragment";
+                        break;
+                    case route_table::add_result::bad_method:
+                        why = "`methods` must be a non-empty list of method tokens";
+                        break;
+                    case route_table::add_result::too_many:
+                        why = "too many routes or methods for one declaration";
+                        break;
+                    case route_table::add_result::duplicate:
+                        why = "this path is declared twice — the second would be ignored";
+                        break;
+                }
+                if (why)
+                {
+                    std::cerr << "[lua] routes[" << i << "] (" << *path << "): " << why
+                              << std::endl;
+                    return false;
+                }
+            }
+
+            if (m_routes.empty())
+            {
+                // Same trap as `filters`: a keyed table reads like a
+                // declaration and is silently nothing, because the array part
+                // is what is walked.  An empty table means "declare nothing"
+                // and is left alone.
+                bool any = false;
+                rt.for_each([&](sol::object, sol::object) { any = true; });
+                if (any)
+                {
+                    std::cerr << "[lua] `routes` has no entry at index 1 — it is an array "
+                                 "of { path = ..., methods = { ... } }, not a keyed table"
+                              << std::endl;
+                    return false;
+                }
+            }
+        }
+    }
+    if (!m_routes.empty()) m_callback_mask |= CB_ROUTES;
+
     return true;
 }
 

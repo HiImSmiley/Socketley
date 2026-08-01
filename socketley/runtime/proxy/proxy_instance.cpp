@@ -204,6 +204,7 @@ void proxy_client_connection::reset(int new_fd)
     path.clear();
     version.clear();
     filter_headers.clear();
+    filter_removed_headers.clear();
     declared_body_len = 0;
     declared_body_chunked = false;
     body_remaining = 0;
@@ -494,6 +495,13 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // anything holds it.
     m_endpoints = std::move(tbl);
 
+    // What the new snapshot says this proxy's backends will answer.  Here and
+    // in setup(), which are the only two moments it can change: the table is
+    // republished whenever a runtime starts, stops, is created, removed,
+    // renamed or has its script reloaded, and setup() covers a proxy whose own
+    // backends were configured after the last publication.
+    rebuild_route_view();
+
     // Whatever the pool still holds to a member that is no longer in the group
     // is dead weight: selection will never ask for that endpoint again, so the
     // socket would sit there until the idle sweep reached it a minute later —
@@ -505,6 +513,54 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // left to say, and dropping it here is what keeps that map the size of the
     // group rather than the size of its history.
     drop_departed_endpoints();
+}
+
+// The declarations of the backends this proxy forwards to, folded into one
+// table.  Called only when the published snapshot changes or the runtime
+// starts, never per request.
+//
+// One silent backend is enough to leave this proxy enforcing nothing, and that
+// is deliberate rather than a limitation.  A backend written as a bare
+// host:port has no entry in the snapshot and never will — it is keyed by
+// runtime name and by group, and an address is neither — so this proxy has no
+// basis whatever on which to claim it knows what that server answers.  Refusing
+// a method at the edge while one of the possible targets might have served it
+// is the one failure this feature must not have; forwarding as before is the
+// safe half of the fork.  See route_table::merge_alternative.
+void proxy_instance::rebuild_route_view()
+{
+    m_routes.clear();
+    if (!m_endpoints || !m_endpoints->any_routes() || m_backends.empty())
+        return;
+
+    // Configuration order, so that the Allow header a client is given does not
+    // depend on anything but what the operator wrote.
+    bool started = false;
+    for (const auto& b : m_backends)
+    {
+        const route_table* rt = nullptr;
+        if (b.address.size() > 1 && b.address[0] == '@')
+            rt = m_endpoints->find_group_routes(
+                     std::string_view(b.address.data() + 1, b.address.size() - 1));
+        else
+            rt = m_endpoints->find_name_routes(b.address);
+
+        if (!rt || rt->empty())
+        {
+            m_routes.clear();
+            return;
+        }
+
+        if (!started)
+        {
+            m_routes = *rt;
+            started = true;
+        }
+        else
+        {
+            m_routes.merge_alternative(*rt);
+        }
+    }
 }
 
 // Called only when the membership snapshot changes, which is per control
@@ -830,6 +886,12 @@ bool proxy_instance::setup(event_loop& loop)
     }
 
     m_avail_scratch.reserve(m_backends.size());
+
+    // The backends are known now.  set_endpoints() builds this too, but a
+    // proxy is configured and then started, so the last publication before
+    // start() may have arrived while m_backends was still empty — and a view
+    // built from no backends is a proxy that enforces nothing.
+    rebuild_route_view();
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
@@ -2218,6 +2280,18 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         else
             new_path = std::string_view(conn->path).substr(m_prefix.size() - 1); // Keep leading /
 
+        // The route declaration, and the one place it is enforced.
+        //
+        // First of everything, because it is the cheapest verdict available and
+        // because it is the only one derived from what the *handler* said: a
+        // method the backend was always going to refuse should not cost a Lua
+        // call, an endpoint resolution, a socket or a round trip.  A proxy
+        // whose backends declare nothing has an empty table and pays one
+        // comparison.
+        if (SOCKETLEY_UNLIKELY(!m_routes.empty()) &&
+            enforce_declared_route(conn, new_path))
+            return;   // answered here; no filter ran and no backend was chosen
+
         // The filter chain, and the one place it may be called from.
         //
         // Above the selection, not beside it: a filter exists to stop a request
@@ -3035,6 +3109,31 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             }
         }
 
+        // A header a filter removed, dropped here and never written back — the
+        // list below carries no value to re-emit.  Every occurrence goes: a
+        // field the client sent twice is one field, and taking away half of it
+        // would leave the backend reading a value the filter meant to delete.
+        // The names were lowercased and checked when they were collected, and
+        // the framing pair, Host and the hop-by-hop set are refused there, so
+        // this loop cannot be made to drop a line it is responsible for.
+        if (SOCKETLEY_UNLIKELY(!conn->filter_removed_headers.empty()))
+        {
+            bool removed = false;
+            for (const auto& n : conn->filter_removed_headers)
+            {
+                if (header_name_equals(hdr_line, n.c_str(), n.size()))
+                {
+                    removed = true;
+                    break;
+                }
+            }
+            if (removed)
+            {
+                h_pos = nl + 2;
+                continue;
+            }
+        }
+
         // Rewrite Host header to backend address
         if (header_name_equals(hdr_line, "host", 4))
         {
@@ -3128,6 +3227,125 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     conn->partial.erase(0, body_off + body_len);
 
     return result;
+}
+
+// ─── Declared routes ────────────────────────────────────────────────────────
+//
+// One question, asked of a table the handler filled in: is this method one the
+// handler said it would take on this path.  See shared/route_table.h for why
+// the answer is published rather than configured, and for the two things this
+// gate is deliberately not (a router, and input validation).
+
+bool proxy_instance::request_has_header(const proxy_client_connection* conn,
+                                        const char* lower_name, size_t len)
+{
+    const auto line_end = conn->partial.find("\r\n");
+    const auto hdr_end  = conn->partial.find("\r\n\r\n");
+    if (line_end == std::string::npos || hdr_end == std::string::npos || hdr_end <= line_end)
+        return false;
+
+    std::string_view block(conn->partial.data() + line_end + 2, hdr_end - line_end - 2);
+    size_t p = 0;
+    while (p < block.size())
+    {
+        auto nl = block.find("\r\n", p);
+        if (nl == std::string_view::npos)
+            nl = block.size();
+        if (header_name_equals(block.substr(p, nl - p), lower_name, len))
+            return true;
+        p = nl + 2;
+    }
+    return false;
+}
+
+bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
+                                            std::string_view path)
+{
+    const route_decl* route = m_routes.find(route_path_only(path));
+    if (!route)
+        return false;   // nobody declared this path; it is not this gate's business
+
+    // OPTIONS is never refused here — route_table::method_allowed says why —
+    // but there are three different right answers to it and the declaration
+    // picks between them.
+    if (conn->method == "OPTIONS")
+    {
+        // The handler asked for OPTIONS itself.  Forward, and do not second
+        // guess it: a script that declares OPTIONS has an answer of its own in
+        // mind, and this is how a CORS layer written in Lua keeps working.
+        for (const auto& m : route->methods)
+            if (m == "OPTIONS")
+                return false;
+
+        // A CORS preflight.  Forwarded, always, and this is the single most
+        // important line in the file.
+        //
+        // A browser sends OPTIONS ahead of any request that is not "simple" —
+        // any POST that is not a form encoding, anything carrying an
+        // Authorization or a custom header — and it needs
+        // Access-Control-Allow-Origin back.  A gateway that answers the
+        // preflight out of the declaration answers it without one, because the
+        // declaration says nothing about origins and this proxy will not invent
+        // an origin policy: reflecting whatever Origin arrives is how a
+        // credentialed endpoint gets opened to every site on the internet.
+        //
+        // The failure that produces is indistinguishable from the 405 this
+        // whole feature was written to avoid — the real request is never sent,
+        // the browser reports a CORS error, and nothing in either runtime's log
+        // mentions a preflight.  Origin policy lives with the handler, so the
+        // preflight goes to the handler.
+        if (request_has_header(conn, "origin", 6) &&
+            request_has_header(conn, "access-control-request-method", 29))
+            return false;
+
+        // A plain OPTIONS, which is RFC 9110 Section 9.3.7 and has nothing to
+        // do with CORS: "what may I do here".  The declaration is exactly that
+        // answer, so it is answered here — no backend, no round trip.
+        std::string response;
+        response.reserve(128);
+        response += "HTTP/1.1 204 No Content\r\nAllow: ";
+        response += route_table::allow_header(*route);
+        // No Content-Length: RFC 9112 Section 6.2 — a 204 carries no content
+        // and must not claim to.  Closed for the same reason every response
+        // this proxy writes itself is closed; see queue_final_response.
+        response += "\r\nConnection: close\r\n\r\n";
+
+        conn->partial.clear();
+        queue_final_response(conn, std::move(response));
+        return true;
+    }
+
+    if (route_table::method_allowed(*route, conn->method))
+        return false;
+
+    // Refused, and with the one header that makes the refusal actionable.
+    // RFC 9110 Section 15.5.6 requires Allow on a 405, and it costs nothing
+    // here: the declaration is the list.  Without it the client is told no and
+    // not told what would have worked.
+    const std::string allow = route_table::allow_header(*route);
+    static constexpr std::string_view body = "Method Not Allowed\n";
+
+    std::string response;
+    response.reserve(128 + allow.size() + body.size());
+    response += "HTTP/1.1 405 Method Not Allowed\r\nAllow: ";
+    response += allow;
+    response += "\r\nContent-Length: ";
+    char len_buf[24];
+    auto [lend, lec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
+    response.append(len_buf, static_cast<size_t>(lend - len_buf));
+    response += "\r\nConnection: close\r\n\r\n";
+    // A response to HEAD carries the length its GET would have had and none of
+    // the bytes.  HEAD only reaches this line for a route that declares
+    // neither GET nor HEAD, which is rare and still has to be framed right.
+    if (conn->method != "HEAD")
+        response += body;
+
+    // Same reason as every other self-answered path here: what is still
+    // buffered must not be picked up as a fresh request while the answer is on
+    // its way out.
+    conn->partial.clear();
+    queue_final_response(conn, std::move(response));
+    return true;
 }
 
 // ─── Filter chain ───────────────────────────────────────────────────────────
@@ -3322,10 +3540,11 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     }
     req["headers"] = hdrs;
 
-    // Headers a filter has asked to be set on the way out.  Cleared here rather
-    // than only between requests: this is the one place that fills it, and a
-    // request that reaches the chain twice must not accumulate.
+    // Headers a filter has asked to be set or taken off on the way out.  Cleared
+    // here rather than only between requests: this is the one place that fills
+    // them, and a request that reaches the chain twice must not accumulate.
     conn->filter_headers.clear();
+    conn->filter_removed_headers.clear();
 
     for (const auto& filter : lctx->filters())
     {
@@ -3375,14 +3594,78 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             // Continue, with the request rewritten.  The only other thing a
             // returned table may be.
             sol::optional<sol::table> set = t["set_headers"];
-            if (!set)
+            sol::optional<sol::table> remove = t["remove_headers"];
+            if (!set && !remove)
             {
-                fprintf(stderr, "[lua] filter returned a table with neither "
-                                "`status` nor `set_headers`\n");
+                fprintf(stderr, "[lua] filter returned a table with none of "
+                                "`status`, `set_headers` or `remove_headers`\n");
                 conn->partial.clear();
                 send_error(conn, "500 Internal Server Error", "Filter Error\n");
                 return true;
             }
+
+            // Taking a header *off* the request, which until now a filter could
+            // not do at all: it could add one and it could overwrite one, so a
+            // header the client sent and the backend must never see — an
+            // internal trust header a caller forged, a cookie that has no
+            // business past the edge — could only be blanked, not removed.
+            //
+            // An array of names, because that is what it is, and the same ban
+            // list as set_headers.  Removing Content-Length or
+            // Transfer-Encoding would make this proxy and its backend disagree
+            // about where the request ends, which is request smuggling in the
+            // one direction the set ban does not cover; Host and the
+            // hop-by-hop set are the proxy's to write, and a filter that could
+            // delete them would be deciding how the message is framed and where
+            // it is addressed.
+            if (remove)
+            {
+                for (size_t i = 1;; ++i)
+                {
+                    sol::object entry = (*remove)[i];
+                    if (!entry.valid() || entry == sol::nil)
+                        break;
+                    if (!entry.is<std::string>())
+                    {
+                        fprintf(stderr, "[lua] filter remove_headers: entry %zu is not a "
+                                        "string\n", i);
+                        continue;
+                    }
+                    std::string name = entry.as<std::string>();
+                    for (auto& c : name)
+                        c = static_cast<char>(c | 0x20);
+                    if (!filter_token_ok(name))
+                    {
+                        fprintf(stderr, "[lua] filter remove_headers: `%s` is not a field "
+                                        "name\n", name.c_str());
+                        continue;
+                    }
+                    if (filter_request_header_forbidden(name))
+                    {
+                        fprintf(stderr, "[lua] filter remove_headers: `%s` is the proxy's "
+                                        "to decide, not a filter's\n", name.c_str());
+                        continue;
+                    }
+                    // A name cannot be both set and removed: the last statement
+                    // about it wins, exactly as two set_headers for one name
+                    // resolve.  Without this the removal would take the
+                    // client's line out and the set would put the proxy's line
+                    // back, which reads as "remove did nothing".
+                    for (auto it = conn->filter_headers.begin();
+                         it != conn->filter_headers.end(); ++it)
+                    {
+                        if (it->first == name) { conn->filter_headers.erase(it); break; }
+                    }
+                    bool already = false;
+                    for (const auto& have : conn->filter_removed_headers)
+                        if (have == name) { already = true; break; }
+                    if (!already)
+                        conn->filter_removed_headers.push_back(std::move(name));
+                }
+            }
+
+            if (!set)
+                continue;
             set->for_each([&](sol::object key, sol::object val) {
                 if (!key.is<std::string>() || !val.is<std::string>())
                 {
@@ -3404,6 +3687,13 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                     fprintf(stderr, "[lua] filter set_headers: `%s` is the proxy's to "
                                     "decide, not a filter's\n", name.c_str());
                     return;
+                }
+                // The other half of the rule above: setting a name a filter
+                // removed puts it back, because that is the later statement.
+                for (auto it = conn->filter_removed_headers.begin();
+                     it != conn->filter_removed_headers.end(); ++it)
+                {
+                    if (*it == name) { conn->filter_removed_headers.erase(it); break; }
                 }
                 // Last writer wins, so a later filter can correct an earlier one
                 // instead of appending a second copy the backend has to combine.
@@ -5352,6 +5642,7 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     // otherwise still be carrying the first request's headers if it ever
     // reached a backend.
     cconn->filter_headers.clear();
+    cconn->filter_removed_headers.clear();
 
     // The answer arrived before the client had finished sending its body — an
     // early 4xx, say.  Then what is buffered is the tail of that body rather
@@ -6451,6 +6742,18 @@ std::string proxy_instance::get_stats() const
     out += "backends:";
     auto [p2, e2] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_backends.size());
     out.append(num_buf, static_cast<size_t>(p2 - num_buf));
+    out += '\n';
+
+    // How many routes this proxy is enforcing, out of what its backends
+    // published.  Zero is the answer to most of the questions this feature will
+    // ever be asked — "why is my 405 not happening", "did my declaration
+    // arrive" — and every one of them is otherwise unanswerable from outside:
+    // a backend that declares nothing, a backend named by address, a script
+    // that failed to load and a proxy started before the handler all look
+    // exactly alike from the client side.
+    out += "declared_routes:";
+    auto [p2b, e2b] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_routes.size());
+    out.append(num_buf, static_cast<size_t>(p2b - num_buf));
     out += '\n';
 
     // Pool stats
