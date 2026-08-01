@@ -1015,6 +1015,12 @@ to claim master role. Only one master at a time; master is released on disconnec
 Alternatively, use the
 .B on_master_auth(client_id, password)
 Lua callback for dynamic authentication.
+.IP
+Failed attempts are counted per source address. A connection is refused at
+accept, before a byte is read, once that address has failed ten attempts within
+sixty seconds; the count decays after sixty seconds of quiet. This is a property
+of master mode and not of this flag \(em it applies whichever of the two
+authenticators is in use.
 .TP
 .B \-\-master\-forward
 When set in master mode, non-master client messages are forwarded to the master
@@ -1956,6 +1962,10 @@ return a replacement string or nil to drop.
 Server only (master mode). Custom authentication. Return true to grant
 master role, false to deny. If defined, overrides
 .BR \-\-master\-pw .
+A denial from this callback is counted against the source address exactly as a
+wrong
+.B \-\-master\-pw
+is, so the per-address lockout described there applies here too.
 .TP
 .B on_auth(client_id) \(-> bool
 Server only. Called immediately after a client is accepted, before

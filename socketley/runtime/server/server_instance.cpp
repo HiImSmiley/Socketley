@@ -2116,10 +2116,31 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_last = now_tp;
         }
 
-        // Check per-IP auth failure rate (master mode only)
+        // Check per-IP auth failure rate.
+        //
+        // The term is the failure table itself, not a configuration value.  It
+        // used to be `!m_master_pw.empty()`, and --master-pw is documented on
+        // its own man-page entry as one of two ways to authenticate a master:
+        // "Alternatively, use the on_master_auth(client_id, password) Lua
+        // callback", which "if defined, overrides --master-pw".  A server that
+        // takes the documented alternative has an empty m_master_pw, so this
+        // block never ran on it — and the per-connection MAX_AUTH_FAILURES cap
+        // is no answer, because it is per connection: an attacker gets five
+        // guesses, hangs up, reconnects and gets five more, for ever.  The
+        // lockout an operator can see working with --master-pw was silently
+        // absent in the one configuration where the password is not a constant
+        // in the state file.
+        //
+        // m_auth_ip_failures is written by the failure path for its own reasons
+        // (mode_master's deny branch records every rejected attempt, whichever
+        // authenticator rejected it) and nothing in the configuration can switch
+        // that off.  Asking it directly is also cheaper than what stood here: an
+        // empty table means no getpeername syscall per accept at all, where
+        // before every accepted connection on a --master-pw server paid for one.
+        //
         // Use getpeername() instead of m_accept_addr because multishot accept
         // passes nullptr for addr — m_accept_addr is never populated per-connection.
-        if (!m_master_pw.empty())
+        if (SOCKETLEY_UNLIKELY(!m_auth_ip_failures.empty()))
         {
             struct sockaddr_in peer{};
             socklen_t peer_len = sizeof(peer);
