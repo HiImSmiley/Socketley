@@ -110,6 +110,21 @@ project "socketley"
         "socketley"
     }
 
+    -- The liburing floor, checked before anything in this project compiles.
+    --
+    -- liburing_version.h is also included by event_loop.h and
+    -- runtime_instance.h, which is what makes the check correct; force-including
+    -- it here is what makes it *legible*.  Without this the first file `make`
+    -- happens to reach is whatever -j ordering picked, and on a system with
+    -- liburing 2.5 the build prints several unrelated-looking errors from deep
+    -- inside event_loop.cpp before anyone sees the one line that names the
+    -- cause.  With it, the very first translation unit compiled fails with the
+    -- required and found versions and the command that fixes it.
+    --
+    -- It costs two #defines per TU: the header includes
+    -- <liburing/io_uring_version.h>, not <liburing.h>.
+    forceincludes { "socketley/shared/liburing_version.h" }
+
     libdirs { "thirdparty/luajit" }
     links { "luajit", "uring", "ssl", "crypto" }
 

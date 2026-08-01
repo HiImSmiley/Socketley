@@ -20,6 +20,27 @@ curl -fsSL "$URL" -o "$TMP/socketley.deb"
 echo "Installing dependencies..."
 apt-get update -qq && apt-get install -y -qq liburing2 > /dev/null
 
+# The binary needs liburing.so.2 with the LIBURING_2.6 symbol version, because
+# it calls io_uring_register_napi().  Ubuntu 24.04 packages 2.5, so on a stock
+# 24.04 the line above installs something the daemon cannot load, and the dpkg
+# below then fails its `liburing2 (>= 2.6)` dependency.  Say why here, where the
+# person running this can still read it, rather than letting dpkg's unmet
+# dependency be the whole explanation.
+if ! ldconfig -p 2>/dev/null | grep -q 'liburing\.so\.2' \
+   || ! grep -qs LIBURING_2.6 /usr/lib/*/liburing.so.2* 2>/dev/null; then
+  cat >&2 <<'WARN'
+
+note: this system's liburing appears older than 2.6 (Ubuntu 24.04 ships 2.5).
+      socketley needs 2.6+ to run.  If the install below fails on liburing2,
+      install a current one and retry:
+
+        git clone --depth 1 --branch liburing-2.15 https://github.com/axboe/liburing
+        cd liburing && ./configure --prefix=/usr \
+            --libdir="/usr/lib/$(gcc -print-multiarch)" && make && sudo make install
+
+WARN
+fi
+
 UPGRADE=false
 if dpkg -s socketley >/dev/null 2>&1; then
   UPGRADE=true

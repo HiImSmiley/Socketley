@@ -15,6 +15,7 @@
 #ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
 #endif
+#include "liburing_version.h"   // must precede <liburing.h>; see that file
 #include <liburing.h>
 #include "runtime_definitions.h"
 #include "event_loop_definitions.h"

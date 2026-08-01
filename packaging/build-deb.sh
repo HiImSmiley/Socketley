@@ -42,6 +42,23 @@ chmod 755 "$PKG_DIR/usr/share/socketley/socketley-help.sh"
 cp "$SCRIPT_DIR/socketley.service" "$PKG_DIR/usr/lib/systemd/system/"
 
 # Control file
+#
+# `Depends: liburing2` — with no version — was a package that installed cleanly
+# and then would not start.  The binary calls io_uring_register_napi(), a real
+# exported symbol added in liburing 2.6, so it records a versioned dependency:
+#
+#   $ objdump -p bin/Release/socketley | grep -A3 'required from liburing'
+#     required from liburing.so.2:
+#       LIBURING_2.6
+#
+# Ubuntu 24.04's liburing2 is 2.5 and satisfies an unversioned `liburing2`, so
+# dpkg was happy, and the first exec then died on a version lookup for
+# LIBURING_2.6.  Stating the constraint makes apt refuse the install instead,
+# which is the same news delivered where it can be acted on.
+#
+# 2.6 and not the 2.7 the *source* needs: the two extra things 2.7 provides that
+# this tree uses are preprocessor constants compiled into the binary, not
+# symbols resolved from the shared object at load time.
 cat > "$PKG_DIR/DEBIAN/control" << EOF
 Package: socketley
 Version: $VERSION
@@ -50,7 +67,7 @@ Maintainer: Socketley Developers
 Description: Network runtime daemon with Docker-style management
  Socketley is a Linux-only daemon that manages long-living network
  runtimes (server, client, proxy, cache) in a Docker-like style.
-Depends: liburing2
+Depends: liburing2 (>= 2.6)
 Section: net
 Priority: optional
 EOF

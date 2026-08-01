@@ -1,4 +1,11 @@
 #pragma once
+// Before <liburing.h>, so that a liburing too old for this file says so instead
+// of producing `not declared in this scope` for the identifiers below.  Also
+// force-included into every translation unit by premake5.lua; here as well
+// because a header must not depend on the build system to be correct, and the
+// clang advisory job in CI compiles these sources without premake.
+#include "liburing_version.h"
+
 #include <atomic>
 #include <cstdint>
 #include <liburing.h>

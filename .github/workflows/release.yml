@@ -16,10 +16,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential liburing-dev libssl-dev \
+          # Not liburing-dev: ubuntu-24.04 has 2.5 and this tree needs >= 2.7.
+          # A tagged release built against 2.5 does not exist — the build stops
+          # at event_loop.cpp — so every tag pushed since 2026-07-28 failed here.
+          sudo apt-get install -y build-essential libssl-dev \
             netcat-openbsd bc libluajit-5.1-dev
           cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" \
             thirdparty/luajit/libluajit.a
+
+      - name: Install liburing
+        run: bash scripts/install-liburing.sh
 
       - name: Build release binary
         run: |

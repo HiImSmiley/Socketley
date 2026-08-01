@@ -87,7 +87,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential liburing-dev libssl-dev \
+          # No liburing-dev here.  ubuntu-24.04 packages liburing 2.5 and this
+          # tree has not compiled against 2.5 since 6c5c110 (2026-07-28); this
+          # job installed it anyway and was red on every run from that day until
+          # 2026-08-01.  scripts/install-liburing.sh below is the dependency.
+          sudo apt-get install -y build-essential libssl-dev \
             netcat-openbsd bc libluajit-5.1-dev \
             clang-18 libclang-rt-18-dev
           # clang is for libFuzzer only — see the note at the top of this file.
@@ -98,6 +102,9 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+
+      - name: Install liburing
+        run: bash scripts/install-liburing.sh
 
       - name: Generate Makefiles
         run: ./bin/premake5 gmake2
@@ -252,8 +259,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 liburing-dev libssl-dev libluajit-5.1-dev
+          # See the note in the job above: liburing-dev is 2.5 on this runner and
+          # 2.5 does not compile this tree.  This is the job whose failure reads
+          # as six "not declared in this scope" and one incomplete type, with
+          # nothing anywhere naming a package version — so it is the job that
+          # most needed the dependency to be honest.
+          sudo apt-get install -y clang-18 build-essential libssl-dev libluajit-5.1-dev
           clang++-18 --version
+
+      - name: Install liburing
+        run: bash scripts/install-liburing.sh
 
       - name: Compile every source with clang
         run: |

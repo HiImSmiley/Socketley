@@ -55,8 +55,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # liburing is deliberately absent from this list.  ubuntu-24.04 packages 2.5,
+  # this tree has needed >= 2.7 since 6c5c110 (2026-07-28), and every job below
+  # installed 2.5 and then failed to build — the Nightly was red from that day
+  # until 2026-08-01.  Each job runs scripts/install-liburing.sh instead, which
+  # is also what the Dockerfile, CI and the release job use.
   APT_PACKAGES: >-
-    build-essential liburing-dev libssl-dev netcat-openbsd bc libluajit-5.1-dev
+    build-essential libssl-dev netcat-openbsd bc libluajit-5.1-dev
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
@@ -78,6 +83,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       - name: Build (Sanitize)
         run: |
@@ -149,6 +155,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       # Carry-over.  The key rotates per run so each night writes a new entry;
       # restore-keys falls back to the most recent one, which is what makes the
@@ -574,6 +581,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       - name: Build (Debug + invariants, warn-only)
         # The generated makefiles pass $(CPPFLAGS) through, which is how
@@ -676,6 +684,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       - name: Build (Release)
         run: |
@@ -736,6 +745,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       - name: Build (TSan)
         run: |
@@ -782,6 +792,7 @@ jobs:
           luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
           test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
           cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash scripts/install-liburing.sh
 
       - name: Build (Release) and fail on any warning
         # The project's build contract is zero warnings under -Wall -Wextra.

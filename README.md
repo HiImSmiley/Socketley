@@ -47,7 +47,15 @@ curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.s
 
 ```bash
 # Dependencies (Ubuntu/Debian)
-sudo apt install build-essential liburing-dev libssl-dev
+sudo apt install build-essential libssl-dev libluajit-5.1-dev git
+
+# liburing >= 2.7, which is NOT what `apt install liburing-dev` gives you.
+# Ubuntu 24.04 packages liburing 2.5 (April 2024) and the event loop has used
+# IORING_SETUP_NO_SQARRAY, io_uring_register_napi (2.6) and
+# IORING_ACCEPT_POLL_FIRST (2.7) since 2026-07-28, so 2.5 does not compile this
+# tree at all.  This script checks what you have and builds a current release
+# only if it needs to — it exits immediately if your liburing is already good.
+bash scripts/install-liburing.sh
 
 # Build
 ./bin/premake5 gmake2
@@ -322,7 +330,13 @@ bash test/benchmark/run_all.sh
 ## Requirements
 
 - Linux 5.19+ (for io_uring multishot accept)
-- liburing-dev
+- **liburing 2.7 or newer** — `liburing-dev` from Ubuntu 24.04 is 2.5 and will
+  not build this project. Install it with `bash scripts/install-liburing.sh`,
+  which is what CI, the release job and the Dockerfile all use. 2.15 is the
+  version everything is tested against; 2.7 is the oldest that compiles.
+  Distributions carrying 2.7 or later (Debian 13, Fedora 40+, Arch) need no
+  extra step. A binary built this way needs liburing 2.6+ at *run* time, which
+  is why the `.deb` depends on `liburing2 (>= 2.6)`.
 - libssl-dev (TLS on server listeners, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
 
