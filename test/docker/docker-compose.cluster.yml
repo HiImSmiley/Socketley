@@ -1,50 +1,111 @@
-# Docker cluster test: 2 API backends + 1 gateway proxy
+# Docker cluster test: 2 API backends + 1 gateway proxy.
 #
-# Usage: docker compose -f test/docker/docker-compose.cluster.yml up -d
-# Test:  bash test/docker/test_cluster_docker.sh
+# Usage: bash test/docker/test_cluster_docker.sh
+#
+# This is the deployment shape the man page documents under CLUSTER MODE and
+# the only multi-node one it describes: one daemon per container, each on the
+# DEFAULT socket, discovering the others through a directory on a shared
+# volume.  test/integration/test_cluster.sh runs three daemons in one
+# filesystem namespace separated by SOCKETLEY_SOCKET, which is the development
+# simulation of this and cannot see anything that depends on the namespaces
+# being separate.
+#
+# ─── ON `entrypoint:` ────────────────────────────────────────────────────────
+#
+# The image's ENTRYPOINT is ["socketley"], so a compose `command:` is appended
+# to it as arguments.  The version of this file that shipped before had
+#
+#     command: >
+#       sh -c "socketley daemon & sleep 1 && ..."
+#
+# which asks the container to run `socketley sh -c "socketley daemon & ..."` —
+# socketley with a runtime named `sh`.  Overriding entrypoint is what makes the
+# shell the shell rather than an argument.
+#
+# ─── ON ONE `build:` FOR THREE SERVICES ──────────────────────────────────────
+#
+# All three run the same image and only one of them builds it.  Three identical
+# build blocks is three concurrent LTO builds of the same tree racing for the
+# same memory, which on a small machine is the difference between a build and
+# an OOM kill.  test_cluster_docker.sh builds explicitly before it brings
+# anything up.
+
+# ─── ON seccomp ──────────────────────────────────────────────────────────────
+#
+# Without this every node dies at startup with
+#
+#     [ERROR] failed to init event loop
+#
+# and nothing anywhere says why.  Docker's default seccomp profile does not
+# allow io_uring_setup, io_uring_enter or io_uring_register — they were taken
+# out of the allowlist after the io_uring escapes of 2023 and have not come
+# back — so a daemon whose entire I/O layer is a ring cannot start under it.
+# This is not a regression and not something five months of commits did: it has
+# been true of every socketley container since the image existed, and nothing
+# ran one, so nobody found out.
+#
+# `unconfined` is the blunt instrument and it is acceptable here because this is
+# a test cluster on a throwaway network.  A deployment should ship a profile
+# derived from Docker's default with those three syscalls added back, and pass
+# it as `seccomp:/path/to/profile.json` — the point being that the ring needs
+# three syscalls, not that it needs no sandbox.
+x-node: &node
+  image: socketley-cluster-test:latest
+  entrypoint: ["/bin/sh", "/node.sh"]
+  security_opt:
+    - seccomp:unconfined
 
 volumes:
   cluster:
 
 services:
   api1:
+    <<: *node
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api1 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s &&
-             wait"
+      args:
+        # One make job by default; the Release configuration's -flto=auto is
+        # already parallel underneath it.  See the header comment in the
+        # Dockerfile.  CI, which has memory, passes BUILD_JOBS=$(nproc).
+        BUILD_JOBS: ${BUILD_JOBS:-1}
+    # Explicit, not left to compose's default, because this is the address the
+    # daemon advertises to its peers: cluster_discovery takes it from
+    # gethostname(3), and every proxy on another node dials what it finds
+    # there.  It has to be a name this compose network resolves.
+    hostname: api1
+    environment:
+      NODE_NAME: api1
+      NODE_ROLE: backend
+      NODE_RUNTIME: web1
     volumes:
       - cluster:/cluster
+      - ./node.sh:/node.sh:ro
+      - ./identity.lua:/identity.lua:ro
 
   api2:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api2 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s &&
-             wait"
+    <<: *node
+    hostname: api2
+    environment:
+      NODE_NAME: api2
+      NODE_ROLE: backend
+      NODE_RUNTIME: web2
     volumes:
       - cluster:/cluster
+      - ./node.sh:/node.sh:ro
+      - ./identity.lua:/identity.lua:ro
 
   gateway:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name gateway --cluster /cluster &&
-             sleep 1 &&
-             socketley create proxy gw -p 8080 --backend @api --protocol tcp -s &&
-             wait"
+    <<: *node
+    hostname: gateway
+    environment:
+      NODE_NAME: gateway
+      NODE_ROLE: gateway
     volumes:
       - cluster:/cluster
+      - ./node.sh:/node.sh:ro
+    # The gateway is the only published port.  Nothing in group `api` is
+    # reachable from the host at all, so a reply that names a backend can only
+    # have come through the proxy.
     ports:
-      - "18080:8080"
+      - "${GW_PORT:-18080}:8080"
