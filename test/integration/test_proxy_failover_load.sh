@@ -417,7 +417,14 @@ python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 # empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
 # cannot tell the two apart -- so without this the run would go on measuring a
 # corpse and only notice, if at all, at the very end.
-NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+#
+# `|| true` because of `set -o pipefail`: when the pid really is gone -- the
+# case this check exists for -- `ls` fails and the pipeline fails with it.
+# This file runs without `set -e`, so that leaves nothing worse than a status
+# behind; in the sibling tests that do set it, the one check able to report a
+# dead daemon exited the run before it could report one.  The `|| true` is what
+# makes this line safe to copy into a file that has the -e.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
         bad "setup" "pid $DPID is not a live process -- the daemon that answers is not the one this test launched" ;;

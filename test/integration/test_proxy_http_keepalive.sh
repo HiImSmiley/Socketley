@@ -169,7 +169,11 @@ python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 # live process has.  Without it the run measures somebody else's daemon and says
 # nothing about it.
 TOTAL=$((TOTAL+1))
-NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+# `|| true` because of `set -o pipefail`: when the pid really is gone — the
+# case this check exists for — `ls` fails, the pipeline fails, and the script
+# dies right here with no output at all.  The one check that can report a
+# dead daemon could never report one.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
         FAIL=$((FAIL+1))

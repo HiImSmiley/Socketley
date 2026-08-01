@@ -204,7 +204,14 @@ python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 # test has a deliberate, known failure tally (TLS transport is not implemented),
 # and a startup check that also scored a pass on every healthy run would move
 # that tally for a reason that has nothing to do with TLS.
-NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+#
+# `|| true` because of `set -o pipefail`: when the pid really is gone -- the
+# case this check exists for -- `ls` fails and the pipeline fails with it.
+# This file runs without `set -e`, so that leaves nothing worse than a status
+# behind; in the sibling tests that do set it, the one check able to report a
+# dead daemon exited the run before it could report one.  The `|| true` is what
+# makes this line safe to copy into a file that has the -e.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
         bad "setup" "pid $DPID is not a live process -- the daemon that answers is not the one this test launched, so nothing below measures it"

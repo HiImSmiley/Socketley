@@ -254,7 +254,15 @@ python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 # cannot tell the two apart -- so this looks at the descriptor table, which only
 # a live process has.  Said here rather than left to the FD0/FD1 check at the
 # end, which would report it as a descriptor problem long after the fact.
-NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+#
+# `|| true` because of `set -o pipefail`: when the pid really is gone -- the
+# case this check exists for -- `ls` fails and the pipeline fails with it.
+# This file runs without `set -e`, so that leaves nothing worse than a status
+# behind; in the sibling tests that do set it, the one check able to report a
+# dead daemon exited the run before it could report one.  The `|| true` is what
+# makes this line safe to copy into a file that has the -e.  The two FD0/FD1
+# readings below carry it for the same reason.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
         bad "setup" "pid $DPID is not a live process -- the daemon that answers is not the one this test launched" ;;
@@ -281,7 +289,7 @@ if "$BIN" stats "$GW_NAME" >/dev/null 2>&1; then ok; else
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"; exit $((FAIL+HERR))
 fi
 
-FD0=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l)
+FD0=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l || true)
 if [ -z "$FD0" ] || [ "$FD0" -eq 0 ] 2>/dev/null; then FD0=""; fi
 
 # ---- 1. deterministic: one connection, several requests -------------------
@@ -663,7 +671,7 @@ if kill -0 "$DPID" 2>/dev/null; then ok; else bad "daemon alive" "the daemon die
 # readings, and charging fewer connections than the tally still includes is
 # exactly how this check would go red for the wrong reason.
 POOL_A_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_A_RC=$?
-FD1=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l)
+FD1=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l || true)
 POOL_B_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_B_RC=$?
 # Absent means zero: the runtime only prints the line when the pool is non-empty.
 POOL_SED='s/^pooled_connections:\([0-9][0-9]*\)$/\1/p'
