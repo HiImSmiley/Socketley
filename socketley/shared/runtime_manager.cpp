@@ -4,8 +4,10 @@
 #include "event_loop.h"
 #include "cluster_discovery.h"
 #include "lua_context.h"
+#include "route_table.h"
 #include "logging.h"
 #include <cctype>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 
@@ -564,6 +566,16 @@ void runtime_manager::publish_endpoints()
 {
     auto tbl = std::make_shared<endpoint_table>();
 
+    // Every running member of every group, and what it declares — null when it
+    // declares nothing, which is a fact about that group and not a member to be
+    // skipped over.  Folded into one declaration per group below, once here
+    // rather than once inside every proxy that forwards to the group.
+    //
+    // Ordered by member name, and by std::map rather than by sorting later,
+    // because the fold decides the order of the Allow header a client is given
+    // and that must not change with the order a hash map is walked in.
+    std::map<std::string, std::map<std::string, std::shared_ptr<const route_table>>> group_members;
+
     {
         std::shared_lock lock(mutex);
         for (const auto& [name, inst] : runtimes)
@@ -580,9 +592,56 @@ void runtime_manager::publish_endpoints()
             // By group: running only, which is what get_by_group() filtered on.
             // A member that is merely configured has nothing listening.
             const std::string_view group = inst->get_group();
-            if (!group.empty() && inst->get_state() == runtime_running)
+            const bool running = (inst->get_state() == runtime_running);
+            if (!group.empty() && running)
                 tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
+
+            // And what this runtime says it will answer, if its script says so
+            // at all.  The declaration belongs to the handler and is published
+            // to whoever routes to it — see shared/route_table.h.  A runtime
+            // that declares nothing gets no entry, and a proxy in front of it
+            // forwards exactly as it did before this existed.
+            const auto* lctx = inst->lua();
+            std::shared_ptr<const route_table> decl;
+            if (lctx && lctx->has_routes())
+            {
+                decl = std::make_shared<const route_table>(lctx->declared_routes());
+                tbl->set_name_routes(name, decl);
+            }
+            if (!group.empty() && running)
+                group_members[std::string(group)][name] = std::move(decl);
         }
+    }
+
+    // One declaration per group, describing every member at once: a path only
+    // some of them declare is dropped and a path all of them declare keeps the
+    // union of their methods.  A single member that declares nothing therefore
+    // leaves the group with nothing — which is the point, because a request to
+    // the group may land on that member and it has told us nothing about what
+    // it answers.  See route_table::merge_alternative.
+    for (const auto& [group, members] : group_members)
+    {
+        route_table merged;
+        bool started = false;
+        for (const auto& [member, decl] : members)
+        {
+            if (!decl)
+            {
+                started = false;
+                break;
+            }
+            if (!started)
+            {
+                merged = *decl;
+                started = true;
+            }
+            else
+            {
+                merged.merge_alternative(*decl);
+            }
+        }
+        if (started && !merged.empty())
+            tbl->set_group_routes(group, std::make_shared<const route_table>(std::move(merged)));
     }
 
     // Remote members, from the cluster's last scan.  Same filter as

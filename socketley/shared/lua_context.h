@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "route_table.h"
+
 class runtime_instance;
 
 // Lua context for a runtime - manages state and bindings
@@ -55,6 +57,7 @@ public:
         CB_ON_UPSTREAM_DISCONNECT = 1u << 23,
         CB_ON_HTTP_REQUEST       = 1u << 24,
         CB_FILTERS               = 1u << 25,
+        CB_ROUTES                = 1u << 26,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -87,6 +90,9 @@ public:
     // request on the proxy's route path, so it is a mask bit like every other
     // callback here rather than a vector emptiness test.
     bool has_filters()               const { return m_callback_mask & CB_FILTERS; }
+    // Whether the script declared a non-empty `routes` table.  Asked by the
+    // daemon when it publishes the endpoint snapshot, not on any request path.
+    bool has_routes()                const { return m_callback_mask & CB_ROUTES; }
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -117,6 +123,14 @@ public:
     // The chain, in the order the script listed it.  Only valid to read when
     // has_filters() is true; empty otherwise.
     const std::vector<sol::protected_function>& filters() const { return m_filters; }
+
+    // What this script says it will answer.  Read by runtime_manager when it
+    // builds the snapshot every proxy is handed, and by nothing else — a route
+    // declaration is data about this runtime, not a callback into it, which is
+    // the whole reason it can cross a process boundary later.  Empty unless
+    // has_routes().
+    const route_table& declared_routes() const { return m_routes; }
+
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
@@ -166,6 +180,13 @@ private:
     // back as a value this side can act on — the request is refused — rather
     // than as an unwind whose behaviour depends on how LuaJIT was built.
     std::vector<sol::protected_function> m_filters;
+
+    // The `routes` declaration, converted out of Lua once at load time.  A
+    // plain C++ table and not a sol::table: it is published to other runtimes,
+    // and anything that has to survive being sent somewhere cannot be a
+    // reference into this Lua state.
+    route_table m_routes;
+
     uint32_t m_tick_ms{0};
     uint32_t m_callback_mask{0};
 
@@ -199,6 +220,8 @@ private:
 #include <string>
 #include <string_view>
 #include <cstdint>
+
+#include "route_table.h"
 
 class runtime_instance;
 
@@ -238,6 +261,14 @@ public:
     bool has_on_upstream_disconnect() const { return false; }
     bool has_on_http_request()       const { return false; }
     bool has_filters()               const { return false; }
+    bool has_routes()                const { return false; }
+    // A reference to one empty table for every caller: without Lua there is no
+    // script to declare a route, so there is nothing to own per instance.
+    const route_table& declared_routes() const
+    {
+        static const route_table empty;
+        return empty;
+    }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,
