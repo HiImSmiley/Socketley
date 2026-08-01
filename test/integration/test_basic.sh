@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate basic
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
@@ -11,6 +13,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove testsvr 2>/dev/null || true
     "$BIN" remove autosvr 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -37,8 +40,7 @@ assert_contains() {
 echo "=== Integration: basic lifecycle ==="
 
 # Ensure daemon is running (started by run_all.sh or already running)
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Test: create server
 OUT=$("$BIN" create server testsvr -p 19000 2>&1) || true

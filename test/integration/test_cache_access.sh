@@ -30,6 +30,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cacheaccess
 CACHE_PORT=19240
 SERVER_PORT=19241
 PASS=0; FAIL=0; TOTAL=0
@@ -40,6 +42,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove ca_server 2>/dev/null || true
     "$BIN" remove ca_cache 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -71,8 +74,7 @@ send_cmd() {
 echo "=== Integration: cache access via server ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Create cache and server linked to it
 "$BIN" create cache ca_cache -p "$CACHE_PORT" -s 2>&1 || true

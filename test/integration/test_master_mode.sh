@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate mastermode
 PORT=19210
 PASS=0; FAIL=0; TOTAL=0
 
@@ -10,6 +12,7 @@ cleanup() {
     "$BIN" stop master_test 2>/dev/null || true
     sleep 0.5
     "$BIN" remove master_test 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -41,8 +44,7 @@ send_cmd() {
 echo "=== Integration: master mode ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 "$BIN" create server master_test -p "$PORT" --mode master --master-pw secret123 -s 2>&1 || true
 sleep 0.3

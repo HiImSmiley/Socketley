@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate client
 SVR_PORT=19280
 PASS=0; FAIL=0; TOTAL=0
 
@@ -12,6 +14,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove cli_client 2>/dev/null || true
     "$BIN" remove cli_svr 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -38,8 +41,7 @@ assert_ok() {
 echo "=== Integration: client-server ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Create and start server
 "$BIN" create server cli_svr -p "$SVR_PORT" -s 2>&1 || true

@@ -4,14 +4,25 @@
 # Starts 2 daemons with a shared cluster directory, creates servers with
 # Lua scripts that exercise socketley.cluster.* and on_cluster_* callbacks,
 # then verifies the output.
+#
+# Two daemons in one filesystem namespace is a simulation of a cluster, not how
+# one is deployed: members find each other through the shared cluster directory
+# and the network addresses they advertise there, never through socket paths.
+# Both sockets and the state directory are per-run — they used to be two fixed
+# names in /tmp and the caller's real state directory.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
 PASS=0; FAIL=0; TOTAL=0
 
-CLUSTER_DIR=$(mktemp -d)
-SOCK_A="/tmp/socketley-clua-a.sock"
-SOCK_B="/tmp/socketley-clua-b.sock"
+TMPD=$(mktemp -d /tmp/socketley-clua-XXXXXX)
+export HOME="$TMPD/home"
+mkdir -p "$HOME"
+CLUSTER_DIR="$TMPD/cluster"
+mkdir -p "$CLUSTER_DIR"
+SOCK_A="$TMPD/nodeA.sock"
+SOCK_B="$TMPD/nodeB.sock"
 PORT_A=19401
 PORT_B=19402
 DAEMON_PIDS=()
@@ -29,15 +40,25 @@ nodeB() { SOCKETLEY_SOCKET="$SOCK_B" "$BIN" "$@"; }
 
 cleanup() {
     set +e
-    for cmd in nodeA nodeB; do
+    # Only talk to a daemon that is answering.  Test 6 kills nodeB's daemon on
+    # purpose, and these loops then ran `nodeB stop` and `nodeB remove` against
+    # its dead socket — which auto-starts a detached daemon rather than failing,
+    # because that is what every CLI command except `daemon`, `version` and
+    # `help` does when the socket is silent.  Nothing below could kill it: its
+    # pid slot is 0 by then, and the `rm -f` unlinked the socket so it could not
+    # even be found again.  That is one of the two daemons a full suite run left
+    # behind; test_cluster.sh left the other.
+    for sock in "$SOCK_A" "$SOCK_B"; do
+        daemon_alive "$sock" || continue
         for rt in "$RT_A" "$RT_B"; do
-            $cmd stop "$rt" &>/dev/null
+            SOCKETLEY_SOCKET="$sock" "$BIN" stop "$rt" &>/dev/null
         done
     done
     sleep 0.5
-    for cmd in nodeA nodeB; do
+    for sock in "$SOCK_A" "$SOCK_B"; do
+        daemon_alive "$sock" || continue
         for rt in "$RT_A" "$RT_B"; do
-            $cmd remove "$rt" &>/dev/null
+            SOCKETLEY_SOCKET="$sock" "$BIN" remove "$rt" &>/dev/null
         done
     done
     for pid in "${DAEMON_PIDS[@]}"; do
@@ -45,8 +66,10 @@ cleanup() {
         kill "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
     done
-    rm -f "$SOCK_A" "$SOCK_B" "$LUA_OUT" "$LUA_SCRIPT"
-    rm -rf "$CLUSTER_DIR"
+    daemon_sweep "$SOCK_A"
+    daemon_sweep "$SOCK_B"
+    rm -f "$LUA_OUT" "$LUA_SCRIPT"
+    rm -rf "$TMPD"
 }
 trap cleanup EXIT
 
@@ -127,17 +150,29 @@ end
 LUAEOF
 
 # ─── Start daemon A ──────────────────────────────────────────────────────────
-CLUA_OUT_FILE="$LUA_OUT" SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon 2>/dev/null &
-DAEMON_PIDS+=($!)
-sleep 0.3
-SOCKETLEY_SOCKET="$SOCK_A" "$BIN" daemon --name nodeA --cluster "$CLUSTER_DIR"
-sleep 0.2
+#
+# The configuration call below is a CLI command, so it auto-starts a detached
+# daemon of its own if the socket is not answering yet.  The `sleep 0.3` it used
+# to wait was a guess; losing that guess did not fail loudly, it silently left a
+# daemon nobody had the pid of.  Wait for the daemon to say it is up instead.
+start_node() {   # start_node SOCKET NAME [env assignments...]
+    local sock=$1 name=$2 i; shift 2
+    env "$@" SOCKETLEY_SOCKET="$sock" "$BIN" daemon >>"$TMPD/$name.log" 2>&1 &
+    DAEMON_PIDS+=($!)
+    for i in $(seq 1 100); do
+        grep -q "daemon started" "$TMPD/$name.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    if [ ! -S "$sock" ]; then
+        echo "ERROR: daemon $name socket not created"
+        tail -5 "$TMPD/$name.log" 2>/dev/null | sed 's/^/    /'
+        exit 1
+    fi
+    SOCKETLEY_SOCKET="$sock" "$BIN" daemon --name "$name" --cluster "$CLUSTER_DIR"
+}
 
-# Verify socket created
-if [ ! -S "$SOCK_A" ]; then
-    echo "ERROR: daemon A socket not created"
-    exit 1
-fi
+start_node "$SOCK_A" nodeA "CLUA_OUT_FILE=$LUA_OUT"
+sleep 0.2
 
 # ─── Create server on A with Lua script ─────────────────────────────────────
 nodeA create server "$RT_A" -p "$PORT_A" -g api \
@@ -152,10 +187,7 @@ assert_contains "$OUT" "daemon=nodeA"
 assert_contains "$OUT" "stats_daemons=1"
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
-SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon 2>/dev/null &
-DAEMON_PIDS+=($!)
-sleep 0.3
-SOCKETLEY_SOCKET="$SOCK_B" "$BIN" daemon --name nodeB --cluster "$CLUSTER_DIR"
+start_node "$SOCK_B" nodeB
 sleep 0.2
 
 # Create server on B in same group

@@ -14,19 +14,20 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cachebacklog
 PORT=19320
 NAME=backlogcache
 MSGS="${MSGS:-6000}"
 PASS=0; FAIL=0; TOTAL=0
-DAEMON_PID=""
 
 cleanup() {
     "$BIN" stop "$NAME" 2>/dev/null || true
     sleep 0.2
     "$BIN" remove "$NAME" 2>/dev/null || true
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
     rm -f "$TMPD"/* 2>/dev/null || true
     rmdir "$TMPD" 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -94,9 +95,7 @@ print("delivered=%d" % delivered)
 print("closed_early=%d" % (1 if closed_early else 0))
 PY
 
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 
 "$BIN" create cache "$NAME" -p "$PORT" -s >/dev/null 2>&1 || true
 # PING/+PONG, not an accepted connection: a cache accepts before it has

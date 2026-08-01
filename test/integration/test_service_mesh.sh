@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate mesh
 BE1_PORT=19381
 BE2_PORT=19382
 PROXY_PORT=19383
@@ -21,6 +23,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove sidecar_proxy 2>/dev/null || true
     "$BIN" remove sidecar_be 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -62,8 +65,7 @@ assert_exit_code() {
 echo "=== Integration: service mesh ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # --- Test 1: Health check flags accepted on create ---
 "$BIN" create server mesh_be1 -p "$BE1_PORT" -s 2>&1 || true

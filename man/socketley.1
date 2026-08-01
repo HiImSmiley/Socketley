@@ -3420,14 +3420,32 @@ The
 .B was_running
 field tracks whether a runtime should be auto-started on daemon startup.
 .SH ENVIRONMENT
-Tuning knobs read by the daemon at startup. All are optional; the defaults suit
-a general-purpose deployment and only need changing for an unusual workload.
+Read at daemon startup; all are optional. The first selects which daemon this
+is. The rest are tuning knobs whose defaults suit a general-purpose deployment
+and only need changing for an unusual workload.
 .TP
 .B SOCKETLEY_SOCKET
-Path to the IPC socket. Overrides the default lookup
-.RB ( /run/socketley/socketley.sock ,
-then
+Which daemon you are, or which one you are talking to. Overrides the default
+lookup
+.RB ( /run/socketley/socketley.sock
+when installed and privileged, otherwise
 .BR /tmp/socketley.sock ).
+.IP
+No workload calls for setting it. A deployed node — a container or a host — has
+a filesystem namespace to itself, so one daemon on the default path is the whole
+arrangement, and that is what the systemd unit ships. Clustering does not use
+this variable either: members publish themselves into a shared directory and
+reach each other over network addresses, never over socket paths. See
+.BR "CLUSTER MODE" .
+.IP
+What it is for is running several daemons inside
+.I one
+namespace, which is the development and test situation and nothing else. Two
+checkouts on one workstation, or two test runs at once, are otherwise the same
+daemon: whichever process binds the default path first owns it, and every later
+one silently talks to that process instead of starting its own. Anything that
+starts a daemon on the default path is claiming the identity the real daemon
+runs under, so the test suite gives every test a socket of its own.
 .TP
 .B SOCKETLEY_SQPOLL=1
 Give every io_uring ring in this daemon \(em its own, and every worker process it
@@ -3677,6 +3695,9 @@ env, then
 .BR /run/socketley/socketley.sock ,
 then
 .BR /tmp/socketley.sock .
+Set the variable only to reach a daemon that is not the one for this namespace,
+which in practice means a second daemon on a development machine; a deployed
+node runs one daemon on the default path.
 .PP
 .B "Example: lifecycle management"
 .nf

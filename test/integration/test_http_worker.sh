@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate httpworker
 HTTP_PORT=19391
 PASS=0; FAIL=0; TOTAL=0
 LUA_SCRIPT="/tmp/test_http_worker.lua"
@@ -14,6 +16,7 @@ cleanup() {
     "$BIN" remove http_svr 2>/dev/null || true
     "$BIN" remove proto_svr 2>/dev/null || true
     rm -f "$LUA_SCRIPT"
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -30,8 +33,7 @@ assert_contains() {
 echo "=== Integration: HTTP worker + multi-protocol ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # --- Test 1: Lua HTTP worker ---
 

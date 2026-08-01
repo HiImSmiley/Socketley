@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cache
 PORT=19150
 PASS=0; FAIL=0; TOTAL=0
 
@@ -11,6 +13,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove testcache 2>/dev/null || true
     rm -f /tmp/test-cache-$$.bin
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -32,8 +35,7 @@ send_cmd() {
 echo "=== Integration: cache commands ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 "$BIN" create cache testcache -p "$PORT" --persistent /tmp/test-cache-$$.bin -s 2>&1 || true
 sleep 0.3

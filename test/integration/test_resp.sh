@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate resp
 PORT=19250
 PASS=0; FAIL=0; TOTAL=0
 
@@ -10,6 +12,7 @@ cleanup() {
     "$BIN" stop resp_test 2>/dev/null || true
     sleep 0.5
     "$BIN" remove resp_test 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -41,8 +44,7 @@ send_resp() {
 echo "=== Integration: RESP2 protocol ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 "$BIN" create cache resp_test -p "$PORT" --resp -s 2>&1 || true
 sleep 0.3

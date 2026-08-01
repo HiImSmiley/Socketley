@@ -3,12 +3,15 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate dashboard
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop dash_svr 2>/dev/null || true
     sleep 0.5
     "$BIN" remove dash_svr 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -35,8 +38,7 @@ assert_not_empty() {
 echo "=== Integration: dashboard ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Test: dashboard command without metrics (should give info message)
 OUT=$("$BIN" dashboard 2>&1) || true

@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate luacb
 PORT=19400
 PASS=0; FAIL=0; TOTAL=0
 LUA_SCRIPT="/tmp/test-callbacks-$$.lua"
@@ -13,6 +15,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove luasvr 2>/dev/null || true
     rm -f "$LUA_SCRIPT" "$LOG_FILE"
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -27,6 +30,13 @@ assert_log_contains() {
 }
 
 echo "=== Integration: Lua callbacks ==="
+
+# This test never started a daemon of its own: it went straight to `create`, and
+# `create` auto-starts one when the socket does not answer.  So on a machine with
+# nothing running it silently claimed the default socket — the path a deployed
+# daemon runs under — and on a machine with something running it created luasvr
+# inside whatever that was, then stopped and removed it on the way out.
+daemon_start "$BIN"
 
 # Create Lua script that logs callbacks
 cat > "$LUA_SCRIPT" << 'LUAEOF'

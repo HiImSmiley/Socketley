@@ -12,11 +12,12 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cacherepl
 LEADER_PORT=19290
 FOLLOWER_PORT=19291
 KEYS=${KEYS:-20000}
 PASS=0; FAIL=0; TOTAL=0
-DAEMON_PID=""
 
 cleanup() {
     "$BIN" stop replfollower 2>/dev/null || true
@@ -24,7 +25,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove replfollower 2>/dev/null || true
     "$BIN" remove replleader   2>/dev/null || true
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -49,9 +50,7 @@ key_count() {  # port -> number of keys, via the runtime's own stats
 
 echo "=== Integration: cache replication ==="
 
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 
 "$BIN" create cache replleader -p "$LEADER_PORT" -s 2>&1 || true
 sleep 0.5

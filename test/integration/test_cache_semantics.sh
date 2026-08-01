@@ -9,15 +9,16 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cachesem
 PORT=19703
 PASS=0; FAIL=0; TOTAL=0
-DAEMON_PID=""
 
 cleanup() {
     "$BIN" stop semcache 2>/dev/null || true
     sleep 0.3
     "$BIN" remove semcache 2>/dev/null || true
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -39,9 +40,7 @@ if ! command -v redis-cli >/dev/null 2>&1; then
     exit 0
 fi
 
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 "$BIN" create cache semcache -p "$PORT" --resp -s 2>&1 || true
 # PING/+PONG, not an accepted connection: a cache accepts before it has
 # finished loading and can answer.

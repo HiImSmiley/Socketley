@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate persist
 PORT=19270
 PASS=0; FAIL=0; TOTAL=0
 
@@ -10,6 +12,7 @@ cleanup() {
     "$BIN" stop persist_test 2>/dev/null || true
     sleep 0.5
     "$BIN" remove persist_test 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -36,8 +39,7 @@ assert_not_contains() {
 echo "=== Integration: state persistence ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Test: Create server (don't start)
 "$BIN" create server persist_test -p "$PORT" 2>&1 || true

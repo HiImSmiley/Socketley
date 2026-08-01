@@ -31,16 +31,45 @@ else
     SYS_BIN="$(command -v socketley 2>/dev/null)"
 fi
 [ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $BIN_DIR/, PATH)"; exit 1; }
+SYS_BIN=$(readlink -f "$SYS_BIN")
 echo "Testing binary: $SYS_BIN"
 
 # Use a fixed test socket path (avoids system-mode path resolution issues)
 export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
 
+# Kill every daemon running THIS binary.
+#
+# Identity is the executable behind the process, read out of /proc/<pid>/exe,
+# never a command-line pattern.  `pkill -f "$SYS_BIN daemon"`, which is what this
+# used to be, matches any process whose command line merely contains that string
+# — including a shell running this script with the path in its arguments — and an
+# -f match one character too broad kills the run doing the killing.  The exe link
+# cannot be spoofed by an argument and distinguishes checkouts and worktrees from
+# each other, which is the property the old pattern was reaching for.
+sweep_own_daemons() {
+    local p exe
+    for p in $(pgrep -x socketley 2>/dev/null || true); do
+        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+            *" daemon "*|*" daemon") ;;
+            *) continue ;;
+        esac
+        exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+        [ "$exe" = "$SYS_BIN" ] || continue
+        kill -9 "$p" 2>/dev/null || true
+    done
+}
+
+# A suite that leaves daemons behind poisons the next thing anyone measures,
+# including its own next run: the survivors sit on the ports the next run wants
+# and answer for state directories that have been deleted underneath them.  The
+# individual tests each clean up their own daemon; this is the backstop for the
+# case where one of them dies before its trap can run.
 cleanup() {
     if [ -n "$DAEMON_PID" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
+    sweep_own_daemons
     rm -f "$SOCKETLEY_SOCKET"
 }
 trap cleanup EXIT
@@ -74,14 +103,15 @@ run_test "ws_parser" "$BIN_DIR/test_ws_parser"
 echo "--- Integration Tests ---"
 echo ""
 
-# Kill any existing daemon of the binary this run is about to use.
+# Kill any existing daemon of the binary this run is about to use — including
+# anything a previous run of this suite left behind.
 #
-# Matching on "socketley daemon" alone matches every socketley daemon on the
-# machine, including ones belonging to a different checkout — two suites running
-# from separate worktrees killed each other's daemon mid-test, and the resulting
-# failures pointed at whatever test happened to be running rather than at the
-# collision. The binary path is what distinguishes them.
-pkill -f "$SYS_BIN daemon" 2>/dev/null || true
+# Killing every socketley daemon on the machine would take out ones belonging to
+# a different checkout; two suites running from separate worktrees killed each
+# other's daemon mid-test, and the resulting failures pointed at whatever test
+# happened to be running rather than at the collision.  The executable is what
+# distinguishes them.
+sweep_own_daemons
 sleep 0.2
 rm -f "$SOCKETLEY_SOCKET"
 

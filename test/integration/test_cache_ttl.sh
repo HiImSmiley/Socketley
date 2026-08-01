@@ -17,11 +17,12 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate cachettl
 PORT=19280
 STORE="/tmp/test-cache-ttl-$$.bin"
 PASS=0; FAIL=0; TOTAL=0
 
-DAEMON_PID=""
 
 cleanup() {
     "$BIN" stop ttlcache 2>/dev/null || true
@@ -31,8 +32,8 @@ cleanup() {
     # already running, so the one started below exits immediately and this kill
     # fails.  An EXIT trap ending on a non-zero status makes the whole script
     # report failure even though every assertion passed.
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
     rm -f "$STORE"
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -56,9 +57,7 @@ echo "=== Integration: cache TTL expiry ==="
 # stdout must be redirected as well, not just stderr: a backgrounded daemon
 # inherits the script's stdout, and if that is a pipe the reader never sees EOF
 # while the daemon lives — the caller hangs instead of getting the results.
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 
 "$BIN" create cache ttlcache -p "$PORT" --persistent "$STORE" 2>&1 || true
 "$BIN" start ttlcache 2>&1 || true

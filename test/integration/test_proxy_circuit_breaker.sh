@@ -13,10 +13,12 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate breaker
 OK_BE=19901; OK_PROXY=19900
 BAD_BE=19911; BAD_PROXY=19910
 PASS=0; FAIL=0; TOTAL=0
-DAEMON_PID=""; BE_PIDS=()
+BE_PIDS=()
 
 cleanup() {
     "$BIN" stop cb_ok   2>/dev/null || true
@@ -25,7 +27,7 @@ cleanup() {
     "$BIN" remove cb_ok  2>/dev/null || true
     "$BIN" remove cb_bad 2>/dev/null || true
     for p in "${BE_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -97,9 +99,7 @@ count_codes() {     # proxy port, name, requests -> "<n200> <n503>"
     echo "$n200 $n503"
 }
 
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 
 start_backend healthy "$OK_BE"  || { echo "  SKIP: healthy backend did not start"; exit 0; }
 start_backend failing "$BAD_BE" || { echo "  SKIP: failing backend did not start"; exit 0; }

@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate ws
 PORT=19200
 PASS=0; FAIL=0; TOTAL=0
 
@@ -10,6 +12,7 @@ cleanup() {
     "$BIN" stop ws_test 2>/dev/null || true
     sleep 0.5
     "$BIN" remove ws_test 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -37,8 +40,7 @@ assert_contains() {
 echo "=== Integration: WebSocket ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 "$BIN" create server ws_test -p "$PORT" -s 2>&1 || true
 sleep 0.3

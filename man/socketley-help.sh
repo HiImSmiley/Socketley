@@ -1745,6 +1745,9 @@ sdk_tier1() {
     echo -e "  1. \$SOCKETLEY_SOCKET env var"
     echo -e "  2. /run/socketley/socketley.sock"
     echo -e "  3. /tmp/socketley.sock"
+    echo -e "  The default path is the daemon's identity for this namespace — a"
+    echo -e "  deployed node runs one daemon on it. Set the env var only to run or"
+    echo -e "  reach a second daemon on a dev machine; clustering does not use it."
     echo ""
 
     echo -e "${BOLD}Example — Lifecycle:${NC}"

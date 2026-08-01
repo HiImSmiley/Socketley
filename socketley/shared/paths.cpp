@@ -22,7 +22,23 @@ socketley_paths socketley_paths::resolve()
 {
     socketley_paths p;
 
-    // SOCKETLEY_SOCKET env var overrides socket path (used by cluster multi-daemon setups)
+    // SOCKETLEY_SOCKET overrides the socket path.  It is a development and test
+    // affordance: it exists so that several daemons can coexist inside one
+    // filesystem namespace, which is only ever the situation on a workstation or
+    // in a test run.
+    //
+    // It is not how clustering works, whatever the previous wording here said.
+    // Cluster members do not find each other through socket paths at all — each
+    // daemon publishes dir/<name>.json into a shared directory and peers reach
+    // one another over the network addresses they advertise there.  A real node
+    // is a container or a host, so it has a namespace to itself and runs on the
+    // default path; the systemd unit says as much, one daemon per host with a
+    // RuntimeDirectory and no override in sight.
+    //
+    // Which is why the default path is an identity rather than a mere default.
+    // A process that binds it *is* the daemon for that namespace, and anything
+    // that starts a daemon there — a test, most of all — is claiming the
+    // identity the deployed daemon runs under.
     const char* env_socket = std::getenv("SOCKETLEY_SOCKET");
 
     bool installed = access("/usr/bin/socketley", X_OK) == 0;

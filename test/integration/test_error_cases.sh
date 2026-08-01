@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate errorcases
 PORT=19290
 PASS=0; FAIL=0; TOTAL=0
 
@@ -15,14 +17,14 @@ cleanup() {
     "$BIN" remove err_svr2 2>/dev/null || true
     "$BIN" remove err_svr3 2>/dev/null || true
     "$BIN" remove err_badport 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
 echo "=== Integration: error cases ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Test: Create server with invalid port (99999)
 RC=0

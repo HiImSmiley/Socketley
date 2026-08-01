@@ -4,17 +4,30 @@
 # Starts 3 daemons on localhost with separate sockets and a shared cluster
 # directory, then verifies discovery, group resolution, and proxy @group routing.
 #
-# NOTE: All daemons share the same state directory (/var/lib/socketley/runtimes),
-# so runtime names must be globally unique and explicitly cleaned up.
+# Three daemons in one filesystem namespace is what SOCKETLEY_SOCKET is for, and
+# it is a simulation: a real cluster member is a container or a host, so it has a
+# namespace to itself and runs on the default path.  Members find each other
+# through the shared cluster directory and network addresses, never through
+# socket paths.
+#
+# Everything below is per-run — sockets, state directory, cluster directory.  The
+# socket paths used to be three fixed names in /tmp, which meant two runs of this
+# file on one machine were the same three daemons, and the state directory was
+# shared by all three nodes and by every other test on the box.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
 PASS=0; FAIL=0; TOTAL=0
 
-CLUSTER_DIR=$(mktemp -d)
-SOCK_NODE1="/tmp/socketley-cluster-node1.sock"
-SOCK_NODE2="/tmp/socketley-cluster-node2.sock"
-SOCK_GW="/tmp/socketley-cluster-gw.sock"
+TMPD=$(mktemp -d /tmp/socketley-cluster-XXXXXX)
+export HOME="$TMPD/home"
+mkdir -p "$HOME"
+CLUSTER_DIR="$TMPD/cluster"
+mkdir -p "$CLUSTER_DIR"
+SOCK_NODE1="$TMPD/node1.sock"
+SOCK_NODE2="$TMPD/node2.sock"
+SOCK_GW="$TMPD/gw.sock"
 NODE1_PORT=19301
 NODE2_PORT=19302
 GW_PORT=19310
@@ -31,16 +44,36 @@ gw()    { SOCKETLEY_SOCKET="$SOCK_GW"    "$BIN" "$@"; }
 
 cleanup() {
     set +e
-    # Stop and remove runtimes (via whichever daemon owns them)
-    for cmd in node1 node2 gw; do
+    # ─── Why the stops are guarded ─────────────────────────────────────────────
+    #
+    # This is where two daemons per suite run used to be born.  Test 6 kills
+    # node2's daemon on purpose, and then this function ran `node2 stop` and
+    # `node2 remove` regardless — CLI commands against a socket with nothing
+    # behind it.  Every CLI command except `daemon`, `version` and `help`
+    # auto-starts a daemon when the socket does not answer, forking and
+    # setsid-ing one detached from this shell, so each of those calls raised a
+    # brand new daemon on node2's socket.  The kill loop below skips it (its slot
+    # is 0 by then and the pid would be wrong anyway), the `rm -f` unlinked the
+    # socket so nothing could even see it afterwards, and the process stayed up
+    # until someone went looking.  A full suite reliably left two behind, from
+    # here and from test_cluster_lua.sh, and they then sat on the next run's
+    # ports and heartbeated into whatever cluster directory came along.
+    #
+    # So: only talk to a daemon that is answering, and sweep by socket at the end
+    # for anything that got raised anyway.
+    for sock_var in SOCK_NODE1 SOCK_NODE2 SOCK_GW; do
+        eval "sock=\$$sock_var"
+        daemon_alive "$sock" || continue
         for rt in "$RT_API1" "$RT_API2" "$RT_GW"; do
-            $cmd stop "$rt" &>/dev/null
+            SOCKETLEY_SOCKET="$sock" "$BIN" stop "$rt" &>/dev/null
         done
     done
     sleep 0.5
-    for cmd in node1 node2 gw; do
+    for sock_var in SOCK_NODE1 SOCK_NODE2 SOCK_GW; do
+        eval "sock=\$$sock_var"
+        daemon_alive "$sock" || continue
         for rt in "$RT_API1" "$RT_API2" "$RT_GW"; do
-            $cmd remove "$rt" &>/dev/null
+            SOCKETLEY_SOCKET="$sock" "$BIN" remove "$rt" &>/dev/null
         done
     done
 
@@ -50,8 +83,10 @@ cleanup() {
         kill "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
     done
-    rm -f "$SOCK_NODE1" "$SOCK_NODE2" "$SOCK_GW"
-    rm -rf "$CLUSTER_DIR"
+    daemon_sweep "$SOCK_NODE1"
+    daemon_sweep "$SOCK_NODE2"
+    daemon_sweep "$SOCK_GW"
+    rm -rf "$TMPD"
 }
 trap cleanup EXIT
 
@@ -79,30 +114,33 @@ assert_not_contains() {
 echo "=== Integration: cluster discovery ==="
 
 # ─── Start 3 daemons ──────────────────────────────────────────────────────────
-
-SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon 2>/dev/null &
-DAEMON_PIDS+=($!)
-sleep 0.3
-SOCKETLEY_SOCKET="$SOCK_NODE1" "$BIN" daemon --name node1 --cluster "$CLUSTER_DIR"
-
-SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon 2>/dev/null &
-DAEMON_PIDS+=($!)
-sleep 0.3
-SOCKETLEY_SOCKET="$SOCK_NODE2" "$BIN" daemon --name node2 --cluster "$CLUSTER_DIR"
-
-SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon 2>/dev/null &
-DAEMON_PIDS+=($!)
-sleep 0.3
-SOCKETLEY_SOCKET="$SOCK_GW" "$BIN" daemon --name gateway --cluster "$CLUSTER_DIR"
-sleep 0.5
-
-# Verify all sockets exist
-for sock in "$SOCK_NODE1" "$SOCK_NODE2" "$SOCK_GW"; do
+#
+# `daemon --name ... --cluster ...` is configuration mode: it talks to a daemon
+# that is already up, and like every other CLI command it auto-starts a detached
+# one when the socket does not answer.  The `sleep 0.3` this used to wait was a
+# guess about how long binding takes, and losing that guess on a loaded machine
+# did not fail — it started a second daemon nobody had the pid of.  Waiting for
+# the daemon to say it is up removes the race rather than widening it.
+start_node() {   # start_node SOCKET NAME
+    local sock=$1 name=$2 i
+    SOCKETLEY_SOCKET="$sock" "$BIN" daemon >>"$TMPD/$name.log" 2>&1 &
+    DAEMON_PIDS+=($!)
+    for i in $(seq 1 100); do
+        grep -q "daemon started" "$TMPD/$name.log" 2>/dev/null && break
+        sleep 0.1
+    done
     if [ ! -S "$sock" ]; then
         echo "ERROR: daemon socket $sock not created"
+        tail -5 "$TMPD/$name.log" 2>/dev/null | sed 's/^/    /'
         exit 1
     fi
-done
+    SOCKETLEY_SOCKET="$sock" "$BIN" daemon --name "$name" --cluster "$CLUSTER_DIR"
+}
+
+start_node "$SOCK_NODE1" node1
+start_node "$SOCK_NODE2" node2
+start_node "$SOCK_GW"    gateway
+sleep 0.5
 
 # ─── Create runtimes ──────────────────────────────────────────────────────────
 

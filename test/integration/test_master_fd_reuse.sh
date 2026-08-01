@@ -12,16 +12,17 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate masterfd
 PORT=19810
 PW=s3cret
 PASS=0; FAIL=0; TOTAL=0
-DAEMON_PID=""
 
 cleanup() {
     "$BIN" stop mfdsrv 2>/dev/null || true
     sleep 0.3
     "$BIN" remove mfdsrv 2>/dev/null || true
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -32,9 +33,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-"$BIN" daemon >/dev/null 2>&1 &
-DAEMON_PID=$!
-sleep 0.5
+daemon_start "$BIN"
 "$BIN" create server mfdsrv -p "$PORT" --mode master --master-pw "$PW" -s 2>&1 || true
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3

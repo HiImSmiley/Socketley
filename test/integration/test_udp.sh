@@ -3,6 +3,8 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate udp
 PORT=19220
 PASS=0; FAIL=0; TOTAL=0
 
@@ -12,6 +14,7 @@ cleanup() {
     sleep 0.5
     "$BIN" remove udp_client 2>/dev/null || true
     "$BIN" remove udp_test 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -28,8 +31,7 @@ assert_contains() {
 echo "=== Integration: UDP ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 # Test: Create UDP server
 "$BIN" create server udp_test -p "$PORT" --udp -s 2>&1 || true

@@ -3,12 +3,15 @@
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_isolate stats
 PORT=19200
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop statsvr 2>/dev/null || true
     "$BIN" remove statsvr 2>/dev/null || true
+    daemon_stop
 }
 trap cleanup EXIT
 
@@ -25,8 +28,7 @@ assert_contains() {
 echo "=== Integration: stats command ==="
 
 # Ensure daemon is running
-"$BIN" daemon 2>/dev/null &
-sleep 0.3
+daemon_start "$BIN"
 
 "$BIN" create server statsvr -p "$PORT" -s 2>&1 || true
 sleep 0.3
