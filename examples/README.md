@@ -44,7 +44,7 @@ examples/
 
 ### Server
 - `tls-server.sh` - TLS on a server listener, plus mutual TLS; also shows what
-  is refused (TLS on a client, proxy or cache, and any incomplete key pair)
+  is refused (TLS on a client or cache, and any incomplete key pair)
 - `auth-token.lua`, `auth-ip-allowlist.lua` - connection authorisation
 - `rate-limit.lua`, `session-ids.lua`, `websocket-session.lua` - per-connection state
 - `upstream-hub.lua`, `service-discovery.lua` - upstream and discovery patterns
@@ -55,6 +55,8 @@ examples/
 - `load-balancer.sh` - Round-robin load balancing
 - `group-discovery.sh` - Dynamic backends with `@group` discovery
 - `tcp-proxy.sh` - Raw TCP byte forwarding
+- `tls-proxy.sh` - TLS on both legs: the proxy's own listener, and an
+  `https://` backend whose chain and name are verified
 - `multi-backend.lua` - Multiple backends with Lua
 
 ### Cache

@@ -105,22 +105,26 @@ is a high-performance Linux daemon and CLI that manages network runtimes
 (servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
-.B "TLS terminates on a server listener only."
+.B "TLS terminates on a server listener and on both of a proxy's legs."
 A
 .B server
 runtime encrypts its own listening port with
 .BR \-\-tls " " \-\-cert " " \-\-key ,
 and verifies client certificates with
 .BR \-\-ca .
-No other role performs a handshake: a client runtime's outbound socket, a
-proxy's backend leg and the mesh
+A
+.B proxy
+does the same on its own port, verifies client certificates with
 .BR \-\-client\-ca ,
-.B \-\-client\-cert
-and
-.B \-\-client\-key
-options are rejected with exit status 1, and a runtime carrying any of them
-(for example one restored from a state file written by an older release)
-refuses to start rather than running in cleartext. See
+and reaches an
+.B https://
+backend over TLS \(em verifying the chain and the endpoint's name, and
+presenting a client certificate with
+.BR \-\-client\-cert " " \-\-client\-key .
+A client runtime's outbound socket and a cache's listener still perform no
+handshake: their TLS options are rejected with exit status 1, and a runtime
+carrying any of them (for example one restored from a state file written by an
+older release) refuses to start rather than running in cleartext. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -362,24 +366,32 @@ which reach the full field set.
 The TLS flags are the exception to that wording. Editing is the usual way to
 put encryption on something already running, so on a
 .B server
+or
+.B proxy
 runtime
 .BR \-\-tls ,
 .BR \-\-cert ,
 .B \-\-key
 and
 .B \-\-ca
-are accepted here and take effect at the runtime's next start. An edit that
-would leave the set incomplete \(em a certificate with no
-.BR \-\-tls ,
-.B \-\-tls
-with no key pair \(em is refused and changes nothing, so a mistyped flag
-cannot leave a runtime half-configured.
-On any other runtime type, and for the proxy's
+\(em and, on a proxy,
 .BR \-\-client\-ca ,
 .B \-\-client\-cert
 and
-.BR \-\-client\-key ,
-they are refused with the same message
+.B \-\-client\-key
+\(em are accepted here and take effect at the runtime's next start.
+Certificates are read when a runtime starts, so a running one keeps the
+identity it handshook with until it is restarted. An edit that would leave the
+set incomplete \(em a certificate with no
+.BR \-\-tls ,
+.B \-\-tls
+with no key pair, half a client-certificate pair \(em is refused and changes
+nothing, so a mistyped flag cannot leave a runtime half-configured.
+On a
+.B client
+or
+.B cache
+runtime they are refused with the same message
 .B create
 gives \(em no handshake exists behind them \(em rather than
 .BR "unknown flag" .
@@ -407,16 +419,25 @@ are ignored. Fields marked
 cannot be changed while the runtime is running.
 Port, protocol, and UDP settings cannot be changed while running.
 .PP
-A JSON document that sets
+A JSON document is held to the same rules the flags are: on a
+.B client
+or
+.B cache
+runtime, setting
 .BR tls ,
 .BR cert_path ,
-.BR key_path ,
-.BR ca_path ,
+.BR key_path " or " ca_path
+is rejected outright and nothing is applied \(em neither role performs a
+handshake. On a
+.B server
+or
+.B proxy
+the fields are accepted as a complete set and refused as an incomplete one, and
 .BR client_ca ,
 .B client_cert
-or
+and
 .B client_key
-is rejected outright and nothing is applied \(em TLS is not implemented (see
+belong to a proxy alone (see
 .BR LIMITATIONS ).
 A document that simply omits those fields is accepted and clears them, which
 is how a runtime restored from an older state file is made startable again:
@@ -458,10 +479,10 @@ rate_limit	number	Messages/sec per connection (0 = unlimited)
 global_rate_limit	number	Messages/sec across all connections (0 = unlimited)
 idle_timeout	number	Close idle connections after N seconds (0 = disabled)
 drain	bool	Graceful shutdown (flush writes before close)
-tls	bool	Terminate TLS on the listener \fB(server only)\fR
-cert_path	string	PEM certificate \fB(server only, needs tls)\fR
-key_path	string	PEM private key \fB(server only, needs tls)\fR
-ca_path	string	Client CA for mutual TLS \fB(server only, needs tls)\fR
+tls	bool	Terminate TLS on the listener \fB(server, proxy)\fR
+cert_path	string	PEM certificate \fB(server, proxy; needs tls)\fR
+key_path	string	PEM private key \fB(server, proxy; needs tls)\fR
+ca_path	string	Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends
 target	string	Client target host:port \fB(requires restart)\fR
 cache_name	string	Connected cache runtime name
 group	string	Group tag for dynamic proxy discovery
@@ -505,9 +526,9 @@ circuit_timeout	number	Seconds before half-open (default 30)
 backend_timeout	number	Seconds for the first response byte (default 2, 0 = off)
 retry	number	Retry count (0 = disabled)
 retry_all	bool	Also retry non-idempotent methods
-client_ca	string	\fB(rejected)\fR mTLS is not implemented
-client_cert	string	\fB(rejected)\fR mTLS is not implemented
-client_key	string	\fB(rejected)\fR mTLS is not implemented
+client_ca	string	CA for certificates clients present \fB(needs tls)\fR
+client_cert	string	Client certificate presented to backends
+client_key	string	Its private key (both or neither)
 sidecar	bool	Enable sidecar defaults
 .TE
 .PP
@@ -709,7 +730,7 @@ but flushes all pending write queues before closing connections.
 .BI "\-\-key " "file"
 .TQ
 .BI "\-\-ca " "file"
-.B "Server runtimes only."
+.B "Server and proxy runtimes."
 Terminate TLS on this runtime's own listening port.
 .B \-\-tls
 turns encryption on and requires both
@@ -717,9 +738,22 @@ turns encryption on and requires both
 (a PEM certificate, chain allowed) and
 .BI \-\-key " file"
 (its PEM private key).
+.PP
 .BI \-\-ca " file"
-additionally enables mutual TLS: a client must then present a certificate
-signed by that CA, and one that does not is rejected during the handshake.
+means one thing on each role, because a proxy has a second leg and a server
+does not. On a
+.B server
+it enables mutual TLS: a client must then present a certificate signed by that
+CA, and one that does not is rejected during the handshake. On a
+.B proxy
+it is the trust store used to verify the certificate a
+.B backend
+presents \(em the proxy's own listener asks for client certificates with
+.BI \-\-client\-ca " file"
+instead. See
+.B "mTLS Flags"
+under
+.BR "PROXY FLAGS" .
 .PP
 Certificates are read when the runtime starts, so
 .B reload
@@ -735,9 +769,9 @@ state and nothing binds the port. There is no fallback to cleartext on any
 path.
 .PP
 On a
-.BR client ", " proxy " or " cache
-runtime these flags are rejected with exit status 1 \(em nothing there
-performs a handshake. They are also refused on a server combined with
+.BR client " or " cache
+runtime these flags are rejected with exit status 1 \(em neither performs a
+handshake. They are also refused on a server combined with
 .B \-\-udp
 (that would need DTLS) or with
 .B \-\-upstream
@@ -976,6 +1010,17 @@ Add backend server. Can be ip:port, runtime name, or
 to dynamically target all running members of that group. Repeatable or comma-separated.
 Group backends are resolved at connection time, so new group members are picked up
 automatically without restarting the proxy.
+.IP
+An address may carry a scheme:
+.BI https:// host : port
+is reached over TLS,
+.BI http:// host : port
+in cleartext, and a bare
+.IB host : port
+follows whatever the backend-TLS options below say. The port may be omitted
+after a scheme, in which case it is 443 or 80. See
+.B "mTLS Flags"
+for what verifies such a connection.
 .TP
 .BI "\-\-strategy " "strategy"
 Load balancing strategy:
@@ -1123,19 +1168,67 @@ find them there. See
 under
 .BR LIMITATIONS .
 .SS mTLS Flags
+A proxy has two legs and each has its own half of mutual TLS. The names say
+which: \fBclient\fR here always means "a TLS client", and the proxy is one of
+those towards its backends while its own callers are ones towards it.
 .TP
 .BI "\-\-client\-ca " "path"
-.TQ
+The CA that a certificate presented
+.I by a client
+must be signed by. This is mutual TLS on the proxy's own listening port, so it
+requires
+.BR \-\-tls " " \-\-cert " " \-\-key ;
+without them it is refused, because on a cleartext port it would authenticate
+nobody while
+.B inspect
+reported mutual TLS.
+.TP
 .BI "\-\-client\-cert " "path"
 .TQ
 .BI "\-\-client\-key " "path"
-.B "Not implemented \(em rejected."
-Mutual TLS needs a TLS handshake, and the proxy performs none: it speaks
-plaintext to its clients and plaintext to its backends. Each flag exits
-with status 1 and a message naming the flag. See
-.B TLS
-under
-.BR LIMITATIONS .
+The certificate and key this proxy presents
+.I to a backend
+that asks for one. Both or neither: half a pair loads nothing, so it is
+refused rather than leaving a leg that presents no certificate after the flag
+said it would.
+.PP
+Any of
+.BR \-\-ca ,
+.B \-\-client\-cert
+and
+.B \-\-client\-key
+also turns the backend leg itself to TLS, for every backend \(em none of the
+three means anything against a cleartext peer, and honouring them without
+encrypting would be the fail-open reading of all three. Use an
+.B https://
+backend address instead to encrypt one backend and leave its neighbours alone.
+.PP
+A TLS backend connection is
+.B verified,
+always: the chain against
+.BI \-\-ca " file"
+when one is given and against the system CA store otherwise, and the
+certificate against the endpoint the request was routed to \(em a host name
+matched against the certificate's DNS names with partial wildcards refused, an
+address literal against its IP SAN. TLS 1.2 is the minimum version. There is
+no option to disable any of that; a backend presenting a private-CA or
+self-signed certificate needs that CA in
+.BI \-\-ca " file"
+or in the store OpenSSL reads. A backend whose certificate fails either check
+is answered 502 (or retried, where
+.B \-\-retry
+is set) and is charged to its circuit breaker \(em the request is never sent
+in the clear as a fallback.
+.PP
+Two costs come with the backend leg. Connections to a TLS backend are
+.B not pooled,
+so each request pays for a handshake: a pooled socket is handed out on a host
+and a port, which cannot express the session and peer identity a TLS
+connection carries. And
+.B \-\-health\-check http
+is refused alongside it, because a plaintext probe against a TLS port would
+mark every backend unhealthy; use
+.BR "\-\-health\-check tcp" .
 .SS Sidecar Mode
 .TP
 .B \-\-sidecar
@@ -2209,6 +2302,15 @@ endpoint it was opened to, never under the group, so it is only ever
 handed back to a request routed to that same member; a member that leaves
 the group has its pooled connections closed at once rather than left to
 the idle sweep.
+.PP
+It does not cover a
+.B TLS
+backend. The pool is keyed by host and port, and a TLS connection carries more
+than an address \(em a negotiated session, a peer identity that was verified
+against a name, and possibly a client certificate \(em none of which that key
+can express. Handing one to the next request for the same endpoint would be a
+guess about identity, so such connections are closed after their response and
+each request to a TLS backend pays for a fresh handshake.
 .SS Retries
 When
 .B \-\-retry
@@ -2218,19 +2320,40 @@ retried; use
 .B \-\-retry\-all
 to include POST and PATCH.
 .SS mTLS
-.B "Not available."
-Neither side of the proxy is encrypted: it accepts plaintext from clients and
-sends plaintext to backends, whatever the flags say. The
-.BR \-\-client\-ca ,
+Both legs can be encrypted.
+.BR "\-\-tls \-\-cert \-\-key"
+terminates TLS on the proxy's own port and
+.B \-\-client\-ca
+makes it demand a certificate from its callers;
+.B https://
+on a backend address, or any of
+.BR \-\-ca ,
 .B \-\-client\-cert
 and
-.B \-\-client\-key
-flags are rejected. Terminate TLS in front of the proxy (for example with
-nginx, HAProxy or stunnel) and run socketley on a loopback or otherwise
-trusted network path. See
-.B TLS
+.BR \-\-client\-key ,
+takes the backend leg to TLS, with the chain and the endpoint's name verified
+and a client certificate presented when one is configured. A full sidecar pair
+looks like this:
+.nf
+socketley create proxy edge -p 8443 \\
+    \-\-tls \-\-cert edge.pem \-\-key edge\-key.pem \\
+    \-\-client\-ca mesh\-ca.pem \\
+    \-\-backend https://10.0.0.7:8443 \\
+    \-\-ca mesh\-ca.pem \\
+    \-\-client\-cert edge.pem \-\-client\-key edge\-key.pem \\
+    \-\-sidecar \-s
+.fi
+.PP
+Two things to plan for: a TLS backend connection is never returned to the
+connection pool, so every request to one pays for a handshake, and
+.B \-\-health\-check http
+is refused against a TLS backend \(em use
+.BR "\-\-health\-check tcp" .
+See
+.B "mTLS Flags"
 under
-.BR LIMITATIONS .
+.B "PROXY FLAGS"
+for what is verified and what cannot be switched off.
 .SS Sidecar Deployment
 The
 .B \-\-sidecar
@@ -2555,19 +2678,29 @@ socketley create proxy gateway -p 8080 \\
     \-\-retry 3 \-\-circuit\-threshold 10 -s
 .fi
 .PP
-Proxy with mTLS \(em not supported. TLS terminates on a
-.B server
-listener only; a proxy speaks plaintext to clients and to backends, so every
-one of these flags is rejected rather than stored:
+Proxy with mTLS on both legs. The listener terminates TLS and demands a
+certificate from its callers; the backend leg dials TLS, verifies the chain
+and the endpoint's name, and presents a certificate of its own:
 .PP
 .nf
 socketley create proxy secure \-p 8443 \\
     \-\-tls \-\-cert proxy.pem \-\-key proxy\-key.pem \\
     \-\-client\-ca trusted\-clients.pem \\
     \-\-client\-cert backend\-client.pem \-\-client\-key backend\-client\-key.pem \\
-    \-\-backend 10.0.0.1:9000 -s
-# --tls: TLS transport is not implemented for this runtime -- ...
-# exit status 1
+    \-\-ca mesh\-ca.pem \\
+    \-\-backend https://10.0.0.1:9000 -s
+# Backend connections are not pooled: one handshake per request.
+# --health-check http is refused against a TLS backend; use tcp.
+.fi
+.PP
+TLS to the backend only \(em the proxy listens in cleartext on loopback and
+encrypts the hop that leaves the machine:
+.PP
+.nf
+socketley create proxy egress \-p 8080 \\
+    \-\-backend https://api.example.com \-s
+# Verified against the system CA store, name checked against the certificate.
+# A private CA goes in --ca; there is no way to skip verification.
 .fi
 .PP
 Open the live dashboard:
@@ -3026,7 +3159,8 @@ loop()     -> event_loop&
 client(string_view host, uint16_t port)
 
 // Config
-tls()  tls_ca(ca)  // NOT IMPLEMENTED - a client dials in cleartext
+tls()  tls_ca(ca)  // NOT IMPLEMENTED - a client dials in cleartext,
+                   // so start() refuses rather than dialling
 reconnect(max)     mode(m)            udp()
 lua(path)          tick_interval(ms)
 
@@ -3047,7 +3181,10 @@ proxy(uint16_t port)
 
 // Config
 backend(addr)      strategy(s)        protocol(p)
-tls(cert, key)     // NOT IMPLEMENTED - refused, no handshake here
+tls(cert, key)     // terminates TLS on this proxy's listener
+client_ca(ca)      // mutual TLS on it: clients must present a certificate
+backend_ca(ca)     // trust store for the backend leg; turns that leg to TLS
+client_cert(c, k)  // the certificate presented to a backend that asks
 max_connections(n) idle_timeout(s)
 lua(path)          group(g)
 
@@ -3080,16 +3217,27 @@ per process (the signal handler points to one event_loop).
 blocks until SIGINT/SIGTERM. For multi-runtime or async patterns, use the raw API
 via the escape hatches or directly.
 .PP
-.B "TLS is not implemented."
-The
-.BR tls() ,
-.B tls_ca()
+.B "TLS: on a server and a proxy only."
+.B server().tls()
 and
-.B set_tls()
-entry points store their arguments and are read by nothing; unlike the CLI,
-the embedded API does not refuse them, so an SDK binary calling
-.B tls()
-listens in cleartext. Do not call them. See
+.B proxy().tls()
+terminate TLS on that runtime's listener, and
+.BR proxy().backend_ca() ,
+.B proxy().client_ca()
+and
+.B proxy().client_cert()
+configure the proxy's two legs, exactly as the CLI flags do \(em
+.B start()
+goes through
+.B runtime_manager::start
+and reaches the same gate. On a
+.B client
+or
+.B cache
+builder the same entry points still store their arguments and are read by
+nothing, and there
+.B start()
+refuses rather than listening in cleartext. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -3370,7 +3518,7 @@ Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route
 from pushed data the way the proxy now does.
 .SS TLS
-.B "One role terminates TLS: a server runtime's own listener."
+.B "Two roles terminate TLS: a server runtime's own listener, and a proxy \(em on both of its legs."
 Created with
 .BR "\-\-tls \-\-cert " file " \-\-key " file ,
 a
@@ -3388,15 +3536,45 @@ work on a listener configured this way.
 .BI \-\-ca " file"
 adds mutual TLS \(em a client must present a certificate signed by that CA.
 .PP
+A
+.B proxy
+runs the same record layer on both of its legs. The same three flags terminate
+TLS on its listening port and
+.BI \-\-client\-ca " file"
+makes it demand a certificate from its callers; an
+.B https://
+backend address \(em or
+.BR \-\-ca ,
+.B \-\-client\-cert
+or
+.BR \-\-client\-key ,
+which apply to every backend \(em takes the backend leg to TLS, with
+.B \-\-client\-cert
+and
+.B \-\-client\-key
+presenting a certificate to a backend that asks for one. A TLS backend
+connection is always verified, against
+.B \-\-ca
+or the system store, with the endpoint's name checked and TLS 1.2 as the
+minimum version; there is no option to turn that off. Two consequences worth
+knowing: such connections are never pooled, so each request pays for a
+handshake, and
+.B "\-\-health\-check http"
+is refused against a TLS backend because a plaintext probe would mark every
+backend unhealthy.
+.PP
 .B "Nothing else does."
-A client runtime's outbound socket, a proxy's leg to its backends and the
-mesh client-certificate options have no handshake behind them, and their
-flags are refused rather than stored. Two server combinations are refused
-for the same reason:
+A client runtime's outbound socket and a cache's listener have no handshake
+behind them, and their flags are refused rather than stored. Two server
+combinations are refused for the same reason:
 .B \-\-udp
 (DTLS is not implemented) and
 .B \-\-upstream
-(the upstream connection would still be made in cleartext).
+(the upstream connection would still be made in cleartext). A proxy in
+.B \-\-protocol tcp
+mode terminates TLS on its listener like any other, and forwards the decrypted
+stream to its backend; the zero-copy splice path is bypassed on any connection
+with a session, because a splice would move bytes the record layer never saw.
 .PP
 One outbound exception exists and is not transport:
 .B socketley.http()
@@ -3414,28 +3592,37 @@ and then encrypted nothing. A proxy created with
 answered a plaintext HTTP request with 200 on the port it claimed to encrypt,
 and a proxy aimed at an HTTPS backend sent a plaintext request line the
 backend logged as a failed handshake. An operator asking for encryption was
-told they had it.
+told they had it. Both of those are now transport rather than decoration; the
+roles that still have no handshake go on refusing the flags.
 .PP
 Everything that is not implemented therefore fails closed, and so does every
 configuration that is incomplete:
 .IP \(bu 2
 .BR \-\-tls ", " \-\-cert ", " \-\-key " and " \-\-ca
 on a
-.BR client ", " proxy " or " cache
+.BR client " or " cache
 runtime, and
 .BR \-\-client\-ca ", " \-\-client\-cert " and " \-\-client\-key
-anywhere, are rejected by
+on anything but a proxy, are rejected by
 .B create
 with exit status 1 and a message naming the flag.
 .IP \(bu 2
 on a
 .B server
+or
+.B proxy
 runtime the same flags are accepted, but only as a complete set.
 .B \-\-tls
 without a certificate and key, or a certificate without
 .BR \-\-tls ,
 is refused and no runtime is created \(em either would describe a listener
-that could only serve cleartext.
+that could only serve cleartext. On a proxy,
+.B \-\-client\-ca
+without
+.B \-\-tls
+and half a
+.BR \-\-client\-cert / \-\-client\-key
+pair are refused on the same reasoning.
 .IP \(bu 2
 flag-based
 .B edit
@@ -3470,15 +3657,18 @@ goes through
 .BR runtime_manager::start ,
 so
 .B server().tls(cert, key)
-terminates TLS exactly as the daemon-managed runtime does, and the same
-call on a client, proxy or cache fails the runtime instead of running in
-cleartext.
+and
+.B proxy().tls(cert, key)
+terminate TLS exactly as the daemon-managed runtime does, and the same call on
+a client or cache fails the runtime instead of running in cleartext.
 .PP
 For encrypted transport on a
-.BR client ", " proxy " or " cache
+.BR client " or " cache
 \(em or on a server's upstream connections \(em terminate TLS in a front-end
 proxy (nginx, HAProxy, stunnel) and have it forward over loopback or an
-otherwise trusted network path.
+otherwise trusted network path. A socketley
+.B proxy
+is now one of the things that can play that part.
 .SH EXIT STATUS
 .TP
 .B 0

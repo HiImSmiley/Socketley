@@ -17,6 +17,11 @@ Round-robin and random load balancing across backends.
 ### TCP Proxy
 Raw TCP byte forwarding without HTTP parsing.
 
+### TLS Proxy
+TLS on the proxy's own listener, on the leg to an `https://` backend, or both,
+with mutual TLS in either direction. The backend leg always verifies the chain
+and the endpoint's name and cannot be told not to.
+
 ### Group Discovery
 Dynamic backend discovery using runtime groups (`-g` and `@group`).
 
@@ -37,6 +42,7 @@ Backend Request: GET /api/users HTTP/1.1
 ### Backend Resolution
 Backends can be specified as:
 - IP:Port: `127.0.0.1:9001`
+- URL: `https://10.0.0.7:8443` (reached over TLS) or `http://…` (cleartext)
 - Runtime name: `api-server` (resolved via runtime_manager)
 - Group reference: `@api` (dynamically discovers all running members of group `api`)
 
