@@ -480,7 +480,20 @@ runtime's Lua script is automatically hot-reloaded. Alias:
 .BR \-\-reload .
 .TP
 .BI "import " "name " "json"
-Update a runtime's configuration from a JSON string. Accepts the same
+Update a runtime's configuration from a JSON string. With no
+.I json
+argument the document is read from standard input instead, so
+.B show
+pipes straight into
+.BR import :
+.nf
+socketley show name | socketley import name
+.fi
+That form has no command-line length limit, which the quoted one does.
+Whitespace outside string literals is stripped before the document is sent,
+so the pretty-printed output of
+.B show
+is accepted as-is. Accepts the same
 fields as the interactive editor (see below). Fields marked
 .B (read-only)
 are ignored. Fields marked

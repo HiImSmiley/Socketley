@@ -259,6 +259,8 @@ cli_commands() {
 
     echo -e "${BOLD}import <name> <json>${NC}"
     echo "  Update a runtime's configuration from a JSON string"
+    echo "  With no <json> argument the document is read from stdin, so 'show'"
+    echo "  pipes straight into 'import' with no command-line length limit."
     echo "  Same fields as the interactive editor. Read-only fields are ignored."
     echo "  Port/protocol/UDP cannot be changed while running."
     echo "  tls/cert_path/key_path/ca_path are honoured on every runtime type;"
@@ -267,6 +269,7 @@ cli_commands() {
     echo "  fields clears them, which is how a runtime restored from an old state"
     echo "  file is made startable again."
     echo -e "  ${CYAN}socketley import myserver '{\"port\":9001,\"rate_limit\":500}'${NC}"
+    echo -e "  ${CYAN}socketley show myserver | socketley import myserver${NC}"
     echo ""
 
     echo -e "${BOLD}owner <name>${NC}"

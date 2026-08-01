@@ -295,6 +295,15 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("edit"):
             return cli_edit(argc, argv);
 
+        // Not a plain forward.  The document `show` prints is pretty-printed,
+        // and the IPC framing is one command per line, so forwarding the
+        // argument verbatim would send the daemon everything up to the first
+        // newline and nothing after it.  cli_import compacts first, the same
+        // way the interactive editor does before it calls the same daemon
+        // command.
+        case fnv1a("import"):
+            return cli_import(argc, argv);
+
         default:
             // Check for runtime action: socketley <name> <action> [args]
             if (argc >= 3)
@@ -446,6 +455,93 @@ static std::string compact_json(const std::string& pretty)
         }
     }
     return result;
+}
+
+// import <name> <json>
+//
+// The other half of `show`.  The man page has documented the pair as a round
+// trip since the daemon grew cmd_import, but the CLI never had a case for the
+// word, so `import` fell through to cli_runtime_action and was sent as the name
+// of a runtime to act on — "runtime not found: import", exit 1.  The daemon
+// side was never the problem and is exercised daily: interactive `edit` dumps,
+// opens $EDITOR and sends the result through this same IPC command.
+//
+// Two things have to happen here that cli_forward would not do.
+//
+// The document has to be compacted.  `show` pretty-prints, IPC frames one
+// command per line, and cli_forward would hand ipc_send a string whose first
+// newline ends the command — the daemon would parse `import name {` and answer
+// "invalid JSON".  compact_json strips whitespace outside string literals,
+// which is exactly what the editor path already does before sending.
+//
+// And stdin has to be accepted.  The documented spelling puts the whole
+// document in one argv entry, which is fine for the configs socketley writes
+// but is the same shape as every command-substitution size limit: `show`
+// output grows with backends, upstreams and mesh paths, and a document that
+// outgrows ARG_MAX fails with E2BIG from the shell, before this binary runs at
+// all.  `socketley show name | socketley import name` has no such ceiling, and
+// it is the form that composes.  cli_send already reads a message from stdin
+// when the argument is absent, so this is the house pattern rather than a new
+// one.
+int cli_import(int argc, char** argv)
+{
+    if (argc < 3)
+    {
+        std::cerr << "usage: import <name> <json>\n";
+        std::cerr << "       socketley show <name> | socketley import <name>\n";
+        return 1;
+    }
+
+    std::string name = argv[2];
+    std::string json;
+
+    if (argc >= 4)
+    {
+        // Quoted, the document is argv[3] entire, newlines and all.  Unquoted,
+        // the shell has already split it on whitespace; joining with a single
+        // space puts it back together well enough for the compaction below,
+        // which is about to drop that whitespace anyway.
+        for (int i = 3; i < argc; ++i)
+        {
+            if (i > 3) json += ' ';
+            json += argv[i];
+        }
+    }
+    else if (!isatty(STDIN_FILENO))
+    {
+        std::ostringstream ss;
+        ss << std::cin.rdbuf();
+        json = ss.str();
+    }
+    else
+    {
+        std::cerr << "usage: import <name> <json>\n";
+        std::cerr << "       socketley show <name> | socketley import <name>\n";
+        return 1;
+    }
+
+    std::string compact = compact_json(json);
+    if (compact.empty())
+    {
+        std::cerr << "empty configuration\n";
+        return 1;
+    }
+
+    std::string command = "import " + name + " " + compact;
+
+    std::string data;
+    int exit_code = ipc_send(command, data);
+
+    if (exit_code < 0)
+    {
+        std::cerr << "failed to connect to daemon\n";
+        return 2;
+    }
+
+    if (!data.empty())
+        std::cout << data;
+
+    return exit_code;
 }
 
 static int open_editor(const std::string& path)
