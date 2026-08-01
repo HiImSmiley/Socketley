@@ -4307,7 +4307,49 @@ bool cache_instance::get_resp_forced() const
 void cache_instance::set_replicate_target(std::string_view host_port)
 {
     m_replicate_target = host_port;
-    m_repl_role = repl_follower;
+
+    // ─── What an empty target means ────────────────────────────────────────
+    //
+    // This setter names the leader this cache follows.  An empty string names
+    // no leader, so it means "follows nobody" — not "follows something
+    // unspecified", which is what assigning repl_follower unconditionally used
+    // to make of it.
+    //
+    // That distinction is not academic, because every `import` and every `edit`
+    // calls this with whatever the document holds, and a cache that was never
+    // meant to replicate has no replicate_target field in its document at all.
+    // So editing a plain cache — changing its eviction policy, say — turned it
+    // into a follower of nothing.  From that point on it could never become a
+    // leader either: handle_replicate_request() answers "error: this node is a
+    // follower" before it looks at anything else, so a cache that had simply
+    // been edited once refused to serve REPLICATE for the rest of its life.
+    //
+    // Two other sites had already met this state and papered over it locally —
+    // setup() checks `repl_follower && !m_replicate_target.empty()` in both the
+    // dial and the TLS refusal, because a follower with no leader to dial is
+    // nonsense.  Those checks are the symptom.  This is where the state was
+    // created.
+    //
+    // ─── Why a leader is left alone ────────────────────────────────────────
+    //
+    // repl_leader is not configuration.  It is established at runtime, when a
+    // peer sends REPLICATE, and it owns live sockets: m_followers holds a
+    // connection per follower and this runtime is the only writer on each.
+    // Letting a config change revoke it silently is worse than the bug above.
+    // It happened, too — an edit that touched only the eviction policy demoted a
+    // leader with a follower attached, and because replicate_command() returns
+    // early unless the role is repl_leader, every write after that stopped
+    // reaching a follower whose socket was still open and still healthy from
+    // both ends.  Neither side can detect that; the datasets simply drift.
+    //
+    // The target is still recorded, so an operator who genuinely wants this
+    // cache to follow another gets what they asked for at the next restart —
+    // which is when it would take effect in any case, since setup() is what
+    // dials the leader and a fresh instance starts at repl_none.
+    if (m_repl_role == repl_leader)
+        return;
+
+    m_repl_role = m_replicate_target.empty() ? repl_none : repl_follower;
 }
 
 std::string_view cache_instance::get_replicate_target() const

@@ -16,15 +16,18 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 daemon_isolate cacherepl
 LEADER_PORT=19290
 FOLLOWER_PORT=19291
+PLAIN_PORT=19292
 KEYS=${KEYS:-20000}
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     "$BIN" stop replfollower 2>/dev/null || true
     "$BIN" stop replleader   2>/dev/null || true
+    "$BIN" stop replplain    2>/dev/null || true
     sleep 0.5
     "$BIN" remove replfollower 2>/dev/null || true
     "$BIN" remove replleader   2>/dev/null || true
+    "$BIN" remove replplain    2>/dev/null || true
     daemon_stop
 }
 trap cleanup EXIT
@@ -81,6 +84,43 @@ assert_eq "$(send_to "$FOLLOWER_PORT" "get replkey$KEYS")"    "valuevaluevalue$K
 send_to "$LEADER_PORT" 'set livekey livevalue' >/dev/null
 sleep 1
 assert_eq "$(send_to "$FOLLOWER_PORT" 'get livekey')" "livevalue" "live write replicated"
+
+# ─── A cache nobody asked to replicate is not a follower ─────────────────────
+#
+# Every `import` and every `edit` applies the whole document, and a cache that
+# was never given --replicate has no replicate_target field in its document at
+# all — so both hand the setter an empty string.  Reading that as "this cache
+# follows somebody" turned an unrelated edit into a permanent demotion: the
+# cache became a follower of nothing, and from then on it refused REPLICATE with
+# "error: this node is a follower", because that check runs before any other.
+#
+# The edit below is the most innocuous one available.  It changes the eviction
+# policy and says nothing whatsoever about replication, which is the point: the
+# operator did not ask for a replication change and must not get one.
+"$BIN" create cache replplain -p "$PLAIN_PORT" -s 2>&1 || true
+sleep 1
+
+repl_role_of() {  # name -> 0 none, 1 leader, 2 follower
+    "$BIN" stats "$1" 2>/dev/null | grep -oP '^repl_role:\K[0-9]+' | head -1
+}
+
+assert_eq "$(repl_role_of replplain)" "0" "plain cache starts with no replication role"
+
+EDITOR_SCRIPT="$SOCKETLEY_TMPD/edit-eviction.sh"
+cat > "$EDITOR_SCRIPT" <<'EDEOF'
+#!/usr/bin/env bash
+sed -i 's/"eviction": "noeviction"/"eviction": "lru"/' "$1"
+EDEOF
+chmod +x "$EDITOR_SCRIPT"
+EDITOR="$EDITOR_SCRIPT" "$BIN" edit replplain >/dev/null 2>&1 || true
+sleep 0.5
+
+assert_eq "$(repl_role_of replplain)" "0" "an edit that says nothing about replication leaves the role alone"
+
+# The oracle: ask it to serve a REPLICATE.  A cache that was quietly made a
+# follower answers "error: this node is a follower" here, and can never be a
+# leader again.
+assert_eq "$(send_to "$PLAIN_PORT" 'replicate')" "ok" "an edited plain cache still accepts REPLICATE"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
