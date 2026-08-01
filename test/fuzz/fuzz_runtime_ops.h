@@ -67,6 +67,7 @@
 // ids are the first argument of each RT_FINDING.  Nothing is skipped unless the
 // variable names it, so CI still fails on the first one.
 
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -292,71 +293,144 @@ struct ring_watch
     // coming" are different claims and only the second is a defect.  The first
     // bound is short, so the overwhelmingly common case — everything already
     // drained — costs nothing.  When it expires the drain escalates to a bound
-    // generous enough that no scheduling delay can explain it, and only an
-    // owner still outstanding at *that* point is reported.
-    //
-    // The short bound used to be the whole test, and it produced a finding on a
-    // loaded machine and none on an idle one: a multishot accept's cancellation
-    // was landing three to twenty-nine milliseconds after a thirty millisecond
-    // budget, measured over five reproductions.  That is a budget racing the
-    // scheduler, not a completion that never arrives, and this invariant is
-    // about the second.  An operation that is genuinely stuck does not become
-    // fine if you wait longer, which is why the escalation is bounded too.
-    bool drain_owner(const io_handler* owner, int budget_ms)
+    // no amount of ring activity can explain, and only an owner still
+    // outstanding at *that* point is reported.
+    bool drain_owner(const io_handler* owner, int rounds)
     {
         if (!loop || !owner)
             return true;
-        if (pump_until_idle(owner, budget_ms))
+        // The knob tightens as well as it loosens.  An oracle nobody can make
+        // fire is not a verified oracle, and the only way to exercise this one
+        // without patching the harness is to squeeze the budget below what a
+        // healthy drain needs — so a hard bound smaller than the caller's short
+        // one caps that one too, rather than being silently ignored.
+        const int hard  = hard_drain_rounds();
+        const int first = rounds < hard ? rounds : hard;
+        if (pump_until_idle(owner, first))
             return true;
 
-        const int hard  = hard_drain_ms();
-        const int extra = hard > budget_ms ? hard - budget_ms : 0;
+        const int extra = hard > first ? hard - first : 0;
         if (extra > 0 && pump_until_idle(owner, extra))
         {
-            note_late_drain(budget_ms);
+            note_late_drain(first);
+            return true;
+        }
+
+        // Not drained.  That is not yet a defect, because the two ways to reach
+        // this point are not the same claim:
+        //
+        //   the ring was being serviced and these operations still did not
+        //   finish            → the operations are stuck, which is the defect
+        //
+        //   this thread barely ran, so the pass above did a fraction of the
+        //   polling it asked for   → a statement about the machine
+        //
+        // Distinguishing them is what the wall clock is for here, and it is the
+        // only thing it is for: a pass that wanted N milliseconds of polling and
+        // took several times that was starved, and a finding from a starved pass
+        // is the false alarm this oracle produced twice before — once at a 30 ms
+        // budget and once at 2 s, each costing an investigation that ended in
+        // "the clock, again".  The clock decides when to stop waiting.  It does
+        // not decide whether what it found is broken.
+        if (m_last_pass_starved)
+        {
+            note_starved_drain();
             return true;
         }
         return false;
     }
 
-    // One pumping pass, up to ms milliseconds of waiting.  Returns true when the
-    // owner is idle.
-    bool pump_until_idle(const io_handler* owner, int ms)
+    // One pumping pass, measured in ring round trips rather than milliseconds.
+    //
+    // Each round submits a nop and polls until that nop's own completion comes
+    // back.  The kernel finishes a nop without performing any I/O, so it always
+    // returns, and it returns once the ring has been round under whatever load
+    // the machine is actually under.  Every other completion that was ready is
+    // dispatched on the way past, which is the actual work of the pass.
+    //
+    // This is the unit the invariant wants.  "The ring went round N times and
+    // these operations still did not finish" is a statement about the
+    // operations.  "Two thousand milliseconds passed" is a statement about the
+    // scheduler, and it is the wrong one: the previous bound counted 1 ms poll
+    // waits, so on a machine loaded enough that this thread is not scheduled,
+    // N iterations bought far less than N milliseconds of ring progress.  It
+    // reported busy machines, not stuck rings — twice, once at a 30 ms budget
+    // and once at 2 s, and each report cost an investigation that ended in
+    // "the clock, again".  Measured here: under one busy loop per core, four
+    // owners exceeded the 30 ms budget in a single replay of the tracked corpus
+    // while every one of them drained.  Rounds do not have that failure mode,
+    // because a machine slow enough to delay the operations delays the nops by
+    // the same factor.
+    // One pumping pass.  `rounds` is how many 1 ms polls it asks the loop for;
+    // what it records alongside is how long those polls actually took.
+    //
+    // A pass that asks for 30 polls of a millisecond and returns 400 ms later
+    // did not do the waiting it was asked to do — the thread was off the CPU
+    // for most of it.  Every previous version of this oracle threw that
+    // information away and compared the deadline to the wall, which is why it
+    // reported busy machines: measured here under one busy loop per core, four
+    // owners blew a 30 ms budget in a single replay of the tracked corpus while
+    // every one of them drained perfectly well.  Keeping the ratio is what lets
+    // the caller tell a stuck ring from a starved one.
+    bool pump_until_idle(const io_handler* owner, int rounds)
     {
-        for (int i = 0; i < ms && loop->owner_inflight(owner) != 0; i++)
+        const auto t0 = std::chrono::steady_clock::now();
+        int spent = 0;
+        for (; spent < rounds && loop->owner_inflight(owner) != 0; spent++)
             loop->poll_completions(1);
         // One last non-blocking pass, so a completion that landed inside the
         // final wait is dispatched rather than counted against the owner.
         loop->poll_completions(0);
+
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0).count();
+        // Three times the asked-for waiting, plus a millisecond so that a pass
+        // too short to measure cannot be called starved by rounding alone.
+        m_last_pass_starved = elapsed_ms > 3 * static_cast<long long>(spent) + 1;
+
         return loop->owner_inflight(owner) == 0;
     }
 
-    // How long a drain may take in total before it is a defect rather than a
-    // delay.  Two seconds: two orders of magnitude above the delays this has
-    // actually been measured at, and still far below what a stuck operation
-    // costs, which is unbounded.  Overridable so a slower machine can raise it
-    // without editing the oracle.
-    static int hard_drain_ms()
+    // How long a drain may wait in total before it stops waiting.  Two seconds:
+    // two orders of magnitude above the delays this has actually been measured
+    // at.  It bounds the waiting only — whether an expiry is reported is
+    // decided by drain_owner from whether the pass was starved.  Overridable so
+    // an unusual machine can raise it without editing the oracle.
+    static int hard_drain_rounds()
     {
-        static const int ms = [] {
-            const char* e = std::getenv("FUZZ_DRAIN_MS");
+        static const int n = [] {
+            const char* e = std::getenv("FUZZ_DRAIN_ROUNDS");
             const int   v = e ? std::atoi(e) : 0;
             return v > 0 ? v : 2000;
         }();
-        return ms;
+        return n;
     }
+
+    // Reported like a late drain rather than swallowed: a run where this fires
+    // often is a run whose owner-drain findings mean less, and that is worth
+    // seeing rather than inferring.
+    static void note_starved_drain()
+    {
+        static unsigned long reported = 0;
+        if (reported++ < 5)
+            std::fprintf(stderr,
+                         "[fuzz] observation: an owner did not drain, but the pass that "
+                         "waited for it was starved of CPU — not reported as stuck\n");
+    }
+
+    bool m_last_pass_starved{false};
 
     // A drain that needed the escalation is not a failure, but it is worth
     // seeing: it is the early shape of a latency regression, and absorbing it
     // silently is how the next one goes unnoticed.  Rate-limited like
     // fuzz_observe(), for the same reason.
-    static void note_late_drain(int short_budget_ms)
+    static void note_late_drain(int short_budget_rounds)
     {
         static unsigned long reported = 0;
         if (reported++ < 5)
             std::fprintf(stderr,
-                         "[fuzz] observation: an owner drained only after its %d ms budget "
-                         "expired — slow, not stuck\n", short_budget_ms);
+                         "[fuzz] observation: an owner drained only after its %d-round "
+                         "budget expired — slow, not stuck\n", short_budget_rounds);
     }
 
     // Report what is holding an owner that would not drain.  A count says the
