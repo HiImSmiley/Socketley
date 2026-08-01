@@ -1,7 +1,21 @@
+# Everything here is either build output, or something the image does not
+# install.  The second half matters as much as the first: `COPY . .` sits above
+# the compile, so any path that reaches the context invalidates the build layer
+# when it changes.  With man/, examples/ and test/docker/ in the context, editing
+# the compose file this image is built for recompiles the whole tree to test it.
 bin/Debug
+bin/Dev
+bin/Release
 bin/Sanitize
+bin/TSan
+obj
 make
 test/benchmark/results
+test/fuzz/corpus
+test/docker
+examples
+man
+docs
 .git
 .github
-docs
+.claude
