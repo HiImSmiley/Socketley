@@ -1,54 +1,147 @@
 # Multi-daemon cluster discovery with Docker Compose
 #
-# Build:   docker compose build    (uses Dockerfile at repo root)
+# Build:   docker compose build          (uses Dockerfile at the repo root)
 # Start:   docker compose up -d
-# Inspect: socketley cluster ls
+# Inspect: docker compose exec gateway socketley cluster ls
+#          docker compose exec gateway socketley cluster group api
+# Try it:  printf 'hello\n' | nc 127.0.0.1 8080
+#          docker compose exec api1 socketley stats web1   # total_connections
+#          docker compose exec api2 socketley stats web2   # goes up alternately
 #
-# The shared "cluster" volume lets all daemons discover each other.
-# The gateway proxy uses @api to route to all api instances.
+# Watch the counters rather than the reply: a server in the default inout mode
+# relays a message to its OTHER clients and answers the sender nothing, so a
+# client on the far side of the gateway sees a connection that succeeded and
+# no bytes back.  That is the server behaving as documented and not a broken
+# route — total_connections on the two backends is what shows the request
+# crossed to another container.  test/docker/identity.lua is the four-line
+# script that makes a backend name itself in its reply instead.
+#
+# Every daemon here runs on the DEFAULT socket path.  That is not an oversight
+# and it is the whole point: a container has a filesystem namespace to itself,
+# so it has no reason to move its socket, and members find each other through
+# the shared "cluster" volume and the addresses advertised in it.
+# SOCKETLEY_SOCKET is for running several daemons inside ONE namespace, which
+# is a development and test situation — examples/cluster/01-local-cluster.sh
+# does exactly that, and it is a simulation of this file rather than the same
+# thing.
+#
+# The gateway proxy's @api backend resolves to every runtime in group `api` on
+# every live node, local or remote.
+#
+# ─── ON THE READINESS LOOP ───────────────────────────────────────────────────
+#
+# `socketley daemon --name X --cluster D` is NOT a second daemon.  It is a
+# configuration command against the daemon that is already running, and like
+# every other socketley command it auto-starts a detached daemon of its own if
+# the socket does not answer yet.  This file used to say `sleep 1` between the
+# two, which is a race: lose it and you get two daemons, the backgrounded one
+# exits because the socket is taken, `wait` returns, and the container stops
+# with status 0 and nothing in its log.  Waiting for the daemon's own
+# "daemon started" line — printed once the socket is bound and persisted state
+# is restored — removes the race instead of widening it.
 
 volumes:
   cluster:
 
+x-node: &node
+  image: socketley:latest
+  # The image's ENTRYPOINT is ["socketley"], so a bare `command:` would be
+  # passed to socketley as arguments.  This makes the shell the shell.
+  entrypoint: ["/bin/sh", "-c"]
+  # Without this every node here dies at startup with
+  #     [ERROR] failed to init event loop
+  # and nothing says why.  Docker's default seccomp profile does not allow
+  # io_uring_setup, io_uring_enter or io_uring_register, and socketley's entire
+  # I/O layer is a ring.  `unconfined` is the blunt way to say it; a deployment
+  # should copy Docker's default profile, add those three syscalls back, and
+  # pass the file instead — the ring needs three syscalls, not no sandbox.
+  security_opt:
+    - seccomp:unconfined
+  volumes:
+    - cluster:/cluster
+
 services:
   api1:
+    <<: *node
     build:
-      context: ../../..
+      context: ../..
       dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api1 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s &&
-             wait"
-    volumes:
-      - cluster:/cluster
+    # Advertised to peers out of gethostname(3), and dialled by proxies on the
+    # other nodes — so it has to be a name this network resolves.
+    hostname: api1
+    command:
+      - |
+        set -e
+        socketley daemon >/var/log/socketley.log 2>&1 &
+        dpid=$$!
+        while ! grep -q "daemon started" /var/log/socketley.log 2>/dev/null; do
+            kill -0 $$dpid || { cat /var/log/socketley.log >&2; exit 1; }
+            sleep 0.1
+        done
+        tail -f -n +1 /var/log/socketley.log &
+        trap 'kill -TERM $$dpid' TERM INT
+        socketley daemon --name api1 --cluster /cluster
+        # A container that is restarted still has its state directory, so the
+        # daemon restores this runtime before the line below runs and `create`
+        # answers "runtime already exists".  That is not a failure, and under
+        # `set -e` treating it as one means a node can never be restarted.
+        socketley create server web1 -p 9001 -g api -s || socketley start web1 || true
+        # `wait` returns as soon as the trap has run, not when the daemon has
+        # finished — exiting here would tear the container down mid-shutdown and
+        # leave the node's file on the volume to age out instead of being deleted.
+        wait $$dpid || true
+        while kill -0 $$dpid 2>/dev/null; do sleep 0.1; done
 
   api2:
-    build:
-      context: ../../..
-      dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api2 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s &&
-             wait"
-    volumes:
-      - cluster:/cluster
+    <<: *node
+    hostname: api2
+    command:
+      - |
+        set -e
+        socketley daemon >/var/log/socketley.log 2>&1 &
+        dpid=$$!
+        while ! grep -q "daemon started" /var/log/socketley.log 2>/dev/null; do
+            kill -0 $$dpid || { cat /var/log/socketley.log >&2; exit 1; }
+            sleep 0.1
+        done
+        tail -f -n +1 /var/log/socketley.log &
+        trap 'kill -TERM $$dpid' TERM INT
+        socketley daemon --name api2 --cluster /cluster
+        # A container that is restarted still has its state directory, so the
+        # daemon restores this runtime before the line below runs and `create`
+        # answers "runtime already exists".  That is not a failure, and under
+        # `set -e` treating it as one means a node can never be restarted.
+        socketley create server web2 -p 9001 -g api -s || socketley start web2 || true
+        # `wait` returns as soon as the trap has run, not when the daemon has
+        # finished — exiting here would tear the container down mid-shutdown and
+        # leave the node's file on the volume to age out instead of being deleted.
+        wait $$dpid || true
+        while kill -0 $$dpid 2>/dev/null; do sleep 0.1; done
 
   gateway:
-    build:
-      context: ../../..
-      dockerfile: Dockerfile
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name gateway --cluster /cluster &&
-             sleep 1 &&
-             socketley create proxy gw -p 8080 --backend @api --protocol tcp -s &&
-             wait"
-    volumes:
-      - cluster:/cluster
+    <<: *node
+    hostname: gateway
+    command:
+      - |
+        set -e
+        socketley daemon >/var/log/socketley.log 2>&1 &
+        dpid=$$!
+        while ! grep -q "daemon started" /var/log/socketley.log 2>/dev/null; do
+            kill -0 $$dpid || { cat /var/log/socketley.log >&2; exit 1; }
+            sleep 0.1
+        done
+        tail -f -n +1 /var/log/socketley.log &
+        trap 'kill -TERM $$dpid' TERM INT
+        socketley daemon --name gateway --cluster /cluster
+        # A container that is restarted still has its state directory, so the
+        # daemon restores this runtime before the line below runs and `create`
+        # answers "runtime already exists".  That is not a failure, and under
+        # `set -e` treating it as one means a node can never be restarted.
+        socketley create proxy gw -p 8080 --backend @api --protocol tcp -s || socketley start gw || true
+        # `wait` returns as soon as the trap has run, not when the daemon has
+        # finished — exiting here would tear the container down mid-shutdown and
+        # leave the node's file on the volume to age out instead of being deleted.
+        wait $$dpid || true
+        while kill -0 $$dpid 2>/dev/null; do sleep 0.1; done
     ports:
       - "8080:8080"

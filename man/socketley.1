@@ -3344,41 +3344,49 @@ On graceful shutdown, the daemon deletes its file
 .PP
 .B Docker Compose example:
 .PP
-.nf
-version: "3.8"
-volumes:
-  cluster:
-
-services:
-  api1:
-    image: socketley
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api1 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s && wait"
-    volumes: [cluster:/cluster]
-
-  api2:
-    image: socketley
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name api2 --cluster /cluster &&
-             socketley create server web -p 9001 -g api -s && wait"
-    volumes: [cluster:/cluster]
-
-  gateway:
-    image: socketley
-    command: >
-      sh -c "socketley daemon &
-             sleep 1 &&
-             socketley daemon --name gateway --cluster /cluster &&
-             sleep 1 &&
-             socketley create proxy gw -p 8080 --backend @api -s && wait"
-    volumes: [cluster:/cluster]
-    ports: ["8080:8080"]
-.fi
+A complete, working one is
+.IR examples/cluster/docker-compose.yml ,
+and the same shape with assertions on it is
+.IR test/docker/ .
+Three things about it are not optional and were wrong in the example this
+paragraph used to print:
+.RS
+.IP \(bu 3
+.B seccomp.
+Docker's default profile does not permit
+.BR io_uring_setup (2),
+.BR io_uring_enter (2)
+or
+.BR io_uring_register (2),
+and socketley's whole I/O layer is a ring, so every node dies at startup with
+.B "failed to init event loop"
+under it.  Run the containers with a profile that allows those three syscalls
+\(em during development,
+.BR "security_opt: [seccomp:unconfined]" .
+.IP \(bu 3
+.B entrypoint.
+The image's ENTRYPOINT is
+.BR socketley ,
+so a compose
+.B command:
+is passed to it as arguments.  A node that needs a shell has to say
+.BR "entrypoint: [\(dq/bin/sh\(dq, \(dq-c\(dq]" ,
+and give its script as a one\-element list \(em compose word\-splits a bare
+string into an argv and everything past the first
+.B &
+is lost.
+.IP \(bu 3
+.B Readiness.
+.B daemon --name
+and
+.B daemon --cluster
+are configuration commands against a daemon that is already running, and they
+auto\-start a detached one when the socket does not answer.  Sleeping for a
+second before them is a race whose loss forks a second daemon and takes the
+container down without a message.  Wait for the daemon's own
+.B "daemon started"
+line instead.
+.RE
 .PP
 Alternatively, use a Lua config file:
 .PP
