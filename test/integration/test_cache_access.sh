@@ -58,6 +58,9 @@ assert_eq() {
     fi
 }
 
+# The output goes out on failure too: its callers are fed by CLI commands that
+# are allowed to fail, and when one does the reason is in $1 while "not found in
+# output" describes only the symptom.
 assert_contains() {
     TOTAL=$((TOTAL+1))
     if echo "$1" | grep -q "$2"; then
@@ -65,11 +68,19 @@ assert_contains() {
     else
         FAIL=$((FAIL+1))
         echo "  FAIL [$2]: not found in output"
+        printf '%s\n' "${1:-<nothing>}" | sed 's/^/        got: /'
     fi
 }
 
+# `|| true` on the pipeline: a refused create leaves nothing on $SERVER_PORT, nc
+# exits non-zero, `pipefail` promotes it, and the four `RESULT=$(send_cmd …)`
+# below are simple commands whose status is exactly that.  The file used to end
+# at the first of them — after two assertions, with no `Results` line — which
+# also took the whole second half with it: the restart section is about the
+# cache surviving a server bounce and had nothing to do with the create that
+# failed.  An empty reply is the finding, and assert_eq is what reports it.
 send_cmd() {
-    echo "$1" | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r'
+    echo "$1" | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r' || true
 }
 
 echo "=== Integration: cache access via server ==="
@@ -89,7 +100,15 @@ ready_resp 127.0.0.1 "$CACHE_PORT" 20 || true
 ready_tcp  127.0.0.1 "$SERVER_PORT" 20 || true
 
 # Test: Both show in ps
-OUT=$("$BIN" ps 2>&1)
+#
+# `OUT=$(cmd)` alone is a simple command whose status is the substitution's, so
+# a failing CLI command ended this file at the assignment — no assertion, no
+# `Results`.  daemon_required rather than `|| true` because the two answers are
+# different: a `ps` that fails while the daemon still serves is a finding the
+# assertion below states, and a `ps` that fails because the daemon is gone makes
+# every assertion after it noise.  Only the second stops, and it stops with a
+# summary instead of vanishing.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "ca_cache" "cache in ps"
 assert_contains "$OUT" "ca_server" "server in ps"
 
@@ -104,12 +123,19 @@ assert_eq "$RESULT" "alice" "cache get via server"
 # Test: Regular message (not cache command) doesn't return cache error
 # A plain message should be broadcast, not interpreted as cache command
 TOTAL=$((TOTAL+1))
-RESULT=$(echo "hello" | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r')
+RESULT=$(echo "hello" | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r') || true
 # No error expected — broadcast returns nothing to sender typically
 PASS=$((PASS+1))
 
 # Test: Verify the key is also accessible directly on the cache port
-DIRECT=$(echo "get user" | nc -q 1 127.0.0.1 "$CACHE_PORT" 2>/dev/null | tr -d '\r')
+#
+# `|| true` on these two and not daemon_required: what they run is nc, not a CLI
+# command, so a non-zero status here says nothing about the daemon — it says
+# nothing was listening on the port, which is precisely what the assertion below
+# is for.  Before the guard, `pipefail` made nc's status the assignment's and the
+# file ended here, taking the whole ordering/half-close/concurrency section with
+# it — a section that shares nothing with the port that was refused.
+DIRECT=$(echo "get user" | nc -q 1 127.0.0.1 "$CACHE_PORT" 2>/dev/null | tr -d '\r') || true
 assert_eq "$DIRECT" "alice" "direct cache get"
 
 # ─── ordering, half-close, concurrency, abandonment ─────────────────────────
@@ -290,7 +316,7 @@ RESULT=$(send_cmd 'cache set back yes')
 assert_eq "$RESULT" "ok" "cache is served again after a restart"
 
 # Test: Server still running after mixed traffic
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "ca_server" "server still running"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

@@ -29,8 +29,13 @@ assert_eq() {
     fi
 }
 
+# `|| true` on the pipeline: a refused create leaves nothing on $PORT, nc exits
+# non-zero, `pipefail` promotes it, and `RESULT=$(send_cmd …)` below is a simple
+# command whose status is exactly that — so the file used to end at the publish
+# with no `Results` line and the subscriber check never ran at all.  The empty
+# answer is the finding; assert_eq is what reports it.
 send_cmd() {
-    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
+    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' || true
 }
 
 echo "=== Integration: pub/sub ==="

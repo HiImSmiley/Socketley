@@ -38,8 +38,14 @@ assert_contains() {
     fi
 }
 
+# `|| true` on the pipeline: every one of the five checks below is written
+# `RESULT=$(send_resp …)`, a simple command whose exit status is this pipeline's,
+# so a refused create — nothing listening, nc non-zero, `pipefail` promoting it —
+# ended the file at the first SET and printed no `Results` line.  Five RESP
+# assertions with nothing to say is a worse report than five saying they got an
+# empty reply, which is what assert_contains prints once the file survives.
 send_resp() {
-    printf '%b' "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
+    printf '%b' "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' || true
 }
 
 echo "=== Integration: RESP2 protocol ==="

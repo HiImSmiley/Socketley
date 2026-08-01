@@ -48,7 +48,13 @@ sleep 0.3
 
 # Test: Send WebSocket upgrade request, expect 101 Switching Protocols
 WS_KEY="dGhlIHNhbXBsZSBub25jZQ=="
-WS_RESPONSE=$(printf "GET / HTTP/1.1\r\nHost: 127.0.0.1:$PORT\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $WS_KEY\r\nSec-WebSocket-Version: 13\r\n\r\n" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r')
+# `|| true` on the pipeline, as the two raw-TCP checks below already have: with
+# nothing listening on $PORT nc exits non-zero, `pipefail` promotes it, and this
+# lone `VAR=$(…)` takes its status from the substitution — so a refused create
+# ended the file here, before a single one of its six assertions had run and
+# before any `Results` line.  An empty response is the finding; the three
+# assert_contains below are what report it.
+WS_RESPONSE=$(printf "GET / HTTP/1.1\r\nHost: 127.0.0.1:$PORT\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $WS_KEY\r\nSec-WebSocket-Version: 13\r\n\r\n" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r') || true
 assert_contains "$WS_RESPONSE" "101 Switching Protocols" "WS upgrade 101"
 assert_contains "$WS_RESPONSE" "Upgrade: websocket" "WS upgrade header"
 assert_contains "$WS_RESPONSE" "Sec-WebSocket-Accept" "WS accept header"
@@ -66,7 +72,7 @@ echo "hello-again" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
 PASS=$((PASS+1))
 
 # Test: Server is still running after mixed connections
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "ws_test" "server still running"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

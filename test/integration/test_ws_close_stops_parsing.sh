@@ -49,7 +49,18 @@ create_ok "server created" "$BIN" create server wsclose_srv -p "$SRV_PORT" -s
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$SRV_PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 
-BEFORE=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2)
+# `|| true` on the pipeline, and the grep is what needs it: it exits 1 when
+# there is no such field, which is the normal answer for a runtime a refused
+# create never built, and `pipefail` makes that the status of the assignment —
+# which, being a lone `VAR=$(…)`, is the status of the whole simple command.
+# Under `set -euo pipefail` this line was therefore the entire file when a create
+# failed: not one of its three assertions ran and no `Results` line printed.
+#
+# Empty is exactly the right value to carry forward.  The check immediately
+# below already asks `[ -n "$BEFORE" ]` and prints "cannot read the message
+# counter — is the runtime up?", which names the cause better than anything the
+# assignment could have done; it only ever needed the file to still be running.
+BEFORE=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2) || true
 TOTAL=$((TOTAL+1))
 if [ -n "$BEFORE" ]; then
     PASS=$((PASS+1))
@@ -58,7 +69,15 @@ else
     echo "  FAIL [setup]: cannot read the message counter — is the runtime up?"
 fi
 
-python3 - "$SRV_PORT" <<'PYEOF'
+# `|| true` here for the same reason as the captures either side of it, in the
+# shape a bare command takes it — on the command line, because the heredoc body
+# follows the redirection.  Under `set -e` this python was the end of the file
+# whenever it could not connect, which is exactly what a refused create leaves
+# behind: the run stopped on a traceback with no `Results` line and neither of
+# the two assertions that follow.  Failing to deliver the frames is not a reason
+# to stop asking what the counter did — it is the reason the counter did
+# nothing, and the check below states that in one line instead of a stack trace.
+python3 - "$SRV_PORT" <<'PYEOF' || true
 import base64, os, socket, struct, sys, time
 
 port = int(sys.argv[1])
@@ -99,8 +118,11 @@ s.close()
 PYEOF
 
 sleep 1
-AFTER=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2)
+AFTER=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2) || true
 
+# The `-n` guards on both sides are load-bearing and stay that way: two unread
+# counters are both empty, and "" = "" would report "no work past close" as a
+# pass for a runtime that was never there.
 TOTAL=$((TOTAL+1))
 if [ -n "$BEFORE" ] && [ -n "$AFTER" ] && [ "$AFTER" = "$BEFORE" ]; then
     PASS=$((PASS+1))

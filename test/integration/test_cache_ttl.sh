@@ -138,8 +138,16 @@ assert_eq "$(send_cmd 'del pc')" "nil" "DEL on TTL key restored from disk"
 # keys_expired comes from the sweep alone and is read through the stats command,
 # which never goes near the key, so this assertion cannot be satisfied by a lazy
 # check standing in for the timer.
+# `|| true` on the pipeline, and it is the grep that needs it more than the
+# stats: `grep -oP` exits 1 when the field is simply not there, which is the
+# normal answer for a runtime a refused create never built.  Both readings below
+# are written `BEFORE=$(expired_count)` / `AFTER=$(expired_count)` — simple
+# commands whose status is this pipeline's — so under `set -euo pipefail` the
+# file ended at the first of them with no `Results` line.  Empty is a fine
+# answer to hand back: the assertion prints "keys_expired went unset -> unset",
+# which names the problem, and it cannot print anything if the file is gone.
 expired_count() {
-    "$BIN" stats ttlcache 2>&1 | grep -oP 'keys_expired:\K[0-9]+' | head -1
+    "$BIN" stats ttlcache 2>&1 | grep -oP 'keys_expired:\K[0-9]+' | head -1 || true
 }
 
 BEFORE=$(expired_count)

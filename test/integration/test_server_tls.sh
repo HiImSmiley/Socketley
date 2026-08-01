@@ -121,24 +121,29 @@ rc_of() {
 CERTS="$TMPDIR_T/certs"
 mkdir -p "$CERTS"
 
+# Each guarded, so that the SKIP below is reachable.  Under `set -e` an openssl
+# that failed ended the file on the spot — silently, since all five are
+# redirected to /dev/null — and the "could not generate the test certificates"
+# message a few lines down, which exists precisely to say so, could never print.
+# The existence check is the real gate; these statuses are not.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$CERTS/server-key.pem" -out "$CERTS/server.pem" \
     -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || true
 
 # A second key, never paired with any certificate.  Used to prove that a key
 # which does not match the certificate is refused rather than accepted.
-openssl genrsa -out "$CERTS/other-key.pem" 2048 >/dev/null 2>&1
+openssl genrsa -out "$CERTS/other-key.pem" 2048 >/dev/null 2>&1 || true
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$CERTS/ca-key.pem" -out "$CERTS/ca.pem" \
-    -subj "/CN=socketley-test-ca" >/dev/null 2>&1
+    -subj "/CN=socketley-test-ca" >/dev/null 2>&1 || true
 openssl req -newkey rsa:2048 -nodes \
     -keyout "$CERTS/client-key.pem" -out "$CERTS/client.csr" \
-    -subj "/CN=test-client" >/dev/null 2>&1
+    -subj "/CN=test-client" >/dev/null 2>&1 || true
 openssl x509 -req -in "$CERTS/client.csr" -days 2 \
     -CA "$CERTS/ca.pem" -CAkey "$CERTS/ca-key.pem" -CAcreateserial \
-    -out "$CERTS/client.pem" >/dev/null 2>&1
+    -out "$CERTS/client.pem" >/dev/null 2>&1 || true
 
 if [ ! -s "$CERTS/server.pem" ] || [ ! -s "$CERTS/client.pem" ]; then
     echo "  SKIP: openssl could not generate the test certificates"
@@ -179,7 +184,11 @@ assert_ok "$(rc_of ready_tls 127.0.0.1 "$SRV_PORT" "$CERTS/server.pem" localhost
 # truncation in the BIO plumbing is visible (a repetitive payload would survive
 # an off-by-one unnoticed), then ask the daemon to broadcast and read it back
 # through the same session.
-python3 - "$SRV_PORT" "$CERTS/server.pem" "$BIN" > "$TMPDIR_T/roundtrip.out" 2>&1 <<'PYEOF'
+# `|| true`: a listener that never came up makes this exit non-zero, and a bare
+# command that fails under `set -e` ends the file — here, before every assertion
+# in the file.  The output is already being captured to a file that the checks
+# below read, so an empty capture is a result they can report.
+python3 - "$SRV_PORT" "$CERTS/server.pem" "$BIN" > "$TMPDIR_T/roundtrip.out" 2>&1 <<'PYEOF' || true
 import socket, ssl, subprocess, sys, time
 
 port, cafile, binary = int(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -259,7 +268,10 @@ assert_eq "$(read_key 4)" "$BIG"                        "client -> server: 700 b
 # TLS listener they are not a record, so the handshake fails and the connection
 # is dropped -- what must never happen is the line being delivered as a message,
 # which is what a listener that fell back to cleartext would do.
-python3 - "$SRV_PORT" >/dev/null 2>&1 <<'PYEOF'
+# `|| true`: this one only has to *happen* — what it proves is asserted a few
+# lines down, off the daemon's own state.  Failing to connect is not a reason to
+# stop the file, and under `set -e` a bare failing command was exactly that.
+python3 - "$SRV_PORT" >/dev/null 2>&1 <<'PYEOF' || true
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
 s.sendall(b"PLAINTEXT-MUST-NOT-BE-DELIVERED\n")
@@ -329,7 +341,11 @@ s.sendall(f"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
 print("101" if b"101" in s.recv(512).split(b"\r\n")[0] else "no")
 s.close()
 PYEOF
-)
+) || true
+# `|| true` for the same reason as the curl capture above: this python exits
+# non-zero when the listener is not there to connect to, and a lone `VAR=$(…)`
+# would make that the end of the file rather than the end of this test.  An
+# empty $WSS is not "101", which is what assert_eq is here to say.
 assert_eq "$WSS" "101" "wss:// upgrade succeeds on the same TLS listener"
 
 rc_of "$BIN" stop tls_http >/dev/null
@@ -343,7 +359,10 @@ rc_of "$BIN" remove tls_http >/dev/null
 # ClientHello followed by an RST, a truncated record that can never complete,
 # and a connection that is opened and closed without a byte.  A session leaked
 # on any of those shows up as connections that never falls back to zero.
-python3 - "$SRV_PORT" "$CERTS/server.pem" >/dev/null 2>&1 <<'PYEOF'
+# `|| true`: the aborted handshakes are the setup, not the assertion — the
+# assertion is the connections counter falling back to zero afterwards, and it
+# cannot be read if a failure to connect ends the file first.
+python3 - "$SRV_PORT" "$CERTS/server.pem" >/dev/null 2>&1 <<'PYEOF' || true
 import socket, ssl, struct, sys
 
 port, cafile = int(sys.argv[1]), sys.argv[2]
@@ -391,7 +410,13 @@ PYEOF
 # runtime's life, which is the sharpest assertion in this file.
 CONNS=""
 for _ in $(seq 1 60); do
-    CONNS=$("$BIN" stats tls_srv 2>/dev/null | grep '^connections:' | cut -d: -f2 | tr -d ' ')
+    # `|| true`: grep exits 1 when the field is absent, `pipefail` promotes it,
+    # and a lone `VAR=$(…)` takes its status from the substitution — so a runtime
+    # that is not there ended the file inside this poll loop, with the sharpest
+    # assertion in the file and everything after it unreported.  CONNS is
+    # pre-set to "" above precisely so an unreadable counter falls through to
+    # assert_eq, which fails on "" and says what it wanted.
+    CONNS=$("$BIN" stats tls_srv 2>/dev/null | grep '^connections:' | cut -d: -f2 | tr -d ' ') || true
     [ "$CONNS" = "0" ] && break
     sleep 0.1
 done
@@ -456,7 +481,11 @@ while time.time() < deadline:
 print("WITHCERT", "yes" if with_ else "no")
 print("NOCERT", "yes" if attempt(False) else "no")
 PYEOF
-)
+) || true
+# `|| true`: an mTLS listener that never came up makes this python exit
+# non-zero, and a lone `VAR=$(…)` turned that into the end of the file — taking
+# section 5, "fail closed", with it, which is about a different feature again.
+# An empty $MTLS_RESULT fails both assertions below, which is the correct report.
 assert_eq "$(echo "$MTLS_RESULT" | grep '^WITHCERT' | cut -d' ' -f2)" "yes" \
     "mTLS: a client certificate signed by --ca is accepted"
 assert_eq "$(echo "$MTLS_RESULT" | grep '^NOCERT' | cut -d' ' -f2)" "no" \

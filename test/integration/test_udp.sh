@@ -43,12 +43,18 @@ create_ok "UDP client created" "$BIN" create client udp_client --udp -t 127.0.0.
 sleep 0.3
 
 # Test: Both show in ps as running
-OUT=$("$BIN" ps 2>&1)
+#
+# A lone `OUT=$(cmd)` takes its exit status from the substitution, so a failing
+# CLI command used to end this file at the assignment with no `Results` line.
+# daemon_required carries on when the daemon is still serving — the assertion
+# below is what reports a command that failed on its own merits — and stops,
+# with counts, when it is not.  See lib_daemon.sh.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "udp_test" "UDP server in ps"
 assert_contains "$OUT" "udp_client" "UDP client in ps"
 
 # Test: ls shows both
-OUT=$("$BIN" ls 2>&1)
+OUT=$("$BIN" ls 2>&1) || daemon_required "ls"
 assert_contains "$OUT" "udp_test" "UDP server in ls"
 assert_contains "$OUT" "udp_client" "UDP client in ls"
 
@@ -59,7 +65,7 @@ echo "hello-udp" | nc -u -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
 PASS=$((PASS+1))
 
 # Test: Server still running after receiving datagram
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "udp_test" "UDP server still running"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

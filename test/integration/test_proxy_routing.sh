@@ -12,6 +12,10 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+# For daemon_required only.  This file keeps its own inline isolation — it is the
+# one the library was generalised from — and sourcing defines functions without
+# running anything, so nothing here changes hands.
+. "$(dirname "$0")/lib_daemon.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-routing-XXXXXX)
@@ -116,7 +120,10 @@ create "proxy created" proxy proxy_tcp -p "$TCP_PROXY_PORT" \
 ready_tcp 127.0.0.1 "$TCP_PROXY_PORT" 10 || true
 
 # Test: All 3 runtimes show in ps
-OUT=$("$BIN" ps 2>&1)
+#
+# A lone `OUT=$(cmd)` takes its exit status from the substitution; the guard is
+# what keeps a failing `ps` from ending the file before its `Results` line.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "proxy_be1" "backend 1 in ps"
 assert_contains "$OUT" "proxy_be2" "backend 2 in ps"
 assert_contains "$OUT" "proxy_tcp" "proxy in ps"

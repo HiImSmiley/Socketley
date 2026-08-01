@@ -38,7 +38,12 @@ sleep 0.3
 echo "hello" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
 sleep 0.2
 
-OUT=$("$BIN" stats statsvr 2>&1)
+# `stats` on a runtime a refused create never built exits non-zero, and a lone
+# `OUT=$(cmd)` takes its status from the substitution — so this one line was the
+# whole file's ending, with none of the four assertions below and no `Results`.
+# daemon_required carries on while the daemon is serving, because the assertions
+# below are what report a missing runtime, and stops with counts when it is not.
+OUT=$("$BIN" stats statsvr 2>&1) || daemon_required "stats statsvr"
 assert_contains "$OUT" "total_connections"
 assert_contains "$OUT" "total_messages"
 assert_contains "$OUT" "bytes_in"

@@ -62,7 +62,13 @@ create_ok "server created" "$BIN" create server wsdata_srv -p "$SRV_PORT" \
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$SRV_PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 
-python3 - "$SRV_PORT" <<'PYEOF'
+# `|| true` on the command line, where a heredoc's guard has to go.  With nothing
+# listening — which is what a refused create leaves behind — this python raises
+# ConnectionRefusedError, and under `set -e` a bare command that fails is the end
+# of the file: the run stopped on a traceback before any of the six payload
+# assertions and printed no `Results` line.  Not delivering the frames is the
+# reason the reads below come back empty, and assert_eq says that in six lines.
+python3 - "$SRV_PORT" <<'PYEOF' || true
 import base64, hashlib, os, socket, struct, sys, time
 
 port = int(sys.argv[1])

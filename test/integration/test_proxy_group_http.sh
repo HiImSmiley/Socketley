@@ -20,6 +20,9 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+# For daemon_required only.  This file keeps its own inline isolation; sourcing
+# defines functions without running anything, so nothing here changes hands.
+. "$(dirname "$0")/lib_daemon.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-grphttp-XXXXXX)
@@ -156,7 +159,9 @@ create "gateway created" proxy grphttp_gw -p "$GW_PORT" \
     --backend "@$GROUP" --protocol http -s
 listening "$GW_PORT" 10 || true
 
-OUT=$("$BIN" ps 2>&1)
+# A lone `OUT=$(cmd)` takes its exit status from the substitution; the guard is
+# what keeps a failing `ps` from ending the file before its `Results` line.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "grphttp_be" "group member in ps"
 assert_contains "$OUT" "grphttp_gw" "gateway in ps"
 

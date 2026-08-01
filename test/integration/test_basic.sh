@@ -60,7 +60,16 @@ daemon_start "$BIN"
 create_ok "create server" "$BIN" create server testsvr -p 19000
 
 # Test: ls shows it
-OUT=$("$BIN" ls 2>&1)
+#
+# The guard is not decoration.  `OUT=$(cmd)` on a line of its own is a simple
+# command whose exit status is the substitution's, so under `set -euo pipefail`
+# a failing `ls` ended this file here — at an assignment, with no assertion, no
+# `Results` line and no `OK`/`FAILED`.  daemon_required rather than `|| true`
+# because the two failures are not the same one: an `ls` that fails while the
+# daemon still answers is a finding the assertion below states exactly, and an
+# `ls` that fails because the daemon is gone makes every assertion after it
+# noise.  Only the second stops, and it stops printing counts.  See lib_daemon.sh.
+OUT=$("$BIN" ls 2>&1) || daemon_required "ls"
 assert_contains "$OUT" "testsvr"
 
 # Test: start
@@ -69,7 +78,7 @@ assert_ok "$RC" "start server" "$OUT"
 sleep 0.2
 
 # Test: ps shows running
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "testsvr"
 
 # Test: stop
@@ -82,7 +91,7 @@ RC=0; OUT=$("$BIN" remove testsvr 2>&1) || RC=$?
 assert_ok "$RC" "remove server" "$OUT"
 
 # Test: ls no longer shows testsvr
-OUT=$("$BIN" ls 2>&1)
+OUT=$("$BIN" ls 2>&1) || daemon_required "ls"
 TOTAL=$((TOTAL+1))
 if ! echo "$OUT" | grep -q "testsvr"; then
     PASS=$((PASS+1))
@@ -94,7 +103,7 @@ fi
 # Test: create with -s (start immediately)
 create_ok "create+start" "$BIN" create server autosvr -p 19001 -s
 sleep 0.2
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "autosvr"
 
 # Cleanup

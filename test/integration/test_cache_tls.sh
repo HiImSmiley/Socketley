@@ -148,24 +148,29 @@ start_daemon() {
 CERTS="$TMPDIR_T/certs"
 mkdir -p "$CERTS"
 
+# Each guarded, so that the SKIP below is reachable.  Under `set -e` an openssl
+# that failed ended the file on the spot — silently, since all five are
+# redirected to /dev/null — and the "could not generate the test certificates"
+# message a few lines down, which exists precisely to say so, could never print.
+# The existence check is the real gate; these statuses are not.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$CERTS/cache-key.pem" -out "$CERTS/cache.pem" \
     -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || true
 
 # A second key, never paired with any certificate.  Used to prove that a key
 # which does not match the certificate is refused rather than accepted.
-openssl genrsa -out "$CERTS/other-key.pem" 2048 >/dev/null 2>&1
+openssl genrsa -out "$CERTS/other-key.pem" 2048 >/dev/null 2>&1 || true
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$CERTS/ca-key.pem" -out "$CERTS/ca.pem" \
-    -subj "/CN=socketley-cache-test-ca" >/dev/null 2>&1
+    -subj "/CN=socketley-cache-test-ca" >/dev/null 2>&1 || true
 openssl req -newkey rsa:2048 -nodes \
     -keyout "$CERTS/client-key.pem" -out "$CERTS/client.csr" \
-    -subj "/CN=test-client" >/dev/null 2>&1
+    -subj "/CN=test-client" >/dev/null 2>&1 || true
 openssl x509 -req -in "$CERTS/client.csr" -days 2 \
     -CA "$CERTS/ca.pem" -CAkey "$CERTS/ca-key.pem" -CAcreateserial \
-    -out "$CERTS/client.pem" >/dev/null 2>&1
+    -out "$CERTS/client.pem" >/dev/null 2>&1 || true
 
 if [ ! -s "$CERTS/cache.pem" ] || [ ! -s "$CERTS/client.pem" ]; then
     echo "  SKIP: openssl could not generate the test certificates"
@@ -180,7 +185,14 @@ fi
 # The STATUS column of `ls`, lower-cased.  Columns are
 # ID NAME TYPE PORT CONN "OWNED BY" STATUS CREATED..., and CREATED is several
 # words ("0 seconds ago"), so the status is the seventh field and not the last.
-state_of() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2==n {print tolower($7)}'; }
+#
+# `|| true` on the pipeline: `RSTATE=$(state_of tlsrestore)` below is a lone
+# `VAR=$(…)`, so its status is this pipeline's, and a `ls` that fails would have
+# ended the file at that assignment rather than at the assertion two lines
+# later.  A runtime with no row is legitimately empty here, and empty is neither
+# "running" nor a reason to stop — the combined verdict below reads it as
+# running=no, which is what it means.
+state_of() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2==n {print tolower($7)}' || true; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. A real handshake, and RESP over the encrypted stream

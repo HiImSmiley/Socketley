@@ -38,8 +38,13 @@ assert_contains() {
     fi
 }
 
+# `|| true` on the pipeline: a refused create leaves nothing on $PORT, nc exits
+# non-zero, `pipefail` promotes it, and both `RESULT=$(send_cmd …)` below are
+# simple commands whose status is exactly that — so the file ended at the first
+# password check and never reported either of them.  An empty answer is not
+# "master: ok", and assert_eq is what says so.
 send_cmd() {
-    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
+    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' || true
 }
 
 echo "=== Integration: master mode ==="
@@ -60,7 +65,10 @@ RESULT=$(send_cmd 'master wrongpw')
 assert_eq "$RESULT" "master: denied" "wrong password"
 
 # Test: Server is still running after auth attempts
-OUT=$("$BIN" ps 2>&1)
+#
+# A lone `OUT=$(cmd)` takes its exit status from the substitution; the guard is
+# what keeps a failing `ps` from ending the file before its `Results` line.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "master_test" "server still running"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

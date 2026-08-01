@@ -133,15 +133,26 @@ daemon_stop() {
 # the same question: the socket file outlives the process that bound it, so a
 # test that cleans up with a CLI command "because the socket is still there"
 # reaches a dead daemon and auto-starts a live one in its place.
+#
+# The /proc reads are wrapped in `{ …; } 2>/dev/null` rather than written as
+# `tr … <"/proc/$p/…" 2>/dev/null`.  In the latter the shell opens the redirect
+# before tr exists to have its stderr redirected, so the shell's own complaint
+# goes to the terminal: every sweep over a process belonging to another user
+# printed "Permission denied" for /proc/<pid>/environ, and every sweep over a
+# pid that exited mid-loop printed "No such file or directory".  Both are
+# expected here — this walks every socketley on the machine — and both landed in
+# exactly the output someone is reading because something has already gone
+# wrong.  The brace group redirects the group's stderr first, so the open is
+# covered too.
 daemon_alive() {
     local sock=$1 p
     [ -n "$sock" ] || return 1
     for p in $(pgrep -x socketley 2>/dev/null || true); do
-        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+        case "$({ tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
             *) continue ;;
         esac
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
+        if { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
            | grep -qx "SOCKETLEY_SOCKET=$sock"; then
             return 0
         fi
@@ -159,14 +170,80 @@ daemon_sweep() {
     [ -n "$sock" ] || return 0
     local p
     for p in $(pgrep -x socketley 2>/dev/null || true); do
-        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+        case "$({ tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
             *) continue ;;
         esac
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
+        if { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
            | grep -qx "SOCKETLEY_SOCKET=$sock"; then
             kill -9 "$p" 2>/dev/null || true
         fi
     done
     return 0
+}
+
+# ─── STOPPING WITHOUT VANISHING ─────────────────────────────────────────────
+#
+# The other half of "a refused create must be visible".  Under `set -euo
+# pipefail` a lone `VAR=$(cmd)` is a simple command whose exit status *is* the
+# substitution's, so when cmd fails the file ends at that line: no assertion, no
+# `Results`, no `OK`/`FAILED`.  What a broken test_cache.sh printed was
+#
+#     FAIL [cache created]: create refused, exit 2 …    <- ba7a147 added this
+#     FAIL [SET]: got '', expected 'ok'
+#     … 20 more …
+#     (nothing — the file is gone, at `TTL=$(send_cmd 'ttl ttlkey')`)
+#
+# and it exited 1 rather than 26, because the status that escaped was nc's.  Five
+# assertions after that line never ran and the counts never printed, so a run
+# that broke twenty-six things is indistinguishable from one that broke one.
+#
+# Most such sites should simply survive: the assertion underneath is the thing
+# with something to say about a command that failed, and it can only say it if
+# the file is still running.  Those are guarded where they stand.
+#
+# The rest are what these two are for.
+
+# daemon_bail LABEL REASON [DETAIL...]
+#
+# End the run here — but end it *reporting*.  Counts the bail-out as the failure
+# it is and prints the same two closing lines every test in this directory ends
+# with, so a file that stops early still answers the only question the summary
+# exists to answer: was it one thing or twenty?
+daemon_bail() {
+    local label=$1 reason=$2; shift 2
+    TOTAL=$(( ${TOTAL:-0} + 1 ))
+    FAIL=$(( ${FAIL:-0} + 1 ))
+    echo "  FAIL [$label]: $reason"
+    local line
+    for line in "$@"; do echo "        $line"; done
+    echo "  Results: ${PASS:-0}/$TOTAL passed ($FAIL failed)"
+    echo "  FAILED"
+    exit "$FAIL"
+}
+
+# daemon_required LABEL [SOCKET]
+#
+# Decide, at a CLI command that has just failed, which of the two kinds of
+# failure it was — and return 0 either way so it can be written as the `||`
+# branch of the capture itself:
+#
+#     OUT=$("$BIN" stats mesh_proxy 2>&1) || daemon_required "stats mesh_proxy"
+#
+# A daemon that is still serving means the command failed on its own merits —
+# usually a runtime that a refused create never built.  That is not fatal: $OUT
+# holds whatever the CLI said, the assertion below judges it, and the file goes
+# on to test the four unrelated things it also covers.  Returning 0 is what lets
+# it, and it hides nothing, because something below is looking.
+#
+# A daemon that is gone is the other case.  Twenty assertions about the
+# behaviour of a socket nobody is serving are not twenty findings; they are one
+# finding printed twenty times, and they bury it.  So that stops — via
+# daemon_bail, which is the whole point: stopping is fine, disappearing is not.
+daemon_required() {
+    daemon_alive "${2:-${SOCKETLEY_SOCKET:-}}" && return 0
+    daemon_bail "$1" "this test's daemon is no longer serving its socket" \
+        "${2:-${SOCKETLEY_SOCKET:-<unset>}}" \
+        "every assertion below this point would be measuring a dead socket," \
+        "so they are not run — this one failure is the finding, not twenty."
 }

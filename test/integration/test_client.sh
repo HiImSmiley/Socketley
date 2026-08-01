@@ -53,7 +53,12 @@ create_ok "client created" "$BIN" create client cli_client -t "127.0.0.1:$SVR_PO
 sleep 0.3
 
 # Test: Both show in ps
-OUT=$("$BIN" ps 2>&1)
+#
+# A lone `OUT=$(cmd)` takes its exit status from the substitution, so a failing
+# CLI command used to end this file at the assignment with no `Results` line.
+# daemon_required carries on when the daemon is still serving — the assertion
+# below is what reports it — and stops, with counts, when it is not.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "cli_svr" "server in ps"
 assert_contains "$OUT" "cli_client" "client in ps"
 

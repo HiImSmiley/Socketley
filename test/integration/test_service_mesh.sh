@@ -50,6 +50,11 @@ assert_ok() {
     fi
 }
 
+# The output goes out on failure, not just the pattern that was missing.  Every
+# caller below is fed by a CLI command that is allowed to fail, and when one
+# does, $1 holds the reason — `no such runtime: mesh_proxy` — while "expected
+# 'protocol:tcp' in output" describes only the symptom.  Printing the pattern
+# and swallowing the cause is the same trade ba7a147 spent 70 call sites undoing.
 assert_contains() {
     TOTAL=$((TOTAL+1))
     if echo "$1" | grep -q "$2"; then
@@ -57,6 +62,7 @@ assert_contains() {
     else
         FAIL=$((FAIL+1))
         echo "  FAIL: expected '$2' in output"
+        printf '%s\n' "${1:-<nothing>}" | sed 's/^/        got: /'
     fi
 }
 
@@ -96,11 +102,32 @@ create_ok "create proxy with mesh flags" \
 sleep 0.5
 
 # Test: proxy is running
-OUT=$("$BIN" ps 2>&1)
+#
+# ─── Why every capture below carries a `|| daemon_required` ─────────────────
+#
+# `OUT=$(cmd)` alone on a line is a simple command whose exit status is the
+# substitution's, so under `set -euo pipefail` a failing CLI command ended this
+# file *at the assignment*: no assertion, no `Results`, no `OK`/`FAILED`.  With
+# the proxy's port held so its create was refused, that is what this file did —
+#
+#     FAIL [create proxy with mesh flags]: create refused, exit 2 …
+#     FAIL: expected 'mesh_proxy' in output
+#     (nothing — gone at `OUT=$("$BIN" stats mesh_proxy 2>&1)`)
+#
+# — two assertions out of eighteen, and the entire --sidecar half of the file,
+# which shares nothing with the proxy that failed, never ran or reported.
+#
+# `|| true` would fix the abort and cost the distinction that matters: a `stats`
+# that fails because the runtime is missing is a finding the assertion below
+# states precisely, while a `stats` that fails because the daemon died makes the
+# fourteen assertions after it noise.  daemon_required tells those apart, lets
+# the first carry on, and stops the second *with a summary* rather than by
+# evaporating.
+OUT=$("$BIN" ps 2>&1)                    || daemon_required "ps"
 assert_contains "$OUT" "mesh_proxy"
 
 # Test: stats show healthy backends
-OUT=$("$BIN" stats mesh_proxy 2>&1)
+OUT=$("$BIN" stats mesh_proxy 2>&1)      || daemon_required "stats mesh_proxy"
 assert_contains "$OUT" "protocol:tcp"
 assert_contains "$OUT" "backends:2"
 
@@ -116,7 +143,7 @@ else
 fi
 
 # --- Test 2: Show/dump includes mesh config ---
-OUT=$("$BIN" show mesh_proxy 2>&1)
+OUT=$("$BIN" show mesh_proxy 2>&1)       || daemon_required "show mesh_proxy"
 assert_contains "$OUT" "health_check"
 assert_contains "$OUT" "circuit_threshold"
 assert_contains "$OUT" "retry_count"
@@ -141,11 +168,11 @@ create_ok "create proxy with --sidecar" \
     -s
 sleep 0.5
 
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1)                    || daemon_required "ps"
 assert_contains "$OUT" "sidecar_proxy"
 
 # Test: sidecar sets health-check, retry, drain
-OUT=$("$BIN" show sidecar_proxy 2>&1)
+OUT=$("$BIN" show sidecar_proxy 2>&1)    || daemon_required "show sidecar_proxy"
 assert_contains "$OUT" "health_check"
 assert_contains "$OUT" "retry_count"
 
@@ -164,7 +191,7 @@ fi
 RC=0; OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || RC=$?
 assert_ok "$RC" "edit mesh flags" "$OUT"
 
-OUT=$("$BIN" show sidecar_proxy 2>&1)
+OUT=$("$BIN" show sidecar_proxy 2>&1)    || daemon_required "show sidecar_proxy"
 assert_contains "$OUT" "circuit_threshold"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

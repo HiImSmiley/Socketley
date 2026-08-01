@@ -57,11 +57,17 @@ create_ok "server created" "$BIN" create server dash_svr -p 19390 -s
 sleep 0.3
 
 # Test: runtime is visible
-OUT=$("$BIN" ps 2>&1)
+#
+# The `|| true` three tests up is right for that one — a dashboard that is not
+# configured legitimately exits non-zero and the assertion accepts both answers.
+# These two are different: they must not end the file either, but a failure here
+# is not expected, so it goes to daemon_required, which carries on when the
+# daemon is still serving and stops with counts when it is not.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "dash_svr"
 
 # Test: stats command works
-OUT=$("$BIN" stats dash_svr 2>&1)
+OUT=$("$BIN" stats dash_svr 2>&1) || daemon_required "stats dash_svr"
 assert_contains "$OUT" "connections:"
 assert_contains "$OUT" "total_connections:"
 

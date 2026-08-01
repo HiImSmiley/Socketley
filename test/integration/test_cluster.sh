@@ -159,7 +159,21 @@ sleep 3
 # ─── Test 1: Daemon discovery (cluster ls) ─────────────────────────────────────
 
 echo "  Test 1: daemon discovery"
-OUT=$(node1 cluster ls 2>&1)
+# ─── Why each capture names a socket ────────────────────────────────────────
+#
+# A lone `OUT=$(cmd)` is a simple command whose exit status is the
+# substitution's, so under `set -euo pipefail` a failing `cluster` command ended
+# this file at the assignment: no assertion, no `Results` line, and — since test
+# 6 is the one that kills a daemon on purpose — no way to tell "discovery is
+# broken" from "the file stopped before it looked".
+#
+# daemon_required is given the socket explicitly here.  This file runs three
+# daemons on three sockets and the wrapper functions set SOCKETLEY_SOCKET for
+# the duration of one command, so the ambient value the other tests rely on is
+# not set: without the argument the liveness check would ask about the wrong
+# daemon, and answering "gone" for a daemon that is fine would stop a run that
+# should carry on.
+OUT=$(node1 cluster ls 2>&1)      || daemon_required "cluster ls" "$SOCK_NODE1"
 assert_contains "$OUT" "node1"
 assert_contains "$OUT" "node2"
 assert_contains "$OUT" "gateway"
@@ -167,14 +181,14 @@ assert_contains "$OUT" "gateway"
 # ─── Test 2: Runtime visibility (cluster ps) ───────────────────────────────────
 
 echo "  Test 2: runtime visibility"
-OUT=$(node1 cluster ps 2>&1)
+OUT=$(node1 cluster ps 2>&1)      || daemon_required "cluster ps" "$SOCK_NODE1"
 assert_contains "$OUT" "$RT_API1"
 assert_contains "$OUT" "$RT_API2"
 
 # ─── Test 3: Group resolution (cluster group api) ─────────────────────────────
 
 echo "  Test 3: group resolution"
-OUT=$(node1 cluster group api 2>&1)
+OUT=$(node1 cluster group api 2>&1) || daemon_required "cluster group api" "$SOCK_NODE1"
 assert_contains "$OUT" "node1"
 assert_contains "$OUT" "node2"
 assert_contains "$OUT" "$NODE1_PORT"
@@ -183,7 +197,7 @@ assert_contains "$OUT" "$NODE2_PORT"
 # ─── Test 4: Cluster stats ────────────────────────────────────────────────────
 
 echo "  Test 4: cluster stats"
-OUT=$(node1 cluster stats 2>&1)
+OUT=$(node1 cluster stats 2>&1)   || daemon_required "cluster stats" "$SOCK_NODE1"
 assert_contains "$OUT" "3 healthy"
 assert_contains "$OUT" "api"
 assert_contains "$OUT" "2 members"
@@ -221,7 +235,10 @@ DAEMON_PIDS[1]=0
 # Stale threshold is 10s; wait for it to expire
 sleep 12
 
-OUT=$(node1 cluster ls 2>&1)
+# node1's daemon, deliberately, not node2's: node2's was killed on purpose a few
+# lines up, and this is the one that has to still be answering for the staleness
+# question to mean anything.
+OUT=$(node1 cluster ls 2>&1)      || daemon_required "cluster ls" "$SOCK_NODE1"
 # node2 should be stale or its heartbeat should be old
 TOTAL=$((TOTAL+1))
 if echo "$OUT" | grep "node2" | grep -q "stale"; then

@@ -40,7 +40,13 @@ create_ok "server created" "$BIN" create server rl_test -p "$PORT" \
 sleep 0.3
 
 # Test: Server shows in ps
-OUT=$("$BIN" ps 2>&1)
+#
+# A lone `OUT=$(cmd)` takes its exit status from the substitution, so a failing
+# CLI command used to end this file at the assignment with no `Results` line.
+# daemon_required carries on when the daemon is still serving — the assertion
+# below is what reports a command that failed on its own merits — and stops,
+# with counts, when it is not.  See lib_daemon.sh.
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "rl_test" "server in ps"
 
 # Test: Open 3 connections (within limit) — hold them open with sleep
@@ -59,11 +65,11 @@ NC_PID4=$!
 sleep 0.3
 
 # Check stats to verify connection count
-OUT=$("$BIN" stats rl_test 2>&1)
+OUT=$("$BIN" stats rl_test 2>&1) || daemon_required "stats rl_test"
 assert_contains "$OUT" "total_connections" "stats has total_connections"
 
 # Test: Server is still running
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "rl_test" "server still running after connections"
 
 # Kill held connections
@@ -73,7 +79,7 @@ NC_PID1=""; NC_PID2=""; NC_PID3=""; NC_PID4=""
 sleep 0.3
 
 # Test: Server still healthy after all connections closed
-OUT=$("$BIN" ps 2>&1)
+OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "rl_test" "server healthy after cleanup"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

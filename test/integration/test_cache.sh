@@ -29,8 +29,19 @@ assert_eq() {
     fi
 }
 
+# The `|| true` belongs to this pipeline, not to any caller's assignment.
+#
+# When the create was refused nothing is listening on $PORT, nc exits non-zero,
+# and `pipefail` makes that the pipeline's status.  Callers that write
+# `assert_eq "$(send_cmd …)" …` are unaffected — a command substitution in an
+# argument does not decide the command's status — but the two that write
+# `TTL=$(send_cmd …)` are a simple command whose status *is* this one, and under
+# `set -e` the file ended there: no TTL assertions, no SIZE assertion, no
+# `Results` line, and an exit status of 1 that came from nc rather than from the
+# failure count.  An empty answer is the right result to hand back; the assert
+# below is what reports it, and it needs the file to still be running.
 send_cmd() {
-    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r'
+    echo "$1" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' || true
 }
 
 echo "=== Integration: cache commands ==="
