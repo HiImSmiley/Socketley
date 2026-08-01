@@ -657,6 +657,20 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
     }
 
 resubmit:
+    // A connection marked closing with nothing left in flight has nobody to
+    // notice it.  arm_read() declines while closing, so no completion is
+    // coming; the client sat connected and deaf, on an open socket, until the
+    // runtime was stopped -- and with reconnect configured it never dialled
+    // again either, because nothing had told it the connection was gone.  One
+    // path reaches that state: a line longer than MAX_PARTIAL_SIZE, which is
+    // the branch a few lines above.  Every other way of losing the socket goes
+    // through drop_connection; this one used to just stop.
+    if (m_conn->closing && !m_conn->write_pending && m_connected)
+    {
+        drop_connection();
+        return;
+    }
+
     arm_read();
 }
 
