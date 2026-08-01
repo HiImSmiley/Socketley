@@ -203,6 +203,7 @@ void proxy_client_connection::reset(int new_fd)
     method.clear();
     path.clear();
     version.clear();
+    filter_headers.clear();
     declared_body_len = 0;
     declared_body_chunked = false;
     body_remaining = 0;
@@ -2217,6 +2218,21 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         else
             new_path = std::string_view(conn->path).substr(m_prefix.size() - 1); // Keep leading /
 
+        // The filter chain, and the one place it may be called from.
+        //
+        // Above the selection, not beside it: a filter exists to stop a request
+        // before it costs anything, and everything it is meant to stop —
+        // resolving an endpoint, claiming a circuit breaker's half-open probe,
+        // taking a socket from the pool, opening a new one — begins on the next
+        // line.  A chain that ran after any of that would be decorative.
+        //
+        // The guard is the callback mask, as it is for every other Lua hook
+        // here: a proxy whose script declares no `filters` array never makes
+        // the call.
+        if (SOCKETLEY_UNLIKELY(lua() && lua()->has_filters()) &&
+            run_request_filters(conn))
+            return;   // answered by a filter; no backend was ever chosen
+
         // Select and connect to backend
         auto* target = select_and_resolve_backend(conn);
         if (SOCKETLEY_UNLIKELY(!target))
@@ -2995,6 +3011,30 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // Content-Length: parse_http_request_line refuses that combination now
         // that it can actually see both headers.
 
+        // A header a filter set replaces the client's, rather than joining it:
+        // "set" would mean very little if the value it was meant to overwrite
+        // travelled alongside it and the backend combined the two.  The names
+        // were lowercased and checked when they were collected — Host and the
+        // framing pair among them are refused there, so this loop cannot be
+        // made to skip a line it is responsible for.
+        if (SOCKETLEY_UNLIKELY(!conn->filter_headers.empty()))
+        {
+            bool overridden = false;
+            for (const auto& [n, v] : conn->filter_headers)
+            {
+                if (header_name_equals(hdr_line, n.c_str(), n.size()))
+                {
+                    overridden = true;
+                    break;
+                }
+            }
+            if (overridden)
+            {
+                h_pos = nl + 2;
+                continue;
+            }
+        }
+
         // Rewrite Host header to backend address
         if (header_name_equals(hdr_line, "host", 4))
         {
@@ -3020,6 +3060,18 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // Add Host if not present
     if (!host_written)
         append_backend_host_header(result, conn);
+
+    // What the chain asked for, once each, after the client's own block.  Name
+    // and value were validated at the point they were taken from Lua — no CR,
+    // no LF, a bare token for a name — so nothing here can add a line the
+    // backend would frame differently from this proxy.
+    for (const auto& [n, v] : conn->filter_headers)
+    {
+        result += n;
+        result += ": ";
+        result += v;
+        result += "\r\n";
+    }
 
     // Request keep-alive to enable backend connection pooling,
     // unless the client sent Connection: close
@@ -3076,6 +3128,397 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     conn->partial.erase(0, body_off + body_len);
 
     return result;
+}
+
+// ─── Filter chain ───────────────────────────────────────────────────────────
+//
+// Everything below serves run_request_filters at the end of this block.  It runs
+// on a request whose header block has been parsed and accepted and whose path
+// belongs to this proxy, and before anything at all has been decided about where
+// that request is going.
+#ifndef SOCKETLEY_NO_LUA
+
+// A field name a filter supplied.  RFC 9110 Section 5.1 tchar, and nothing else:
+// a name carrying a colon, a space or a CR splits into something the backend
+// reads as two fields, which is header injection with the proxy as the vehicle.
+// Filter input is frequently derived from the request — a rate limiter echoing
+// back a client-supplied identifier is the ordinary case — so "the script wrote
+// it" is not evidence that the peer did not.
+static bool filter_token_ok(std::string_view s)
+{
+    if (s.empty() || s.size() > 256)
+        return false;
+    for (char c : s)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u <= 0x20 || u >= 0x7F)
+            return false;
+        switch (c)
+        {
+            case '(': case ')': case ',': case '/': case ':': case ';':
+            case '<': case '=': case '>': case '?': case '@': case '[':
+            case '\\': case ']': case '{': case '}': case '"':
+                return false;
+            default: break;
+        }
+    }
+    return true;
+}
+
+// A field value a filter supplied.  The bytes that end a line and the bytes that
+// end a header block are the ones that matter; obs-text (>= 0x80) is left alone
+// because it is legal and this is not the place to start transcoding.
+static bool filter_value_ok(std::string_view s)
+{
+    if (s.size() > 8192)
+        return false;
+    for (char c : s)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u == '\r' || u == '\n' || u == 0 || (u < 0x20 && u != '\t') || u == 0x7F)
+            return false;
+    }
+    return true;
+}
+
+// Names a filter may not set on the request it is letting through.
+//
+// The framing pair first: parse_http_request_line has just proved this request
+// gives exactly one answer to "how long is the body", and rewrite_http_request
+// forwards precisely that many bytes.  A filter that sets Content-Length or
+// Transfer-Encoding makes the proxy and the backend disagree about where the
+// request ends — request smuggling, introduced by the feature meant to stop it.
+// Then the hop-by-hop set, which rewrite_http_request strips on purpose, and
+// Host, which it rewrites to the endpoint actually selected.
+static bool filter_request_header_forbidden(std::string_view lower)
+{
+    static constexpr std::string_view banned[] = {
+        "content-length", "transfer-encoding", "host", "connection",
+        "keep-alive", "te", "trailer", "upgrade",
+        "proxy-authenticate", "proxy-authorization",
+    };
+    for (auto b : banned)
+        if (lower == b)
+            return true;
+    return false;
+}
+
+// The same question for a header on the answer a filter is sending.  Shorter
+// list: the proxy writes the length and the connection disposition itself, and
+// a filter's copy of either would be a second answer to a question that has one.
+static bool filter_response_header_forbidden(std::string_view lower)
+{
+    return lower == "content-length" || lower == "transfer-encoding" ||
+           lower == "connection";
+}
+
+static std::string_view filter_reason(int status)
+{
+    switch (status)
+    {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 202: return "Accepted";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 307: return "Temporary Redirect";
+        case 308: return "Permanent Redirect";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 407: return "Proxy Authentication Required";
+        case 409: return "Conflict";
+        case 413: return "Content Too Large";
+        case 418: return "I'm a teapot";
+        case 421: return "Misdirected Request";
+        case 422: return "Unprocessable Content";
+        case 429: return "Too Many Requests";
+        case 451: return "Unavailable For Legal Reasons";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+        default:  return "Unknown";
+    }
+}
+
+// Lowercase the name and trim the value of one field line, for the table handed
+// to a filter.  Names are lowercased because a lookup on a table is exact and
+// HTTP field names are not — a filter written as req.headers["authorization"]
+// must not depend on which capitalisation the client happened to send.
+static void filter_collect_header(sol::table& out, std::string_view line)
+{
+    const auto colon = line.find(':');
+    if (colon == std::string_view::npos || colon == 0)
+        return;   // parse_http_request_line has already refused these
+    std::string name(line.substr(0, colon));
+    for (auto& c : name)
+        c = static_cast<char>(c | 0x20);
+    const std::string_view value = http_trim_ows(line.substr(colon + 1));
+
+    // Repeats are combined, in the order sent, as RFC 9110 Section 5.2 defines
+    // the field value of a field that appears more than once.  A table holds one
+    // value per key, and dropping the later ones would hide half a Cookie.
+    sol::optional<std::string> prev = out[name];
+    if (prev)
+    {
+        std::string joined = std::move(*prev);
+        joined += ", ";
+        joined.append(value);
+        out[name] = joined;
+    }
+    else
+        out[name] = std::string(value);
+}
+
+#endif // SOCKETLEY_NO_LUA
+
+bool proxy_instance::run_request_filters(proxy_client_connection* conn)
+{
+#ifdef SOCKETLEY_NO_LUA
+    (void)conn;
+    return false;
+#else
+    auto* lctx = lua();
+    if (!lctx || !lctx->has_filters())
+        return false;
+
+    sol::state& L = lctx->state();
+
+    // The request, as the client sent it.  `path` carries this proxy's own
+    // prefix, exactly as on_route sees it: a filter judging a request judges
+    // what arrived, not what the proxy will forward.
+    sol::table req = L.create_table(0, 5);
+    req["method"]    = conn->method;
+    req["path"]      = conn->path;
+    req["version"]   = conn->version;
+    req["client_id"] = conn->fd;
+
+    // The header block, measured from the same terminator parse_http_request_line
+    // measured it from.  Both finds succeed by construction — the caller only
+    // reaches here on http_request_parse::complete — and the guards below are
+    // for the day that stops being true, because a filter chain that silently
+    // sees no headers is an auth filter that admits everyone.
+    sol::table hdrs = L.create_table();
+    const auto line_end = conn->partial.find("\r\n");
+    const auto hdr_end  = conn->partial.find("\r\n\r\n");
+    if (line_end != std::string::npos && hdr_end != std::string::npos && hdr_end > line_end)
+    {
+        std::string_view block(conn->partial.data() + line_end + 2, hdr_end - line_end - 2);
+        size_t p = 0;
+        while (p < block.size())
+        {
+            auto nl = block.find("\r\n", p);
+            if (nl == std::string_view::npos)
+                nl = block.size();
+            filter_collect_header(hdrs, block.substr(p, nl - p));
+            p = nl + 2;
+        }
+    }
+    req["headers"] = hdrs;
+
+    // Headers a filter has asked to be set on the way out.  Cleared here rather
+    // than only between requests: this is the one place that fills it, and a
+    // request that reaches the chain twice must not accumulate.
+    conn->filter_headers.clear();
+
+    for (const auto& filter : lctx->filters())
+    {
+        auto result = filter(req);
+
+        // A filter that failed did not say "carry on".  Nothing that raises an
+        // error has expressed an opinion about this request, and the opinion it
+        // was there to express is usually "no" — so the request is refused and
+        // the operator is told, rather than the chain silently shortening.
+        if (SOCKETLEY_UNLIKELY(!result.valid()))
+        {
+            sol::error err = result;
+            fprintf(stderr, "[lua] filter error: %s\n", err.what());
+            conn->partial.clear();
+            send_error(conn, "500 Internal Server Error", "Filter Error\n");
+            return true;
+        }
+
+        // Nothing returned, or nil: this filter has no opinion.  The commonest
+        // outcome by far, and the only one that costs nothing.
+        if (result.return_count() == 0)
+            continue;
+        sol::object r = result.get<sol::object>();
+        if (!r.valid() || r == sol::nil)
+            continue;
+
+        if (SOCKETLEY_UNLIKELY(!r.is<sol::table>()))
+        {
+            // Deliberately not "anything truthy carries on".  A filter is
+            // allowed exactly two vocabularies — say nothing, or return the
+            // answer — and a third value is a script that means something this
+            // side cannot read.  Guessing at it is how a `return false` meant as
+            // a rejection becomes an admission.
+            fprintf(stderr, "[lua] filter returned a %s; expected nil or a table\n",
+                    lua_typename(L.lua_state(), static_cast<int>(r.get_type())));
+            conn->partial.clear();
+            send_error(conn, "500 Internal Server Error", "Filter Error\n");
+            return true;
+        }
+
+        sol::table t = r.as<sol::table>();
+        sol::optional<sol::object> status_obj = t["status"];
+        const bool is_answer = status_obj && *status_obj != sol::nil;
+
+        if (!is_answer)
+        {
+            // Continue, with the request rewritten.  The only other thing a
+            // returned table may be.
+            sol::optional<sol::table> set = t["set_headers"];
+            if (!set)
+            {
+                fprintf(stderr, "[lua] filter returned a table with neither "
+                                "`status` nor `set_headers`\n");
+                conn->partial.clear();
+                send_error(conn, "500 Internal Server Error", "Filter Error\n");
+                return true;
+            }
+            set->for_each([&](sol::object key, sol::object val) {
+                if (!key.is<std::string>() || !val.is<std::string>())
+                {
+                    fprintf(stderr, "[lua] filter set_headers: name and value must be strings\n");
+                    return;
+                }
+                std::string name = key.as<std::string>();
+                std::string value = val.as<std::string>();
+                for (auto& c : name)
+                    c = static_cast<char>(c | 0x20);
+                if (!filter_token_ok(name) || !filter_value_ok(value))
+                {
+                    fprintf(stderr, "[lua] filter set_headers: refused a header this "
+                                    "proxy will not put on the wire\n");
+                    return;
+                }
+                if (filter_request_header_forbidden(name))
+                {
+                    fprintf(stderr, "[lua] filter set_headers: `%s` is the proxy's to "
+                                    "decide, not a filter's\n", name.c_str());
+                    return;
+                }
+                // Last writer wins, so a later filter can correct an earlier one
+                // instead of appending a second copy the backend has to combine.
+                for (auto& [n, v] : conn->filter_headers)
+                {
+                    if (n == name) { v = std::move(value); return; }
+                }
+                conn->filter_headers.emplace_back(std::move(name), std::move(value));
+            });
+            continue;
+        }
+
+        // The answer.  Everything from here on ends the request: no backend is
+        // selected, no endpoint is resolved, no socket is opened or taken from
+        // the pool, and no circuit breaker is told anything — because none of
+        // those has happened yet, which is the reason this function is called
+        // where it is.
+        int status = 0;
+        if (status_obj->is<int>())
+            status = status_obj->as<int>();
+        if (status < 200 || status > 599)
+        {
+            fprintf(stderr, "[lua] filter answer: status must be 200..599\n");
+            conn->partial.clear();
+            send_error(conn, "500 Internal Server Error", "Filter Error\n");
+            return true;
+        }
+
+        std::string body;
+        {
+            sol::optional<std::string> b = t["body"];
+            if (b)
+                body = std::move(*b);
+        }
+
+        std::string response;
+        response.reserve(128 + body.size());
+        response += "HTTP/1.1 ";
+        char code_buf[8];
+        auto [cend, cec] = std::to_chars(code_buf, code_buf + sizeof(code_buf), status);
+        response.append(code_buf, static_cast<size_t>(cend - code_buf));
+        response += ' ';
+        response += filter_reason(status);
+        response += "\r\n";
+
+        sol::optional<sol::table> rh = t["headers"];
+        if (rh)
+        {
+            rh->for_each([&](sol::object key, sol::object val) {
+                if (!key.is<std::string>() || !val.is<std::string>())
+                {
+                    fprintf(stderr, "[lua] filter answer headers: name and value must be strings\n");
+                    return;
+                }
+                const std::string name = key.as<std::string>();
+                const std::string value = val.as<std::string>();
+                std::string lower = name;
+                for (auto& c : lower)
+                    c = static_cast<char>(c | 0x20);
+                if (!filter_token_ok(name) || !filter_value_ok(value))
+                {
+                    fprintf(stderr, "[lua] filter answer headers: refused a header this "
+                                    "proxy will not put on the wire\n");
+                    return;
+                }
+                if (filter_response_header_forbidden(lower))
+                {
+                    fprintf(stderr, "[lua] filter answer headers: `%s` is framing, and "
+                                    "this proxy writes it\n", lower.c_str());
+                    return;
+                }
+                response += name;
+                response += ": ";
+                response += value;
+                response += "\r\n";
+            });
+        }
+
+        // A 204 or a 304 carries no content and RFC 9112 Section 6.2 forbids the
+        // header that would say how much; a response to HEAD carries the length
+        // its GET would have had and none of the bytes.  Everything else gets
+        // both.  Nothing here is left to the peer to work out from the close.
+        const bool no_content = (status == 204 || status == 304);
+        const bool head = (conn->method == "HEAD");
+        if (no_content)
+            body.clear();
+        else
+        {
+            response += "Content-Length: ";
+            char len_buf[24];
+            auto [lend, lec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
+            response.append(len_buf, static_cast<size_t>(lend - len_buf));
+            response += "\r\n";
+            if (head)
+                body.clear();
+        }
+
+        // Closed, like every other response this proxy writes itself.  Keeping
+        // the connection alive would mean deciding where this request ends so
+        // the next one can begin — consuming a body that may not have arrived
+        // yet — and that decision is exactly what the answered-here path does
+        // not have a backend response to make for it.
+        response += "Connection: close\r\n\r\n";
+        response += body;
+
+        // Same reason as the 400 path in drive_client_request: what is still
+        // buffered must not be picked up as a fresh request while the answer is
+        // on its way out.
+        conn->partial.clear();
+        queue_final_response(conn, std::move(response));
+        return true;
+    }
+
+    return false;
+#endif
 }
 
 const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
@@ -4902,6 +5345,13 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->method.clear();
     cconn->path.clear();
     cconn->version.clear();
+    // Per request, not per connection: the next request on this socket gets the
+    // chain's verdict on itself, not the last one's.  run_request_filters
+    // clears it too, but only for requests that reach the chain — a keep-alive
+    // connection whose second request is answered 404 before it does would
+    // otherwise still be carrying the first request's headers if it ever
+    // reached a backend.
+    cconn->filter_headers.clear();
 
     // The answer arrived before the client had finished sending its body — an
     // early 4xx, say.  Then what is buffered is the tail of that body rather
@@ -6345,12 +6795,23 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     response.append(hdr_buf, hdr_len);
     response += body;
 
+    queue_final_response(conn, std::move(response));
+}
+
+// The tail of every response this proxy produces on its own account: an error
+// above, or a filter's answer.  It was inline in send_error, and it is a
+// function now because the filter chain answers requests too — and an answer
+// that reached the client down a path of its own would be an exit that skips
+// exactly the two things below.
+void proxy_instance::queue_final_response(proxy_client_connection* conn,
+                                          std::string&& response)
+{
     conn->write_queue.push(std::move(response));
     conn->closing = true;
 
-    // conn->closing is already set above.  If the error body cannot be handed
-    // to the ring it simply never goes out; the caller's teardown proceeds
-    // either way, so there is nothing for this to decide.
+    // conn->closing is already set above.  If the body cannot be handed to the
+    // ring it simply never goes out; the caller's teardown proceeds either way,
+    // so there is nothing for this to decide.
     if (!conn->write_pending && !flush_client_write_queue(conn))
         conn->write_queue.clear();
 

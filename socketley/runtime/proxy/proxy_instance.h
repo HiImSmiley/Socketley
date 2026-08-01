@@ -163,6 +163,13 @@ struct alignas(64) proxy_client_connection
     size_t body_remaining{0};
     bool body_unbounded{false};
 
+    // Request headers a filter set on the request now being parsed, applied by
+    // rewrite_http_request on the way out.  Per request and not per connection:
+    // cleared between requests on a keep-alive socket, or the second request
+    // would carry the first one's identity.  Empty — and never touched — on a
+    // proxy whose script declares no chain.
+    std::vector<std::pair<std::string, std::string>> filter_headers;
+
     std::chrono::steady_clock::time_point last_activity{};
     int retries_remaining{0};
     size_t backend_idx{0};
@@ -559,6 +566,33 @@ private:
     http_request_parse parse_http_request_line(proxy_client_connection* conn);
     std::string rewrite_http_request(proxy_client_connection* conn,
                                      std::string_view new_path);
+
+    // ── Filter chain ────────────────────────────────────────────────────────
+    //
+    // The `filters` array a Lua script declares, run in order on a parsed
+    // request *before* a backend is chosen for it.  Each filter either says
+    // nothing — carry on — or returns the answer, in which case this request is
+    // answered here and no backend is ever selected, resolved or connected to.
+    // That ordering is the whole feature: a filter that ran after the connect
+    // would already have cost the thing it exists to prevent, so the call sits
+    // above select_and_resolve_backend in drive_client_request and nowhere else.
+    //
+    // Returns true when the request has been answered and the caller must
+    // return immediately without forwarding anything.  The answer goes out
+    // through the same tail every other self-answered response uses, so the
+    // connection is torn down by the paths that already exist — see
+    // queue_final_response.
+    //
+    // Guarded by lua()->has_filters() at the call site: a proxy with no chain
+    // does not reach this function at all.
+    bool run_request_filters(proxy_client_connection* conn);
+
+    // The tail shared by every response this proxy writes itself: queue it,
+    // mark the connection closing, flush what can be flushed, and half-close
+    // the read direction so the teardown actually happens (see send_error for
+    // why the last one is not optional).  One copy, because a second exit from
+    // the answered-here path is how a descriptor leaks.
+    void queue_final_response(proxy_client_connection* conn, std::string&& response);
 
     bool resolve_backend(backend_info& b);
     const backend_info* select_and_resolve_backend(proxy_client_connection* conn);

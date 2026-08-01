@@ -236,6 +236,59 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_upstream_disconnect.valid()) m_callback_mask |= CB_ON_UPSTREAM_DISCONNECT;
     if (m_on_http_request.valid())       m_callback_mask |= CB_ON_HTTP_REQUEST;
 
+    // The filter chain.  `filters` is an array of functions run in order before
+    // a proxy chooses a backend; see proxy_instance::run_request_filters.
+    //
+    // A malformed entry refuses the script rather than being skipped.  The chain
+    // is where authentication lives, so "the third filter was a typo and was
+    // quietly dropped" is a runtime that admits everyone while looking exactly
+    // like one that does not.  A script that cannot be loaded is visible at the
+    // moment the operator writes it; a hole in the chain is not.
+    m_filters.clear();
+    {
+        sol::object fobj = m_lua["filters"];
+        if (fobj.valid() && fobj != sol::nil)
+        {
+            if (!fobj.is<sol::table>())
+            {
+                std::cerr << "[lua] `filters` must be a table of functions" << std::endl;
+                return false;
+            }
+            sol::table ft = fobj.as<sol::table>();
+            // The array part only, and stopping at the first hole: a chain with
+            // a gap in it has an order nobody can state, which is the one thing
+            // a chain has to have.
+            for (size_t i = 1;; ++i)
+            {
+                sol::object entry = ft[i];
+                if (!entry.valid() || entry == sol::nil)
+                    break;
+                if (!entry.is<sol::function>())
+                {
+                    std::cerr << "[lua] filters[" << i << "] is not a function" << std::endl;
+                    return false;
+                }
+                m_filters.push_back(entry.as<sol::protected_function>());
+            }
+            if (m_filters.empty())
+            {
+                // `filters = { auth = f }` reads like a registration and is
+                // silently nothing: the array part is empty, so the chain never
+                // runs.  An empty table is a legitimate way to say "no filters"
+                // and is left alone.
+                bool any = false;
+                ft.for_each([&](sol::object, sol::object) { any = true; });
+                if (any)
+                {
+                    std::cerr << "[lua] `filters` has no entry at index 1 — a chain is "
+                                 "an ordered array, not a keyed table" << std::endl;
+                    return false;
+                }
+            }
+        }
+    }
+    if (!m_filters.empty()) m_callback_mask |= CB_FILTERS;
+
     return true;
 }
 

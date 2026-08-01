@@ -54,6 +54,7 @@ public:
         CB_ON_UPSTREAM_CONNECT   = 1u << 22,
         CB_ON_UPSTREAM_DISCONNECT = 1u << 23,
         CB_ON_HTTP_REQUEST       = 1u << 24,
+        CB_FILTERS               = 1u << 25,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -82,6 +83,10 @@ public:
     bool has_on_upstream_connect()   const { return m_callback_mask & CB_ON_UPSTREAM_CONNECT; }
     bool has_on_upstream_disconnect() const { return m_callback_mask & CB_ON_UPSTREAM_DISCONNECT; }
     bool has_on_http_request()       const { return m_callback_mask & CB_ON_HTTP_REQUEST; }
+    // Whether the script declared a non-empty `filters` chain.  Asked once per
+    // request on the proxy's route path, so it is a mask bit like every other
+    // callback here rather than a vector emptiness test.
+    bool has_filters()               const { return m_callback_mask & CB_FILTERS; }
 
     // Get callbacks
     sol::function& on_start() { return m_on_start; }
@@ -109,6 +114,9 @@ public:
     sol::function& on_upstream_connect()   { return m_on_upstream_connect; }
     sol::function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
     sol::function& on_http_request()       { return m_on_http_request; }
+    // The chain, in the order the script listed it.  Only valid to read when
+    // has_filters() is true; empty otherwise.
+    const std::vector<sol::protected_function>& filters() const { return m_filters; }
     uint32_t get_tick_ms() const { return m_tick_ms; }
 
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
@@ -147,6 +155,17 @@ private:
     sol::function m_on_upstream_connect;
     sol::function m_on_upstream_disconnect;
     sol::function m_on_http_request;
+
+    // The `filters` chain.  A vector and not a single sol::function because the
+    // whole point of it is order: each entry is asked in turn and the first one
+    // with an answer ends the request.  Collected once at load time, so nothing
+    // walks the Lua global table per request.
+    //
+    // protected_function and not function, unlike every callback above: a filter
+    // is where authentication lives, and an error raised inside one has to come
+    // back as a value this side can act on — the request is refused — rather
+    // than as an unwind whose behaviour depends on how LuaJIT was built.
+    std::vector<sol::protected_function> m_filters;
     uint32_t m_tick_ms{0};
     uint32_t m_callback_mask{0};
 
@@ -218,6 +237,7 @@ public:
     bool has_on_upstream_connect()   const { return false; }
     bool has_on_upstream_disconnect() const { return false; }
     bool has_on_http_request()       const { return false; }
+    bool has_filters()               const { return false; }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
     // on_*() callbacks omitted — only called when has_*() returns true,
