@@ -1360,6 +1360,51 @@ is set. For TCP mode, any failed connection attempt is retried.
 Also retry non-idempotent methods (POST, PATCH). Use with caution \(em
 the request body is replayed to the next backend, which may cause
 duplicate side effects.
+.SS What a Request That Never Reaches a Backend Is Answered
+In
+.B \-\-protocol http
+a client that has sent a whole request always gets a status line back, and
+which status it is names the end that failed. A retry, where
+.B \-\-retry
+allows one, is tried first in every case below; these are what is sent when
+no retry is available or every retry also failed.
+.TP
+.B 502 Bad Gateway
+The backend's answer. It refused the connection, was unreachable, could not be
+resolved, closed before a byte of the response arrived, or rejected the TLS
+handshake. The backend is charged to its circuit breaker. A client that
+retries a 502 immediately is asking a backend that has just said no.
+.TP
+.B 503 Service Unavailable
+This proxy's own shortage, reached before the backend was asked anything: the
+local ephemeral port range exhausted
+.RB ( EADDRNOTAVAIL ),
+descriptors exhausted
+.RB ( EMFILE ", " ENFILE ),
+memory or buffers exhausted
+.RB ( ENOMEM ", " ENOBUFS ),
+or a submission that did not reach the io_uring ring. Nothing is charged to
+any circuit breaker \(em the backend is healthy and the same request will very
+likely succeed on the next attempt. 503 is also the answer when there is no
+backend to send to at all: every member of an
+.B @group
+is out, or the single backend's breaker is open.
+.TP
+.B 504 Gateway Timeout
+The backend accepted (or never finished accepting) and produced no first byte
+inside
+.BR \-\-backend\-timeout .
+Charged to the breaker.
+.PP
+Two cases deliberately get no status line.
+.B \-\-protocol tcp
+has no request and no response, so a byte pipe whose backend never came up is
+closed and nothing is invented for it. And a request whose backend has already
+put bytes on the client's wire is past the point where a status line could be
+written: it would land at an offset that is not a message boundary, and the
+client would read it as the middle of the response it is already receiving.
+Such a connection is closed, and the backend that produced an unfinished
+response is charged to its breaker so the next client is routed elsewhere.
 .SS Process Isolation
 .TP
 .B \-\-out\-of\-process

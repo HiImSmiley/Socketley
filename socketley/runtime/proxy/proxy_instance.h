@@ -730,6 +730,26 @@ private:
     void forward_to_backend(proxy_client_connection* conn, std::string_view data);
     void forward_to_client(proxy_backend_connection* conn, std::string_view data);
     void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body);
+    // The one answer for "this request will never reach a backend", and the one
+    // place that decides which status says so.
+    //
+    // `ours` is the flag connect_to_backend already computes for the circuit
+    // breaker — see the note on that function — spent a second time, on the
+    // client rather than on the breaker.  502 is the backend's answer: it
+    // refused, it was unreachable, or its handshake could not be started.  503
+    // is this proxy running short of something local before the backend was
+    // ever asked; the backend is healthy and the request would very likely
+    // succeed on the next attempt.  The difference is the difference between
+    // "stop asking this backend" and "try again shortly", and a client that
+    // gets the wrong one either hammers a dead backend or throws away a request
+    // that would have worked.
+    //
+    // Returns false when there is no answer to give, which is a decision and not
+    // a failure: TCP mode has no status line, a connection already closing has
+    // been answered, and one whose response has started cannot have a status
+    // line written behind bytes already on the wire — that would put it at an
+    // offset the client cannot read as the start of a message.
+    bool answer_gateway_failure(proxy_client_connection* conn, bool ours);
     // Re-arm the listener, falling back to the backoff timer when the
     // submission does not reach the ring.  Without that the proxy stops
     // accepting connections silently — there is no completion to report it.

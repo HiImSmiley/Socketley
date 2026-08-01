@@ -2475,6 +2475,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
             if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
             {
+                // A submission that did not reach the ring is this proxy's
+                // shortage, and this connection is carrying a whole request
+                // whose backend handshake is still in flight.  503, not
+                // silence: the backend is fine and the next attempt will very
+                // likely work.  See answer_gateway_failure.
+                answer_gateway_failure(conn, true);
                 close_pair(fd, conn->backend_fd);
                 return;
             }
@@ -2650,7 +2656,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
             if (!ours) note_backend_failure(conn);
             if (!try_retry(conn))
             {
-                send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
+                answer_gateway_failure(conn, ours);
                 return;
             }
             // Retry succeeded — request already forwarded by try_retry
@@ -2663,6 +2669,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
                 if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                 {
+                    answer_gateway_failure(conn, true);
                     close_pair(fd, conn->backend_fd);
                     return;
                 }
@@ -2716,6 +2723,12 @@ proxy_http_resubmit:
             if (!bp)
                 if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                 {
+                    // The request has gone to a backend and the pair is about
+                    // to be torn down, so its answer can no longer be
+                    // delivered.  Our shortage, not the backend's: 503.
+                    // answer_gateway_failure declines on its own if any of that
+                    // answer has already reached this client.
+                    answer_gateway_failure(conn, true);
                     close_pair(fd, conn->backend_fd);
                     return;
                 }
@@ -2830,8 +2843,39 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // lets the failure be recorded where it belongs.
             if (ce.side == conn_client)
             {
+                // "The backend answered" is not "bytes arrived from the
+                // backend", and response_started is the second of those.  It is
+                // set by the first byte off this socket, so a backend that wrote
+                // a fragment of a header block and then half-closed was recorded
+                // as having answered — note_backend_success ran on that first
+                // byte too — and kept its full share of the rotation while
+                // doing the same to the next client.  The proxy has already
+                // forwarded that fragment, so it cannot take it back and cannot
+                // write a status line behind it; the one thing it can still do
+                // is stop sending traffic to a backend that ends messages in the
+                // middle, and that is what the breaker is for.
+                //
+                // Stated over the framing state the response path already
+                // maintains for the pool's sake, rather than over a flag of its
+                // own: response_bytes_seen says this socket began a response,
+                // headers_parsed says its header block resolved, and `unknown`
+                // says the scan gave up on tracking it.
+                //
+                // All three, and not headers_parsed alone.  A header block
+                // split across two reads is ordinary and leaves headers_parsed
+                // false for ever — the scan sets `unknown` on the second chunk
+                // and stops — so charging on headers_parsed by itself would
+                // take a perfectly healthy backend with large headers out of
+                // rotation on every close.  `unknown` is this proxy saying it
+                // cannot tell; only its absence makes the silence the backend's.
+                // TCP mode has no framing and is left alone.
+                const bool never_framed =
+                    (m_protocol == protocol_http) &&
+                    conn->http_frame.response_bytes_seen &&
+                    !conn->http_frame.headers_parsed &&
+                    !conn->http_frame.unknown;
                 const bool backend_failed =
-                    (cqe->res < 0) || !ce.client->response_started;
+                    (cqe->res < 0) || !ce.client->response_started || never_framed;
                 if (backend_failed)
                     note_backend_failure(ce.client);
 
@@ -2873,7 +2917,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     cconn->backend_fd = -1;
                     conn->client_fd = -1;
                     if (!try_retry(cconn))
-                        send_error(cconn, "502 Bad Gateway", "Bad Gateway\n");
+                        answer_gateway_failure(cconn, false);
                     close_pair(-1, fd);
                     return;
                 }
@@ -2958,8 +3002,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     // backend of its own and this one is torn down next line.
                     cconn->backend_fd = -1;
                     conn->client_fd = -1;
+                    // 502 and not 503: this is a handshake the backend answered
+                    // and rejected — an unknown CA, an expired chain, a name
+                    // that does not match.  The record layer has been on the
+                    // wire; the far end is what said no.
                     if (!try_retry(cconn))
-                        send_error(cconn, "502 Bad Gateway", "Bad Gateway\n");
+                        answer_gateway_failure(cconn, false);
                     close_pair(-1, fd);
                     return;
                 }
@@ -3005,7 +3053,6 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // doing its job, and cutting it short would be a new defect rather
             // than a fix for this one.
             clear_response_deadline(ce.client);
-            note_backend_success(ce.client);
         }
     }
 
@@ -3026,8 +3073,39 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // handler, which meant nothing short of a running daemon could call it and
     // it was the last parser in the tree with no fuzz target.  It is the same
     // code, in a form test/fuzz/fuzz_http_response.cpp can drive directly.
+    const bool framed_before = conn->http_frame.headers_parsed;
     if (m_protocol == protocol_http)
         http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
+
+    // And here, not above the forward, is where the breaker hears that this
+    // backend answered.
+    //
+    // It used to hear it from the same test that sets response_started: the
+    // first byte to arrive on the socket.  A byte is not an answer.  A backend
+    // that wrote a status line and one header and then half-closed was recorded
+    // as a success on every single request, so its failure at the end of that
+    // request — which the EOF path does charge — was cancelled out before it
+    // could ever reach circuit_threshold, and the breaker sat at zero errors
+    // for ever while every client got a message the backend never finished.
+    //
+    // The two facts are kept apart because they are timed differently on
+    // purpose: response_started bars a retry and ends the first-byte deadline
+    // the moment anything arrives, which is right and is why that test stays
+    // where it is.  This one waits for the header block to resolve, which is
+    // the earliest moment this proxy can say the peer produced a response
+    // rather than bytes.
+    //
+    // Stated as a transition of headers_parsed rather than as a flag of its
+    // own: the scan clears that field per response and sets it exactly once,
+    // so false-to-true is "the header block of this response just resolved"
+    // and needs nothing new to remember it.
+    if (m_protocol == protocol_http && !framed_before && conn->http_frame.headers_parsed &&
+        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& ce = m_conn_idx[conn->client_fd];
+        if (ce.side == conn_client)
+            note_backend_success(ce.client);
+    }
 
     // Return provided buffer after scanning
     if (is_provided)
@@ -4687,6 +4765,34 @@ bool proxy_instance::start_backend_tls(proxy_client_connection* cconn,
     return tls_flush(bconn);
 }
 
+// Which end a failed connect belongs to, read off errno.
+//
+// EADDRNOTAVAIL — "cannot assign requested address", the local ephemeral port
+// range exhausted — and the out-of-memory family are this machine running short,
+// and the backend has not been asked anything at all.  Everything else is the
+// backend's own answer: a refusal, an unreachable host, a reset.
+//
+// One function because the two connects have to agree.  The synchronous
+// ::connect() below reports through errno and the asynchronous one reports
+// through SO_ERROR in handle_connect; the same shortage arriving by the second
+// route used to be read as the backend refusing, which charged the breaker and
+// told the client the wrong thing about which end to give up on.
+static inline bool connect_errno_is_ours(int err)
+{
+    switch (err)
+    {
+    case EADDRNOTAVAIL:
+    case EADDRINUSE:
+    case ENOBUFS:
+    case ENOMEM:
+    case EMFILE:
+    case ENFILE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const backend_info* target,
                                        bool* resource_failure)
 {
@@ -4734,7 +4840,13 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         // Got pooled connection — set up immediately (no async connect)
         if (SOCKETLEY_UNLIKELY(bfd >= MAX_FDS))
         {
+            // A descriptor number past this runtime's own slot table is this
+            // process having run out of room, not a backend refusing anything —
+            // the connection to it is established and working.  Left
+            // unclassified, it charged the breaker and answered the client 502,
+            // which is a verdict about a backend that was never asked.
             close_tracked(bfd);
+            ours();
             return false;
         }
 
@@ -4852,7 +4964,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
     if (SOCKETLEY_UNLIKELY(bfd >= MAX_FDS))
     {
+        // Same shortage as the pooled branch above, reached with a socket this
+        // function opened itself.  socket() succeeding and the number being
+        // past MAX_FDS is this process holding too many descriptors.
         close_tracked(bfd);
+        ours();
         return false;
     }
 
@@ -4970,20 +5086,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         // three breakers, and then answered 503 to everything for a full
         // circuit_timeout — a local resource problem turned into a verdict
         // about three healthy runtimes.  This is the same rule handle_accept
-        // already applies to a full ring.
-        switch (errno)
-        {
-        case EADDRNOTAVAIL:
-        case EADDRINUSE:
-        case ENOBUFS:
-        case ENOMEM:
-        case EMFILE:
-        case ENFILE:
+        // already applies to a full ring.  The list itself is in
+        // connect_errno_is_ours, because handle_connect has to apply it too.
+        if (connect_errno_is_ours(errno))
             ours();
-            break;
-        default:
-            break;
-        }
         close_tracked(bfd);
         return false;
     }
@@ -6500,10 +6606,17 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         if (fd_ours && !retry_ours)
             note_backend_failure(conn);
 
+        // And the same three things decide what the client is told.  The
+        // asynchronous connect reports its errno through SO_ERROR, so the local
+        // shortages arrive here exactly as they arrive at the synchronous
+        // connect — and reached the client as 502 either way, which named a
+        // backend that had not been asked anything.
+        const bool ours = !fd_ours || retry_ours || connect_errno_is_ours(-res);
+
         if (m_protocol == protocol_http)
         {
             if (!try_retry(conn))
-                send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
+                answer_gateway_failure(conn, ours);
         }
         else
         {
@@ -6515,7 +6628,11 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     // Connect succeeded — create backend connection struct
     if (SOCKETLEY_UNLIKELY(bfd < 0 || bfd >= MAX_FDS))
     {
+        // The connect worked and this process has nowhere to put the result:
+        // a descriptor number past the slot table, or one the deadline sweep
+        // withdrew while this completion was in flight.  Ours either way.
         if (bfd >= 0) close_tracked(bfd);
+        answer_gateway_failure(conn, true);
         close_pair(client_fd, -1);
         return;
     }
@@ -6575,6 +6692,9 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, bfd, ptr, m_recv_multishot,
                                                    m_use_provided_bufs, BUF_GROUP_ID)))
     {
+        // The backend is connected and this proxy cannot arm a read on it.  Our
+        // shortage, and the client had been waiting on it in silence.
+        answer_gateway_failure(conn, true);
         close_pair(conn->fd, bfd);
         return;
     }
@@ -6584,13 +6704,23 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     // ready, and goes out as records when it is.  A session that cannot be
     // created costs the pair — the alternative is sending the request in the
     // clear to a backend the operator asked to reach over TLS.
+    //
+    // 503 and not 502, which is what this used to say.  Nothing has reached the
+    // backend yet — start_backend_tls fails on a session that could not be built
+    // or a first handshake turn that could not be taken, and its own comment
+    // calls that "a local failure — no memory, no usable cipher — rather than a
+    // rejection: there is nothing on the wire yet to be rejected".
+    // connect_to_backend classifies the identical failure as ours already; the
+    // two disagreed only because this one wrote its status by hand.  A backend
+    // that *refuses* the handshake is a different event and still answers 502,
+    // from handle_backend_read, where the rejection actually arrives.
     if (SOCKETLEY_UNLIKELY(conn_backend_tls(conn) && !start_backend_tls(conn, ptr)))
     {
         if (m_protocol == protocol_http && !conn->closing && !conn->response_started)
         {
             conn->backend_fd = -1;
             ptr->client_fd = -1;
-            send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
+            answer_gateway_failure(conn, true);
             close_pair(-1, bfd);
             return;
         }
@@ -6613,6 +6743,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->fd, conn, m_recv_multishot,
                                            m_use_provided_bufs, BUF_GROUP_ID)))
     {
+        answer_gateway_failure(conn, true);
         close_pair(conn->fd, bfd);
         return;
     }
@@ -7533,6 +7664,36 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     response += body;
 
     queue_final_response(conn, std::move(response));
+}
+
+// See the declaration in proxy_instance.h for why the status is chosen here and
+// nowhere else.  This is the whole of what `ours` buys the client; it was
+// already being computed on every connect failure and spent only on the circuit
+// breaker, so a local shortage and a dead backend reached the client as the
+// same 502 and every path that could not answer at all closed in silence.
+bool proxy_instance::answer_gateway_failure(proxy_client_connection* conn, bool ours)
+{
+    // TCP mode is exempt on principle rather than convenience.  There is no
+    // request and no status line on that path, so a byte pipe whose backend
+    // never came up has nothing it could say; inventing something would be
+    // worse than the silence.  The accept-time connect takes exactly this exit.
+    if (m_protocol != protocol_http || !conn)
+        return false;
+    // Already answered, or on its way out carrying an answer.
+    if (conn->closing)
+        return false;
+    // Bytes of a backend's response are already on this client's wire.  A status
+    // line written behind them is not an answer, it is the middle of somebody
+    // else's message — the same fault as a socket pooled off a boundary, seen
+    // from the client's end.  The close is all there is here, and it is honest:
+    // the client has a truncated response and can see that it is truncated.
+    if (conn->response_started)
+        return false;
+    if (ours)
+        send_error(conn, "503 Service Unavailable", "Service Unavailable\n");
+    else
+        send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
+    return true;
 }
 
 // The tail of every response this proxy produces on its own account: an error
