@@ -188,6 +188,20 @@ filters = {
                     -- the endpoint it actually selected.
                     ["host"] = "evil.example",
                 },
+                -- Taking a header off the request, which a filter could not do
+                -- at all before: it could add one and overwrite one, so a
+                -- header the backend must never see could only be blanked.
+                remove_headers = {
+                    "X-Internal-Trust",   -- a header a caller forged
+                    "Cookie",             -- no business past the edge
+                    -- Refused, both of them, and for the same reason the
+                    -- set_headers above are: a filter that can delete
+                    -- Content-Length makes this proxy and its backend disagree
+                    -- about where the request ends, and one that can delete
+                    -- Host decides where the request is addressed.
+                    "content-length",
+                    "host",
+                },
             }
         end
     end,
@@ -366,9 +380,11 @@ def read_response(s):
     return (status, hdrs, body[:clen].decode("latin1", "replace"))
 
 
-def request(path, extra=""):
-    req = ("GET /%s%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%s"
-           "Connection: keep-alive\r\n\r\n" % (name, path, port, extra))
+def request(path, extra="", method="GET", body=""):
+    clen = ("Content-Length: %d\r\n" % len(body)) if body else ""
+    req = ("%s /%s%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%s%s"
+           "Connection: keep-alive\r\n\r\n%s"
+           % (method, name, path, port, extra, clen, body))
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=20)
     except OSError as e:
@@ -444,9 +460,30 @@ print("P3 STATUS %s" % st)
 print("P3 RETRYAFTER %s" % hdrs.get("retry-after", "<absent>"))
 print("P3 BODY %s" % body.strip())
 
-# ── phase 4: still serving ─────────────────────────────────────────────────
+# ── phase 4: a filter takes a header off the request ───────────────────────
+#
+# Two requests, because "the header is not in what the backend read" is not by
+# itself evidence of anything — a header that was never sent is also not there.
+# The first sends headers the filter removes, the second sends the same name
+# with a different value and no X-Mark-Me, so the filter says nothing and it
+# must arrive.  The two values are distinguishable in the capture, so one file
+# answers both questions.
+#
+# The POST carries a body: the filter also asks for Content-Length to be
+# removed, and a request with no body would not show whether that was refused.
+st, _, body = request("/removal", method="POST", body="hello",
+                      extra="X-Mark-Me: yes\r\n"
+                            "X-Internal-Trust: removed-me\r\n"
+                            "Cookie: session=secret\r\n"
+                            "X-Keep-Me: yes\r\n")
+print("P4 REMOVED %s %s" % (st, body))
+
+st, _, body = request("/kept", extra="X-Internal-Trust: kept-me\r\n")
+print("P4 KEPT %s %s" % (st, body))
+
+# ── phase 5: still serving ─────────────────────────────────────────────────
 st, _, body = request("/after-storm")
-print("P4 AFTER %s %s" % (st, body))
+print("P5 AFTER %s %s" % (st, body))
 
 print("DONE")
 PYEOF
@@ -597,12 +634,82 @@ check "a later filter's headers are emitted too" \
     '^P3 RETRYAFTER 7$' \
     "$(grep -m1 '^P3 RETRYAFTER' "$OUT" 2>/dev/null || echo 'no result')"
 
+# ── remove_headers, read off what the backend actually received ────────────
+check "the request a filter stripped headers from is still served" \
+    '^P4 REMOVED HTTP/1\.1 200 ' \
+    "$(grep -m1 '^P4 REMOVED' "$OUT" 2>/dev/null || echo 'no result')"
+
+# The control first: this is what makes the two assertions after it mean
+# anything.  Without it, "the header is not in the capture" is equally true of a
+# header nobody ever sent.
+TOTAL=$((TOTAL+1))
+if grep -qai 'X-Internal-Trust: kept-me' "$RAW" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a header no filter removes reaches the backend]: the control header"
+    echo "        is not in the capture, so 'the removed one is absent' below proves"
+    echo "        nothing at all"
+fi
+
+TOTAL=$((TOTAL+1))
+if grep -qai 'removed-me' "$RAW" 2>/dev/null; then
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a filter removes a request header]: X-Internal-Trust reached the"
+    echo "        backend although a filter asked for it to be taken off.  A caller"
+    echo "        that forges an internal trust header is exactly what removal is for"
+else
+    PASS=$((PASS+1))
+fi
+
+TOTAL=$((TOTAL+1))
+if grep -qai 'session=secret' "$RAW" 2>/dev/null; then
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a filter removes Cookie]: the cookie reached the backend"
+else
+    PASS=$((PASS+1))
+fi
+
+TOTAL=$((TOTAL+1))
+if grep -qai 'X-Keep-Me: yes' "$RAW" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [removal takes only the names it was given]: a header the filter said"
+    echo "        nothing about is missing from what the backend read"
+fi
+
+# The bans, on the removal side.  Same rule as set_headers and the same reason:
+# a filter must not be able to change how a message is framed or where it is
+# addressed.
+TOTAL=$((TOTAL+1))
+if grep -qai 'content-length: 5' "$RAW" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a filter may not remove the request framing]: the Content-Length of"
+    echo "        a request with a body is gone.  The proxy forwards exactly the body"
+    echo "        the parsed request declared, so the backend is now reading a body it"
+    echo "        was never told the length of — and the socket is pooled for the next"
+    echo "        request"
+fi
+
+TOTAL=$((TOTAL+1))
+if grep -qai "Host: 127.0.0.1:$BE_PORT" "$RAW" 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a filter may not remove Host]: the proxy writes Host to the endpoint"
+    echo "        it selected; a filter that can delete it decides where the request is"
+    echo "        addressed"
+fi
+
 # A self-answered request is torn down through the paths every other answered
 # request uses.  A leaked descriptor or a socket returned to the pool off a
 # message boundary shows up here as a proxy that has stopped working.
 check "the proxy still serves after forty rejections" \
-    '^P4 AFTER HTTP/1\.1 200 .* after-storm$' \
-    "$(grep -m1 '^P4 AFTER' "$OUT" 2>/dev/null || echo 'no result')"
+    '^P5 AFTER HTTP/1\.1 200 .* after-storm$' \
+    "$(grep -m1 '^P5 AFTER' "$OUT" 2>/dev/null || echo 'no result')"
 
 TOTAL=$((TOTAL+1))
 if "$BIN" stats "$PX_NAME" >/dev/null 2>&1; then
