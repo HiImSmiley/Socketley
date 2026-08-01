@@ -50,7 +50,7 @@
 //  B. NO POOLED SOCKET IS HANDED OUT OFF A MESSAGE BOUNDARY.  Checked from the
 //     backend's end, which is the only end that knows: the harness backend
 //     tracks whether it has finished the response it is writing, and a socket
-//     the proxy has filed in its pool while that answer is unfinished is
+//     the proxy *files* in its pool while that answer is unfinished is
 //     `pool-off-boundary`.  The same fact from the other direction is
 //     `request-on-unfinished-socket`: a request arriving on a backend socket
 //     whose previous response never completed, which is the moment the next
@@ -63,6 +63,38 @@
 //     This is the failure that matters most and it is completely silent — the
 //     bytes are well formed, the framing is correct, and they are simply the
 //     wrong bytes.
+//
+// ─── AND WHERE EACH OF THE THREE IS ENTITLED TO SPEAK ────────────────────────
+//
+// All three are stated over the harness's own bookkeeping while the program
+// decides independently when a backend reads, when it answers and when a client
+// writes.  Each of them used to be stated at a moment where that bookkeeping
+// had already moved on, and each of them accused the proxy of it.  Between them
+// they cost three agents a day of re-diagnosis on 2026-08-01 and hid one real
+// defect behind the noise, so the moment each one speaks is now part of the
+// invariant rather than an accident of where the check happened to sit:
+//
+//   A speaks about requests the proxy has undertaken to answer.  A request
+//     written into a connection the proxy has already said it is ending — a
+//     response carrying Connection: close — is not one of those, and does not
+//     move the ledger.  See client_send().
+//
+//   B speaks about the filing decision, once, at the moment release_to_pool()
+//     makes it.  What a backend does to a socket that is already correctly
+//     filed is that backend's traffic; whether the next borrower survives it is
+//     the acquire probe's question and C's, not B's.  See check_backend_pool().
+//
+//   C speaks about marks, and a mark is only evidence if this harness put the
+//     right one on the answer.  An answer written over a request this end never
+//     read is answered blind: the id belongs to whoever the proxy has on the
+//     other end of that socket now, and this end does not know who that is.
+//     See bsock_respond() and bsock_note_request().
+//
+// None of the three excludes a case to be quieter.  Each excludes a case where
+// its own words would be false, and every one of them still fires on the defect
+// it was written for the moment that defect is put back — which is the only
+// test of a change like this that means anything, and is written into the
+// commit that made it.
 //
 // ─── AND THE THREE IT INHERITS FROM THE PRODUCT ─────────────────────────────
 //
@@ -137,6 +169,7 @@
 //     certificate this does not make.
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -155,6 +188,7 @@
 #include <linux/time_types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -468,6 +502,7 @@ bool g_hook_drops = false;
 struct world;
 world* g_world = nullptr;
 
+
 // ─────────────────────────── request ids ────────────────────────────────────
 //
 // One id per request, owned by exactly one client, allocated per input and
@@ -513,6 +548,19 @@ struct client_sock
     size_t   rx_since_req{0};
     uint32_t run_epoch{0};    // which run of the runtime the request belongs to
 
+    // Everything this connection ever received, which rx_since_req deliberately
+    // forgets.  The oracle's *claim* is about the last request; its *detail
+    // line* used to read "received 0 bytes" on a connection that had carried a
+    // whole answer, and a report the wire contradicts is a report nobody
+    // believes the next time.  This is what makes the two numbers say different
+    // things instead of one of them saying something false.
+    size_t   rx_total{0};
+
+    // Set the moment the proxy says, in a response on this connection, that it
+    // is ending it.  From then on the proxy owes this client nothing more: see
+    // client_send(), which keeps writing but stops counting.
+    bool     peer_announced_close{false};
+
     // A mark can straddle two reads, so the tail of the last one is kept.
     std::string carry;
 
@@ -531,9 +579,19 @@ struct backend_sock
                               // recognised — see check_backend_pool()
 
     // Invariant B's state.  True from the moment a response is started until
-    // the moment it is finished; a socket in the proxy's pool with this set is
-    // a socket pooled off a message boundary.
+    // the moment it is finished; a socket the proxy *files in its pool* while
+    // this is set is a socket pooled off a message boundary.  "Files" and not
+    // "holds": see check_backend_pool(), and in_pool below, which is what tells
+    // the two apart.
     bool     resp_pending{false};
+
+    // Whether this socket was in the proxy's pool at the end of the previous
+    // step.  A false→true transition is the filing decision, and the filing
+    // decision is the only moment at which invariant B has anything to say
+    // about the proxy: what the harness does to the socket afterwards is the
+    // harness's own traffic, not a pooling mistake.
+    bool     in_pool{false};
+    bool     pool_seen{false};   // scratch for the walk in progress
 
     // Ids read out of requests on this socket and not yet answered, and the
     // last one that was — which is what an unsolicited answer is marked with,
@@ -541,6 +599,16 @@ struct backend_sock
     uint32_t owed[8];
     uint8_t  owed_n{0};
     uint32_t last_id{0};
+
+    // How far this end has read, and how far the wire had already run when this
+    // end last answered something it had not read.  A request lying unread at
+    // the *backend's* end when an answer goes out is a request the proxy has
+    // already been given an answer for, so it is not owed one — putting it in
+    // owed[] is what made this harness stamp a later answer with an id whose
+    // client had let go of the socket.  See bsock_respond().
+    size_t   rx_bytes{0};
+    size_t   blind_horizon{0};
+    uint32_t blind_pending{0};
 
     std::string carry;
 
@@ -1017,6 +1085,8 @@ void client_close(client_sock& c)
     c.reported = false;
     c.reqs_sent = 0;
     c.rx_since_req = 0;
+    c.rx_total = 0;
+    c.peer_announced_close = false;
     c.carry.clear();
 }
 
@@ -1063,6 +1133,8 @@ void client_connect(world& w, int idx)
     c.reported = false;
     c.reqs_sent = 0;
     c.rx_since_req = 0;
+    c.rx_total = 0;
+    c.peer_announced_close = false;
     c.accepted = false;
     c.proxy_fd = -1;
     c.carry.clear();
@@ -1105,6 +1177,21 @@ void client_connect(world& w, int idx)
 //   * a proxy hook configured to drop is a policy that swallows requests, and a
 //     policy doing what it says is not a defect.
 //
+// One thing it does *not* exclude, and the distinction is the whole of it: a
+// connection that received an answer earlier and nothing since.  reqs_sent and
+// rx_since_req are per-request by design — a keep-alive client's second request
+// has to be judged on its own bytes — so "answered, then asked again, then
+// closed in silence" is a real loss and is reported.  What is not a loss is a
+// request written into a connection the proxy has already said it is ending: a
+// response carrying Connection: close is the proxy undertaking to answer
+// nothing further, and RFC 9112 Section 9.6 says the client must not send
+// another request on it.  client_send() keeps writing those bytes, because the
+// proxy has to survive receiving them, and stops counting them — see the note
+// there.  Without that, the deadline sweep's own 408 or 504 (87 bytes, read in
+// full by the client) was erased by the client's next request and this oracle
+// reported "received 0 bytes" against a wire that had plainly carried an
+// answer.  Three agents read that report as a defect.
+//
 // A client that had half-closed first is reported under an id of its own.  It
 // is the same loss — the request is already at the backend and the answer is
 // discarded — but it is a claim somebody can argue with: shutdown(SHUT_WR) is
@@ -1125,10 +1212,16 @@ void client_report_close(world& w, client_sock& c)
     if (c.run_epoch != w.epoch || !live_rt())
         return;
 
+    // Both numbers, always.  The claim is about the bytes since the last
+    // request; the total is what makes it checkable against the wire, and a
+    // total of 0 is the shape where the proxy wrote nothing to this client at
+    // all — which is the one that is still undiagnosed.
     fuzzrt::set_detail("client fd %d (proxy fd %d) sent %u complete request(s)%s and "
-                       "received %zu bytes before the proxy closed it",
+                       "received %zu bytes before the proxy closed it "
+                       "(%zu bytes in total on this connection)",
                        c.fd, c.proxy_fd, c.reqs_sent,
-                       c.fin_sent ? " and then half-closed" : "", c.rx_since_req);
+                       c.fin_sent ? " and then half-closed" : "", c.rx_since_req,
+                       c.rx_total);
     if (c.fin_sent)
     {
         RT_FINDING("answer-lost-to-a-half-close", false,
@@ -1148,11 +1241,42 @@ void client_report_close(world& w, client_sock& c)
     fuzzrt::g_detail[0] = 0;
 }
 
+// Case-insensitive substring search, for the one header this harness has to
+// recognise in what a *proxy* wrote rather than in what it built itself.  The
+// spelling on the wire is this proxy's own — send_error() and the response
+// rewriter both emit "Connection: close" — but a check on an announcement that
+// ends a connection should not be one capital letter away from missing it.
+size_t find_ci(std::string_view hay, std::string_view needle, size_t from)
+{
+    if (needle.empty() || hay.size() < needle.size())
+        return std::string_view::npos;
+    for (size_t i = from; i + needle.size() <= hay.size(); i++)
+    {
+        size_t j = 0;
+        for (; j < needle.size(); j++)
+        {
+            const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(hay[i + j])));
+            const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(needle[j])));
+            if (a != b)
+                break;
+        }
+        if (j == needle.size())
+            return i;
+    }
+    return std::string_view::npos;
+}
+
 // ─── invariant C, stated where it is observable ─────────────────────────────
 //
 // Every mark in what a client receives has to be one of its own.  The bytes are
 // well formed either way; that is what makes this the failure that has to be
 // checked rather than noticed.
+//
+// The same pass reads one thing out of the response for invariant A: whether
+// the proxy has announced that it is ending this connection.  It is read here
+// because here is where the client's received bytes already are, and because
+// the two facts are read out of the same carry — a header split across two
+// reads has to be found either way.
 void client_scan_marks(world& w, int slot, std::string_view chunk)
 {
     client_sock& c = w.cli[slot];
@@ -1199,8 +1323,13 @@ void client_scan_marks(world& w, int slot, std::string_view chunk)
         }
     }
 
-    // Keep enough of the tail that a mark split across two reads is still found.
-    const size_t keep = MARK.size() + 12;
+    static const std::string_view CLOSING = "Connection: close";
+    if (!c.peer_announced_close && find_ci(buf, CLOSING, 0) != std::string_view::npos)
+        c.peer_announced_close = true;
+
+    // Keep enough of the tail that a mark or a close announcement split across
+    // two reads is still found — the longer of the two decides the length.
+    const size_t keep = (MARK.size() > CLOSING.size() ? MARK.size() : CLOSING.size()) + 12;
     if (buf.size() > keep)
         c.carry.assign(buf, buf.size() - keep, keep);
     else
@@ -1254,6 +1383,7 @@ void client_recv(world& w, int idx)
             }
         }
         c.rx_since_req += static_cast<size_t>(n);
+        c.rx_total     += static_cast<size_t>(n);
         client_scan_marks(w, idx, std::string_view(sink, static_cast<size_t>(n)));
     }
 }
@@ -1330,7 +1460,22 @@ void client_send(world& w, int idx, int shape)
             return;
         }
     }
-    if (static_cast<size_t>(n) == buf.size() && whole > 0)
+    // A request written into a connection the proxy has said it is ending is
+    // still written — the proxy has to survive receiving it, and refusing to
+    // send would take that coverage away — but it is not a request the proxy
+    // has undertaken to answer, so it does not move invariant A's ledger.
+    //
+    // This is the whole of the artefact that was read as a defect three times.
+    // The deadline sweep answers 408 or 504 with Connection: close, the client
+    // reads all 87 bytes of it, and the program's next OP_REQUEST used to reset
+    // rx_since_req to 0 — which is right for a keep-alive client, whose second
+    // request must be judged on its own bytes, and wrong here, because it
+    // erased the only record that the first one had been answered.  The report
+    // then read "sent 3 complete requests and received 0 bytes" against a wire
+    // that had carried a whole answer.  Freezing the ledger at the
+    // announcement, rather than excusing the finding afterwards, keeps the
+    // oracle's words literally true wherever it does fire.
+    if (static_cast<size_t>(n) == buf.size() && whole > 0 && !c.peer_announced_close)
     {
         c.reqs_sent += static_cast<uint32_t>(whole);
         c.rx_since_req = 0;
@@ -1355,8 +1500,13 @@ void bsock_close(backend_sock& b)
     b.backend = -1;
     b.peer_port = 0;
     b.resp_pending = false;
+    b.in_pool = false;
+    b.pool_seen = false;
     b.owed_n = 0;
     b.last_id = 0;
+    b.rx_bytes = 0;
+    b.blind_horizon = 0;
+    b.blind_pending = 0;
     b.carry.clear();
 }
 
@@ -1449,8 +1599,13 @@ int backend_accept(world& w, int idx)
     b.backend = idx;
     b.peer_port = ntohs(peer.sin_port);
     b.resp_pending = false;
+    b.in_pool = false;
+    b.pool_seen = false;
     b.owed_n = 0;
     b.last_id = 0;
+    b.rx_bytes = 0;
+    b.blind_horizon = 0;
+    b.blind_pending = 0;
     b.carry.clear();
 
     // The backend leg.  This end is the server: it presents the certificate the
@@ -1470,13 +1625,50 @@ int backend_accept(world& w, int idx)
     return slot;
 }
 
+// How many bytes are waiting at *this* end of the backend socket, unread.
+//
+// This is the mirror image of the liveness probe in acquire_pooled_backend, and
+// the two together are the whole of the crosstalk diagnosis: bytes waiting at
+// the proxy's end when a socket is borrowed are an answer nobody asked for, and
+// bytes waiting at the backend's end when an answer goes out are a request
+// nobody read.  The first is the defect ed07f12 fixed.  The second is this
+// harness getting ahead of its own ledger, and it is what the two functions
+// below now account for instead of blaming the proxy for.
+size_t bsock_unread(const backend_sock& b)
+{
+    if (b.fd < 0)
+        return 0;
+    size_t n = 0;
+    if (b.ssl)
+    {
+        const int p = SSL_pending(b.ssl);
+        if (p > 0)
+            n += static_cast<size_t>(p);
+    }
+    int q = 0;
+    if (::ioctl(b.fd, FIONREAD, &q) == 0 && q > 0)
+        n += static_cast<size_t>(q);
+    return n;
+}
+
 // ─── invariant B, at the moment a socket changes hands ──────────────────────
 //
 // A request arriving on a socket whose previous response never finished is the
 // next borrower reading somebody else's tail.  Nothing else puts a second
 // request on a backend socket: this proxy holds a pipelined request back until
 // the first exchange is over.
-void bsock_note_request(backend_sock& b, uint32_t id)
+//
+// `abs_off` is where this request's mark sits in the stream this end has read,
+// counted from the first byte of the connection.  It exists for the second
+// thing this function decides: whether the request is one this end still owes
+// an answer for, or one it has already answered without having read it.  See
+// blind_horizon in bsock_respond() — a request that was already on the wire
+// when an answer went out has been answered, and adding it to owed[] is what
+// made a later answer carry an id whose client had let go of the socket two
+// steps earlier.  That answer is on the wire, correctly framed, and it reaches
+// whichever client the proxy has on the other end of this socket now; the
+// finding it produced named the proxy for a mark this harness had stamped.
+void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
 {
     if (b.resp_pending)
     {
@@ -1490,6 +1682,24 @@ void bsock_note_request(backend_sock& b, uint32_t id)
         fuzzrt::g_detail[0] = 0;
         b.resp_pending = false;   // reported once; do not repeat it every request
     }
+
+    // Already answered, before this end had read it.  Both terms are needed:
+    // the offset says the request was on the wire when the blind answer went
+    // out, and the counter bounds how many requests one blind answer may
+    // account for, so a blind answer written over bytes that carried no mark at
+    // all cannot swallow the next real one.
+    if (b.blind_pending > 0 && abs_off < b.blind_horizon)
+    {
+        b.blind_pending--;
+        // last_id is deliberately not moved here.  It is what an answer
+        // volunteered onto a quiet socket is marked with, and it has to mean
+        // "the request this end answered knowingly" — this one was answered
+        // before it was read, so this end never saw which client it belonged
+        // to, and stamping a later answer with it would be a mark invented for
+        // the second time in the same exchange.
+        return;
+    }
+
     if (b.owed_n < 8)
         b.owed[b.owed_n++] = id;
 }
@@ -1528,6 +1738,14 @@ void bsock_recv(world& w, int idx)
         }
         if (n > 0)
         {
+            // Where this chunk starts in the stream, so that a mark found in it
+            // can be placed against blind_horizon.  The carry in front of it is
+            // bytes already counted, so the buffer as a whole starts that many
+            // bytes earlier.
+            const size_t carry_len = b.carry.size();
+            const size_t buf_off   = b.rx_bytes - carry_len;
+            b.rx_bytes += static_cast<size_t>(n);
+
             std::string buf;
             buf.reserve(b.carry.size() + static_cast<size_t>(n));
             buf.append(b.carry);
@@ -1554,7 +1772,7 @@ void bsock_recv(world& w, int idx)
                     break;
                 pos = p;
                 if (digits)
-                    bsock_note_request(b, id);
+                    bsock_note_request(b, id, buf_off + at);
             }
 
             const size_t keep = MARK.size() + 12;
@@ -1580,6 +1798,17 @@ void bsock_respond(world& w, int idx, int shape)
     if (b.fd < 0)
         return;
 
+    // What is on the wire at this end but has not been read.  Nothing below
+    // changes what goes out — the program decides that — but it decides what
+    // this end may honestly claim about what it is answering.
+    const size_t unread = bsock_unread(b);
+
+    // Whether this end has anything it knows it owes an answer for.  Read
+    // before the queue is popped below, because "the queue is empty now" and
+    // "the queue was empty when this answer was decided" are different facts
+    // and only the second one makes an answer blind.
+    const bool nothing_owed = (b.owed_n == 0);
+
     uint32_t id = 0;
     if (b.owed_n > 0)
     {
@@ -1591,10 +1820,22 @@ void bsock_respond(world& w, int idx, int shape)
     }
     else if ((shape % RS_COUNT) == RS_UNSOLICITED)
     {
-        // Nothing was asked on this socket, which is the point: the answer is
-        // marked with whoever asked last, so a client that receives it can be
-        // told whose answer it got.
-        id = b.last_id;
+        // Nothing was asked on this socket *as far as this end knows*, and the
+        // two ways that can be true are not the same thing.
+        //
+        // With nothing unread, the socket really is quiet: this is an answer
+        // volunteered onto a socket nobody is using, and marking it with
+        // whoever asked last is what lets a client that receives it be told
+        // whose answer it got.  That is the defect ed07f12 fixed, and it is
+        // still marked, so it is still caught.
+        //
+        // With a request lying unread, it is not quiet at all: the proxy has an
+        // exchange outstanding here and will pair this answer with it, because
+        // positional pairing is all HTTP/1.1 gives it.  An older id on such an
+        // answer is a mismatch this harness invented and then reported the
+        // proxy for.  It goes out unmarked.
+        if (unread == 0)
+            id = b.last_id;
     }
 
     static std::string buf;
@@ -1633,6 +1874,25 @@ void bsock_respond(world& w, int idx, int shape)
     // A short write leaves the answer unfinished as surely as a shape that was
     // never going to finish it.
     b.resp_pending = !complete || static_cast<size_t>(n) != buf.size();
+
+    // Recorded here rather than above, because an answer that never left this
+    // end answered nothing: a return through either failure branch above must
+    // not leave a horizon behind that swallows the next request read.
+    //
+    // Answering something this end has not read puts the ledger behind the
+    // wire.  From here on every request already on the wire has had its answer,
+    // whatever order this end gets round to reading them in, and recording how
+    // far the wire had run is what lets bsock_note_request() tell those apart
+    // from the requests that arrived afterwards and really are owed one.
+    if (nothing_owed && unread > 0)
+    {
+        const size_t horizon = b.rx_bytes + unread;
+        if (horizon > b.blind_horizon)
+        {
+            b.blind_horizon = horizon;
+            b.blind_pending++;
+        }
+    }
     (void)w;
 }
 
@@ -1874,15 +2134,48 @@ void check_struct_pools(proxy_instance* rt, bool deep)
     }
 }
 
-// Invariant B at rest, and the pool's own two rules.
+// Invariant B at the moment of filing, and the pool's own two rules.
 //
 // The socket pool is the one place in this runtime where a *descriptor* changes
 // hands without going back to the kernel, so everything that makes a descriptor
 // dangerous applies to it: an SQE that still names it, an index entry that
 // still claims it, and — the one that is this target's own — a response that
 // has not finished on it.
+//
+// ─── WHY THIS ASKS AT FILING TIME AND NOT AT REST ───────────────────────────
+//
+// It used to ask at rest: walk the pool every step, and report any socket found
+// in it while the harness backend's answer was unfinished.  That reported two
+// different things under one id.  One is the defect — release_to_pool() files a
+// socket in the middle of a message, because the proxy and the backend disagree
+// about where the message ended (efdbabd) — and the other is a backend starting
+// a NEW message, unbidden, on a socket the proxy had already filed correctly at
+// a boundary.  In the second the finding's own words are false: it says the
+// socket "was filed in the pool somewhere other than a message boundary", and
+// the filing was right; the state changed under it afterwards.
+//
+// The proxy cannot be asked to notice the second, either.  Noticing would mean
+// having something armed on a pooled socket, and pooled-fd-armed above forbids
+// exactly that by name — the two invariants cannot both be satisfied as they
+// were written.  The earliest the proxy can act is when it next reaches for the
+// socket, which is where acquire_pooled_backend's probe now refuses it.
+//
+// So the question is asked once, of the filing, and in_pool is what makes that
+// possible: a socket seen in the pool that was not in it at the end of the
+// previous step has just been filed, and that is the one observation invariant
+// B is entitled to make about the proxy.  Everything the harness does to a
+// socket that is already filed is the harness's own traffic; whether the next
+// borrower survives it is the probe's question, and crosstalk's, not this one's.
+//
+// Three separate agents diagnosed the at-rest form as a defect on 2026-08-01
+// before it was written down.  That is the cost this shape removes, and it
+// removes none of the defect: a socket filed mid-message is filed mid-message
+// on the very first walk that sees it.
 void check_backend_pool(world& w, proxy_instance* rt)
 {
+    for (int i = 0; i < NBSOCK; i++)
+        w.bs[i].pool_seen = false;
+
     for (const auto& pool : rt->m_backend_pool)
     {
         for (const auto& pb : pool)
@@ -1915,10 +2208,15 @@ void check_backend_pool(world& w, proxy_instance* rt)
             {
                 if (w.bs[i].fd < 0 || w.bs[i].peer_port != lport)
                     continue;
-                if (!w.bs[i].resp_pending)
+
+                const bool just_filed = !w.bs[i].in_pool;
+                w.bs[i].pool_seen = true;
+
+                if (!just_filed || !w.bs[i].resp_pending)
                     break;
-                fuzzrt::set_detail("the socket to 127.0.0.1:%u is in the pool while the "
-                                   "backend's answer on it is unfinished",
+
+                fuzzrt::set_detail("the socket to 127.0.0.1:%u was filed in the pool while "
+                                   "the backend's answer on it was unfinished",
                                    static_cast<unsigned>(pb.port));
                 RT_FINDING("pool-off-boundary", false,
                            "a backend socket was filed in the connection pool somewhere other "
@@ -1931,6 +2229,13 @@ void check_backend_pool(world& w, proxy_instance* rt)
             }
         }
     }
+
+    // Carried into the next step, so that the next walk can tell a socket that
+    // has just been filed from one that has been sitting there.  A socket that
+    // left the pool goes back to false and is adjudicated again the next time
+    // the proxy files it, which is right: that is a second filing decision.
+    for (int i = 0; i < NBSOCK; i++)
+        w.bs[i].in_pool = w.bs[i].pool_seen;
 }
 
 void check_instance(world& w, bool deep)

@@ -423,88 +423,128 @@ jobs:
         #     concluded for the later ones.  Its seed,
         #     proxy/response_with_a_tail, stays in the corpus.
         #
-        # STILL RED ON MUTATION, AND NOT FOR A DEFECT.  The whole seed corpus
-        # replays clean with nothing demoted at all.  Blind mutation past it
-        # does not, and what it reaches are four shapes where the oracle is
-        # stated over the harness's *own* bookkeeping while the program decides
-        # independently when a backend reads, when it answers, and when a client
-        # writes.  Written down here so the next person recognises them instead
-        # of re-diagnosing them; none is demoted, because a demoted id would
-        # also silence the real defect that shares its name.
+        # WAS RED ON MUTATION AND NOT FOR A DEFECT — three of the four are now
+        # closed in the harness, and the entries stay because what was wrong
+        # with them is the part worth keeping.  The whole seed corpus replayed
+        # clean with nothing demoted; blind mutation past it did not, and what
+        # it reached were four shapes where an oracle stated its claim at a
+        # moment the harness's *own* bookkeeping had already moved past.  None
+        # was ever demoted — a demoted id silences the real defect that shares
+        # its name — so the fix in each case was to state the claim at the
+        # moment it is true, which is narrower than the old form and not
+        # quieter.  Every one of them was re-checked against the defect it
+        # exists for, by putting that defect back; those runs are in the commit.
         #
-        #   * pool-off-boundary, where the backend starts a *new* message on a
-        #     socket the proxy had already filed correctly at a boundary.  The
-        #     finding's own words — "was filed in the pool somewhere other than
-        #     a message boundary" — are not what happened: the filing was right
-        #     and the state changed afterwards.  The proxy cannot notice,
-        #     either, because nothing may be armed on a pooled socket — the
-        #     pooled-fd-armed check in the same file forbids exactly that — so
-        #     the earliest it can act is when it next reaches for the socket,
-        #     which is where the probe above now refuses it.  The two invariants
-        #     cannot both be satisfied; reconciling them is a change to the
-        #     harness and is deliberately not made here.
-        #     Reaches it in well under a minute of blind mutation.
-        #     What it looks like in a trace, since it has now been rediscovered
-        #     twice: release_to_pool files the socket in one step with the
-        #     harness's resp_pending false, and a later OP_BE_RESPOND of
-        #     A_HEAD_SPLIT on that same socket flips resp_pending true, at which
-        #     point the per-step check_backend_pool() walk reports it.  The
-        #     order of those two lines is the whole diagnosis.
-        #   * crosstalk, where the harness backend answers an unread request
-        #     late, on a socket that has since been reused, so the mark on the
-        #     wire is the harness's own bookkeeping rather than a misrouted
-        #     response.  A proxy pairs answers to requests positionally, which
-        #     is all HTTP/1.1 gives it, and both pairings here were right.
-        #     Traced end to end on 2026-08-01, because it was mistaken for the
-        #     fixed defect returning and it is worth being able to tell them
-        #     apart by reading rather than by arguing.  BE_SERVE accepts the
-        #     proxy's connection in the same step the proxy is still writing the
-        #     request into it, so the harness's read finds nothing and the
-        #     socket's owed queue stays empty.  A later A_UNSOLICITED on that
-        #     socket is therefore built with id 0 — no X-Fuzz-Ack at all — and
-        #     it is, on the wire, the only answer to the one request the proxy
-        #     has outstanding there.  The proxy forwards it to the client that
-        #     asked and pools the socket, both correct.  The probe returns
-        #     EAGAIN when the next client borrows it, and that is the truth:
-        #     nothing is waiting at the proxy's end.  The desync is at the
-        #     *backend's* end, where the first request still sits unread.  The
-        #     harness then reads both requests in one go and answers the older
-        #     one, stamping it with an id whose client let go of that socket two
-        #     steps earlier.  So the finding's own detail line — "client[1]
-        #     received an answer marked 1, which client[0] asked for" — is
-        #     true and is not about the proxy: no client's bytes ever reached
-        #     another client.
-        #   * request-on-unfinished-socket, where the harness reads a request
-        #     that arrived *before* its unfinished response was written, and
-        #     notes it at read time rather than at arrival time.
+        #   * pool-off-boundary — CLOSED 2026-08-01, in the harness.  The
+        #     backend starts a *new* message on a socket the proxy had already
+        #     filed correctly at a boundary, and the finding's own words — "was
+        #     filed in the pool somewhere other than a message boundary" — were
+        #     not what happened: the filing was right and the state changed
+        #     afterwards.  The proxy could not notice either, because noticing
+        #     needs an operation armed on a pooled socket and the pooled-fd-armed
+        #     check in the same file forbids exactly that by name; the two
+        #     invariants could not both be satisfied as written.  In a trace,
+        #     and it was rediscovered three times: release_to_pool files the
+        #     socket in one step with the harness's resp_pending false, and a
+        #     later OP_BE_RESPOND of A_HEAD_SPLIT on that same socket flips
+        #     resp_pending true, at which point the per-step
+        #     check_backend_pool() walk reported it.  The order of those two
+        #     lines was the whole diagnosis, and it is now the whole check:
+        #     check_backend_pool() reports at filing time — the first walk that
+        #     sees a socket in the pool which was not in it before — so what a
+        #     backend does to an already-filed socket is no longer charged to
+        #     the filing.  Reverting efdbabd's `unknown` past a bounded end
+        #     brings the finding straight back on proxy/response_with_a_tail.
+        #   * crosstalk — CLOSED 2026-08-01, in the harness.  The harness backend
+        #     answered an unread request late, on a socket that had since been
+        #     reused, so the mark on the wire was its own bookkeeping rather than
+        #     a misrouted response.  A proxy pairs answers to requests
+        #     positionally, which is all HTTP/1.1 gives it, and both pairings
+        #     were right.  Traced end to end, because it was mistaken for the
+        #     fixed defect returning: BE_SERVE accepts the proxy's connection in
+        #     the same step the proxy is still writing the request into it, so
+        #     the harness's read finds nothing and the socket's owed queue stays
+        #     empty.  A later A_UNSOLICITED on that socket is therefore built
+        #     with id 0 — no X-Fuzz-Ack at all — and it is, on the wire, the only
+        #     answer to the one request the proxy has outstanding there.  The
+        #     proxy forwards it to the client that asked and pools the socket,
+        #     both correct.  The probe returns EAGAIN when the next client
+        #     borrows it, and that is the truth: nothing is waiting at the
+        #     proxy's end.  The desync was at the *backend's* end, where the
+        #     first request still sat unread; the harness then read both requests
+        #     in one go and answered the older one, stamping it with an id whose
+        #     client had let go of that socket two steps earlier.
+        #     bsock_respond() now records how far the wire had run whenever it
+        #     answers something this end has not read, and bsock_note_request()
+        #     does not add a request from behind that mark to owed[] — it has
+        #     been answered already.  An answer written over an unread request
+        #     also goes out unmarked, because an older id on it is a mismatch
+        #     this end invented.  Neither touches the case the defect is in: an
+        #     answer volunteered onto a genuinely quiet socket still carries
+        #     last_id, so reverting ed07f12's destroy-on-readable branch brings
+        #     crosstalk straight back on proxy/pooled_socket_speaks_unbidden.
+        #     THE DISCRIMINATOR, if this id fires again: read the probe's result
+        #     first.  r>0 is the defect back.  EAGAIN is the harness.
+        #   * request-on-unfinished-socket — STILL OPEN, and the one of the four
+        #     not touched here.  The harness reads a request that arrived
+        #     *before* its unfinished response was written, and notes it at read
+        #     time rather than at arrival time.  Same shape as the two above and
+        #     the same kind of fix is available; it is left alone rather than
+        #     changed untested.  Reached in about 25 s of blind mutation from the
+        #     seeds, on this tree and identically on the tree before the three
+        #     fixes above, so it is neither new nor caused by them.
         #   * client-closed-without-answer, in the shape where the client was
-        #     answered and then wrote again.  The proxy answers 408 or 504 with
-        #     Connection: close, the client reads all 87 bytes of it, and the
-        #     program's next OP_REQUEST puts another request into a connection
-        #     the proxy has already said it is ending.  client_send() counts
-        #     that request and sets rx_since_req back to 0 — which is right for
-        #     a keep-alive client, whose second request must be judged on its
-        #     own bytes, and wrong here, because it erases the only record that
-        #     the first one was answered.  client_report_close() then reports
-        #     "sent N complete request(s) and received 0 bytes", which the wire
-        #     contradicts.  Reached from two directions: the deadline sweep's
-        #     408 and its 504.  This is NOT the undiagnosed shape below — there
-        #     nothing at all is written to the client, here a whole answer is —
-        #     so a run that reports this id still has to be read before it is
-        #     filed under either.
+        #     answered and then wrote again — CLOSED 2026-08-01, in the harness.
+        #     The proxy answers 408 or 504 with Connection: close, the client
+        #     reads all 87 bytes of it, and the program's next OP_REQUEST puts
+        #     another request into a connection the proxy has already said it is
+        #     ending.  client_send() counted that request and set rx_since_req
+        #     back to 0 — which is right for a keep-alive client, whose second
+        #     request must be judged on its own bytes, and wrong here, because it
+        #     erased the only record that the first one was answered.  The report
+        #     then read "sent N complete request(s) and received 0 bytes" against
+        #     a wire that had plainly carried an answer.  Reached from three
+        #     directions: the deadline sweep's 408, its 504, and a backend
+        #     response carrying Connection: close that the proxy forwarded.
+        #     client_send() still writes those bytes — the proxy has to survive
+        #     receiving them — and no longer counts them: a connection the proxy
+        #     has announced the end of is owed nothing further, which is also
+        #     what RFC 9112 Section 9.6 says of a client that keeps sending on
+        #     one.  The report now carries the connection total beside the
+        #     since-the-request count, so the claim can be checked against the
+        #     wire instead of contradicting it.
+        #     This was NEVER the undiagnosed shape below — there nothing at all
+        #     is written to the client, here a whole answer is — and the two are
+        #     now told apart by the report itself: the undiagnosed one reads
+        #     "0 bytes in total on this connection".
         #
         # AND ONE THAT IS NOT DIAGNOSED, so do not assume it belongs in the list
         # above.  client-closed-without-answer, in the shape WITHOUT a
-        # half-close: the backend connect is refused and the client is torn down
-        # with nothing written to it.  Reached by mutation and confirmed to fire
-        # identically on an unmodified build, so it predates both 2026-08-01
-        # fixes and neither caused it.  It is the same id 84d624c and 984dadc
-        # were written for, in the error-answer path rather than the deadline or
-        # the pool, and whether the proxy owes a 502 there has not been settled.
+        # half-close: the client is torn down with nothing written to it at all.
+        # Reached by mutation and confirmed to fire identically on an unmodified
+        # build, so it predates the 2026-08-01 fixes and none of them caused it.
+        # It is the same id 84d624c and 984dadc were written for, in the
+        # error-answer path rather than the deadline or the pool, and whether
+        # the proxy owes a 502 there has not been settled.  It is untouched by
+        # the harness fix above, which only ever declines to count a request
+        # written after a Connection: close the client has read: here there is
+        # no response, so there is no announcement, so the ledger is not frozen
+        # and the finding stands.  Read the total in the report to tell them
+        # apart — this one says "0 bytes in total on this connection".
         # Not demoted: an id demoted for an undiagnosed shape silences every
         # other shape it covers, and this id covers the loss those two commits
-        # fixed — and, since 2026-08-01, an artefact as well, which is the third
-        # reason not to demote it.
+        # fixed.
+        #
+        # A THIRD SHAPE UNDER THE SAME ID, found while the above was being
+        # checked and left standing on purpose.  The backend answers with no
+        # status line, the proxy forwards 37 bytes of it to the client, the
+        # backend half-closes, and the client — never told the connection was
+        # ending, because nothing the proxy sent said so — asks again and is
+        # closed in silence.  It fires identically before and after the harness
+        # change.  Either the proxy owes an answer to the second request or it
+        # owes a Connection: close on the first; the report reads "received 0
+        # bytes ... (37 bytes in total on this connection)", which is now exactly
+        # what happened.  Not diagnosed further here.
         #
         # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
         # one of the harness's checks: it is socketley/shared/invariants.h
