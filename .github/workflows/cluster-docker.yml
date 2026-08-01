@@ -1,0 +1,206 @@
+# Container cluster — the only multi-node deployment this project documents.
+#
+# ─── WHY THIS IS ITS OWN FILE ───────────────────────────────────────────────
+#
+# test/docker/test_cluster_docker.sh existed since 97d236d and was invoked by
+# nothing: no workflow mentioned docker and test/run_all.sh does not glob it.
+# In the five months that followed, 167 commits landed — 35 in daemon/ or
+# runtime_manager.cpp — the proxy moved into its own process, all four runtime
+# types grew TLS, group membership became a table pushed to workers rather than
+# a live query, and `socketley daemon` learned to read its own command line.
+# When the script was finally run against the tree it did not get as far as
+# starting a container: the image had not built since 2026-07-28.
+#
+# A test nothing runs is not a test, so this job exists to make that failure
+# mode impossible.  It is a separate workflow rather than a job in ci.yml
+# because it needs a different trigger (below) and because a container build is
+# a different kind of cost from a compile.
+#
+# ─── ON THE TRIGGER: WHY NOT EVERY PUSH ─────────────────────────────────────
+#
+# Because it is a Release build with LTO inside a container, plus liburing from
+# source, plus about forty seconds of deliberate waiting on heartbeat
+# thresholds.  ci.yml deliberately moved Release off the per-push path for
+# exactly this reason and left per-push as a Debug build; putting a slower
+# Release container build back on every push would undo that.
+#
+# So the trigger is three things at once:
+#
+#   * `push`/`pull_request` restricted to `paths:` — the deployment path itself
+#     (Dockerfile, .dockerignore, test/docker/, examples/cluster/) and the
+#     sources that decide whether a cluster works at all (cluster_discovery,
+#     runtime_manager, daemon/).  A change to any of those is checked
+#     immediately, because those are the changes that break this.
+#   * `schedule`, daily.  This is the part that answers the actual failure
+#     above: the image broke through a change to event_loop.cpp, which is not
+#     in the paths list and could not sensibly be, because the honest paths
+#     list for "does this still build and cluster" is the whole tree.  A daily
+#     run bounds how long any such break can hide at one day instead of five
+#     months.
+#   * `workflow_dispatch`, so it can be run on demand while working on it.
+#
+# Scheduled at 05:00 rather than nightly.yml's 03:00 so the two do not compete
+# for runner capacity, and after it so a red nightly is the first thing seen.
+#
+# ─── WHAT A GREEN RUN HERE MEANS ────────────────────────────────────────────
+#
+# That a request entering one container was answered by a socketley runtime in
+# a different container, over an address that container advertised into a
+# shared volume; that killing a container takes its runtime out of rotation
+# inside the documented 10s window and bringing it back puts it in again; and
+# that a graceful stop is a different mechanism from a kill.  See the header of
+# test/docker/test_cluster_docker.sh for what it does not mean.
+
+name: Cluster (Docker)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'test/docker/**'
+      - 'examples/cluster/**'
+      - '.github/workflows/cluster-docker.yml'
+      - 'socketley/shared/cluster_discovery.*'
+      - 'socketley/shared/runtime_manager.*'
+      - 'socketley/daemon/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'test/docker/**'
+      - 'examples/cluster/**'
+      - '.github/workflows/cluster-docker.yml'
+      - 'socketley/shared/cluster_discovery.*'
+      - 'socketley/shared/runtime_manager.*'
+      - 'socketley/daemon/**'
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: cluster-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cluster:
+    name: Three daemons, three containers, one volume
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the docker that will run this
+        run: |
+          docker version
+          docker compose version
+
+      - name: Build the image
+        # Explicitly, and before anything is brought up, so that a build
+        # failure is reported as a build failure rather than as three
+        # containers that would not start.  BUILD_JOBS is the whole machine
+        # here: the runner has memory, and the default of 1 exists for small
+        # developer boxes where -flto=auto times -j$(nproc) is an OOM kill.
+        # See the header comment in the Dockerfile.
+        run: |
+          docker compose -f test/docker/docker-compose.cluster.yml \
+            -p socketley-cluster-test build \
+            --build-arg BUILD_JOBS="$(nproc)" api1
+
+      - name: Verify the image produced a working binary
+        # A build step that "succeeded" without producing something runnable is
+        # the most common source of a false green, and this one has a second
+        # way to go wrong that a plain `docker build` will not catch: the
+        # runtime stage copies liburing out of the builder, and getting that
+        # wrong yields an image that builds and then cannot load.
+        run: docker run --rm socketley-cluster-test:latest version
+
+      - name: Cluster test
+        run: bash test/docker/test_cluster_docker.sh
+        timeout-minutes: 15
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/docker/docker-compose.cluster.yml \
+            -p socketley-cluster-test logs --tail 200 || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f test/docker/docker-compose.cluster.yml \
+            -p socketley-cluster-test down -v --remove-orphans || true
+
+  # The example is documentation, and documentation that does not run is worse
+  # than none.  This does not start it — the compose in examples/cluster is a
+  # thing a reader copies, not a thing CI has to prove end to end, and the
+  # cluster job above covers the same shape with assertions.  What it does
+  # prove is that the file is valid compose, that its build context resolves,
+  # and that its shell blocks parse — which is where all three of its defects
+  # were: a build context one directory above the repository root, a `command:`
+  # handed to the image's ENTRYPOINT as arguments, and a `sleep 1` standing in
+  # for readiness.
+  example:
+    name: examples/cluster is still a runnable example
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The compose file parses and its context resolves
+        run: |
+          cd examples/cluster
+          docker compose -f docker-compose.yml config >/tmp/resolved.yml
+          # `config` resolves the build context to an absolute path; if it were
+          # still ../../.. it would point above the checkout.
+          grep -q "context: $GITHUB_WORKSPACE\$" /tmp/resolved.yml \
+            || { echo "build context does not resolve to the repository root:";
+                 grep context: /tmp/resolved.yml; exit 1; }
+
+      - name: Every node's command is one shell script, and valid
+        # Checked against the RESOLVED config rather than the source YAML,
+        # because the two differ in the way that matters.  A `command:` given
+        # as a plain string is word-split by compose into an argv, so
+        #
+        #     entrypoint: ["/bin/sh", "-c"]
+        #     command: |
+        #       set -e
+        #       socketley daemon &
+        #       ...
+        #
+        # resolves to ["set", "-e", "socketley", "daemon"] — sh -c gets "set",
+        # the rest become its positional parameters, and everything past the
+        # first `&` is gone.  The container then exits instantly with no error.
+        # A one-element list keeps the script whole.  This check exists because
+        # that is exactly what happened while this example was being repaired.
+        run: |
+          # From apt, not pip: the runner's python is an externally managed
+          # environment and a bare `pip install` fails on it.
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+          python3 - <<'PY'
+          import subprocess, sys, yaml
+          doc = yaml.safe_load(open("/tmp/resolved.yml"))
+          bad = 0
+          for name, svc in doc["services"].items():
+              ep, cmd = svc.get("entrypoint"), svc.get("command")
+              if ep[:2] != ["/bin/sh", "-c"]:
+                  print(f"{name}: entrypoint is not a shell: {ep}"); bad = 1; continue
+              if not isinstance(cmd, list) or len(cmd) != 1:
+                  n = len(cmd) if isinstance(cmd, list) else type(cmd).__name__
+                  print(f"{name}: command resolved to {n} arguments, not one "
+                        f"script — compose word-split it"); bad = 1; continue
+              p = subprocess.run(["sh", "-n"], input=cmd[0], text=True,
+                                 capture_output=True)
+              if p.returncode != 0:
+                  print(f"{name}: {p.stderr.strip()}"); bad = 1
+              else:
+                  print(f"{name}: ok ({len(cmd[0].splitlines())} lines)")
+          sys.exit(bad)
+          PY
+
+      - name: The local-cluster example is valid shell too
+        run: bash -n examples/cluster/01-local-cluster.sh
