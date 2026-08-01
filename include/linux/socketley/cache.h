@@ -26,6 +26,15 @@ public:
     cache& eviction(eviction_policy p)       { cch()->set_eviction(p); return *this; }
     cache& resp()                            { cch()->set_resp_forced(true); return *this; }
     cache& mode(cache_mode m)                { cch()->set_mode(m); return *this; }
+    // Refused at start(), on every build.  A cache's listener has no handshake
+    // behind it — nothing drives a record layer on this runtime — so a cache
+    // "configured with TLS" would accept in the clear while inspect reported it
+    // encrypted, and tls_config_refusal fails it closed instead.
+    //
+    // Kept, and kept failing, rather than deleted: it is published, and a call
+    // that stops compiling teaches an embedder less than one that says why on
+    // the first run.  When a cache listener terminates TLS this becomes real
+    // with no change here.  See shared/tls_context.h.
     cache& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
     }

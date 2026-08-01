@@ -22,8 +22,26 @@ public:
     }
 
     // ── Chainable config ────────────────────────────────────────────────
+    // Dial over TLS.  Complete on its own for this role: a client has no
+    // listener to present a certificate on, the host from the constructor is
+    // pinned before the ClientHello, and the chain is verified against the
+    // system trust store.  See tls_context.h.
     client& tls()                          { raw()->set_tls(true); return *this; }
+    // Verify the peer against this CA instead of the system store.
     client& tls_ca(std::string_view ca)    { raw()->set_tls(true); raw()->set_ca_path(ca); return *this; }
+    // The certificate this client presents when the peer asks for one — the
+    // client half of mutual TLS.  Needs tls() as well, and both halves or
+    // neither: a certificate with no key presents nothing, and start() refuses
+    // the pair rather than dialling and presenting nothing.
+    //
+    // Named for what it configures rather than after the two flags it sets.
+    // --cert/--key on a *client* are not the listener certificate they are on
+    // every other role, and the SDK had no spelling for them at all: an
+    // embedding that needed mutual TLS had to drop to
+    // raw()->set_cert_path(), which is the escape hatch, not the interface.
+    client& client_cert(std::string_view cert, std::string_view key) {
+        auto* i = raw(); i->set_cert_path(cert); i->set_key_path(key); return *this;
+    }
     client& reconnect(int max)             { raw()->set_reconnect(max); return *this; }
     client& mode(client_mode m)            { cli()->set_mode(m); return *this; }
     client& udp()                          { cli()->set_udp(true); return *this; }
