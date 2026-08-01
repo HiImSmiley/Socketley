@@ -26,7 +26,7 @@ enum tls_conn_state : uint8_t {
 
 // ─── What this build can honour ───
 //
-// Two roles have a handshake behind them:
+// Three roles have a handshake behind them:
 //
 //   * a **server runtime's own listener** — accept, handshake and record layer
 //     driven by io_uring completions through the memory BIO pair below; see
@@ -35,11 +35,13 @@ enum tls_conn_state : uint8_t {
 //     exactly as a server's does, and its backend leg dials one — verifying
 //     the chain and the endpoint's name, and presenting a client certificate
 //     when the mesh options ask for it.
+//   * a **client runtime's outbound socket** — the same dial as the proxy's
+//     backend leg, with the same verification: create_ssl_client pins the host
+//     from `-t` before the ClientHello and there is no way to switch that off.
 //
-// A client runtime's outbound socket and a cache's listener still connect in
-// cleartext, and a runtime "configured with TLS" on one of those paths would
-// listen or dial in the clear while inspect reported it as encrypted.  That is
-// the dangerous shape: an operator who asks for encryption and is told they
+// A cache's listener still accepts in cleartext, and a cache "configured with
+// TLS" would listen in the clear while inspect reported it as encrypted.  That
+// is the dangerous shape: an operator who asks for encryption and is told they
 // have it has no way to notice they do not.
 //
 // So those flags fail closed, and stay refused until some runtime actually
@@ -50,11 +52,16 @@ enum tls_conn_state : uint8_t {
 // about to take effect asks — flag parsing, `edit`, `import`, and the last
 // gate before a runtime is started.  It returns the refusal text,
 // newline-terminated, or an empty string when the configuration is one this
-// build can honour.  A half-written configuration is refused too, on both
-// roles that have one: --tls with no certificate, a certificate with no --tls,
-// half a client-certificate pair, or a client CA for a listener that is not
-// encrypted.  Each of those describes something that could only run in
-// cleartext or verify nothing.
+// build can honour.  A half-written configuration is refused too, on every
+// role that has one: --tls with no certificate on a *listener*, a certificate
+// with no --tls, half a client-certificate pair, or a client CA for a listener
+// that is not encrypted.  Each of those describes something that could only
+// run in cleartext or verify nothing.
+//
+// A client runtime is the one role where --tls on its own is complete: it has
+// no listener to present a certificate on, and the trust store it verifies the
+// peer against defaults to the system one.  --cert/--key there are the
+// certificate it *presents*, for a peer that asks for mutual TLS.
 std::string tls_config_refusal(runtime_type type,
                                bool tls,
                                std::string_view cert_path,
@@ -74,7 +81,8 @@ std::string tls_not_implemented_error(std::string_view option);
 // start gate asking "may this come up?" cannot drift apart.
 inline bool tls_role_has_handshake(runtime_type type)
 {
-    return type == runtime_server || type == runtime_proxy;
+    return type == runtime_server || type == runtime_proxy ||
+           type == runtime_client;
 }
 
 // TLS context wrapper for server/client runtimes

@@ -19,16 +19,16 @@
 // ─── TLS configuration gate ───
 // See the header for what this build honours and what it still refuses.  It
 // deliberately lives next to the OpenSSL wrapper: whoever wires up the next
-// role — a client runtime's outbound socket, a cache listener — will be
-// reading this file, and narrowing the gate is part of that work.
+// role — a cache listener, a server runtime's upstream leg — will be reading
+// this file, and narrowing the gate is part of that work.
 
 std::string tls_not_implemented_error(std::string_view option)
 {
     std::string msg(option);
     msg += ": TLS transport is not implemented for this runtime -- only a "
-           "server runtime's own listener and a proxy runtime (both legs) "
-           "perform a handshake, so this would run in cleartext on an endpoint "
-           "reported as encrypted\n";
+           "server runtime's own listener, a client runtime's outbound socket "
+           "and a proxy runtime (both legs) perform a handshake, so this would "
+           "run in cleartext on an endpoint reported as encrypted\n";
     return msg;
 }
 
@@ -64,6 +64,60 @@ std::string tls_config_refusal(runtime_type type,
     return "--tls: this binary was built without the OpenSSL development "
            "headers, so it has no record layer to speak TLS with\n";
 #else
+    // ── a client runtime: one leg, and it dials ──
+    //
+    // Handled before the listener rules below because it has no listener at
+    // all, and every one of them would ask this configuration for something it
+    // has no place to put.  --tls on its own is the complete configuration
+    // here: create_ssl_client pins the host from -t and verifies the chain
+    // against the system store, and neither of those is optional.
+    if (type == runtime_client)
+    {
+        // The mesh options configure a proxy: --client-ca verifies certificates
+        // presented by clients, which needs a listener, and
+        // --client-cert/--client-key name a second leg this role does not have.
+        // The certificate a client presents is --cert/--key, below.
+        if (!mesh_client_ca.empty())
+            return "--client-ca: verifies the certificates clients present, and a "
+                   "client runtime has no listener for one to arrive on -- it "
+                   "would be stored and reported and authenticate nobody\n";
+        if (!mesh_client_cert.empty() || !mesh_client_key.empty())
+        {
+            std::string msg(!mesh_client_cert.empty() ? "--client-cert" : "--client-key");
+            msg += ": configures a proxy's backend leg, and a client runtime has "
+                   "only its own -- use --cert and --key, which are the "
+                   "certificate this client presents when the peer asks for one\n";
+            return msg;
+        }
+
+        // A certificate or a trust store with no --tls is an operator who
+        // believes the dial is encrypted and has not turned it on: it would be
+        // stored, reported, and used to verify a handshake that never happens.
+        if (!tls)
+        {
+            std::string msg(!cert_path.empty() ? "--cert"
+                          : !key_path.empty()  ? "--key"
+                                               : "--ca");
+            msg += ": needs --tls as well -- on its own it configures a "
+                   "certificate for a connection that would still be dialled in "
+                   "cleartext\n";
+            return msg;
+        }
+
+        // The certificate this client presents is a pair.  Half of one loads
+        // nothing, so the dial would present nothing at all and a peer
+        // requiring mutual TLS would refuse it -- after the flags said it was
+        // configured.
+        if (cert_path.empty() != key_path.empty())
+            return cert_path.empty()
+                ? std::string("--key: needs --cert <file> as well -- a key with no "
+                              "certificate presents nothing\n")
+                : std::string("--cert: needs --key <file> as well -- a certificate "
+                              "with no key presents nothing\n");
+
+        return {};
+    }
+
     // The mesh client-certificate options describe a *backend* leg, and a
     // server runtime has none: it would store them, report them and dial
     // nothing.  (The flag handlers do not offer them on a server at all; this

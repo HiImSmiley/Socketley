@@ -10,6 +10,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
+#include "../../shared/tls_context.h"
 
 // Everything the ring can name for one run of this runtime: the two requests it
 // reuses, the buffers the kernel reads out of and writes into, and the reconnect
@@ -51,6 +52,28 @@ struct client_tcp_connection
     // way, and that completion is dropped if the runtime has stopped.
     io_request timeout_req{};
     struct __kernel_timespec timeout_ts{};
+
+    // === TLS session ===
+    // Non-null only on a client configured with --tls.  OpenSSL never sees the
+    // socket: the session sits on a memory BIO pair, ciphertext reaches it from
+    // read_buf and leaves it into write_buf, and every byte on the wire is
+    // still moved by an io_uring submission — the same design the server's
+    // listener and the proxy's backend leg use, with this end as the client.
+    //
+    // Nothing the ring can name lives inside the SSL, which is what makes the
+    // session safe to free the moment the connection is lost even with a write
+    // still in flight: the kernel is reading out of write_buf, which this
+    // struct owns.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    // The peer sent close_notify.  Recorded rather than acted on, so the
+    // plaintext that arrived ahead of it in the same read is still delivered.
+    bool tls_peer_closed{false};
+
+    ~client_tcp_connection() { tls_context::free_ssl(ssl); }
+    client_tcp_connection() = default;
+    client_tcp_connection(const client_tcp_connection&) = delete;
+    client_tcp_connection& operator=(const client_tcp_connection&) = delete;
 };
 
 enum client_mode : uint8_t
@@ -114,6 +137,33 @@ private:
     // a runtime that keeps dropping them starves all of them.
     void return_provided_buf(struct io_uring_cqe* cqe);
 
+    // ── TLS record layer ────────────────────────────────────────────────────
+    //
+    // OpenSSL does no I/O in either of these.  The handshake is advanced one
+    // completion at a time: tls_feed hands the record layer the ciphertext a
+    // read delivered and leaves whatever plaintext came out in m_conn->partial,
+    // and tls_flush takes queued plaintext plus whatever the session owes on
+    // its own account — a handshake flight, an alert, a session ticket — and
+    // puts it on the wire as one ordinary write submission.  Everything above
+    // them, the line framing and the Lua callbacks, sees the same plaintext it
+    // always did.
+    //
+    // The design is server_instance's and proxy_instance's; a third spelling of
+    // it would be a third thing to keep in step, so the shape is deliberately
+    // identical and only the buffers differ — this runtime has one write
+    // request and one write buffer, not a batch.
+    void tls_feed(const char* data, size_t len);
+    void tls_flush();
+    // Give this connection a session and put the ClientHello on the wire.
+    // False means no session could be created — no peer name to verify
+    // against, or OpenSSL refused — and the caller must give the socket up
+    // rather than carry on in cleartext, which is the whole point of the flag.
+    bool start_tls();
+    // Release the session.  Called wherever the socket is lost, so that a
+    // reconnect starts a fresh handshake rather than resuming one against a
+    // peer that never saw the first half of it.
+    void tls_release();
+
     client_mode m_mode;
     bool m_udp{false};
     // The current run's I/O state, and the ones earlier runs left behind with
@@ -154,6 +204,19 @@ private:
     bool m_has_cached_addr{false};
     std::string m_cached_host;
     uint16_t m_cached_port{0};
+
+    // ─── TLS ────────────────────────────────────────────────────────────────
+    // Null when this client dials in cleartext.  Rebuilt by setup() on every
+    // start, so `reload` is how a renewed certificate is installed — sessions
+    // already handed out hold their own reference to the old SSL_CTX and are
+    // unaffected.  Exactly the server's arrangement.
+    std::unique_ptr<tls_context> m_tls;
+    // The name the peer's certificate has to be valid for: the host side of
+    // `-t`, as the operator wrote it, resolved to nothing and read back from no
+    // certificate.  Recorded in try_connect while the target is being parsed,
+    // because that is the only place it is known, and handed to
+    // create_ssl_client — which refuses to build a session without one.
+    std::string m_tls_peer_name;
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 4;
