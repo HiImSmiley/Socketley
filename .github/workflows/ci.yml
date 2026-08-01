@@ -32,13 +32,16 @@
 #     here; the integration suite runs an uninstrumented Debug build.  The
 #     sanitized suite is nightly.
 #   * TSan.  Nightly, and expected to be quiet — see the note in premake5.lua.
-#   * fuzz_http_request.  That target needs the runtime, which under clang means
-#     compiling fifteen SDK translation units with sanitizers (see the header
-#     comment in test/fuzz/fuzz_http_request.cpp).  That is a nightly cost, not
-#     a per-push one.  Consequence: a regression in the proxy's *request* header
-#     handling is caught within a day, not within a push.  The response side is
-#     covered here — fuzz_http_response needs no SDK at all, because that parser
-#     was lifted into runtime/proxy/http_response_framing.h.
+#   * fuzz_http_request, and the three operation-sequence targets that drive a
+#     live runtime (fuzz_server_ops, fuzz_client_ops, fuzz_proxy_ops).  All four
+#     need the runtime, which under clang means compiling fifteen SDK
+#     translation units with sanitizers (see the header comment in
+#     test/fuzz/fuzz_http_request.cpp).  That is a nightly cost, not a per-push
+#     one.  Consequence: a regression in the proxy's *request* header handling,
+#     or in any runtime's connection lifecycle, is caught within a day rather
+#     than within a push.  The response side is covered here —
+#     fuzz_http_response needs no SDK at all, because that parser was lifted
+#     into runtime/proxy/http_response_framing.h.
 #   * MemorySanitizer.  Deliberately absent everywhere, not an oversight — it
 #     needs libc++ and every dependency (liburing, OpenSSL, LuaJIT) rebuilt with
 #     -fsanitize=memory or it reports a false positive per uninstrumented byte,
