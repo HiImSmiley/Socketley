@@ -146,12 +146,27 @@ load_x100() {
 # Wait for a defined starting state.  Returns 0 when reached, 1 when it gave up
 # — callers report that alongside their numbers so a batch measured on a dirty
 # machine is visible as such rather than silently mixed in with the clean ones.
+#
+# This waits.  It does not kill anything, and it must not: it used to open with
+#
+#     pkill -f "$BIN daemon"
+#
+# which matches every daemon started from this binary — including the one the
+# caller started moments earlier.  measure_tcp.sh calls preflight *before*
+# start_daemon and survived it; measure_http.sh and measure_ws.sh call it at the
+# top of each pass, after start_daemon, and killed their own daemon on the first
+# line of the first pass.  Everything after that measured an absent daemon:
+# every round reported connect-failed=20, and the harness closed with "the
+# daemon died during the run" — a true statement about a death it had caused
+# itself.  Nothing replaces the kill because nothing needs to: start_daemon
+# gives every run its own HOME and its own control socket, so a daemon left over
+# from another run is invisible to this one, each harness uses its own ports, and
+# each harness already kills the daemon it started.
 preflight() {
     local tw_limit="${LOAD_TW_LIMIT:-200}"
     local load_limit="${LOAD_LOADAVG_LIMIT:-60}"     # x100, so 60 == 0.60
     local tries="${LOAD_PREFLIGHT_TRIES:-60}"
 
-    pkill -f "$BIN daemon" 2>/dev/null
     local i tw la
     for i in $(seq 1 "$tries"); do
         tw="$(time_wait_count)"
