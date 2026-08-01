@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 
+#include "../../shared/conn_identity.h"
 #include "../../shared/runtime_instance.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
@@ -47,6 +48,12 @@ struct alignas(64) server_connection
     // fd" is not the same connection; every request this connection submits
     // carries this stamp and the dispatcher compares before acting on it.
     uint32_t generation{0};
+    // The half of this connection's conn_ref that varies.  `generation` above
+    // is the *loop's* stamp — 32 bits, process-wide, and it wraps, all of which
+    // is fine for deciding whether a completion still belongs to its submitter
+    // and none of which is fine for a name another process holds.  This one is
+    // 64 bits, per runtime, and never repeats.  See conn_identity.h.
+    uint64_t ref_serial{0};
     bool direct_fd{false};   // true if fd came from direct-accept (fixed file index)
     bool read_pending{false};
     bool write_pending{false};
@@ -201,6 +208,10 @@ struct alignas(64) server_connection
     {
         fd = new_fd;
         fixed_idx = -1;
+        // Cleared, not carried.  pool_acquire() mints a fresh one straight
+        // after; leaving the previous connection's serial in a struct being
+        // handed to a new client is the whole defect one level up.
+        ref_serial = 0;
         direct_fd = false;
         // pool_release() already did this; repeated here because a struct
         // leaving the pool must not carry the previous connection's session
@@ -374,17 +385,63 @@ public:
     // Stats
     std::string get_stats() const override;
 
-    // Client routing
-    bool route_client(int client_fd, std::string_view target_name);
-    bool unroute_client(int client_fd);
-    std::string_view get_client_route(int client_fd) const;
-    void process_forwarded_message(int client_fd, std::string_view msg, std::string_view parent_name);
-    void remove_forwarded_client(int client_fd);
-    void send_to_client(int client_fd, std::string_view msg);
+    // ── Client routing ──────────────────────────────────────────────────────
+    //
+    // The Lua-facing half.  `client_id` is whatever Lua was handed for this
+    // connection: a descriptor for one of this runtime's own clients, or a
+    // handle out of conn_identity.h's reserved range for one that was routed
+    // here from elsewhere.  Nothing above this line ever sees a conn_ref, and
+    // nothing below it ever sees a descriptor belonging to another process.
+    bool route_client(int client_id, std::string_view target_name);
+    bool unroute_client(int client_id);
+    std::string_view get_client_route(int client_id) const;
+    void send_to_client(int client_id, std::string_view msg);
 
-    // Owner-targeted sending (sub-server → owner's clients)
-    bool owner_send(int client_fd, std::string_view msg);
+    // Owner-targeted sending (sub-server → the connection that was routed here)
+    //
+    // owner_send used to take a descriptor number from a sub-server's Lua and
+    // write it straight into the owner's connection table, with no check that
+    // the number still named the connection the sub-server was talking about.
+    // It resolves a handle now, and a handle whose connection has gone resolves
+    // to nothing.
+    bool owner_send(int client_id, std::string_view msg);
     bool owner_broadcast(std::string_view msg);
+
+    // ── The cross-runtime interface ─────────────────────────────────────────
+    //
+    // Everything one runtime does to another's connection goes through these
+    // four, and every one of them takes a conn_ref.  That is the property the
+    // process split needs: none of them can be called with a number that only
+    // means something in the caller's address space, so the in-process form and
+    // the form that arrives over a socket are the same call with the same
+    // arguments.
+    //
+    // Called on the *receiving* runtime.  Mints a local handle for a connection
+    // that lives in `origin_name` and tells this runtime's script about it.
+    // Returns the handle, or -1 if the ref is not usable.
+    int accept_routed(const conn_ref& ref, std::string_view origin_name);
+
+    // Called on the receiving runtime: the connection is gone.
+    void release_routed(const conn_ref& ref);
+
+    // Called on the *owning* runtime by a receiver that is shutting down: stop
+    // routing this connection, it has nowhere to go.  The connection itself is
+    // untouched and goes back to being served here.
+    void drop_route(const conn_ref& ref);
+
+    // Called on the receiving runtime: bytes arrived from it.
+    void deliver_routed(const conn_ref& ref, std::string_view msg);
+
+    // Called on the *owning* runtime: write to one of my connections, named the
+    // way a stranger is allowed to name it.  False when the ref names nothing
+    // here any more, which is the case that used to write into whichever
+    // connection had inherited the descriptor number.
+    bool write_to_ref(const conn_ref& ref, std::string_view msg);
+
+    // The name of one of this runtime's own connections, for a caller that is
+    // about to hand it to another runtime.  Invalid for a descriptor this
+    // runtime does not hold.
+    conn_ref ref_for_fd(int fd) const;
 
     // Master mode
     void set_master_pw(std::string_view pw);
@@ -640,10 +697,49 @@ private:
 
     uint64_t m_message_counter = 0;
 
-    // Client routing: fd → target runtime name
-    std::unordered_map<int, std::string> m_routes;
-    // Forwarded clients: fd → source (parent) runtime name
-    std::unordered_map<int, std::string> m_forwarded_clients;
+    // ── Cross-runtime routing ───────────────────────────────────────────────
+    //
+    // Both of these used to be keyed by a file descriptor number, and the
+    // sub-server's copy was keyed by the *parent's* descriptor number — a value
+    // that means nothing in the sub-server's own address space and less than
+    // nothing once the two are in different processes.  See conn_identity.h for
+    // the three properties of a descriptor that made that unworkable.
+    //
+    // What this runtime owns and has routed away: our own connection's serial →
+    // the runtime it went to.  Keyed by serial rather than fd so that a
+    // descriptor reissued to a new client is not silently still routed.
+    std::unordered_map<uint64_t, std::string> m_routes;
+
+    // Our serials back to the descriptor that currently carries them.  This is
+    // the only place a conn_ref becomes an fd again, it is private to the
+    // runtime that minted the ref, and the entry is removed the moment the
+    // connection closes — which is what makes a stale ref resolve to nothing
+    // instead of to whoever inherited the number.
+    std::unordered_map<uint64_t, int> m_conn_by_serial;
+
+    // What another runtime has routed *to* us.  The connection lives elsewhere;
+    // all we hold is its name and a local handle to show Lua.
+    struct forwarded_client
+    {
+        conn_ref    ref;
+        std::string origin;      // runtime name that owns the connection
+    };
+    std::unordered_map<int, forwarded_client> m_forwarded;
+    std::unordered_map<conn_ref, int, conn_ref_hash> m_forwarded_by_ref;
+    int m_next_handle{conn_handle_base};
+    int alloc_handle();
+
+    // Mints the serial half of this runtime's conn_refs.  Per instance, seeded
+    // from the monotonic clock, never restarting at a value a peer could still
+    // be holding from a previous lifetime.
+    conn_serial_source m_serials;
+
+    // conn_owner_key(get_id()), computed once.  get_id() is set after
+    // construction, so this is filled lazily on first use rather than in the
+    // constructor — a ref minted before the daemon has assigned an id would
+    // carry owner 0 and be invalid by construction.
+    mutable uint64_t m_owner_key{0};
+    uint64_t owner_key() const;
 
     // Stats
     uint32_t m_stat_peak_connections{0};
