@@ -252,7 +252,11 @@ python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 # empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
 # cannot tell the two apart.
 TOTAL=$((TOTAL+1))
-NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l)
+# `|| true` because of `set -o pipefail`: when the pid really is gone — the
+# case this check exists for — `ls` fails, the pipeline fails, and the script
+# dies right here with no output at all.  The one check that can report a
+# dead daemon could never report one.
+NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
         FAIL=$((FAIL+1))
