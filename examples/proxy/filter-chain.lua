@@ -61,7 +61,15 @@ filters = {
         -- set here replaces one the client sent under the same name — which is
         -- the point: the backend must not be able to be told who the user is by
         -- the client.
-        return { set_headers = { ["x-authenticated-user"] = user } }
+        --
+        -- `remove_headers` is the other half of that: a list of names taken off
+        -- the request entirely.  Overwriting is enough for a header the backend
+        -- reads; it is not enough for one the backend must never see at all,
+        -- and a blanked header is still a header.
+        return {
+            set_headers = { ["x-authenticated-user"] = user },
+            remove_headers = { "x-internal-trust", "x-real-user" },
+        }
     end,
 
     -- ── 2. rate limiting ─────────────────────────────────────────────────
@@ -100,7 +108,7 @@ function on_tick()
 end
 
 --[[
-What a filter may NOT set, on either side:
+What a filter may NOT set — or remove — on either side:
 
   Content-Length, Transfer-Encoding   framing.  The proxy forwards exactly the
                                       body the parsed request declared; a filter
@@ -127,6 +135,8 @@ Other rules worth knowing:
   * A `filters` entry that is not a function refuses the whole script at load
     time.  A silently dropped auth filter looks exactly like one that admits
     everybody.
+  * A name that appears in both set_headers and remove_headers takes whichever
+    was said later, exactly as two set_headers for one name resolve.
 
 Test:
   socketley create server api -p 9001 -s
