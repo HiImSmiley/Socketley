@@ -56,7 +56,7 @@ codes=""
 for r in $(seq 1 "$REP"); do
     RUNDIR="$(make_run_dir)"
 
-    pin_load python3 "$LIB/churn_be.py" "$BEP" >"$RUNDIR/backend.log" 2>&1 &
+    start_load_bg python3 "$LIB/churn_be.py" "$BEP" >"$RUNDIR/backend.log" 2>&1
     BEPID=$!
 
     if ! start_daemon "$RUNDIR"; then

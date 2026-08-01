@@ -53,7 +53,7 @@ trap cleanup EXIT
 echo "=== Proxy HTTP path — $PASSES passes of $ROUNDS rounds ==="
 announce_environment
 
-pin_load python3 "$LIB/httpharness.py" --mode backend --port "$BE" >"$RUNDIR/backend.log" 2>&1 &
+start_load_bg python3 "$LIB/httpharness.py" --mode backend --port "$BE" >"$RUNDIR/backend.log" 2>&1
 BPID=$!
 sleep 1
 kill -0 "$BPID" 2>/dev/null || {

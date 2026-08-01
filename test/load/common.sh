@@ -105,6 +105,40 @@ pin_load() {
     if [ "$PIN_AVAILABLE" = 1 ]; then taskset -c "$LOAD_CPUS" "$@"; else "$@"; fi
 }
 
+# ─── backgrounding, and why it is not `pin_load cmd &` ───────────────────────
+#
+# `&` applied to a shell function runs the function in a subshell.  $! is then
+# the subshell's pid and the command is its child, so:
+#
+#   kill "$!"            kills bash and leaves the command running
+#   /proc/$!/fd          lists bash's descriptors
+#   /proc/$!/status      reports bash's RSS
+#
+# Every harness here backgrounded through pin_load or pin_daemon and kept $!, so
+# every one of those was true.  The two below background the command themselves,
+# in the current shell, so $! is the command's own pid — and taskset execs its
+# argument rather than forking, so the pinned branch keeps that pid too.
+#
+# Call them without a trailing `&`; they add it:
+#
+#   start_daemon_bg "$BIN" daemon >"$log" 2>&1   ; DAEMON_PID=$!
+#   start_load_bg   python3 "$LIB/x.py" >"$log" 2>&1 ; BPID=$!
+start_daemon_bg() {
+    if [ "$PIN_AVAILABLE" = 1 ]; then
+        taskset -c "$DAEMON_CPUS" "$@" &
+    else
+        "$@" &
+    fi
+}
+
+start_load_bg() {
+    if [ "$PIN_AVAILABLE" = 1 ]; then
+        taskset -c "$LOAD_CPUS" "$@" &
+    else
+        "$@" &
+    fi
+}
+
 announce_environment() {
     echo "  binary:   $BIN"
     if [ "$PIN_AVAILABLE" = 1 ]; then
@@ -192,13 +226,25 @@ make_run_dir() {
     echo "$t"
 }
 
-# Start a daemon in the given run dir; sets DAEMON_PID.  Fails loudly rather
-# than letting the rest of the harness measure an absent daemon.
+# Start a daemon in the given run dir; sets DAEMON_PID to the daemon's own pid.
+# Fails loudly rather than letting the rest of the harness measure an absent
+# daemon.
+#
+# DAEMON_PID is the instrument the leak harnesses read: restart_under_load.sh and
+# runtime_churn_leak.sh both sample /proc/$DAEMON_PID for descriptors and RSS and
+# report the difference across their cycles.  It used to be set from
+# `pin_daemon "$BIN" daemon &`, which named the subshell — so both harnesses were
+# reporting bash's five descriptors and bash's two megabytes, unchanged across
+# every cycle because bash was doing nothing.  Nightly run 30719890629 printed
+# "baseline: 5 descriptors, 2136 kB RSS" and then, after twelve stop/start
+# cycles, "5 descriptors, 2136 kB RSS" — identical to the byte, as it always
+# would be.  Neither harness could fail its leak check.  See the note above
+# start_daemon_bg for the mechanism.
 start_daemon() {
     local rundir="$1"
     export HOME="$rundir/home"
     export SOCKETLEY_SOCKET="$rundir/d.sock"
-    pin_daemon "$BIN" daemon >"$rundir/daemon.log" 2>&1 &
+    start_daemon_bg "$BIN" daemon >"$rundir/daemon.log" 2>&1
     DAEMON_PID=$!
     local i
     for i in $(seq 1 100); do
