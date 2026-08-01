@@ -35,6 +35,28 @@ workspace "Socketley"
         end
     end
 
+    -- Which linker Dev can actually use, asked rather than assumed.
+    --
+    -- This was `-fuse-ld=lld-18`, and it meant Dev did not link at all under the
+    -- default toolchain: gcc rejects the versioned spelling outright
+    -- ("unrecognized command-line option '-fuse-ld=lld-18'").  The unversioned
+    -- spelling does not rescue it either -- gcc accepts the option and then
+    -- fails with "collect2: cannot find 'ld'", because lld installs as
+    -- ld.lld-18 and there is no unsuffixed ld.lld for gcc to find.  clang knows
+    -- where its own lld lives and needs neither.
+    --
+    -- So the flag is added only when an unsuffixed ld.lld is on PATH, which is
+    -- the one case every driver can resolve.  Without it Dev links with the
+    -- default linker and is still the fast configuration: the speed comes from
+    -- having no LTO, and lld only ever shortened what was left.
+    local dev_linker = ""
+    if os.outputof then
+        local lld = os.outputof("command -v ld.lld 2>/dev/null")
+        if lld and lld ~= "" then
+            dev_linker = "-fuse-ld=lld"
+        end
+    end
+
     -- Workspace-wide Release hardening (applies to ALL projects)
     -- Dev: for iteration, tests and fuzzing.  No LTO, because LTO runs at every
     -- link no matter how much came out of the cache, and it is half the eight
@@ -45,7 +67,7 @@ workspace "Socketley"
         optimize "On"
         symbols "On"
         buildoptions { "-fstack-protector-strong", "-march=native" }
-        linkoptions { "-fuse-ld=lld-18", "-Wl,--as-needed" }
+        linkoptions { dev_linker, "-Wl,--as-needed" }
     filter {}
 
     filter "configurations:Release"
