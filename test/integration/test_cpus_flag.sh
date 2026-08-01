@@ -34,13 +34,31 @@ NCPU=$(nproc)
 ok()   { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad()  { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
-# start_daemon [env assignments...]
+DLOG="$WORK/daemon.log"
+
+# start_daemon [env assignments...] [-- daemon flags...]
+#
+# Anything before `--` is put in the daemon's environment, anything after it on
+# its command line.  The two halves are the same two settings arriving by the
+# two routes that exist, and section 6 is about them disagreeing.
+#
+# KEEP_STATE=1 leaves the state directory alone across the restart, for the
+# sections that are about what a runtime carries over one.  It defaults to 0
+# because every section before those wants a daemon with nothing restored.
+KEEP_STATE=0
 start_daemon() {
+    local envs=() flags=() after=0 a
+    for a in "$@"; do
+        if [ "$a" = "--" ]; then after=1; continue; fi
+        if [ "$after" -eq 0 ]; then envs+=("$a"); else flags+=("$a"); fi
+    done
+
     [ -n "$DPID" ] && { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
     DPID=""
     rm -f "$SOCKETLEY_SOCKET"
-    rm -rf "$HOME"; mkdir -p "$HOME"
-    env "$@" "$BIN" daemon >/dev/null 2>&1 &
+    [ "$KEEP_STATE" -eq 1 ] || { rm -rf "$HOME"; mkdir -p "$HOME"; }
+    : > "$DLOG"
+    env ${envs[@]+"${envs[@]}"} "$BIN" daemon ${flags[@]+"${flags[@]}"} >"$DLOG" 2>&1 &
     DPID=$!
     for _ in $(seq 1 60); do
         [ -S "$SOCKETLEY_SOCKET" ] && "$BIN" ls >/dev/null 2>&1 && return 0
@@ -49,6 +67,9 @@ start_daemon() {
     echo "  FAIL: daemon did not come up"
     return 1
 }
+
+# The state file a runtime was persisted to, wherever paths.h decided to put it.
+state_file() { find "$HOME" -name "$1.json" -print -quit 2>/dev/null; }
 
 # How many io_uring submission-polling kernel threads the daemon process holds.
 # This is the figure the whole change is about: it used to be one per ring
@@ -216,6 +237,162 @@ if [ "$NCPU" -ge 2 ]; then
 else
     echo "  SKIP: pinning checks need at least 2 CPUs"
 fi
+
+# ─── 6. The daemon's own command line ───────────────────────────────────────
+# `socketley daemon` used to ignore argv entirely.  --sqpoll, --cpus and a plain
+# misspelling all started a daemon and exited 0, so the two settings could only
+# be given through the environment and an operator who typed them as flags was
+# told nothing at all.
+#
+# Every oracle below has to tell "refused" apart from "started a daemon and
+# discarded the argument", which an oracle reading only stdout and an exit code
+# cannot do: a daemon that ignores its command line never returns.  So each runs
+# under `timeout`, and a run that reaches the timeout is the failure — the
+# daemon came up.  Each also names the reason it expects, because exit 1 with
+# text on stdout is what a build with none of this answers to an unknown flag.
+
+stop_daemon() {
+    [ -n "$DPID" ] && { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
+    DPID=""
+    for _ in $(seq 1 50); do [ -S "$SOCKETLEY_SOCKET" ] || break; sleep 0.1; done
+    rm -f "$SOCKETLEY_SOCKET"
+}
+
+# daemon_refuses <why> <expected-substring> <args...>
+daemon_refuses() {
+    local why=$1 expect=$2; shift 2
+    local out rc=0
+    out=$(timeout 5 "$BIN" daemon "$@" 2>&1) || rc=$?
+    if [ "$rc" -eq 124 ]; then
+        bad "$why: the daemon started and ran on — the argument was ignored, not refused"
+        return
+    fi
+    if [ "$rc" -eq 0 ]; then bad "$why: exited 0, expected a refusal"; return; fi
+    if [ -z "$out" ]; then bad "$why: refused with exit $rc but printed nothing"; return; fi
+    case "$out" in
+        *"$expect"*) ok ;;
+        *) bad "$why: refused, but not for the expected reason: $out" ;;
+    esac
+}
+
+# No daemon on this socket: these have to be refused on the real startup path,
+# not merely by the "one is already running" check further down it.
+stop_daemon
+daemon_refuses "a flag the daemon has never heard of" "unknown daemon flag" --not-a-real-flag
+daemon_refuses "--cpus with nothing after it"         "--cpus requires a CPU set" --cpus
+daemon_refuses "a descending range on the daemon"     "descending CPU range" --cpus 3-1
+daemon_refuses "a CPU this machine does not have"     "does not exist on this machine" --cpus "$NCPU-$NCPU"
+
+# --cpus as a flag does what SOCKETLEY_CPUS does, read back from the kernel and
+# not from the daemon's own report.
+if [ "$NCPU" -ge 2 ]; then
+    start_daemon -- --cpus 0-1 || exit 1
+    "$BIN" create server cpus_flagpin -p 19963 -s >/dev/null 2>&1
+    sleep 0.3
+    [ "$(stat_field cpus_flagpin cpus)" = "0-1" ] && ok \
+        || bad "daemon --cpus 0-1: stats says cpus=$(stat_field cpus_flagpin cpus)"
+    AFF=$(taskset -pc "$DPID" 2>/dev/null | sed 's/.*list: //')
+    case "$AFF" in
+        0-1|0,1) ok ;;
+        *) bad "daemon --cpus 0-1: the I/O thread's real affinity is '$AFF'" ;;
+    esac
+    # And a runtime asking for the same set is now accepted, which is the whole
+    # point of being able to say it on the command line.
+    accepts "a runtime request the flag satisfies" --cpus 0-1
+fi
+
+# A flag beats the environment.  Without this the two routes fight and the one
+# that wins is the one nobody typed: SOCKETLEY_SQPOLL is usually exported once
+# and forgotten, --no-sqpoll is typed for this run.
+start_daemon SOCKETLEY_SQPOLL=1 -- --no-sqpoll || exit 1
+"$BIN" create server cpus_over -p 19964 -s >/dev/null 2>&1
+sleep 0.3
+[ "$(stat_field cpus_over sqpoll)" = "off" ] && ok \
+    || bad "--no-sqpoll under SOCKETLEY_SQPOLL=1: stats says sqpoll=$(stat_field cpus_over sqpoll)"
+N=$(iou_threads)
+[ "$N" -eq 0 ] && ok || bad "--no-sqpoll under SOCKETLEY_SQPOLL=1: $N polling thread(s), expected 0"
+
+# ─── 7. A request survives the daemon that accepted it ──────────────────────
+# --cpus and --sqpoll were not written to the state file.  Because a ring
+# belongs to a process, losing them never moved a restored runtime's I/O — it
+# was always going to run wherever the new daemon's ring runs.  What was lost
+# was the requirement, and with it the refusal: a runtime created with
+# --cpus 0 came back on an unpinned ring, reported cpus:max, and said nothing.
+#
+# Both halves are checked, and they are different claims.  That the request is
+# in the file is one; that a restored runtime whose request the new ring cannot
+# meet fails loudly is the other, and a build could pass the first while doing
+# nothing with what it read.
+SET7=0
+start_daemon SOCKETLEY_CPUS="$SET7" || exit 1
+"$BIN" create server cpus_keep   -p 19965 --cpus "$SET7" -s >/dev/null 2>&1
+"$BIN" create server cpus_nosq   -p 19966 --no-sqpoll -s >/dev/null 2>&1
+"$BIN" create server cpus_plain  -p 19967 -s >/dev/null 2>&1
+sleep 0.5
+
+F=$(state_file cpus_keep)
+if [ -z "$F" ]; then
+    bad "persistence: cpus_keep has no state file at all"
+else
+    grep -q "\"cpus\": \"$SET7\"" "$F" && ok \
+        || bad "persistence: --cpus $SET7 is not in the state file: $(tr -d '\n' <"$F")"
+fi
+
+F=$(state_file cpus_nosq)
+if [ -z "$F" ]; then
+    bad "persistence: cpus_nosq has no state file at all"
+else
+    grep -q '"sqpoll": false' "$F" && ok \
+        || bad "persistence: --no-sqpoll is not in the state file: $(tr -d '\n' <"$F")"
+fi
+
+# A runtime that asked for neither must carry neither.  Writing the default
+# value of a flag nobody typed would turn every plain `create` into an explicit
+# --no-sqpoll on the next boot, and a daemon whose ring has a poller would then
+# refuse to restore runtimes that never had an opinion about one.
+F=$(state_file cpus_plain)
+if [ -z "$F" ]; then
+    bad "persistence: cpus_plain has no state file at all"
+elif grep -qE '"(cpus|sqpoll)"' "$F"; then
+    bad "persistence: a runtime that asked for nothing carries a request: $(tr -d '\n' <"$F")"
+else
+    ok
+fi
+
+# Restart onto a ring that cannot meet the persisted request.
+KEEP_STATE=1 start_daemon || exit 1
+sleep 0.5
+
+LINE=$("$BIN" ls 2>/dev/null | grep -E "[[:space:]]cpus_keep[[:space:]]")
+case "$LINE" in
+    *Failed*) ok ;;
+    "")       bad "restore refusal: cpus_keep is not listed at all after the restart" ;;
+    *)        bad "restore refusal: cpus_keep came up anyway — '$LINE'" ;;
+esac
+
+# The reason, not merely the failure.  A build that failed every restore for any
+# reason would satisfy the check above.
+grep -q "already pinned to" "$DLOG" && ok \
+    || bad "restore refusal: the daemon never said why — log: $(tr '\n' '|' <"$DLOG")"
+
+# Vacuity guard, and the more important half of it: a runtime that asked for
+# nothing must still come back up.  Without this every assertion above is also
+# satisfied by a daemon that restores nothing at all.
+LINE=$("$BIN" ls 2>/dev/null | grep -E "[[:space:]]cpus_plain[[:space:]]")
+case "$LINE" in
+    *Up*) ok ;;
+    *)    bad "restore: a runtime with no ring request did not come back — '$LINE'" ;;
+esac
+
+# And onto a ring that does meet it, by the flag this time rather than the
+# environment it was created under.
+KEEP_STATE=1 start_daemon -- --cpus "$SET7" || exit 1
+sleep 0.5
+LINE=$("$BIN" ls 2>/dev/null | grep -E "[[:space:]]cpus_keep[[:space:]]")
+case "$LINE" in
+    *Up*) ok ;;
+    *)    bad "restore: cpus_keep did not come back on a ring that meets its request — '$LINE'" ;;
+esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
