@@ -42,23 +42,18 @@ std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 // up a listener that answers cleartext on a port `inspect` describes as
 // encrypted.
 //
-// A server runtime terminates TLS on its own listener, so a complete server
-// configuration passes; every other role is still refused.  See tls_context.h.
+// A server runtime terminates TLS on its own listener and a proxy on both of
+// its legs, so a complete configuration for either passes; every other role is
+// still refused.  See tls_context.h.
 static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
         return {};
 
     std::string_view mesh_ca, mesh_cert, mesh_key;
-    if (inst->get_type() == runtime_proxy)
-    {
-        const auto& mesh = static_cast<const proxy_instance*>(inst)->get_mesh_config();
-        mesh_ca   = mesh.client_ca;
-        mesh_cert = mesh.client_cert;
-        mesh_key  = mesh.client_key;
-    }
+    inst->get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
 
-    return tls_config_refusal(inst->get_type() == runtime_server,
+    return tls_config_refusal(inst->get_type(),
                               inst->get_tls(), inst->get_cert_path(),
                               inst->get_key_path(), inst->get_ca_path(),
                               mesh_ca, mesh_cert, mesh_key);
@@ -2144,6 +2139,14 @@ int daemon_handler::cmd_edit(const parsed_args& pa)
     const std::string cert_before(instance->get_cert_path());
     const std::string key_before(instance->get_key_path());
     const std::string ca_before(instance->get_ca_path());
+    // The proxy's half of the same set.  Its backend leg is configured by
+    // three more paths, and they are as much a set as the listener's: half a
+    // client-certificate pair is refused, so an edit that leaves one behind
+    // has to leave no trace either.
+    std::string_view mca_v, mcert_v, mkey_v;
+    instance->get_mesh_tls_paths(mca_v, mcert_v, mkey_v);
+    const std::string mesh_ca_before(mca_v), mesh_cert_before(mcert_v),
+                      mesh_key_before(mkey_v);
 
     for (size_t i = 2; i < pa.count; ++i)
     {
@@ -2186,6 +2189,13 @@ int daemon_handler::cmd_edit(const parsed_args& pa)
         instance->set_cert_path(cert_before);
         instance->set_key_path(key_before);
         instance->set_ca_path(ca_before);
+        if (type == runtime_proxy)
+        {
+            auto* prx = static_cast<proxy_instance*>(instance);
+            prx->set_mesh_client_ca(mesh_ca_before);
+            prx->set_mesh_client_cert(mesh_cert_before);
+            prx->set_mesh_client_key(mesh_key_before);
+        }
         std::cout << msg;
         return 1;
     }
@@ -2269,7 +2279,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // config that omits the TLS fields is accepted, which is how an operator
     // clears them from a runtime restored out of an older state file (dump,
     // drop the fields, import).
-    if (const std::string msg = tls_config_refusal(type == runtime_server,
+    if (const std::string msg = tls_config_refusal(type,
                                                    cfg.tls, cfg.cert_path, cfg.key_path,
                                                    cfg.ca_path, cfg.mesh_client_ca,
                                                    cfg.mesh_client_cert, cfg.mesh_client_key);

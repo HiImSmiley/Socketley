@@ -165,6 +165,14 @@ void proxy_client_connection::reset(int new_fd)
     generation = next_io_generation();
     connect_reattempted = false;
     fd = new_fd;
+    // client_pool_release() already did this; repeated here because a struct
+    // leaving the pool must not carry the previous connection's session under
+    // any circumstances, and this is the last point at which that can still be
+    // true.
+    tls_context::free_ssl(ssl);
+    ssl = nullptr;
+    tls_state = tls_conn_none;
+    tls_peer_closed = false;
     read_pending = false;
     write_pending = false;
     closing = false;
@@ -230,6 +238,13 @@ void proxy_backend_connection::reset(int new_fd)
     // accident is common rather than rare.
     generation = next_io_generation();
     fd = new_fd;
+    // See proxy_client_connection::reset.  It matters more here: backend fds
+    // are pooled as well as backend structs, so a session left behind would be
+    // the session of a *different peer*.
+    tls_context::free_ssl(ssl);
+    ssl = nullptr;
+    tls_state = tls_conn_none;
+    tls_peer_closed = false;
     read_pending = false;
     write_pending = false;
     closing = false;
@@ -294,6 +309,16 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     // number back until the ring has stopped naming it.
     if (conn->pipe_to_backend[0] >= 0) { close_tracked(conn->pipe_to_backend[0]); conn->pipe_to_backend[0] = -1; }
     if (conn->pipe_to_backend[1] >= 0) { close_tracked(conn->pipe_to_backend[1]); conn->pipe_to_backend[1] = -1; }
+
+    // The TLS session dies with the connection that owned it, whether the
+    // struct goes back to the pool or is retired with completions still owed.
+    // No completion can name it — every byte the ring carries was copied out
+    // of a BIO first — so unlike the write batch beside it this needs none of
+    // the "wait until the kernel is finished" reasoning below.
+    tls_context::free_ssl(conn->ssl);
+    conn->ssl = nullptr;
+    conn->tls_state = tls_conn_none;
+    conn->tls_peer_closed = false;
 
     // The half-open connect socket goes the same way, and for the same reason.
     // Every caller closes it before getting here, but nothing downstream would:
@@ -402,6 +427,14 @@ void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connecti
     // Pipes first, for the reason in client_pool_release.
     if (conn->pipe_to_client[0] >= 0) { close_tracked(conn->pipe_to_client[0]); conn->pipe_to_client[0] = -1; }
     if (conn->pipe_to_client[1] >= 0) { close_tracked(conn->pipe_to_client[1]); conn->pipe_to_client[1] = -1; }
+
+    // And the session, for the reason in client_pool_release.  The descriptor
+    // this struct was using may go on to the connection pool; the session it
+    // negotiated may not, and does not outlive this call.
+    tls_context::free_ssl(conn->ssl);
+    conn->ssl = nullptr;
+    conn->tls_state = tls_conn_none;
+    conn->tls_peer_closed = false;
 
     // Same rule as the client side — see client_pool_release.
     {
@@ -550,6 +583,14 @@ void proxy_instance::set_mesh_client_ca(std::string_view path) { m_mesh.client_c
 void proxy_instance::set_mesh_client_cert(std::string_view path) { m_mesh.client_cert = std::string(path); }
 void proxy_instance::set_mesh_client_key(std::string_view path) { m_mesh.client_key = std::string(path); }
 
+void proxy_instance::get_mesh_tls_paths(std::string_view& ca, std::string_view& cert,
+                                        std::string_view& key) const
+{
+    ca   = m_mesh.client_ca;
+    cert = m_mesh.client_cert;
+    key  = m_mesh.client_key;
+}
+
 size_t proxy_instance::get_connection_count() const
 {
     // A placeholder for a proxy running in its own process has no clients of
@@ -587,13 +628,48 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return true;
     }
 
-    auto colon = b.address.find(':');
-    if (colon != std::string::npos)
+    // A scheme says how to reach this backend, not only where.  "https://" is
+    // how one backend is asked for over TLS while its neighbours stay
+    // cleartext; the backend-TLS options ask for it everywhere at once and
+    // have already set b.tls before this runs, so this only ever turns it on.
+    //
+    // The scheme stays on b.address, which is what `stats` and the Lua API
+    // report: an operator reading that back has to see what they configured.
+    std::string_view addr(b.address);
+    uint16_t default_port = 0;
+    if (addr.starts_with("https://"))
     {
-        b.resolved_host = b.address.substr(0, colon);
-        auto port_str = b.address.data() + colon + 1;
-        auto port_end = b.address.data() + b.address.size();
-        std::from_chars(port_str, port_end, b.resolved_port);
+        addr.remove_prefix(8);
+        b.tls = true;
+        default_port = 443;
+    }
+    else if (addr.starts_with("http://"))
+    {
+        addr.remove_prefix(7);
+        default_port = 80;
+    }
+
+    const auto colon = addr.find(':');
+    // A scheme with no port is a URL, and a URL's port is implied rather than
+    // absent.  Without this it would fall through to the runtime-name lookup
+    // below and be reported as an unknown runtime, which is a confusing answer
+    // to something an operator wrote as a perfectly ordinary address.
+    const bool have_endpoint = (colon != std::string_view::npos) ||
+                               (default_port != 0 && !addr.empty());
+    if (have_endpoint)
+    {
+        if (colon != std::string_view::npos)
+        {
+            b.resolved_host = std::string(addr.substr(0, colon));
+            const char* pstart = addr.data() + colon + 1;
+            const char* pend   = addr.data() + addr.size();
+            std::from_chars(pstart, pend, b.resolved_port);
+        }
+        else
+        {
+            b.resolved_host = std::string(addr);
+            b.resolved_port = default_port;
+        }
         if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
         {
             b.cached_addr.sin_family = AF_INET;
@@ -674,10 +750,82 @@ bool proxy_instance::setup(event_loop& loop)
     if (m_backends.empty())
         return false;
 
+    // ── TLS ─────────────────────────────────────────────────────────────────
+    //
+    // Certificates are read and parsed here, at setup, before a single
+    // completion is armed.  That is file I/O and it blocks, which is exactly
+    // why it happens here and nowhere near the event loop's hot path: neither
+    // handshake ever touches a file, and neither touches a socket either — see
+    // tls_feed/tls_flush.
+    //
+    // Every refusal below returns false, which puts the runtime in the failed
+    // state.  None of them may fall through to a cleartext leg: a
+    // configuration that asked for encryption and got a plaintext port, or a
+    // plaintext request sent to a backend, is the one outcome the operator
+    // cannot see.
+    m_tls.reset();
+    m_backend_tls.reset();
+
+    if (get_tls())
+    {
+        auto ctx = std::make_unique<tls_context>();
+        // --client-ca is the listener's mutual-TLS CA: with it, a client that
+        // presents no certificate, or one signed by anybody else, is rejected
+        // during the handshake.
+        if (!ctx->init_server(get_cert_path(), get_key_path(), m_mesh.client_ca))
+        {
+            // init_server has already said which file and what OpenSSL made of
+            // it.  This says what it cost.
+            LOG_ERROR("proxy: TLS listener not started -- the certificate, key or "
+                      "client CA could not be loaded");
+            return false;
+        }
+        m_tls = std::move(ctx);
+    }
+
+    // The backend-TLS options apply to every backend at once.  None of them
+    // means anything against a cleartext peer — a trust store with nothing to
+    // verify, a client certificate nobody is asked for — so honouring them
+    // without encrypting the leg would be the fail-open reading of all three.
+    m_backend_tls_all = !get_ca_path().empty() || !m_mesh.client_cert.empty() ||
+                        !m_mesh.client_key.empty();
+
+    bool any_backend_tls = false;
     for (auto& b : m_backends)
     {
+        b.tls = m_backend_tls_all;   // resolve_backend adds an https:// scheme
         if (!resolve_backend(b))
             return false;
+        any_backend_tls = any_backend_tls || b.tls;
+    }
+
+    if (any_backend_tls)
+    {
+        // An HTTP health probe writes a plaintext GET straight at the backend
+        // socket, which a TLS backend answers with a handshake failure — so
+        // every backend would be marked unhealthy and the proxy would refuse
+        // every request while the backends were all fine.  Refusing to start
+        // says which two options disagree; coming up would look like an
+        // outage in the backends.
+        if (m_mesh.health_check == mesh_config::health_http)
+        {
+            LOG_ERROR("proxy: --health-check http probes a TLS backend in cleartext and "
+                      "would mark every backend unhealthy -- use --health-check tcp");
+            return false;
+        }
+
+        auto ctx = std::make_unique<tls_context>();
+        // --ca is this leg's trust store; without one the system store is used.
+        // Either way the chain is verified and the endpoint's name is checked
+        // per connection (see start_backend_tls) -- there is deliberately no
+        // way to turn either off.
+        if (!ctx->init_client(get_ca_path(), m_mesh.client_cert, m_mesh.client_key))
+        {
+            LOG_ERROR("proxy: TLS backend leg not started -- the CA file or the client "
+                      "certificate could not be loaded");
+            return false;
+        }
+        m_backend_tls = std::move(ctx);
     }
 
     m_avail_scratch.reserve(m_backends.size());
@@ -1376,6 +1524,29 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         if (m_client_count > m_peak_connections)
             m_peak_connections = m_client_count;
 
+        // A --tls listener gives every accepted socket a session before
+        // anybody else touches the connection, and in particular before
+        // on_connect below and before the TCP-mode backend connect: whatever
+        // those set in motion ends in bytes going to this client, and a
+        // connection that did not know it was encrypted would send them in the
+        // clear.
+        //
+        // The session is created here and the handshake starts on the first
+        // read completion.  Nothing is written yet — the client speaks first.
+        if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
+        {
+            ptr->ssl = m_tls->create_ssl_server();
+            if (SOCKETLEY_UNLIKELY(!ptr->ssl))
+            {
+                // No session, no encryption, so no connection.  Serving this
+                // client in cleartext is the one alternative and it is worse
+                // than dropping it.
+                close_pair(client_fd, -1);
+                goto proxy_resubmit_accept;
+            }
+            ptr->tls_state = tls_conn_handshake;
+        }
+
         if (m_idle_timeout_cached > 0)
             ptr->last_activity = std::chrono::steady_clock::now();
 
@@ -1719,13 +1890,75 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         read_data = conn->read_buf;
     }
 
+    // ── the record layer, when this listener terminates TLS ──
+    //
+    // These bytes are ciphertext.  tls_feed leaves the plaintext in
+    // conn->partial — the same buffer the cleartext HTTP path fills — and
+    // tls_flush puts back whatever the session owes the wire: the next
+    // handshake flight, an alert explaining one that just failed, a session
+    // ticket.  Flushing here rather than at the end means a connection the
+    // handshake has just failed on has its alert in flight before any of the
+    // teardown paths below can decide there is nothing pending to wait for.
+    //
+    // Everything past this point reads plaintext and knows nothing about TLS.
+    std::string tls_plain;
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        tls_feed(conn, read_data, static_cast<size_t>(cqe->res));
+        if (is_provided)
+        {
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            is_provided = false;   // returned; the branches below must not again
+        }
+        if (!tls_flush(conn))
+            conn->closing = true;
+        // The peer's close_notify is applied now rather than where it was
+        // read: the read that carried it can carry a last request ahead of it,
+        // and marking the connection closing any earlier would have thrown
+        // that request away with the answer half computed.
+        if (conn->tls_peer_closed)
+            conn->closing = true;
+
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+        {
+            if (!conn->write_pending && !conn->read_pending &&
+                !conn->splice_in_pending && !conn->splice_out_pending)
+                close_pair(fd, conn->backend_fd);
+            return;
+        }
+
+        // Mid-handshake: nothing was decrypted, so there is nothing to route.
+        // The read is re-armed and the next flight is what arrives.
+        if (conn->partial.empty())
+        {
+            if (!conn->read_pending &&
+                SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot,
+                                                   m_use_provided_bufs, BUF_GROUP_ID)))
+                close_pair(fd, conn->backend_fd);
+            return;
+        }
+
+        // TCP mode forwards what it is given rather than parsing it, so the
+        // plaintext is taken out of `partial` here and handed on in a buffer
+        // of its own.  HTTP mode reads partial directly and is left alone.
+        if (m_protocol == protocol_tcp)
+        {
+            tls_plain.swap(conn->partial);
+            read_data = tls_plain.data();
+        }
+    }
+
     if (m_protocol == protocol_tcp)
     {
+        // The decrypted length when there is a session, the completion's own
+        // when there is not.
+        const size_t data_len = conn->ssl ? tls_plain.size()
+                                          : static_cast<size_t>(cqe->res);
         // If async connect is pending, buffer incoming data (with limit)
         if (SOCKETLEY_UNLIKELY(conn->connect_pending))
         {
             if (conn->saved_request.size() < proxy_client_connection::MAX_PARTIAL_SIZE)
-                conn->saved_request.append(read_data, static_cast<size_t>(cqe->res));
+                conn->saved_request.append(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
             // Pause reads if too much data buffered, resume in handle_connect
@@ -1752,7 +1985,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             }
 
             // Save initial data for forwarding after connect
-            conn->saved_request.assign(read_data, static_cast<size_t>(cqe->res));
+            conn->saved_request.assign(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
@@ -1796,7 +2029,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             return;
         }
 
-        std::string_view data(read_data, cqe->res);
+        std::string_view data(read_data, data_len);
         forward_to_backend(conn, data);
         if (is_provided)
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
@@ -1844,10 +2077,14 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
-    // HTTP mode
-    conn->partial.append(read_data, cqe->res);
-    if (is_provided)
-        m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    // HTTP mode.  On a TLS connection the plaintext is already in `partial` —
+    // tls_feed put it there — and the provided buffer has already gone back.
+    if (SOCKETLEY_LIKELY(conn->ssl == nullptr))
+    {
+        conn->partial.append(read_data, cqe->res);
+        if (is_provided)
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    }
 
     // If async connect is pending, just buffer data in partial
     if (SOCKETLEY_UNLIKELY(conn->connect_pending))
@@ -2237,24 +2474,6 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         return;
     }
 
-    // Backend responded successfully — record for circuit breaker (once per connection, HTTP only)
-    if (m_protocol == protocol_http && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
-    {
-        auto& ce = m_conn_idx[conn->client_fd];
-        if (ce.side == conn_client && !ce.client->response_started)
-        {
-            // Mark that we've started receiving response data — no retry after this
-            ce.client->response_started = true;
-            // The backend has answered, so the deadline it was being measured
-            // against is over.  It bounds the wait for the *first* byte only:
-            // once bytes are flowing, a slow or streaming body is the backend
-            // doing its job, and cutting it short would be a new defect rather
-            // than a fix for this one.
-            clear_response_deadline(ce.client);
-            note_backend_success(ce.client);
-        }
-    }
-
     // Extract data pointer for forwarding and HTTP response tracking
     char* data_ptr;
     uint16_t buf_id = 0;
@@ -2273,6 +2492,111 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     else
     {
         data_ptr = conn->read_buf;
+    }
+
+    // ── the record layer, when this backend is reached over TLS ──
+    //
+    // The mirror of the client leg: ciphertext in, plaintext out of
+    // conn->partial and into a buffer of its own, and whatever the session
+    // owes the wire — the rest of the handshake, the request that has been
+    // waiting behind it, an alert — flushed before anything below can decide
+    // the connection has nothing left to do.
+    //
+    // A handshake round produces no plaintext at all, and that must not be
+    // mistaken for a response: everything from the circuit breaker's "the
+    // backend answered" to the pool's "the response is over" is downstream of
+    // data_len, so this returns rather than falling through with zero.
+    std::string tls_plain;
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        tls_feed(conn, data_ptr, data_len);
+        if (is_provided)
+        {
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            is_provided = false;
+        }
+        if (!tls_flush(conn))
+            conn->closing = true;
+        if (conn->tls_peer_closed)
+            conn->closing = true;
+
+        if (SOCKETLEY_UNLIKELY(conn->closing && conn->partial.empty()))
+        {
+            // A handshake that failed — an unknown CA, an expired chain, a
+            // name that does not match the endpoint this request was routed
+            // to — ends up here with nothing decrypted.  do_handshake has
+            // already logged which of those it was.
+            //
+            // The client is waiting on a request that was never sent and, on
+            // this leg, never will be in the clear.  Dropping it would tell it
+            // nothing; 502 says which half failed, and a retry — where one is
+            // configured — is safe by the same test the retry path already
+            // applies: not one byte has reached the client.
+            if (m_protocol == protocol_http && conn->client_fd >= 0 &&
+                conn->client_fd < MAX_FDS)
+            {
+                auto& ce = m_conn_idx[conn->client_fd];
+                if (ce.side == conn_client && !ce.client->closing &&
+                    !ce.client->response_started)
+                {
+                    auto* cconn = ce.client;
+                    // A backend this proxy cannot complete a handshake with is
+                    // as unusable as one refusing connections, and belongs in
+                    // the breaker for the same reason.
+                    note_backend_failure(cconn);
+                    // Detached before either branch runs: a retry opens a
+                    // backend of its own and this one is torn down next line.
+                    cconn->backend_fd = -1;
+                    conn->client_fd = -1;
+                    if (!try_retry(cconn))
+                        send_error(cconn, "502 Bad Gateway", "Bad Gateway\n");
+                    close_pair(-1, fd);
+                    return;
+                }
+            }
+            if (!conn->write_pending && !conn->read_pending &&
+                !conn->splice_in_pending && !conn->splice_out_pending)
+                close_pair(conn->client_fd, fd);
+            return;
+        }
+
+        if (conn->partial.empty())
+        {
+            // Mid-handshake, or a record that carried no application data.
+            // Re-arm and wait for the next flight.
+            if (!conn->read_pending &&
+                SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, fd, conn, m_recv_multishot,
+                                                           m_use_provided_bufs, BUF_GROUP_ID)))
+                close_pair(conn->client_fd, fd);
+            return;
+        }
+
+        tls_plain.swap(conn->partial);
+        data_ptr = tls_plain.data();
+        data_len = tls_plain.size();
+    }
+
+    // Backend responded successfully — record for circuit breaker (once per connection, HTTP only)
+    //
+    // Below the decryption on purpose: on a TLS leg the first completions
+    // carry a handshake, and counting one of those as "the backend answered"
+    // would clear the response deadline and bar a retry before the request had
+    // even gone out.
+    if (m_protocol == protocol_http && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& ce = m_conn_idx[conn->client_fd];
+        if (ce.side == conn_client && !ce.client->response_started)
+        {
+            // Mark that we've started receiving response data — no retry after this
+            ce.client->response_started = true;
+            // The backend has answered, so the deadline it was being measured
+            // against is over.  It bounds the wait for the *first* byte only:
+            // once bytes are flowing, a slow or streaming body is the backend
+            // doing its job, and cutting it short would be a new defect rather
+            // than a fix for this one.
+            clear_response_deadline(ce.client);
+            note_backend_success(ce.client);
+        }
     }
 
     // Forward to client
@@ -3208,6 +3532,61 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
 // Finish setting up backend after connect (pooled or async connect completion).
 // Creates backend conn struct, registers in maps, sets up splice/read.
 // Returns true if backend is ready. connect_pending will be false.
+// Whether this connection's backend leg is encrypted.
+//
+// backend_idx cannot answer it on its own: the group path leaves the index
+// pointing at the group entry rather than at the member it chose.  It does not
+// need to — the backend-TLS options apply to every backend at once, and a
+// group's members have no address of their own to carry an https:// scheme —
+// so the group case is answered by the all-backends flag and the indexed case
+// by the entry itself.
+bool proxy_instance::conn_backend_tls(const proxy_client_connection* conn) const
+{
+    if (SOCKETLEY_LIKELY(!m_backend_tls))
+        return false;
+    if (m_backend_tls_all)
+        return true;
+    return !conn->backend_from_group && conn->backend_idx < m_backends.size() &&
+           m_backends[conn->backend_idx].tls;
+}
+
+// Give a backend connection its session and put the ClientHello on the wire.
+//
+// The name pinned to the session is the endpoint this request was routed to —
+// the host an operator configured, or the member the group selected — and
+// never one read back out of the certificate that turns up.  create_ssl_client
+// refuses to build a session without one, which is why this can only fail
+// closed: a false return costs the socket, and the request is answered 502 or
+// retried rather than sent in the clear.
+bool proxy_instance::start_backend_tls(proxy_client_connection* cconn,
+                                       proxy_backend_connection* bconn)
+{
+    if (SOCKETLEY_UNLIKELY(!m_backend_tls))
+        return false;
+
+    std::string_view host;
+    uint16_t port = 0;
+    if (SOCKETLEY_UNLIKELY(!backend_endpoint_of(cconn, m_backends, host, port)))
+    {
+        LOG_ERROR("proxy: TLS backend connection refused -- the endpoint this request "
+                  "was routed to is not known, so there is no name to verify against");
+        return false;
+    }
+
+    bconn->ssl = m_backend_tls->create_ssl_client(host);
+    if (SOCKETLEY_UNLIKELY(!bconn->ssl))
+        return false;
+    bconn->tls_state = tls_conn_handshake;
+
+    // One turn of the handshake, which produces the ClientHello; the peer
+    // speaks next and the read armed on this socket carries the answer.  A
+    // negative here is a local failure — no memory, no usable cipher — rather
+    // than a rejection: there is nothing on the wire yet to be rejected.
+    if (SOCKETLEY_UNLIKELY(tls_context::do_handshake(bconn->ssl) < 0))
+        return false;
+    return tls_flush(bconn);
+}
+
 bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const backend_info* target,
                                        bool* resource_failure)
 {
@@ -3226,6 +3605,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         arm_response_deadline(conn);
 
     int bfd = -1;
+    const bool backend_tls = conn_backend_tls(conn);
 
     // Try connection pool first — for a group-routed request too.  What the
     // pool is asked for is an idle socket to *this endpoint*, which is a
@@ -3233,6 +3613,12 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // it just selected is on the connection.  Asking by index alone could not,
     // which is why this used to be skipped altogether and why an @group gateway
     // paid for a TCP handshake, and left a TIME_WAIT behind, on every request.
+    //
+    // Never for a TLS backend.  Nothing is filed under one — backend_pool_
+    // eligible refuses to pool a connection carrying a session, and says why
+    // there — so this would find nothing anyway; asking explicitly is what
+    // keeps the two halves of that decision from drifting apart.
+    if (!backend_tls)
     {
         std::string_view host;
         uint16_t port = 0;
@@ -3454,6 +3840,19 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             return false;
         }
 
+        // The session goes on after the read is armed and before the caller
+        // forwards anything: the request it is about to queue waits in the
+        // write queue until the handshake this starts has finished.  Failing
+        // here is our own shortage, not the backend's answer — nothing has
+        // reached it yet — so the breaker is not charged.
+        if (SOCKETLEY_UNLIKELY(backend_tls && !start_backend_tls(conn, ptr)))
+        {
+            conn->backend_fd = -1;
+            close_pair_close_backend(bfd, ptr, conn);
+            ours();
+            return false;
+        }
+
         return true;  // connect_pending stays false — caller forwards saved_request
     }
 
@@ -3534,6 +3933,20 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
 void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn)
 {
+    // Never on a connection with a TLS session on either leg.  A splice moves
+    // bytes from one descriptor to the other inside the kernel, and OpenSSL
+    // never sees them: what left an encrypted client would arrive at the
+    // backend as ciphertext nothing decrypted, and — the direction that
+    // matters — what this proxy was asked to encrypt would be handed to the
+    // wire exactly as it arrived, in the clear, on a port an operator was told
+    // was encrypted.
+    //
+    // The guard is here rather than at the three call sites because leaving
+    // splice_active false is all it takes: the pair then runs on the ordinary
+    // read/write path, which is where the record layer lives.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr || bconn->ssl != nullptr))
+        return;
+
     // Create pipe for client -> backend direction
     if (pipe2(conn->pipe_to_backend, O_NONBLOCK) < 0)
         return;
@@ -3851,6 +4264,25 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // Only pool HTTP connections — TCP connections are long-lived streams
     if (protocol != protocol_http)
         return false;
+    // Never a TLS backend connection.  This is the deliberate, conservative
+    // answer to the one place the two mechanisms meet.
+    //
+    // A pooled socket is handed to whoever asks for the same endpoint next,
+    // and the key that decides that is a host and a port.  A TLS connection
+    // carries more than an endpoint: a negotiated session, a peer identity
+    // that was verified against a name, a client certificate that may have
+    // been presented, and a record layer sitting at a sequence number that
+    // belongs to this exchange.  None of that is expressible in the key, so a
+    // key that matched would still be a guess about identity — and the cost of
+    // guessing wrong is one client receiving another's session.
+    //
+    // Refusing costs a handshake per request on the TLS leg, which is real:
+    // an unused socket is thrown away and dialled again.  It is the cheaper
+    // side of the trade by a wide margin, and the expensive side is not
+    // detectable from outside.  If this is ever revisited, the key has to
+    // carry the negotiated identity, not merely the address.
+    if (bconn->ssl != nullptr)
+        return false;
     if (bconn->closing || bconn->splice_active)
         return false;
     if (!bconn->write_queue.empty() || bconn->write_batch_count > 0)
@@ -4018,6 +4450,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                          bconn->zc_notif_pending ||
                          bconn->splice_in_pending || bconn->splice_out_pending ||
                          !bconn->write_queue.empty() ||
+                         // The record layer's own bytes: the alert that says
+                         // why a handshake failed is the only diagnosis the
+                         // other end will ever get, and it is queued nowhere.
+                         tls_owes_output(bconn) ||
                          // The other direction of the same rule as below: the
                          // client's outbound splice writes into *this*
                          // descriptor, so closing it while that operation is
@@ -4033,7 +4469,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                 // open and push them out; the write completion tears down once the
                 // queue has actually drained.
                 bconn->closing = true;
-                if (!bconn->write_pending && !bconn->write_queue.empty() &&
+                if (!bconn->write_pending &&
+                    (!bconn->write_queue.empty() || tls_owes_output(bconn)) &&
                     !flush_backend_write_queue(bconn))
                     defer = false;
                 else
@@ -4078,11 +4515,12 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                     bool defer2 = bconn2->read_pending || bconn2->write_pending ||
                                   bconn2->zc_notif_pending ||
                                   bconn2->splice_in_pending || bconn2->splice_out_pending ||
-                                  !bconn2->write_queue.empty();
+                                  !bconn2->write_queue.empty() || tls_owes_output(bconn2);
                     if (defer2)
                     {
                         bconn2->closing = true;
-                        if (!bconn2->write_pending && !bconn2->write_queue.empty() &&
+                        if (!bconn2->write_pending &&
+                            (!bconn2->write_queue.empty() || tls_owes_output(bconn2)) &&
                             !flush_backend_write_queue(bconn2))
                             defer2 = false;
                         else
@@ -4133,11 +4571,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
             bool defer_c = conn->read_pending || conn->write_pending ||
                            conn->zc_notif_pending ||
                            conn->splice_in_pending || conn->splice_out_pending ||
-                           !conn->write_queue.empty() || peer_splicing_into_client;
+                           !conn->write_queue.empty() || tls_owes_output(conn) ||
+                           peer_splicing_into_client;
             if (defer_c)
             {
                 conn->closing = true;
-                if (!conn->write_pending && !conn->write_queue.empty() &&
+                if (!conn->write_pending &&
+                    (!conn->write_queue.empty() || tls_owes_output(conn)) &&
                     !flush_client_write_queue(conn))
                     defer_c = false;
                 else
@@ -4972,6 +5412,25 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, bfd, ptr, m_recv_multishot,
                                                    m_use_provided_bufs, BUF_GROUP_ID)))
     {
+        close_pair(conn->fd, bfd);
+        return;
+    }
+
+    // The handshake starts here, before the saved request is forwarded: what
+    // forward_to_backend queues waits in the write queue until the session is
+    // ready, and goes out as records when it is.  A session that cannot be
+    // created costs the pair — the alternative is sending the request in the
+    // clear to a backend the operator asked to reach over TLS.
+    if (SOCKETLEY_UNLIKELY(conn_backend_tls(conn) && !start_backend_tls(conn, ptr)))
+    {
+        if (m_protocol == protocol_http && !conn->closing && !conn->response_started)
+        {
+            conn->backend_fd = -1;
+            ptr->client_fd = -1;
+            send_error(conn, "502 Bad Gateway", "Bad Gateway\n");
+            close_pair(-1, bfd);
+            return;
+        }
         close_pair(conn->fd, bfd);
         return;
     }
@@ -5914,6 +6373,204 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     shutdown(conn->fd, SHUT_RD);
 }
 
+// ─── TLS record layer ───────────────────────────────────────────────────────
+//
+// Ciphertext in, plaintext into conn->partial.  One call per read completion,
+// which is what makes the handshake asynchronous: OpenSSL is handed the bytes
+// that have arrived and asked what it makes of them, and whatever it wants to
+// say back is drained by tls_flush at the same point.  Several rounds of that
+// is a handshake; there is no loop here waiting for one, and nothing blocks.
+template <typename Conn>
+void proxy_instance::tls_feed(Conn* conn, const char* data, size_t len)
+{
+    // Inbound ciphertext into the read BIO.  A refusal is fatal by contract —
+    // the peer is over the per-connection buffer cap, or the BIO failed — and
+    // it has to be: there is nowhere to hold what was not taken, and handing a
+    // record layer a stream with a hole in it is worse than closing.
+    size_t off = 0;
+    while (off < len)
+    {
+        const int n = tls_context::bio_write_in(conn->ssl, data + off,
+                                                static_cast<int>(len - off));
+        if (SOCKETLEY_UNLIKELY(n <= 0))
+        {
+            conn->closing = true;
+            return;
+        }
+        off += static_cast<size_t>(n);
+    }
+
+    if (conn->tls_state == tls_conn_handshake)
+    {
+        const int r = tls_context::do_handshake(conn->ssl);
+        if (SOCKETLEY_UNLIKELY(r < 0))
+        {
+            // Closing, but not silently: what OpenSSL produced on its way to
+            // failing is the alert that tells the peer why, and it is the only
+            // diagnosis the other end will ever get.  The tls_flush that
+            // follows this call puts it on the wire, and the connection is
+            // torn down when that write completes.
+            //
+            // On the backend leg this is also where a certificate is rejected
+            // — an unknown CA, an expired chain, a name that does not match
+            // the endpoint we meant to reach.  do_handshake has already logged
+            // which; the request it belonged to is answered 502 by the read
+            // path, never forwarded in the clear.
+            conn->closing = true;
+            return;
+        }
+        if (r == 0)
+            return;   // another round; its records go out with the flush below
+
+        conn->tls_state = tls_conn_ready;
+        // Deliberately falling through rather than returning: the same read can
+        // already carry application data behind the handshake's last flight —
+        // under TLS 1.3 a peer's Finished and its first message routinely
+        // arrive in one packet, and returning here would leave that message
+        // sitting in the BIO until something else was sent.
+    }
+
+    char plain[16384];
+    for (;;)
+    {
+        const int n = tls_context::ssl_read(conn->ssl, plain, sizeof(plain));
+        if (SOCKETLEY_LIKELY(n > 0))
+        {
+            conn->partial.append(plain, static_cast<size_t>(n));
+            // The same ceiling the cleartext path applies, checked inside the
+            // loop rather than after it: one read completion can decrypt
+            // everything the inbound BIO had buffered, so "one read cannot
+            // produce more than one buffer's worth" is not true here.
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > Conn::MAX_PARTIAL_SIZE))
+            {
+                conn->closing = true;
+                break;
+            }
+            continue;
+        }
+        if (n < 0)
+        {
+            // Either the peer's close_notify or a record we cannot use.  Both
+            // end the connection, and neither ends it here: the bytes decrypted
+            // above may be a request or a response that deserves to be
+            // delivered, so this is recorded and applied by the caller once
+            // they have been.
+            conn->tls_peer_closed = true;
+        }
+        break;
+    }
+}
+
+template <typename Conn>
+bool proxy_instance::tls_owes_output(const Conn* conn)
+{
+    return conn->ssl != nullptr && tls_context::has_pending_out(conn->ssl);
+}
+
+// Every byte this connection sends is a TLS record, including the ones nobody
+// queued: a handshake flight, an alert, a session ticket.  There is no other
+// way onto the wire for a connection that has a session.
+template <typename Conn>
+bool proxy_instance::tls_flush(Conn* conn)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || !conn->ssl))
+        return true;
+
+    // One write in flight at a time, exactly as the cleartext path does — the
+    // ciphertext buffer built below is what the kernel reads out of, and a
+    // second submission would need a second buffer and would interleave two
+    // record streams on one socket.  Whatever does not go now stays in the
+    // queue or in the write BIO; the write completion comes back here.
+    if (conn->write_pending || conn->zc_notif_pending)
+        return true;
+
+    // Application data only once the handshake is done.  A request queued
+    // while the backend handshake is still in flight waits here rather than
+    // being handed to an SSL that would answer WANT_READ and leave the caller
+    // unsure what was consumed.
+    if (conn->tls_state == tls_conn_ready)
+    {
+        while (!conn->write_queue.empty())
+        {
+            const std::string& msg = conn->write_queue.front();
+            const int n = tls_context::ssl_write(conn->ssl, msg.data(),
+                                                 static_cast<int>(msg.size()));
+            if (n <= 0)
+            {
+                // 0 is backpressure: the write BIO is at its cap, and OpenSSL's
+                // contract is that the same buffer is offered again once it has
+                // drained — which is what leaving this message at the front of
+                // the queue arranges.  -1 is fatal for the session.
+                if (n < 0)
+                    conn->closing = true;
+                break;
+            }
+            // Partial writes are not enabled on this context, so SSL_write is
+            // all-or-nothing.  A short count would mean the record layer and
+            // this queue disagree about what has been sent, and a stream with a
+            // hole in it has no framing left to recover: close instead.
+            if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg.size()))
+            {
+                conn->closing = true;
+                break;
+            }
+            conn->write_queue.pop();
+        }
+    }
+
+    if (!tls_context::has_pending_out(conn->ssl))
+        return true;
+
+    // Ciphertext out of the write BIO and into a buffer this connection owns.
+    // It has to be copied rather than pointed at: an SQE names an address the
+    // kernel reads at its leisure, and the BIO's storage moves under it as
+    // OpenSSL writes the next record.  Copying is also what keeps the SSL free
+    // of anything the ring can name, which is what makes the session safe to
+    // release the moment the connection is torn down.
+    //
+    // The buffer then rides in write_batch[0] like any other message, so the
+    // short-write retry and the batch release in the write handlers need no
+    // TLS-specific case at all.
+    std::string cipher;
+    char buf[16384];
+    for (;;)
+    {
+        const int n = tls_context::bio_read_out(conn->ssl, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        cipher.append(buf, static_cast<size_t>(n));
+    }
+    if (SOCKETLEY_UNLIKELY(cipher.empty()))
+        return true;
+
+    // Nothing is in flight (checked above), so any batch entries still held are
+    // from a completed write and are this function's to drop.
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+
+    conn->write_batch[0] = std::move(cipher);
+    conn->write_iovs[0].iov_base = conn->write_batch[0].data();
+    conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
+    conn->write_batch_count = 1;
+    conn->write_pending = true;
+    conn->write_req.type = op_write;
+
+    const auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(conn->fd, conn->write_batch[0].data(),
+                                                 len, &conn->write_req)))
+    {
+        // Nothing reached the ring, so no completion will arrive.  Undo the
+        // in-flight bookkeeping and report it, as the cleartext path does: a
+        // write_pending that never clears keeps the teardown waiting for a
+        // completion that cannot come.
+        conn->write_pending = false;
+        conn->write_batch[0].clear();
+        conn->write_batch_count = 0;
+        return false;
+    }
+    return true;
+}
+
 // Returns false when nothing reached the ring.  A caller that leaves
 // write_pending set after that waits for a completion that cannot come:
 // the connection stops making progress and the peer is left holding a
@@ -5922,6 +6579,13 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
 // saying so is the difference between a closed connection and a hung one.
 bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
 {
+    // A TLS connection's bytes go through the record layer, which is the only
+    // thing allowed to put them on the wire.  This branch is what keeps every
+    // caller above — forwarded responses, error pages, Lua-rewritten bodies —
+    // from having to know which kind of connection it is holding.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+        return tls_flush(conn);
+
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
         return true;
 
@@ -5979,6 +6643,12 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
 // saying so is the difference between a closed connection and a hung one.
 bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
 {
+    // See flush_client_write_queue: on a TLS backend leg the record layer is
+    // the only thing that writes, and it is also what holds a request back
+    // until the handshake behind it has finished.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+        return tls_flush(conn);
+
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
         return true;
 
@@ -6148,7 +6818,11 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         conn->write_batch_count = 0;
     }
 
-    if (!conn->write_queue.empty() && !conn->zc_notif_pending)
+    // A TLS connection can owe the wire bytes with an empty queue — the rest
+    // of a handshake, an alert, a session ticket, or ciphertext that did not
+    // fit in the write that just completed.  Asking only about the queue is
+    // how a handshake stalls one round short of finishing.
+    if ((!conn->write_queue.empty() || tls_owes_output(conn)) && !conn->zc_notif_pending)
     {
         if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
         {
@@ -6305,7 +6979,9 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         conn->write_batch_count = 0;
     }
 
-    if (!conn->write_queue.empty() && !conn->zc_notif_pending)
+    // See handle_client_write: the record layer owes bytes the queue cannot
+    // account for.
+    if ((!conn->write_queue.empty() || tls_owes_output(conn)) && !conn->zc_notif_pending)
     {
         if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
         {

@@ -288,6 +288,19 @@ public:
     // endpoints.  See shared/request_channel.h.
     virtual request_sink* as_request_sink() { return nullptr; }
 
+    // The mesh client-certificate paths, for the one role that has them.
+    //
+    // The TLS gate in start() has to see the *whole* configuration — half a
+    // client-certificate pair is refused, and a client CA without --tls is
+    // refused — and it runs here, in shared code that must not know what a
+    // proxy is.  A virtual keeps the knowledge on the side that has it; the
+    // views point into the instance and are valid for as long as it is.
+    virtual void get_mesh_tls_paths(std::string_view& ca, std::string_view& cert,
+                                    std::string_view& key) const
+    {
+        ca = {}; cert = {}; key = {};
+    }
+
     // Lua integration
     bool load_lua_script(std::string_view path);
     lua_context* lua() const { return m_lua.get(); }

@@ -20,15 +20,9 @@
 
 class runtime_manager;
 
-// Where a TLS connection is in its handshake.  A plaintext connection is
-// tls_conn_none and has no SSL at all; there is deliberately no way back from
-// tls_conn_handshake to tls_conn_none, because "give up and carry on in
-// cleartext" is the one outcome a TLS listener must never produce.
-enum tls_conn_state : uint8_t {
-    tls_conn_none      = 0,  // plaintext connection, ssl == nullptr
-    tls_conn_handshake = 1,  // records crossing, no application data yet
-    tls_conn_ready     = 2   // handshake complete, application data flowing
-};
+// tls_conn_state lives in shared/tls_context.h, included above: the proxy runs
+// the same state machine on both of its legs, and a second spelling of it
+// would be a second thing to keep in step.
 
 enum proto_state : uint8_t {
     proto_unknown     = 0,

@@ -25,10 +25,25 @@ public:
     proxy& clear_backends()                { prx()->clear_backends(); return *this; }
     proxy& strategy(proxy_strategy s)      { prx()->set_strategy(s); return *this; }
     proxy& protocol(proxy_protocol p)      { prx()->set_protocol(p); return *this; }
+    // Terminate TLS on this proxy's own listening port.
     proxy& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
     }
-    proxy& tls_ca(std::string_view ca)     { raw()->set_tls(true); raw()->set_ca_path(ca); return *this; }
+    // The trust store for the *backend* leg, and — because none of the
+    // backend-TLS options means anything against a cleartext peer — what turns
+    // that leg to TLS for every backend.  It does not switch on the listener:
+    // a proxy has two legs, and the one this configures is not the one tls()
+    // above configures.  (It used to call set_tls(true) as well, from when
+    // neither leg had a handshake behind it and the distinction was moot.)
+    proxy& backend_ca(std::string_view ca) { raw()->set_ca_path(ca); return *this; }
+    // The certificate a client presents to this proxy has to be signed by this
+    // CA — mutual TLS on the listener, so it needs tls() as well.
+    proxy& client_ca(std::string_view ca)  { prx()->set_mesh_client_ca(ca); return *this; }
+    // The certificate this proxy presents to a backend that asks for one.
+    // Both or neither: half a pair is refused at start.
+    proxy& client_cert(std::string_view cert, std::string_view key) {
+        auto* i = prx(); i->set_mesh_client_cert(cert); i->set_mesh_client_key(key); return *this;
+    }
     proxy& max_connections(uint32_t n)     { raw()->set_max_connections(n); return *this; }
     proxy& rate_limit(double r)            { raw()->set_rate_limit(r); return *this; }
     proxy& global_rate_limit(double r)     { raw()->set_global_rate_limit(r); return *this; }

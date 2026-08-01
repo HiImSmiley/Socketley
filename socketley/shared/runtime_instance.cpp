@@ -142,12 +142,16 @@ bool runtime_instance::start(event_loop& loop)
     // to encrypt — and which inspect still reports as encrypted — is worse than
     // refusing to come up.
     //
-    // A server runtime is the one role that terminates TLS, so a complete
-    // server configuration passes here and is honoured by server_instance's
-    // setup().  Everything else is still refused; see tls_context.h.
-    if (const std::string msg = tls_config_refusal(get_type() == runtime_server,
+    // A server runtime's listener and a proxy's two legs are the roles that
+    // perform a handshake, so a complete configuration for either passes here
+    // and is honoured by that runtime's setup().  Everything else is still
+    // refused; see tls_context.h.
+    std::string_view mesh_ca, mesh_cert, mesh_key;
+    get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
+    if (const std::string msg = tls_config_refusal(get_type(),
                                                    get_tls(), get_cert_path(),
-                                                   get_key_path(), get_ca_path());
+                                                   get_key_path(), get_ca_path(),
+                                                   mesh_ca, mesh_cert, mesh_key);
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());

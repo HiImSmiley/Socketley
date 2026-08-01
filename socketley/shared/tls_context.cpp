@@ -19,19 +19,20 @@
 // ─── TLS configuration gate ───
 // See the header for what this build honours and what it still refuses.  It
 // deliberately lives next to the OpenSSL wrapper: whoever wires up the next
-// role — the proxy's backend leg, a client runtime's outbound socket — will be
+// role — a client runtime's outbound socket, a cache listener — will be
 // reading this file, and narrowing the gate is part of that work.
 
 std::string tls_not_implemented_error(std::string_view option)
 {
     std::string msg(option);
     msg += ": TLS transport is not implemented for this runtime -- only a "
-           "server runtime's own listener performs a handshake, so this would "
-           "run in cleartext on an endpoint reported as encrypted\n";
+           "server runtime's own listener and a proxy runtime (both legs) "
+           "perform a handshake, so this would run in cleartext on an endpoint "
+           "reported as encrypted\n";
     return msg;
 }
 
-std::string tls_config_refusal(bool is_server_listener,
+std::string tls_config_refusal(runtime_type type,
                                bool tls,
                                std::string_view cert_path,
                                std::string_view key_path,
@@ -40,36 +41,57 @@ std::string tls_config_refusal(bool is_server_listener,
                                std::string_view mesh_client_cert,
                                std::string_view mesh_client_key)
 {
-    // Mesh mTLS configures the proxy's *backend* connections.  Nothing dials
-    // one over TLS whatever runtime is holding the option, so these are
-    // refused before the per-role question is even asked.
-    if (!mesh_client_ca.empty())    return tls_not_implemented_error("--client-ca");
-    if (!mesh_client_cert.empty())  return tls_not_implemented_error("--client-cert");
-    if (!mesh_client_key.empty())   return tls_not_implemented_error("--client-key");
-
-    if (!tls && cert_path.empty() && key_path.empty() && ca_path.empty())
+    const bool anything_asked = tls || !cert_path.empty() || !key_path.empty() ||
+                                !ca_path.empty() || !mesh_client_ca.empty() ||
+                                !mesh_client_cert.empty() || !mesh_client_key.empty();
+    if (!anything_asked)
         return {};   // no TLS asked for, nothing to refuse
 
-    if (!is_server_listener)
+    if (!tls_role_has_handshake(type))
     {
         // Order matters only for the message: name the flag the operator most
         // likely typed.
-        if (tls)                 return tls_not_implemented_error("--tls");
-        if (!cert_path.empty())  return tls_not_implemented_error("--cert");
-        if (!key_path.empty())   return tls_not_implemented_error("--key");
-        return tls_not_implemented_error("--ca");
+        if (tls)                        return tls_not_implemented_error("--tls");
+        if (!cert_path.empty())         return tls_not_implemented_error("--cert");
+        if (!key_path.empty())          return tls_not_implemented_error("--key");
+        if (!ca_path.empty())           return tls_not_implemented_error("--ca");
+        if (!mesh_client_ca.empty())    return tls_not_implemented_error("--client-ca");
+        if (!mesh_client_cert.empty())  return tls_not_implemented_error("--client-cert");
+        return tls_not_implemented_error("--client-key");
     }
 
 #if !SOCKETLEY_HAS_TLS
     return "--tls: this binary was built without the OpenSSL development "
-           "headers, so it has no record layer to serve a TLS listener with\n";
+           "headers, so it has no record layer to speak TLS with\n";
 #else
+    // The mesh client-certificate options describe a *backend* leg, and a
+    // server runtime has none: it would store them, report them and dial
+    // nothing.  (The flag handlers do not offer them on a server at all; this
+    // catches a state file or an imported document that carries them.)
+    if (type == runtime_server &&
+        (!mesh_client_ca.empty() || !mesh_client_cert.empty() || !mesh_client_key.empty()))
+    {
+        std::string msg(!mesh_client_ca.empty()   ? "--client-ca"
+                      : !mesh_client_cert.empty() ? "--client-cert"
+                                                  : "--client-key");
+        msg += ": configures a proxy's backend leg, and a server runtime has "
+               "none -- it would be stored and reported and dial nothing\n";
+        return msg;
+    }
+
+    // ── the listener half, identical for both roles ──
+    //
     // A listener that terminates TLS needs something to terminate it with.
     // Half a configuration is refused rather than half-honoured, in both
     // directions: --tls without a key pair could only ever fall back to
     // cleartext, and a certificate without --tls is an operator who believes
     // the port is encrypted and has not turned it on.
-    if (!tls)
+    //
+    // --ca is the exception on a proxy, and only there: it is that role's
+    // trust store for the *backend* leg (see below), not a listener option.
+    const bool ca_is_listener_option = (type != runtime_proxy);
+    if (!tls && (!cert_path.empty() || !key_path.empty() ||
+                 (ca_is_listener_option && !ca_path.empty())))
     {
         std::string msg(!cert_path.empty() ? "--cert"
                       : !key_path.empty()  ? "--key"
@@ -78,10 +100,35 @@ std::string tls_config_refusal(bool is_server_listener,
                "certificate for a listener that would still accept cleartext\n";
         return msg;
     }
-    if (cert_path.empty())
+    if (tls && cert_path.empty())
         return "--tls: a TLS listener needs --cert <file> and --key <file>\n";
-    if (key_path.empty())
+    if (tls && key_path.empty())
         return "--tls: a TLS listener needs --key <file> to go with --cert\n";
+
+    if (type != runtime_proxy)
+        return {};
+
+    // ── the proxy's own options ──
+    //
+    // --client-ca verifies certificates presented *by clients*, which only a
+    // listener that speaks TLS can ask any client for.  On a cleartext port it
+    // would authenticate nobody while inspect reported mutual TLS.
+    if (!mesh_client_ca.empty() && !tls)
+        return "--client-ca: verifies the certificates clients present, which "
+               "needs --tls --cert --key on this proxy's own listener -- on a "
+               "cleartext port it would authenticate nobody\n";
+
+    // A client certificate is a pair.  Half of one loads nothing, so the
+    // backend leg would connect without presenting anything at all and a
+    // backend requiring mutual TLS would refuse it — after the flags said it
+    // was configured.
+    if (mesh_client_cert.empty() != mesh_client_key.empty())
+        return mesh_client_cert.empty()
+            ? std::string("--client-key: needs --client-cert <file> as well -- a "
+                          "key with no certificate presents nothing\n")
+            : std::string("--client-cert: needs --client-key <file> as well -- a "
+                          "certificate with no key presents nothing\n");
+
     return {};
 #endif
 }

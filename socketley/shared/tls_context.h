@@ -1,23 +1,46 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <cstdint>
+
+#include "runtime_definitions.h"
 
 // Forward declare OpenSSL types to avoid pulling in headers everywhere
 typedef struct ssl_ctx_st SSL_CTX;
 typedef struct ssl_st SSL;
 
+// Where a TLS connection is in its handshake.  A plaintext connection is
+// tls_conn_none and has no SSL at all; there is deliberately no way back from
+// tls_conn_handshake to tls_conn_none, because "give up and carry on in
+// cleartext" is the one outcome a TLS transport must never produce.
+//
+// Lives here rather than beside one runtime's connection struct: the server's
+// listener and the proxy's two legs run the same state machine over the same
+// memory BIO pair, and a second spelling of it would be a second thing to keep
+// in step.
+enum tls_conn_state : uint8_t {
+    tls_conn_none      = 0,  // plaintext connection, ssl == nullptr
+    tls_conn_handshake = 1,  // records crossing, no application data yet
+    tls_conn_ready     = 2   // handshake complete, application data flowing
+};
+
 // ─── What this build can honour ───
 //
-// One role has a handshake behind it: a **server runtime's own listener**.  It
-// terminates TLS here — accept, handshake and record layer all driven by
-// io_uring completions through the memory BIO pair below, see
-// server_instance's tls_feed/tls_flush.
+// Two roles have a handshake behind them:
 //
-// Nothing else does.  A client runtime's outbound socket, a proxy's backend
-// leg and mesh mTLS still connect in cleartext, and a runtime "configured with
-// TLS" on one of those paths would listen or dial in the clear while inspect
-// reported it as encrypted.  That is the dangerous shape: an operator who asks
-// for encryption and is told they have it has no way to notice they do not.
+//   * a **server runtime's own listener** — accept, handshake and record layer
+//     driven by io_uring completions through the memory BIO pair below; see
+//     server_instance's tls_feed/tls_flush.
+//   * a **proxy runtime**, on either leg.  Its listening port terminates TLS
+//     exactly as a server's does, and its backend leg dials one — verifying
+//     the chain and the endpoint's name, and presenting a client certificate
+//     when the mesh options ask for it.
+//
+// A client runtime's outbound socket and a cache's listener still connect in
+// cleartext, and a runtime "configured with TLS" on one of those paths would
+// listen or dial in the clear while inspect reported it as encrypted.  That is
+// the dangerous shape: an operator who asks for encryption and is told they
+// have it has no way to notice they do not.
 //
 // So those flags fail closed, and stay refused until some runtime actually
 // drives the handshake for them.  A flag that errors out is a bad afternoon; a
@@ -27,10 +50,12 @@ typedef struct ssl_st SSL;
 // about to take effect asks — flag parsing, `edit`, `import`, and the last
 // gate before a runtime is started.  It returns the refusal text,
 // newline-terminated, or an empty string when the configuration is one this
-// build can honour.  A half-written server configuration (--tls with no
-// certificate, a certificate with no --tls) is refused too: a listener that
-// came up out of one could only serve cleartext.
-std::string tls_config_refusal(bool is_server_listener,
+// build can honour.  A half-written configuration is refused too, on both
+// roles that have one: --tls with no certificate, a certificate with no --tls,
+// half a client-certificate pair, or a client CA for a listener that is not
+// encrypted.  Each of those describes something that could only run in
+// cleartext or verify nothing.
+std::string tls_config_refusal(runtime_type type,
                                bool tls,
                                std::string_view cert_path,
                                std::string_view key_path,
@@ -43,6 +68,14 @@ std::string tls_config_refusal(bool is_server_listener,
 // (create/edit) and in the IPC response buffer (start/import) so the wording a
 // user sees is the same wherever they hit the wall.
 std::string tls_not_implemented_error(std::string_view option);
+
+// Whether a runtime of this type performs a handshake at all.  The single
+// place that knows, so that a flag handler asking "may I store this?" and the
+// start gate asking "may this come up?" cannot drift apart.
+inline bool tls_role_has_handshake(runtime_type type)
+{
+    return type == runtime_server || type == runtime_proxy;
+}
 
 // TLS context wrapper for server/client runtimes
 // Uses OpenSSL BIO memory pairs for non-blocking integration with io_uring

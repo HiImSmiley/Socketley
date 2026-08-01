@@ -29,8 +29,9 @@
 #   5. fail closed: a certificate that cannot be loaded, a key that does not
 #      match it, and every incomplete flag combination refuse rather than
 #      falling back to a cleartext listener
-#   6. the roles that still have no handshake behind them — client, proxy,
-#      cache — go on refusing the flags
+#   6. the roles that still have no handshake behind them — client and cache —
+#      go on refusing the flags, and the proxy, which now has one on both legs,
+#      takes the same complete set and refuses the same incomplete ones
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -504,7 +505,7 @@ assert_eq "$(rc_of "$BIN" create server tls_certonly -p "$BAD_PORT" \
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. The roles that still have no handshake
 # ─────────────────────────────────────────────────────────────────────────────
-for kind in client proxy cache; do
+for kind in client cache; do
     # tlsprobe_ and not tls_: tls_cache is the live cache this file linked the
     # server to, and asking `ls` about it would answer for that one instead.
     assert_eq "$(rc_of "$BIN" create "$kind" "tlsprobe_$kind" -p "$BAD_PORT" \
@@ -512,6 +513,53 @@ for kind in client proxy cache; do
         "--tls on a $kind runtime is still refused"
     assert_eq "$(state_of "tlsprobe_$kind")" "" "--tls on a $kind runtime creates no runtime"
 done
+
+# The proxy is no longer one of them: it terminates TLS on its own listener and
+# dials one to its backends, so the complete set is accepted here exactly as it
+# is on a server.  Asserted in this file rather than only in the proxy's own,
+# because this is the file that enumerates who may hold these flags — and a
+# stale entry here is how the gate ends up refusing a role that has since grown
+# a handshake.  See test_proxy_tls_backend.sh for the transport itself.
+assert_eq "$(rc_of "$BIN" create proxy tlsprobe_proxy -p "$BAD_PORT" \
+    --backend 127.0.0.1:1 --tls --cert "$CERTS/server.pem" \
+    --key "$CERTS/server-key.pem")" "0" \
+    "--tls --cert --key on a proxy runtime is accepted"
+assert_eq "$(state_of tlsprobe_proxy)" "created" "--tls on a proxy runtime creates the runtime"
+rc_of "$BIN" remove tlsprobe_proxy >/dev/null
+
+# ...and the incomplete sets are refused there for the same reason they are on a
+# server: each describes a listener that could only serve cleartext.
+assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxbare -p "$BAD_PORT" \
+    --backend 127.0.0.1:1 --tls)" "1" \
+    "--tls with no certificate is refused on a proxy"
+assert_eq "$(state_of tlsprobe_pxbare)" "" "--tls with no certificate creates no proxy"
+
+assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxcert -p "$BAD_PORT" \
+    --backend 127.0.0.1:1 --cert "$CERTS/server.pem" \
+    --key "$CERTS/server-key.pem")" "1" \
+    "a certificate without --tls is refused on a proxy"
+assert_eq "$(state_of tlsprobe_pxcert)" "" "a certificate without --tls creates no proxy"
+
+# --client-ca verifies the certificates *clients* present, which only a TLS
+# listener can ask for.  On a cleartext port it would authenticate nobody while
+# inspect reported mutual TLS, which is the shape this whole gate exists for.
+assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxmca -p "$BAD_PORT" \
+    --backend 127.0.0.1:1 --client-ca "$CERTS/ca.pem")" "1" \
+    "--client-ca without --tls is refused on a proxy"
+assert_eq "$(state_of tlsprobe_pxmca)" "" "--client-ca without --tls creates no proxy"
+
+# Half a client-certificate pair loads nothing: the backend leg would present
+# no certificate at all after the flag said it would.
+assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxhalf -p "$BAD_PORT" \
+    --backend 127.0.0.1:1 --client-cert "$CERTS/server.pem")" "1" \
+    "--client-cert without --client-key is refused on a proxy"
+assert_eq "$(state_of tlsprobe_pxhalf)" "" "--client-cert alone creates no proxy"
+
+# A server has no backend leg, so the options that configure one are refused
+# there even though it is a role that does handshake.
+assert_eq "$(rc_of "$BIN" create server tlsprobe_srvmesh -p "$BAD_PORT" \
+    --client-cert "$CERTS/server.pem" --client-key "$CERTS/server-key.pem")" "1" \
+    "--client-cert on a server runtime is refused"
 
 rc_of "$BIN" stop tls_srv tls_mtls tls_cache >/dev/null
 sleep 0.3

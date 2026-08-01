@@ -183,11 +183,11 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         }
 
         // ── TLS ──
-        // Stored for a server runtime, which terminates TLS on its own
-        // listener, and refused for every other runtime type, which does not
-        // and would answer cleartext on an endpoint `inspect` reports as
-        // encrypted.  Failing at the point the flag is typed is the only place
-        // the operator is still looking.
+        // Stored for the roles that perform a handshake — a server runtime's
+        // own listener and a proxy's two legs — and refused for every other
+        // runtime type, which would answer cleartext on an endpoint `inspect`
+        // reports as encrypted.  Failing at the point the flag is typed is the
+        // only place the operator is still looking.
         //
         // Whether the *set* is complete — --tls with a key pair, a key pair
         // with --tls — cannot be decided here, because the flag that completes
@@ -195,7 +195,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         // parsing is done, and runtime_instance::start() asks it again for
         // configurations that never went through a command line at all.
         case fnv1a("--tls"):
-            if (instance->get_type() != runtime_server)
+            if (!tls_role_has_handshake(instance->get_type()))
             {
                 std::cout << tls_not_implemented_error("--tls");
                 return 1;
@@ -211,7 +211,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             const char* flag = which == fnv1a("--cert") ? "--cert"
                              : which == fnv1a("--key")  ? "--key"
                                                         : "--ca";
-            if (instance->get_type() != runtime_server)
+            if (!tls_role_has_handshake(instance->get_type()))
             {
                 std::cout << tls_not_implemented_error(flag);
                 return 1;
@@ -638,17 +638,36 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         case fnv1a("--out-of-process"):
             proxy->mark_out_of_process();
             return 0;
-        // mTLS is TLS: with no handshake anywhere in the proxy these only ever
-        // decorated `inspect` output.  Refused for the same reason as --tls.
+        // ── mTLS, both directions ──
+        //
+        // --client-ca is the listener's: the CA a certificate presented *by a
+        // client* has to be signed by, so it goes with --tls --cert --key.
+        // --client-cert/--client-key are the backend leg's: the certificate
+        // this proxy presents to a backend that asks for one.
+        //
+        // Which of those is complete, and whether the listener they describe
+        // is encrypted at all, is decided once parsing is done — the flag that
+        // completes a pair may be further along the command line.  See
+        // tls_config_refusal.
         case fnv1a("--client-ca"):
-            std::cout << tls_not_implemented_error("--client-ca");
-            return 1;
         case fnv1a("--client-cert"):
-            std::cout << tls_not_implemented_error("--client-cert");
-            return 1;
         case fnv1a("--client-key"):
-            std::cout << tls_not_implemented_error("--client-key");
-            return 1;
+        {
+            const uint32_t which = pa.hashes[i];
+            const char* flag = which == fnv1a("--client-ca")   ? "--client-ca"
+                             : which == fnv1a("--client-cert") ? "--client-cert"
+                                                               : "--client-key";
+            if (i + 1 >= pa.count)
+            {
+                std::cout << flag << " requires a file\n";
+                return 1;
+            }
+            const std::string_view path = pa.args[++i];
+            if (which == fnv1a("--client-ca"))        proxy->set_mesh_client_ca(path);
+            else if (which == fnv1a("--client-cert")) proxy->set_mesh_client_cert(path);
+            else                                      proxy->set_mesh_client_key(path);
+            return 0;
+        }
         case fnv1a("--sidecar"):
             // Sidecar mode: shorthand for health-check tcp + circuit + retry + drain
             proxy->set_health_check(mesh_config::health_tcp);
@@ -901,8 +920,8 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 
         // Same rule as the create path — and this is the path that matters
         // most, because `edit` is where an operator goes to put TLS on
-        // something that is already serving traffic.  A server runtime takes
-        // them; every other type is refused with the reason rather than
+        // something that is already serving traffic.  A server or a proxy
+        // takes them; every other type is refused with the reason rather than
         // falling through to the generic "unknown flag", which gave that
         // operator the same exit status and a wrong explanation: it reads as a
         // typo, so the answer to it is to try again with different spelling,
@@ -912,7 +931,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         // the resulting set is made there, on whatever the runtime is carrying
         // by then, and not on this one flag.
         case fnv1a("--tls"):
-            if (instance->get_type() != runtime_server)
+            if (!tls_role_has_handshake(instance->get_type()))
             {
                 std::cout << tls_not_implemented_error("--tls");
                 return 1;
@@ -928,7 +947,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             const char* flag = which == fnv1a("--cert") ? "--cert"
                              : which == fnv1a("--key")  ? "--key"
                                                         : "--ca";
-            if (instance->get_type() != runtime_server)
+            if (!tls_role_has_handshake(instance->get_type()))
             {
                 std::cout << tls_not_implemented_error(flag);
                 return 1;
@@ -1284,20 +1303,34 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         case fnv1a("--out-of-process"):
             std::cout << "--out-of-process can only be set when the proxy is created\n";
             return 1;
-        // The mesh client-certificate flags, refused here as they are on the
+        // The mesh client-certificate flags, taken here as they are on the
         // create path.  They live with the proxy rather than in the common
         // edit handler because that is where they exist at all: a server or
         // client runtime has no mesh_config, so "unknown flag" is the true
-        // answer there and this message would only be a different lie.
+        // answer there.
+        //
+        // Like every other TLS option the change takes effect at the next
+        // start — certificates are read in setup(), so a running proxy keeps
+        // the identity it handshook with until it is restarted.
         case fnv1a("--client-ca"):
-            std::cout << tls_not_implemented_error("--client-ca");
-            return 1;
         case fnv1a("--client-cert"):
-            std::cout << tls_not_implemented_error("--client-cert");
-            return 1;
         case fnv1a("--client-key"):
-            std::cout << tls_not_implemented_error("--client-key");
-            return 1;
+        {
+            const uint32_t which = pa.hashes[i];
+            const char* flag = which == fnv1a("--client-ca")   ? "--client-ca"
+                             : which == fnv1a("--client-cert") ? "--client-cert"
+                                                               : "--client-key";
+            if (i + 1 >= pa.count)
+            {
+                std::cout << flag << " requires a file\n";
+                return 1;
+            }
+            const std::string_view path = pa.args[++i];
+            if (which == fnv1a("--client-ca"))        proxy->set_mesh_client_ca(path);
+            else if (which == fnv1a("--client-cert")) proxy->set_mesh_client_cert(path);
+            else                                      proxy->set_mesh_client_key(path);
+            return 0;
+        }
         default:
             return -1;
     }

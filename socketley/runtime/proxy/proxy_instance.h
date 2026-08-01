@@ -14,6 +14,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
+#include "../../shared/tls_context.h"
 #include "../../shared/trace.h"
 #include "http_response_framing.h"
 
@@ -44,6 +45,13 @@ struct backend_info
     uint16_t resolved_port = 0;
     bool is_group = false;
     bool has_cached_addr = false;
+    // Whether this backend is reached over TLS.  Two things turn it on, and
+    // both are explicit: an `https://` address turns it on for this backend
+    // alone, and the backend-TLS options (--ca, --client-cert/--client-key)
+    // turn it on for every backend at once — none of them means anything
+    // against a cleartext peer, so honouring them without encrypting would be
+    // the fail-open half of this flag.
+    bool tls = false;
     struct sockaddr_in cached_addr{};
 };
 
@@ -51,6 +59,11 @@ struct resolved_backend
 {
     std::string host;
     uint16_t port = 0;
+    // Deliberately no `tls` here.  A group's members have no address of their
+    // own to carry an https:// scheme, so the only thing that can encrypt the
+    // leg to one is the backend-TLS options — which apply to every backend at
+    // once.  proxy_instance::conn_backend_tls answers it from there rather
+    // than from a copy that would have to be kept in step.
 };
 
 // 64KB read buffer for high-throughput TCP forwarding.
@@ -92,6 +105,25 @@ struct alignas(64) proxy_client_connection
     uint32_t write_batch_count{0};
     io_request read_req;
     io_request write_req;
+
+    // === TLS session (listener leg) ===
+    // Non-null only on a proxy configured with --tls.  OpenSSL never sees this
+    // socket: the session is fed ciphertext a read completion delivered and
+    // drained of ciphertext a write submission carries, so nothing the kernel
+    // holds ever names it or its memory BIOs — every byte is copied into or
+    // out of a buffer this struct owns before any SQE is built.  That is what
+    // makes the session safe to free the moment the struct is released, unlike
+    // the write batch beside it.
+    //
+    // Plaintext goes into `partial`, where the HTTP path already looks for it;
+    // TCP mode takes it from there and forwards it.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    // The peer's close_notify, remembered rather than acted on.  The read that
+    // carries it can carry the last request ahead of it, and marking the
+    // connection closing before that request is parsed answers it with a
+    // dropped connection.
+    bool tls_peer_closed{false};
 
     // === WARM fields ===
     io_request splice_in_req;
@@ -205,6 +237,15 @@ struct alignas(64) proxy_client_connection
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
 
+    // The session, for a struct that never reached its release path — one
+    // retired with completions outstanding when the runtime stopped, and freed
+    // with the instance instead.  Safe here for the same reason it is safe
+    // anywhere: no submission ever named it.
+    ~proxy_client_connection() { tls_context::free_ssl(ssl); }
+    proxy_client_connection() = default;
+    proxy_client_connection(const proxy_client_connection&) = delete;
+    proxy_client_connection& operator=(const proxy_client_connection&) = delete;
+
     void reset(int new_fd);
 };
 
@@ -237,9 +278,26 @@ struct alignas(64) proxy_backend_connection
     io_request read_req;
     io_request write_req;
 
+    // === TLS session (backend leg) ===
+    // Non-null only on a connection to a backend this proxy reaches over TLS.
+    // Same design as the client side above — OpenSSL is a codec and the ring
+    // moves every byte — with the roles reversed: this end is the client, so
+    // the session is created with the endpoint's name pinned to it and the
+    // chain is verified against the configured trust store before one byte of
+    // the request goes out.
+    //
+    // A connection carrying one of these is never pooled; see
+    // backend_pool_eligible.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    bool tls_peer_closed{false};
+
     // === WARM fields ===
     io_request splice_in_req;
     io_request splice_out_req;
+    // Where the record layer puts the plaintext it has decrypted, on the way
+    // to the client.  Unused on a cleartext backend connection, which forwards
+    // straight out of the read buffer.
     std::string partial;
     socketley::byte_counted_queue<std::string> write_queue;
     std::string write_batch[MAX_WRITE_BATCH];
@@ -279,6 +337,12 @@ struct alignas(64) proxy_backend_connection
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
+
+    // See proxy_client_connection's destructor.
+    ~proxy_backend_connection() { tls_context::free_ssl(ssl); }
+    proxy_backend_connection() = default;
+    proxy_backend_connection(const proxy_backend_connection&) = delete;
+    proxy_backend_connection& operator=(const proxy_backend_connection&) = delete;
 
     void reset(int new_fd);
 };
@@ -416,6 +480,11 @@ public:
     // arrives as data rather than as a pointer it may dereference — see
     // shared/endpoint_table.h for what that buys.
     void set_endpoints(std::shared_ptr<const endpoint_table> tbl) override;
+
+    // The proxy is the one role with a backend leg, so it is the one role that
+    // has these.  See runtime_instance for why the TLS gate asks this way.
+    void get_mesh_tls_paths(std::string_view& ca, std::string_view& cert,
+                            std::string_view& key) const override;
 
     proxy_protocol get_protocol() const;
     proxy_strategy get_strategy() const;
@@ -580,6 +649,38 @@ private:
     // definitions for why a caller must not ignore that.
     bool flush_client_write_queue(proxy_client_connection* conn);
     bool flush_backend_write_queue(proxy_backend_connection* conn);
+
+    // ── TLS record layer ────────────────────────────────────────────────────
+    //
+    // One implementation for both legs: a client connection this proxy
+    // terminates TLS for and a backend connection it dials over TLS run the
+    // same state machine, and the two structs carry the same four things it
+    // needs (a descriptor, a write request, a write queue of plaintext and a
+    // `partial` to decrypt into).  A second copy of it would be a second thing
+    // to keep in step with server_instance, which is where the design comes
+    // from.
+    //
+    // OpenSSL does no I/O in either.  tls_feed takes the ciphertext a read
+    // completion delivered and leaves plaintext in conn->partial; tls_flush
+    // takes queued plaintext and whatever the record layer owes on its own
+    // account — a handshake flight, an alert, a session ticket — and puts it
+    // on the wire as one ordinary write submission.
+    template <typename Conn> void tls_feed(Conn* conn, const char* data, size_t len);
+    // False means the submission did not reach the ring, exactly as the two
+    // flush functions above report it.
+    template <typename Conn> bool tls_flush(Conn* conn);
+    // A TLS connection can owe the wire bytes with an empty write queue.
+    // Asking only about the queue is how a handshake stalls one round short of
+    // finishing, and how an alert is dropped on the way to a teardown.
+    template <typename Conn> static bool tls_owes_output(const Conn* conn);
+
+    // Give a backend connection a TLS session and start its handshake.  False
+    // means no session could be created or the first flight did not reach the
+    // ring — the caller must give the socket up rather than carry on in
+    // cleartext, which is the whole point of the flag.
+    bool start_backend_tls(proxy_client_connection* cconn, proxy_backend_connection* bconn);
+    // Whether this connection's backend leg is encrypted.
+    bool conn_backend_tls(const proxy_client_connection* conn) const;
 
     // Socket tuning: set optimal buffer sizes and options
     void tune_socket(int fd);
@@ -760,6 +861,26 @@ private:
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
+
+    // ─── TLS ───────────────────────────────────────────────────────────────
+    //
+    // Both are built in setup() and dropped there on the next start, so
+    // `reload` — a stop followed by a start — is how a renewed certificate is
+    // installed.  A context that outlived the file would go on serving or
+    // trusting the expired one.  Sessions handed out by a previous context
+    // keep it alive through their own reference.
+    //
+    // Null means cleartext on that leg, and nothing but a refused start can
+    // make a configured leg null: a listener that came up unencrypted under
+    // --tls is the failure this whole path exists to prevent.
+    std::unique_ptr<tls_context> m_tls;          // this proxy's own listener
+    std::unique_ptr<tls_context> m_backend_tls;  // the leg to the backends
+
+    // The backend-TLS options were given, so every backend is reached over
+    // TLS — including a group's members, which have no address of their own to
+    // carry a scheme.  Kept apart from the per-backend flag because that is
+    // the question a group-routed connection has to ask.
+    bool m_backend_tls_all{false};
 
     // Service mesh
     mesh_config m_mesh{};
