@@ -1275,22 +1275,28 @@ def xop(name, a=0, b=0, c=0):
     return bytes([_PX[name], a & 0xFF, b & 0xFF, c & 0xFF])
 
 
-def px_head(shape=0, tcp=False, lua=False, group=0, hook=0):
+def px_head(shape=0, tcp=False, lua=False, group=0, hook=0,
+            tls_front=False, tls_back=False):
     """The first four bytes: configuration, and one harmless operation.
 
     Bits 0-4 of byte 0 are the configuration and are not free; bits 5-7 only
     move which operation `byte % len(ops)` lands on, so they are chosen to land
     on something that does nothing before the runtime is started.  DESTROY is
     the one to avoid — it would rebuild the instance from its own argument bytes
-    and throw the configuration away."""
+    and throw the configuration away.
+
+    The two TLS bits are in byte 1 for exactly that reason: byte 0 has no free
+    bits left, and byte 1 is the chosen operation's first argument, where a
+    couple of high bits change nothing."""
     base = (shape & 0x07) | (0x08 if tcp else 0) | (0x10 if lua else 0)
+    arg1 = (group & 0x07) | (0x08 if tls_front else 0) | (0x10 if tls_back else 0)
     for want in (_PX["PUMP"], _PX["STATS"], _PX["AGE"], _PX["START"]):
         for k in range(8):
             if (base + 32 * k) % _PX_N == want:
-                return bytes([base + 32 * k, group & 0xFF, hook & 0xFF, 0])
+                return bytes([base + 32 * k, arg1, hook & 0xFF, 0])
     for k in range(8):
         if (base + 32 * k) % _PX_N != _PX["DESTROY"]:
-            return bytes([base + 32 * k, group & 0xFF, hook & 0xFF, 0])
+            return bytes([base + 32 * k, arg1, hook & 0xFF, 0])
     raise AssertionError("no head byte encodes this configuration")
 
 
@@ -1726,6 +1732,72 @@ def proxy_seeds():
         xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK),
         xop("PUMP", 3), xop("RECV", 0), xop("STATS"), xop("STOP"))
+
+    # ── TLS, on each leg independently (e756810) ──
+    #
+    # The harness speaks OpenSSL directly at both ends; the certificate is
+    # generated once into /dev/shm and is both what the proxy serves and what it
+    # trusts.  A TLS backend connection is never pooled — see
+    # backend_pool_eligible, which refuses one on purpose because the pool key is
+    # an address and a session is not — so these seeds are about the handshake
+    # and the record layer rather than about the pool.
+    s["tls_on_the_listener"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_on_the_backend_leg"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_on_both_legs"] = prog(
+        px_head(SH_ONE, tls_front=True, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # Two requests over a TLS backend leg.  The second must not find the first
+    # one's socket in the pool: a pooled socket carries a negotiated identity
+    # that the pool's key — a host and a port — cannot express.
+    s["tls_backend_is_never_pooled"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_backend_handshake_never_finishes"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("BE_LISTEN", 0, L_STALLED), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_client_aborts_after_its_request"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("ABORT", 0), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("STOP"))
+
+    s["tls_group_over_both_legs"] = prog(
+        px_head(SH_GROUP, group=0x03, tls_front=True, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK),
+        xop("PUMP", 3), xop("RECV", 0),
+        xop("MEMBERSHIP", 0x02), xop("PUMP", 3), xop("STOP"))
+
+    s["tls_restart_reloads_the_certificate"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("STOP"), xop("START"), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
 
     s["strategies"] = prog(
         px_head(SH_THREE),

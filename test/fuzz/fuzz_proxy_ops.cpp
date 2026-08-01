@@ -117,6 +117,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// The harness's own TLS, and deliberately not the runtime's.  socketley/shared/
+// tls_context.h is the record layer under test on both legs; a harness built on
+// it would break in exactly the same way as the thing it is testing and report
+// a clean handshake.  So the peers here speak OpenSSL directly, over the socket
+// rather than over memory BIOs, which is also the only way this end can be
+// driven a step at a time between pumps of the proxy's loop.
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
 #include "fuzz_common.h"
 #include "fuzz_runtime_ops.h"
 
@@ -462,6 +474,12 @@ struct client_sock
 
     // A mark can straddle two reads, so the tail of the last one is kept.
     std::string carry;
+
+    // The listener leg's TLS, when the proxy terminates it.  Null on a
+    // cleartext proxy; tls_ok says the handshake finished, and until it does
+    // this client can send nothing at all.
+    SSL*     ssl{nullptr};
+    bool     tls_ok{false};
 };
 
 struct backend_sock
@@ -484,6 +502,12 @@ struct backend_sock
     uint32_t last_id{0};
 
     std::string carry;
+
+    // The backend leg's TLS, when the proxy dials one.  This end is the server:
+    // it presents the certificate the proxy verifies the endpoint's name
+    // against.
+    SSL*     ssl{nullptr};
+    bool     tls_ok{false};
 };
 
 struct backend_listener
@@ -502,6 +526,8 @@ struct world
     int              shape{0};
     bool             tcp{false};
     bool             lua{false};
+    bool             tls_front{false};   // the proxy terminates TLS on its listener
+    bool             tls_back{false};    // the proxy dials its backends over TLS
     uint32_t         epoch{0};      // bumped by every start, stop and destroy
     client_sock      cli[NCLIENTS];
     backend_listener be[NBACKENDS];
@@ -788,10 +814,149 @@ void build_response(int shape, uint32_t id, std::string& out, bool& complete)
     }
 }
 
+// ─────────────────────────────── the harness's TLS ──────────────────────────
+//
+// One self-signed certificate for 127.0.0.1, generated once into /dev/shm and
+// used for both legs at once: the proxy serves it on its own listener, and the
+// harness backends serve it while the proxy verifies it against the same file
+// given as --ca.  It carries an iPAddress SAN because that is what the endpoint
+// is — create_ssl_client checks an address literal against the iPAddress SAN
+// and refuses to send it as SNI, so a certificate with only a CN would be
+// rejected and the whole backend leg would be untestable.
+//
+// The harness's clients verify nothing.  They are not what is under test, and a
+// harness that refused the proxy's certificate would report a TLS defect it had
+// caused itself.
+
+std::string* g_cert_path = nullptr;
+std::string* g_key_path  = nullptr;
+SSL_CTX*     g_peer_client_ctx = nullptr;   // the harness's clients
+SSL_CTX*     g_peer_server_ctx = nullptr;   // the harness's backends
+
+void write_tls_material()
+{
+    char cert[160], key[160];
+    std::snprintf(cert, sizeof(cert), "/dev/shm/socketley-fuzz-proxy-%d.crt",
+                  static_cast<int>(::getpid()));
+    std::snprintf(key, sizeof(key), "/dev/shm/socketley-fuzz-proxy-%d.key",
+                  static_cast<int>(::getpid()));
+
+    EVP_PKEY* pkey = EVP_EC_gen("P-256");
+    if (!pkey)
+        return;
+
+    X509* x = X509_new();
+    if (!x)
+    {
+        EVP_PKEY_free(pkey);
+        return;
+    }
+
+    bool ok = X509_set_version(x, 2) == 1 &&                 // v3, for the SAN
+              ASN1_INTEGER_set(X509_get_serialNumber(x), 1) == 1 &&
+              X509_gmtime_adj(X509_getm_notBefore(x), -3600) != nullptr &&
+              X509_gmtime_adj(X509_getm_notAfter(x), 365 * 24 * 3600) != nullptr &&
+              X509_set_pubkey(x, pkey) == 1;
+
+    X509_NAME* nm = X509_get_subject_name(x);
+    ok = ok && X509_NAME_add_entry_by_txt(
+                   nm, "CN", MBSTRING_ASC,
+                   reinterpret_cast<const unsigned char*>("127.0.0.1"), -1, -1, 0) == 1 &&
+         X509_set_issuer_name(x, nm) == 1;
+
+    X509V3_CTX vctx;
+    X509V3_set_ctx_nodb(&vctx);
+    X509V3_set_ctx(&vctx, x, x, nullptr, nullptr, 0);
+    // Its own trust anchor: the same file is the proxy's --ca, so it has to be
+    // usable as one.
+    for (const auto& [nid, value] : { std::pair<int, const char*>{NID_basic_constraints,
+                                                                  "critical,CA:TRUE"},
+                                      std::pair<int, const char*>{NID_subject_alt_name,
+                                                                  "IP:127.0.0.1,DNS:localhost"} })
+    {
+        X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &vctx, nid, value);
+        if (!ext) { ok = false; break; }
+        ok = ok && X509_add_ext(x, ext, -1) == 1;
+        X509_EXTENSION_free(ext);
+    }
+
+    ok = ok && X509_sign(x, pkey, EVP_sha256()) > 0;
+
+    if (ok)
+    {
+        FILE* f = std::fopen(cert, "wb");
+        ok = f && PEM_write_X509(f, x) == 1;
+        if (f) std::fclose(f);
+    }
+    if (ok)
+    {
+        FILE* f = std::fopen(key, "wb");
+        ok = f && PEM_write_PrivateKey(f, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+        if (f) std::fclose(f);
+    }
+
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+
+    if (!ok)
+        return;
+
+    g_peer_client_ctx = SSL_CTX_new(TLS_client_method());
+    g_peer_server_ctx = SSL_CTX_new(TLS_server_method());
+    if (!g_peer_client_ctx || !g_peer_server_ctx)
+        return;
+    SSL_CTX_set_verify(g_peer_client_ctx, SSL_VERIFY_NONE, nullptr);
+    if (SSL_CTX_use_certificate_file(g_peer_server_ctx, cert, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_use_PrivateKey_file(g_peer_server_ctx, key, SSL_FILETYPE_PEM) != 1)
+        return;
+
+    g_cert_path = new std::string(cert);
+    g_key_path  = new std::string(key);
+}
+
+bool tls_available()
+{
+    return g_cert_path != nullptr && g_peer_client_ctx != nullptr &&
+           g_peer_server_ctx != nullptr;
+}
+
+// One handshake, driven a step at a time with the proxy's loop pumped between
+// the steps.  There is no other way round it: the proxy's half of both
+// handshakes advances only when a completion is dispatched, and this thread is
+// the one that dispatches them.  The bound is on rounds rather than on time,
+// for the reason ring_watch gives — a machine slow enough to delay the peer
+// delays this loop by the same factor — and a handshake that does not finish
+// inside it is simply reported as failed, which is a state the program is
+// entitled to reach.
+bool tls_handshake(SSL* ssl, bool accept_side)
+{
+    for (int i = 0; i < 48; i++)
+    {
+        ERR_clear_error();
+        const int r = accept_side ? SSL_accept(ssl) : SSL_connect(ssl);
+        if (r == 1)
+            return true;
+        const int e = SSL_get_error(ssl, r);
+        if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
+            return false;
+        g_loop->poll_completions(i < 8 ? 0 : 1);
+    }
+    return false;
+}
+
 // ─────────────────────────── the harness sockets ────────────────────────────
 
 void client_close(client_sock& c)
 {
+    if (c.ssl)
+    {
+        // No SSL_shutdown: the harness closes abortively on purpose (see
+        // set_abortive), and a close_notify would be a graceful teardown the
+        // program did not ask for.
+        SSL_free(c.ssl);
+        c.ssl = nullptr;
+    }
+    c.tls_ok = false;
     if (c.fd < 0)
         return;
     ::close(c.fd);        // SO_LINGER{1,0}: an RST, and no TIME_WAIT
@@ -854,6 +1019,23 @@ void client_connect(world& w, int idx)
     c.proxy_fd = -1;
     c.carry.clear();
     c.run_epoch = w.epoch;
+
+    // The listener leg.  The handshake runs here rather than being spread over
+    // later steps: a client that has not finished one cannot send a request, so
+    // leaving it half-done would put every TLS program out of reach of the
+    // invariants that matter.  Failing it is still reachable — the program can
+    // stop the runtime, or point the client at a listener that is not
+    // encrypted — and a failure leaves the socket open and mute, which is
+    // exactly what such a client looks like.
+    if (w.tls_front && tls_available())
+    {
+        c.ssl = SSL_new(g_peer_client_ctx);
+        if (c.ssl)
+        {
+            SSL_set_fd(c.ssl, c.fd);
+            c.tls_ok = tls_handshake(c.ssl, false);
+        }
+    }
 }
 
 // ─── invariant A, stated where it is observable ─────────────────────────────
@@ -985,24 +1167,46 @@ void client_recv(world& w, int idx)
     static char sink[16384];
     for (int i = 0; i < 4; i++)
     {
-        ssize_t n = ::recv(c.fd, sink, sizeof(sink), MSG_DONTWAIT);
-        if (n > 0)
+        ssize_t n;
+        if (c.ssl)
         {
-            c.rx_since_req += static_cast<size_t>(n);
-            client_scan_marks(w, idx, std::string_view(sink, static_cast<size_t>(n)));
-            continue;
+            if (!c.tls_ok)
+                return;
+            ERR_clear_error();
+            const int r = SSL_read(c.ssl, sink, static_cast<int>(sizeof(sink)));
+            if (r > 0)
+            {
+                n = r;
+            }
+            else
+            {
+                const int e = SSL_get_error(c.ssl, r);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                    break;
+                // ZERO_RETURN is a close_notify and SYSCALL an abrupt end;
+                // both are the far end ending this connection, which is what
+                // invariant A is asked about.
+                client_report_close(w, c);
+                break;
+            }
         }
-        if (n == 0)
+        else
         {
-            client_report_close(w, c);
-            break;
+            n = ::recv(c.fd, sink, sizeof(sink), MSG_DONTWAIT);
+            if (n == 0)
+            {
+                client_report_close(w, c);
+                break;
+            }
+            if (n < 0)
+            {
+                if (errno == ECONNRESET || errno == EPIPE)
+                    client_report_close(w, c);
+                break;   // EAGAIN otherwise
+            }
         }
-        if (errno == ECONNRESET || errno == EPIPE)
-        {
-            client_report_close(w, c);
-            break;
-        }
-        break;   // EAGAIN
+        c.rx_since_req += static_cast<size_t>(n);
+        client_scan_marks(w, idx, std::string_view(sink, static_cast<size_t>(n)));
     }
 }
 
@@ -1019,16 +1223,46 @@ void client_send(world& w, int idx, int shape)
     // deliberately dropped: what the proxy has to survive is a request that
     // stops halfway, and that is what a short write produces.  A request only
     // counts as complete when all of it went out.
-    ssize_t n = ::send(c.fd, buf.data(), buf.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (n < 0)
+    ssize_t n;
+    if (c.ssl)
     {
-        if (errno == EPIPE || errno == ECONNRESET)
+        if (!c.tls_ok)
+            return;
+        ERR_clear_error();
+        // SSL_write is all-or-nothing by default, so the record layer's short
+        // write is "nothing went out" rather than "half did".  Half a request
+        // over TLS is still reachable — the shapes that are half a request are
+        // half a request before they are encrypted.
+        const int r = SSL_write(c.ssl, buf.data(), static_cast<int>(buf.size()));
+        if (r > 0)
         {
-            client_report_close(w, c);
-            c.self_closed = true;
-            client_close(c);
+            n = r;
         }
-        return;
+        else
+        {
+            const int e = SSL_get_error(c.ssl, r);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
+            {
+                client_report_close(w, c);
+                c.self_closed = true;
+                client_close(c);
+            }
+            return;
+        }
+    }
+    else
+    {
+        n = ::send(c.fd, buf.data(), buf.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0)
+        {
+            if (errno == EPIPE || errno == ECONNRESET)
+            {
+                client_report_close(w, c);
+                c.self_closed = true;
+                client_close(c);
+            }
+            return;
+        }
     }
     if (static_cast<size_t>(n) == buf.size() && whole > 0)
     {
@@ -1042,6 +1276,12 @@ void client_send(world& w, int idx, int shape)
 
 void bsock_close(backend_sock& b)
 {
+    if (b.ssl)
+    {
+        SSL_free(b.ssl);
+        b.ssl = nullptr;
+    }
+    b.tls_ok = false;
     if (b.fd < 0)
         return;
     ::close(b.fd);
@@ -1146,6 +1386,21 @@ int backend_accept(world& w, int idx)
     b.owed_n = 0;
     b.last_id = 0;
     b.carry.clear();
+
+    // The backend leg.  This end is the server: it presents the certificate the
+    // proxy pins the endpoint's name to and verifies against the trust store it
+    // was given.  A handshake that does not complete leaves the socket open and
+    // mute, which is a backend the proxy has to give up on by deadline rather
+    // than by refusal — one of the cases this target exists for.
+    if (w.tls_back && tls_available())
+    {
+        b.ssl = SSL_new(g_peer_server_ctx);
+        if (b.ssl)
+        {
+            SSL_set_fd(b.ssl, b.fd);
+            b.tls_ok = tls_handshake(b.ssl, true);
+        }
+    }
     return slot;
 }
 
@@ -1181,7 +1436,30 @@ void bsock_recv(world& w, int idx)
     static char sink[16384];
     for (int i = 0; i < 4; i++)
     {
-        ssize_t n = ::recv(b.fd, sink, sizeof(sink), MSG_DONTWAIT);
+        ssize_t n;
+        if (b.ssl)
+        {
+            if (!b.tls_ok)
+                return;
+            ERR_clear_error();
+            const int r = SSL_read(b.ssl, sink, static_cast<int>(sizeof(sink)));
+            if (r > 0)
+            {
+                n = r;
+            }
+            else
+            {
+                const int e = SSL_get_error(b.ssl, r);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                    break;
+                bsock_close(b);
+                return;
+            }
+        }
+        else
+        {
+            n = ::recv(b.fd, sink, sizeof(sink), MSG_DONTWAIT);
+        }
         if (n > 0)
         {
             std::string buf;
@@ -1257,12 +1535,34 @@ void bsock_respond(world& w, int idx, int shape)
     bool complete = true;
     build_response(shape, id, buf, complete);
 
-    ssize_t n = ::send(b.fd, buf.data(), buf.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (n < 0)
+    ssize_t n;
+    if (b.ssl)
     {
-        if (errno == EPIPE || errno == ECONNRESET)
-            bsock_close(b);
-        return;
+        if (!b.tls_ok)
+            return;
+        ERR_clear_error();
+        const int r = SSL_write(b.ssl, buf.data(), static_cast<int>(buf.size()));
+        if (r > 0)
+        {
+            n = r;
+        }
+        else
+        {
+            const int e = SSL_get_error(b.ssl, r);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
+                bsock_close(b);
+            return;
+        }
+    }
+    else
+    {
+        n = ::send(b.fd, buf.data(), buf.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0)
+        {
+            if (errno == EPIPE || errno == ECONNRESET)
+                bsock_close(b);
+            return;
+        }
     }
     // A short write leaves the answer unfinished as surely as a shape that was
     // never going to finish it.
@@ -1413,6 +1713,25 @@ std::unique_ptr<proxy_instance> make_instance(world& w)
 
     rt->set_on_connect(cb_on_connect);
     rt->set_on_disconnect(cb_on_disconnect);
+
+    // The two legs, independently.  Nothing but a refused start may leave a leg
+    // that asked for encryption running in cleartext, so a setup() that returns
+    // false here is the runtime doing its job and the program simply gets
+    // nothing more out of it.
+    if (w.tls_front && tls_available())
+    {
+        rt->set_tls(true);
+        rt->set_cert_path(*g_cert_path);
+        rt->set_key_path(*g_key_path);
+    }
+    if (w.tls_back && tls_available())
+    {
+        // --ca alone turns the backend leg on for every backend at once,
+        // group members included: they have no address of their own to carry an
+        // https:// scheme.  The trust store is the certificate the harness
+        // backends serve, so the chain and the endpoint's name both check out.
+        rt->set_ca_path(*g_cert_path);
+    }
 
     // A filter chain, when the configuration asked for one.  There is no other
     // way to reach run_request_filters: it is guarded by lua()->has_filters(),
@@ -1769,6 +2088,8 @@ void run_step(world& w, const step& s)
             w.tcp   = (s.a & 0x08) != 0;
             w.lua   = (s.a & 0x10) != 0;
             w.group_mask = static_cast<uint8_t>((s.c & 0x07) ? (s.c & 0x07) : 0x07);
+            w.tls_front = (s.c & 0x08) != 0;
+            w.tls_back  = (s.c & 0x10) != 0;
             w.epoch++;
             w.rt = make_instance(w);
             publish_endpoints(w);
@@ -1976,6 +2297,7 @@ void init_once()
 
     g_graveyard = new std::vector<std::unique_ptr<proxy_instance>>();
     write_lua_script();
+    write_tls_material();
 
     g_loop = new event_loop(2048);
     if (!g_loop->init())
@@ -2034,6 +2356,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     w.tcp        = (data[0] & 0x08) != 0;
     w.lua        = (data[0] & 0x10) != 0;
     w.group_mask = static_cast<uint8_t>((data[1] & 0x07) ? (data[1] & 0x07) : 0x07);
+    // The two TLS bits live in byte 1 rather than byte 0 because the top three
+    // bits of byte 0 are what px_head() in make_corpus.py uses to steer which
+    // *operation* the same byte spells.  Byte 1 is that operation's first
+    // argument, where a couple of high bits change nothing.
+    w.tls_front  = (data[1] & 0x08) != 0;
+    w.tls_back   = (data[1] & 0x10) != 0;
     g_hook_mode  = data[2] % 4;
     g_hook_drops = (g_hook_mode % 4) == 3;
 
