@@ -87,15 +87,31 @@ workspace "Socketley"
         }
     filter {}
 
-    -- Workspace-wide Sanitize settings.  Each project also carries its own
-    -- Sanitize filter; these add the one flag none of them had.
+    -- Workspace-wide Sanitize settings (applies to ALL projects), matching the
+    -- TSan block below.
     --
     -- -fno-sanitize-recover=all is the important part: without it UBSan prints a
     -- diagnostic and carries on, so an integration run under UBSan finishes with
     -- exit status 0 and a defect buried in the log.  A CI job that goes green on
     -- a run that found something is worse than no job.
+    --
+    -- -fsanitize=address,undefined is here rather than only in the per-project
+    -- filters because a project that forgets it does not build at all: every
+    -- object in libsocketley_sdk.a carries calls to __asan_* and __ubsan_*, so an
+    -- executable linked without the runtime fails with several hundred undefined
+    -- references and takes the whole job down with it.  bench_conn_transfer was
+    -- added without a Sanitize filter and did exactly that, which is what the
+    -- nightly's "Build (Sanitize)" step was failing on.  TSan has never been able
+    -- to break this way because it was always stated once, here; Sanitize was
+    -- stated sixteen times, and the seventeenth project was the one that mattered.
+    -- The per-project filters keep their copies — repeating a flag costs nothing,
+    -- and they still carry the symbols/optimize settings that differ per project.
     filter "configurations:Sanitize"
-        buildoptions { "-fno-sanitize-recover=all" }
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                       "-fno-sanitize-recover=all" }
+        linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
     -- Workspace-wide TSan settings (applies to ALL projects).
