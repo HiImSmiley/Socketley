@@ -1683,6 +1683,28 @@ void server_instance::teardown(event_loop& loop)
     m_forwarded.clear();
     m_forwarded_by_ref.clear();
 
+    // And the other direction: every connection this runtime had routed away is
+    // being closed by the stop, so the runtime holding its name has to be told.
+    //
+    // Nothing told it before.  A stop does not go through close_conn — it walks
+    // m_clients and clears the index directly — so unroute_client never ran for
+    // any of these, and the target kept an entry per routed connection naming a
+    // runtime that had gone.  Harmless in that owner_send answered false on
+    // them, and unbounded: a parent restarted a hundred times left a hundred
+    // connections' worth of them behind, and its own connection count reported
+    // them as live.
+    {
+        auto* mgr = get_runtime_manager();
+        for (const auto& [serial, target_name] : m_routes)
+        {
+            if (!mgr) break;
+            auto* target = mgr->get(target_name);
+            if (target && target->get_type() == runtime_server)
+                static_cast<server_instance*>(target)->release_routed(
+                    conn_ref{owner_key(), serial});
+        }
+    }
+
     // Our own side: whatever we had routed away, and the serial index that
     // resolves a name to a descriptor.  Both describe connections that are
     // being closed as this runtime stops, so a name minted before the stop must
@@ -4187,16 +4209,30 @@ bool server_instance::route_client(int client_id, std::string_view target_name)
     auto* target = mgr->get(target_name);
     if (!target || target->get_type() != runtime_server) return false;
 
-    // The target decides whether it will take it, and it is the target that
-    // mints the handle its own script will see.  Nothing about our descriptor
-    // table crosses.
+    // Our own bookkeeping first, the notification second.  accept_routed runs
+    // the target's on_connect, and a script is allowed to answer that by
+    // closing the connection — which frees the struct m_conn_idx[client_id]
+    // points at.  Touching that pointer afterwards would be a read of a pooled
+    // connection at best.
     auto* sub = static_cast<server_instance*>(target);
-    if (sub->accept_routed(ref, get_name()) < 0)
-        return false;
-
     m_routes[ref.serial] = std::string(target_name);
     m_conn_idx[client_id]->routed = true;
-    return true;
+
+    if (sub->accept_routed(ref, get_name()) >= 0)
+        return true;
+
+    // Refused.  Undo, and find the connection by name rather than by the
+    // descriptor we were given: nothing ran in between here, but the rule that
+    // a descriptor is not an identity does not get suspended for rollback.
+    m_routes.erase(ref.serial);
+    if (auto it = m_conn_by_serial.find(ref.serial); it != m_conn_by_serial.end())
+    {
+        const int fd = it->second;
+        if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd] &&
+            m_conn_idx[fd]->ref_serial == ref.serial)
+            m_conn_idx[fd]->routed = false;
+    }
+    return false;
 }
 
 bool server_instance::unroute_client(int client_id)
@@ -4210,17 +4246,22 @@ bool server_instance::unroute_client(int client_id)
     auto it = m_routes.find(serial);
     if (it == m_routes.end()) return false;
 
+    // Everything read out of the map and the map left consistent before
+    // anything else is called.  release_routed runs the target's on_disconnect,
+    // a script may answer that by unrouting again, and a second pass through
+    // here holding `it` would be using an erased iterator.
+    const std::string target_name = it->second;
+    m_routes.erase(it);
     m_conn_idx[client_id]->routed = false;
 
     auto* mgr = get_runtime_manager();
     if (mgr)
     {
-        auto* target = mgr->get(it->second);
+        auto* target = mgr->get(target_name);
         if (target && target->get_type() == runtime_server)
             static_cast<server_instance*>(target)->release_routed(
                 conn_ref{owner_key(), serial});
     }
-    m_routes.erase(it);
     return true;
 }
 
@@ -4324,12 +4365,14 @@ void server_instance::release_routed(const conn_ref& ref)
 
     const int handle = it->second;
 
-    // The callback runs while the handle still resolves, so a script that
-    // answers a disconnect by writing to the connection gets a clean false
+    // The name goes first, so a second release for the same connection — which
+    // is what an origin retrying, or a script unrouting from inside its own
+    // on_disconnect, looks like — finds nothing and does not fire the callback
+    // twice.  The handle stays resolvable across the callback, so a script that
+    // answers a disconnect by writing gets a clean false out of write_to_ref
     // rather than a lookup into an empty table.
+    m_forwarded_by_ref.erase(it);
     invoke_on_disconnect(handle);
-
-    m_forwarded_by_ref.erase(ref);
     m_forwarded.erase(handle);
 }
 

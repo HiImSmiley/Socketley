@@ -307,5 +307,62 @@ if grep -q "sub_disconnect 1[6-9][0-9]\{6\}" "$WORK/daemon.log"; then ok; else
     bad "on_disconnect fired with $(grep -o 'sub_disconnect [0-9]*' "$WORK/daemon.log" | tail -1 | cut -d' ' -f2), which is inside this runtime's own descriptor range"
 fi
 
+# ─── A stopped origin takes its routes with it ──────────────────────────────
+#
+# A stop does not go through the per-connection close path — it walks the client
+# table and clears it — so nothing told the target that the connections routed
+# to it had gone.  The entries stayed, naming a runtime that was no longer
+# running, and the target counted them as live connections for the rest of its
+# life.
+#
+# The target here is created from the command line and is nobody's child.  That
+# matters: a target the parent created is stopped by the same cascade that
+# stops the parent, so its own teardown clears the entries and the leak cannot
+# be seen.  An independent one is left running, which is the configuration the
+# fix is about — and the one an operator gets by pointing self.route() at a
+# server that already existed.
+
+cat > "$WORK/lone.lua" <<'EOLUA'
+function on_connect(client_id)  socketley.log("lone_connect " .. client_id) end
+function on_disconnect(client_id) socketley.log("lone_disconnect " .. client_id) end
+EOLUA
+
+cat > "$WORK/parent2.lua" <<EOLUA
+function on_client_message(client_id, msg)
+    if msg == "join_lone" then self.route(client_id, "rid_lone") end
+end
+EOLUA
+
+"$BIN" create server rid_lone -p 19773 --lua "$WORK/lone.lua" -s >/dev/null 2>&1
+"$BIN" create server rid_par2 -p 19774 --lua "$WORK/parent2.lua" -s >/dev/null 2>&1
+sleep 0.6
+
+lone_conns() { "$BIN" stats rid_lone 2>/dev/null | grep -E "^connections:" | head -1 | cut -d: -f2; }
+
+python3 - <<'PY' >/dev/null 2>&1 &
+import socket, time
+s = socket.create_connection(("127.0.0.1", 19774))
+s.settimeout(2)
+s.sendall(b"join_lone\n")
+time.sleep(8)
+PY
+HOLDER=$!
+sleep 1.2
+
+BEFORE=$(lone_conns)
+"$BIN" stop rid_par2 >/dev/null 2>&1
+sleep 1.2
+AFTER=$(lone_conns)
+
+# The control.  Without it, "0 afterwards" is also what a build that never
+# routed anything says, and the check below would pass for the wrong reason.
+if [ "${BEFORE:-0}" -ge 1 ]; then ok; else
+    bad "the target did not count the routed connection before the stop (got '${BEFORE:-}'), so the check below proves nothing"
+fi
+if [ "${AFTER:-1}" -eq 0 ]; then ok; else
+    bad "the target still counts ${AFTER} connection(s) after the runtime that owned them stopped, and nothing will ever remove them"
+fi
+kill "$HOLDER" 2>/dev/null
+
 echo "--- $PASS/$TOTAL passed ---"
 [ "$FAIL" -eq 0 ]
