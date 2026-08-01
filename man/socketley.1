@@ -105,7 +105,7 @@ is a high-performance Linux daemon and CLI that manages network runtimes
 (servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
-.B "TLS terminates on a server listener and on both of a proxy's legs."
+.B "TLS terminates on a server listener, on both of a proxy's legs, and on a client's dial."
 A
 .B server
 runtime encrypts its own listening port with
@@ -121,10 +121,23 @@ and reaches an
 backend over TLS \(em verifying the chain and the endpoint's name, and
 presenting a client certificate with
 .BR \-\-client\-cert " " \-\-client\-key .
-A client runtime's outbound socket and a cache's listener still perform no
-handshake: their TLS options are rejected with exit status 1, and a runtime
-carrying any of them (for example one restored from a state file written by an
-older release) refuses to start rather than running in cleartext. See
+A
+.B client
+runtime dials its target over TLS with
+.BR \-\-tls ,
+verifying the chain against
+.B \-\-ca
+or the system trust store and matching the host from
+.B \-t
+against the certificate; it presents its own certificate with
+.BR \-\-cert " " \-\-key .
+There is no way to switch either check off \(em an unverified TLS client buys
+encryption against somebody recording the wire and nothing at all against
+somebody sitting on it.
+A cache's listener still performs no handshake: its TLS options are rejected
+with exit status 1, and a runtime carrying any of them (for example one
+restored from a state file written by an older release) refuses to start rather
+than running in cleartext. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -365,7 +378,7 @@ and exit status 1; change those through the editor or
 which reach the full field set.
 The TLS flags are the exception to that wording. Editing is the usual way to
 put encryption on something already running, so on a
-.B server
+.BR server ", " client
 or
 .B proxy
 runtime
@@ -385,15 +398,14 @@ identity it handshook with until it is restarted. An edit that would leave the
 set incomplete \(em a certificate with no
 .BR \-\-tls ,
 .B \-\-tls
-with no key pair, half a client-certificate pair \(em is refused and changes
-nothing, so a mistyped flag cannot leave a runtime half-configured.
+with no key pair on a listener, half a client-certificate pair \(em is refused
+and changes nothing, so a mistyped flag cannot leave a runtime
+half-configured.
 On a
-.B client
-or
 .B cache
 runtime they are refused with the same message
 .B create
-gives \(em no handshake exists behind them \(em rather than
+gives \(em no handshake exists behind it \(em rather than
 .BR "unknown flag" .
 Exit status is 1 either way; only the reason differs. See
 .BR LIMITATIONS .
@@ -479,10 +491,10 @@ rate_limit	number	Messages/sec per connection (0 = unlimited)
 global_rate_limit	number	Messages/sec across all connections (0 = unlimited)
 idle_timeout	number	Close idle connections after N seconds (0 = disabled)
 drain	bool	Graceful shutdown (flush writes before close)
-tls	bool	Terminate TLS on the listener \fB(server, proxy)\fR
-cert_path	string	PEM certificate \fB(server, proxy; needs tls)\fR
-key_path	string	PEM private key \fB(server, proxy; needs tls)\fR
-ca_path	string	Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends
+tls	bool	Terminate TLS on the listener \fB(server, proxy)\fR; dial TLS \fB(client)\fR
+cert_path	string	PEM certificate \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the certificate it presents
+key_path	string	PEM private key \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the key for cert_path
+ca_path	string	Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends; on a \fBclient\fR, the trust store for its target
 target	string	Client target host:port \fB(requires restart)\fR
 cache_name	string	Connected cache runtime name
 group	string	Group tag for dynamic proxy discovery
@@ -730,18 +742,39 @@ but flushes all pending write queues before closing connections.
 .BI "\-\-key " "file"
 .TQ
 .BI "\-\-ca " "file"
-.B "Server and proxy runtimes."
-Terminate TLS on this runtime's own listening port.
+.B "Server, client and proxy runtimes."
+Encrypt this runtime's transport. What that means depends on whether the role
+listens or dials.
+.PP
+On a
+.BR server " or " proxy ,
+TLS terminates on the runtime's own listening port, and
 .B \-\-tls
-turns encryption on and requires both
+requires both
 .BI \-\-cert " file"
 (a PEM certificate, chain allowed) and
 .BI \-\-key " file"
-(its PEM private key).
+(its PEM private key) \(em a listener has to have something to terminate TLS
+with.
+.PP
+On a
+.BR client ,
+TLS is dialled rather than terminated, and
+.B \-\-tls
+on its own is the complete configuration: there is no listening port to hold a
+certificate, and the peer is verified against the system trust store by
+default.
+.BI \-\-cert " file"
+and
+.BI \-\-key " file"
+are optional there and mean the certificate this client
+.I presents
+when the peer asks for one (mutual TLS); half a pair is refused, because it
+would present nothing while the flags said otherwise.
 .PP
 .BI \-\-ca " file"
-means one thing on each role, because a proxy has a second leg and a server
-does not. On a
+means one thing on each role, because only some of them verify a peer they
+dialled. On a
 .B server
 it enables mutual TLS: a client must then present a certificate signed by that
 CA, and one that does not is rejected during the handshake. On a
@@ -750,30 +783,52 @@ it is the trust store used to verify the certificate a
 .B backend
 presents \(em the proxy's own listener asks for client certificates with
 .BI \-\-client\-ca " file"
-instead. See
+instead. On a
+.B client
+it is the trust store for the peer named by
+.BR \-t ;
+without it the system store is used.
+See
 .B "mTLS Flags"
 under
 .BR "PROXY FLAGS" .
 .PP
-Certificates are read when the runtime starts, so
+A dialled connection \(em a client's target, a proxy's backend \(em is verified
+on two counts, and neither can be turned off. The chain must be signed by
+something in the trust store, and the certificate must be valid for the host
+that was dialled: the name in
+.B \-t
+for a client, matched against the certificate's DNS SAN, or against its IP SAN
+for an address literal. The name checked is always the one configured, never
+one read back out of the certificate that arrived. TLS 1.2 is the minimum
+version. There is deliberately no skip-verify option: a TLS client that does
+not verify buys encryption against an eavesdropper and nothing at all against
+somebody in the path, while reporting itself as encrypted either way.
+.PP
+Certificates and trust stores are read when the runtime starts, so
 .B reload
-is how a renewed certificate is installed. A certificate that cannot be
-loaded, a key that does not match it, and any incomplete combination
-(\c
+is how a renewed certificate is installed \(em on every role that has one. A
+certificate that cannot be loaded, a key that does not match it, and any
+incomplete combination (\c
 .B \-\-tls
-without a key pair, a key pair without
-.BR \-\-tls )
-are refused: the runtime goes to the
+without a key pair on a listener, a key pair or a trust store without
+.BR \-\-tls ,
+half a client-certificate pair) are refused: the runtime goes to the
 .B failed
-state and nothing binds the port. There is no fallback to cleartext on any
-path.
+state and nothing binds the port or dials the target. There is no fallback to
+cleartext on any path. A client whose peer fails verification drops the socket
+and re-dials on its usual backoff; it never retries in the clear.
 .PP
 On a
-.BR client " or " cache
-runtime these flags are rejected with exit status 1 \(em neither performs a
-handshake. They are also refused on a server combined with
+.B cache
+runtime these flags are rejected with exit status 1 \(em its listener performs
+no handshake. They are also refused on a
+.B client
+or a
+.B server
+combined with
 .B \-\-udp
-(that would need DTLS) or with
+(that would need DTLS), and on a server combined with
 .B \-\-upstream
 (the upstream leg would still dial in cleartext). See
 .B TLS
@@ -1002,6 +1057,28 @@ Enable automatic reconnection with exponential backoff when the connection
 is lost. Backoff starts at 1 second and doubles each attempt up to 30 seconds,
 with random jitter. Set to 0 for infinite attempts (default when flag is given
 without a value). Set to a positive number to limit reconnection attempts.
+.PP
+A client also takes the TLS flags \(em see
+.B \-\-tls
+under
+.BR "COMMON FLAGS" .
+.B \-\-tls
+alone dials the target over TLS and verifies it against the system trust
+store;
+.BI \-\-ca " file"
+supplies a trust store instead, and
+.BI \-\-cert " file"
+with
+.BI \-\-key " file"
+present a certificate to a peer that asks for one. The host in
+.B \-t
+is the name the certificate has to be valid for. A verification failure costs
+the socket and the client re-dials on the backoff above; it is never retried
+in cleartext, and there is no way to skip the check.
+.B \-\-tls
+with
+.B \-\-udp
+is refused \(em that would need DTLS.
 .SH PROXY FLAGS
 .TP
 .BI "\-\-backend " "addr"
@@ -2679,6 +2756,45 @@ socketley create server oops -p 9443 --tls --cert server.pem
 # exit status 1
 .fi
 .PP
+Encrypted client. The dial is the mirror of the listener above: one flag turns
+the transport on, and the peer is verified on both counts \(em the chain
+against the trust store, and the certificate against the host in
+.BR \-t .
+.PP
+.nf
+# verify against the system trust store
+socketley create client feed -t events.example.com:9443 --tls -s
+
+# verify against a private CA instead
+socketley create client feed -t 10.0.0.7:9443 \\
+    --tls --ca internal-ca.pem -s
+
+# and present a certificate of our own, for a peer that demands one
+socketley create client feed -t 10.0.0.7:9443 \\
+    --tls --ca internal-ca.pem \\
+    --cert client.pem --key client-key.pem -s
+.fi
+.PP
+A peer whose certificate does not verify costs the socket \(em the client
+re-dials on its backoff and never falls back to cleartext. There is no
+skip-verify flag: encryption without verification is protection against
+somebody recording the wire and none at all against somebody sitting on it,
+and the two look identical from the outside.
+.PP
+The same rules apply as on the listener. Half a certificate pair is refused,
+a trust store without
+.B \-\-tls
+is refused, and
+.B reload
+is how a renewed client certificate is installed:
+.PP
+.nf
+socketley create client bad -t host:9443 --tls --cert client.pem
+# --cert: needs --key <file> as well -- a certificate with no key
+# presents nothing
+# exit status 1
+.fi
+.PP
 Graceful shutdown (drain pending writes):
 .PP
 .nf
@@ -3626,7 +3742,7 @@ Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route
 from pushed data the way the proxy now does.
 .SS TLS
-.B "Two roles terminate TLS: a server runtime's own listener, and a proxy \(em on both of its legs."
+.B "Three roles speak TLS: a server runtime's own listener, a proxy \(em on both of its legs \(em and a client runtime's dial."
 Created with
 .BR "\-\-tls \-\-cert " file " \-\-key " file ,
 a
@@ -3671,12 +3787,31 @@ handshake, and
 is refused against a TLS backend because a plaintext probe would mark every
 backend unhealthy.
 .PP
+A
+.B client
+runtime runs the dialling half of that same record layer on its outbound
+socket. Created with
+.BR \-\-tls ,
+it puts a ClientHello on the wire as soon as it has a socket and advances the
+handshake one completion at a time, exactly as the other two do; the line
+framing and the Lua callbacks above it see the same plaintext they always did.
+The peer is verified against
+.BI \-\-ca " file"
+or the system store, and the certificate must be valid for the host in
+.B \-t
+\(em matched against its DNS SAN, or its IP SAN for an address literal.
+.BI \-\-cert " file"
+and
+.BI \-\-key " file"
+present a certificate to a peer that asks for one. There is no skip-verify
+option, by design. A peer that fails either check costs the socket: the client
+drops it and re-dials on its usual backoff, and never retries in cleartext.
+.PP
 .B "Nothing else does."
-A client runtime's outbound socket and a cache's listener have no handshake
-behind them, and their flags are refused rather than stored. Two server
-combinations are refused for the same reason:
+A cache's listener has no handshake behind it, and its flags are refused
+rather than stored. Two combinations are refused for the same reason:
 .B \-\-udp
-(DTLS is not implemented) and
+on a client or a server (DTLS is not implemented) and, on a server,
 .B \-\-upstream
 (the upstream connection would still be made in cleartext). A proxy in
 .B \-\-protocol tcp
@@ -3708,7 +3843,7 @@ configuration that is incomplete:
 .IP \(bu 2
 .BR \-\-tls ", " \-\-cert ", " \-\-key " and " \-\-ca
 on a
-.BR client " or " cache
+.B cache
 runtime, and
 .BR \-\-client\-ca ", " \-\-client\-cert " and " \-\-client\-key
 on anything but a proxy, are rejected by
@@ -3716,15 +3851,22 @@ on anything but a proxy, are rejected by
 with exit status 1 and a message naming the flag.
 .IP \(bu 2
 on a
-.B server
-or
-.B proxy
+.BR server ", " client " or " proxy
 runtime the same flags are accepted, but only as a complete set.
 .B \-\-tls
-without a certificate and key, or a certificate without
-.BR \-\-tls ,
-is refused and no runtime is created \(em either would describe a listener
-that could only serve cleartext. On a proxy,
+without a certificate and key on a
+.BR server " or " proxy ,
+or a certificate or trust store without
+.B \-\-tls
+on any of the three, is refused and no runtime is created \(em either would
+describe a listener that could only serve cleartext, or a dial that would be
+made in it. On a
+.B client
+.B \-\-tls
+alone is complete, but half a
+.BR \-\-cert / \-\-key
+pair is refused: it would present nothing while the flags said a certificate
+was configured. On a proxy,
 .B \-\-client\-ca
 without
 .B \-\-tls

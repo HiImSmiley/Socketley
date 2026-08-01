@@ -41,10 +41,12 @@ examples/
 - `broadcast.sh` - One-to-many messaging
 - `bidirectional.sh` - Full duplex communication
 - `modes.sh` - in/out/inout message modes
+- `tls-client.sh` - a client that dials its target over TLS, with the chain and
+  the host name verified; also mutual TLS and what is refused
 
 ### Server
 - `tls-server.sh` - TLS on a server listener, plus mutual TLS; also shows what
-  is refused (TLS on a client or cache, and any incomplete key pair)
+  is refused (TLS on a cache, and any incomplete key pair)
 - `auth-token.lua`, `auth-ip-allowlist.lua` - connection authorisation
 - `rate-limit.lua`, `session-ids.lua`, `websocket-session.lua` - per-connection state
 - `upstream-hub.lua`, `service-discovery.lua` - upstream and discovery patterns

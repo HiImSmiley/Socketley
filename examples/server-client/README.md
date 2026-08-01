@@ -20,6 +20,14 @@ Full duplex messaging between server and clients.
 ### Message Modes
 Demonstrates `--mode in`, `--mode out`, and `--mode inout`.
 
+### TLS (`tls-client.sh`)
+A client that dials its target over TLS. The peer is verified on two counts and
+neither can be switched off: the chain against `--ca` or the system trust store,
+and the certificate against the host given in `-t`. `--cert`/`--key` present a
+certificate of the client's own for a peer that demands one. A peer that fails
+verification costs the socket and is re-dialled; nothing is ever sent in the
+clear.
+
 ## Key Concepts
 
 ### Server Default Behavior

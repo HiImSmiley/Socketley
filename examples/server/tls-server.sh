@@ -11,12 +11,12 @@
 # serves https:// and wss:// as well as the line protocol.
 #
 # WHAT IS *NOT* ENCRYPTED
-#   A client runtime's outbound socket, a cache's listener, and a server's own
-#   --upstream connections have no handshake behind them, and the flags for
-#   those are refused rather than stored -- see the bottom of this script.
-#   Nothing here ever falls back to cleartext: a configuration that cannot be
-#   honoured fails the runtime.  A *proxy* does have a handshake, on both of
-#   its legs; examples/proxy/tls-proxy.sh is that one.
+#   A cache's listener and a server's own --upstream connections have no
+#   handshake behind them, and the flags for those are refused rather than
+#   stored -- see the bottom of this script.  Nothing here ever falls back to
+#   cleartext: a configuration that cannot be honoured fails the runtime.
+#   A *proxy* has a handshake on both of its legs (examples/proxy/tls-proxy.sh)
+#   and a *client* dials one (examples/server-client/tls-client.sh).
 #
 # USAGE:
 #   ./tls-server.sh
@@ -121,12 +121,13 @@ echo ""
 echo "  socketley create server oops -p 9445 --cert server.pem --key server-key.pem"
 echo "      # --cert: needs --tls as well"
 echo ""
-echo "  socketley create client oops --tls"
 echo "  socketley create cache  oops -p 9445 --tls --cert ... --key ..."
 echo "      # TLS transport is not implemented for this runtime"
 echo ""
-echo "A proxy is not on that list any more: it terminates TLS on its own"
-echo "listener and dials one to its backends.  See examples/proxy/tls-proxy.sh."
+echo "Neither a proxy nor a client is on that list any more: a proxy terminates"
+echo "TLS on its own listener and dials one to its backends, and a client dials"
+echo "one to its target.  See examples/proxy/tls-proxy.sh and"
+echo "examples/server-client/tls-client.sh."
 echo ""
 echo "And a certificate that cannot be loaded, or a key that does not match it,"
 echo "puts the runtime in the 'failed' state without ever binding the port."
