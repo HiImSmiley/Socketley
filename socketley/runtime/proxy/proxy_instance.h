@@ -170,6 +170,14 @@ struct alignas(64) proxy_client_connection
     // proxy whose script declares no chain.
     std::vector<std::pair<std::string, std::string>> filter_headers;
 
+    // Names a filter asked to be taken *off* the request, lowercased, applied
+    // by the same loop in rewrite_http_request that applies the ones above.
+    // Same lifetime rules and the same ban list: a filter that could remove
+    // Content-Length or Transfer-Encoding would change how the message is
+    // framed, and a proxy that frames a request differently from its backend
+    // is the whole of request smuggling.
+    std::vector<std::string> filter_removed_headers;
+
     std::chrono::steady_clock::time_point last_activity{};
     int retries_remaining{0};
     size_t backend_idx{0};
