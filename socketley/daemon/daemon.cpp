@@ -142,6 +142,29 @@ static void restore_runtimes(state_persistence& persistence,
         if (cfg.out_of_process)
             instance->mark_out_of_process();
 
+        // What this runtime asked its I/O to run as.  Restored before start(),
+        // which is where the request meets the ring: this daemon's ring was
+        // created from the environment it was launched with, and there is no
+        // reason that has to be the environment the request was accepted under.
+        //
+        // A set this machine no longer has is dropped with a warning rather
+        // than refused: the alternative is a daemon that will not restore a
+        // runtime because the box it was moved to has fewer cores, and the
+        // request is a requirement about the ring, not about this runtime's
+        // ability to exist.  Dropping it means start() checks nothing, which is
+        // the same position a runtime that never asked is in.
+        if (!cfg.cpus.empty())
+        {
+            cpu_set_spec spec;
+            std::string err;
+            if (parse_cpu_set(cfg.cpus, spec, err))
+                instance->set_cpus(spec);
+            else
+                LOG_WARN("restore: this machine cannot satisfy a persisted --cpus set");
+        }
+        if (cfg.sqpoll_set)
+            instance->set_sqpoll(cfg.sqpoll);
+
         // External (attached) runtimes: mark as external so start() skips io_uring setup
         if (cfg.external_runtime)
         {
@@ -238,8 +261,13 @@ static void restore_runtimes(state_persistence& persistence,
         if (!cfg.was_running)
             continue;
 
+        // Named, because the reason start() gives is printed by start() and a
+        // daemon restoring several runtimes would otherwise report a refusal
+        // with nothing to attach it to.  The runtime is left in `failed`, where
+        // `ls` and `stats` show it — a restore that could not honour what a
+        // runtime asked for must not read as a restore that worked.
         if (!manager.start(cfg.name, loop))
-            LOG_WARN("restore: could not start runtime");
+            LOG_WARN(("restore: could not start runtime " + cfg.name).c_str());
         else
             LOG_DEBUG("restored runtime");
     }

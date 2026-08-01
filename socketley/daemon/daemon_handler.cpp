@@ -62,63 +62,17 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
 // Why this runtime's --cpus / --sqpoll request cannot be honoured, or an empty
 // string if it can.
 //
-// A ring is a queue between one thread and the kernel, and io_uring fixes its
-// flags — SQPOLL among them — when the ring is created.  The ring a runtime uses
-// is created by the *process* it lives in, before that process has read any
-// runtime configuration at all: the daemon's in daemon_start(), a worker's
-// before its config frame arrives.  So `create` cannot make a ring; it can only
-// be told to run a runtime on one that already exists.
-//
-// That leaves two honest answers to a request the existing ring does not
-// satisfy, and this is the one that is not a lie.  Accepting it and doing
-// nothing would put a figure in the state file that `stats` contradicts, and
-// leave an operator measuring a poller that was never started.
-//
-// Nothing changes here when the split lands: a runtime that owns its process
-// owns its ring, the request becomes that ring's parameters, and this check has
-// nothing left to refuse.
+// The reasoning and the text live on runtime_instance, next to the request they
+// are about, because `create` is no longer the only place that asks: the
+// request is persisted now, and the daemon's restore path meets it again on a
+// ring that was created before the state file was read.  See
+// runtime_instance::ring_policy_refusal.
 static std::string instance_ring_refusal(const runtime_instance* inst,
                                          const event_loop& loop)
 {
     if (!inst)
         return {};
-
-    std::string msg;
-
-    // Only what was actually asked for is checked.  A runtime created without
-    // either flag takes the ring it is given and is told nothing about it —
-    // there is no request to disappoint.
-    const bool want_sqpoll = inst->get_sqpoll();
-    if (inst->has_sqpoll_request() && want_sqpoll != loop.sqpoll_enabled())
-    {
-        msg += want_sqpoll
-             ? "--sqpoll: this runtime shares a ring that was created without a "
-               "submission poller.\n"
-               "  A ring's polling mode is fixed when the ring is created, and this "
-               "one exists already.\n"
-               "  Start the daemon with SOCKETLEY_SQPOLL=1 to give every runtime in "
-               "it a poller.\n"
-             : "--no-sqpoll: this runtime shares a ring that was created with a "
-               "submission poller.\n"
-               "  A ring's polling mode is fixed when the ring is created, and this "
-               "one exists already.\n"
-               "  Start the daemon without SOCKETLEY_SQPOLL to drop the poller.\n";
-    }
-
-    const cpu_set_spec& want = inst->get_cpus();
-    const cpu_set_spec& have = loop.cpus();
-    if (inst->has_cpus_request() &&
-        (want.all != have.all || (!want.all && want.mask != have.mask)))
-    {
-        msg += "--cpus " + want.to_string() + ": this runtime's I/O thread is "
-               "already pinned to " + have.to_string() + ".\n"
-               "  One thread cannot be in two places, and every runtime in this "
-               "daemon shares it.\n"
-               "  Start the daemon with SOCKETLEY_CPUS=" + want.to_string()
-             + " to move all of them.\n";
-    }
-
-    return msg;
+    return inst->ring_policy_refusal(loop);
 }
 
 // Everything `create` prints, delivered to the client that typed it.

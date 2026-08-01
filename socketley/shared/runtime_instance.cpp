@@ -81,6 +81,30 @@ bool runtime_instance::start(event_loop& loop)
     if (current != runtime_created && current != runtime_stopped)
         return false;
 
+    // Before every early return below, and deliberately so.  `create` checks
+    // this for every runtime whatever process it will end up in, and this is the
+    // same check on the path `create` does not cover: the daemon's own restore.
+    //
+    // The state file carries the request; the ring was created before the file
+    // was read, from the environment the daemon was launched with.  So a daemon
+    // restarted without the setting that satisfied a runtime's --cpus brings
+    // that runtime up on a ring that does not meet it, and until this gate
+    // existed it did so in silence — `stats` reported the ring it actually got
+    // and nothing reported that it was not the one asked for.  Refusing to start
+    // is the same answer `create` gives, arrived at one restart later.
+    //
+    // An out-of-process runtime is checked against the daemon's ring too, which
+    // is not its own: its worker builds one from the environment it inherited
+    // from this daemon, so this ring is what that one will look like.  Comparing
+    // against it is closer than not comparing at all, and it keeps `create` and
+    // restore giving the same answer to the same configuration.
+    if (const std::string msg = ring_policy_refusal(loop); !msg.empty())
+    {
+        LOG_ERROR(msg.c_str());
+        m_state.store(runtime_failed, std::memory_order_release);
+        return false;
+    }
+
     // A placeholder for a worker process arms nothing and binds nothing: the
     // supervisor forks the child that does both.  Returning before
     // register_owner() is what keeps has_armed_io() false for it, so removal
@@ -591,6 +615,62 @@ bool runtime_instance::has_cpus_request() const { return m_cpus_set; }
 void runtime_instance::set_sqpoll(bool on) { m_sqpoll = on; m_sqpoll_set = true; }
 bool runtime_instance::get_sqpoll() const { return m_sqpoll; }
 bool runtime_instance::has_sqpoll_request() const { return m_sqpoll_set; }
+
+// A ring is a queue between one thread and the kernel, and io_uring fixes its
+// flags — SQPOLL among them — when the ring is created.  The ring a runtime uses
+// is created by the *process* it lives in, before that process has read any
+// runtime configuration at all: the daemon's in daemon_start(), a worker's
+// before its config frame arrives.  So neither `create` nor `start` can make a
+// ring; either can only be told to run a runtime on one that already exists.
+//
+// That leaves two honest answers to a request the existing ring does not
+// satisfy, and this is the one that is not a lie.  Accepting it and doing
+// nothing would put a figure in the state file that `stats` contradicts, and
+// leave an operator measuring a poller that was never started.
+//
+// Nothing changes here when the split lands: a runtime that owns its process
+// owns its ring, the request becomes that ring's parameters, and this check has
+// nothing left to refuse.
+std::string runtime_instance::ring_policy_refusal(const event_loop& loop) const
+{
+    std::string msg;
+
+    // Only what was actually asked for is checked.  A runtime created without
+    // either flag takes the ring it is given and is told nothing about it —
+    // there is no request to disappoint.
+    const bool want_sqpoll = get_sqpoll();
+    if (has_sqpoll_request() && want_sqpoll != loop.sqpoll_enabled())
+    {
+        msg += want_sqpoll
+             ? "--sqpoll: this runtime shares a ring that was created without a "
+               "submission poller.\n"
+               "  A ring's polling mode is fixed when the ring is created, and this "
+               "one exists already.\n"
+               "  Start the daemon with --sqpoll (or SOCKETLEY_SQPOLL=1) to give "
+               "every runtime in it a poller.\n"
+             : "--no-sqpoll: this runtime shares a ring that was created with a "
+               "submission poller.\n"
+               "  A ring's polling mode is fixed when the ring is created, and this "
+               "one exists already.\n"
+               "  Start the daemon with --no-sqpoll (and without SOCKETLEY_SQPOLL) "
+               "to drop the poller.\n";
+    }
+
+    const cpu_set_spec& want = get_cpus();
+    const cpu_set_spec& have = loop.cpus();
+    if (has_cpus_request() &&
+        (want.all != have.all || (!want.all && want.mask != have.mask)))
+    {
+        msg += "--cpus " + want.to_string() + ": this runtime's I/O thread is "
+               "already pinned to " + have.to_string() + ".\n"
+               "  One thread cannot be in two places, and every runtime in this "
+               "daemon shares it.\n"
+               "  Start the daemon with --cpus " + want.to_string()
+             + " (or SOCKETLEY_CPUS=" + want.to_string() + ") to move all of them.\n";
+    }
+
+    return msg;
+}
 
 void runtime_instance::set_runtime_manager(runtime_manager* mgr) { m_runtime_manager = mgr; }
 void runtime_instance::set_event_loop(event_loop* loop) { m_event_loop = loop; }

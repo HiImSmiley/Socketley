@@ -420,6 +420,14 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
     cfg.out_of_process = instance->is_out_of_process();
+    // Only a request that was actually made is written.  Storing the default
+    // value of a flag nobody typed would turn every plain `create` into an
+    // explicit --no-sqpoll on the next restart, and a runtime that asked for
+    // nothing would start being refused by a daemon whose ring carries a poller.
+    if (instance->has_cpus_request())
+        cfg.cpus = instance->get_cpus().to_string();
+    cfg.sqpoll_set = instance->has_sqpoll_request();
+    cfg.sqpoll = instance->get_sqpoll();
     cfg.external_runtime = instance->is_external();
     if (cfg.external_runtime)
     {
@@ -592,6 +600,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_int_field("child_policy", cfg.child_policy);
     if (cfg.out_of_process)
         append_bool_field("out_of_process", true);
+    if (!cfg.cpus.empty())
+        append_str_field("cpus", cfg.cpus);
+    // Written for both values and omitted only when nothing was asked for, so
+    // that absence and `false` stay distinguishable in the file itself.  Every
+    // other boolean here is written only when true, which is fine for a flag
+    // whose absence and whose false mean the same thing; this one's do not.
+    if (cfg.sqpoll_set)
+        append_bool_field("sqpoll", cfg.sqpoll);
     if (cfg.external_runtime)
     {
         append_bool_field("external_runtime", true);
@@ -735,6 +751,16 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
     cfg.out_of_process = json_get_bool(json, "out_of_process");
+    cfg.cpus = json_get_string(json, "cpus");
+    // Read through json_get_string rather than json_get_bool: the question here
+    // is whether the key is there at all, and json_get_bool answers false to
+    // both "absent" and "false".  Anything that is neither spelling reads as no
+    // request, which is what a file hand-edited into nonsense should get.
+    {
+        const std::string v = json_get_string(json, "sqpoll");
+        cfg.sqpoll_set = (v == "true" || v == "false");
+        cfg.sqpoll = (v == "true");
+    }
     cfg.external_runtime = json_get_bool(json, "external_runtime");
     cfg.managed = json_get_bool(json, "managed");
     cfg.exec_path = json_get_string(json, "exec_path");
