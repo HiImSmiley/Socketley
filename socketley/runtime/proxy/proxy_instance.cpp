@@ -61,6 +61,30 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
     return !host.empty() && port != 0;
 }
 
+// "The ring still owes this half a completion."
+//
+// One statement of it, used by everything that has to answer the question:
+// whether a half-closed client may be held for its answer, and whether a
+// teardown may be deferred until a completion finishes it.  Both are promises
+// that something will come back, and a promise nothing keeps is how a pair ends
+// up holding its descriptors until the runtime stops.
+//
+// Deliberately the same predicate inv_check_pair asserts on — see
+// shared/invariants.h.  The invariant is the specification for these two; if
+// they ever disagree with it, they are the ones that are wrong.
+static inline bool client_op_in_flight(const proxy_client_connection* c)
+{
+    return c->read_pending || c->write_pending || c->zc_notif_pending ||
+           c->splice_in_pending || c->splice_out_pending || c->connect_pending ||
+           c->abort_watch_pending;
+}
+
+static inline bool backend_op_in_flight(const proxy_backend_connection* b)
+{
+    return b->read_pending || b->write_pending || b->zc_notif_pending ||
+           b->splice_in_pending || b->splice_out_pending;
+}
+
 // Socket buffer sizes: 256KB gives good throughput for bulk transfers
 static constexpr int SOCK_BUF_SIZE = 256 * 1024;
 
@@ -1880,6 +1904,66 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             return;
         }
 
+        // A zero-length completion is end of stream only when the socket is
+        // actually drained.  IORING_CQE_F_SOCK_NONEMPTY says the opposite: the
+        // multishot recv ended while data is still queued.  Treating that as
+        // EOF tears the connection down under a client that is still writing,
+        // and its next write fails for data the proxy simply never collected.
+        if (cqe->res == 0 && (cqe->flags & IORING_CQE_F_SOCK_NONEMPTY) && !conn->closing)
+        {
+            SKL_TRACE_ADD(conn, multishot_ends, 1);
+            if (!conn->read_pending)
+                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot,
+                                                       m_use_provided_bufs, BUF_GROUP_ID)))
+                {
+                    close_pair(fd, conn->backend_fd);
+                    return;
+                }
+            return;
+        }
+
+        // A clean EOF from the client means it will send no more — not that we
+        // may throw away what it already sent, or the answer to it.  The
+        // request is at the backend, or on its way there; whatever it does
+        // there HAPPENS, and closing the pair here is the one outcome the
+        // client cannot act on.  It has shut down its write side only: it is
+        // still reading, and the answer still has somewhere to go.
+        //
+        // What bounds the hold:
+        //
+        //   * it is the request's bound, not a new one.  A request that has
+        //     reached connect_to_backend is being timed by --backend-timeout
+        //     from that moment, half-close or no half-close, and
+        //     response_deadline_sweep answers it 502/504 and closes when that
+        //     expires.  This connection is held no longer than one that never
+        //     half-closed at all;
+        //   * no read is re-armed, so a client cannot buy time with a FIN.  It
+        //     gets the answer to the request already in flight and nothing
+        //     else: reset_client_for_next_request closes rather than waiting
+        //     for a second request that by definition cannot come;
+        //   * and it is held only while the pair is REACHABLE — while the
+        //     connect or the backend still owes a completion.  Without that
+        //     test this branch would be the very defect it is fixing: a pair
+        //     with nothing in flight, which nothing will ever wake, holding two
+        //     descriptors until the runtime stops.
+        //
+        // TCP mode is deliberately not held: it has no request and no response
+        // to be owed one, and a byte pipe whose client has finished writing has
+        // nothing left to be told.
+        if (cqe->res == 0 && !conn->closing && m_protocol == protocol_http)
+        {
+            const proxy_backend_connection* b = nullptr;
+            if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
+                m_conn_idx[conn->backend_fd].side == conn_backend)
+                b = m_conn_idx[conn->backend_fd].backend;
+
+            if (conn->connect_pending || (b && backend_op_in_flight(b)))
+            {
+                conn->client_eof = true;
+                return;
+            }
+        }
+
         close_pair(fd, conn->backend_fd);
         return;
     }
@@ -1902,35 +1986,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             uint16_t buf_id_rl = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
             m_loop->return_buf(BUF_GROUP_ID, buf_id_rl);
         }
-        // A zero-length completion is end of stream only when the socket is
-        // actually drained.  IORING_CQE_F_SOCK_NONEMPTY says the opposite: the
-        // multishot recv ended while data is still queued.  Treating that as
-        // EOF tears the connection down under a client that is still writing,
-        // and its next write fails for data the proxy simply never collected.
-        if (cqe->res == 0 && (cqe->flags & IORING_CQE_F_SOCK_NONEMPTY) && !conn->closing)
-        {
-            SKL_TRACE_ADD(conn, multishot_ends, 1);
-            if (!conn->read_pending)
-                if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
-                {
-                    close_pair(fd, conn->backend_fd);
-                    return;
-                }
-            return;
-        }
-
-        // A clean EOF from the client means it will send no more — not that we
-        // may throw away what it already sent.  With the backend connect still
-        // in flight the whole payload sits in saved_request, and tearing down
-        // here discards it silently: the client's writes all succeeded, and the
-        // backend never sees a byte.  Hold the connection until the connect
-        // completes and handle_connect has forwarded it.
-        if (cqe->res == 0 && conn->connect_pending && !conn->saved_request.empty())
-        {
-            conn->client_eof = true;
-            return;
-        }
-
+        // The end-of-stream tests used to be written out here as well, and they
+        // could not fire: every path out of the `cqe->res <= 0` block above
+        // returns, so `res` is positive by construction from here down and
+        // `res == 0` is not a condition this branch can meet.  They are stated
+        // once now, in the block that sees a zero-length completion.
         close_pair(fd, conn->backend_fd);
         return;
     }
@@ -5255,6 +5315,30 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                     defer = false;
                 else
                     shutdown(backend_fd, SHUT_RD);
+
+                // And a flush that reported success is not the same as a
+                // completion on its way.  On a TLS leg whose handshake never
+                // finished, tls_flush holds the application data back on
+                // purpose — a request handed to an SSL that would answer
+                // WANT_READ is a request nobody can say was sent — and returns
+                // true with the queue untouched and nothing submitted.  The
+                // deferral was then a promise nothing keeps: the queue is only
+                // ever flushed from inside a completion handler, no completion
+                // is coming, so those bytes never go out and this descriptor is
+                // held until the runtime stops.  That is the state
+                // SKL_INV_PAIR names — "nothing in flight on either half, this
+                // pair will never be woken again" — and it was reachable from
+                // any backend torn down mid-handshake with a request queued
+                // behind it.
+                //
+                // So the test is what the invariant tests, and not what the
+                // flush returned.  When nothing is in flight the queue can no
+                // longer drain and holding the descriptor buys nobody
+                // anything; the teardown below is the honest outcome, and it is
+                // the same one this function already reaches when the flush
+                // fails outright.
+                if (defer && !backend_op_in_flight(bconn))
+                    defer = false;
             }
             if (!defer)
             {
@@ -5305,6 +5389,11 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                             defer2 = false;
                         else
                             shutdown(conn->backend_fd, SHUT_RD);
+
+                        // Same rule as the block above: a deferral is only
+                        // honest while a completion is actually owed.
+                        if (defer2 && !backend_op_in_flight(bconn2))
+                            defer2 = false;
                     }
                     if (!defer2)
                     {
@@ -5362,6 +5451,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                     defer_c = false;
                 else
                     shutdown(client_fd, SHUT_RD);
+
+                // Same rule as the two backend blocks above, with the peer's
+                // splice counted in: it names this descriptor and its
+                // completion is what makes the number safe to give away, so it
+                // is as good a reason to wait as one of this connection's own.
+                if (defer_c && !client_op_in_flight(conn) && !peer_splicing_into_client)
+                    defer_c = false;
             }
             if (!defer_c)
             {
@@ -5669,6 +5765,25 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
 
 void proxy_instance::reset_client_for_next_request(proxy_client_connection* cconn)
 {
+    // There is no next request.  The client half-closed its write side during
+    // this exchange, which says exactly that, and handle_client_read held the
+    // pair open so this answer could be finished rather than thrown away.  It
+    // has been: every caller of this function reaches it with the response
+    // already forwarded or queued.  So the hold ends here — close_pair defers
+    // on whatever is still in flight and on whatever is still in the write
+    // queue, so the tail of the answer goes out first.
+    //
+    // This is what keeps the hold bounded on the happy path: the connection is
+    // not put back into the keep-alive pool to wait for a second request that
+    // by definition cannot come, and no read is armed on it that would let it
+    // sit there.
+    if (SOCKETLEY_UNLIKELY(cconn->client_eof) && cconn->fd >= 0)
+    {
+        cconn->closing = true;
+        close_pair(cconn->fd, cconn->backend_fd);
+        return;
+    }
+
     cconn->header_parsed = false;
     cconn->response_started = false;
     // The exchange this connection was being timed for is over.  The next
@@ -6242,11 +6357,23 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    // The client had already half-closed while this connect was in flight.  Now
-    // that its payload is on its way, pass the half-close on rather than leaving
-    // the pair open waiting for a client that will never write again.
-    if (conn->client_eof)
-        shutdown(bfd, SHUT_WR);
+    // The client had already half-closed while this connect was in flight, and
+    // its payload has just been queued for the backend above.  What used to
+    // stand here was `shutdown(bfd, SHUT_WR)` — passing the half-close on — and
+    // it must not: forward_to_backend only PREPARES the send, and nothing
+    // reaches the kernel until this completion round submits.  A FIN issued
+    // here is a syscall, so it overtakes the request it is supposed to
+    // terminate; the backend gets an empty stream and the send that follows it
+    // fails EPIPE.  That is the same loss this whole path exists to prevent,
+    // reintroduced one line further along.
+    //
+    // Nor is it needed.  A request only reaches a backend after
+    // parse_http_request_line has proved its framing gives exactly one answer
+    // to "how long is the body" — Content-Length or chunked, never both, never
+    // twice — so the backend knows where the request ends without being told.
+    // client_eof is read where it changes an outcome instead: the connection
+    // gets the answer to this request and is then closed rather than kept alive
+    // for a second one, in reset_client_for_next_request.
 }
 
 void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* req)

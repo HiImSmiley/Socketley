@@ -1232,6 +1232,24 @@ void client_send(world& w, int idx, int shape)
     if (c.fd < 0)
         return;
 
+    // A client that has shut down its own write side cannot send, and the
+    // failure says nothing about the far end.  send() on a socket with
+    // SEND_SHUTDOWN returns EPIPE from the local kernel before the peer is ever
+    // consulted — so the branch below, which reads EPIPE as "the proxy closed
+    // this connection", was reporting a close that had not happened.  It agreed
+    // with the truth only for as long as the proxy really did tear a
+    // half-closed client down; against a proxy that correctly holds the
+    // connection for its answer it fires on every program of the shape
+    // "request, FIN, request".
+    //
+    // Nothing is lost by not sending: a real client does not write after its
+    // own FIN, and the peer-close this oracle is about is still observed
+    // directly, by client_recv, which run_step calls for every client after
+    // every step and which reports on a recv of 0 or a reset.  That is the far
+    // end saying so, rather than this side inferring it from its own state.
+    if (c.fin_sent)
+        return;
+
     static std::string buf;
     const int whole = build_request(shape, idx, buf);
 

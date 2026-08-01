@@ -368,25 +368,22 @@ jobs:
         #     low, the refusal reported as a success); they are here so those
         #     stay fixed.
         #
-        # KNOWN RED 2026-08-01: fuzz_proxy_ops.  One finding left demoted below,
-        # so the target runs past it looking for the next one.  It has a seed in
-        # test/fuzz/corpus/proxy that reproduces it on its own in well under a
-        # second, and the id comes off this list the day the defect is fixed —
-        # an id left here after the fix silences the check that would catch it
-        # coming back.
+        # fuzz_proxy_ops: all four findings this target raised against the tree
+        # on 2026-08-01 are fixed, and FUZZ_PROXY_SKIP is empty for that reason.
+        # Each seed stays in test/fuzz/corpus/proxy, so each defect has a check
+        # that would catch it coming back — which is the whole reason an id
+        # comes off this list the day its defect goes rather than being left
+        # behind to silence it.  What each one was, in the order they were found:
         #
-        #   answer-lost-to-a-half-close
-        #     Seed: proxy/client_fin_after_a_whole_request.  A client sends a
-        #     whole request and then shutdown(SHUT_WR); the proxy tears the pair
-        #     down without answering, although the request is already at the
-        #     backend.  The cause is dead code: handle_client_read returns from
-        #     its `cqe->res <= 0` block before the two guards added in 05c5a95
-        #     — the IORING_CQE_F_SOCK_NONEMPTY re-arm and the `client_eof` hold
-        #     — which sit further down inside the *global rate limit* branch,
-        #     where res is positive by construction.  So conn->client_eof is
-        #     never set anywhere, and the code in handle_connect that reads it
-        #     never runs.  Both guards have been unreachable since the commit
-        #     that wrote them.
+        #   answer-lost-to-a-half-close — FIXED, and off this list with the fix.
+        #     handle_client_read stated its two end-of-stream guards inside the
+        #     global rate limit branch, where res is positive by construction,
+        #     so neither could ever run; they are stated once now, in the block
+        #     that actually sees a zero-length completion.  A client that
+        #     half-closes after a whole request is held for its answer while the
+        #     pair is still reachable, and closed after it.  Seed:
+        #     proxy/client_fin_after_a_whole_request, which now runs clean and
+        #     fails again the moment either guard is put back where it was.
         #
         #   crosstalk
         #     Fixed 2026-08-01, and off this list for that reason.  The liveness
@@ -411,9 +408,9 @@ jobs:
         #     proxy/response_with_a_tail, stays in the corpus.
         #
         # STILL RED ON MUTATION, AND NOT FOR A DEFECT.  The whole seed corpus
-        # replays clean with only the id above demoted.  Mutation past it does
-        # not, and what it reaches are three shapes where the oracle is stated
-        # over the harness's *own* backend while the program decides
+        # replays clean with nothing demoted at all.  Blind mutation past it
+        # does not, and what it reaches are three shapes where the oracle is
+        # stated over the harness's *own* backend while the program decides
         # independently when that backend reads and when it answers.  Written
         # down here so the next person recognises them instead of re-diagnosing
         # them; none is demoted, because a demoted id would also silence the
@@ -440,6 +437,18 @@ jobs:
         #     that arrived *before* its unfinished response was written, and
         #     notes it at read time rather than at arrival time.
         #
+        # AND ONE THAT IS NOT DIAGNOSED, so do not assume it belongs in the list
+        # above.  client-closed-without-answer, in the shape WITHOUT a
+        # half-close: the backend connect is refused and the client is torn down
+        # with nothing written to it.  Reached by mutation and confirmed to fire
+        # identically on an unmodified build, so it predates both 2026-08-01
+        # fixes and neither caused it.  It is the same id 84d624c and 984dadc
+        # were written for, in the error-answer path rather than the deadline or
+        # the pool, and whether the proxy owes a 502 there has not been settled.
+        # Not demoted: an id demoted for an undiagnosed shape silences every
+        # other shape it covers, and this id covers the loss those two commits
+        # fixed.
+        #
         # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
         # one of the harness's checks: it is socketley/shared/invariants.h
         # aborting on its own account, and SKL_INV_PAIR has no id and no
@@ -450,22 +459,22 @@ jobs:
         #     | a: fd=-1 present=0 queued=0 closing=0
         #     | b: fd=11 present=1 queued=1 closing=1
         #
-        # A backend half that is closing with bytes still in its write queue and
-        # nothing at all in flight: no completion is coming, so the queue never
-        # goes out and the descriptor is held until the runtime stops.  It
-        # reproduces only in the clang build, because that is the one that
-        # defines SOCKETLEY_INVARIANTS — the GCC replay half of the same target
-        # runs the same input clean.  Consequence, until it is fixed: the
-        # libFuzzer half of fuzz_proxy_ops aborts on this input.  The only lever
-        # that exists is -DSOCKETLEY_INVARIANTS_WARN_ONLY at build time, and it
-        # would take the same assertions out of fuzz_server_ops and
-        # fuzz_client_ops as well, which is a worse trade than a red job — so it
-        # is deliberately NOT set here.
+        # FIXED.  close_pair deferred a teardown on the strength of what the
+        # flush returned rather than on whether anything had actually reached
+        # the ring: on a TLS leg whose handshake never finished, tls_flush holds
+        # the application data back and reports success, so the pair was left
+        # closing with a queue that nothing would ever drain.  The deferral is
+        # now conditional on a completion really being owed — the same predicate
+        # the invariant asserts — so a queue that can no longer drain is torn
+        # down instead of held.  There is nothing to demote here and there never
+        # was: -DSOCKETLEY_INVARIANTS_WARN_ONLY is the only lever that exists,
+        # it would take the same assertions out of fuzz_server_ops and
+        # fuzz_client_ops with it, and it stays deliberately unset.
         env:
           FUZZ_SEED: ${{ github.run_number }}
           FUZZ_SMUGGLING: "1"
           REQUIRE_LIBFUZZER: "1"
-          FUZZ_PROXY_SKIP: "answer-lost-to-a-half-close"
+          FUZZ_PROXY_SKIP: ""
         run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
         timeout-minutes: 60
 
