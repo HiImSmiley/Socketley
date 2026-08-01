@@ -245,6 +245,7 @@ void proxy_client_connection::reset(int new_fd)
     backend_idx = 0;
     saved_request.clear();
     SKL_TRACE_RESET(*this);
+    SKL_INV_RESET(*this);
     client_eof = false;
     backend_from_group = false;
     backend_host.clear();
@@ -264,6 +265,7 @@ void proxy_client_connection::reset(int new_fd)
 void proxy_backend_connection::reset(int new_fd)
 {
     SKL_TRACE_RESET(*this);
+    SKL_INV_RESET(*this);
     // Process-wide, not a per-struct count: both check sites resolve the struct
     // by descriptor first, so a per-struct counter is compared against a
     // different object's value once a descriptor moves between structs — and
@@ -1288,6 +1290,10 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
     const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
                         req->type == op_timeout || req->type == op_health_check)
                        ? -1 : req->fd;
+    // For the same reason, and one more: cqe is the loop's and is not promised
+    // to outlive the handler either.
+    const int     inv_res  = cqe->res;
+    const uint8_t inv_type = static_cast<uint8_t>(req->type);
 #endif
 
     switch (req->type)
@@ -1458,6 +1464,11 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 
 #ifdef SOCKETLEY_INVARIANTS
     inv_check_pair(inv_fd, "proxy::on_cqe");
+    // Charged here rather than inside the handlers, because the subject is the
+    // completion and not what any one handler chose to do with it: a loop that
+    // returns early down a path nobody instrumented is exactly the loop this is
+    // for.  Every completion this runtime is dispatched, once.
+    inv_check_progress(inv_fd, inv_res, inv_type, "proxy::on_cqe");
     // See inv_sweep_all: the check above can only ever look at the pair this
     // completion named, and says nothing at all when the handler tore that pair
     // down — which is exactly when another one gets stranded.
@@ -1470,6 +1481,12 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 }
 
 #ifdef SOCKETLEY_INVARIANTS
+// Declared here and defined beside handle_client_read, which is the reader that
+// gives it its meaning.  Invariant (1b) has to ask the same question the hold in
+// that function asks, out of the same predicate, or the invariant is not the
+// specification for it.
+static inline bool backend_response_complete(const proxy_backend_connection* bconn);
+
 // Invariant (1) from invariants.h, in the form this runtime takes.  A proxied
 // connection is half of a pair and only the pair can answer the question: a
 // client waiting on its backend's connect or its reply has nothing of its own
@@ -1530,7 +1547,187 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
         b.fd        = bconn->fd;
     }
 
-    SKL_INV_PAIR(where, c, b);
+    // Invariant (1b)'s two terms, and this runtime is the only thing that can
+    // state them.  Both are read out of the exchange and neither out of the
+    // ring — that distinction is the whole of the invariant, because the pair
+    // that leaked passed (1) on the strength of an idle multishot read.
+    //
+    // They are deliberately the SAME two facts handle_client_read decides the
+    // hold on, expressed once each: client_eof is set there and nowhere else,
+    // and answer_owed is the predicate written three lines below where the hold
+    // is taken.  The invariant is the specification and the hold is the
+    // implementation; when they disagree, the hold is the one that is wrong.
+    //
+    // Stated only in HTTP mode.  A TCP pair has no request and no response, so
+    // "an answer is owed" is not a question that can be asked about it — and it
+    // is never held on a half-close either, for the same reason.
+    skl_inv::exchange x{};
+    if (cconn && m_protocol == protocol_http)
+    {
+        x.stated      = true;
+        x.half_closed = cconn->client_eof;
+        x.answer_owed = cconn->connect_pending ||
+                        (bconn && !(cconn->response_started &&
+                                    backend_response_complete(bconn)));
+    }
+
+    SKL_INV_PAIR_X(where, c, b, x);
+}
+
+// Everything about a client connection a caller could observe, folded into one
+// number: how much is buffered awaiting a parse, how much is queued to go out,
+// where the request framing has got to, which backend it is bound to, and every
+// lifecycle flag.  Change any one of them and this changes.
+//
+// The mixing is FNV-1a over the terms rather than a sum, so that two terms
+// moving in opposite directions by the same amount is not a state that reads as
+// unchanged.  Collisions are possible and cost a delayed report, never a false
+// one: the digest is only ever compared with the immediately preceding value of
+// itself on the same connection.
+static inline uint64_t inv_mix(uint64_t h, uint64_t v)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        h ^= (v >> (i * 8)) & 0xFF;
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
+uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    h = inv_mix(h, static_cast<uint64_t>(c->fd));
+    h = inv_mix(h, c->generation);
+    h = inv_mix(h, c->partial.size());
+    h = inv_mix(h, c->write_queue.bytes());
+    h = inv_mix(h, c->write_queue.size());
+    h = inv_mix(h, c->write_batch_count);
+    h = inv_mix(h, c->declared_body_len);
+    h = inv_mix(h, c->body_remaining);
+    h = inv_mix(h, static_cast<uint64_t>(c->backend_fd));
+    h = inv_mix(h, c->backend_idx);
+    h = inv_mix(h, c->backend_port);
+    h = inv_mix(h, static_cast<uint64_t>(c->retries_remaining));
+    h = inv_mix(h, static_cast<uint64_t>(c->connect_fd));
+    h = inv_mix(h, static_cast<uint64_t>(c->tls_state));
+    h = inv_mix(h, c->saved_request.size());
+    h = inv_mix(h, c->method.size() + c->path.size() + c->version.size());
+
+    // One word of flags.  A flag that flips and flips back between two
+    // completions is invisible to this and says so in the header: the digest
+    // compares against the previous value, not against a history.
+    uint64_t f = 0;
+    f |= uint64_t(c->read_pending)          << 0;
+    f |= uint64_t(c->write_pending)         << 1;
+    f |= uint64_t(c->closing)               << 2;
+    f |= uint64_t(c->zc_notif_pending)      << 3;
+    f |= uint64_t(c->splice_active)         << 4;
+    f |= uint64_t(c->splice_in_pending)     << 5;
+    f |= uint64_t(c->splice_out_pending)    << 6;
+    f |= uint64_t(c->header_parsed)         << 7;
+    f |= uint64_t(c->response_started)      << 8;
+    f |= uint64_t(c->client_conn_close)     << 9;
+    f |= uint64_t(c->tls_peer_closed)       << 10;
+    f |= uint64_t(c->declared_body_chunked) << 11;
+    f |= uint64_t(c->body_unbounded)        << 12;
+    f |= uint64_t(c->connect_reattempted)   << 13;
+    f |= uint64_t(c->client_eof)            << 14;
+    f |= uint64_t(c->backend_from_group)    << 15;
+    f |= uint64_t(c->connect_pending)       << 16;
+    f |= uint64_t(c->abort_watch_pending)   << 17;
+    f |= uint64_t(c->awaiting_response)     << 18;
+    f |= uint64_t(c->awaiting_headers)      << 19;
+    f |= uint64_t(c->ssl != nullptr)        << 20;
+    return inv_mix(h, f);
+}
+
+uint64_t proxy_instance::inv_digest(const proxy_backend_connection* b)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    h = inv_mix(h, static_cast<uint64_t>(b->fd));
+    h = inv_mix(h, b->generation);
+    h = inv_mix(h, b->partial.size());
+    h = inv_mix(h, b->write_queue.bytes());
+    h = inv_mix(h, b->write_queue.size());
+    h = inv_mix(h, b->write_batch_count);
+    h = inv_mix(h, static_cast<uint64_t>(b->client_fd));
+    h = inv_mix(h, static_cast<uint64_t>(b->tls_state));
+    h = inv_mix(h, b->pool_backend_idx);
+    h = inv_mix(h, b->pool_port);
+    // The response frame is this half's whole notion of "further on than it
+    // was": body_remaining counts down as the answer arrives, and the rest of
+    // it changes exactly once per response.
+    h = inv_mix(h, b->http_frame.body_remaining);
+    h = inv_mix(h, b->http_frame.status_code);
+    h = inv_mix(h, b->http_frame.interim_blocks);
+
+    uint64_t f = 0;
+    f |= uint64_t(b->read_pending)                   << 0;
+    f |= uint64_t(b->write_pending)                  << 1;
+    f |= uint64_t(b->closing)                        << 2;
+    f |= uint64_t(b->zc_notif_pending)               << 3;
+    f |= uint64_t(b->splice_active)                  << 4;
+    f |= uint64_t(b->splice_in_pending)              << 5;
+    f |= uint64_t(b->splice_out_pending)             << 6;
+    f |= uint64_t(b->pool_draining)                  << 7;
+    f |= uint64_t(b->pool_abandoned)                 << 8;
+    f |= uint64_t(b->tls_peer_closed)                << 9;
+    f |= uint64_t(b->http_frame.headers_parsed)      << 10;
+    f |= uint64_t(b->http_frame.has_content_length)  << 11;
+    f |= uint64_t(b->http_frame.conn_close)          << 12;
+    f |= uint64_t(b->http_frame.chunked)             << 13;
+    f |= uint64_t(b->http_frame.no_body)             << 14;
+    f |= uint64_t(b->http_frame.transfer_encoding)   << 15;
+    f |= uint64_t(b->http_frame.response_bytes_seen) << 16;
+    f |= uint64_t(b->http_frame.unknown)             << 17;
+    f |= uint64_t(b->ssl != nullptr)                 << 18;
+    return inv_mix(h, f);
+}
+
+// Invariant (3) from invariants.h, in the form this runtime takes.
+//
+// The ledger is charged to the half the completion named, not to the pair.  A
+// client parked while its backend answers receives no completions at all, so it
+// accrues nothing and cannot be suspected; the half that is being completed over
+// and over is the half that has to justify it.
+void proxy_instance::inv_check_progress(int fd, int res, uint8_t type, const char* where)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+
+    // Only the operations that carry traffic report a byte count in res.  A
+    // poll answers with a revents mask and a connect with nought, and counting
+    // either as bytes moved would be a connection excused from the invariant for
+    // the wrong reason.
+    uint64_t bytes = 0;
+    if (res > 0)
+    {
+        switch (type)
+        {
+            case op_read:  case op_read_provided: case op_recv_multishot:
+            case op_write: case op_writev:        case op_send_zc:
+            case op_splice:
+                bytes = static_cast<uint64_t>(res);
+                break;
+            default:
+                break;
+        }
+    }
+
+    const auto& entry = m_conn_idx[fd];
+    if (entry.side == conn_client)
+    {
+        auto* c = entry.client;
+        SKL_INV_PROGRESS(where, c->pr, inv_digest(c), bytes, c->fd, io_op_name(type), res);
+    }
+    else if (entry.side == conn_backend)
+    {
+        auto* b = entry.backend;
+        SKL_INV_PROGRESS(where, b->pr, inv_digest(b), bytes, b->fd, io_op_name(type), res);
+    }
+    // Anything else is a connection the handler has just torn down.  There is
+    // nothing left to make progress, and the ledger went with the struct.
 }
 
 void proxy_instance::inv_sweep_all(const char* where)

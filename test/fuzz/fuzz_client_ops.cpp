@@ -686,6 +686,7 @@ void init_once()
 
     fuzzrt::skip_env() = "FUZZ_CLIENT_SKIP";
     fuzzrt::print_program_hook() = print_program;
+    fuzzrt::adopt_invariant_reports();
 }
 
 } // namespace

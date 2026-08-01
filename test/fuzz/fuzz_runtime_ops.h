@@ -59,6 +59,16 @@
 //     check fires at the moment of the push and the walk catches a struct that
 //     became unsafe afterwards.
 //
+//     That header states three more properties beside this one — reachability
+//     over a pair, the sharpening of it that says reachable is not the same as
+//     making progress, and the conservation law that catches a loop turning
+//     without moving anybody's traffic.  Which of them a given target is exposed
+//     to is the runtime's decision, not this header's: a runtime opts in by
+//     stating its own terms, and the server and the client state none of the new
+//     ones.  They abort on their own account rather than through RT_FINDING, so
+//     no SKIP variable reaches them; adopt_invariant_reports() below is what
+//     gives their aborts the decoded program.
+//
 // ─── TRIAGE ─────────────────────────────────────────────────────────────────
 //
 // On a violation the raw bytes say nothing, so the report prints the decoded
@@ -84,6 +94,7 @@
 #include "fuzz_common.h"
 #include "shared/event_loop.h"
 #include "shared/event_loop_definitions.h"
+#include "shared/invariants.h"
 
 namespace fuzzrt {
 
@@ -100,6 +111,30 @@ inline void (*&print_program_hook())()
 {
     static void (*fn)() = nullptr;
     return fn;
+}
+
+// Give the product's own invariants the same printer.
+//
+// socketley/shared/invariants.h aborts on its own account — invariant 4 is
+// literally one of its checks, and two more were added for the loop and the
+// held-and-not-owed pair that 2026-08-01 turned up.  Until now that abort landed
+// as a message with no decoded program behind it, which the nightly has carried
+// as a standing note since found-55a07a18: the operator could read what was
+// violated and had no way to reproduce it.  These are the invariants these
+// targets are built to assert, so a violation of one should report like a
+// violation of one of the harness's own.
+//
+// Adds output and takes nothing away: the hook cannot stop the abort, and the
+// only lever that can is still SOCKETLEY_INVARIANTS_WARN_ONLY, which is still
+// deliberately unset.  Call after print_program_hook() has been set.
+inline void adopt_invariant_reports()
+{
+#ifdef SOCKETLEY_INVARIANTS
+    ::skl_inv::pre_abort_hook() = [] {
+        if (print_program_hook())
+            print_program_hook()();
+    };
+#endif
 }
 
 inline bool finding_suppressed(const char* id)

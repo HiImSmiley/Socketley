@@ -17,6 +17,7 @@
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/tls_context.h"
 #include "../../shared/trace.h"
+#include "../../shared/invariants.h"
 #include "http_response_framing.h"
 
 class runtime_manager;
@@ -249,6 +250,7 @@ struct alignas(64) proxy_client_connection
     std::chrono::steady_clock::time_point header_deadline{};
 
     SKL_TRACE_FIELD(tr)
+    SKL_INV_FIELD(pr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -350,6 +352,7 @@ struct alignas(64) proxy_backend_connection
     uint16_t pool_port{0};
 
     SKL_TRACE_FIELD(tr)
+    SKL_INV_FIELD(pr)
 
     // 64KB read buffer — at the END to keep hot fields in first cache lines
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -696,6 +699,14 @@ private:
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
     void inv_check_pair(int fd, const char* where);
+    // Invariant (3), charged to the connection this completion named.  `res` and
+    // `type` are the completion's, read before the dispatch that may free the
+    // request they came from.
+    void inv_check_progress(int fd, int res, uint8_t type, const char* where);
+    // Everything about one half that a caller could observe, folded into one
+    // number.  Two of these, because the two halves keep different books.
+    static uint64_t inv_digest(const proxy_client_connection* c);
+    static uint64_t inv_digest(const proxy_backend_connection* b);
     // Every pair the runtime still holds, not just the one a completion named.
     // A completion names one connection, and when its handler tears that
     // connection down the per-completion check finds an empty slot and says

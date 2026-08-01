@@ -64,6 +64,38 @@
 //     bytes are well formed, the framing is correct, and they are simply the
 //     wrong bytes.
 //
+// ─── AND THE THREE IT INHERITS FROM THE PRODUCT ─────────────────────────────
+//
+// socketley/shared/invariants.h states three properties of its own and this
+// target is built with SOCKETLEY_INVARIANTS, so they are live here and they
+// abort on their own account rather than through RT_FINDING.  Two of the three
+// were written on 2026-08-01 for defects this target could reach and could not
+// see, and they are the reason a run of this file is worth more than the sum of
+// the checks written below:
+//
+//   (1) / (1b) REACHABILITY AND PROGRESS-REACHABILITY, over a pair.  (1) is old:
+//     nothing in flight on either half means no completion is coming.  (1b) is
+//     the sharpening 6f7b9e2 proved was needed — a client that has half-closed
+//     and is owed no answer is dead however much the ring has armed on its
+//     backend, because a backend's idle multishot read completes only if the
+//     backend sends, and a backend with no request outstanding never does.  That
+//     is the 26-connection leak, and every functional check in this file passed
+//     while it happened.
+//
+//   (3) PROGRESS.  Completions charged to a connection must be matched by
+//     observable change on it — bytes the kernel confirmed, or the connection's
+//     own state moving.  The end-of-stream re-arm that reached 1,352,398
+//     iterations on one connection violated nothing else anywhere: no byte was
+//     lost, no framing was wrong, and this target ran it and reported a clean
+//     execution.
+//
+// Their aborts print the decoded program, the same as a finding below —
+// fuzzrt::adopt_invariant_reports() in init_once() is what arranges that.  They
+// have no ids and FUZZ_PROXY_SKIP cannot demote them, which is deliberate: the
+// only lever over them is -DSOCKETLEY_INVARIANTS_WARN_ONLY, it would take the
+// same assertions out of fuzz_server_ops and fuzz_client_ops with it, and it
+// stays unset.
+//
 // ─── WHAT IS REAL HERE AND WHAT IS NOT ──────────────────────────────────────
 //
 // Everything on the wire.  One process-wide event_loop with a real ring, a real
@@ -2345,6 +2377,11 @@ void init_once()
 
     fuzzrt::skip_env() = "FUZZ_PROXY_SKIP";
     fuzzrt::print_program_hook() = print_program;
+    // Three of the checks this target runs on are the product's own — invariant
+    // 4 at the moment of a pool push, and the two in invariants.h that state
+    // reachability and progress over a pair.  This is what makes their aborts
+    // reproducible rather than merely readable.
+    fuzzrt::adopt_invariant_reports();
 }
 
 } // namespace
