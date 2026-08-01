@@ -120,12 +120,33 @@ assert_eq "$RESULT" "ok" "cache set via server"
 RESULT=$(send_cmd 'cache get user')
 assert_eq "$RESULT" "alice" "cache get via server"
 
-# Test: Regular message (not cache command) doesn't return cache error
-# A plain message should be broadcast, not interpreted as cache command
-TOTAL=$((TOTAL+1))
-RESULT=$(echo "hello" | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r') || true
-# No error expected — broadcast returns nothing to sender typically
-PASS=$((PASS+1))
+# Test: a plain message is broadcast, not interpreted as a cache command.
+#
+# This was three lines that counted a pass and asserted nothing:
+#
+#     TOTAL=$((TOTAL+1))
+#     RESULT=$(echo "hello" | nc … )        <- captured, then never read
+#     PASS=$((PASS+1))                      <- unconditional
+#
+# `1/1 OK` for as long as the file has existed, and the only thing it could ever
+# have established is that execution reached line 128.  Writing it as
+# `assert_eq "$RESULT" ""` would not have been a fix either: what a plain message
+# returns to its sender is nothing, so the expectation is empty, and a dead
+# server, an unbound port and a crashed nc all produce that too.
+#
+# The claim needs an oracle that only the intended behaviour satisfies, so the
+# plain message is followed down the SAME connection by a cache command whose
+# answer is known.  One line comes back, and it is the cache's:
+#
+#   * if 'hello' were interpreted as a cache command, its error would come back
+#     first and the reply would be two lines, not one
+#   * if nothing served the connection, nothing comes back and 'alice' — which
+#     is not the empty string — is not what was got
+#
+# so the assertion is red for the failure it is named after and red for the
+# probe not having run, and those are different messages.
+RESULT=$(printf 'hello\ncache get user\n' | nc -q 1 127.0.0.1 "$SERVER_PORT" 2>/dev/null | tr -d '\r') || true
+assert_eq "$RESULT" "alice" "a plain message is not answered as a cache command"
 
 # Test: Verify the key is also accessible directly on the cache port
 #

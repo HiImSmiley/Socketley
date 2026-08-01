@@ -66,6 +66,124 @@ assert_contains() {
     fi
 }
 
+# mesh_counter RUNTIME FIELD
+#
+# One numeric field out of `stats`, or the empty string when the runtime is not
+# there or the daemon did not answer.  Deliberately not 0 in that case: 0 is a
+# legitimate reading of every counter here, and "there was nothing to read" must
+# not compare equal to it — that substitution is how the checks below would go
+# back to passing for the wrong reason.
+mesh_counter() {
+    local v
+    v=$("$BIN" stats "$1" 2>/dev/null | sed -n "s/^$2:\([0-9][0-9]*\)$/\1/p" | head -1) || v=""
+    printf '%s' "$v"
+}
+
+# mesh_sum_bytes_in RUNTIME...
+#
+# Combined bytes_in over the named backends, or the empty string if any one of
+# them could not be read.  Summed because round-robin picks the backend and
+# either choice is a pass; a partial sum is not a smaller number, it is no
+# measurement, and it says so.
+mesh_sum_bytes_in() {
+    local total=0 rt v
+    for rt in "$@"; do
+        v=$(mesh_counter "$rt" bytes_in)
+        if [ -z "$v" ]; then printf ''; return 0; fi
+        total=$((total + v))
+    done
+    printf '%s' "$total"
+}
+
+# assert_proxy_served PROXY PORT PAYLOAD LABEL BACKEND...
+#
+# ─── What the old check could not tell apart ────────────────────────────────
+#
+#     RC=0
+#     REPLY=$(echo "hello mesh" | nc -q 1 127.0.0.1 "$PROXY_PORT" 2>/dev/null) || RC=$?
+#     if [ "$RC" -eq 0 ]; then PASS=$((PASS+1)); …
+#
+# $REPLY was captured and never read, so the entire assertion was nc's exit
+# status — which is 0 for anything at all that accepts a TCP connection on that
+# port.  It passed, in a staged run, against another agent's port-holder: a
+# python process that accepted the connection and did nothing else.  A proxy
+# whose backends were all down, or a create that was refused while a stranger
+# held the port, are the same 0.  Connecting is not the claim.
+#
+# The claim is that the *mesh proxy* served it and forwarded it to a *mesh
+# backend*, so the oracle is this daemon's own counters, which nothing outside
+# this daemon can move:
+#
+#   * the proxy's total_connections goes up by exactly one.  A stranger holding
+#     the port cannot produce that, because the connection never reached us.
+#   * the payload's bytes arrive at one of the backends.  A proxy that accepts
+#     and forwards nowhere cannot produce that.
+#
+# Health checks disturb neither number, and that was measured rather than
+# assumed: they are outbound connections made by the proxy, so they are not
+# counted by its listener, and they carry no payload, so an idle backend sits at
+# bytes_in:0 across any number of them.
+assert_proxy_served() {
+    local proxy=$1 port=$2 payload=$3 label=$4; shift 4
+    local n rc=0 c0 c1 b0 b1 i
+    n=$(( ${#payload} + 1 ))          # printf adds the newline that is also sent
+
+    c0=$(mesh_counter "$proxy" total_connections)
+    b0=$(mesh_sum_bytes_in "$@")
+
+    # `timeout` around nc, because `-q 1` only bounds the wait *after* the peer
+    # has hung up.  A peer that accepts and then holds the connection open
+    # forever — a stray port-holder is exactly that — leaves nc blocked with
+    # nothing to time it out, and the file never reaches its Results line at
+    # all.  Both forms of this check had that hang; a run that never reports is
+    # worse than one that reports red, so the wait is bounded and whatever nc
+    # exited with is carried into the failure message below.
+    printf '%s\n' "$payload" | timeout 10 nc -q 1 127.0.0.1 "$port" >/dev/null 2>&1 || rc=$?
+
+    # Wait for the counters to settle rather than sleeping a guess at how long
+    # forwarding takes; on success this returns as soon as both have moved.
+    c1=$c0; b1=$b0
+    for i in $(seq 1 40); do
+        c1=$(mesh_counter "$proxy" total_connections)
+        b1=$(mesh_sum_bytes_in "$@")
+        if [ -n "$c0" ] && [ -n "$c1" ] && [ -n "$b0" ] && [ -n "$b1" ] \
+           && [ "$c1" -gt "$c0" ] && [ "$b1" -ge "$((b0 + n))" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    TOTAL=$((TOTAL+1))
+    if [ -z "$c0" ] || [ -z "$c1" ]; then
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$label: the mesh proxy accepted the connection]: could not read"
+        echo "        $proxy's total_connections (before='$c0' after='$c1') — stats did not"
+        echo "        answer, so nothing was measured and nothing may be concluded"
+    elif [ "$c1" -eq "$((c0 + 1))" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$label: the mesh proxy accepted the connection]: $proxy's"
+        echo "        total_connections went $c0 -> $c1, wanted exactly one more (nc exited $rc)."
+        echo "        Something may still be answering port $port — that is what the old"
+        echo "        nc-exit-code check measured — but it is not this proxy."
+    fi
+
+    TOTAL=$((TOTAL+1))
+    if [ -z "$b0" ] || [ -z "$b1" ]; then
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$label: the payload reached a mesh backend]: could not read bytes_in"
+        echo "        for $* (before='$b0' after='$b1') — stats did not answer"
+    elif [ "$b1" -eq "$((b0 + n))" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$label: the payload reached a mesh backend]: bytes_in across $*"
+        echo "        went $b0 -> $b1, wanted exactly $n more ($((b1 - b0)) arrived).  The"
+        echo "        proxy took the connection but the payload did not reach a backend."
+    fi
+}
+
 assert_exit_code() {
     TOTAL=$((TOTAL+1))
     local cmd="$1"
@@ -132,15 +250,7 @@ assert_contains "$OUT" "protocol:tcp"
 assert_contains "$OUT" "backends:2"
 
 # Test: TCP proxy works with health-enabled config
-TOTAL=$((TOTAL+1))
-RC=0
-REPLY=$(echo "hello mesh" | nc -q 1 127.0.0.1 "$PROXY_PORT" 2>/dev/null) || RC=$?
-if [ "$RC" -eq 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [mesh proxy connect]: nc exit code $RC"
-fi
+assert_proxy_served mesh_proxy "$PROXY_PORT" "hello mesh" "mesh proxy" mesh_be1 mesh_be2
 
 # --- Test 2: Show/dump includes mesh config ---
 OUT=$("$BIN" show mesh_proxy 2>&1)       || daemon_required "show mesh_proxy"
@@ -176,16 +286,11 @@ OUT=$("$BIN" show sidecar_proxy 2>&1)    || daemon_required "show sidecar_proxy"
 assert_contains "$OUT" "health_check"
 assert_contains "$OUT" "retry_count"
 
-# Test: sidecar proxy accepts traffic
-TOTAL=$((TOTAL+1))
-RC=0
-echo "sidecar test" | nc -q 1 127.0.0.1 19385 2>/dev/null || RC=$?
-if [ "$RC" -eq 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [sidecar proxy connect]: nc exit code $RC"
-fi
+# Test: sidecar proxy accepts traffic — the same claim about the same shape of
+# check, so it gets the same oracle.  This one was not in the brief; it is the
+# identical defect three lines further down the file, and leaving it would have
+# meant fixing one of a matched pair.
+assert_proxy_served sidecar_proxy 19385 "sidecar test" "sidecar proxy" sidecar_be
 
 # --- Test 4: Edit mesh flags on running proxy ---
 RC=0; OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || RC=$?
