@@ -139,7 +139,11 @@ jobs:
   fuzz:
     name: Long fuzz run
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The fuzz step alone is allowed 200 minutes (see BUDGET below); the two
+    # builds ahead of it take about eight.  A job ceiling under the sum of its
+    # steps is not a safety net, it is a second timeout that fires first and
+    # reports something other than what happened.
+    timeout-minutes: 220
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -220,10 +224,26 @@ jobs:
         # reason it is nightly.
         #
         # BUDGET.  run_fuzz.sh spends the per-target budget twice — libFuzzer
-        # then the replay driver — so the wall clock is 2 x targets x seconds.
-        # At the 600 s default that is already past timeout-minutes below with
-        # the targets that were here before these two; lower fuzz_seconds, or
-        # raise the timeout, rather than dropping a target.
+        # then the replay driver — so the worst case is 2 x targets x seconds:
+        # 2 x 9 x 600 = 180 minutes.  That is a ceiling, not a forecast.  The
+        # libFuzzer half always spends its whole -max_total_time; the replay half
+        # stops at whichever of FUZZ_ITERS (20000) and FUZZ_SECONDS comes first,
+        # and on the parser targets it is the iterations, by a wide margin.
+        #
+        # Measured on run 30719890629 (2026-08-01), the first honest run of this
+        # job since 2026-07-28: the five targets that completed averaged 612 s of
+        # wall clock each — 601 s of libFuzzer plus a replay of 1.3 s (resp),
+        # 0.7 s (ws_frame), 50.7 s (cache_ops), 1.4 s (http_response).  Nine
+        # targets at that rate is about 92 minutes.  The replay cost of the three
+        # operation-sequence targets is still unmeasured, because that run timed
+        # out inside target six, so the timeout below covers the 180-minute
+        # ceiling rather than the 92-minute observation.
+        #
+        # The step timeout was 60 minutes against a job that cannot finish in
+        # under 90 even in the best case, so the step was killed mid-target every
+        # time and the last four targets never ran at all.  Raise the timeout
+        # rather than lowering fuzz_seconds or dropping a target: the number of
+        # executions is what this job is for.
         env:
           REQUIRE_LIBFUZZER: "1"
         run: bash test/fuzz/build_libfuzzer.sh
@@ -616,7 +636,10 @@ jobs:
           REQUIRE_LIBFUZZER: "1"
           FUZZ_PROXY_SKIP: ""
         run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
-        timeout-minutes: 60
+        # 180 minutes is what 2 x 9 x 600 costs; the rest is margin.  See BUDGET
+        # in the step above before changing this — and change fuzz_seconds, not
+        # this number, if the job has to get cheaper.
+        timeout-minutes: 200
 
       - name: Save fuzz corpus
         if: always()
