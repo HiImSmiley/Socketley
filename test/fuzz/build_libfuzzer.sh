@@ -22,7 +22,8 @@
 # Exit codes:  0 built   1 unavailable (or unavailable+required)   2 build failed
 #
 # Output: bin/fuzz-libfuzzer/{fuzz_resp,fuzz_ws_frame,fuzz_cache_ops,fuzz_http_response,
-#         fuzz_event_loop,fuzz_http_request,fuzz_server_ops,fuzz_client_ops}
+#         fuzz_event_loop,fuzz_http_request,fuzz_server_ops,fuzz_client_ops,
+#         fuzz_proxy_ops}
 #
 # ─── WHY THERE IS NO MEMORYSANITIZER BUILD HERE ─────────────────────────────
 #
@@ -42,13 +43,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$ROOT/bin/fuzz-libfuzzer"
 REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 
-# Which targets to build.  Default is all eight.  The per-push CI job narrows
-# this to the five cheap ones, because the three SDK-linking targets
-# (fuzz_http_request, fuzz_server_ops, fuzz_client_ops) drag in fifteen SDK
-# translation units between them and that is a nightly cost, not a per-push one.
-# Narrowing is always an explicit decision by the caller — nothing here drops a
-# target because building it happened to fail.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops"
+# Which targets to build.  Default is all nine.  The per-push CI job narrows
+# this to the five cheap ones, because the four SDK-linking targets
+# (fuzz_http_request, fuzz_server_ops, fuzz_client_ops, fuzz_proxy_ops) drag in
+# fifteen SDK translation units between them and that is a nightly cost, not a
+# per-push one.  Narrowing is always an explicit decision by the caller —
+# nothing here drops a target because building it happened to fail.
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -148,11 +149,12 @@ want fuzz_event_loop && build fuzz_event_loop \
 
 # ─── the targets that link the runtime ──────────────────────────────────────
 #
-# fuzz_http_request, fuzz_server_ops and fuzz_client_ops all need the runtime
-# itself.  parse_http_request_line lives in proxy_instance.cpp and there is no
-# smaller unit that contains it; the two operation-sequence targets drive a real
-# server_instance and client_instance against a real io_uring event_loop, which
-# is the whole point of them.  None of the three can link premake's GCC archive —
+# fuzz_http_request, fuzz_server_ops, fuzz_client_ops and fuzz_proxy_ops all
+# need the runtime itself.  parse_http_request_line lives in proxy_instance.cpp
+# and there is no smaller unit that contains it; the three operation-sequence
+# targets drive a real server_instance, client_instance and proxy_instance
+# against a real io_uring event_loop, which is the whole point of them.  None of
+# the four can link premake's GCC archive —
 # that archive is built with GCC's ASan, and one process cannot host both GCC's
 # and clang's sanitizer runtimes — so the SDK sources are compiled here with
 # clang as well.  That is a real cost (fifteen translation units, the slowest
@@ -163,12 +165,15 @@ want fuzz_event_loop && build fuzz_event_loop \
 # makes the calls in socketley/shared/invariants.h live: the pool-safety check in
 # server_instance::pool_release and the reachability check in on_cqe compile to
 # nothing without it, and those two are half of what fuzz_server_ops exists to
-# assert.  It costs the shipped binary nothing, because the shipped binary is not
+# assert.  For fuzz_proxy_ops it also turns on inv_check_pair and inv_sweep_all,
+# which state the proxy's own half of the same rule over a *pair* rather than
+# over one connection.  It costs the shipped binary nothing, because the shipped binary is not
 # built from these objects.
 #
 # This does NOT make clang a build dependency of socketley.  These objects are
 # instrumented fuzzing artifacts under bin/; the shipped binary is still GCC's.
-if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops; then
+if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops || \
+   want fuzz_proxy_ops; then
 SDK_OBJ="$OUT/sdk-obj"
 mkdir -p "$SDK_OBJ"
 
@@ -237,6 +242,8 @@ else
                 "$ROOT/test/fuzz/fuzz_server_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
             want fuzz_client_ops && build fuzz_client_ops \
                 "$ROOT/test/fuzz/fuzz_client_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
+            want fuzz_proxy_ops && build fuzz_proxy_ops \
+                "$ROOT/test/fuzz/fuzz_proxy_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
         fi
     fi
 fi
