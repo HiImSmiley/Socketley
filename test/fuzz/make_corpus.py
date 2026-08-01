@@ -1200,6 +1200,617 @@ def client_seeds():
     return s
 
 
+# ──────────────────────────── proxy op programs ──────────────────────────────
+#
+# fuzz_proxy_ops is the third operation-sequence target and the only one with
+# peers on both sides: harness clients dialling the proxy's listener and harness
+# listeners the proxy dials as its backends.  Four bytes per operation, run
+# against a real proxy_instance on a real io_uring loop, with three invariants
+# checked after every step on top of the four the other two share — no client
+# closed without an answer, no backend socket pooled off a message boundary, no
+# response delivered to a client that did not ask for it.
+#
+# So these seeds are programs, and each one is here because it is an *ordering*
+# a defect in this file needed:
+#
+#   * a response the backend never finished, and a client that aborts on top of
+#     it                              (the socket pooled mid-answer, 70a8c6a)
+#   * a socket answered, pooled, and then closed by the backend before the next
+#     request borrows it                                          (984dadc)
+#   * a backend that accepts and never answers, and one whose handshake never
+#     completes, both given up on by the deadline sweep            (84d624c)
+#   * a group whose membership changes with a request in flight, and a group
+#     entry standing beside a plain backend                (decdb7d, 84d624c)
+#   * a request pipelined behind one that is still being answered     (7a235aa)
+#   * a filter that answers and a filter that forwards                (7689b7a)
+#
+# The three leading bytes of an input are read as configuration *as well as* as
+# the first step, exactly as in the server and client programs: bits 0-2 of byte
+# 0 pick the backend shape, bit 3 TCP mode, bit 4 the Lua filter chain; byte 1
+# is the group's membership mask and byte 2 the proxy-hook mode.  px_head()
+# below picks the remaining bits so that the operation those bytes also spell is
+# a harmless one.
+#
+# The tables MUST stay in step with the enums in fuzz_proxy_ops.cpp; the target
+# reduces every byte modulo its table, so a mismatch does not corrupt anything,
+# it just makes these seeds mean something other than what they say.
+
+_PX_OPS = [
+    "START", "STOP", "DESTROY",
+    "PUMP",
+    "CONNECT", "REQUEST", "RECV", "FIN", "ABORT", "CLOSE_CLIENT",
+    "BE_LISTEN", "BE_ACCEPT", "BE_RECV", "BE_RESPOND", "BE_FIN", "BE_ABORT",
+    "BE_SERVE",
+    "MEMBERSHIP",
+    "CONFIG",
+    "DEADLINE",
+    "AGE",
+    "STATS",
+]
+_PX = {n: i for i, n in enumerate(_PX_OPS)}
+_PX_N = len(_PX_OPS)
+
+# What a client sends.
+(Q_WHOLE, Q_HALF, Q_PIPELINED, Q_CONN_CLOSE, Q_BODY, Q_BODY_SPLIT, Q_DENY,
+ Q_NO_PREFIX, Q_SMUGGLE, Q_BARE_LF, Q_HUGE_HEADER, Q_EXPECT_100, Q_RAW) = range(13)
+
+# What a backend answers.  Which of these leave the stream at a message
+# boundary and which do not is the fact invariant B is stated over.
+(A_OK, A_HEAD_ONLY, A_HEAD_SPLIT, A_CHUNKED, A_CHUNKED_OPEN, A_204, A_304,
+ A_CONN_CLOSE, A_NO_LENGTH, A_100_OK, A_1XX_ONLY, A_BARE_LF, A_CL_TE,
+ A_GARBAGE, A_OK_TAIL, A_TWO, A_UNSOLICITED) = range(17)
+
+# OP_CONFIG knobs: `a % 8`.
+(K_STRATEGY, K_RETRY, K_CIRCUIT, K_BACKEND_TIMEOUT, K_MAXCONN, K_IDLE,
+ K_HOOKS, K_HEALTH) = range(8)
+
+# Backend shapes, chosen by bits 0-2 of the first byte.
+(SH_ONE, SH_TWO, SH_GROUP, SH_ONE_AND_GROUP, SH_DEAD_AND_ONE, SH_THREE) = range(6)
+
+# OP_BE_LISTEN modes.
+(L_DOWN, L_UP, L_STALLED) = range(3)
+
+
+def xop(name, a=0, b=0, c=0):
+    return bytes([_PX[name], a & 0xFF, b & 0xFF, c & 0xFF])
+
+
+def px_head(shape=0, tcp=False, lua=False, group=0, hook=0,
+            tls_front=False, tls_back=False):
+    """The first four bytes: configuration, and one harmless operation.
+
+    Bits 0-4 of byte 0 are the configuration and are not free; bits 5-7 only
+    move which operation `byte % len(ops)` lands on, so they are chosen to land
+    on something that does nothing before the runtime is started.  DESTROY is
+    the one to avoid — it would rebuild the instance from its own argument bytes
+    and throw the configuration away.
+
+    The two TLS bits are in byte 1 for exactly that reason: byte 0 has no free
+    bits left, and byte 1 is the chosen operation's first argument, where a
+    couple of high bits change nothing."""
+    base = (shape & 0x07) | (0x08 if tcp else 0) | (0x10 if lua else 0)
+    arg1 = (group & 0x07) | (0x08 if tls_front else 0) | (0x10 if tls_back else 0)
+    for want in (_PX["PUMP"], _PX["STATS"], _PX["AGE"], _PX["START"]):
+        for k in range(8):
+            if (base + 32 * k) % _PX_N == want:
+                return bytes([base + 32 * k, arg1, hook & 0xFF, 0])
+    for k in range(8):
+        if (base + 32 * k) % _PX_N != _PX["DESTROY"]:
+            return bytes([base + 32 * k, arg1, hook & 0xFF, 0])
+    raise AssertionError("no head byte encodes this configuration")
+
+
+def proxy_seeds():
+    s = {}
+
+    # ── the plain shapes, so the mutator has somewhere to start ──
+    s["exchange"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 0), xop("STOP"))
+
+    s["keepalive_two_requests"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3), xop("BE_SERVE", 0, A_OK),
+        xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3), xop("BE_SERVE", 0, A_OK),
+        xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["pipelined"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_PIPELINED), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── the pool, and the message boundary it is supposed to sit on ──
+
+    # The backend promises a body and stops; the client aborts on top of it.
+    # Every teardown path then reaches the pool gate with half an answer on the
+    # socket, which is what 70a8c6a's tenth case looked like.
+    s["abort_mid_response"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_ACCEPT", 0), xop("BE_RECV", 0),
+        xop("BE_RESPOND", 0, A_HEAD_ONLY), xop("PUMP", 3),
+        xop("ABORT", 0), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    # A complete answer with the head of another behind it, in one read.  The
+    # response is framed and finished; the *socket* is not where the next
+    # request can start from.
+    s["response_with_a_tail"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK_TAIL), xop("PUMP", 3), xop("RECV", 0),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 1), xop("RECV", 0), xop("STOP"))
+
+    s["two_answers_to_one_request"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_TWO), xop("PUMP", 3), xop("RECV", 0),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    # The pooled socket speaks after the exchange is over, and the next request
+    # borrows it.  This is invariant C in five operations.
+    s["pooled_socket_speaks_unbidden"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("BE_RESPOND", 0, A_UNSOLICITED), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 1), xop("RECV", 0), xop("STOP"))
+
+    s["chunked_never_terminated"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_CHUNKED_OPEN), xop("PUMP", 3), xop("RECV", 0),
+        xop("ABORT", 0), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    s["framing_two_recipients_could_differ_on"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_BARE_LF), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_CL_TE), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── a pooled connection the backend had already closed (984dadc) ──
+    s["pooled_socket_closed_by_backend"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("BE_ABORT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["pooled_socket_half_closed"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("BE_FIN", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["pool_aged_out"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("AGE"), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── the deadline sweep (84d624c) ──
+
+    # A backlog nothing is accepted from: the handshake never completes, which
+    # is the case the sweep has to withdraw by hand rather than hand to
+    # try_retry.
+    s["stalled_backend_504"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("BE_LISTEN", 0, L_STALLED), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["accepts_and_never_answers"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_ACCEPT", 0), xop("BE_RECV", 0), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["half_request_408"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_HALF), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["deadline_then_retry"] = prog(
+        px_head(SH_TWO),
+        xop("CONFIG", K_RETRY, 2), xop("START"),
+        xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_ACCEPT", 0), xop("BE_RECV", 0), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3),
+        xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["client_aborts_during_the_connect"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("BE_LISTEN", 0, L_STALLED), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("ABORT", 0), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("STOP"))
+
+    # ── groups (decdb7d, 84d624c) ──
+    s["group_exchange"] = prog(
+        px_head(SH_GROUP, group=0x07),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("BE_SERVE", 2, A_OK),
+        xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # The gateway that opened a fresh connection per request until the pool key
+    # could express a group member.
+    s["group_keepalive_pool"] = prog(
+        px_head(SH_GROUP, group=0x03),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("STOP"))
+
+    s["membership_changes_in_flight"] = prog(
+        px_head(SH_GROUP, group=0x07),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("BE_SERVE", 2, A_OK),
+        xop("MEMBERSHIP", 0x01), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("MEMBERSHIP", 0x04), xop("PUMP", 3), xop("STOP"))
+
+    # A group entry beside a plain backend, with two of the three members
+    # refusing: this is the shape where a member's failure used to be charged to
+    # whatever occupied the group's index.
+    s["group_beside_a_plain_backend"] = prog(
+        px_head(SH_ONE_AND_GROUP, group=0x06),
+        xop("CONFIG", K_CIRCUIT, 1), xop("START"),
+        xop("BE_LISTEN", 1, L_DOWN), xop("BE_LISTEN", 2, L_DOWN),
+        xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("RECV", 0),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1),
+        xop("AGE"), xop("STOP"))
+
+    s["every_member_gone"] = prog(
+        px_head(SH_GROUP, group=0x07),
+        xop("START"), xop("MEMBERSHIP", 0x00), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── refusals, retries and the breaker ──
+    s["backend_refuses_502"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("BE_LISTEN", 0, L_DOWN),
+        xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["breaker_opens_then_half_opens"] = prog(
+        px_head(SH_ONE),
+        xop("CONFIG", K_CIRCUIT, 1), xop("START"), xop("BE_LISTEN", 0, L_DOWN),
+        xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("RECV", 0),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3), xop("RECV", 1),
+        xop("BE_LISTEN", 0, L_UP), xop("AGE"),
+        xop("CONNECT", 2), xop("REQUEST", 2, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 2), xop("STOP"))
+
+    s["dead_port_then_healthy"] = prog(
+        px_head(SH_DEAD_AND_ONE),
+        xop("CONFIG", K_RETRY, 1), xop("START"),
+        xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── the filter chain (7689b7a) ──
+    s["filter_answers_403"] = prog(
+        px_head(SH_ONE, lua=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_DENY), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["filter_forwards_with_a_header"] = prog(
+        px_head(SH_ONE, lua=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["filter_answers_then_the_next_request"] = prog(
+        px_head(SH_ONE, lua=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_DENY), xop("PUMP", 3), xop("RECV", 0),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    # ── what the request path refuses ──
+    s["smuggling_400"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_SMUGGLE), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["bare_lf_400"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_BARE_LF), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["header_too_large_431"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_HUGE_HEADER), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["wrong_prefix_404"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_NO_PREFIX), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # Only the body a request declared may follow it; what is left is the next
+    # request and has to go through the framing checks (7a235aa).
+    s["body_then_pipelined_request"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_BODY_SPLIT), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["whole_body"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_BODY), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["expect_100_continue"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_EXPECT_100), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_100_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["interim_blocks_only"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_1XX_ONLY), xop("PUMP", 3), xop("RECV", 0),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["backend_answers_garbage"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_GARBAGE), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["backend_says_connection_close"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_CONN_CLOSE), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["no_content_204"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_204), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_304), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["client_says_connection_close"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_CONN_CLOSE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # ── the orderings ──
+
+    # A client that has said everything it has to say and is waiting to read.
+    s["client_fin_after_a_whole_request"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("FIN", 0), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["stop_start_with_a_request_in_flight"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 1),
+        xop("STOP"), xop("START"), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    s["restart_with_a_populated_pool"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3), xop("BE_SERVE", 0, A_OK),
+        xop("PUMP", 3), xop("RECV", 0),
+        xop("STOP"), xop("START"), xop("PUMP", 3), xop("STOP"))
+
+    s["restart_without_draining"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("STOP"), xop("START"), xop("STOP"), xop("START"),
+        xop("PUMP", 3), xop("STOP"))
+
+    s["destroyed_mid_exchange"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 1),
+        xop("DESTROY", SH_TWO), xop("START"), xop("PUMP", 3),
+        xop("CONNECT", 0), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["four_clients_at_once"] = prog(
+        px_head(SH_ONE),
+        xop("START"),
+        xop("CONNECT", 0), xop("CONNECT", 1), xop("CONNECT", 2), xop("CONNECT", 3),
+        xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("REQUEST", 1, Q_WHOLE),
+        xop("REQUEST", 2, Q_WHOLE), xop("REQUEST", 3, Q_WHOLE),
+        xop("PUMP", 3), xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 0), xop("RECV", 1), xop("RECV", 2), xop("RECV", 3),
+        xop("ABORT", 1), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("STOP"))
+
+    s["three_backends_round_robin"] = prog(
+        px_head(SH_THREE),
+        xop("START"),
+        xop("CONNECT", 0), xop("CONNECT", 1), xop("CONNECT", 2), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("REQUEST", 1, Q_WHOLE), xop("REQUEST", 2, Q_WHOLE),
+        xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("BE_SERVE", 2, A_OK),
+        xop("PUMP", 3), xop("RECV", 0), xop("RECV", 1), xop("RECV", 2), xop("STOP"))
+
+    s["max_connections"] = prog(
+        px_head(SH_ONE),
+        xop("CONFIG", K_MAXCONN, 1), xop("START"),
+        xop("CONNECT", 0), xop("CONNECT", 1), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 0), xop("RECV", 1), xop("STOP"))
+
+    s["lua_close_client"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("CLOSE_CLIENT", 0), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["hook_drops_the_request"] = prog(
+        px_head(SH_ONE, hook=3),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["hook_rewrites"] = prog(
+        px_head(SH_ONE, hook=2),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # TCP mode connects at accept and forwards bytes, so the pumps have to be
+    # blocking ones: there is no request to wait for, only a handshake.
+    s["tcp_mode"] = prog(
+        px_head(SH_ONE, tcp=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_RAW), xop("PUMP", 3), xop("PUMP", 3),
+        xop("BE_ACCEPT", 0), xop("PUMP", 3), xop("BE_RECV", 0), xop("PUMP", 3),
+        xop("BE_RESPOND", 0, A_OK),
+        xop("PUMP", 3, 1), xop("PUMP", 3, 1), xop("RECV", 0),
+        xop("ABORT", 0), xop("PUMP", 3), xop("STOP"))
+
+    s["tcp_mode_backend_down"] = prog(
+        px_head(SH_ONE, tcp=True),
+        xop("START"), xop("BE_LISTEN", 0, L_DOWN), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_RAW), xop("PUMP", 3, 1), xop("RECV", 0), xop("STOP"))
+
+    s["stats_and_health"] = prog(
+        px_head(SH_TWO),
+        xop("CONFIG", K_HEALTH, 1), xop("START"), xop("STATS"),
+        xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK),
+        xop("PUMP", 3), xop("RECV", 0), xop("STATS"), xop("STOP"))
+
+    # ── TLS, on each leg independently (e756810) ──
+    #
+    # The harness speaks OpenSSL directly at both ends; the certificate is
+    # generated once into /dev/shm and is both what the proxy serves and what it
+    # trusts.  A TLS backend connection is never pooled — see
+    # backend_pool_eligible, which refuses one on purpose because the pool key is
+    # an address and a session is not — so these seeds are about the handshake
+    # and the record layer rather than about the pool.
+    s["tls_on_the_listener"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_on_the_backend_leg"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_on_both_legs"] = prog(
+        px_head(SH_ONE, tls_front=True, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # Two requests over a TLS backend leg.  The second must not find the first
+    # one's socket in the pool: a pooled socket carries a negotiated identity
+    # that the pool's key — a host and a port — cannot express.
+    s["tls_backend_is_never_pooled"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_backend_handshake_never_finishes"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("BE_LISTEN", 0, L_STALLED), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("DEADLINE"), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    s["tls_client_aborts_after_its_request"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("ABORT", 0), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("STOP"))
+
+    s["tls_group_over_both_legs"] = prog(
+        px_head(SH_GROUP, group=0x03, tls_front=True, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK),
+        xop("PUMP", 3), xop("RECV", 0),
+        xop("MEMBERSHIP", 0x02), xop("PUMP", 3), xop("STOP"))
+
+    s["tls_restart_reloads_the_certificate"] = prog(
+        px_head(SH_ONE, tls_front=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("STOP"), xop("START"), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 1), xop("STOP"))
+
+    s["strategies"] = prog(
+        px_head(SH_THREE),
+        xop("CONFIG", K_STRATEGY, 1), xop("START"),
+        xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("BE_SERVE", 2, A_OK),
+        xop("PUMP", 3), xop("RECV", 0),
+        xop("CONFIG", K_STRATEGY, 2), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("BE_SERVE", 2, A_OK),
+        xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    return s
+
 # ───────────────────────── event_loop completion programs ────────────────────
 #
 # fuzz_event_loop does not take a protocol message either.  It reads its input
@@ -1459,6 +2070,7 @@ KEPT_BUDGET = {
     "eventloop": 24,   # 0 kept
     "server": 8,       # 0 kept
     "client": 8,       # 0 kept
+    "proxy": 8,        # 0 kept
 }
 
 
@@ -1490,7 +2102,7 @@ def main(argv):
     for name, seeds in (("resp", resp_seeds()), ("ws", ws_seeds()),
                         ("http", http_seeds()), ("httpresp", httpresp_seeds()),
                         ("cache", cache_seeds()), ("server", server_seeds()),
-                        ("client", client_seeds()),
+                        ("client", client_seeds()), ("proxy", proxy_seeds()),
                         ("eventloop", eventloop_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count

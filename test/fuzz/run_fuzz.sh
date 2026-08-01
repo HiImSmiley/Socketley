@@ -19,8 +19,9 @@
 #                      for the next one.  See the header of fuzz_cache_ops.cpp.
 #   FUZZ_HTTPRESP_SKIP the same thing for fuzz_http_response; the ids are the
 #                      first argument of each RESP_FINDING in that file.
-#   FUZZ_SERVER_SKIP   the same for fuzz_server_ops, and
-#   FUZZ_CLIENT_SKIP   for fuzz_client_ops; the ids are the first argument of
+#   FUZZ_SERVER_SKIP   the same for fuzz_server_ops,
+#   FUZZ_CLIENT_SKIP   for fuzz_client_ops, and
+#   FUZZ_PROXY_SKIP    for fuzz_proxy_ops; the ids are the first argument of
 #                      each RT_FINDING in those files and in fuzz_runtime_ops.h.
 #   FUZZ_LOOP_SKIP     the same thing for fuzz_event_loop; the ids are the first
 #                      argument of each LOOP_FINDING in that file.
@@ -29,7 +30,7 @@
 #                      Set this anywhere the runner is known to have clang —
 #                      otherwise a broken build_libfuzzer.sh downgrades the job
 #                      to the GCC floor and still reports green.
-#   FUZZ_TARGETS       which targets to run (default: all seven).  Every target
+#   FUZZ_TARGETS       which targets to run (default: all nine).  Every target
 #                      named here must exist or the run fails — narrowing the
 #                      set is a decision the caller states, never something that
 #                      happens because a binary quietly was not built.
@@ -37,17 +38,19 @@
 # WHAT THIS COVERS.  The four parsers an unauthenticated peer can reach — RESP,
 # WebSocket frames, the proxy's HTTP request line and header block, and the
 # proxy's response framing, which is the one that decides whether a backend
-# socket may be pooled — plus two targets of a different kind, which check
+# socket may be pooled — plus five targets of a different kind, which check
 # accounting and lifetime invariants after every step rather than looking for a
-# crash on one buffer: cache_store driven as a sequence of operations, and the
-# event loop's completion handling driven as a scripted order of CQEs.
+# crash on one buffer: cache_store driven as a sequence of operations, the event
+# loop's completion handling driven as a scripted order of CQEs, and the server,
+# client and proxy runtimes driven as sequences of lifecycle and connection
+# operations against a real ring.
 #
 # WHAT IT DOES NOT.  No kernel behind the event loop — fuzz_event_loop scripts
 # the arrivals and checks the books, it does not prove a submission was really
-# consumed — no connection lifecycle, no Lua, no command dispatch between the
-# RESP parser and the store, and no load() over a file that save() did not
-# write.  A green run here says these six survived the inputs tried; it says
-# nothing about the code that calls them.
+# consumed — no command dispatch between the RESP parser and the store, no
+# load() over a file that save() did not write, and no Lua anywhere except the
+# one filter chain fuzz_proxy_ops loads.  A green run here says these nine
+# survived the inputs tried; it says nothing about the code that calls them.
 #
 # ─── TWO CORPUS DIRECTORIES, ON PURPOSE ─────────────────────────────────────
 #
@@ -99,9 +102,10 @@ declare -A CORPUS=(
     [fuzz_event_loop]=eventloop
     [fuzz_server_ops]=server
     [fuzz_client_ops]=client
+    [fuzz_proxy_ops]=proxy
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops}"
 
 fail=0
 ran=0

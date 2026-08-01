@@ -866,6 +866,52 @@ project "fuzz_client_ops"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the proxy as an operation sequence, with peers at both ends ───
+--
+-- The same shape as the two above and the same four inherited invariants, with
+-- three of its own that the other two have no use for: no client is closed
+-- without an answer once it has sent a whole request, no backend socket is
+-- pooled off a message boundary, and no response reaches a client that did not
+-- ask for it.  Every proxy defect this project found this week broke one of
+-- those three and none of them crashed — see the header comment in
+-- test/fuzz/fuzz_proxy_ops.cpp.
+--
+-- Unlike the server and client targets this one has peers on both sides: real
+-- client sockets dialling the proxy's listener and real listening sockets the
+-- proxy dials as its backends, with what each of them answers, how much of it,
+-- and when they hang up all decided by the program.  That is what makes the
+-- pool reachable at all.
+--
+-- It links socketley_sdk and LuaJIT for the same reason as its neighbours — the
+-- code under test is the runtime, and the filter chain has no interface but a
+-- script — so it costs a full SDK build and belongs in the nightly job.
+
+project "fuzz_proxy_ops"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files {
+        "test/fuzz/fuzz_proxy_ops.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_runtime_ops.h",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Test: SDK cache_client.h (header-only, no libs) ───
 
 project "test_sdk_cache_client"
