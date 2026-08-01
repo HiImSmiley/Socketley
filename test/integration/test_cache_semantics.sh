@@ -10,6 +10,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate cachesem
 PORT=19703
 PASS=0; FAIL=0; TOTAL=0
@@ -41,7 +42,7 @@ if ! command -v redis-cli >/dev/null 2>&1; then
 fi
 
 daemon_start "$BIN"
-"$BIN" create cache semcache -p "$PORT" --resp -s 2>&1 || true
+create_ok "cache created" "$BIN" create cache semcache -p "$PORT" --resp -s
 # PING/+PONG, not an accepted connection: a cache accepts before it has
 # finished loading and can answer.
 ready_resp 127.0.0.1 "$PORT" 20 || true

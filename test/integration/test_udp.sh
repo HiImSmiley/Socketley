@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate udp
 PORT=19220
 PASS=0; FAIL=0; TOTAL=0
@@ -34,11 +35,11 @@ echo "=== Integration: UDP ==="
 daemon_start "$BIN"
 
 # Test: Create UDP server
-"$BIN" create server udp_test -p "$PORT" --udp -s 2>&1 || true
+create_ok "UDP server created" "$BIN" create server udp_test -p "$PORT" --udp -s
 sleep 0.3
 
 # Test: Create UDP client
-"$BIN" create client udp_client --udp -t 127.0.0.1:"$PORT" -s 2>&1 || true
+create_ok "UDP client created" "$BIN" create client udp_client --udp -t 127.0.0.1:"$PORT" -s
 sleep 0.3
 
 # Test: Both show in ps as running

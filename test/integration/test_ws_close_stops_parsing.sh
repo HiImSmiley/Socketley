@@ -14,6 +14,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — leftover state and a warm daemon change what the server
@@ -37,9 +39,13 @@ echo "=== Integration: no parsing past a WebSocket close ==="
 
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
+# Named so that a refused create can print what the daemon said about it; the
+# CLI's own message is `could not start runtime` whenever the reason was found
+# after the request reached the daemon.
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 sleep 2
 
-"$BIN" create server wsclose_srv -p "$SRV_PORT" -s 2>&1 || true
+create_ok "server created" "$BIN" create server wsclose_srv -p "$SRV_PORT" -s
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$SRV_PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 

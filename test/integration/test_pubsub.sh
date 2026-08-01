@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate pubsub
 PORT=19300
 PASS=0; FAIL=0; TOTAL=0
@@ -37,7 +38,7 @@ echo "=== Integration: pub/sub ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create cache pubcache -p "$PORT" -s 2>&1 || true
+create_ok "cache created" "$BIN" create cache pubcache -p "$PORT" -s
 sleep 0.3
 
 # Subscribe in background (keep connection open)

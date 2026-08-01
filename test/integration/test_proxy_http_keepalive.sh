@@ -26,6 +26,8 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — auto-restart hides a crash, and a leftover runtime from an
@@ -159,6 +161,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -195,8 +198,8 @@ fi
 
 # The proxy only routes paths under /<name>/ and strips that prefix before
 # forwarding, so the marker has to sit behind it.
-"$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http -s 2>&1 || true
+create_ok "proxy created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol http -s
 # A real request through the proxy, not an accepted connection and a guess.
 ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 

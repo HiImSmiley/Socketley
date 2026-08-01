@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate errorcases
 PORT=19290
 PASS=0; FAIL=0; TOTAL=0
@@ -38,7 +39,12 @@ else
 fi
 
 # Test: Duplicate name
-"$BIN" create server err_svr1 -p "$PORT" 2>&1 || true
+#
+# The first create is the setup for it and must succeed: if the name is not
+# taken, the second create has nothing to collide with and "expected non-zero
+# exit" below would be asserting that a perfectly ordinary create failed.  The
+# second one is the deliberate refusal and keeps reading its own status.
+create_ok "the name to collide with is taken" "$BIN" create server err_svr1 -p "$PORT"
 sleep 0.3
 RC=0
 OUT=$("$BIN" create server err_svr1 -p $((PORT+1)) 2>&1) || RC=$?

@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate mastermode
 PORT=19210
 PASS=0; FAIL=0; TOTAL=0
@@ -46,7 +47,8 @@ echo "=== Integration: master mode ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create server master_test -p "$PORT" --mode master --master-pw secret123 -s 2>&1 || true
+create_ok "master-mode server created" "$BIN" create server master_test -p "$PORT" \
+    --mode master --master-pw secret123 -s
 sleep 0.3
 
 # Test: Correct password grants master

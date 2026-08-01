@@ -49,6 +49,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — auto-restart hides a crash, and a leftover runtime from an
@@ -176,6 +178,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -210,8 +213,8 @@ else
     echo "  FAIL [setup]: the echo backend never came up on $BE_PORT"
 fi
 
-"$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s 2>&1 || true
+create_ok "proxy created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PX_PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 

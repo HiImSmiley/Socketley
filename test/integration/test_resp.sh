@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate resp
 PORT=19250
 PASS=0; FAIL=0; TOTAL=0
@@ -46,7 +47,7 @@ echo "=== Integration: RESP2 protocol ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create cache resp_test -p "$PORT" --resp -s 2>&1 || true
+create_ok "cache created" "$BIN" create cache resp_test -p "$PORT" --resp -s
 sleep 0.3
 
 # Test: SET via RESP2

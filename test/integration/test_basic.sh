@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate basic
 PASS=0; FAIL=0; TOTAL=0
 
@@ -17,13 +18,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# assert_ok STATUS LABEL [OUTPUT]
+#
+# The status is passed in.  It used to be read from $? inside the function, one
+# line after `TOTAL=$((TOTAL+1))` — and an assignment is a command, so $? was the
+# status of the arithmetic, which is 0 whatever the caller did.  Every one of the
+# five lifecycle steps below therefore passed unconditionally: this file reported
+# 9/9 for `create`, `start`, `stop` and `remove` no matter what the daemon said.
+# The `|| true` on each call made the point moot from the other end as well.
 assert_ok() {
     TOTAL=$((TOTAL+1))
-    if [ $? -eq 0 ]; then
+    local rc="$1" label="$2" out="${3:-}"
+    if [ "$rc" -eq 0 ]; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
-        echo "  FAIL: $1"
+        echo "  FAIL [$label]: exit $rc"
+        # An `if` rather than `[ -n … ] && printf`: the latter is the last
+        # command of the function, so an empty message would make the function
+        # return 1 and `set -e` would end the run at the first failed assertion.
+        if [ -n "$out" ]; then printf '        said: %s\n' "$out"; fi
     fi
 }
 
@@ -43,16 +57,15 @@ echo "=== Integration: basic lifecycle ==="
 daemon_start "$BIN"
 
 # Test: create server
-OUT=$("$BIN" create server testsvr -p 19000 2>&1) || true
-assert_ok "create server"
+create_ok "create server" "$BIN" create server testsvr -p 19000
 
 # Test: ls shows it
 OUT=$("$BIN" ls 2>&1)
 assert_contains "$OUT" "testsvr"
 
 # Test: start
-OUT=$("$BIN" start testsvr 2>&1) || true
-assert_ok "start server"
+RC=0; OUT=$("$BIN" start testsvr 2>&1) || RC=$?
+assert_ok "$RC" "start server" "$OUT"
 sleep 0.2
 
 # Test: ps shows running
@@ -60,13 +73,13 @@ OUT=$("$BIN" ps 2>&1)
 assert_contains "$OUT" "testsvr"
 
 # Test: stop
-OUT=$("$BIN" stop testsvr 2>&1) || true
-assert_ok "stop server"
+RC=0; OUT=$("$BIN" stop testsvr 2>&1) || RC=$?
+assert_ok "$RC" "stop server" "$OUT"
 sleep 0.2
 
 # Test: remove
-OUT=$("$BIN" remove testsvr 2>&1) || true
-assert_ok "remove server"
+RC=0; OUT=$("$BIN" remove testsvr 2>&1) || RC=$?
+assert_ok "$RC" "remove server" "$OUT"
 
 # Test: ls no longer shows testsvr
 OUT=$("$BIN" ls 2>&1)
@@ -79,8 +92,7 @@ else
 fi
 
 # Test: create with -s (start immediately)
-OUT=$("$BIN" create server autosvr -p 19001 -s 2>&1) || true
-assert_ok "create+start"
+create_ok "create+start" "$BIN" create server autosvr -p 19001 -s
 sleep 0.2
 OUT=$("$BIN" ps 2>&1)
 assert_contains "$OUT" "autosvr"

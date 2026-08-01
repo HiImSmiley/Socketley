@@ -18,6 +18,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate cachettl
 PORT=19280
 STORE="/tmp/test-cache-ttl-$$.bin"
@@ -59,7 +60,7 @@ echo "=== Integration: cache TTL expiry ==="
 # while the daemon lives — the caller hangs instead of getting the results.
 daemon_start "$BIN"
 
-"$BIN" create cache ttlcache -p "$PORT" --persistent "$STORE" 2>&1 || true
+create_ok "cache created" "$BIN" create cache ttlcache -p "$PORT" --persistent "$STORE"
 "$BIN" start ttlcache 2>&1 || true
 sleep 0.5
 

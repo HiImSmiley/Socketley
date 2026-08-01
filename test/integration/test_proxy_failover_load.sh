@@ -66,6 +66,8 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_window.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-failover-XXXXXX)
 export HOME="$TMPD/home"
@@ -409,6 +411,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPD/daemon.log"
 "$BIN" daemon >"$TMPD/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -434,10 +437,10 @@ esac
 # health-interval 1 / threshold 2 and circuit-timeout 5 keep every reaction the
 # proxy is capable of well inside a 6 s window -- a slower configuration would
 # make a clean window mean "the test was too short", not "the proxy coped".
-"$BIN" create proxy $NAME -p $PX \
+create_ok "proxy created" "$BIN" create proxy $NAME -p $PX \
     --backend "127.0.0.1:$BE1,127.0.0.1:$BE2,127.0.0.1:$BE3" --protocol http \
     --health-check tcp --health-interval 1 --health-threshold 2 \
-    --circuit-threshold 3 --circuit-timeout 5 --retry 2 -s >/dev/null 2>&1 || true
+    --circuit-threshold 3 --circuit-timeout 5 --retry 2 -s
 # Not "the port accepts, now wait half a second and hope".  A request that
 # comes back 200 has gone through the proxy, been routed to a backend that
 # passed its health checks, and been answered -- which is what the windows

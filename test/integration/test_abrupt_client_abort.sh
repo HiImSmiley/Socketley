@@ -56,6 +56,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: abrupt client aborts ==="
@@ -659,6 +661,7 @@ BEPID=$!
 
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 # Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
 # command auto-starts a daemon when the socket does not answer yet — cli.cpp's
 # ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
@@ -698,9 +701,9 @@ else
     echo "  FAIL [setup]: the echo backend never came up on $BE_PORT"
 fi
 
-"$BIN" create cache "$CACHE_NAME" -p "$CACHE_PORT" -s 2>&1 || true
-"$BIN" create proxy "$PROXY_NAME" -p "$PROXY_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s 2>&1 || true
+create_ok "cache under test created" "$BIN" create cache "$CACHE_NAME" -p "$CACHE_PORT" -s
+create_ok "proxy under test created" "$BIN" create proxy "$PROXY_NAME" -p "$PROXY_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s
 wait_port "$CACHE_PORT" 5 || true
 wait_port "$PROXY_PORT" 5 || true
 

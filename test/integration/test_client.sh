@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate client
 SVR_PORT=19280
 PASS=0; FAIL=0; TOTAL=0
@@ -44,11 +45,11 @@ echo "=== Integration: client-server ==="
 daemon_start "$BIN"
 
 # Create and start server
-"$BIN" create server cli_svr -p "$SVR_PORT" -s 2>&1 || true
+create_ok "server created" "$BIN" create server cli_svr -p "$SVR_PORT" -s
 sleep 0.3
 
 # Create and start client connecting to server
-"$BIN" create client cli_client -t "127.0.0.1:$SVR_PORT" -s 2>&1 || true
+create_ok "client created" "$BIN" create client cli_client -t "127.0.0.1:$SVR_PORT" -s
 sleep 0.3
 
 # Test: Both show in ps
@@ -57,13 +58,17 @@ assert_contains "$OUT" "cli_svr" "server in ps"
 assert_contains "$OUT" "cli_client" "client in ps"
 
 # Test: Send message from client
-"$BIN" send cli_client "hello from client" 2>&1 || true
-RC=$?
+#
+# `cmd || true; RC=$?` reads the status of `true`, so RC was 0 whatever `send`
+# did and both assertions below passed unconditionally.  The status has to be
+# captured by the thing that tolerates the failure, not after it.
+RC=0
+"$BIN" send cli_client "hello from client" >/dev/null 2>&1 || RC=$?
 assert_ok "$RC" "send from client"
 
 # Test: Send message from server (broadcast)
-"$BIN" send cli_svr "hello from server" 2>&1 || true
-RC=$?
+RC=0
+"$BIN" send cli_svr "hello from server" >/dev/null 2>&1 || RC=$?
 assert_ok "$RC" "send from server"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

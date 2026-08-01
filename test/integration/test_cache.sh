@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate cache
 PORT=19150
 PASS=0; FAIL=0; TOTAL=0
@@ -37,7 +38,8 @@ echo "=== Integration: cache commands ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create cache testcache -p "$PORT" --persistent /tmp/test-cache-$$.bin -s 2>&1 || true
+create_ok "cache created" "$BIN" create cache testcache -p "$PORT" \
+    --persistent /tmp/test-cache-$$.bin -s
 sleep 0.3
 
 # String ops

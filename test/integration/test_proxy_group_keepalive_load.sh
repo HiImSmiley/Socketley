@@ -43,6 +43,7 @@ set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_window.sh"
+. "$(dirname "$0")/lib_create.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-grpka-XXXXXX)
@@ -245,6 +246,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPD/daemon.log"
 "$BIN" daemon >"$TMPD/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -272,10 +274,18 @@ esac
 # Group members are TCP proxies in the group, each in front of one backend --
 # the same shape as test_proxy_group_http.sh, so the member is a real runtime
 # whose membership the daemon controls.
-"$BIN" create proxy kam1 -p $M1 --backend "127.0.0.1:$BE1" --protocol tcp -g $GRP -s >/dev/null 2>&1 || true
-"$BIN" create proxy kam2 -p $M2 --backend "127.0.0.1:$BE2" --protocol tcp -g $GRP -s >/dev/null 2>&1 || true
-"$BIN" create proxy kam3 -p $M3 --backend "127.0.0.1:$BE3" --protocol tcp -g $GRP -s >/dev/null 2>&1 || true
-"$BIN" create proxy "$GW_NAME" -p $GW --backend "@$GRP" --protocol http -s >/dev/null 2>&1 || true
+#
+# One assertion per member rather than one for the set: which member is missing
+# is the whole question in a group test, and a single "setup failed" would send
+# the reader back to a log to find out.  Three lines is not noise.
+create_ok "group member 1 created" \
+    "$BIN" create proxy kam1 -p $M1 --backend "127.0.0.1:$BE1" --protocol tcp -g $GRP -s
+create_ok "group member 2 created" \
+    "$BIN" create proxy kam2 -p $M2 --backend "127.0.0.1:$BE2" --protocol tcp -g $GRP -s
+create_ok "group member 3 created" \
+    "$BIN" create proxy kam3 -p $M3 --backend "127.0.0.1:$BE3" --protocol tcp -g $GRP -s
+create_ok "gateway created" \
+    "$BIN" create proxy "$GW_NAME" -p $GW --backend "@$GRP" --protocol http -s
 # A 200 through the gateway proves the group resolved to at least one member
 # and that member answered.  An accepted connection proves only that the
 # gateway is listening, which it does before any member is routable.

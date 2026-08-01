@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate dashboard
 PASS=0; FAIL=0; TOTAL=0
 
@@ -52,7 +53,7 @@ else
 fi
 
 # Create a runtime to test stats endpoints later
-"$BIN" create server dash_svr -p 19390 -s 2>&1 || true
+create_ok "server created" "$BIN" create server dash_svr -p 19390 -s
 sleep 0.3
 
 # Test: runtime is visible

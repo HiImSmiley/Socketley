@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate httpworker
 HTTP_PORT=19391
 PASS=0; FAIL=0; TOTAL=0
@@ -61,7 +62,8 @@ function on_http_request(req)
 end
 EOLUA
 
-"$BIN" create server http_svr -p "$HTTP_PORT" --lua "$LUA_SCRIPT" -s 2>&1 || true
+create_ok "HTTP server created" "$BIN" create server http_svr -p "$HTTP_PORT" \
+    --lua "$LUA_SCRIPT" -s
 sleep 0.5
 
 # Test: HTTP GET to /api/hello returns JSON
@@ -90,7 +92,7 @@ assert_contains "$REPLY" "POST /api/echo"
 # Same server should also handle plain TCP connections
 
 PROTO_PORT=19392
-"$BIN" create server proto_svr -p "$PROTO_PORT" -s 2>&1 || true
+create_ok "multi-protocol server created" "$BIN" create server proto_svr -p "$PROTO_PORT" -s
 sleep 0.3
 
 # TCP (newline-delimited) connection should work

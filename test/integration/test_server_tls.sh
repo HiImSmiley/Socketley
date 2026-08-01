@@ -40,6 +40,8 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_ready.sh
 . "$(dirname "$0")/lib_ready.sh"
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 PASS=0; FAIL=0; TOTAL=0
 
@@ -145,6 +147,7 @@ fi
 
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 for _ in $(seq 1 60); do [ -S "$SOCKETLEY_SOCKET" ] && break; sleep 0.1; done
 if [ ! -S "$SOCKETLEY_SOCKET" ]; then
     echo "  FAIL [setup]: daemon did not come up"
@@ -157,7 +160,8 @@ fi
 # The cache link is what proves the plaintext survived the record layer byte
 # for byte: every message the server receives is stored under an incrementing
 # key, so reading those keys back shows exactly what the server understood.
-"$BIN" create cache tls_cache -p "$CACHE_PORT" -s >/dev/null 2>&1 || true
+create_ok "cache for the plaintext oracle created" \
+    "$BIN" create cache tls_cache -p "$CACHE_PORT" -s
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || true
 
 CREATE_RC=$(rc_of "$BIN" create server tls_srv -p "$SRV_PORT" \

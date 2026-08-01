@@ -44,6 +44,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: restart under load ==="
@@ -561,6 +563,7 @@ while True:
 PYEOF
 BEPID=$!
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 # Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
@@ -602,9 +605,9 @@ else
     echo "  FAIL [setup]: the echo backend never came up on $BE_PORT"
 fi
 
-"$BIN" create cache "$CACHE_NAME" -p "$CACHE_PORT" -s 2>&1 || true
-"$BIN" create proxy "$PROXY_NAME" -p "$PROXY_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s 2>&1 || true
+create_ok "cache under test created" "$BIN" create cache "$CACHE_NAME" -p "$CACHE_PORT" -s
+create_ok "proxy under test created" "$BIN" create proxy "$PROXY_NAME" -p "$PROXY_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol tcp -s
 wait_port "$CACHE_PORT" 5 || true
 wait_port "$PROXY_PORT" 5 || true
 
@@ -728,7 +731,13 @@ done
 
 # The daemon is not merely alive, it still does its job: create a runtime that
 # never existed during the load, serve a verified round trip on it, remove it.
-"$BIN" create cache rl_final -p "$FINAL_PORT" -s >/dev/null 2>&1 || true
+# Deliberately not create_ok.  Here the create is not setup, it is the
+# measurement — "the daemon still creates a runtime and serves it" is one claim
+# and the round trip below is the oracle for all of it, so counting the create
+# separately would report one defect as two.  What the create said is kept, so
+# the failure can say whether the runtime was ever made.
+FINAL_CRC=0
+FINAL_CREATE=$("$BIN" create cache rl_final -p "$FINAL_PORT" -s 2>&1) || FINAL_CRC=$?
 # Wait for the success signal — a completed round trip — and not for a deadline.
 # 'wait_port' alone proves nothing here: it returns as soon as the kernel accepts
 # a connection out of the listen backlog, which is true from the instant listen()
@@ -748,6 +757,11 @@ if printf '%s\n' "$FINAL_RT" | grep -q '^SERVES_OK$'; then
 else
     FAIL=$((FAIL+1))
     echo "  FAIL [daemon still serves]: a freshly created runtime did not answer correctly"
+    if [ "$FINAL_CRC" -ne 0 ]; then
+        echo "        and it was never created: create exited $FINAL_CRC saying"
+        echo "        '${FINAL_CREATE:-<nothing>}' — the daemon refused before anything could serve"
+    fi
+    tail -5 "$TMPDIR_T/daemon.log" 2>/dev/null | sed 's/^/        daemon: /' || true
 fi
 "$BIN" remove rl_final >/dev/null 2>&1 || true
 

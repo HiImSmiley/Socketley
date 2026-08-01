@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate persist
 PORT=19270
 PASS=0; FAIL=0; TOTAL=0
@@ -42,7 +43,7 @@ echo "=== Integration: state persistence ==="
 daemon_start "$BIN"
 
 # Test: Create server (don't start)
-"$BIN" create server persist_test -p "$PORT" 2>&1 || true
+create_ok "server created" "$BIN" create server persist_test -p "$PORT"
 sleep 0.3
 
 # Test: ls shows the runtime

@@ -13,6 +13,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate masterfd
 PORT=19810
 PW=s3cret
@@ -34,7 +35,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 daemon_start "$BIN"
-"$BIN" create server mfdsrv -p "$PORT" --mode master --master-pw "$PW" -s 2>&1 || true
+create_ok "master-mode server created" "$BIN" create server mfdsrv -p "$PORT" \
+    --mode master --master-pw "$PW" -s
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 

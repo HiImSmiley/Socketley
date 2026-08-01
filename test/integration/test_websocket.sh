@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate ws
 PORT=19200
 PASS=0; FAIL=0; TOTAL=0
@@ -42,7 +43,7 @@ echo "=== Integration: WebSocket ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create server ws_test -p "$PORT" -s 2>&1 || true
+create_ok "server created" "$BIN" create server ws_test -p "$PORT" -s
 sleep 0.3
 
 # Test: Send WebSocket upgrade request, expect 101 Switching Protocols

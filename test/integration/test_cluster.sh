@@ -18,6 +18,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 PASS=0; FAIL=0; TOTAL=0
 
 TMPD=$(mktemp -d /tmp/socketley-cluster-XXXXXX)
@@ -144,8 +145,13 @@ sleep 0.5
 
 # ─── Create runtimes ──────────────────────────────────────────────────────────
 
-node1 create server "$RT_API1" -p "$NODE1_PORT" -g api -s 2>&1 || true
-node2 create server "$RT_API2" -p "$NODE2_PORT" -g api -s 2>&1 || true
+# create_ok takes the whole command because these go through the per-node
+# wrapper functions rather than through $BIN directly.  A refused create here is
+# worth naming twice over: every assertion in tests 1 to 5 is about a runtime
+# being discovered across daemons, and a runtime that was never created is
+# reported by all of them as "discovery does not work".
+create_ok "api runtime on node1 created" node1 create server "$RT_API1" -p "$NODE1_PORT" -g api -s
+create_ok "api runtime on node2 created" node2 create server "$RT_API2" -p "$NODE2_PORT" -g api -s
 
 # Wait for cluster heartbeat cycle (publish every 2s)
 sleep 3
@@ -185,8 +191,9 @@ assert_contains "$OUT" "2 members"
 # ─── Test 5: Proxy @group routing ──────────────────────────────────────────────
 
 echo "  Test 5: proxy @group routing"
-gw create proxy "$RT_GW" -p "$GW_PORT" \
-    --backend @api --protocol tcp --strategy round-robin -s 2>&1 || true
+create_ok "@group gateway created on the gateway node" \
+    gw create proxy "$RT_GW" -p "$GW_PORT" \
+    --backend @api --protocol tcp --strategy round-robin -s
 sleep 1
 
 # TCP connect through the proxy should succeed

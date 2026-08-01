@@ -13,6 +13,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 PROXY_PORT=19286
 SINK_PORT=19287
@@ -35,6 +37,7 @@ trap cleanup EXIT
 
 echo "=== Integration: proxy with $BACKENDS backends ==="
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 sleep 2
@@ -49,8 +52,9 @@ for i in $(seq 1 $((BACKENDS-1))); do
     BE="$BE,127.0.0.1:$((21000+i))"
 done
 
-"$BIN" create proxy manybe -p "$PROXY_PORT" --backend "$BE" \
-    --protocol tcp --strategy random --health-check tcp --health-interval 1 -s 2>&1 || true
+create_ok "proxy with $BACKENDS backends created" \
+    "$BIN" create proxy manybe -p "$PROXY_PORT" --backend "$BE" \
+    --protocol tcp --strategy random --health-check tcp --health-interval 1 -s
 sleep 2
 
 TOTAL=$((TOTAL+1))

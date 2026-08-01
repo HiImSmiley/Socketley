@@ -40,6 +40,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_create.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 # Own daemon, socket and state directory: against the shared one this test does
@@ -165,6 +166,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -187,20 +189,24 @@ case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     *) PASS=$((PASS+1)) ;;
 esac
 
-"$BIN" create server "$BE_NAME" -p "$BE_PORT" --lua "$BE_LUA" -s >/dev/null 2>&1 || true
-"$BIN" create proxy  "$PX_NAME" -p "$PX_PORT" --backend "$BE_NAME" --protocol http -s >/dev/null 2>&1 || true
+# Checked, not discarded.  A declaration the daemon will not load makes `create`
+# fail, and that is the single most likely way this file's setup goes wrong —
+# which used to be reported forty lines further down as "the gateway refused a
+# request it should have served", i.e. as the defect under test.
+create_ok "backend created"       "$BIN" create server "$BE_NAME" -p "$BE_PORT" --lua "$BE_LUA" -s
+create_ok "proxy created"         "$BIN" create proxy  "$PX_NAME" -p "$PX_PORT" --backend "$BE_NAME" --protocol http -s
 
-"$BIN" create server "$GA_NAME" -p "$GA_PORT" --lua "$BE_LUA" -g "$GROUP" -s >/dev/null 2>&1 || true
-"$BIN" create server "$GB_NAME" -p "$GB_PORT" --lua "$GB_LUA" -g "$GROUP" -s >/dev/null 2>&1 || true
-"$BIN" create proxy  "$GP_NAME" -p "$GP_PORT" --backend "@$GROUP" --protocol http -s >/dev/null 2>&1 || true
+create_ok "group member A created" "$BIN" create server "$GA_NAME" -p "$GA_PORT" --lua "$BE_LUA" -g "$GROUP" -s
+create_ok "group member B created" "$BIN" create server "$GB_NAME" -p "$GB_PORT" --lua "$GB_LUA" -g "$GROUP" -s
+create_ok "group gateway created"  "$BIN" create proxy  "$GP_NAME" -p "$GP_PORT" --backend "@$GROUP" --protocol http -s
 
 # The same server twice: once by name, which has a declaration, and once as a
 # bare address, which cannot have one.  A proxy that enforced the declaration it
 # does have would be refusing methods on behalf of a backend that never said
 # anything about what it answers — and here the two happen to be the same
 # process, but nothing tells the proxy that.
-"$BIN" create proxy  "$MX_NAME" -p "$MX_PORT" \
-    --backend "$BE_NAME,127.0.0.1:$BE_PORT" --protocol http -s >/dev/null 2>&1 || true
+create_ok "mixed-backend proxy created" "$BIN" create proxy "$MX_NAME" -p "$MX_PORT" \
+    --backend "$BE_NAME,127.0.0.1:$BE_PORT" --protocol http -s
 
 ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 ready_http 127.0.0.1 "$GP_PORT" "/$GP_NAME/ready" 20 || true
@@ -241,7 +247,14 @@ fi
 cat > "$BAD_LUA" <<'LUAEOF'
 routes = { ["/endpoint/login"] = { "GET" } }
 LUAEOF
-"$BIN" create server route_bad2 -p 19649 --lua "$BAD_LUA" -s >/dev/null 2>&1 || true
+# Deliberately not create_ok.  This create is expected to be refused — that is
+# the assertion — and the oracle is the daemon's reason rather than the exit
+# status: "unknown flag" and "unknown runtime" are refusals too, and a check
+# that accepted any non-zero exit would pass against a build where `routes` does
+# not exist at all.  The status is still captured, so a create that *succeeded*
+# can be named in the failure rather than left to be inferred.
+BAD2_RC=0
+"$BIN" create server route_bad2 -p 19649 --lua "$BAD_LUA" -s >/dev/null 2>&1 || BAD2_RC=$?
 TOTAL=$((TOTAL+1))
 if grep -q "no entry at index 1" "$TMPDIR_T/daemon.log" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -250,6 +263,7 @@ else
     echo '  FAIL [a keyed table is refused, and says why]: routes = { [path] = ... }'
     echo "        reads like a declaration and is silently nothing — the array part is"
     echo "        what is walked, so it must not load quietly"
+    echo "        (create exited $BAD2_RC and the daemon logged no reason)"
 fi
 
 python3 - "$PX_PORT" "$PX_NAME" "$BIN" "$BE_NAME" "$GP_PORT" "$GP_NAME" \

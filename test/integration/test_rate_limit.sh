@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate ratelimit
 PORT=19230
 PASS=0; FAIL=0; TOTAL=0
@@ -34,7 +35,8 @@ echo "=== Integration: rate limit & max connections ==="
 # Ensure daemon is running
 daemon_start "$BIN"
 
-"$BIN" create server rl_test -p "$PORT" --rate-limit 2 --max-connections 3 -s 2>&1 || true
+create_ok "server created" "$BIN" create server rl_test -p "$PORT" \
+    --rate-limit 2 --max-connections 3 -s
 sleep 0.3
 
 # Test: Server shows in ps

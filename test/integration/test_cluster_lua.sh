@@ -14,6 +14,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 PASS=0; FAIL=0; TOTAL=0
 
 TMPD=$(mktemp -d /tmp/socketley-clua-XXXXXX)
@@ -175,8 +176,13 @@ start_node "$SOCK_A" nodeA "CLUA_OUT_FILE=$LUA_OUT"
 sleep 0.2
 
 # ─── Create server on A with Lua script ─────────────────────────────────────
-nodeA create server "$RT_A" -p "$PORT_A" -g api \
-    --lua "$LUA_SCRIPT" -s 2>&1 || true
+# create_ok takes the whole command because these go through the per-node
+# wrapper functions rather than through $BIN directly.  A script the daemon
+# refuses to load makes `create` fail, and every assertion below reads the file
+# that script writes — so a refusal used to be reported as "the callback never
+# fired", which is the defect this file exists to catch.
+create_ok "server on nodeA created with the cluster script" \
+    nodeA create server "$RT_A" -p "$PORT_A" -g api --lua "$LUA_SCRIPT" -s
 sleep 1
 
 # ─── Test 1: on_start sees at least the local daemon ────────────────────────
@@ -191,7 +197,7 @@ start_node "$SOCK_B" nodeB
 sleep 0.2
 
 # Create server on B in same group
-nodeB create server "$RT_B" -p "$PORT_B" -g api -s 2>&1 || true
+create_ok "server on nodeB created" nodeB create server "$RT_B" -p "$PORT_B" -g api -s
 
 # Wait for cluster heartbeat cycle (publish every 2s) + scan
 sleep 5

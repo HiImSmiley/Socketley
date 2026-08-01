@@ -31,6 +31,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate cacheaccess
 CACHE_PORT=19240
 SERVER_PORT=19241
@@ -77,8 +78,8 @@ echo "=== Integration: cache access via server ==="
 daemon_start "$BIN"
 
 # Create cache and server linked to it
-"$BIN" create cache ca_cache -p "$CACHE_PORT" -s 2>&1 || true
-"$BIN" create server ca_server -p "$SERVER_PORT" --cache ca_cache -s 2>&1 || true
+create_ok "cache created"  "$BIN" create cache ca_cache -p "$CACHE_PORT" -s
+create_ok "server created" "$BIN" create server ca_server -p "$SERVER_PORT" --cache ca_cache -s
 
 # The cache answers PING before the server is asked anything of it, and the
 # server answers a line — both proved rather than slept for.  ready_tcp on the

@@ -14,6 +14,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate breaker
 OK_BE=19901; OK_PROXY=19900
 BAD_BE=19911; BAD_PROXY=19910
@@ -104,8 +105,10 @@ daemon_start "$BIN"
 start_backend healthy "$OK_BE"  || { echo "  SKIP: healthy backend did not start"; exit 0; }
 start_backend failing "$BAD_BE" || { echo "  SKIP: failing backend did not start"; exit 0; }
 
-"$BIN" create proxy cb_ok  -p "$OK_PROXY"  --backend "127.0.0.1:$OK_BE"  -s 2>&1 || true
-"$BIN" create proxy cb_bad -p "$BAD_PROXY" --backend "127.0.0.1:$BAD_BE" -s 2>&1 || true
+create_ok "proxy for the healthy backend created" \
+    "$BIN" create proxy cb_ok  -p "$OK_PROXY"  --backend "127.0.0.1:$OK_BE"  -s
+create_ok "proxy for the failing backend created" \
+    "$BIN" create proxy cb_bad -p "$BAD_PROXY" --backend "127.0.0.1:$BAD_BE" -s
 # The healthy proxy has to answer before the breaker cases mean anything.
 ready_http 127.0.0.1 "$OK_PROXY" "/cb_ok/ready" 20 || true
 

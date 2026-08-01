@@ -92,6 +92,8 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: create/remove churn ==="
@@ -586,6 +588,10 @@ BEPID=$!
     echo $? >"$TMPDIR_T/daemon.status"
 ) 2>/dev/null &
 SUBPID=$!
+# Set in this shell rather than in the subshell above: create_ok prints the tail
+# of it when a create is refused, and the CLI's own message is only `could not
+# start runtime` whenever the reason was found on the daemon side.
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 for _ in $(seq 1 100); do [ -s "$TMPDIR_T/daemon.pid" ] && break; sleep 0.02; done
 DPID=$(tr -d '[:space:]' <"$TMPDIR_T/daemon.pid" 2>/dev/null || true)
 if [ -z "$DPID" ]; then
@@ -636,7 +642,7 @@ fi
 
 # The sentinel is created once and never removed.  It is what stops the final
 # 'ls' assertion from passing because 'ls' printed nothing at all.
-"$BIN" create cache sentinel_keep -p "$SENTINEL_PORT" -s 2>&1 || true
+create_ok "sentinel created" "$BIN" create cache sentinel_keep -p "$SENTINEL_PORT" -s
 wait_port "$SENTINEL_PORT" 5 || true
 TOTAL=$((TOTAL+1))
 if [ "$(python3 "$H" serve "$SENTINEL_PORT" 2>/dev/null || true)" = "SERVES_OK" ]; then
@@ -751,7 +757,14 @@ fi
 
 # The daemon is not merely alive: it still creates and serves a runtime that
 # never existed during the churn.
-"$BIN" create cache final_probe -p "$FINAL_PORT" -s >/dev/null 2>&1 || true
+# Deliberately not create_ok.  Here the create is not setup, it is the
+# measurement: the claim is that the daemon still creates *and serves* after the
+# churn, and the round trip below is the oracle for both halves.  Counting the
+# create separately would report one defect as two.  What the create said is
+# kept, so that when the round trip fails the report can say whether the runtime
+# was ever made.
+FINAL_CRC=0
+FINAL_CREATE=$("$BIN" create cache final_probe -p "$FINAL_PORT" -s 2>&1) || FINAL_CRC=$?
 # Wait for the success signal — a completed round trip — and not for a deadline.
 # 'wait_port' alone proves nothing here: it returns as soon as the kernel accepts
 # a connection out of the listen backlog, which is true from the instant listen()
@@ -771,6 +784,11 @@ if [ "$FINAL_RT" = "SERVES_OK" ]; then
 else
     FAIL=$((FAIL+1))
     echo "  FAIL [daemon still serves]: a freshly created runtime did not answer correctly"
+    if [ "$FINAL_CRC" -ne 0 ]; then
+        echo "        and it was never created: create exited $FINAL_CRC saying"
+        echo "        '${FINAL_CREATE:-<nothing>}' — the daemon refused before anything could serve"
+    fi
+    tail -5 "$TMPDIR_T/daemon.log" 2>/dev/null | sed 's/^/        daemon: /' || true
 fi
 "$BIN" remove final_probe >/dev/null 2>&1 || true
 

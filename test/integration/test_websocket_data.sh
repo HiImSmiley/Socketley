@@ -17,6 +17,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate wsdata
 SRV_PORT=19701
 CACHE_PORT=19702
@@ -54,9 +55,10 @@ fi
 
 daemon_start "$BIN"
 
-"$BIN" create cache  wsdata_cache -p "$CACHE_PORT" -s 2>&1 || true
+create_ok "cache created" "$BIN" create cache wsdata_cache -p "$CACHE_PORT" -s
 sleep 0.3
-"$BIN" create server wsdata_srv -p "$SRV_PORT" --cache wsdata_cache -s 2>&1 || true
+create_ok "server created" "$BIN" create server wsdata_srv -p "$SRV_PORT" \
+    --cache wsdata_cache -s
 for _ in $(seq 1 50); do nc -z 127.0.0.1 "$SRV_PORT" 2>/dev/null && break; sleep 0.1; done
 sleep 0.3
 

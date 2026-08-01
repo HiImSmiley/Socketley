@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate mesh
 BE1_PORT=19381
 BE2_PORT=19382
@@ -27,13 +28,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# assert_ok STATUS LABEL [OUTPUT]
+#
+# The status is passed in.  It used to be read from $? inside the function, one
+# line after `TOTAL=$((TOTAL+1))` — and an assignment is a command, so $? was the
+# status of the arithmetic and never anything else.  All three uses below —
+# creating the mesh proxy, creating the sidecar, editing the mesh flags — passed
+# unconditionally, and each of their callers also ended in `|| true`.
 assert_ok() {
     TOTAL=$((TOTAL+1))
-    if [ $? -eq 0 ]; then
+    local rc="$1" label="$2" out="${3:-}"
+    if [ "$rc" -eq 0 ]; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
-        echo "  FAIL: $1"
+        echo "  FAIL [$label]: exit $rc"
+        # An `if` rather than `[ -n … ] && printf`: the latter is the last
+        # command of the function, so an empty message would make the function
+        # return 1 and `set -e` would end the run at the first failed assertion.
+        if [ -n "$out" ]; then printf '        said: %s\n' "$out"; fi
     fi
 }
 
@@ -68,18 +81,18 @@ echo "=== Integration: service mesh ==="
 daemon_start "$BIN"
 
 # --- Test 1: Health check flags accepted on create ---
-"$BIN" create server mesh_be1 -p "$BE1_PORT" -s 2>&1 || true
-"$BIN" create server mesh_be2 -p "$BE2_PORT" -s 2>&1 || true
+create_ok "backend 1 created" "$BIN" create server mesh_be1 -p "$BE1_PORT" -s
+create_ok "backend 2 created" "$BIN" create server mesh_be2 -p "$BE2_PORT" -s
 sleep 0.3
 
-OUT=$("$BIN" create proxy mesh_proxy -p "$PROXY_PORT" \
+create_ok "create proxy with mesh flags" \
+    "$BIN" create proxy mesh_proxy -p "$PROXY_PORT" \
     --backend "127.0.0.1:$BE1_PORT,127.0.0.1:$BE2_PORT" \
     --protocol tcp --strategy round-robin \
     --health-check tcp --health-interval 2 --health-threshold 2 \
     --circuit-threshold 3 --circuit-timeout 10 \
     --retry 1 \
-    -s 2>&1) || true
-assert_ok "create proxy with mesh flags"
+    -s
 sleep 0.5
 
 # Test: proxy is running
@@ -118,14 +131,14 @@ sleep 0.5
 "$BIN" remove mesh_be2 2>/dev/null || true
 
 # --- Test 3: --sidecar shorthand ---
-"$BIN" create server sidecar_be -p 19384 -s 2>&1 || true
+create_ok "sidecar backend created" "$BIN" create server sidecar_be -p 19384 -s
 sleep 0.3
 
-OUT=$("$BIN" create proxy sidecar_proxy -p 19385 \
+create_ok "create proxy with --sidecar" \
+    "$BIN" create proxy sidecar_proxy -p 19385 \
     --backend "127.0.0.1:19384" \
     --protocol tcp --sidecar \
-    -s 2>&1) || true
-assert_ok "create proxy with --sidecar"
+    -s
 sleep 0.5
 
 OUT=$("$BIN" ps 2>&1)
@@ -148,8 +161,8 @@ else
 fi
 
 # --- Test 4: Edit mesh flags on running proxy ---
-OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || true
-assert_ok "edit mesh flags"
+RC=0; OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || RC=$?
+assert_ok "$RC" "edit mesh flags" "$OUT"
 
 OUT=$("$BIN" show sidecar_proxy 2>&1)
 assert_contains "$OUT" "circuit_threshold"

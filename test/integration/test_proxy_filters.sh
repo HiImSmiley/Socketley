@@ -37,6 +37,8 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — auto-restart hides a crash, and a leftover runtime from an
@@ -258,6 +260,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -291,8 +294,8 @@ fi
 # No --strategy lua: the chain is not a routing strategy and must run whatever
 # picks the backend afterwards.  A chain that only fired under 'lua' would be a
 # routing feature wearing a different name.
-"$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA" -s 2>&1 || true
+create_ok "proxy with the filter chain created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
+    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA" -s
 ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 
 TOTAL=$((TOTAL+1))

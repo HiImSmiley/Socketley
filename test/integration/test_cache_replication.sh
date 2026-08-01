@@ -13,6 +13,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate cacherepl
 LEADER_PORT=19290
 FOLLOWER_PORT=19291
@@ -55,7 +56,7 @@ echo "=== Integration: cache replication ==="
 
 daemon_start "$BIN"
 
-"$BIN" create cache replleader -p "$LEADER_PORT" -s 2>&1 || true
+create_ok "leader created" "$BIN" create cache replleader -p "$LEADER_PORT" -s
 sleep 0.5
 
 # Populate the leader before any follower exists, so this data can only reach
@@ -70,7 +71,8 @@ assert_eq "$(key_count replleader)" "$KEYS" "leader holds all keys"
 
 # Attach the follower. Its setup() connects and sends "replicate", which makes
 # the leader dump everything it has.
-"$BIN" create cache replfollower -p "$FOLLOWER_PORT" --replicate "127.0.0.1:$LEADER_PORT" -s 2>&1 || true
+create_ok "follower created" "$BIN" create cache replfollower -p "$FOLLOWER_PORT" \
+    --replicate "127.0.0.1:$LEADER_PORT" -s
 sleep 3
 
 assert_eq "$(key_count replfollower)" "$KEYS" "follower received the full dump"
@@ -97,7 +99,7 @@ assert_eq "$(send_to "$FOLLOWER_PORT" 'get livekey')" "livevalue" "live write re
 # The edit below is the most innocuous one available.  It changes the eviction
 # policy and says nothing whatsoever about replication, which is the point: the
 # operator did not ask for a replication change and must not get one.
-"$BIN" create cache replplain -p "$PLAIN_PORT" -s 2>&1 || true
+create_ok "plain cache created" "$BIN" create cache replplain -p "$PLAIN_PORT" -s
 sleep 1
 
 repl_role_of() {  # name -> 0 none, 1 leader, 2 follower

@@ -49,6 +49,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_create.sh"
 daemon_isolate luacb
 PORT=19400
 PASS=0; FAIL=0; TOTAL=0
@@ -131,7 +132,8 @@ fi
 
 daemon_start "$BIN"
 
-"$BIN" create server luasvr -p "$PORT" --mode "$SERVER_MODE" --lua "$LUA_SCRIPT" -s 2>&1 || true
+create_ok "server with the callback script created" "$BIN" create server luasvr \
+    -p "$PORT" --mode "$SERVER_MODE" --lua "$LUA_SCRIPT" -s
 ready_tcp 127.0.0.1 "$PORT" 8 || echo "  NOTE: listener never accepted a connection"
 
 # on_start runs as the runtime comes up, before anything connects.

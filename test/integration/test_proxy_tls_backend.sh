@@ -28,6 +28,8 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+# shellcheck source=lib_create.sh
+. "$(dirname "$0")/lib_create.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-tls-XXXXXX)
 export HOME="$TMPD/home"
@@ -193,6 +195,7 @@ while time.time() < end:
 sys.exit(1)
 PYEOF
 
+SOCKETLEY_DLOG="$TMPD/daemon.log"
 "$BIN" daemon >"$TMPD/daemon.log" 2>&1 &
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
@@ -219,9 +222,10 @@ case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
 esac
 
 # ---- 1. upstream: proxy -> TLS backend ------------------------------------
-"$BIN" create proxy tlsup -p "$PX_UP" --backend "127.0.0.1:$TLS_BE" --protocol http \
+create_ok "proxy with backend-mTLS flags created" \
+    "$BIN" create proxy tlsup -p "$PX_UP" --backend "127.0.0.1:$TLS_BE" --protocol http \
     --client-cert "$TMPD/cert.pem" --client-key "$TMPD/key.pem" --ca "$TMPD/cert.pem" \
-    -s >/dev/null 2>&1 || true
+    -s
 for _ in $(seq 1 60); do nc -z 127.0.0.1 "$PX_UP" 2>/dev/null && break; sleep 0.1; done
 sleep 0.5
 
@@ -243,8 +247,9 @@ else
 fi
 
 # ---- 2. downstream: TLS client -> proxy listener created with --tls --------
-"$BIN" create proxy tlsdown -p "$PX_DOWN" --backend "127.0.0.1:$PLAIN_BE" --protocol http \
-    --tls --cert "$TMPD/cert.pem" --key "$TMPD/key.pem" -s >/dev/null 2>&1 || true
+create_ok "proxy with a TLS listener created" \
+    "$BIN" create proxy tlsdown -p "$PX_DOWN" --backend "127.0.0.1:$PLAIN_BE" --protocol http \
+    --tls --cert "$TMPD/cert.pem" --key "$TMPD/key.pem" -s
 for _ in $(seq 1 60); do nc -z 127.0.0.1 "$PX_DOWN" 2>/dev/null && break; sleep 0.1; done
 sleep 0.5
 
