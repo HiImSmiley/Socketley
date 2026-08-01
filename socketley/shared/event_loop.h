@@ -35,6 +35,13 @@ public:
     // SQPOLL costs a kernel thread per ring for as long as the ring exists, and
     // that thread spins on the submission queue whether or not anything is
     // being submitted.  It is therefore off unless asked for.
+    //
+    // Calling either marks the choice explicit, and an explicit choice beats the
+    // environment at init().  The distinction is what makes `--no-sqpoll` and
+    // `--cpus max` mean anything: without it init() cannot tell "nobody chose,
+    // so the default is off" from "the command line said off", and
+    // SOCKETLEY_SQPOLL=1 in the environment would turn the poller back on under
+    // a flag that had just asked for it to be gone.
     void set_sqpoll(bool on);
     void set_cpus(const cpu_set_spec& cpus);
 
@@ -455,6 +462,12 @@ private:
     // Asked for, as opposed to granted.  Set before init() by set_sqpoll() or,
     // when nothing called that, from the environment inside init().
     bool m_sqpoll_requested{false};
+    // Whether a caller chose, as opposed to the value merely being what it
+    // starts as.  Only these two say the environment has nothing left to
+    // decide; the values above cannot, because "off" and "unrestricted" are
+    // both a legitimate choice and the state of having made none.
+    bool m_sqpoll_explicit{false};
+    bool m_cpus_explicit{false};
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
     int m_sq_thread_cpu{-1};

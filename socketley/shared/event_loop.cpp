@@ -716,6 +716,7 @@ void event_loop::set_sqpoll(bool on)
         return;
     }
     m_sqpoll_requested = on;
+    m_sqpoll_explicit = true;
 }
 
 void event_loop::set_cpus(const cpu_set_spec& cpus)
@@ -726,6 +727,7 @@ void event_loop::set_cpus(const cpu_set_spec& cpus)
         return;
     }
     m_cpus = cpus;
+    m_cpus_explicit = true;
 }
 
 namespace
@@ -808,11 +810,14 @@ bool event_loop::init()
     // is why one daemon-level setting today reaches every ring in the tree.
     //
     // Explicit set_sqpoll()/set_cpus() win; these fill in for a caller that made
-    // no choice.
-    if (!m_sqpoll_requested)
+    // no choice.  "No choice" is the explicit-marker and not the value: `daemon
+    // --no-sqpoll` and `daemon --cpus max` are choices that happen to name the
+    // defaults, and reading them off the value would let the environment
+    // silently overrule the command line that was typed to overrule it.
+    if (!m_sqpoll_explicit)
         env_flag("SOCKETLEY_SQPOLL", m_sqpoll_requested);
 
-    if (m_cpus.all)
+    if (!m_cpus_explicit)
     {
         if (const char* cpus_env = getenv("SOCKETLEY_CPUS"); cpus_env && *cpus_env)
         {

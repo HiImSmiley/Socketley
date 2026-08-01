@@ -129,6 +129,25 @@ int cli_dispatch(int argc, char** argv)
             if (!has_config)
                 return cli_daemon(argc, argv);
 
+            // Configuration mode talks to a daemon that is already up, and the
+            // ring flags configure one that is being started.  They cannot both
+            // be on the same command line: a ring's flags are fixed when the
+            // ring is created, so --sqpoll here would be read, sent nowhere and
+            // do nothing — which is exactly the silence this pair of flags was
+            // given a parser to stop.
+            for (int i = 2; i < argc; ++i)
+            {
+                std::string_view arg = argv[i];
+                if (arg == "--sqpoll" || arg == "--no-sqpoll" || arg == "--cpus")
+                {
+                    std::cerr << arg << " cannot be combined with --name or --cluster\n"
+                              << "  Those name a daemon that is already running; this "
+                                 "one shapes the ring of a daemon being started.\n"
+                              << "  Start the daemon with it: socketley daemon " << arg << "\n";
+                    return 1;
+                }
+            }
+
             // Configuration mode — ensure daemon is running, then send IPC
             if (!ensure_daemon(argv[0]))
             {
