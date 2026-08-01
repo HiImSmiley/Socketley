@@ -29,11 +29,11 @@
 #   5. fail closed: a certificate that cannot be loaded, a key that does not
 #      match it, and every incomplete flag combination refuse rather than
 #      falling back to a cleartext listener
-#   6. the one role that still has no handshake behind it — cache — goes on
-#      refusing the flags, and the proxy and the client, which now have one,
-#      take a complete set and refuse the incomplete ones.  What a client does
-#      with them is test_client_tls.sh's subject; this file only asserts who is
-#      allowed to hold them at all
+#   6. who may hold these flags at all: no role is left without a handshake
+#      behind it, so cache, proxy and client each take a complete set and
+#      refuse the incomplete ones.  What each does with them is its own file's
+#      subject — test_cache_tls.sh, test_proxy_tls_backend.sh,
+#      test_client_tls.sh; this file only asserts who is allowed to hold them
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -505,26 +505,35 @@ assert_eq "$(rc_of "$BIN" create server tls_certonly -p "$BAD_PORT" \
     "a certificate without --tls is refused"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. The role that still has no handshake
+# 6. Who may hold these flags
 # ─────────────────────────────────────────────────────────────────────────────
-# A cache listener is the last one that would accept in cleartext on a port
-# `inspect` reported as encrypted, so it still refuses the flags outright.
+# This section used to enumerate the roles that had no handshake behind them
+# and still refused the flags outright.  There are none left: every runtime
+# type terminates or dials TLS somewhere, so what it enumerates now is that
+# each of them takes a complete set — and a stale entry here is exactly how the
+# gate ends up refusing a role that has since grown a handshake.
 #
-# The client used to be listed here beside it.  It is not any more: a client
-# runtime dials its target over TLS and verifies the peer, so it holds these
-# flags legitimately — with --cert/--key meaning the certificate it *presents*
-# rather than one it serves.  What it does with them is test_client_tls.sh's
-# subject, including every configuration it refuses.
-for kind in cache; do
-    # tlsprobe_ and not tls_: tls_cache is the live cache this file linked the
-    # server to, and asking `ls` about it would answer for that one instead.
-    assert_eq "$(rc_of "$BIN" create "$kind" "tlsprobe_$kind" -p "$BAD_PORT" \
-        --tls --cert "$CERTS/server.pem" --key "$CERTS/server-key.pem")" "1" \
-        "--tls on a $kind runtime is still refused"
-    assert_eq "$(state_of "tlsprobe_$kind")" "" "--tls on a $kind runtime creates no runtime"
-done
+# A cache listener was the last one to arrive.  It terminates TLS on its own
+# port with the same three flags a server uses, and RESP runs on the decrypted
+# stream; see test_cache_tls.sh for the transport, the mutual-TLS case and the
+# one thing a TLS cache still refuses, which is replicating in cleartext out of
+# an encrypted port.
+#
+# tlsprobe_ and not tls_: tls_cache is the live cache this file linked the
+# server to, and asking `ls` about it would answer for that one instead.
+assert_eq "$(rc_of "$BIN" create cache tlsprobe_cache -p "$BAD_PORT" \
+    --tls --cert "$CERTS/server.pem" --key "$CERTS/server-key.pem")" "0" \
+    "--tls --cert --key on a cache runtime is accepted"
+assert_eq "$(state_of tlsprobe_cache)" "created" "--tls on a cache runtime creates the runtime"
+rc_of "$BIN" remove tlsprobe_cache >/dev/null
 
-# And the client takes the complete set, as the proxy below does.  Asserted
+# ...and the incomplete sets are refused there for the same reason they are on
+# a server: each describes a listener that could only serve cleartext.
+assert_eq "$(rc_of "$BIN" create cache tlsprobe_cachebare -p "$BAD_PORT" --tls)" "1" \
+    "--tls with no certificate is refused on a cache"
+assert_eq "$(state_of tlsprobe_cachebare)" "" "--tls with no certificate creates no cache"
+
+# The client takes the complete set, as the proxy below does.  Asserted
 # here because this is the file that enumerates who may hold these flags.
 assert_eq "$(rc_of "$BIN" create client tlsprobe_client -t "127.0.0.1:$BAD_PORT" \
     --tls --ca "$CERTS/server.pem")" "0" "--tls --ca on a client runtime is accepted"

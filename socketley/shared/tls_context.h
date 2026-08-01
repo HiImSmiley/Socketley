@@ -26,7 +26,7 @@ enum tls_conn_state : uint8_t {
 
 // ─── What this build can honour ───
 //
-// Three roles have a handshake behind them:
+// Every runtime type has a handshake behind it now:
 //
 //   * a **server runtime's own listener** — accept, handshake and record layer
 //     driven by io_uring completions through the memory BIO pair below; see
@@ -38,15 +38,25 @@ enum tls_conn_state : uint8_t {
 //   * a **client runtime's outbound socket** — the same dial as the proxy's
 //     backend leg, with the same verification: create_ssl_client pins the host
 //     from `-t` before the ClientHello and there is no way to switch that off.
+//   * a **cache runtime's own listener** — the server's design over the cache's
+//     connection struct: memory BIO pair, ciphertext moved by the same
+//     io_uring submissions, RESP and the line protocol reading the decrypted
+//     stream exactly as they always did.  See cache_instance's
+//     tls_feed/tls_flush.
 //
-// A cache's listener still accepts in cleartext, and a cache "configured with
-// TLS" would listen in the clear while inspect reported it as encrypted.  That
-// is the dangerous shape: an operator who asks for encryption and is told they
-// have it has no way to notice they do not.
+// What a cache still cannot do over TLS is *replicate*, and that is the one
+// asymmetry left in here.  Replication is not a listener: a follower dials its
+// leader from connect_to_master(), and on the leader a promoted follower gets
+// a second writer that submits raw bytes straight at the descriptor, around
+// the record layer that owns it.  Neither of those speaks TLS, so a cache that
+// terminated TLS on its port and went on replicating would put the whole
+// dataset — dump and live command stream — in the clear, out of a runtime the
+// operator configured for encryption and `inspect` reports as encrypted.
 //
-// So those flags fail closed, and stay refused until some runtime actually
-// drives the handshake for them.  A flag that errors out is a bad afternoon; a
-// flag that silently serves cleartext is a breach.
+// That is the same dangerous shape the flags used to have, so it fails closed
+// the same way: a TLS cache carrying --replicate is refused here, and a TLS
+// cache asked to become a leader by a REPLICATE command is refused at the
+// command.  Half an encrypted cache is worse than an honestly cleartext one.
 //
 // tls_config_refusal is the single question every place a TLS configuration is
 // about to take effect asks — flag parsing, `edit`, `import`, and the last
@@ -62,6 +72,12 @@ enum tls_conn_state : uint8_t {
 // no listener to present a certificate on, and the trust store it verifies the
 // peer against defaults to the system one.  --cert/--key there are the
 // certificate it *presents*, for a peer that asks for mutual TLS.
+//
+// `cache_replicate_target` is the cache's --replicate address, empty for every
+// other role and for a cache that does not replicate.  It is a parameter
+// rather than a check made at the cache because this function is the one place
+// that answers "may this configuration take effect?", and a rule enforced
+// anywhere else is a rule the restore path can walk around.
 std::string tls_config_refusal(runtime_type type,
                                bool tls,
                                std::string_view cert_path,
@@ -69,20 +85,33 @@ std::string tls_config_refusal(runtime_type type,
                                std::string_view ca_path,
                                std::string_view mesh_client_ca = {},
                                std::string_view mesh_client_cert = {},
-                               std::string_view mesh_client_key = {});
+                               std::string_view mesh_client_key = {},
+                               std::string_view cache_replicate_target = {});
 
 // The refusal text for `option`, newline-terminated.  Used both on stdout
 // (create/edit) and in the IPC response buffer (start/import) so the wording a
 // user sees is the same wherever they hit the wall.
+//
+// Kept although every runtime_type now answers true to tls_role_has_handshake
+// below: this is the text for "the role holding this flag drives no
+// handshake", and the next role added to the enum starts out being exactly
+// that.  Deleting it would mean the next one silently stores flags it cannot
+// honour, which is the failure this whole file is built against.
 std::string tls_not_implemented_error(std::string_view option);
 
 // Whether a runtime of this type performs a handshake at all.  The single
 // place that knows, so that a flag handler asking "may I store this?" and the
 // start gate asking "may this come up?" cannot drift apart.
+//
+// All four types do, as of the cache listener.  It stays a function rather
+// than becoming `true` at every call site because the question is about a
+// role, not about this moment: a fifth runtime type is added to the enum
+// before anybody writes its record layer, and it has to answer false in the
+// meantime.
 inline bool tls_role_has_handshake(runtime_type type)
 {
     return type == runtime_server || type == runtime_proxy ||
-           type == runtime_client;
+           type == runtime_client || type == runtime_cache;
 }
 
 // TLS context wrapper for server/client runtimes

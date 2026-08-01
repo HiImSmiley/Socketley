@@ -15,6 +15,7 @@
 #include "cache_store.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
+#include "../../shared/tls_context.h"
 
 struct client_connection
 {
@@ -59,6 +60,42 @@ struct client_connection
     bool is_follower{false};
     bool follower_refused{false};
 
+    // === TLS session ===
+    // Non-null only on a listener created with --tls.  The design is the
+    // server runtime's, deliberately unchanged: OpenSSL never sees this
+    // socket, the session is fed ciphertext a read completion delivered and
+    // drained of ciphertext a write submission carries, and every byte is
+    // copied into or out of a buffer this struct owns before an SQE is built.
+    // Nothing the kernel holds ever names the SSL or its memory BIOs.
+    //
+    // Who may free this: this struct, and nothing else.  pool_release() on the
+    // way back to the pool, reset() as a second line of defence for a struct
+    // coming back out, and ~client_connection for one that reaches neither
+    // because it was retired with a completion still outstanding and the
+    // runtime went away before it landed.  Because no completion can name the
+    // session, freeing it never has to wait on the ring — unlike write_batch.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    // The peer's close_notify, remembered rather than acted on.  The read that
+    // carries it can carry the last command ahead of it, and marking the
+    // connection closing before that command is parsed answers it with a
+    // dropped connection; handle_read applies this once the parse is done.
+    bool tls_peer_closed{false};
+
+    // What this struct owns that no container releases for it.  Reached by a
+    // connection that was retired — the ring still owed it a completion — and
+    // whose completion was dropped rather than delivered because the runtime
+    // stopped first, so absorb_retired() never ran.  Safe here for the same
+    // reason it is safe anywhere: no submission ever named the session.
+    ~client_connection()
+    {
+        tls_context::free_ssl(ssl);
+    }
+
+    client_connection() = default;
+    client_connection(const client_connection&) = delete;
+    client_connection& operator=(const client_connection&) = delete;
+
     // Rate limiting (token bucket)
     double rl_tokens{0.0};
     double rl_max{0.0};
@@ -87,6 +124,14 @@ struct client_connection
         resp_detected = false;
         is_follower = false;
         follower_refused = false;
+        // pool_release() already did this; repeated here because a struct
+        // leaving the pool must not carry the previous connection's session
+        // under any circumstances, and this is the last point at which that
+        // can still be true.
+        tls_context::free_ssl(ssl);
+        ssl = nullptr;
+        tls_state = tls_conn_none;
+        tls_peer_closed = false;
         rl_tokens = 0.0;
         rl_max = 0.0;
         SKL_TRACE_RESET(*this);
@@ -212,6 +257,11 @@ public:
     std::string_view get_replicate_target() const;
     repl_role get_repl_role() const;
 
+    // What the TLS gate asks this role for.  A cache that terminates TLS on
+    // its listener and replicates out of it in cleartext is refused, at create
+    // and at every start; see tls_config_refusal.
+    std::string_view get_replication_target() const override { return m_replicate_target; }
+
     // Stats
     std::string get_stats() const override;
     uint64_t m_stat_commands{0};
@@ -247,6 +297,50 @@ private:
     // for why a caller must not ignore that.
     bool flush_responses(client_connection* conn);
     bool flush_write_queue(client_connection* conn);
+
+    // ── TLS record layer ────────────────────────────────────────────────────
+    // OpenSSL does no I/O here.  These two move bytes between a connection's
+    // memory BIO pair and the io_uring submissions that carry every other byte
+    // in the daemon, which is what makes the handshake asynchronous: one call
+    // per completion, several completions per handshake, nothing blocking and
+    // nothing spinning.
+    //
+    // Ciphertext a read delivered → SSL → plaintext in conn->partial, where
+    // RESP detection and the line parser already look for it.  A close_notify
+    // lands in tls_peer_closed instead of closing here, so the command it
+    // arrived with still gets an answer.
+    void tls_feed(client_connection* conn, const char* data, size_t len);
+
+    // Queued plaintext → SSL → one write submission of ciphertext, and the
+    // only way a byte leaves a TLS connection.  Same contract as the two
+    // flushes above: false means nothing reached the ring and no completion is
+    // owed.  True with nothing submitted is legitimate and common — a
+    // handshake still running, or a write already in flight.
+    bool tls_flush(client_connection* conn);
+
+    // Whether this connection still owes the wire anything.  On a TLS
+    // connection the write queue is only half the answer — a handshake flight,
+    // an alert or a session ticket is output with an empty queue, and asking
+    // only about the queue is how a handshake stalls one round short.
+    bool conn_has_output(const client_connection* conn) const;
+
+    // A TLS connection that is closing, owes the wire nothing more, and is
+    // waiting on nothing but its own read.
+    //
+    // The cleartext paths close such a connection the moment they mark it,
+    // because they have nothing left to send.  A session does: the alert that
+    // says why a handshake failed is the only diagnosis the peer will ever
+    // get, so the close waits for that write to land — and by then the read is
+    // the one operation still outstanding.  Nothing is going to complete it.
+    // The peer here is the one being refused; it is sitting on an open socket
+    // waiting for an answer that is never coming, and a multishot recv stays
+    // armed until the socket itself moves.  That is a client that hangs
+    // instead of being refused, which is the opposite of failing closed.
+    //
+    // shutdown() makes the read complete now, and the ordinary teardown runs
+    // from that completion — where freeing the struct is safe, and where every
+    // other close in this runtime already happens.
+    void tls_close_when_read_is_all(client_connection* conn, int fd);
 
     // Arm the read that fits the configured mode.  Returns false when nothing
     // reached the ring, with read_pending left clear so no one waits on it.
@@ -333,6 +427,13 @@ private:
     int m_listen_fd;
     std::unique_ptr<accept_op> m_accept;
     bool m_multishot_active{false};
+
+    // The listener's TLS context, or null when this cache serves cleartext.
+    // Rebuilt on every start rather than kept: `reload` is a stop followed by
+    // a start, and it is how an operator installs a renewed certificate.
+    // Sessions handed out by the previous context hold their own reference and
+    // are unaffected.
+    std::unique_ptr<tls_context> m_tls;
 
     cache_store m_store;
     std::unordered_map<int, std::unique_ptr<client_connection>> m_clients;

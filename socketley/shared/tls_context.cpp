@@ -19,16 +19,17 @@
 // ─── TLS configuration gate ───
 // See the header for what this build honours and what it still refuses.  It
 // deliberately lives next to the OpenSSL wrapper: whoever wires up the next
-// role — a cache listener, a server runtime's upstream leg — will be reading
-// this file, and narrowing the gate is part of that work.
+// role — a server runtime's upstream leg, a cache's replication link — will be
+// reading this file, and narrowing the gate is part of that work.
 
 std::string tls_not_implemented_error(std::string_view option)
 {
     std::string msg(option);
-    msg += ": TLS transport is not implemented for this runtime -- only a "
-           "server runtime's own listener, a client runtime's outbound socket "
-           "and a proxy runtime (both legs) perform a handshake, so this would "
-           "run in cleartext on an endpoint reported as encrypted\n";
+    msg += ": TLS transport is not implemented for this runtime -- a server "
+           "runtime's own listener, a cache runtime's own listener, a client "
+           "runtime's outbound socket and a proxy runtime (both legs) perform "
+           "a handshake, and nothing else does, so this would run in cleartext "
+           "on an endpoint reported as encrypted\n";
     return msg;
 }
 
@@ -39,7 +40,8 @@ std::string tls_config_refusal(runtime_type type,
                                std::string_view ca_path,
                                std::string_view mesh_client_ca,
                                std::string_view mesh_client_cert,
-                               std::string_view mesh_client_key)
+                               std::string_view mesh_client_key,
+                               std::string_view cache_replicate_target)
 {
     const bool anything_asked = tls || !cert_path.empty() || !key_path.empty() ||
                                 !ca_path.empty() || !mesh_client_ca.empty() ||
@@ -118,18 +120,21 @@ std::string tls_config_refusal(runtime_type type,
         return {};
     }
 
-    // The mesh client-certificate options describe a *backend* leg, and a
-    // server runtime has none: it would store them, report them and dial
-    // nothing.  (The flag handlers do not offer them on a server at all; this
-    // catches a state file or an imported document that carries them.)
-    if (type == runtime_server &&
+    // The mesh client-certificate options describe a *backend* leg, and
+    // neither a server nor a cache runtime has one: it would store them,
+    // report them and dial nothing.  (The flag handlers do not offer them on
+    // either at all; this catches a state file or an imported document that
+    // carries them.)
+    if ((type == runtime_server || type == runtime_cache) &&
         (!mesh_client_ca.empty() || !mesh_client_cert.empty() || !mesh_client_key.empty()))
     {
         std::string msg(!mesh_client_ca.empty()   ? "--client-ca"
                       : !mesh_client_cert.empty() ? "--client-cert"
                                                   : "--client-key");
-        msg += ": configures a proxy's backend leg, and a server runtime has "
-               "none -- it would be stored and reported and dial nothing\n";
+        msg += ": configures a proxy's backend leg, and a ";
+        msg += type == runtime_server ? "server" : "cache";
+        msg += " runtime has none -- it would be stored and reported and dial "
+               "nothing\n";
         return msg;
     }
 
@@ -158,6 +163,41 @@ std::string tls_config_refusal(runtime_type type,
         return "--tls: a TLS listener needs --cert <file> and --key <file>\n";
     if (tls && key_path.empty())
         return "--tls: a TLS listener needs --key <file> to go with --cert\n";
+
+    // ── a cache that encrypts its port and replicates out of it ──
+    //
+    // The listener above is honoured; the replication link is not encrypted by
+    // anything and cannot be, so the two together describe a cache that
+    // encrypts what clients send it and then puts the identical data on the
+    // wire in the clear.
+    //
+    // Two separate cleartext paths, neither of which is the listener:
+    //
+    //   * this cache as a *follower* — connect_to_master() opens the socket
+    //     itself, sends "replicate\n" with a bare write(2) and reads the
+    //     leader's whole dump back.  No session, no verification, and no name
+    //     to verify against: --replicate is parsed with inet_pton, so the
+    //     target is always an address literal and there is no trust store on a
+    //     cache to check a chain against — its --ca is the *client* CA for its
+    //     own listener, exactly as a server's is.
+    //   * this cache as a *leader* — a promoted follower is written to by
+    //     follower_conn, which submits raw bytes straight at the descriptor
+    //     around the record layer that owns it.  That second writer is
+    //     deliberate and load-bearing (see handle_replicate_request), and it is
+    //     what makes "encrypted for clients, cleartext for replicas" the
+    //     default outcome rather than a corner case.
+    //
+    // So the configuration is refused rather than half-honoured.  The leader
+    // half cannot be caught here at all — a cache becomes a leader when a
+    // client sends REPLICATE, long after any configuration was validated — so
+    // that one is refused at the command, in handle_replicate_request().  This
+    // covers the half that *is* configuration.
+    if (type == runtime_cache && tls && !cache_replicate_target.empty())
+        return "--replicate: a cache's replication link is not encrypted -- it "
+               "dials its leader in cleartext and would stream this cache's "
+               "whole dataset off a port --tls says is encrypted.  Refusing "
+               "rather than encrypting one half: drop --replicate, or drop "
+               "--tls and be honestly cleartext\n";
 
     if (type != runtime_proxy)
         return {};

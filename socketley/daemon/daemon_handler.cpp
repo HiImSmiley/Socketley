@@ -42,9 +42,11 @@ std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 // up a listener that answers cleartext on a port `inspect` describes as
 // encrypted.
 //
-// A server runtime terminates TLS on its own listener and a proxy on both of
-// its legs, so a complete configuration for either passes; every other role is
-// still refused.  See tls_context.h.
+// A server and a cache terminate TLS on their own listener, a client on its
+// outbound socket and a proxy on both of its legs, so a complete configuration
+// for any of them passes.  What is refused is a configuration that would leave
+// part of the traffic in the clear — a cache replicating out of a TLS port
+// being the one that is not simply a half-typed flag set.  See tls_context.h.
 static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
@@ -56,7 +58,8 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
     return tls_config_refusal(inst->get_type(),
                               inst->get_tls(), inst->get_cert_path(),
                               inst->get_key_path(), inst->get_ca_path(),
-                              mesh_ca, mesh_cert, mesh_key);
+                              mesh_ca, mesh_cert, mesh_key,
+                              inst->get_replication_target());
 }
 
 // Why this runtime's --cpus / --sqpoll request cannot be honoured, or an empty
@@ -2358,10 +2361,19 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // config that omits the TLS fields is accepted, which is how an operator
     // clears them from a runtime restored out of an older state file (dump,
     // drop the fields, import).
+    //
+    // The replication target comes from the same document, not from the live
+    // instance: this is the configuration that is about to take effect, and an
+    // import is exactly how a cleartext replicating cache would otherwise be
+    // handed a certificate one field at a time.  A document that drops
+    // replicate_target drops the replication with it (set_replicate_target
+    // below is called unconditionally), so the pair being judged here is the
+    // pair that will exist afterwards.
     if (const std::string msg = tls_config_refusal(type,
                                                    cfg.tls, cfg.cert_path, cfg.key_path,
                                                    cfg.ca_path, cfg.mesh_client_ca,
-                                                   cfg.mesh_client_cert, cfg.mesh_client_key);
+                                                   cfg.mesh_client_cert, cfg.mesh_client_key,
+                                                   cfg.replicate_target);
         !msg.empty())
     {
         conn->write_buf = msg;

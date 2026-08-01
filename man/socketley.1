@@ -137,10 +137,18 @@ against the certificate; it presents its own certificate with
 There is no way to switch either check off \(em an unverified TLS client buys
 encryption against somebody recording the wire and nothing at all against
 somebody sitting on it.
-A cache's listener still performs no handshake: its TLS options are rejected
-with exit status 1, and a runtime carrying any of them (for example one
-restored from a state file written by an older release) refuses to start rather
-than running in cleartext. See
+A
+.B cache
+terminates TLS on its own listener with the same three flags a server uses, and
+RESP runs on the decrypted stream, so a Redis client needs no change. The one
+thing it refuses is
+.B \-\-tls
+together with
+.BR \-\-replicate :
+replication is not encrypted, so the pair would put the whole dataset on the
+wire in the clear. A runtime carrying a configuration that cannot be honoured
+(for example one restored from a state file written by an older release)
+refuses to start rather than running in cleartext. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -434,11 +442,9 @@ and exit status 1; change those through the editor or
 .BR import ,
 which reach the full field set.
 The TLS flags are the exception to that wording. Editing is the usual way to
-put encryption on something already running, so on a
-.BR server ", " client
-or
-.B proxy
-runtime
+put encryption on something already running, so on
+.I every
+runtime type
 .BR \-\-tls ,
 .BR \-\-cert ,
 .B \-\-key
@@ -455,16 +461,10 @@ identity it handshook with until it is restarted. An edit that would leave the
 set incomplete \(em a certificate with no
 .BR \-\-tls ,
 .B \-\-tls
-with no key pair on a listener, half a client-certificate pair \(em is refused
-and changes nothing, so a mistyped flag cannot leave a runtime
-half-configured.
-On a
-.B cache
-runtime they are refused with the same message
-.B create
-gives \(em no handshake exists behind it \(em rather than
-.BR "unknown flag" .
-Exit status is 1 either way; only the reason differs. See
+with no key pair on a listener, half a client-certificate pair, or
+.B \-\-tls
+on a cache that replicates \(em is refused and changes nothing, so a mistyped
+flag cannot leave a runtime half-configured. See
 .BR LIMITATIONS .
 When called without flags (or with only \-r/\-\-reload),
 opens the runtime's JSON configuration in
@@ -488,26 +488,24 @@ are ignored. Fields marked
 cannot be changed while the runtime is running.
 Port, protocol, and UDP settings cannot be changed while running.
 .PP
-A JSON document is held to the same rules the flags are: on a
-.B client
-or
-.B cache
-runtime, setting
+A JSON document is held to the same rules the flags are: on every runtime type
 .BR tls ,
 .BR cert_path ,
-.BR key_path " or " ca_path
-is rejected outright and nothing is applied \(em neither role performs a
-handshake. On a
-.B server
-or
-.B proxy
-the fields are accepted as a complete set and refused as an incomplete one, and
+.BR key_path " and " ca_path
+are accepted as a complete set and refused as an incomplete one. On a
+.B cache
+a document setting
+.B tls
+alongside
+.B replicate_target
+is rejected outright and nothing is applied, because replication is not
+encrypted (see
+.BR LIMITATIONS ).
 .BR client_ca ,
 .B client_cert
 and
 .B client_key
-belong to a proxy alone (see
-.BR LIMITATIONS ).
+belong to a proxy alone.
 A document that simply omits those fields is accepted and clears them, which
 is how a runtime restored from an older state file is made startable again:
 .nf
@@ -866,12 +864,12 @@ records neither and is never refused for one.
 .BI "\-\-key " "file"
 .TQ
 .BI "\-\-ca " "file"
-.B "Server, client and proxy runtimes."
+.B "All runtime types."
 Encrypt this runtime's transport. What that means depends on whether the role
 listens or dials.
 .PP
 On a
-.BR server " or " proxy ,
+.BR server ", " proxy " or " cache ,
 TLS terminates on the runtime's own listening port, and
 .B \-\-tls
 requires both
@@ -880,6 +878,15 @@ requires both
 .BI \-\-key " file"
 (its PEM private key) \(em a listener has to have something to terminate TLS
 with.
+.PP
+A
+.B cache
+terminates TLS exactly as a server does, and everything above the record layer
+is unchanged: RESP is still auto-detected from the first byte of the
+.I decrypted
+stream, so a Redis client speaks the protocol it always did with TLS switched
+on, and the line protocol works on the same port. This is what allows a cache
+to be reached across a network it does not trust.
 .PP
 On a
 .BR client ,
@@ -899,7 +906,7 @@ would present nothing while the flags said otherwise.
 .BI \-\-ca " file"
 means one thing on each role, because only some of them verify a peer they
 dialled. On a
-.B server
+.BR server " or " cache
 it enables mutual TLS: a client must then present a certificate signed by that
 CA, and one that does not is rejected during the handshake. On a
 .B proxy
@@ -943,10 +950,7 @@ state and nothing binds the port or dials the target. There is no fallback to
 cleartext on any path. A client whose peer fails verification drops the socket
 and re-dials on its usual backoff; it never retries in the clear.
 .PP
-On a
-.B cache
-runtime these flags are rejected with exit status 1 \(em its listener performs
-no handshake. They are also refused on a
+These flags are refused on a
 .B client
 or a
 .B server
@@ -954,7 +958,12 @@ combined with
 .B \-\-udp
 (that would need DTLS), and on a server combined with
 .B \-\-upstream
-(the upstream leg would still dial in cleartext). See
+(the upstream leg would still dial in cleartext). On a
+.B cache
+they are refused together with
+.BI \-\-replicate " host:port"
+\(em replication is not encrypted, so the pair would stream the whole dataset
+in the clear off a port that reports itself as encrypted. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -1504,6 +1513,45 @@ byte is '*'. With this flag, all connections use RESP regardless.
 Connect as a follower to the specified leader cache. The follower receives
 a full data dump on connect, then receives ongoing write command replication.
 The follower operates in read-only mode.
+.IP
+Replication is
+.I not
+encrypted, in either direction, so it cannot be combined with
+.BR \-\-tls :
+that pair is refused at
+.BR create ,
+by
+.BR edit " and " import ,
+and again at every
+.BR start .
+A
+.B \-\-tls
+cache also refuses the
+.B replicate
+command, so it never becomes a leader either. See
+.B TLS
+under
+.BR LIMITATIONS .
+.TP
+.B \-\-tls
+.TQ
+.BI "\-\-cert " "file"
+.TQ
+.BI "\-\-key " "file"
+.TQ
+.BI "\-\-ca " "file"
+Terminate TLS on this cache's listening port, exactly as a server runtime does
+on its own.
+.B \-\-tls
+requires
+.BI \-\-cert " file"
+and
+.BI \-\-key " file";
+.BI \-\-ca " file"
+additionally demands a certificate from every connecting client (mutual TLS).
+RESP and the line protocol both run on the decrypted stream, so an existing
+Redis client needs no change beyond speaking TLS. Described in full under
+.BR "COMMON FLAGS" .
 .PP
 Default port: 9000
 .SS Cache Protocol
@@ -4099,7 +4147,7 @@ Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route
 from pushed data the way the proxy now does.
 .SS TLS
-.B "Three roles speak TLS: a server runtime's own listener, a proxy \(em on both of its legs \(em and a client runtime's dial."
+.B "Every runtime type speaks TLS: a server's and a cache's own listener, a proxy \(em on both of its legs \(em and a client runtime's dial."
 Created with
 .BR "\-\-tls \-\-cert " file " \-\-key " file ,
 a
@@ -4164,9 +4212,39 @@ present a certificate to a peer that asks for one. There is no skip-verify
 option, by design. A peer that fails either check costs the socket: the client
 drops it and re-dials on its usual backoff, and never retries in cleartext.
 .PP
-.B "Nothing else does."
-A cache's listener has no handshake behind it, and its flags are refused
-rather than stored. Two combinations are refused for the same reason:
+A
+.B cache
+terminates TLS on its own listener with the same three flags a server uses, and
+.BI \-\-ca " file"
+demands a client certificate there in the same way. RESP is auto-detected from
+the first byte of the decrypted stream, so an existing Redis client speaks the
+protocol it always did, one layer up, and the line protocol works on the same
+port.
+.PP
+.B "What a cache still cannot do over TLS is replicate."
+Replication is not a listener and is not encrypted by anything: a follower
+dials its leader itself, in cleartext, and on a leader a promoted follower is
+written to by a second writer that goes around the record layer by design. So
+the combination is refused rather than half-honoured \(em
+.B \-\-tls
+together with
+.B \-\-replicate
+is rejected at
+.BR create ,
+by
+.BR edit " and " import ,
+and again at every
+.BR start ,
+so a state file carrying both leaves the runtime
+.B failed
+rather than coming up quietly wrong; and a TLS cache asked to become a leader
+by a
+.B REPLICATE
+command answers with an error instead of promoting itself. A cache that is
+encrypted for its clients and cleartext for its replicas would be worse than
+one that is honestly cleartext, because only the first of those looks safe.
+.PP
+Two further combinations are refused for the same reason:
 .B \-\-udp
 on a client or a server (DTLS is not implemented) and, on a server,
 .B \-\-upstream

@@ -344,6 +344,16 @@ public:
         ca = {}; cert = {}; key = {};
     }
 
+    // The replication target, for the one role that has one.
+    //
+    // Same reasoning as get_mesh_tls_paths above, and the same gate asks it: a
+    // cache that terminates TLS on its listener and replicates out of it in
+    // cleartext is refused, and the check belongs in tls_config_refusal with
+    // every other "may this configuration take effect?" question rather than
+    // in a place the restore path can walk around.  Empty for every role that
+    // does not replicate, which is all of them but the cache.
+    virtual std::string_view get_replication_target() const { return {}; }
+
     // Lua integration
     bool load_lua_script(std::string_view path);
     lua_context* lua() const { return m_lua.get(); }

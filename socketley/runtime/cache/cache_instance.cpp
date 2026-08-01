@@ -138,6 +138,21 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
         conn->direct_fd = false;
     }
 
+    // The TLS session dies with the connection that owned it, here rather than
+    // in reset(), so that a struct being *retired* below — one the ring still
+    // owes a completion — does not hold an OpenSSL session and two memory BIOs
+    // for however long that takes.  No completion can name the session:
+    // everything the kernel reads or writes was copied into or out of a buffer
+    // this struct owns before the SQE was built, which is why this needs none
+    // of the "wait until the ring is finished" care write_batch does.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        tls_context::free_ssl(conn->ssl);
+        conn->ssl = nullptr;
+    }
+    conn->tls_state = tls_conn_none;
+    conn->tls_peer_closed = false;
+
     // A struct only goes back into the pool once the ring is finished with it.
     // The pool hands its structs to the very next accepted connection, and a
     // completion landing on one that has already been reissued is charged to a
@@ -264,6 +279,46 @@ bool cache_instance::setup(event_loop& loop)
     // Kept across teardown: a descriptor closed after a stop still has to be
     // checked against the ring, and m_loop is null exactly then.
     m_retired_loop = &loop;
+
+    // ── TLS listener ────────────────────────────────────────────────────────
+    //
+    // Certificates are read and parsed here, at setup, before a single
+    // completion is armed.  That is file I/O and it blocks, which is exactly
+    // why it happens here and nowhere near the event loop: the handshake
+    // itself never touches a file, and never touches a socket either — see
+    // tls_feed/tls_flush.
+    //
+    // Every refusal below returns false, which puts the runtime in the failed
+    // state.  None of them may fall through to a plaintext listener: a cache
+    // that asked for encryption and got a cleartext port is the one outcome
+    // the operator cannot see, because `inspect` reports what was configured.
+    m_tls.reset();
+    if (get_tls())
+    {
+        // The configuration gate in runtime_instance::start() has already
+        // refused --replicate here, on every path including the restore.  This
+        // is the belt to that braces: setup() is what actually dials the
+        // leader a few lines below, and the cost of the two disagreeing is the
+        // dataset going out in the clear.
+        if (m_repl_role == repl_follower && !m_replicate_target.empty())
+        {
+            LOG_ERROR("cache: --tls encrypts this cache's own listener, and the "
+                      "replication link to its leader is dialled in cleartext -- "
+                      "refusing rather than streaming the dataset off an encrypted "
+                      "port unencrypted");
+            return false;
+        }
+        auto ctx = std::make_unique<tls_context>();
+        if (!ctx->init_server(get_cert_path(), get_key_path(), get_ca_path()))
+        {
+            // init_server has already said which file and what OpenSSL made of
+            // it.  This says what it cost.
+            LOG_ERROR("cache: TLS listener not started -- the certificate, key or "
+                      "client CA could not be loaded");
+            return false;
+        }
+        m_tls = std::move(ctx);
+    }
 
     uint16_t port = get_port();
     if (port == 0)
@@ -443,6 +498,65 @@ void cache_instance::teardown(event_loop& /*loop*/)
     {
         for (auto& [fd, conn] : m_clients)
         {
+            // ── a session's bytes are records, drain or no drain ──
+            //
+            // These are blocking writes straight at the descriptor, and on a
+            // TLS connection the buffers below are plaintext.  Writing them
+            // here as-is would send the answers to a peer's last commands in
+            // the clear, at shutdown, on the one port the operator encrypted —
+            // a downgrade that only ever happens on the way out and is
+            // therefore the one nobody would catch.
+            //
+            // So they go through the session: encrypted, then the ciphertext
+            // the write BIO produced is what reaches the socket.  A session
+            // that is not ready yet — a handshake still in flight — has no way
+            // to encrypt anything, and the reply is dropped rather than
+            // downgraded.  A lost reply on shutdown is recoverable; cleartext
+            // is not.
+            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+            {
+                if (conn->tls_state != tls_conn_ready)
+                    continue;
+
+                if (!conn->response_buf.empty())
+                {
+                    conn->write_queue.push(std::move(conn->response_buf));
+                    conn->response_buf.clear();
+                }
+
+                bool broken = false;
+                while (!conn->write_queue.empty() && !broken)
+                {
+                    const std::string& msg = conn->write_queue.front();
+                    const int n = tls_context::ssl_write(conn->ssl, msg.data(),
+                                                         static_cast<int>(msg.size()));
+                    // 0 is the write BIO at its cap and -1 is a dead session;
+                    // neither recovers here, because nothing is going to drain
+                    // it for us after this loop.
+                    if (n <= 0 || static_cast<size_t>(n) != msg.size())
+                        broken = true;
+                    else
+                        conn->write_queue.pop();
+
+                    // Out of the BIO and onto the wire as we go, so one
+                    // oversized queue cannot buffer past the cap that made
+                    // ssl_write refuse in the first place.
+                    char cbuf[16384];
+                    for (;;)
+                    {
+                        const int c = tls_context::bio_read_out(conn->ssl, cbuf, sizeof(cbuf));
+                        if (c <= 0)
+                            break;
+                        if (!socketley::write_all(fd, cbuf, static_cast<size_t>(c)))
+                        {
+                            broken = true;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Flush response_buf first.
             //
             // Giving up on this client must not give up on the rest: the break
@@ -818,6 +932,25 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
         if (client_fd < MAX_FDS)
             m_conn_idx[client_fd] = ptr;
 
+        // A TLS listener gives every accepted socket a session before anything
+        // else touches the connection.  The session is created here and the
+        // handshake starts on the first read completion — nothing is written
+        // yet, because the client speaks first.
+        if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
+        {
+            ptr->ssl = m_tls->create_ssl_server();
+            if (SOCKETLEY_UNLIKELY(!ptr->ssl))
+            {
+                // No session, no encryption, so no connection.  Serving this
+                // client in cleartext is the one alternative and it is worse
+                // than dropping it.
+                shutdown(client_fd, SHUT_RDWR);
+                close_client(ptr, client_fd, "tls-session-alloc-failed");
+                goto cache_resubmit_accept;
+            }
+            ptr->tls_state = tls_conn_handshake;
+        }
+
         // Initialize rate limiting
         auto now_tp = std::chrono::steady_clock::now();
         if (m_rate_limit_cached > 0)
@@ -937,6 +1070,233 @@ void cache_instance::rearm_accept()
         schedule_accept_backoff();
 }
 
+// Ciphertext in, plaintext into conn->partial.  One call per read completion,
+// which is what makes the handshake asynchronous: OpenSSL is handed the bytes
+// that have arrived and asked what it makes of them, and whatever it wants to
+// say back is drained by tls_flush at the end of handle_read.  Several rounds
+// of that is a handshake; there is no loop here waiting for one.
+//
+// This is the server runtime's implementation over the cache's connection
+// struct, and deliberately not a second design.  The two structs differ in what
+// they queue — owned strings here, shared_ptr there — and in nothing this
+// function touches.
+void cache_instance::tls_feed(client_connection* conn, const char* data, size_t len)
+{
+    // Inbound ciphertext into the read BIO.  A refusal is fatal by contract —
+    // the peer is over the per-connection buffer cap, or the BIO failed — and
+    // it has to be: there is nowhere to hold what was not taken, and handing a
+    // record layer a stream with a hole in it is worse than closing.
+    size_t off = 0;
+    while (off < len)
+    {
+        const int n = tls_context::bio_write_in(conn->ssl, data + off,
+                                                static_cast<int>(len - off));
+        if (SOCKETLEY_UNLIKELY(n <= 0))
+        {
+            conn->closing = true;
+            return;
+        }
+        off += static_cast<size_t>(n);
+    }
+
+    if (conn->tls_state == tls_conn_handshake)
+    {
+        const int r = tls_context::do_handshake(conn->ssl);
+        if (SOCKETLEY_UNLIKELY(r < 0))
+        {
+            // Closing, but not silently: what OpenSSL produced on its way to
+            // failing is the alert that tells the peer why, and it is the only
+            // diagnosis the other end will ever get.  tls_flush at the end of
+            // handle_read puts it on the wire, and the connection is torn down
+            // when that write completes.
+            //
+            // This is also the path a plaintext client takes.  A RESP command
+            // or a bare line is not a TLS record, so the handshake fails here
+            // and the connection is dropped — it is never parsed as a command,
+            // which is the whole point of refusing rather than downgrading.
+            conn->closing = true;
+            return;
+        }
+        if (r == 0)
+            return;   // another round; its records go out at the end of the read
+
+        conn->tls_state = tls_conn_ready;
+        // Deliberately falling through rather than returning: the same read can
+        // already carry application data behind the handshake's last flight —
+        // under TLS 1.3 a client's Finished and its first command routinely
+        // arrive in one packet, and returning here would leave that command
+        // sitting in the BIO until the client sent something else.
+    }
+
+    // Plaintext into partial, where RESP detection and the line parser read it.
+    char plain[16384];
+    for (;;)
+    {
+        const int n = tls_context::ssl_read(conn->ssl, plain, sizeof(plain));
+        if (SOCKETLEY_LIKELY(n > 0))
+        {
+            conn->partial.append(plain, static_cast<size_t>(n));
+            // The same ceiling the cleartext path applies, checked inside the
+            // loop rather than after it: one read completion can decrypt
+            // everything the inbound BIO had buffered, so "one read cannot
+            // produce more than one buffer's worth" is not true here.
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
+            {
+                conn->closing = true;
+                break;
+            }
+            continue;
+        }
+        if (n < 0)
+        {
+            // Either the peer's close_notify or a record we cannot use.  Both
+            // end the connection, and neither ends it here: the bytes decrypted
+            // above may be a command that deserves an answer, so this is
+            // recorded and applied once handle_read has parsed them.
+            conn->tls_peer_closed = true;
+        }
+        break;
+    }
+}
+
+void cache_instance::tls_close_when_read_is_all(client_connection* conn, int fd)
+{
+    // See the declaration for why this exists at all.  Everything here is a
+    // guard: a connection that is not closing, or still owes a write, or has
+    // no session, is somebody else's business.
+    if (!conn->closing || conn->ssl == nullptr)
+        return;
+    if (conn->write_pending || conn->zc_notif_pending || !conn->read_pending)
+        return;
+    if (fd < 0)
+        return;
+
+    shutdown(fd, SHUT_RDWR);
+}
+
+bool cache_instance::conn_has_output(const client_connection* conn) const
+{
+    if (!conn->write_queue.empty())
+        return true;
+    // A TLS connection can owe the wire bytes with an empty queue: a handshake
+    // flight, an alert, a session ticket, or ciphertext that did not fit in the
+    // write that just completed.
+    return conn->ssl != nullptr && tls_context::has_pending_out(conn->ssl);
+}
+
+// Every byte a TLS connection sends is a record, including the ones nobody
+// queued.  Reached from flush_write_queue for a TLS connection and from the end
+// of handle_read; there is no other way onto the wire.
+bool cache_instance::tls_flush(client_connection* conn)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || !conn->ssl))
+        return true;
+
+    // One write in flight at a time, exactly as the cleartext path does — the
+    // ciphertext buffer built below is what the kernel reads out of, and a
+    // second submission would need a second buffer and would interleave two
+    // record streams on one socket.  Whatever does not go now stays in the
+    // queue or in the write BIO; handle_write comes back here when this write
+    // lands.
+    if (conn->write_pending || conn->zc_notif_pending)
+        return true;
+
+    // Application data only once the handshake is done.  A reply queued before
+    // a single record has crossed waits here rather than being handed to an SSL
+    // that would answer WANT_READ and leave the caller unsure what was
+    // consumed.
+    if (conn->tls_state == tls_conn_ready)
+    {
+        while (!conn->write_queue.empty())
+        {
+            const std::string& msg = conn->write_queue.front();
+            const int n = tls_context::ssl_write(conn->ssl, msg.data(),
+                                                 static_cast<int>(msg.size()));
+            if (n <= 0)
+            {
+                // 0 is backpressure: the write BIO is at its cap, and OpenSSL's
+                // contract is that the same buffer is offered again once it has
+                // drained — which is what leaving this message at the front of
+                // the queue arranges.  -1 is fatal for the session.
+                if (n < 0)
+                    conn->closing = true;
+                break;
+            }
+            // Partial writes are not enabled on this context, so SSL_write is
+            // all-or-nothing.  A short count would mean the record layer and
+            // this queue disagree about what has been sent, and a stream with a
+            // hole in it has no framing left to recover: close instead.
+            if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg.size()))
+            {
+                conn->closing = true;
+                break;
+            }
+            conn->write_queue.pop();
+        }
+    }
+
+    if (!tls_context::has_pending_out(conn->ssl))
+        return true;
+
+    // Ciphertext out of the write BIO and into a buffer this connection owns.
+    // It has to be copied rather than pointed at: an SQE names an address the
+    // kernel reads at its leisure, and the BIO's storage moves under it as
+    // OpenSSL writes the next record.  Copying is also what keeps the SSL free
+    // of anything the ring can name, which is what makes the session safe to
+    // release the moment the connection is torn down.
+    //
+    // The buffer then rides in write_batch[0] like any other message, so the
+    // short-write retry and the batch release in handle_write need no
+    // TLS-specific case at all.
+    std::string cipher;
+    char buf[16384];
+    for (;;)
+    {
+        const int n = tls_context::bio_read_out(conn->ssl, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        cipher.append(buf, static_cast<size_t>(n));
+    }
+    if (SOCKETLEY_UNLIKELY(cipher.empty()))
+        return true;
+
+    // Nothing is in flight (checked above), so any buffers still held are from
+    // a completed write and are this function's to drop.
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+
+    conn->write_batch[0] = std::move(cipher);
+    conn->write_iovs[0].iov_base = conn->write_batch[0].data();
+    conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
+    conn->write_batch_count = 1;
+    conn->write_pending = true;
+    conn->write_req.type = op_write;
+
+    // Plain op_write and never send_zc, unlike the cleartext path.  A zero-copy
+    // send answers twice and keeps the kernel reading out of write_batch[0]
+    // until the notification lands, and this buffer has to be refilled from the
+    // BIO on the very next flush; the notification round trip also costs more
+    // than it saves at the sizes a record layer produces.
+    const auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+    const bool queued = conn->direct_fd
+        ? m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(),
+                                          len, &conn->write_req)
+        : m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+
+    // Nothing reached the ring, so no completion will arrive.  Undo the
+    // in-flight bookkeeping and report it, as the cleartext path does: a
+    // write_pending that never clears keeps the teardown waiting for a
+    // completion that cannot come.
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->write_pending = false;
+        conn->write_batch[0].clear();
+        conn->write_batch_count = 0;
+        return false;
+    }
+    return true;
+}
+
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -1027,17 +1387,33 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
+    // On a TLS connection these bytes are ciphertext and tls_feed is what puts
+    // plaintext into partial; everything below this point — RESP detection, the
+    // line parser, every command handler — reads exactly the same buffer it
+    // always did and knows nothing about TLS.
     if (is_provided)
     {
         uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
         char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
         if (buf_ptr)
         {
-            conn->partial.append(buf_ptr, cqe->res);
+            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+                tls_feed(conn, buf_ptr, static_cast<size_t>(cqe->res));
+            else
+                conn->partial.append(buf_ptr, cqe->res);
             SKL_TRACE_ADD(conn, bytes_read, cqe->res);
             SKL_TRACE_ADD(conn, reads, 1);
+            // Back to the group whatever the session made of it: the group is
+            // shared with every other cache on this loop, and one failed
+            // handshake is no reason to starve them.
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
         }
+    }
+    else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        tls_feed(conn, conn->read_buf, static_cast<size_t>(cqe->res));
+        SKL_TRACE_ADD(conn, bytes_read, cqe->res);
+        SKL_TRACE_ADD(conn, reads, 1);
     }
     else
     {
@@ -1121,6 +1497,28 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
         conn->closing = true;
 
+    // ── the TLS half of the same idea ──
+    //
+    // The peer's close_notify is applied here rather than where it was read:
+    // the read that carried it can carry the last command ahead of it, and
+    // marking the connection closing any earlier would have made the parse
+    // above throw that command away with the answer half computed.
+    //
+    // Then one flush for everything the record layer owes the wire — the next
+    // handshake flight, the alert explaining a handshake that just failed, a
+    // session ticket, and whatever flush_responses left in the queue because
+    // the handshake was not finished when it ran.  It has to happen even when
+    // the connection is already closing, which is why it is not inside
+    // flush_responses: that returns early on a closing connection, and the
+    // alert is the only diagnosis the other end will ever get.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        if (conn->tls_peer_closed)
+            conn->closing = true;
+        if (SOCKETLEY_UNLIKELY(!tls_flush(conn)))
+            conn->closing = true;
+    }
+
     if (m_loop && !conn->closing)
     {
         if (!conn->read_pending && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
@@ -1143,16 +1541,36 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // bytes the client already handed us and considers answered.  Push them
         // out and let the write completion finish the teardown; closing on top
         // of them discards a reply that was accepted.
-        if (!conn->write_queue.empty())
+        //
+        // conn_has_output and not the queue alone, for the TLS case: a session
+        // can owe the wire an alert or the tail of a record with an empty
+        // queue, and that alert is what tells the peer why its handshake
+        // failed.
+        if (conn_has_output(conn))
         {
             if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+            {
                 close_client(conn, fd, "write-submit-failed");
+                return;
+            }
+            // A flush can legitimately submit nothing — a TLS connection with
+            // a reply queued while the handshake is still running has output
+            // and no way to send it.  Without this the connection would be
+            // left closing with nothing in flight and nothing to wake it.
+            if (SOCKETLEY_UNLIKELY(!conn->write_pending && !conn->zc_notif_pending))
+                close_client(conn, fd, "closing-with-unsendable-output");
         }
         else
         {
             close_client(conn, fd, "closing-nothing-in-flight");
         }
+        return;
     }
+
+    // Closing, with the read as the only thing still outstanding.  A session
+    // gets here after its alert has been queued; nothing will complete that
+    // read unless the socket is moved.
+    tls_close_when_read_is_all(conn, fd);
 }
 
 void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
@@ -1296,21 +1714,37 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->write_batch_count = 0;
     }
 
-    // Flush remaining queued messages
-    if (!conn->write_queue.empty() && !conn->zc_notif_pending)
+    // Flush whatever is still owed.  conn_has_output and not the queue alone:
+    // a TLS connection owes the wire the next handshake flight, a session
+    // ticket or the tail of a record with nothing queued at all, and asking
+    // only about the queue is how a handshake stalls one round short of
+    // finishing.
+    if (conn_has_output(conn) && !conn->zc_notif_pending)
     {
         if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
         {
             conn->closing = true;
             if (!conn->read_pending && !conn->zc_notif_pending)
                 close_client(conn, fd, "write-submit-failed");
+            return;
         }
+        // Same corner as in handle_read: a flush that submits nothing leaves a
+        // closing connection with no completion left to finish it.
+        if (SOCKETLEY_UNLIKELY(conn->closing && !conn->write_pending &&
+                               !conn->zc_notif_pending && !conn->read_pending))
+            close_client(conn, fd, "closing-with-unsendable-output");
     }
     else
     {
         if (conn->closing && !conn->read_pending && !conn->zc_notif_pending)
         {
             close_client(conn, fd, "idle-sweep");
+        }
+        else
+        {
+            // The alert this write just carried was the last thing owed; the
+            // read is all that is left and no one is going to complete it.
+            tls_close_when_read_is_all(conn, fd);
         }
     }
 }
@@ -2470,8 +2904,15 @@ bool cache_instance::flush_responses(client_connection* conn)
     }
 
     // Fast-path: if no write is pending and queue is empty, submit directly
-    // from response_buf without the queue round-trip (saves move + pop)
-    if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() && !conn->zc_notif_pending))
+    // from response_buf without the queue round-trip (saves move + pop).
+    //
+    // Never on a TLS connection: this path builds an SQE straight out of
+    // response_buf, which is plaintext, and would put the answer to a command
+    // on the wire in the clear on a port the operator encrypted.  Those bytes
+    // go into the queue and out through the record layer below, which is the
+    // only writer a session has.
+    if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() &&
+                         !conn->zc_notif_pending && conn->ssl == nullptr))
     {
         conn->write_batch[0] = std::move(conn->response_buf);
         conn->response_buf.reserve(4096);
@@ -2542,6 +2983,13 @@ bool cache_instance::flush_responses(client_connection* conn)
 // as one that is still going to be written to.
 bool cache_instance::flush_write_queue(client_connection* conn)
 {
+    // A TLS connection's bytes go through the record layer, which is the only
+    // thing allowed to put them on the wire.  This branch is what keeps every
+    // caller above — the command handlers, publish(), the closing paths — from
+    // having to know which kind of connection it is holding.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+        return tls_flush(conn);
+
     if (!m_loop || conn->write_queue.empty() || conn->zc_notif_pending)
         return true;
 
@@ -4059,6 +4507,33 @@ void cache_instance::replicate_command(std::string_view cmd)
 
 void cache_instance::handle_replicate_request(client_connection* conn)
 {
+    // ─── A TLS cache is not a replication leader ───────────────────────────
+    //
+    // The other half of the refusal in tls_config_refusal, and the half no
+    // configuration gate can make: this cache becomes a leader here, when a
+    // client asks, long after `create` and `start` have had their say.
+    //
+    // What promotion would do on a TLS listener is put a *second writer* on
+    // this socket — follower_conn submits raw bytes straight at the descriptor
+    // (see follower_kick), around the record layer that owns it.  Every one of
+    // them would be cleartext inside what the peer believes is an encrypted
+    // session: unreadable to a real follower, and this cache's entire dataset
+    // in the clear on the wire.  Routing it through the session instead is not
+    // a smaller change than it looks — it would mean two independent writers
+    // on one write BIO, which is the exact thing the promotion rules below
+    // exist to prevent.
+    //
+    // So it is refused, and the refusal goes to conn->response_buf, which is
+    // still the ordinary reply path because no promotion has happened.
+    if (m_tls)
+    {
+        conn->response_buf.append(
+            "error: this cache terminates TLS on its listener and replication is "
+            "not encrypted -- the dump and the command stream would go out in "
+            "cleartext\n", 143);
+        return;
+    }
+
     // Client sent "REPLICATE\n" — promote self to leader, send full dump
     if (m_repl_role == repl_follower)
     {

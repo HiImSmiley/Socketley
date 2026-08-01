@@ -166,22 +166,27 @@ bool runtime_instance::start(event_loop& loop)
     // to encrypt — and which inspect still reports as encrypted — is worse than
     // refusing to come up.
     //
-    // A server runtime's listener, a client runtime's outbound socket and a
-    // proxy's two legs are the roles that perform a handshake, so a complete
-    // configuration for any of them passes here and is honoured by that
-    // runtime's setup().  Everything else is still refused; see tls_context.h.
+    // Every runtime type performs a handshake somewhere now — a server's and a
+    // cache's own listener, a client's outbound socket, a proxy's two legs —
+    // so a complete configuration for any of them passes here and is honoured
+    // by that runtime's setup().  What is still refused is a configuration
+    // that would leave part of the traffic in the clear; see tls_context.h.
     //
-    // "Complete" is all this gate can judge.  Two refusals it cannot reach are
+    // "Complete" is all this gate can judge.  Refusals it cannot reach are
     // made by the runtime itself, because they depend on configuration this
-    // signature does not carry: --tls on a UDP socket would need DTLS, and a
-    // server's upstream leg has no handshake behind it.  Both return false from
-    // setup() and land in the same `failed` state as a refusal here.
+    // signature does not carry or on something that happens later: --tls on a
+    // UDP socket would need DTLS, a server's upstream leg has no handshake
+    // behind it, and a TLS cache is only asked to become a replication leader
+    // once a client sends REPLICATE.  The first two return false from setup()
+    // and land in the same `failed` state as a refusal here; the third is
+    // answered at the command.
     std::string_view mesh_ca, mesh_cert, mesh_key;
     get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
     if (const std::string msg = tls_config_refusal(get_type(),
                                                    get_tls(), get_cert_path(),
                                                    get_key_path(), get_ca_path(),
-                                                   mesh_ca, mesh_cert, mesh_key);
+                                                   mesh_ca, mesh_cert, mesh_key,
+                                                   get_replication_target());
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());

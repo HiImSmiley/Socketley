@@ -183,17 +183,20 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         }
 
         // ── TLS ──
-        // Stored for the roles that perform a handshake — a server runtime's
-        // own listener and a proxy's two legs — and refused for every other
-        // runtime type, which would answer cleartext on an endpoint `inspect`
-        // reports as encrypted.  Failing at the point the flag is typed is the
-        // only place the operator is still looking.
+        // Stored for the roles that perform a handshake — a server's and a
+        // cache's own listener, a client's outbound socket, a proxy's two legs
+        // — and refused for a runtime type that would answer cleartext on an
+        // endpoint `inspect` reports as encrypted.  Every type in the enum
+        // handshakes today; the gate stays because the next one added will not,
+        // and failing at the point the flag is typed is the only place the
+        // operator is still looking.
         //
         // Whether the *set* is complete — --tls with a key pair, a key pair
-        // with --tls — cannot be decided here, because the flag that completes
-        // it may be further along the command line.  cmd_create asks that once
-        // parsing is done, and runtime_instance::start() asks it again for
-        // configurations that never went through a command line at all.
+        // with --tls, and on a cache whether it also replicates in cleartext —
+        // cannot be decided here, because the flag that completes it may be
+        // further along the command line.  cmd_create asks that once parsing is
+        // done, and runtime_instance::start() asks it again for configurations
+        // that never went through a command line at all.
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {
@@ -970,16 +973,19 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 
         // Same rule as the create path — and this is the path that matters
         // most, because `edit` is where an operator goes to put TLS on
-        // something that is already serving traffic.  A server or a proxy
-        // takes them; every other type is refused with the reason rather than
-        // falling through to the generic "unknown flag", which gave that
-        // operator the same exit status and a wrong explanation: it reads as a
-        // typo, so the answer to it is to try again with different spelling,
-        // not to go and terminate TLS somewhere else.
+        // something that is already serving traffic.  Every runtime type takes
+        // them today; a type that did not would be refused with the reason
+        // rather than falling through to the generic "unknown flag", which
+        // gave that operator the same exit status and a wrong explanation: it
+        // reads as a typo, so the answer to it is to try again with different
+        // spelling, not to go and terminate TLS somewhere else.
         //
         // The edit takes effect at the next start; the completeness check for
         // the resulting set is made there, on whatever the runtime is carrying
-        // by then, and not on this one flag.
+        // by then, and not on this one flag.  That is also where a cache that
+        // would end up encrypted *and* replicating is caught — cmd_edit
+        // re-asks tls_config_refusal with the whole configuration and puts the
+        // old values back if it refuses.
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {
