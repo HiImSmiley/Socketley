@@ -4151,11 +4151,58 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
         // probe and the write, and nothing can prevent that — which is why the
         // read path answers rather than dropping when it does.
 
-        // Quick liveness probe: if the remote has sent a RST/FIN while pooled,
-        // recv(MSG_PEEK|MSG_DONTWAIT) returns 0 (FIN) or -1/ECONNRESET.
-        // EAGAIN means the socket is alive with no pending data — good to reuse.
+        // Quick liveness probe, and the four things it can say.
+        //
+        //   -1/EAGAIN   the socket is alive and the receive queue is empty.
+        //               This is the only answer that means "reusable", and it
+        //               is the only one this used to act on correctly.
+        //   0           the peer sent a FIN while the socket was idle.  There
+        //               is nothing left to reuse; drop it and try the next.
+        //   -1/other    RST, or a descriptor that has gone wrong underneath us.
+        //               Same verdict, same reason.
+        //   >0          bytes are waiting, and this is the answer the check had
+        //               backwards.
+        //
+        // A socket is in this pool because a request went out on it and the
+        // whole of its answer came back — that judgement is what put it here,
+        // through backend_pool_eligible() and http_response_frame_complete().
+        // Nothing has been asked of it since.  So a byte waiting on it is a
+        // byte nobody asked for: either the answer this proxy called finished
+        // was not, or the backend volunteered a second one, or the peer is not
+        // speaking the protocol we think it is.  In every one of those the
+        // stream is at an offset no request can start from, and handing the
+        // socket over makes those bytes the head of the next client's response
+        // — one client reading another client's data, which is exactly what
+        // this pool exists to make impossible.
+        //
+        // So readable is not merely "not reusable now".  It is evidence about
+        // the socket that does not expire: leaving it on the shelf leaves the
+        // same bytes on it for the next borrower to inherit, and re-probing it
+        // later can only reach the same conclusion.  It is destroyed here.
+        // shutdown() first so the backend is told the connection is over rather
+        // than being left with a half-open socket this proxy will never read,
+        // and so the unread bytes leave with a reset instead of being mistaken
+        // for a graceful end of message.
         char probe;
         ssize_t r = recv(pb.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (SOCKETLEY_UNLIKELY(r > 0))
+        {
+            // Once per instance.  A backend that does this does it on every
+            // socket it has, and a message per pooled connection would bury the
+            // log — but a client receiving somebody else's answer is what the
+            // silent version of this cost, so it is not nothing either.
+            if (!m_pool_unbidden_warned)
+            {
+                m_pool_unbidden_warned = true;
+                LOG_WARN("proxy: a pooled backend socket had unread data on it — the backend "
+                         "sent bytes nobody asked for, or an answer this proxy judged "
+                         "finished was not.  The connection is dropped rather than reused; "
+                         "reusing it would give those bytes to the next client.");
+            }
+            shutdown(pb.fd, SHUT_RDWR);
+            close_tracked(pb.fd);
+            continue;
+        }
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
         {
             // Dead connection

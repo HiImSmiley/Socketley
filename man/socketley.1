@@ -2772,6 +2772,15 @@ split across reads, or was not strictly CRLF-framed \(em is forwarded to
 the client unchanged, and its connection is closed instead of returned
 to the pool.
 .PP
+A connection already in the pool is checked before it is handed to the
+next request, and one with unread data on it is closed rather than
+reused. Nothing was asked of an idle pooled socket, so anything waiting
+on it is something the backend sent unbidden \(em the tail of an answer
+whose length was mis\-declared, or a second answer volunteered behind the
+first. Reusing it would make those bytes the head of the next client's
+response, so the connection is dropped and a fresh one opened. The proxy
+logs this once per instance.
+.PP
 Reuse covers an
 .B @group
 backend as well as a listed one. A pooled connection is filed under the

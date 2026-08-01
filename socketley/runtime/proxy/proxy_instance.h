@@ -949,6 +949,11 @@ private:
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
+    // A backend was found to have written on a pooled socket — see the probe in
+    // acquire_pooled_backend().  Reported once per instance: the condition is a
+    // property of the backend rather than of one connection, so it repeats on
+    // every socket that backend has.
+    bool m_pool_unbidden_warned{false};
 
     // ─── TLS ───────────────────────────────────────────────────────────────
     //

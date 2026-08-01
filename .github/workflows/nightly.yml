@@ -368,9 +368,8 @@ jobs:
         #     low, the refusal reported as a success); they are here so those
         #     stay fixed.
         #
-        # KNOWN RED 2026-08-01: fuzz_proxy_ops.  Three findings, all of them in
-        # proxy_instance.cpp and all of them open, so their ids are demoted
-        # below and the target runs past them looking for the next one.  Each
+        # KNOWN RED 2026-08-01: fuzz_proxy_ops.  Two findings left demoted
+        # below, so the target runs past them looking for the next one.  Each
         # has a seed in test/fuzz/corpus/proxy that reproduces it on its own in
         # well under a second, and each id comes off this list the day its
         # defect is fixed — an id left here after the fix silences the check
@@ -389,6 +388,17 @@ jobs:
         #     never runs.  Both guards have been unreachable since the commit
         #     that wrote them.
         #
+        #   crosstalk
+        #     Fixed 2026-08-01, and off this list for that reason.  The liveness
+        #     probe in acquire_pooled_backend treated "data is waiting" as
+        #     healthy, against its own comment, so a socket a backend had
+        #     written on while it sat idle was handed to the next request and
+        #     the stale answer became the head of that client's response.  A
+        #     readable pooled socket is destroyed now rather than reused:
+        #     nothing was asked of it, so a byte on it is a byte nobody asked
+        #     for.  Its seed, proxy/pooled_socket_speaks_unbidden, stays in the
+        #     corpus.
+        #
         #   pool-off-boundary
         #     Seed: proxy/response_with_a_tail.  A backend flushes a complete
         #     response and the head of a second one in a single write.  The scan
@@ -399,18 +409,25 @@ jobs:
         #     the end of a response — it sets pool_abandoned — but only for
         #     bytes that arrive in a later completion.
         #
-        #   crosstalk
-        #     Seed: proxy/pooled_socket_speaks_unbidden.  A backend writes an
-        #     answer on a socket that is already in the pool.  The liveness
-        #     probe in acquire_pooled_backend peeks one byte and treats
-        #     "data is waiting" as healthy — its own comment says the opposite,
-        #     "EAGAIN means the socket is alive with no pending data — good to
-        #     reuse" — so the socket is handed to the next request and the stale
-        #     answer becomes the head of that client's response.  Measured by
-        #     the harness's marks: client[1] received the answer to client[0]'s
-        #     request.
+        # STILL RED ON MUTATION, AND NOT FOR A DEFECT.  The whole seed corpus
+        # replays clean with only the ids above demoted.  Mutation past them
+        # does not, and what it reaches are shapes where the oracle is stated
+        # over the harness's *own* backend while the program decides
+        # independently when that backend reads and when it answers.  Written
+        # down here so the next person recognises them instead of re-diagnosing
+        # them; neither is demoted, because a demoted id would also silence the
+        # real defect that shares its name.
         #
-        # And a fourth, which FUZZ_PROXY_SKIP cannot reach, because it is not
+        #   * crosstalk, where the harness backend answers an unread request
+        #     late, on a socket that has since been reused, so the mark on the
+        #     wire is the harness's own bookkeeping rather than a misrouted
+        #     response.  A proxy pairs answers to requests positionally, which
+        #     is all HTTP/1.1 gives it, and both pairings here were right.
+        #   * request-on-unfinished-socket, where the harness reads a request
+        #     that arrived *before* its unfinished response was written, and
+        #     notes it at read time rather than at arrival time.
+        #
+        # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
         # one of the harness's checks: it is socketley/shared/invariants.h
         # aborting on its own account, and SKL_INV_PAIR has no id and no
         # demotion.  Seed: proxy/found-55a07a18, 32 bytes, both legs over TLS.
@@ -435,7 +452,7 @@ jobs:
           FUZZ_SEED: ${{ github.run_number }}
           FUZZ_SMUGGLING: "1"
           REQUIRE_LIBFUZZER: "1"
-          FUZZ_PROXY_SKIP: "answer-lost-to-a-half-close,pool-off-boundary,crosstalk"
+          FUZZ_PROXY_SKIP: "answer-lost-to-a-half-close,pool-off-boundary"
         run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
         timeout-minutes: 60
 
