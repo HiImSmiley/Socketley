@@ -28,12 +28,21 @@
 // ─── WHAT DOES NOT CROSS ────────────────────────────────────────────────────
 //
 // No descriptors.  A worker opens its own listening socket from the port in its
-// config; nothing is passed with SCM_RIGHTS.  That is deliberate and it is not
-// only about simplicity: an SQE carries a descriptor NUMBER that the kernel
-// resolves later, on another thread under SQPOLL, so a descriptor sent across
-// this boundary and closed on one side does not cancel the submissions naming
-// it — it redirects them to whatever inherits the number.  This project has
-// paid for that lesson more than once.  Ports are values; descriptors are not.
+// config; nothing is passed with SCM_RIGHTS on THIS socket.  That is deliberate
+// and it is not only about simplicity: an SQE carries a descriptor NUMBER that
+// the kernel resolves later, on another thread under SQPOLL, so a descriptor
+// sent across a boundary and closed on one side does not cancel the submissions
+// naming it — it redirects them to whatever inherits the number.  This project
+// has paid for that lesson more than once.  Ports are values; descriptors are
+// not.
+//
+// A connection being handed from one runtime to another does cross, and it does
+// so on its own channel with its own rule: see shared/conn_transfer.h, where
+// the hazard above is what the two-call relinquish protocol exists to answer.
+// It is a separate channel on purpose.  This one carries control frames whose
+// delivery is best-effort — push_stats drops a frame the daemon is not draining
+// — and a descriptor cannot be dropped, because dropping it is losing a
+// connection that neither side is serving any more.
 #include <cstdint>
 #include <cstring>
 #include <string>
