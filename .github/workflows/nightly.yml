@@ -187,11 +187,20 @@ jobs:
           find bin/fuzz-corpus -type f 2>/dev/null | wc -l | xargs echo "carried-over working corpus:"
 
       - name: Build fuzz targets (GCC, ASan+UBSan)
+        # All nine.  This list is the one run_fuzz.sh defaults to and it has to
+        # stay that way: the script runs each target twice, libFuzzer then the
+        # GCC replay driver, and a target whose replay binary is missing is a
+        # failure, not a skip.  fuzz_event_loop was added to run_fuzz.sh in
+        # 3a7052c and never added here, so every run of this job since has ended
+        # with
+        #     FAIL fuzz_event_loop: bin/Sanitize/fuzz_event_loop does not exist
+        # and would have exited 1 on that alone.  Nobody saw it because the job
+        # has not reached the end of the target list since 2026-07-28.
         run: |
           ./bin/premake5 gmake2
-          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops
+          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops
           cd ..
-          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops; do
+          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops; do
             test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
           done
 
