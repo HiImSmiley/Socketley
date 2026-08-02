@@ -979,11 +979,17 @@ jobs:
       - name: Unit tests (Release)
         run: |
           set -e
-          for t in test_command_hashing test_cache_store test_resp_parser \
-                   test_name_resolver test_ws_parser; do
-            echo "--- $t ---"
-            ./bin/Release/"$t"
+          # Every test binary the build produced — see the note in ci.yml.  Eight
+          # of the thirteen were built by this job and run by nobody.
+          n=0
+          for t in bin/Release/test_*; do
+            [ -f "$t" ] && [ -x "$t" ] || continue
+            n=$((n + 1))
+            echo "--- $(basename "$t") ---"
+            "$t"
           done
+          [ "$n" -gt 0 ] || { echo "no unit test binaries in bin/Release"; exit 1; }
+          echo "$n unit test binaries ran."
 
       - uses: actions/upload-artifact@v4
         if: failure()

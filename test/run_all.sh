@@ -93,11 +93,27 @@ echo ""
 # Unit tests
 echo "--- Unit Tests ---"
 echo ""
-run_test "command_hashing" "$BIN_DIR/test_command_hashing"
-run_test "cache_store" "$BIN_DIR/test_cache_store"
-run_test "resp_parser" "$BIN_DIR/test_resp_parser"
-run_test "name_resolver" "$BIN_DIR/test_name_resolver"
-run_test "ws_parser" "$BIN_DIR/test_ws_parser"
+# Every unit-test binary the build produced, rather than a list of five.
+#
+# The build produces thirteen.  test_conn_transfer, test_managed_runtime, the
+# four SDK tests and the two single-header tests were compiled by every build
+# and run by nothing — not here, not in ci.yml, not in nightly.yml.  A list of
+# names goes stale the moment somebody adds a test and forgets one file, and it
+# goes stale silently, which is the one property a test runner must not have.
+# The integration half has always globbed; this half now does too.
+unit_found=0
+for t in "$BIN_DIR"/test_*; do
+    [ -f "$t" ] && [ -x "$t" ] || continue
+    unit_found=$((unit_found + 1))
+    run_test "$(basename "$t" | sed 's/^test_//')" "$t"
+done
+
+# An empty glob would otherwise sail through this section reporting nothing
+# wrong, which is how a build that produced no tests passes a test suite.
+if [ "$unit_found" -eq 0 ]; then
+    echo "ERROR: no unit test binaries found in $BIN_DIR"
+    exit 1
+fi
 
 # Integration tests — start shared daemon
 echo "--- Integration Tests ---"

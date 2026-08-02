@@ -131,11 +131,20 @@ jobs:
       - name: Unit tests
         run: |
           set -e
-          for t in test_command_hashing test_cache_store test_resp_parser \
-                   test_name_resolver test_ws_parser; do
-            echo "--- $t ---"
-            ./bin/Debug/"$t"
+          # Every test binary the build produced, not a list of five.  The
+          # build produces thirteen; test_conn_transfer, test_managed_runtime,
+          # the four SDK tests and the two single-header tests were compiled
+          # here and by nightly.yml and run by neither.  A name list goes stale
+          # silently when a test is added.
+          n=0
+          for t in bin/Debug/test_*; do
+            [ -f "$t" ] && [ -x "$t" ] || continue
+            n=$((n + 1))
+            echo "--- $(basename "$t") ---"
+            "$t"
           done
+          [ "$n" -gt 0 ] || { echo "no unit test binaries in bin/Debug"; exit 1; }
+          echo "$n unit test binaries ran."
 
       - name: Integration suite
         env:
