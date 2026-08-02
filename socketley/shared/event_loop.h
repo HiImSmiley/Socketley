@@ -193,6 +193,16 @@ public:
     // says so; nothing else submits a cancel it does not close behind.
     uint32_t fd_inflight(int fd) const;
 
+    // The same question for a registered file.  A submission that names one is
+    // counted here and not in the descriptor table, so an operation invisible
+    // to fd_inflight() is either on a fixed index or counted nowhere — and
+    // those two are very different faults.  Exists so a report can tell them
+    // apart; nothing in the runtimes needs it.
+    uint32_t fixed_inflight(uint32_t idx) const
+    {
+        return idx < MAX_FIXED_FILES ? m_fixed_armed[idx] : 0;
+    }
+
     // Batched submissions - these queue SQEs without submitting
     // The submit_* helpers return false when no SQE could be obtained even after
     // flushing the ring.  Nothing is queued in that case, so a caller that has

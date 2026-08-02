@@ -526,9 +526,28 @@ struct ring_watch
                                  loop->fd_inflight(fd));
             ++listed;
         }
-        if (listed == 0 && off > 0 && off < static_cast<int>(sizeof(buf)))
+        // And the registered files, which are counted in a table of their own.
+        // "No descriptor" was as far as this could see, and it leaves the two
+        // possibilities that matter indistinguishable: an operation on a fixed
+        // index — which has its own withdrawal path — or one counted in neither
+        // table, which would mean the owner's total and the per-target totals
+        // disagree and no count-based cancel could ever reach it.
+        int fixed_listed = 0;
+        for (uint32_t ix = 0; ix < 4096 && fixed_listed < 8 && off > 0 &&
+                              off < static_cast<int>(sizeof(buf)); ix++)
+        {
+            if (loop->fixed_inflight(ix) == 0)
+                continue;
             off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
-                                 " on no tracked descriptor at all");
+                                 "%s fixed=%u(%u)", fixed_listed == 0 ? " on" : "",
+                                 ix, loop->fixed_inflight(ix));
+            ++fixed_listed;
+        }
+
+        if (listed == 0 && fixed_listed == 0 && off > 0 &&
+            off < static_cast<int>(sizeof(buf)))
+            off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
+                                 " on neither a descriptor nor a registered file");
 
         if (off > 0 && off < static_cast<int>(sizeof(buf)))
             std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
