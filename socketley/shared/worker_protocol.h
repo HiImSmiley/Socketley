@@ -175,6 +175,12 @@ struct reader
         return static_cast<uint8_t>(*p++);
     }
 
+    // How much of the payload is still unread.  For the one thing the header
+    // above promises and no decoder could otherwise honour: a field appended by
+    // a newer sender is skipped by an older receiver, and a field absent from
+    // an older sender must not be read as a truncation by a newer one.
+    size_t left() const { return ok ? static_cast<size_t>(end - p) : 0; }
+
     // Bounds-checked against the buffer, not just against the declared length:
     // the length is attacker-adjacent in the sense that it arrives from another
     // process, and a truncated frame must fail rather than read past the end.
@@ -301,6 +307,22 @@ inline bool decode_endpoints(std::string_view payload,
 // already.  That is not a coincidence: a reader in another process is a reader
 // off the event-loop thread, with the same prohibition on walking the
 // runtime's containers and more reason to respect it.
+//
+// ─── WHY THE MOMENT TRAVELS WITH THE FIGURES ────────────────────────────────
+//
+// `stats` reports how old these are, and there is exactly one moment that can
+// honestly answer that: the one at which the worker read its counters.  Every
+// later moment the daemon has access to is contaminated by how long the frame
+// spent in the socket — which is not bounded by the publish interval but by how
+// often the daemon happens to drain, up to a full health tick.  Stamping it on
+// arrival made a figure that had been sitting unread for a second read as new,
+// and the label then said a stopped worker had published moments ago.
+//
+// CLOCK_MONOTONIC is system-wide on Linux and the worker is a plain fork+exec
+// of the daemon, so the two processes count from the same zero and the
+// subtraction is meaningful across the boundary.  Wall-clock would not be: an
+// interval measured against a clock that steps reads as hours old or as
+// arriving from the future.
 
 struct stats_wire
 {
@@ -310,6 +332,10 @@ struct stats_wire
     uint64_t    bytes_out{0};
     uint64_t    active_connections{0};
     std::string detail;
+
+    // steady_clock nanoseconds at the instant the counters above were read, or
+    // 0 from a sender that predates the field.
+    uint64_t    taken_ns{0};
 };
 
 inline std::string encode_stats(const stats_wire& s)
@@ -321,6 +347,13 @@ inline std::string encode_stats(const stats_wire& s)
     put_u64(out, s.bytes_out);
     put_u64(out, s.active_connections);
     put_str(out, s.detail);
+    // Appended last, which is what makes it survive an upgrade in both
+    // directions: an old daemon reading a new worker's frame stops after the
+    // detail and never sees these eight bytes, and take_frame() has already
+    // consumed them by the payload length, so ignoring them costs it no
+    // synchronisation.  Inserting the field anywhere earlier would instead have
+    // that daemon read the stamp as a counter.
+    put_u64(out, s.taken_ns);
     return out;
 }
 
@@ -333,6 +366,15 @@ inline bool decode_stats(std::string_view payload, stats_wire& s)
     s.bytes_out          = r.u64();
     s.active_connections = r.u64();
     s.detail             = std::string(r.str());
+    if (!r.ok)
+        return false;
+
+    // Optional, not truncation.  A worker forked from the binary that was on
+    // disk before this field existed sends a payload that ends at the detail,
+    // and a daemon that treated that as a short frame would drop every figure
+    // that worker ever reports — the whole of `stats` for that runtime, to gain
+    // a timestamp.  Absent means "not stamped"; the reader decides what to do.
+    s.taken_ns = r.left() >= 8 ? r.u64() : 0;
     return r.ok;
 }
 

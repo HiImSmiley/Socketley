@@ -168,6 +168,16 @@ private:
         s.active_connections = static_cast<uint64_t>(m_proxy->get_connection_count());
         s.detail             = m_proxy->get_stats();
 
+        // Stamped here, after the reads and before the write, because this is
+        // the moment the figures describe.  The daemon cannot recover it: what
+        // it can observe is when the frame came off the socket, which is later
+        // by however long nothing drained — up to a health tick, not up to a
+        // publish interval.  A frame that waits does not become newer.
+        s.taken_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+
         if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::stats,
                                                  worker_proto::encode_stats(s)))) {}
     }

@@ -1471,7 +1471,8 @@ so at its top level the script does not load and the runtime is left
 The figures the daemon reports for it were pushed by the worker rather than
 read live, and
 .B stats
-says how old they are. See
+says how old they are \(em measured from when the worker read them, so an age in
+the seconds means a child that has stopped publishing. See
 .B "Out-of-process proxies"
 under
 .BR LIMITATIONS .
@@ -4538,6 +4539,26 @@ and
 for such a runtime, and neither line for an in\-process one. Every other figure
 is identical on both paths \(em which is the property the split exists to have,
 and exactly what made this one invisible without a label.
+.PP
+The age is measured from the moment the worker read its counters, which travels
+with them, not from the moment the daemon took the frame off the socket. Those
+are not the same instant: frames wait in the socket until something drains it,
+which is either a command that prints them or the two\-second supervision tick,
+so a figure that had been sitting unread for a second used to be reported as
+new. A normal reading is therefore under
+.BR 250 ms ,
+and it is a full measurement of staleness rather than of the last hop.
+.PP
+.B "A large figures_age_ms means the worker is not publishing"
+\(em stopped, wedged in its event loop, or gone with the daemon not yet having
+reaped it. The number is not capped and nothing resets it but a fresh push from
+the child, so it keeps growing for as long as the silence lasts, and that is the
+reading it exists to make possible. The runtime's
+.B state
+answers a different question: a worker that is
+.B running
+and has an age in the seconds is one the daemon still believes in and that has
+stopped speaking.
 .PP
 Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route

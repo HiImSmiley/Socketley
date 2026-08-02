@@ -189,14 +189,27 @@ public:
     // this address space.  A worker is the off-thread reader's case with the
     // boundary made physical, so it reuses the answer rather than inventing a
     // second one.
-    void set_worker_stats(std::string detail, uint64_t active)
+    // `taken_ns` is the worker's steady-clock reading at the instant it read the
+    // counters, which travels with them; 0 from a sender that does not stamp.
+    void set_worker_stats(std::string detail, uint64_t active, int64_t taken_ns)
     {
         m_stat_active_connections.store(active, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
             m_stat_detail = std::move(detail);
         }
-        m_worker_stats_ns.store(steady_ns(), std::memory_order_relaxed);
+
+        // The worker's moment, not this one.  This line used to read steady_ns()
+        // — the instant the frame came off the socket — which is the same thing
+        // only when the daemon drains the moment the child writes.  It does not:
+        // it drains when a command asks or when the two-second health tick comes
+        // round, so a frame can sit unread for a second and more, and stamping
+        // it here declared it new.  Unstamped is the pre-upgrade worker, whose
+        // figures are still worth having; the read moment is then the closest
+        // honest answer available and it is a lower bound on the true age.
+        m_worker_stats_ns.store(taken_ns > 0 ? taken_ns : steady_ns(),
+                                std::memory_order_relaxed);
+
         // Published after the detail it promises, with a release so a reader
         // that sees the flag also sees the text.  Setting it first would let
         // the first `stats` after a worker starts print nothing at all.
@@ -218,13 +231,25 @@ public:
     //
     // Not folded into the pushed detail text: that text is built by the worker
     // and would then be reporting its own age at the moment it was written,
-    // which is always zero.  Age is a property of the read, not of the write.
+    // which is always zero.  Age is the interval between two moments — the
+    // worker's read of its own counters and this read of them — and the first
+    // of the two therefore has to cross the socket as a value, because the
+    // daemon has no way to reconstruct it.  See stats_wire::taken_ns.
+    //
+    // What a large number means is a worker that has not published: stopped,
+    // wedged, or gone with the daemon not yet having noticed.  That is the
+    // reading this field exists to make possible, so nothing here bounds it.
     long long worker_stats_age_ms() const
     {
         const int64_t at = m_worker_stats_ns.load(std::memory_order_relaxed);
         if (at == 0)
             return -1;
-        return static_cast<long long>((steady_ns() - at) / 1'000'000);
+        // Clamped, because the two moments are read on two processes' clocks:
+        // CLOCK_MONOTONIC is the same clock on both, but the frame is written
+        // before it is read only in the order the two syscalls happen, and a
+        // negative age is a number no operator can use.
+        const int64_t d = steady_ns() - at;
+        return d <= 0 ? 0 : static_cast<long long>(d / 1'000'000);
     }
 
     // True once a worker has reported at least once.  Read by the placeholder's
@@ -462,7 +487,8 @@ private:
     std::string m_stat_detail;
     std::atomic<bool> m_worker_backed{false};
 
-    // When the last worker push landed, on the monotonic clock, or 0 for never.
+    // When the worker read the figures it last pushed, on the monotonic clock,
+    // or 0 for never.  Its clock, not this process's: see set_worker_stats().
     // Monotonic and not wall-clock: this is an interval, and a wall clock that
     // steps — ntp, a suspend — would report a figure as hours old or as arriving
     // from the future.  Outside m_stat_detail_mutex on purpose, so that reading
