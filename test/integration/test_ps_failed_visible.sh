@@ -49,6 +49,23 @@ bad() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
+# Does HAYSTACK contain NEEDLE.
+#
+# NOT `printf '%s' "$x" | grep -q "$n"`.  This file runs under `set -o
+# pipefail` and `grep -q` exits at its first match, which hands the writer a
+# SIGPIPE; the pipeline then reports 141 and the `if` takes the "no match"
+# branch precisely when it matched.  lib_daemon.sh carries the same warning
+# over daemon_starting_pids, where it is latent.
+#
+# Here it was not latent, and it is worth recording how it surfaced: the
+# man-page assertion at the bottom of this file was written as an awk range fed
+# into `grep -qi`, went green, and turned red the moment the section it reads
+# grew by a paragraph -- because awk was then still writing when grep exited.
+# A test that reports "the documentation does not say this" about documentation
+# that does say it is worse than no test.  A case statement has no pipeline and
+# cannot do that.
+has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
+
 cleanup() {
     "$BIN" stop   upsrv brokencli 2>/dev/null || true
     sleep 0.2
@@ -87,7 +104,7 @@ fi
 
 # ─── 1. the failed runtime is reachable from ps ──────────────────────────────
 PSA=$("$BIN" ps -a 2>&1 || true)
-if printf '%s' "$PSA" | grep -q "brokencli"; then ok; else
+if has "$PSA" "brokencli"; then ok; else
     bad "ps -a lists a runtime that failed" \
         "an operator whose runtime did not come up gets nothing from ps, and" \
         "ps -a is where the docker reflex sends them.  Got:" \
@@ -108,7 +125,7 @@ fi
 # because every row it could print was running.  A row for a failed runtime that
 # still claims "running" is worse than no row.
 PSAJ=$("$BIN" ps -a --json 2>&1 || true)
-if printf '%s' "$PSAJ" | grep -q '"name":"brokencli","type":"client","port":0,"status":"failed"'; then
+if has "$PSAJ" '"name":"brokencli","type":"client","port":0,"status":"failed"'; then
     ok
 else
     bad "ps -a --json reports the real state" \
@@ -121,7 +138,7 @@ fi
 # These are the assertions that would stay green on a no-op build, which is why
 # each one is stated next to its opposite above rather than on its own.
 PS=$("$BIN" ps 2>&1 || true)
-if printf '%s' "$PS" | grep -q "brokencli"; then
+if has "$PS" "brokencli"; then
     bad "bare ps still lists running runtimes and only those" \
         "a failed runtime appeared in default ps output; every script in" \
         "test/integration and examples/ that greps ps now sees rows it never saw"
@@ -130,7 +147,7 @@ else
 fi
 
 PSJ=$("$BIN" ps --json 2>&1 || true)
-if printf '%s' "$PSJ" | grep -q "brokencli"; then
+if has "$PSJ" "brokencli"; then
     bad "bare ps --json is unchanged too" \
         "the failed runtime leaked into the default JSON listing: $PSJ"
 else
@@ -138,13 +155,13 @@ else
 fi
 
 # ─── 4. CONTROL: -a is additive ──────────────────────────────────────────────
-if printf '%s' "$PS" | grep -q "upsrv"; then ok; else
+if has "$PS" "upsrv"; then ok; else
     bad "the running runtime is still in bare ps" \
         "ps lost a running runtime, so the 'absent' assertions above are" \
         "measuring an empty listing rather than a filtered one:  ${PS:-<nothing>}"
 fi
 
-if printf '%s' "$PSA" | grep -q "upsrv"; then ok; else
+if has "$PSA" "upsrv"; then ok; else
     bad "the running runtime is still in ps -a" \
         "-a replaced the listing instead of widening it: ${PSA:-<nothing>}"
 fi
@@ -152,10 +169,12 @@ fi
 # Asked of the same snapshot as the brokencli row above, and in the same shape,
 # so that "one row went to its real state" and "the other stayed running" are
 # two readings of one listing rather than two listings taken a moment apart.
-if printf '%s' "$PSAJ" | grep -q '"name":"upsrv","type":"server","port":[0-9]*,"status":"running"'; then
+if has "$PSAJ" "\"name\":\"upsrv\",\"type\":\"server\",\"port\":$SRV_PORT,\"status\":\"running\""; then
     ok
 else
     bad "ps -a --json still reports a running runtime as running" \
+        "the status field used to be the literal 'running' for every row; making" \
+        "it real must not have made it wrong for the rows it was right about." \
         "expected upsrv with status running; got:" \
         "  ${PSAJ:-<no output at all>}"
 fi
@@ -174,11 +193,18 @@ else
         "the ps synopsis in man/socketley.1 does not mention -a/--all"
 fi
 
-if awk '/^\.B ps /,/^\.SS|^\.SH/' "$MAN" | grep -qi "failed"; then
+# The ps entry alone, from its synopsis to the .RE that closes it.  Bounded on
+# the .RE rather than on the next .SH, so that the word being looked for has to
+# appear in the ps entry and not merely somewhere in the 3700 lines after it.
+PS_SECTION=$(awk '/^\.B ps \\fR\[/ { f = 1 } f { print } f && /^\.RE$/ { exit }' "$MAN")
+
+if has "$PS_SECTION" "failed" && has "$PS_SECTION" "ps \\-a"; then
     ok
 else
-    bad "the man page says a failed runtime is not in bare ps" \
-        "the ps section never mentions the state an operator goes looking for"
+    bad "the man page says a failed runtime is not in bare ps, and where it is" \
+        "the ps entry has to name the state an operator goes looking for and" \
+        "point at the flag that shows it.  The entry reads:" \
+        "  $(printf '%s' "$PS_SECTION" | tr '\n' '|' | head -c 300)"
 fi
 
 if grep -q "ps -a" "$HELP" 2>/dev/null; then ok; else

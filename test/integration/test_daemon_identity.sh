@@ -71,6 +71,16 @@ bad() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
+# Does HAYSTACK contain NEEDLE.
+#
+# NOT `printf '%s' "$x" | grep -q "$n"`.  This file runs under `set -o
+# pipefail` and `grep -q` exits at its first match, which hands the writer a
+# SIGPIPE; the pipeline then reports 141 and the `if` takes the "no match"
+# branch precisely when it matched.  lib_daemon.sh carries the same warning
+# over daemon_starting_pids; test_ps_failed_visible.sh carries the account of
+# it actually happening.  A case statement has no pipeline and cannot do it.
+has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
+
 IMP_PID=""
 
 # Kill the impostor and take the path back to empty.  Between scenarios, not
@@ -208,7 +218,7 @@ if [ "$RC" -ne 0 ]; then ok; else
         "shell's convention that reads as 'a server is up on port $SRV_PORT'"
 fi
 
-if printf '%s' "$OUT" | grep -qF "$SOCKETLEY_SOCKET"; then ok; else
+if has "$OUT" "$SOCKETLEY_SOCKET"; then ok; else
     bad "the refusal names the path it refused" \
         "an operator has to be told WHICH socket is occupied to fix it; got:" \
         "  ${OUT:-<nothing>}"
@@ -260,7 +270,7 @@ if daemon_alive "$SOCKETLEY_SOCKET"; then ok; else
 fi
 
 LS=$("$BIN" ls 2>&1 || true)
-if printf '%s' "$LS" | grep -q "realsrv"; then ok; else
+if has "$LS" "realsrv"; then ok; else
     bad "the runtime the auto-started daemon was asked for exists" \
         "ls does not list realsrv:" "  ${LS:-<nothing>}"
 fi
