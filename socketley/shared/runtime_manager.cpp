@@ -402,13 +402,25 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     // C++ runtimes now costs one lock and a pointer test each instead of a
     // string copy and a virtual call each.  If on_publish_dispatch() is ever
     // overridden to do something that is not Lua, this filter has to go with it.
+    // Out of this address space first, and before any Lua runs.  A subscriber is
+    // allowed to call straight back into the manager — socketley.remove is bound
+    // in the very VM these run in — and a frame already written to a socket
+    // cannot be affected by what it does.
+    if (m_publish_sink)
+        m_publish_sink(cache_name, channel, message);
+
+    // A runtime that lives in a worker process is skipped here on purpose; see
+    // set_publish_sink().  Its placeholder holds a fully loaded copy of the same
+    // script, so it answers lua() and has the script's subscribers registered —
+    // it would run them in the daemon, against an instance with no connections,
+    // while the process actually serving the traffic saw nothing.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
         names.reserve(runtimes.size());
         for (auto& [n, inst] : runtimes)
         {
-            if (inst->lua())
+            if (inst->lua() && !inst->is_out_of_process())
                 names.push_back(n);
         }
     }
@@ -704,6 +716,12 @@ void runtime_manager::publish_endpoints()
 void runtime_manager::set_endpoint_sink(std::function<void(const endpoint_table&)> sink)
 {
     m_endpoint_sink = std::move(sink);
+}
+
+void runtime_manager::set_publish_sink(
+    std::function<void(std::string_view, std::string_view, std::string_view)> sink)
+{
+    m_publish_sink = std::move(sink);
 }
 
 const runtime_manager::runtime_map& runtime_manager::list() const

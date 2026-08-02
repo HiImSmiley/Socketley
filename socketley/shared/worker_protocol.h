@@ -77,6 +77,7 @@ enum class frame_type : uint16_t
     start     = 18,  // payload: empty
     stop      = 19,  // payload: empty
     shutdown  = 20,  // payload: empty
+    publish   = 21,  // payload: see encode_publish
 };
 
 // ── What a worker's exit status means ───────────────────────────────────────
@@ -332,6 +333,51 @@ inline bool decode_stats(std::string_view payload, stats_wire& s)
     s.bytes_out          = r.u64();
     s.active_connections = r.u64();
     s.detail             = std::string(r.str());
+    return r.ok;
+}
+
+// ── Published message payload ───────────────────────────────────────────────
+//
+// A cache's PUBLISH reaches every runtime's subscribe callbacks, and the daemon
+// used to deliver it by calling into each instance.  A worker is not an
+// instance the daemon can call into, so the three strings travel instead —
+// which is all a subscriber is ever handed anyway.
+//
+// One-way and best-effort, like every other frame on this socket.  A subscriber
+// is told what was published, not asked about it: there is no reply, nothing
+// waits, and a frame dropped because the child is not reading is a message that
+// subscriber does not see — the same outcome as a subscriber that was not
+// running yet.  Unlike the endpoint table there is nothing to re-send it from,
+// because a publish is an event and not a state.
+//
+// All three strings are length-prefixed, so a message with a NUL or a newline
+// in it is not a parsing problem: a cache value is arbitrary bytes.
+
+struct publish_wire
+{
+    std::string cache_name;
+    std::string channel;
+    std::string message;
+};
+
+inline std::string encode_publish(std::string_view cache_name,
+                                  std::string_view channel,
+                                  std::string_view message)
+{
+    std::string out;
+    out.reserve(12 + cache_name.size() + channel.size() + message.size());
+    put_str(out, cache_name);
+    put_str(out, channel);
+    put_str(out, message);
+    return out;
+}
+
+inline bool decode_publish(std::string_view payload, publish_wire& p)
+{
+    reader r(payload.data(), payload.size());
+    p.cache_name = std::string(r.str());
+    p.channel    = std::string(r.str());
+    p.message    = std::string(r.str());
     return r.ok;
 }
 

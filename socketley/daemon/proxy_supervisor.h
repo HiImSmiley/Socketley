@@ -67,6 +67,14 @@ public:
     // removed or renamed, or when the cluster's view moves.
     void send_endpoints(const std::string& encoded_payload);
 
+    // One published message, on its way to the child's subscribe callbacks.
+    //
+    // Not kept the way the endpoint table is: a table is a state a new child has
+    // to be brought up to, a publish is an event that already happened, and
+    // re-sending one to a child forked afterwards would deliver it twice to a
+    // daemon that restarted its worker mid-stream.
+    void send_publish(const std::string& encoded_payload);
+
     // Drain whatever the child has sent and apply it to the placeholder.
     // Called from the health timer and before any command that reads figures.
     void poll();

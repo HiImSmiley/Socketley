@@ -1455,10 +1455,14 @@ Settable only at
 rejects it, because honouring it would mean moving a configured runtime
 between address spaces underneath whatever already points at it.
 .IP
-Lua callbacks run inside the worker, against the worker's own state. A script
-that reaches for other runtimes through the management API is refused there by
-name rather than answering nothing \(em and if it does so at its top level the
-script does not load and the runtime is left
+Lua callbacks run inside the worker, against the worker's own state, and a
+cache's
+.B PUBLISH
+reaches the worker's
+.B subscribe
+callbacks. A script that reaches for other runtimes through the management
+API is refused there by name rather than answering nothing \(em and if it does
+so at its top level the script does not load and the runtime is left
 .BR failed .
 See
 .B "Out-of-process proxies"
@@ -4457,13 +4461,25 @@ the
 .B self
 table, and the connection and request callbacks.
 .PP
+.PP
+.B "Cross\-runtime pub/sub reaches a worker."
+A cache's
+.B PUBLISH
+is delivered to a worker's
+.B subscribe
+callbacks over its control socket, and the daemon no longer runs them against
+the placeholder it keeps for the runtime. It used to: the placeholder loads the
+same script, so its copy of the callback fired \(em inside the daemon, attached
+to an instance with no connections \(em while the process actually relaying the
+traffic heard nothing. Delivery is one\-way and best\-effort, like every other
+frame on that socket. A publish is an event and not a state, so a frame dropped
+because the child is not reading is not re\-sent, and one that arrives before
+the worker has been configured is discarded rather than replayed at a subscriber
+that did not exist when it happened.
+.PP
 Interactive mode
 .RB ( "start \-i" )
 is not offered for a proxy on either path.
-.PP
-Cross\-runtime pub/sub dispatch does not reach a worker: the daemon
-delivers it by calling into each instance, and a placeholder has no
-subscribers of its own.
 .PP
 The figures the daemon reports for a worker are as recent as the worker's
 last publish \(em a quarter of a second, and refreshed on demand before

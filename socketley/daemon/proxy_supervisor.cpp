@@ -209,6 +209,18 @@ void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
 }
 
+void proxy_supervisor::send_publish(const std::string& encoded_payload)
+{
+    if (m_control_fd < 0)
+        return;
+    // A dropped frame is a message this worker's subscribers do not see, which
+    // is what write_frame() already warns about.  Not retried and not queued:
+    // the alternative is the daemon growing an unbounded backlog on behalf of a
+    // child that is not reading, for messages whose whole value was being
+    // timely.
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::publish, encoded_payload))) {}
+}
+
 void proxy_supervisor::shutdown()
 {
     if (m_pid > 0)

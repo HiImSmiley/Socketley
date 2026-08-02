@@ -217,6 +217,7 @@ private:
         {
             case worker_proto::frame_type::config:    on_config(payload);    break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
+            case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
@@ -354,6 +355,30 @@ private:
             m_proxy->set_endpoints(std::move(tbl));
         else
             m_pending_endpoints = std::move(tbl);
+    }
+
+    // A cache somewhere in the daemon published, and this proxy's script asked to
+    // hear about it.  Delivered through the same entry point an in-process
+    // runtime's dispatch goes through, so a subscribe callback cannot tell which
+    // side of the boundary it is running on.
+    //
+    // Dropped when there is no proxy yet: a publish that arrives before the
+    // config frame has nowhere to go, and holding it the way a pending endpoint
+    // table is held would be storing an event to replay at a subscriber that did
+    // not exist when it happened.
+    void on_publish(const std::string& payload)
+    {
+        if (!m_proxy)
+            return;
+
+        worker_proto::publish_wire p;
+        if (!worker_proto::decode_publish(payload, p))
+        {
+            LOG_WARN("proxy worker: malformed publish frame, dropped");
+            return;
+        }
+
+        m_proxy->on_publish_dispatch(p.cache_name, p.channel, p.message);
     }
 
     void on_start()

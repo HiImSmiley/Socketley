@@ -103,6 +103,21 @@ public:
     // a socket, because for a worker it is one.
     void set_endpoint_sink(std::function<void(const endpoint_table&)> sink);
 
+    // Where a published message goes besides the in-process runtimes — the same
+    // boundary rule as the endpoint sink, for the other thing the daemon used to
+    // deliver by calling into each instance.
+    //
+    // dispatch_publish() skips a runtime that lives in a worker process and
+    // hands it to this instead.  Skipping is not an optimisation: the daemon
+    // keeps a placeholder for such a runtime, the placeholder loaded the same
+    // script, and its subscribe callbacks are therefore registered here as well
+    // — so without the skip one PUBLISH ran the callback twice, once in the
+    // daemon against a copy of the runtime that serves nothing, and never in the
+    // process that does.
+    void set_publish_sink(std::function<void(std::string_view cache_name,
+                                             std::string_view channel,
+                                             std::string_view message)> sink);
+
     // Where a runtime sends a request meant for another runtime.  One per
     // daemon, attached to the event loop by daemon_start() and detached before
     // the ring goes; see shared/request_channel.h for why this is a channel and
@@ -132,6 +147,7 @@ private:
     void retire(std::unique_ptr<runtime_instance> inst);
 
     std::function<void(const endpoint_table&)> m_endpoint_sink;
+    std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
 
     runtime_map runtimes;
 

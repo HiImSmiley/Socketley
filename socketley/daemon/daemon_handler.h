@@ -194,4 +194,9 @@ private:
 
     // Encode the manager's endpoint table and push it to every worker.
     void publish_endpoints_to_workers(const endpoint_table& tbl);
+
+    // Encode one published message and push it to every worker, so a proxy's
+    // subscribe callbacks fire in the process that is serving its traffic.
+    void publish_to_workers(std::string_view cache_name, std::string_view channel,
+                            std::string_view message);
 };

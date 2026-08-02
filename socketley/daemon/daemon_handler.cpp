@@ -138,6 +138,14 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // up — the boot-time restore does exactly that.
     m_manager.set_endpoint_sink([this](const endpoint_table& tbl)
                                 { publish_endpoints_to_workers(tbl); });
+
+    // And every published message, for the same reason: a worker's subscribers
+    // are not reachable by calling into an instance, so the manager hands them
+    // over here instead of walking a map it cannot find them in.
+    m_manager.set_publish_sink([this](std::string_view cache_name,
+                                      std::string_view channel,
+                                      std::string_view message)
+                               { publish_to_workers(cache_name, channel, message); });
 }
 
 daemon_handler::~daemon_handler()
@@ -259,6 +267,7 @@ void daemon_handler::teardown()
     // table for an empty map, which is harmless, but the manager outlives this
     // handler and the lambda captures `this`.
     m_manager.set_endpoint_sink(nullptr);
+    m_manager.set_publish_sink(nullptr);
 
     // Reap managed children
     {
@@ -2897,6 +2906,21 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
     const std::string payload = worker_proto::encode_endpoints(names, groups);
     for (auto& [_, sup] : m_proxy_workers)
         sup->send_endpoints(payload);
+}
+
+void daemon_handler::publish_to_workers(std::string_view cache_name,
+                                        std::string_view channel,
+                                        std::string_view message)
+{
+    if (m_proxy_workers.empty())
+        return;
+
+    // Encoded once for all of them.  A PUBLISH on a busy cache is a hot path in
+    // a way an endpoint republish is not, and the payload does not depend on
+    // which worker it is going to.
+    const std::string payload = worker_proto::encode_publish(cache_name, channel, message);
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->send_publish(payload);
 }
 
 void daemon_handler::poll_proxy_workers()
