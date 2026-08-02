@@ -299,7 +299,11 @@ Interactive mode. Starts the runtime and opens an interactive session.
 For server: stdin is broadcast to clients, received messages appear on stdout.
 For client: stdin is sent to server, received messages appear on stdout.
 For cache: stdin accepts cache commands, responses appear on stdout (like redis-cli).
-Not supported for proxy. Press Ctrl+C to detach (runtime continues running).
+Refused for a proxy \(em it relays between a client and a backend and has no
+stream of its own for typed input to join. The refusal comes before the start,
+so the runtime is left exactly as it was; see
+.BR LIMITATIONS .
+Press Ctrl+C to detach (runtime continues running).
 If the runtime is already running, attaches without restarting.
 .RE
 .TP
@@ -4464,7 +4468,6 @@ the
 .B self
 table, and the connection and request callbacks.
 .PP
-.PP
 .B "Cross\-runtime pub/sub reaches a worker."
 A cache's
 .B PUBLISH
@@ -4480,9 +4483,17 @@ because the child is not reading is not re\-sent, and one that arrives before
 the worker has been configured is discarded rather than replayed at a subscriber
 that did not exist when it happened.
 .PP
-Interactive mode
-.RB ( "start \-i" )
-is not offered for a proxy on either path.
+.B "Interactive mode (start \-i) is not offered for a proxy, on either path."
+Interactive mode is a stream: what is typed reaches a server's clients, a
+client's server, or a cache's command parser. A proxy relays between a client
+and a backend and speaks for neither, so there is nothing for typed input to
+mean, and offering it would mean inventing a meaning rather than exposing one.
+The command refuses and exits 1
+.I without starting anything
+\(em it used to start the proxy, persist
+.BR was_running ,
+and then report the failure, leaving a listener up and a state file that would
+bring it back on the next daemon restart.
 .PP
 .B "A worker's figures are pushed, and stats says how old they are."
 The child publishes them every quarter\-second and the daemon drains the control

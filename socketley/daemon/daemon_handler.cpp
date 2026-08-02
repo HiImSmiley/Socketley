@@ -929,6 +929,35 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
+    // Refused before anything is started, not after.
+    //
+    // This check used to sit below the start loop, so `start myproxy -i` started
+    // the proxy, persisted was_running, and then exited 1 saying interactive mode
+    // was not supported — an operator told the command failed, with a listener up
+    // and a state file that would bring it back on the next daemon restart.
+    //
+    // And it stays a refusal.  Interactive mode is a stream: for a server what is
+    // typed is broadcast to its clients, for a client it is sent to its server,
+    // for a cache it is executed as a command and the reply comes back.  A proxy
+    // has no such stream — it relays between a client and a backend and speaks
+    // for neither — so there is nothing for typed input to mean.  Offering it
+    // would mean inventing a semantics rather than exposing one.  This is the
+    // same on both paths: a worker's proxy has no more of a stream than the
+    // daemon's does, so nothing here is about --out-of-process.
+    if (want_interactive)
+    {
+        if (auto* first = m_manager.get(names.front());
+            first && first->get_type() == runtime_proxy)
+        {
+            conn->write_buf =
+                "interactive mode is not offered for a proxy: a proxy relays "
+                "between a client and a backend and has no stream of its own for "
+                "typed input to join. Nothing was started; run `start " +
+                std::string(names.front()) + "` without -i.\n";
+            return 1;
+        }
+    }
+
     int failed = 0;
     for (const auto& n : names)
     {
@@ -961,11 +990,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
 
         if (want_interactive && inst)
         {
-            if (inst->get_type() == runtime_proxy)
-            {
-                conn->write_buf = "interactive mode not supported for proxy\n";
-                return 1;
-            }
+            // The proxy case was refused above, before anything was started.
             conn->interactive = true;
             conn->interactive_name = n;
             inst->add_interactive_fd(conn->fd);
