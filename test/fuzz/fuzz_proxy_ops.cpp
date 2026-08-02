@@ -1646,7 +1646,42 @@ void client_send(world& w, int idx, int shape)
     // that had carried a whole answer.  Freezing the ledger at the
     // announcement, rather than excusing the finding afterwards, keeps the
     // oracle's words literally true wherever it does fire.
-    if (static_cast<size_t>(n) == buf.size() && whole > 0 && !c.peer_announced_close)
+    // The same freeze, for a close the proxy is making rather than announcing.
+    //
+    // peer_announced_close above covers the endings the proxy puts into words:
+    // 408, 504, or a response carrying Connection: close.  It cannot cover the
+    // ending where there is nothing to say.  When a backend resets mid-
+    // connection the proxy marks the client closing and tears the pair down
+    // without writing another byte — correctly, because the request it was
+    // carrying has already been answered in full and there is no second answer
+    // owed — and a request the program writes into that connection afterwards
+    // was reset rx_since_req to 0 and erased the record of the answer that did
+    // arrive.  The report then read "sent 2 complete request(s) and received 0
+    // bytes" against a wire that had carried 71 of them.
+    //
+    // Measured on the artefact this shape came in on: at that second write the
+    // proxy's own connection had closing=1 and rx_since_req was 71, so the
+    // answer was delivered and recorded before the ledger threw it away.
+    //
+    // Asked of the proxy's connection rather than of anything on the wire,
+    // because that is where the fact lives.  A descriptor the proxy has let go
+    // of entirely counts the same as one it has marked: both mean this end is
+    // no longer owed an answer, which is also what RFC 9112 Section 9.6 says of
+    // a client that keeps sending on a connection the server is ending.
+    //
+    // What this deliberately does NOT excuse is the shape the id exists for: a
+    // proxy that accepts a request on a live connection and then closes it
+    // having written nothing.  There closing is false at this instant, the
+    // ledger moves normally, and the finding still fires.
+    bool proxy_ending = false;
+    if (w.rt && c.proxy_fd >= 0 && c.proxy_fd < proxy_instance::MAX_FDS)
+    {
+        const auto* cc = w.rt->m_client_slots[c.proxy_fd].get();
+        proxy_ending = (cc == nullptr) || cc->closing;
+    }
+
+    if (static_cast<size_t>(n) == buf.size() && whole > 0 &&
+        !c.peer_announced_close && !proxy_ending)
     {
         c.reqs_sent += static_cast<uint32_t>(whole);
         c.rx_since_req = 0;
@@ -1853,6 +1888,56 @@ size_t bsock_unread(const backend_sock& b)
 // finding it produced named the proxy for a mark this harness had stamped.
 void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
 {
+    // Not stated for a TCP proxy, which client_report_close already excludes for
+    // the same reason.  This claim is about HTTP message boundaries -- "the
+    // previous response on it was still unfinished" -- and a TCP proxy frames
+    // nothing: it is a byte pipe between one client connection and one backend
+    // connection for the life of both, so no socket is ever "handed to another
+    // request" and there is no boundary for a hand-over to be off.  The harness
+    // goes on writing its HTTP-shaped marks through the pipe because that is how
+    // it recognises its own traffic, and a shape like 200-no-length leaves
+    // resp_pending set for ever by construction -- it is framed by the close --
+    // so every later request on that pipe was reported against a response that
+    // was never going to end.
+    if (g_world && g_world->tcp)
+        return;
+
+    // Already answered, before this end had read it.  Both terms are needed:
+    // the offset says the request was on the wire when the blind answer went
+    // out, and the counter bounds how many requests one blind answer may
+    // account for, so a blind answer written over bytes that carried no mark at
+    // all cannot swallow the next real one.
+    //
+    // ASKED BEFORE resp_pending, and that ordering is the whole of the fourth
+    // shape 1eb7d53 recorded and left alone.  A request from behind this mark
+    // was on the wire before this end wrote anything at all, so it cannot have
+    // been "handed to a socket carrying the tail of a previous response": there
+    // was no previous response when the proxy sent it, and the tail the report
+    // named is bytes this end volunteered onto the socket afterwards, without
+    // having read the request that was already sitting there.
+    //
+    // Measured on repro-req-on-unfinished: one request on the wire, 81 bytes,
+    // its mark at offset 40; the harness answered blind with 39 bytes of a
+    // headers-only response before reading any of it, setting blind_horizon to
+    // 81; and then read the request and charged the proxy for the answer it had
+    // just invented.  tx=39 with complete_at=0 -- this end had never finished a
+    // message on that socket, so there was no boundary for the proxy to be off.
+    //
+    // The defect the id exists for is untouched, because it is not blind: a
+    // socket really handed over mid-response was answering a request this end
+    // had read, so blind_pending is 0 there and the report below still fires.
+    if (b.blind_pending > 0 && abs_off < b.blind_horizon)
+    {
+        b.blind_pending--;
+        // last_id is deliberately not moved here.  It is what an answer
+        // volunteered onto a quiet socket is marked with, and it has to mean
+        // "the request this end answered knowingly" — this one was answered
+        // before it was read, so this end never saw which client it belonged
+        // to, and stamping a later answer with it would be a mark invented for
+        // the second time in the same exchange.
+        return;
+    }
+
     if (b.resp_pending)
     {
         fuzzrt::set_detail("a request marked %u arrived on the backend socket at port %u "
@@ -1864,23 +1949,6 @@ void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
                    "head of the next borrower's answer");
         fuzzrt::g_detail[0] = 0;
         b.resp_pending = false;   // reported once; do not repeat it every request
-    }
-
-    // Already answered, before this end had read it.  Both terms are needed:
-    // the offset says the request was on the wire when the blind answer went
-    // out, and the counter bounds how many requests one blind answer may
-    // account for, so a blind answer written over bytes that carried no mark at
-    // all cannot swallow the next real one.
-    if (b.blind_pending > 0 && abs_off < b.blind_horizon)
-    {
-        b.blind_pending--;
-        // last_id is deliberately not moved here.  It is what an answer
-        // volunteered onto a quiet socket is marked with, and it has to mean
-        // "the request this end answered knowingly" — this one was answered
-        // before it was read, so this end never saw which client it belonged
-        // to, and stamping a later answer with it would be a mark invented for
-        // the second time in the same exchange.
-        return;
     }
 
     g_be_requests++;
