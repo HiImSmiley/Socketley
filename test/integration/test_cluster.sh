@@ -14,6 +14,12 @@
 # socket paths used to be three fixed names in /tmp, which meant two runs of this
 # file on one machine were the same three daemons, and the state directory was
 # shared by all three nodes and by every other test on the box.
+#
+# ONE HOME IS NOW ENOUGH.  Six daemons run in this file and they share it.  The
+# state directory is keyed to the socket path whenever that path is not the
+# default one, so six sockets are six state directories, and no daemon here can
+# see, restore or delete another's runtimes.  Tests 7 and 8 used to need three
+# HOMEs of their own for exactly that reason — see the note above them.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -38,7 +44,10 @@ NODE2_PORT=19302
 GW_PORT=19310
 DAEMON_PIDS=()
 
-# Use unique runtime names to avoid state-dir collisions between daemons
+# Three roles, three names.  These used to be spelled distinctly because the
+# three daemons shared one state directory and a repeated name would have been
+# one runtime; that is no longer the reason, and they stay distinct because
+# api1, api2 and a gateway are three different things.
 RT_API1="clst_api1"
 RT_API2="clst_api2"
 RT_GW="clst_gw"
@@ -375,10 +384,17 @@ assert_not_contains "$(echo "$OUT" | grep node1)" "stale"
 # ─── Tests 7 and 8: reclaiming a name, and not being able to steal one ────────
 #
 # The two directions of one rule, and they need a cluster of their own: these
-# tests kill and restart a daemon on purpose, and the daemons above share a
-# state directory, so a restart up there would have one node restoring another
-# node's runtimes onto ports that are already taken.  Three fresh daemons, three
-# HOMEs, one fresh cluster directory, nothing borrowed.
+# tests kill and restart a daemon on purpose, and a restart is the moment a
+# daemon restores whatever its state directory holds.  Three fresh daemons, one
+# fresh cluster directory, nothing borrowed.
+#
+# They used to need three HOMEs as well, and that was a workaround rather than
+# isolation.  Every daemon in this file was reading one state directory derived
+# from HOME alone, so the restart below restored node1's, node2's and the
+# gateway's runtimes too — onto ports those three daemons were already serving.
+# Separate HOMEs hid it.  The state directory is now keyed to the socket path,
+# these three daemons are on three sockets, and the restart brings back the one
+# runtime that belongs to it.
 #
 #   witness   joins and stays.  It is the peer, and the point: a node that
 #             cannot join is not merely unhappy, it is missing from everyone
@@ -401,28 +417,26 @@ assert_not_contains "$(echo "$OUT" | grep node1)" "stale"
 # daemon's own.  A unix socket path admits one process at a time, so a fresh
 # file carrying our own triple was written by a process that is gone.
 
-WIT_HOME="$TMPD/hwit"; RJ_HOME="$TMPD/hrj"; IN_HOME="$TMPD/hin"
-mkdir -p "$WIT_HOME" "$RJ_HOME" "$IN_HOME"
 RJ_DIR="$TMPD/cluster2"; mkdir -p "$RJ_DIR"
 RJ_PORT=19303
 
-wit() { HOME="$WIT_HOME" SOCKETLEY_SOCKET="$SOCK_WIT" "$BIN" "$@"; }
-rj()  { HOME="$RJ_HOME"  SOCKETLEY_SOCKET="$SOCK_RJ"  "$BIN" "$@"; }
-intr(){ HOME="$IN_HOME"  SOCKETLEY_SOCKET="$SOCK_IN"  "$BIN" "$@"; }
+wit() { SOCKETLEY_SOCKET="$SOCK_WIT" "$BIN" "$@"; }
+rj()  { SOCKETLEY_SOCKET="$SOCK_RJ"  "$BIN" "$@"; }
+intr(){ SOCKETLEY_SOCKET="$SOCK_IN"  "$BIN" "$@"; }
 
-# spawn_daemon HOME SOCKET LOG -> sets SPAWNED_PID
+# spawn_daemon SOCKET LOG -> sets SPAWNED_PID
 #
 # By count of "daemon started", not by presence: the node in test 7 boots twice
 # into the same log, and "has the line appeared" is already true the second
 # time.  That returns instantly, before the socket is bound, and the readiness
 # wait becomes a race the test loses at its own startup.
 spawn_daemon() {
-    local h=$1 s=$2 l=$3 i n want
+    local s=$1 l=$2 i n want
     n=$(grep -c "daemon started" "$l" 2>/dev/null || true)
     [ -n "$n" ] || n=0
     want=$((n + 1))
 
-    HOME="$h" SOCKETLEY_SOCKET="$s" "$BIN" daemon >>"$l" 2>&1 &
+    SOCKETLEY_SOCKET="$s" "$BIN" daemon >>"$l" 2>&1 &
     SPAWNED_PID=$!
     for i in $(seq 1 100); do
         n=$(grep -c "daemon started" "$l" 2>/dev/null || true)
@@ -439,10 +453,10 @@ spawn_daemon() {
 
 echo "  Test 7: a node reclaiming its own name after a restart"
 
-spawn_daemon "$WIT_HOME" "$SOCK_WIT" "$TMPD/witness.log"; DAEMON_PIDS+=($SPAWNED_PID)
+spawn_daemon "$SOCK_WIT" "$TMPD/witness.log"; DAEMON_PIDS+=($SPAWNED_PID)
 wit daemon --name witness --cluster "$RJ_DIR"
 
-spawn_daemon "$RJ_HOME" "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID=$SPAWNED_PID
+spawn_daemon "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID=$SPAWNED_PID
 DAEMON_PIDS+=($RJ_PID)
 rj daemon --name rejoin1 --cluster "$RJ_DIR"
 create_ok "runtime on the rejoining node created" \
@@ -463,8 +477,53 @@ HB_BEFORE=$(grep -o '"heartbeat":[0-9]*' "$RJ_DIR/rejoin1.json" 2>/dev/null | cu
 kill -9 "$RJ_PID" 2>/dev/null || true
 wait "$RJ_PID" 2>/dev/null || true
 rm -f "$SOCK_RJ"
-spawn_daemon "$RJ_HOME" "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID2=$SPAWNED_PID
+spawn_daemon "$SOCK_RJ" "$TMPD/rejoin.log"; RJ_PID2=$SPAWNED_PID
 DAEMON_PIDS+=($RJ_PID2)
+
+# ─── A restart restores this node's runtimes and nobody else's ───────────────
+#
+# The restart above is the only one in this file, which makes it the only place
+# the state directory's ownership can be observed at all: restoring is what a
+# daemon does with whatever its state directory holds, and nothing else in this
+# suite starts a daemon that has runtimes waiting for it.
+#
+# This is asserted rather than arranged around.  Tests 7 and 8 used to be given
+# three HOMEs of their own so that the question could not come up, and with
+# those removed the question comes up on every run — but it did not fail
+# anything on its own, which is why it needed writing down.  Measured here on a
+# binary from before the state directory was keyed to the socket, one HOME:
+#
+#     PROBE  clst_rj    server 19303  Up 0 seconds     <- its own
+#     PROBE  clst_api1  server 19301  Up 0 seconds     <- node1's, and node1 is serving it
+#     PROBE  clst_gw    proxy  19310  Up 0 seconds     <- the gateway's, likewise
+#
+# Three daemons claiming two ports, and the file still reported 32/32 because no
+# assertion had ever been pointed at it.  A `remove` on any of them would have
+# deleted a state file belonging to a daemon that was still running it.
+RJ_INV=$(rj ls -a 2>&1 || true)
+for foreign in "$RT_API1" "$RT_API2" "$RT_GW"; do
+    TOTAL=$((TOTAL+1))
+    if grep -q "$foreign" <<<"$RJ_INV"; then
+        FAIL=$((FAIL+1))
+        echo "  FAIL: the restarted node restored $foreign, which belongs to another"
+        echo "        daemon in this file and is running on it now"
+        echo "  GOT: $RJ_INV"
+    else
+        PASS=$((PASS+1))
+    fi
+done
+
+# The other direction, so the three above cannot pass by the daemon restoring
+# nothing at all: its own runtime did come back.
+TOTAL=$((TOTAL+1))
+if grep -q "clst_rj" <<<"$RJ_INV"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: the restarted node did not restore its own runtime either —"
+    echo "        the three checks above are not evidence of isolation"
+    echo "  GOT: $RJ_INV"
+fi
 
 # The test has to have reached the hole it is aiming at.  If the machine was
 # slow enough that the entry aged out on its own, a rejoin proves nothing —
@@ -518,7 +577,7 @@ echo "  Test 8: a different daemon may not take a live node's name"
 # unambiguously a second, live, different daemon.  Same machine and same
 # hostname as the intruder; what tells them apart is the control socket, and a
 # unix socket path admits one process at a time.
-spawn_daemon "$IN_HOME" "$SOCK_IN" "$TMPD/intruder.log"; DAEMON_PIDS+=($SPAWNED_PID)
+spawn_daemon "$SOCK_IN" "$TMPD/intruder.log"; DAEMON_PIDS+=($SPAWNED_PID)
 
 RC=0
 intr daemon --name witness --cluster "$RJ_DIR" >/dev/null 2>&1 || RC=$?

@@ -3693,6 +3693,14 @@ daemon: whichever process binds the default path first owns it, and every later
 one silently talks to that process instead of starting its own. Anything that
 starts a daemon on the default path is claiming the identity the real daemon
 runs under, so the test suite gives every test a socket of its own.
+.IP
+It selects the state directory as well as the socket, and it has to. Several
+daemons in one namespace reading one state directory are not several daemons:
+each restores everything in it at startup, including the others' runtimes, onto
+ports the others are already serving, and each
+.B remove
+deletes a state file a daemon that is still running it depends on. See
+.BR "WHERE STATE LIVES" .
 .TP
 .B SOCKETLEY_SQPOLL=1
 Give every io_uring ring in this daemon \(em its own, and every worker process it
@@ -3819,6 +3827,88 @@ Per-runtime JSON configuration files.
 .TP
 .I ~/.config/socketley/config.lua
 Daemon configuration (or set SOCKETLEY_CONFIG env var).
+.SS WHERE STATE LIVES
+The two paths above are where a daemon's runtimes live when it is serving the
+default socket, which is every deployed daemon and every daemon that has never
+heard of
+.BR SOCKETLEY_SOCKET .
+Nothing about that has changed or will.
+.PP
+A daemon on any
+.I other
+socket path gets a directory of its own, a sibling of the one above named after
+that path: the leading slash is dropped and every character outside
+.BR A-Za-z0-9._-
+becomes an underscore.
+.PP
+.nf
+SOCKETLEY_SOCKET unset          ~/.local/share/socketley/runtimes
+SOCKETLEY_SOCKET=/tmp/a.sock    ~/.local/share/socketley/runtimes.tmp_a.sock
+SOCKETLEY_SOCKET=/tmp/socketley.sock
+                                ~/.local/share/socketley/runtimes
+.fi
+.PP
+Setting the variable to the path that would have been used anyway is the
+default, not a second daemon, so a script that spells the default out keeps the
+default directory. The name is readable rather than hashed on purpose: the
+answer to "which of these is mine" should come out of an
+.BR ls .
+.PP
+The daemon logs the directory it is using at startup
+.RB ( "state directory: ..." ),
+and that line is the authoritative answer. It is worth knowing where to find it
+before you need it.
+.PP
+.B "Upgrading."
+The first time a daemon uses one of these keyed directories, everything in the
+shared directory it used to read is copied into it, once, and an INFO line says
+how many runtimes were adopted and from where. The originals are left exactly
+where they are, so an older binary rolled back onto the machine still finds what
+it has always found. A
+.I .adopted
+file in the new directory records what happened and is what makes it a one-time
+event \(em without it, an operator who later removed every runtime would find
+them all back after the next restart.
+.PP
+.B "...but never out from under a running daemon."
+Adoption is skipped entirely while a daemon is serving the default socket path,
+because those runtimes are that daemon's and adopting them would mean binding
+ports it is already serving. The check is a probe of the default path, and
+anything answering there \(em daemon or not \(em is enough to decline.
+.PP
+This is not a rare corner. An operator debugging beside a running daemon reaches
+it with one command, and the second bind
+.I succeeds
+under
+.BR SO_REUSEPORT ,
+so nothing but the port count would ever have reported it.
+.PP
+The decline is logged at
+.B WARN
+with both directory paths and what to do about it, because from the outside it
+looks exactly like the runtimes having vanished. It writes no
+.I .adopted
+marker: "somebody is using these right now" is a fact about this minute rather
+than a decision, so stopping the daemon on the default path and restarting this
+one adopts them as normal.
+.PP
+.B "The failure this trades against."
+A daemon started with a
+.B SOCKETLEY_SOCKET
+it did not have last time finds no runtimes. On a development machine that is
+correct: it is a different daemon and it owns nothing. It cannot happen to a
+deployed node, because a deployed node runs on the default path with the
+variable unset, and the default path is exempt from the rule for exactly that
+reason. If it happens anyway, nothing has been destroyed \(em the other
+directory is still on disk with everything in it, and starting the daemon with
+the variable it had before brings it all back.
+.PP
+The alternative, one state directory for every daemon in the namespace, is not
+the safe direction. Two daemons then bind each other's ports on boot, each
+reports the other's runtimes as its own, and a
+.B remove
+sent to either deletes a state file the other is still serving \(em and there is
+no undo for that.
 .SS Daemon Configuration
 The daemon config file is a Lua script that sets a
 .B config

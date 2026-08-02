@@ -5,6 +5,7 @@
 #include "../shared/runtime_manager.h"
 #include "../shared/logging.h"
 #include "../shared/paths.h"
+#include "../shared/daemon_client.h"
 #include "../shared/state_persistence.h"
 #include "../shared/runtime_config_apply.h"
 #include "../runtime/server/server_instance.h"
@@ -95,6 +96,194 @@ static uint16_t load_daemon_config(const std::string& config_path)
         metrics_port = static_cast<uint16_t>(*mp);
 
     return metrics_port;
+}
+
+// ─── ADOPTING WHAT AN UPGRADE WOULD OTHERWISE HAVE ORPHANED ─────────────────
+//
+// paths.cpp now keys the state directory to the socket path whenever that path
+// is not the default one.  For every deployed daemon that changes nothing —
+// they run on the default path and their directory is where it always was — but
+// a daemon that has been running for months behind a fixed SOCKETLEY_SOCKET,
+// with real runtimes behind it, would come up after the upgrade looking at a
+// directory that has never existed.  Every runtime gone, no error, nothing to
+// go and read.  That is not an acceptable way to ship a path change.
+//
+// So the first time a keyed directory is used, whatever was in the directory it
+// used to share is copied into it.  Once.
+//
+// WHY COPY RATHER THAN READ THROUGH.  Reading the old directory whenever the
+// new one is empty is the smaller change and it is worse in two ways.  It never
+// ends: the daemon keeps reading the old directory every boot, so the two
+// daemons sharing it keep seeing each other's runtimes for ever, which is the
+// defect this is supposed to close.  And it ends abruptly when it does end —
+// the first runtime created in the new directory makes it non-empty, and every
+// legacy runtime disappears in that instant, triggered by an unrelated action.
+// A copy has no cliff and leaves one directory to look at afterwards instead of
+// two.  The originals are not touched, so an older binary rolled back onto this
+// machine finds exactly what it has always found.
+//
+// EXACTLY ONCE, and marked on disk rather than inferred.  "The new directory is
+// empty" is not a safe trigger on its own: an operator who removes every
+// runtime empties it again, and the next restart would resurrect the very
+// runtimes they had just deleted.  The marker also cannot be inferred from the
+// directory not existing yet, because every CLI command resolves paths too and
+// creates it — `SOCKETLEY_SOCKET=... socketley ps` would have consumed the one
+// chance before the daemon it auto-starts ever looked.
+//
+// ─── AND ONLY WHEN NOBODY IS STILL USING THEM ───────────────────────────────
+//
+// Disk state cannot tell the upgrade apart from the disaster.  "Keyed directory
+// empty, legacy directory populated" describes the daemon that has been running
+// for months behind a fixed SOCKETLEY_SOCKET — adopt, that is the whole point —
+// and it equally describes a brand new second daemon started beside a live one,
+// where adopting means binding the running daemon's ports.
+//
+// Which is the arrangement an operator debugging next to production actually
+// has, and it took one command to reach.  Measured, before this check, on a box
+// whose default-path daemon was serving collide_a on :19781:
+//
+//     SOCKETLEY_SOCKET=$HOME/b.sock socketley ls
+//
+//     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458701,fd=6))
+//     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458349,fd=6))
+//
+// Two daemons on one port, and the second holding a copy of the first's state
+// file that `remove` would delete — which is the transcript this whole change
+// exists to prevent, produced by the repair for it.
+//
+// The discriminator is not on disk, it is on the socket: whoever is serving the
+// default path owns the legacy directory.  Anything other than `absent` there
+// means those runtimes are in use, and nothing is adopted.  A short deadline is
+// deliberate and safe in one direction only — a slow daemon degrades to `mute`,
+// never to `absent`, because `absent` means connect() was refused — so the
+// worst a busy box can do is decline an adoption it would have declined anyway.
+//
+// A DECLINE IS NOT A DECISION, so it does not write the marker.  A successful
+// adoption is permanent because the question has been answered; "somebody else
+// is using them right now" is a fact about this minute, and a daemon whose
+// upgrade happened to coincide with a stray default-path daemon deserves to
+// adopt on the next boot once that daemon is gone.  It says so, loudly, with
+// both directories named, because the operator reading it is the one whose
+// runtimes appear to have vanished.
+static void adopt_legacy_state(const socketley_paths& paths)
+{
+    namespace fs = std::filesystem;
+
+    if (paths.legacy_state_dir.empty() || paths.state_dir.empty())
+        return;   // this daemon is on the default path; nothing ever moved
+
+    const fs::path marker = paths.state_dir / ".adopted";
+
+    std::error_code ec;
+    if (fs::exists(marker, ec))
+        return;
+
+    auto count_json = [](const fs::path& dir) {
+        size_t n = 0;
+        std::error_code lec;
+        for (const auto& e : fs::directory_iterator(dir, lec))
+        {
+            if (e.is_regular_file() && e.path().extension() == ".json")
+                ++n;
+        }
+        return n;   // a directory that does not exist iterates zero times
+    };
+
+    auto write_marker = [&](const std::string& body) {
+        std::ofstream f(marker, std::ios::trunc);
+        if (!f.is_open())
+            return;
+        f << "# socketley state directory for the daemon on socket\n"
+          << "#   " << paths.socket_path.string() << "\n"
+          << "#\n"
+          << body
+          << "#\n"
+          << "# This file is what makes that a one-time event.  Delete it and the\n"
+          << "# next restart will ask again, which is rarely what you want.\n";
+    };
+
+    // Never adopt into a directory that already holds runtimes: those are this
+    // daemon's own, and a copy over the top of them would be resurrecting
+    // something under a name that is already in use.
+    const size_t existing = count_json(paths.state_dir);
+    if (existing > 0)
+    {
+        write_marker("# Nothing was adopted: this directory already held " +
+                     std::to_string(existing) + " runtime(s).\n");
+        return;
+    }
+
+    // Asked before the socket is, and answered permanently.  An empty legacy
+    // directory is "nothing to adopt", full stop — not an error and not a
+    // reason to come back later.  It is also the ordinary state of a box that
+    // has only ever run keyed daemons, because resolve() creates the base
+    // directory whether or not anything will use it, so an empty one it made
+    // itself and an empty one a daemon emptied read the same and mean the same.
+    const size_t available = count_json(paths.legacy_state_dir);
+    if (available == 0)
+    {
+        write_marker("# Nothing was adopted: " + paths.legacy_state_dir.string() +
+                     "\n# held no runtimes at this daemon's first start.\n");
+        return;
+    }
+
+    const std::string dsock = paths.default_socket_path.string();
+    const socketley::daemon_identity owner =
+        socketley::daemon_probe(dsock.c_str(), nullptr, 1000);
+
+    if (owner != socketley::daemon_identity::absent)
+    {
+        // Loud, and naming both directories: to the operator this looks exactly
+        // like the runtimes vanishing, and the log is the only place that can
+        // say otherwise.  No marker — see the note above.
+        LOG_WARN(("state: NOT adopting " + std::to_string(available) +
+                  " runtime(s) from " + paths.legacy_state_dir.string() +
+                  " into " + paths.state_dir.string() +
+                  " — a daemon is serving " + dsock +
+                  " and those runtimes belong to it").c_str());
+        LOG_WARN(("state: this daemon starts with no runtimes.  They are not lost: "
+                  "stop the daemon on " + dsock +
+                  " and restart this one to adopt them, or copy the .json files "
+                  "across by hand.  Adopting them now would bind ports that "
+                  "daemon is already serving.").c_str());
+        return;
+    }
+
+    size_t copied = 0, failed = 0;
+    for (const auto& e : fs::directory_iterator(paths.legacy_state_dir, ec))
+    {
+        if (!e.is_regular_file() || e.path().extension() != ".json")
+            continue;
+        std::error_code cec;
+        if (fs::copy_file(e.path(), paths.state_dir / e.path().filename(),
+                          fs::copy_options::skip_existing, cec))
+            ++copied;
+        else
+            ++failed;
+    }
+
+    write_marker("# " + std::to_string(copied) +
+                 " runtime(s) were copied here at first start from\n#   " +
+                 paths.legacy_state_dir.string() +
+                 "\n# which is the directory a daemon on the default socket path uses,\n"
+                 "# and which this daemon shared with it before its state directory\n"
+                 "# was keyed to its socket.  Nothing was serving " + dsock +
+                 " at the\n# time, so those runtimes were unowned.  The originals were left"
+                 " in place.\n");
+
+    if (copied > 0)
+    {
+        LOG_INFO(("state: adopted " + std::to_string(copied) +
+                  " runtime(s) from " + paths.legacy_state_dir.string() +
+                  " into " + paths.state_dir.string() +
+                  " (nothing was serving " + dsock + ")").c_str());
+    }
+    if (failed > 0)
+    {
+        LOG_WARN(("state: " + std::to_string(failed) + " runtime(s) in " +
+                  paths.legacy_state_dir.string() +
+                  " could not be copied and will not be restored").c_str());
+    }
 }
 
 static void restore_runtimes(state_persistence& persistence,
@@ -381,6 +570,19 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // — a server with --cache posts on its first message, and the first message
     // can arrive inside restore.  See shared/request_channel.h.
     manager.requests().attach(loop);
+
+    // Which directory this daemon's runtimes live in, said out loud, once, at
+    // startup.  "Where does my state live" is a question an operator asks
+    // exactly once and at the worst possible moment, and the daemon log is
+    // where they are already looking when they ask it.  Under the rule in
+    // paths.cpp the answer depends on the socket path, so it cannot be a
+    // constant in the man page any more — it has to come from the process.
+    LOG_INFO(("state directory: " + paths.state_dir.string()).c_str());
+
+    // Before load_all(): an upgrade that keys this daemon's state directory to
+    // its socket for the first time takes what it used to share with the
+    // default-path daemon along with it.
+    adopt_legacy_state(paths);
 
     // Create state persistence
     state_persistence persistence(paths.state_dir.string());
