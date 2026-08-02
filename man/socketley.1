@@ -715,6 +715,27 @@ is unchanged, so anything parsing it keeps seeing running runtimes only.
 .BR \-\-conn ,
 .BR \-\-owner ,
 .BR \-\-created .
+.PP
+.B \-\-status
+and
+.B \-\-uptime
+are two names for one column, headed
+.BR UPTIME .
+It holds an uptime for a running runtime and the state
+.RB ( Created ,
+.BR Stopped ,
+.BR Failed )
+for anything else, so under
+.B \-a
+a row can read
+.B Failed
+beneath a header saying
+.BR UPTIME .
+That is the same column
+.B ls
+heads
+.BR STATUS ;
+the header is left alone because scripts select on it.
 .RE
 .TP
 .BI "owner " "name"
