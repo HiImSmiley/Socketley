@@ -119,6 +119,46 @@ assert_not_contains() {
     fi
 }
 
+pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
+fail() {
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL [$1]: $2"
+    local line
+    for line in "${@:3}"; do echo "        $line"; done
+}
+
+# cluster_counter SOCKET RUNTIME FIELD
+#
+# One numeric field out of `stats`, asked of the daemon on SOCKET -- this file
+# runs three of them and the runtime whose counter is wanted is not always on
+# the same one.  The empty string when the runtime is not there or the daemon
+# did not answer, deliberately not 0: 0 is a legitimate reading of every counter
+# below, and "there was nothing to read" must not compare equal to it.
+cluster_counter() {
+    local v
+    v=$(SOCKETLEY_SOCKET="$1" "$BIN" stats "$2" 2>/dev/null \
+        | sed -n "s/^$3:\([0-9][0-9]*\)$/\1/p" | head -1) || v=""
+    printf '%s' "$v"
+}
+
+# cluster_sum_bytes_in SOCKET|RUNTIME...
+#
+# Combined bytes_in over the named runtimes, each on its own daemon, or the
+# empty string if any one of them could not be read.  Summed because
+# round-robin over the @api group picks which member gets the connection and
+# either choice is a pass; a partial sum is not a smaller number, it is no
+# measurement, and it says so.
+cluster_sum_bytes_in() {
+    local total=0 spec sock rt v
+    for spec in "$@"; do
+        sock=${spec%%|*}; rt=${spec#*|}
+        v=$(cluster_counter "$sock" "$rt" bytes_in)
+        if [ -z "$v" ]; then printf ''; return 0; fi
+        total=$((total + v))
+    done
+    printf '%s' "$total"
+}
+
 echo "=== Integration: cluster discovery ==="
 
 # ─── Start 3 daemons ──────────────────────────────────────────────────────────
@@ -217,15 +257,82 @@ create_ok "@group gateway created on the gateway node" \
     --backend @api --protocol tcp --strategy round-robin -s
 sleep 1
 
-# TCP connect through the proxy should succeed
-TOTAL=$((TOTAL+1))
+# TCP connect through the proxy should reach a member of the @api group
+#
+# ─── What the old check could not tell apart ────────────────────────────────
+#
+#     RC=0
+#     echo "hello cluster" | nc -q 1 127.0.0.1 "$GW_PORT" 2>/dev/null || RC=$?
+#     if [ "$RC" -eq 0 ]; then PASS=$((PASS+1)); ...
+#
+# The entire assertion was nc's exit status, which is 0 for anything at all that
+# accepts a TCP connection on that port.  Staged: with a foreign process holding
+# 19310 so `create proxy` was refused and clst_gw never existed, this file
+# printed 30/31 and `proxy @group connect` was not the one failure.  It passed
+# against a stranger.
+#
+# Connecting is not the claim.  The claim is the one thing this whole file is
+# about: that `--backend @api` resolved a *group name* into runtimes living on
+# *other daemons*, and that traffic actually crossed.  So the oracle is the
+# daemons' own counters, and the two halves are asked of two different daemons:
+#
+#   * the gateway's clst_gw counts the connection -- asked of the gw daemon.
+#     A stranger on the port cannot produce that, because the connection never
+#     reached us.
+#   * the payload's bytes arrive at an @api member -- asked of node1 and node2,
+#     summed, because round-robin picks which one and either is a pass.  This is
+#     the half that no port-holder and no empty group can fake, and it is the
+#     half that makes this a test of @group routing rather than of bind().
+CL_PAYLOAD="hello cluster"
+CL_N=$(( ${#CL_PAYLOAD} + 1 ))       # printf adds the newline that is also sent
+GC0=$(cluster_counter "$SOCK_GW" "$RT_GW" total_connections)
+GB0=$(cluster_sum_bytes_in "$SOCK_NODE1|$RT_API1" "$SOCK_NODE2|$RT_API2")
+
+# `timeout` around nc, because `-q 1` only bounds the wait *after* the peer has
+# hung up.  A peer that accepts and then holds the connection open forever -- a
+# stray port-holder is exactly that -- leaves nc blocked with nothing to time it
+# out, and this file never reaches its `Results` line.  It is a 6-minute file
+# with two whole cluster scenarios after this point; wedging here costs all of
+# them, and a run that never reports is worse than one that reports red.
 RC=0
-echo "hello cluster" | nc -q 1 127.0.0.1 "$GW_PORT" 2>/dev/null || RC=$?
-if [ "$RC" -eq 0 ]; then
-    PASS=$((PASS+1))
+printf '%s\n' "$CL_PAYLOAD" | timeout 10 nc -q 1 127.0.0.1 "$GW_PORT" >/dev/null 2>&1 || RC=$?
+
+# Wait for the counters to settle rather than sleeping a guess at how long a
+# cross-daemon forward takes; on success this returns as soon as both have moved.
+GC1=$GC0; GB1=$GB0
+for _ in $(seq 1 40); do
+    GC1=$(cluster_counter "$SOCK_GW" "$RT_GW" total_connections)
+    GB1=$(cluster_sum_bytes_in "$SOCK_NODE1|$RT_API1" "$SOCK_NODE2|$RT_API2")
+    if [ -n "$GC0" ] && [ -n "$GC1" ] && [ -n "$GB0" ] && [ -n "$GB1" ] \
+       && [ "$GC1" -gt "$GC0" ] && [ "$GB1" -ge "$((GB0 + CL_N))" ]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [ -z "$GC0" ] || [ -z "$GC1" ]; then
+    fail "proxy @group: the gateway accepted the connection" \
+         "could not read $RT_GW's total_connections (before='$GC0' after='$GC1')" \
+         "— the gateway daemon did not answer, so nothing was measured"
+elif [ "$GC1" -eq "$((GC0 + 1))" ]; then
+    pass
 else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [proxy @group connect]: nc exit code $RC"
+    fail "proxy @group: the gateway accepted the connection" \
+         "$RT_GW's total_connections went $GC0 -> $GC1, wanted exactly one more (nc exited $RC)." \
+         "Something may still answer port $GW_PORT — that is what the old nc-exit-code" \
+         "check measured — but it is not this gateway."
+fi
+
+if [ -z "$GB0" ] || [ -z "$GB1" ]; then
+    fail "proxy @group: the payload reached an @api member" \
+         "could not read bytes_in for $RT_API1/$RT_API2 (before='$GB0' after='$GB1')"
+elif [ "$GB1" -eq "$((GB0 + CL_N))" ]; then
+    pass
+else
+    fail "proxy @group: the payload reached an @api member" \
+         "bytes_in across $RT_API1+$RT_API2 went $GB0 -> $GB1, wanted exactly $CL_N more" \
+         "($((GB1 - GB0)) arrived).  The gateway took the connection, but @api did not" \
+         "resolve to a reachable member on another daemon."
 fi
 
 # ─── Test 6: Stale detection ──────────────────────────────────────────────────

@@ -75,6 +75,35 @@ assert_contains() {
     if echo "$1" | grep -q "$2"; then ok; else bad "$3" "expected '$2' in output"; fi
 }
 
+# counter RUNTIME FIELD
+#
+# One numeric field out of `stats`, or the empty string when the runtime is not
+# there or the daemon did not answer.  Deliberately not 0 in that case: 0 is a
+# legitimate reading of every counter here, and "there was nothing to read" must
+# not compare equal to it -- that substitution is how the check below would go
+# back to passing for the wrong reason.
+counter() {
+    local v
+    v=$("$BIN" stats "$1" 2>/dev/null | sed -n "s/^$2:\([0-9][0-9]*\)$/\1/p" | head -1) || v=""
+    printf '%s' "$v"
+}
+
+# sum_bytes_in RUNTIME...
+#
+# Combined bytes_in over the named backends, or the empty string if any one of
+# them could not be read.  Summed because round-robin picks the backend and
+# either choice is a pass; a partial sum is not a smaller number, it is no
+# measurement, and it says so.
+sum_bytes_in() {
+    local total=0 rt v
+    for rt in "$@"; do
+        v=$(counter "$rt" bytes_in)
+        if [ -z "$v" ]; then printf ''; return 0; fi
+        total=$((total + v))
+    done
+    printf '%s' "$total"
+}
+
 echo "=== Integration: proxy routing ==="
 
 # Wait on the daemon's own log line, never by polling with a CLI command: a CLI
@@ -128,12 +157,79 @@ assert_contains "$OUT" "proxy_be1" "backend 1 in ps"
 assert_contains "$OUT" "proxy_be2" "backend 2 in ps"
 assert_contains "$OUT" "proxy_tcp" "proxy in ps"
 
-# Test: TCP proxy accepts connections and forwards to backend
-# Server broadcasts to other clients, so send from two connections:
-# first one establishes, second one sends data, first should receive broadcast
+# Test: TCP proxy accepts connections and forwards to a backend
+#
+# ─── What the old check could not tell apart ────────────────────────────────
+#
+#     RC=0
+#     echo "hello proxy" | nc -q 1 127.0.0.1 "$TCP_PROXY_PORT" 2>/dev/null || RC=$?
+#     if [ "$RC" -eq 0 ]; then ok; else bad "TCP proxy connect" "nc exit code $RC"; fi
+#
+# The entire assertion was nc's exit status, which is 0 for anything at all that
+# accepts a TCP connection on that port.  Staged: with a foreign process holding
+# 19263 so `create proxy` was refused and proxy_tcp never existed, this file
+# printed 6/8 and `TCP proxy connect` was not one of the two failures.  It passed
+# against a stranger.  Connecting is not the claim.
+#
+# The claim is that *this* proxy served the connection and forwarded it to *this
+# test's* backend, so the oracle is this daemon's own counters, which nothing
+# outside this daemon can move:
+#
+#   * proxy_tcp's total_connections goes up by exactly one.  A stranger holding
+#     the port cannot produce that, because the connection never reached us.
+#   * the payload's bytes arrive at a backend.  A proxy that accepts and
+#     forwards nowhere cannot produce that.
+#
+# Summed over both backends because round-robin picks which one gets it and
+# either choice is a pass.
+PAYLOAD="hello proxy"
+NBYTES=$(( ${#PAYLOAD} + 1 ))        # echo adds the newline that is also sent
+C0=$(counter proxy_tcp total_connections)
+B0=$(sum_bytes_in proxy_be1 proxy_be2)
+
+# `timeout` around nc, because `-q 1` only bounds the wait *after* the peer has
+# hung up.  A peer that accepts and then holds the connection open forever -- a
+# stray port-holder is exactly that -- leaves nc blocked with nothing to time it
+# out, and the file never reaches its `Results` line at all.  Staged against such
+# a peer the old form wedged until it was killed at 60s, having printed two
+# FAILs and no summary.  A run that never reports is worse than one that reports
+# red, so the wait is bounded and nc's status is carried into the message below
+# as a symptom rather than used as the verdict.
 RC=0
-echo "hello proxy" | nc -q 1 127.0.0.1 "$TCP_PROXY_PORT" 2>/dev/null || RC=$?
-if [ "$RC" -eq 0 ]; then ok; else bad "TCP proxy connect" "nc exit code $RC"; fi
+printf '%s\n' "$PAYLOAD" | timeout 10 nc -q 1 127.0.0.1 "$TCP_PROXY_PORT" >/dev/null 2>&1 || RC=$?
+
+# Wait for the counters to settle rather than sleeping a guess at how long
+# forwarding takes; on success this returns as soon as both have moved.
+C1=$C0; B1=$B0
+for _ in $(seq 1 40); do
+    C1=$(counter proxy_tcp total_connections)
+    B1=$(sum_bytes_in proxy_be1 proxy_be2)
+    if [ -n "$C0" ] && [ -n "$C1" ] && [ -n "$B0" ] && [ -n "$B1" ] \
+       && [ "$C1" -gt "$C0" ] && [ "$B1" -ge "$((B0 + NBYTES))" ]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [ -z "$C0" ] || [ -z "$C1" ]; then
+    bad "TCP proxy accepted the connection" \
+        "could not read proxy_tcp's total_connections (before='$C0' after='$C1') — stats did not answer, so nothing was measured"
+elif [ "$C1" -eq "$((C0 + 1))" ]; then
+    ok
+else
+    bad "TCP proxy accepted the connection" \
+        "proxy_tcp's total_connections went $C0 -> $C1, wanted exactly one more (nc exited $RC); something may still answer port $TCP_PROXY_PORT, but it is not this proxy"
+fi
+
+if [ -z "$B0" ] || [ -z "$B1" ]; then
+    bad "payload reached a backend" \
+        "could not read bytes_in for proxy_be1/proxy_be2 (before='$B0' after='$B1') — stats did not answer"
+elif [ "$B1" -eq "$((B0 + NBYTES))" ]; then
+    ok
+else
+    bad "payload reached a backend" \
+        "bytes_in across proxy_be1+proxy_be2 went $B0 -> $B1, wanted exactly $NBYTES more ($((B1 - B0)) arrived); the proxy took the connection but the payload did not reach a backend"
+fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
