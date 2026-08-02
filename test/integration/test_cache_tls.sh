@@ -37,6 +37,72 @@
 #      asked for -- at create, on the restore path at start, and at the
 #      REPLICATE command, which is the only one of the three that is not
 #      configuration -- while a cleartext cache replicates exactly as before
+#
+# ─── HOW A PROBE THAT COULD NOT ANSWER REPORTS ITSELF ───────────────────────
+#
+# Every assertion here reads a marked line out of a python probe's output and
+# demands a positive token -- 'not-executed', 'yes', '+PONG', 'accepted'.  That
+# shape is right, and it is the shape #40 built into test_master_auth_lockout.sh:
+# an expectation of *nothing* is satisfied by everything going wrong.
+#
+# What was missing was the other half of that pattern.  Each probe ended in
+# `) || true` with its stderr on /dev/null, so a probe that died printed no
+# marked line at all, the substitution yielded '', and the assertion said
+#
+#     FAIL [the plaintext client's command is never executed]:
+#           expected: 'not-executed'
+#           got:      ''
+#
+# which is correct and undiagnosable.  The reason -- observed today, and only by
+# re-running the file by hand with stderr attached -- was
+# `TimeoutError: _ssl.c:983: The handshake operation timed out`.
+#
+# So every probe now owes the shell one line per claim it was going to answer,
+# and pays every line it did not reach with a token naming why.  The empty
+# string is printed by no path at all, which is what lets it mean the one thing
+# it means: python3 never got as far as printing, and the assertion says so.
+#
+# THE VOCABULARY, defined once in cachetls_probe.py and shared by all of them.
+# The first four words are test_master_auth_lockout.sh's, kept as they are
+# rather than restated; the TLS ones are new because that file speaks none:
+#
+#   <no-listener>         connect() was refused -- nothing is bound there
+#   <connect-timeout>     connect() did not finish inside the client's budget
+#   <handshake-timeout>   the TLS handshake did not finish inside that budget
+#   <handshake-failed>    the handshake was refused, or the certificate did not
+#                         verify: an answer, and a bad one
+#   <stalled>             the session was up and nothing arrived before the
+#                         timeout
+#   <dropped>             the peer ended the connection with an answer owed
+#   <blank-reply>         bytes came back, but no text in them
+#   <error:WHAT>          anything else, named by its exception class
+#
+# A token names an OBSERVATION.  What it is worth is this file's judgement, and
+# it splits three ways:
+#
+#   * the three timeouts are NOT MEASURABLE, in the words d1fa885 and
+#     test_proxy_group_keepalive_load.sh already use.  Six probes here carry a
+#     fixed client budget (10 s, 8 s, 5 s, 8 s, 6 s, 8 s) while the handshake
+#     they are waiting on measures 0.01 s on a quiet box, against a
+#     Sanitize-built cache.  Under foreign load those budgets are missed -- 8 of
+#     32 assertions failed at load average 1.72 -- and a missed budget is this
+#     run failing to put the question, not the product answering wrongly.  It
+#     still ends the run non-zero, because an assertion that was never evaluated
+#     has not passed; it is just not reported as a defect in the cache.
+#   * every other token is a FAILURE.  A refused connect, a handshake the
+#     listener would not complete, a session it closed with an answer owed: each
+#     of those is the product answering, and answering wrongly.
+#   * the empty string is a failure with its own sentence, because it can now
+#     only mean the probe never ran at all.
+#
+# A hang is the one genuinely ambiguous case and it is called <stalled>
+# deliberately.  "The listener accepted a plaintext client and left it hanging"
+# is a defect this file is written to catch, and "the box was too loaded to
+# answer inside five seconds" is not, and from the client's side after five
+# seconds the two are the same observation.  Reporting it as NOT MEASURABLE
+# still fails the run -- a real hang produces it every single time and never
+# stops -- while a loaded machine produces it once and is not accused of
+# shipping a hang.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -44,7 +110,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_ready.sh
 . "$(dirname "$0")/lib_ready.sh"
 
-PASS=0; FAIL=0; TOTAL=0
+PASS=0; FAIL=0; HERR=0; TOTAL=0
 
 echo "=== Integration: TLS on a cache listener ==="
 
@@ -108,6 +174,99 @@ assert_ok() {
     fi
 }
 
+# herr LABEL REASON [DETAIL...]
+#
+# A claim this run was unable to put the question to.  Kept apart from a failure
+# on purpose, and deliberately in the words test_restart_under_load.sh and
+# test_proxy_group_keepalive_load.sh already use for it rather than a third
+# vocabulary.  Both still end the run non-zero -- an assertion that was never
+# evaluated has not passed -- but only one of them is about the product, and the
+# summary counts them separately so that is visible without reading the log.
+herr() {
+    local label=$1 reason=$2; shift 2
+    TOTAL=$((TOTAL+1)); HERR=$((HERR+1))
+    echo "  NOT MEASURABLE [$label]: $reason"
+    local line
+    for line in "$@"; do echo "        $line"; done
+}
+
+# True for the tokens that mean "the client's budget ran out", and for no
+# others.  Everything else a probe can print is an answer -- see the vocabulary
+# in the header.  Written as an explicit list rather than a pattern on '<...>':
+# a token added later must be classified deliberately, and the default for an
+# unrecognised one is the strict side, which is a failure.
+unmeasurable_token() {   # value
+    case "$1" in
+        '<connect-timeout>'|'<handshake-timeout>'|'<stalled>') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Everything a probe said, printed only next to an assertion that did not pass.
+# Every probe writes stdout AND stderr to its file, deliberately: a probe that
+# died has a traceback and that traceback is the only place the reason lives.
+# It used to go to /dev/null, which is how a handshake timeout came to be
+# reported as the cache answering wrongly.
+probe_said() {   # file
+    local n
+    n=$(wc -l <"$1" 2>/dev/null || echo 0)
+    if [ "$n" -eq 0 ]; then
+        echo "        --- the probe printed nothing at all, on either stream ---"
+        return
+    fi
+    echo "        --- what the probe said ---"
+    sed 's/^/        /' "$1" 2>/dev/null || true
+}
+
+# assert_probe GOT EXPECTED LABEL [PROBE_OUTPUT_FILE]
+#
+# assert_eq, with the three things a probe can produce kept apart: an answer, a
+# named reason there is no answer, and nothing at all.
+#
+# The empty string is its own failure with its own sentence, and that is most of
+# the point.  Every path through every probe in this file prints a token, so ''
+# is printed by no path: it can only mean python3 never got as far as printing,
+# and that is what it now says instead of being reported as the cache having
+# answered wrongly.
+assert_probe() {
+    local got="$1" expected="$2" label="$3" file="${4:-}"
+    if [ -z "$got" ]; then
+        TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+        echo "  FAIL [$label]: the probe printed no token at all, so it never ran --"
+        echo "        no python3, or it died before reaching its own handler.  Every path"
+        echo "        that completes prints something, so this is not the cache answering"
+        echo "        wrongly and it is not a missed timeout either."
+        [ -n "$file" ] && probe_said "$file"
+        return
+    fi
+    if unmeasurable_token "$got"; then
+        herr "$label" "the probe answered $got, wanted '$expected'" \
+            "The client's own budget ran out before the cache had answered.  On a" \
+            "quiet box the handshake here takes 0.01s and this never fires; under" \
+            "foreign load it does.  Nothing in this says the build misbehaved --" \
+            "it says this run could not put the question.  Check what else was" \
+            "running, and re-run alone."
+        return
+    fi
+    TOTAL=$((TOTAL+1))
+    if [ "$got" = "$expected" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$label]:"
+        echo "        expected: '$expected'"
+        echo "        got:      '$got'"
+        [ -n "$file" ] && probe_said "$file"
+    fi
+}
+
+# The marked line a probe printed for one claim, or the empty string when it
+# printed none.  head -1 matters: a probe settles the markers it never reached
+# at the very end, so a marker it already answered must not be read twice.
+marker() {   # file marker
+    grep "^$2 " "$1" 2>/dev/null | head -1 | cut -d' ' -f2- || true
+}
+
 # Run a command and echo its exit status.  Much of this file is about commands
 # that are *supposed* to fail, and under `set -e` a bare `cmd; rc=$?` ends the
 # run before the assertion is ever reached.
@@ -140,6 +299,147 @@ start_daemon() {
     for _ in $(seq 1 60); do [ -S "$SOCKETLEY_SOCKET" ] && break; sleep 0.1; done
     [ -S "$SOCKETLEY_SOCKET" ]
 }
+
+# ── the probes' shared vocabulary ───────────────────────────────────────────
+# Written once and imported by every probe below through PYTHONPATH, rather
+# than pasted into eight heredocs that would drift apart.  See the header for
+# what each token means and how this file judges it.
+cat >"$TMPDIR_T/cachetls_probe.py" <<'PYEOF'
+"""The words every probe in test_cache_tls.sh answers in.
+
+Two rules, and everything here exists to keep them:
+
+  * a probe owes the shell one marked line per claim it was going to answer,
+    and pays anything it did not reach with a token naming why.  The empty
+    string is then printed by no path at all, so it can mean the one thing it
+    actually means -- python3 never ran.
+  * a token names an OBSERVATION and nothing more.  Whether <stalled> is a
+    defect or a loaded machine is the shell's judgement, not this module's, and
+    it is written down there.
+"""
+import socket
+import ssl
+
+
+class Owed:
+    """The markers a probe owes, and what it pays the unreached ones with.
+
+    say() answers one; settle() pays the rest.  A marker answered twice would
+    make the shell read the first line and ignore the second, which is why say()
+    strikes it off rather than leaving it to be settled again at the end.
+    """
+
+    def __init__(self, *markers):
+        self._owed = list(markers)
+
+    def say(self, marker, value):
+        print(marker, value, flush=True)
+        if marker in self._owed:
+            self._owed.remove(marker)
+
+    def settle(self, token):
+        for m in self._owed:
+            print(m, token, flush=True)
+        self._owed = []
+
+
+def dial(port, timeout, host="127.0.0.1"):
+    """(socket, None), or (None, token) naming why there is no socket.
+
+    A refused connect and a connect that timed out are deliberately different
+    tokens: the first says nothing is bound there, which is an answer, and the
+    second says this client gave up, which is not.
+    """
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+    except ConnectionRefusedError:
+        return None, "<no-listener>"
+    except (socket.timeout, TimeoutError):
+        return None, "<connect-timeout>"
+    except OSError as e:
+        return None, "<error:connect-%s>" % (e.__class__.__name__,)
+    s.settimeout(timeout)
+    return s, None
+
+
+def handshake(raw, cafile, servername="localhost", client=None, verify=True):
+    """(tls socket, None), or (None, token) naming why there is no session.
+
+    The timeout clause comes first on purpose.  socket.timeout IS TimeoutError
+    on this python and both are subclasses of OSError, as is ssl.SSLError, so a
+    handshake that ran out of budget would otherwise be caught by a later clause
+    and reported as the listener refusing it -- which is the whole confusion
+    this file is being repaired for.
+    """
+    ctx = ssl.create_default_context(cafile=cafile)
+    ctx.check_hostname = verify
+    if not verify:
+        ctx.verify_mode = ssl.CERT_NONE
+    if client:
+        ctx.load_cert_chain(client[0], client[1])
+    try:
+        return ctx.wrap_socket(raw, server_hostname=servername), None
+    except (socket.timeout, TimeoutError):
+        return None, "<handshake-timeout>"
+    except (ssl.SSLZeroReturnError, ssl.SSLEOFError,
+            ConnectionResetError, BrokenPipeError):
+        return None, "<dropped>"
+    except ssl.SSLError:
+        return None, "<handshake-failed>"
+    except OSError as e:
+        return None, "<error:handshake-%s>" % (e.__class__.__name__,)
+
+
+def session(port, cafile, timeout, servername="localhost", client=None):
+    """dial + handshake in one: (tls, None) or (None, token)."""
+    raw, tok = dial(port, timeout)
+    if tok:
+        return None, tok
+    tls, tok = handshake(raw, cafile, servername, client)
+    if tok:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return None, tok
+    return tls, None
+
+
+def read_token(exc):
+    """The token for an exception raised on an established session.
+
+    Timeout first, for the same reason as above.
+    """
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "<stalled>"
+    if isinstance(exc, (ssl.SSLZeroReturnError, ssl.SSLEOFError,
+                        ConnectionResetError, BrokenPipeError)):
+        return "<dropped>"
+    return "<error:%s>" % (exc.__class__.__name__,)
+
+
+def text_or_blank(data):
+    """A reply as text, or <dropped>/<blank-reply>.
+
+    An empty read means the peer hung up with an answer owed; bytes that strip
+    to nothing are a different thing and are not folded into it.
+    """
+    if not data:
+        return "<dropped>"
+    text = (data.decode(errors="replace") if isinstance(data, bytes) else data).strip()
+    return text if text else "<blank-reply>"
+
+
+def shut(*socks):
+    for s in socks:
+        try:
+            s.close()
+        except OSError:
+            pass
+PYEOF
+# Every probe below imports it by name; nothing else on this box is called
+# cachetls_probe, and the directory is one mktemp made for this run.
+export PYTHONPATH="$TMPDIR_T"
 
 # ── certificates ────────────────────────────────────────────────────────────
 # A self-signed leaf for the listener, and a separate one-level CA that signs a
@@ -212,7 +512,8 @@ assert_ok "$(rc_of ready_tls 127.0.0.1 "$TLS_PORT" "$CERTS/cache.pem" localhost 
 # off-by-one unnoticed), then GET them all back through the same session.  The
 # large one deliberately spans several TLS records.
 python3 - "$TLS_PORT" "$CERTS/cache.pem" > "$TMPDIR_T/resp.out" 2>&1 <<'PYEOF' || true
-import socket, ssl, sys
+import sys
+from cachetls_probe import Owed, read_token, session, shut
 
 port, cafile = int(sys.argv[1]), sys.argv[2]
 values = {
@@ -222,6 +523,12 @@ values = {
     "k4": "".join(str(i % 10) for i in range(20000)),   # spans many records
 }
 
+# The four claims this probe owes an answer to.  Anything it does not reach is
+# paid with the token naming why, so no assertion below can read an empty value
+# unless python3 itself never ran.
+owed = Owed("VERSION", "CIPHER", "ROUNDTRIP", "PING")
+
+
 def cmd(*parts):
     out = f"*{len(parts)}\r\n".encode()
     for p in parts:
@@ -229,71 +536,106 @@ def cmd(*parts):
         out += b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
     return out
 
-ctx = ssl.create_default_context(cafile=cafile)
-ctx.check_hostname = True
-raw = socket.create_connection(("127.0.0.1", port), timeout=10)
-tls = ctx.wrap_socket(raw, server_hostname="localhost")
-print("VERSION", tls.version())
-print("CIPHER", tls.cipher()[0] if tls.cipher() else "")
 
-f = tls.makefile("rwb")
+tls, tok = session(port, cafile, 10)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
 
-def line():
-    return f.readline().rstrip(b"\r\n")
+try:
+    owed.say("VERSION", tls.version())
+    owed.say("CIPHER", tls.cipher()[0] if tls.cipher() else "<blank-reply>")
 
-def bulk():
-    hdr = line()
-    if not hdr.startswith(b"$"):
-        return hdr
-    n = int(hdr[1:])
-    if n < 0:
-        return None
-    data = f.read(n)
-    f.read(2)
-    return data
+    f = tls.makefile("rwb")
 
-for k, v in values.items():
-    f.write(cmd("SET", k, v)); f.flush()
-    line()
+    def line():
+        return f.readline().rstrip(b"\r\n")
 
-ok = True
-for k, v in values.items():
-    f.write(cmd("GET", k)); f.flush()
-    got = bulk()
-    if got != v.encode():
-        ok = False
-        print("MISMATCH", k, "len", len(got) if got is not None else -1,
-              "expected", len(v))
-print("ROUNDTRIP", "yes" if ok else "no")
+    def bulk():
+        hdr = line()
+        if not hdr.startswith(b"$"):
+            return hdr
+        n = int(hdr[1:])
+        if n < 0:
+            return None
+        data = f.read(n)
+        f.read(2)
+        return data
 
-# PING on the same session, after the large value, so a record layer that
-# desynchronised on a multi-record write shows up here rather than silently.
-f.write(cmd("PING")); f.flush()
-print("PING", line().decode(errors="replace"))
-tls.close()
+    for k, v in values.items():
+        f.write(cmd("SET", k, v)); f.flush()
+        line()
+
+    ok = True
+    for k, v in values.items():
+        f.write(cmd("GET", k)); f.flush()
+        got = bulk()
+        if got != v.encode():
+            ok = False
+            print("MISMATCH", k, "len", len(got) if got is not None else -1,
+                  "expected", len(v))
+    owed.say("ROUNDTRIP", "yes" if ok else "no")
+
+    # PING on the same session, after the large value, so a record layer that
+    # desynchronised on a multi-record write shows up here rather than silently.
+    f.write(cmd("PING")); f.flush()
+    owed.say("PING", line().decode(errors="replace") or "<dropped>")
+except Exception as e:            # noqa: BLE001 -- every path owes an answer
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(tls)
 PYEOF
 
-TLS_VERSION=$(grep '^VERSION ' "$TMPDIR_T/resp.out" | cut -d' ' -f2- || true)
-TLS_CIPHER=$(grep '^CIPHER ' "$TMPDIR_T/resp.out" | cut -d' ' -f2- || true)
-ROUNDTRIP=$(grep '^ROUNDTRIP ' "$TMPDIR_T/resp.out" | cut -d' ' -f2- || true)
-PINGED=$(grep '^PING ' "$TMPDIR_T/resp.out" | cut -d' ' -f2- || true)
+TLS_VERSION=$(marker "$TMPDIR_T/resp.out" VERSION)
+TLS_CIPHER=$(marker "$TMPDIR_T/resp.out" CIPHER)
+ROUNDTRIP=$(marker "$TMPDIR_T/resp.out" ROUNDTRIP)
+PINGED=$(marker "$TMPDIR_T/resp.out" PING)
 
-TOTAL=$((TOTAL+1))
-case "$TLS_VERSION" in
-    TLSv1.2|TLSv1.3) PASS=$((PASS+1)) ;;
-    *) FAIL=$((FAIL+1)); echo "  FAIL [negotiated TLS version]: got '$TLS_VERSION'"
-       sed 's/^/        /' "$TMPDIR_T/resp.out" ;;
-esac
-
-TOTAL=$((TOTAL+1))
-if [ -n "$TLS_CIPHER" ]; then
-    PASS=$((PASS+1))
+# Not assert_probe: the expectation is a set of two acceptable answers rather
+# than one string, so the token arm is spelled out.  Same three-way split.
+if [ -z "$TLS_VERSION" ]; then
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL [negotiated TLS version]: the probe printed no token at all, so it never ran"
+    probe_said "$TMPDIR_T/resp.out"
+elif unmeasurable_token "$TLS_VERSION"; then
+    herr "negotiated TLS version" "the probe answered $TLS_VERSION" \
+        "The handshake did not finish inside the client's 10s budget.  That is" \
+        "this run failing to put the question, not the listener refusing."
 else
-    FAIL=$((FAIL+1)); echo "  FAIL [a cipher was negotiated]"
+    TOTAL=$((TOTAL+1))
+    case "$TLS_VERSION" in
+        TLSv1.2|TLSv1.3) PASS=$((PASS+1)) ;;
+        *) FAIL=$((FAIL+1)); echo "  FAIL [negotiated TLS version]: got '$TLS_VERSION'"
+           probe_said "$TMPDIR_T/resp.out" ;;
+    esac
 fi
 
-assert_eq "$ROUNDTRIP" "yes" "RESP over TLS: every value comes back byte for byte"
-assert_eq "$PINGED" "+PONG"  "RESP over TLS: the session is still framed after a 20KB value"
+# This one was `[ -n "$TLS_CIPHER" ]`, which every token also satisfies: a
+# non-empty check passes on '<handshake-timeout>' as readily as on
+# 'TLS_AES_256_GCM_SHA384'.  A cipher name is what is being claimed, so the
+# claim is now that the answer is not a token.
+if [ -z "$TLS_CIPHER" ]; then
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL [a cipher was negotiated]: the probe printed no token at all, so it never ran"
+    probe_said "$TMPDIR_T/resp.out"
+elif unmeasurable_token "$TLS_CIPHER"; then
+    herr "a cipher was negotiated" "the probe answered $TLS_CIPHER" \
+        "The handshake did not finish inside the client's 10s budget."
+else
+    TOTAL=$((TOTAL+1))
+    case "$TLS_CIPHER" in
+        '<'*'>') FAIL=$((FAIL+1))
+                 echo "  FAIL [a cipher was negotiated]: got '$TLS_CIPHER'"
+                 probe_said "$TMPDIR_T/resp.out" ;;
+        *)       PASS=$((PASS+1)) ;;
+    esac
+fi
+
+assert_probe "$ROUNDTRIP" "yes" "RESP over TLS: every value comes back byte for byte" \
+    "$TMPDIR_T/resp.out"
+assert_probe "$PINGED" "+PONG"  "RESP over TLS: the session is still framed after a 20KB value" \
+    "$TMPDIR_T/resp.out"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. The line protocol on a TLS listener
@@ -309,21 +651,32 @@ assert_eq "$(rc_of "$BIN" create cache tlsline -p "$LINE_PORT" \
 assert_ok "$(rc_of ready_tls 127.0.0.1 "$LINE_PORT" "$CERTS/cache.pem" localhost 20)" \
     "line-protocol TLS cache completes a handshake"
 
-LINE_OUT=$(python3 - "$LINE_PORT" "$CERTS/cache.pem" 2>/dev/null <<'PYEOF'
-import socket, ssl, sys
+python3 - "$LINE_PORT" "$CERTS/cache.pem" >"$TMPDIR_T/line.out" 2>&1 <<'PYEOF' || true
+import sys
+from cachetls_probe import Owed, read_token, session, shut, text_or_blank
+
 port, cafile = int(sys.argv[1]), sys.argv[2]
-ctx = ssl.create_default_context(cafile=cafile)
-raw = socket.create_connection(("127.0.0.1", port), timeout=8)
-tls = ctx.wrap_socket(raw, server_hostname="localhost")
-f = tls.makefile("rwb")
-f.write(b"set line-key line-value\n"); f.flush()
-f.readline()
-f.write(b"get line-key\n"); f.flush()
-print(f.readline().rstrip(b"\r\n").decode(errors="replace"))
-tls.close()
+owed = Owed("LINE")
+
+tls, tok = session(port, cafile, 8)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
+try:
+    f = tls.makefile("rwb")
+    f.write(b"set line-key line-value\n"); f.flush()
+    f.readline()
+    f.write(b"get line-key\n"); f.flush()
+    owed.say("LINE", text_or_blank(f.readline().rstrip(b"\r\n")))
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(tls)
 PYEOF
-) || true
-assert_eq "$LINE_OUT" "line-value" "line protocol works on the decrypted stream"
+assert_probe "$(marker "$TMPDIR_T/line.out" LINE)" "line-value" \
+    "line protocol works on the decrypted stream" "$TMPDIR_T/line.out"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. No downgrade: a plaintext client is refused, not served and not hung
@@ -333,28 +686,47 @@ assert_eq "$LINE_OUT" "line-value" "line protocol works on the decrypted stream"
 # must hold and both are asserted: the client is *told* -- it reaches EOF or is
 # reset rather than sitting on an open socket waiting forever -- and the command
 # is never executed.
-PLAIN_RESULT=$(python3 - "$TLS_PORT" 2>/dev/null <<'PYEOF'
-import socket, sys
+python3 - "$TLS_PORT" >"$TMPDIR_T/plain.out" 2>&1 <<'PYEOF' || true
+import socket
+import sys
+from cachetls_probe import Owed, dial, read_token, shut
+
 port = int(sys.argv[1])
-s = socket.create_connection(("127.0.0.1", port), timeout=5)
-s.sendall(b"*3\r\n$3\r\nSET\r\n$9\r\nplainkey\x31\r\n$10\r\nplainvalue\r\n")
-s.settimeout(5)
+owed = Owed("CLOSED", "REPLY")
+
+s, tok = dial(port, 5)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
 try:
+    s.sendall(b"*3\r\n$3\r\nSET\r\n$9\r\nplainkey\x31\r\n$10\r\nplainvalue\r\n")
     data = s.recv(4096)
     # An alert, or a clean EOF.  Either is the listener refusing; what must not
     # happen is "+OK", and what must not happen is nothing at all.
-    print("CLOSED", "yes" if data == b"" or data[:1] == b"\x15" else "no")
-    print("REPLY", repr(data[:16]))
-except socket.timeout:
-    print("CLOSED", "hung")          # still open with nothing said: a hang
-except OSError:
-    print("CLOSED", "yes")           # reset
-    print("REPLY", "b''")
-s.close()
+    owed.say("CLOSED", "yes" if data == b"" or data[:1] == b"\x15" else "no")
+    owed.say("REPLY", repr(data[:16]))
+except (socket.timeout, TimeoutError):
+    # Accepted, still open, nothing said.  <stalled> rather than a verdict of
+    # its own: see the header.  A listener that really hangs produces this every
+    # run for ever; a box too busy to answer in five seconds produces it once.
+    owed.settle("<stalled>")
+except (ConnectionResetError, BrokenPipeError):
+    # A reset is the listener refusing, exactly as a clean EOF is, and it is what
+    # the assertion is asking for.  It is NOT <dropped>: the claim here is that
+    # nothing comes back, and a reset is that.  This was the OSError arm of the
+    # original probe and it stays a positive answer.
+    owed.say("CLOSED", "yes")
+    owed.say("REPLY", "b''")
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(s)
 PYEOF
-) || true
-assert_eq "$(echo "$PLAIN_RESULT" | grep '^CLOSED' | cut -d' ' -f2)" "yes" \
-    "a plaintext client on a TLS cache port is refused rather than left hanging"
+assert_probe "$(marker "$TMPDIR_T/plain.out" CLOSED)" "yes" \
+    "a plaintext client on a TLS cache port is refused rather than left hanging" \
+    "$TMPDIR_T/plain.out"
 
 # ...and the SET it sent never happened.  Read back through a real session.
 #
@@ -363,39 +735,57 @@ assert_eq "$(echo "$PLAIN_RESULT" | grep '^CLOSED' | cut -d' ' -f2)" "yes" \
 # so on its own it would pass against a binary that has none of this.  It is
 # only evidence when the session it was read over worked -- which is why a key
 # that *is* set has to come back correct in the same breath.
-MISS_CHECK=$(python3 - "$TLS_PORT" "$CERTS/cache.pem" 2>/dev/null <<'PYEOF'
-import socket, ssl, sys
+python3 - "$TLS_PORT" "$CERTS/cache.pem" >"$TMPDIR_T/miss.out" 2>&1 <<'PYEOF' || true
+import sys
+from cachetls_probe import Owed, read_token, session, shut
+
 port, cafile = int(sys.argv[1]), sys.argv[2]
+owed = Owed("VERDICT")
+
+
 def cmd(*parts):
     out = f"*{len(parts)}\r\n".encode()
     for p in parts:
         b = p.encode()
         out += b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n"
     return out
-ctx = ssl.create_default_context(cafile=cafile)
-raw = socket.create_connection(("127.0.0.1", port), timeout=8)
-tls = ctx.wrap_socket(raw, server_hostname="localhost")
-f = tls.makefile("rwb")
-def get(k):
-    f.write(cmd("GET", k)); f.flush()
-    hdr = f.readline().rstrip(b"\r\n")
-    if hdr.startswith(b"$") and int(hdr[1:]) >= 0:
-        n = int(hdr[1:]); d = f.read(n); f.read(2); return d
-    return None
-plain = get("plainkey1")
-never = get("a-key-nothing-ever-wrote")
-known = get("k1")
-tls.close()
-# A live session (k1 reads back), the plaintext client's key a miss, and a miss
-# spelled the same way as one for a key nobody ever mentioned.
-if known == b"012345" and plain is None and never is None:
-    print("VERDICT not-executed")
-else:
-    print("VERDICT", "known=%r plain=%r never=%r" % (known, plain, never))
+
+
+# This is the probe whose death was reported as `expected: 'not-executed'
+# got: ''`.  It dies here, on the handshake, and the reason is now a token
+# rather than a traceback on a stream nobody was reading.
+tls, tok = session(port, cafile, 8)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
+try:
+    f = tls.makefile("rwb")
+
+    def get(k):
+        f.write(cmd("GET", k)); f.flush()
+        hdr = f.readline().rstrip(b"\r\n")
+        if hdr.startswith(b"$") and int(hdr[1:]) >= 0:
+            n = int(hdr[1:]); d = f.read(n); f.read(2); return d
+        return None
+
+    plain = get("plainkey1")
+    never = get("a-key-nothing-ever-wrote")
+    known = get("k1")
+    # A live session (k1 reads back), the plaintext client's key a miss, and a
+    # miss spelled the same way as one for a key nobody ever mentioned.
+    if known == b"012345" and plain is None and never is None:
+        owed.say("VERDICT", "not-executed")
+    else:
+        owed.say("VERDICT", "known=%r plain=%r never=%r" % (known, plain, never))
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(tls)
 PYEOF
-) || true
-assert_eq "$(echo "$MISS_CHECK" | grep '^VERDICT' | cut -d' ' -f2-)" "not-executed" \
-    "the plaintext client's command is never executed"
+assert_probe "$(marker "$TMPDIR_T/miss.out" VERDICT)" "not-executed" \
+    "the plaintext client's command is never executed" "$TMPDIR_T/miss.out"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Mutual TLS
@@ -406,9 +796,15 @@ assert_eq "$(rc_of "$BIN" create cache tlsmtls -p "$MTLS_PORT" \
 
 ready_tcp 127.0.0.1 "$MTLS_PORT" 10 || true
 
-MTLS_RESULT=$(python3 - "$MTLS_PORT" "$CERTS" 2>/dev/null <<'PYEOF'
-import socket, ssl, sys, time
+python3 - "$MTLS_PORT" "$CERTS" >"$TMPDIR_T/mtls.out" 2>&1 <<'PYEOF' || true
+import socket
+import ssl
+import sys
+import time
+from cachetls_probe import Owed, dial, handshake, shut
+
 port, certs = int(sys.argv[1]), sys.argv[2]
+owed = Owed("WITHCERT", "NOCERT")
 
 # "Accepted" cannot be read off the handshake alone.  A TLS 1.3 server only
 # discovers the missing client certificate after the client believes it is
@@ -421,47 +817,56 @@ port, certs = int(sys.argv[1]), sys.argv[2]
 # probe reports the no-certificate case as a pass against a binary that cannot
 # create this runtime at all -- an assertion that is satisfied by the feature
 # being absent is not an assertion.  A refused connect is its own answer here.
+#
+# A FOURTH OUTCOME, and it is the repair.  This used to end
+# `except Exception: return "rejected"`, which is also what a handshake that ran
+# out of its six-second budget raises -- socket.timeout is TimeoutError is an
+# OSError on this python, and so is ssl.SSLError.  So a NOCERT probe that never
+# got an answer at all returned the very string the assertion below wants, and
+# passed.  An assertion satisfied by the probe failing is not an assertion.
+# dial() and handshake() split the timeouts out by name before anything else
+# can claim them.
 def attempt(with_cert):
-    ctx = ssl.create_default_context(cafile=f"{certs}/cache.pem")
-    ctx.check_hostname = True
-    if with_cert:
-        ctx.load_cert_chain(f"{certs}/client.pem", f"{certs}/client-key.pem")
-    tls = None
-    try:
-        raw = socket.create_connection(("127.0.0.1", port), timeout=6)
-    except OSError:
-        return "no-listener"
-    try:
-        tls = ctx.wrap_socket(raw, server_hostname="localhost")
-    except Exception:
-        return "rejected"     # refused during the handshake itself (TLS 1.2)
+    client = (f"{certs}/client.pem", f"{certs}/client-key.pem") if with_cert else None
+    raw, tok = dial(port, 6)
+    if tok:
+        return tok
+    tls, tok = handshake(raw, f"{certs}/cache.pem", "localhost", client)
+    if tok:
+        shut(raw)
+        # A handshake the listener refused IS the rejection this test is looking
+        # for, and it is what TLS 1.2 produces; a handshake that timed out is
+        # not, and now says so.
+        return "rejected" if tok in ("<handshake-failed>", "<dropped>") else tok
     try:
         tls.settimeout(3)
         tls.sendall(b"*1\r\n$4\r\nPING\r\n")
         return "accepted" if tls.recv(64).startswith(b"+PONG") else "rejected"
-    except Exception:
-        return "rejected"     # fatal alert or reset
+    except (socket.timeout, TimeoutError):
+        return "<stalled>"        # the session came up and then said nothing
+    except (ssl.SSLError, OSError):
+        return "rejected"         # fatal alert or reset: the listener refusing
     finally:
-        try:
-            tls.close()
-        except Exception:
-            pass
+        shut(tls)
+
 
 deadline = time.time() + 20
-with_ = "no-listener"
+with_ = "<no-listener>"
 while time.time() < deadline:
     with_ = attempt(True)
     if with_ == "accepted":
         break
     time.sleep(0.2)
-print("WITHCERT", with_)
-print("NOCERT", attempt(False))
+owed.say("WITHCERT", with_)
+owed.say("NOCERT", attempt(False))
+owed.settle("<error:no-answer>")
 PYEOF
-) || true
-assert_eq "$(echo "$MTLS_RESULT" | grep '^WITHCERT' | cut -d' ' -f2)" "accepted" \
-    "mTLS: a client certificate signed by --ca is accepted, and RESP answers"
-assert_eq "$(echo "$MTLS_RESULT" | grep '^NOCERT' | cut -d' ' -f2)" "rejected" \
-    "mTLS: a client with no certificate is rejected by the listener"
+assert_probe "$(marker "$TMPDIR_T/mtls.out" WITHCERT)" "accepted" \
+    "mTLS: a client certificate signed by --ca is accepted, and RESP answers" \
+    "$TMPDIR_T/mtls.out"
+assert_probe "$(marker "$TMPDIR_T/mtls.out" NOCERT)" "rejected" \
+    "mTLS: a client with no certificate is rejected by the listener" \
+    "$TMPDIR_T/mtls.out"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Clients that abort mid-handshake
@@ -520,7 +925,23 @@ for _ in $(seq 1 60); do
     [ "$CONNS" = "0" ] && break
     sleep 0.1
 done
-assert_eq "$CONNS" "0" "aborted handshakes leave no connections behind"
+# Not assert_eq.  This is not a probe, but it has the same hole: '' here means
+# six seconds of 'stats' never printed a connections: line at all, which is the
+# runtime or the daemon being gone, and reporting that as "the count was wrong"
+# describes the wrong defect.
+TOTAL=$((TOTAL+1))
+if [ -z "$CONNS" ]; then
+    FAIL=$((FAIL+1))
+    echo "  FAIL [aborted handshakes leave no connections behind]: 'stats tlscache' never"
+    echo "        printed a 'connections:' line in six seconds of asking -- the runtime or"
+    echo "        the daemon is gone, which is a failure and not a count of zero"
+elif [ "$CONNS" = "0" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [aborted handshakes leave no connections behind]: still $CONNS connections"
+    echo "        six seconds after the last aborted handshake -- nothing will wake them"
+fi
 
 assert_ok "$(rc_of ready_tls 127.0.0.1 "$TLS_PORT" "$CERTS/cache.pem" localhost 15)" \
     "listener still completes a handshake after the aborts"
@@ -529,20 +950,39 @@ assert_ok "$(rc_of ready_tls 127.0.0.1 "$TLS_PORT" "$CERTS/cache.pem" localhost 
 # it, or a struct reissued with the previous connection's session on it, does
 # not always show up as a lost connection -- it shows up as a cache that has
 # stopped answering correctly.
-POSTABORT=$(python3 - "$TLS_PORT" "$CERTS/cache.pem" 2>/dev/null <<'PYEOF'
-import socket, ssl, sys
+python3 - "$TLS_PORT" "$CERTS/cache.pem" >"$TMPDIR_T/postabort.out" 2>&1 <<'PYEOF' || true
+import sys
+from cachetls_probe import Owed, read_token, session, shut, text_or_blank
+
 port, cafile = int(sys.argv[1]), sys.argv[2]
-ctx = ssl.create_default_context(cafile=cafile)
-raw = socket.create_connection(("127.0.0.1", port), timeout=8)
-tls = ctx.wrap_socket(raw, server_hostname="localhost")
-f = tls.makefile("rwb")
-f.write(b"*2\r\n$3\r\nGET\r\n$2\r\nk1\r\n"); f.flush()
-hdr = f.readline().rstrip(b"\r\n")
-n = int(hdr[1:]); print(f.read(n).decode(errors="replace"))
-tls.close()
+owed = Owed("VALUE")
+
+tls, tok = session(port, cafile, 8)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
+try:
+    f = tls.makefile("rwb")
+    f.write(b"*2\r\n$3\r\nGET\r\n$2\r\nk1\r\n"); f.flush()
+    hdr = f.readline().rstrip(b"\r\n")
+    if not hdr.startswith(b"$"):
+        # A reply that is not a bulk header at all.  int(hdr[1:]) used to raise
+        # here and the probe died with nothing said, which is the same hole as
+        # the handshake timeout: the cache answering something unexpected is
+        # exactly what this check exists to catch, so it has to be reportable.
+        owed.say("VALUE", text_or_blank(hdr))
+    else:
+        n = int(hdr[1:])
+        owed.say("VALUE", text_or_blank(f.read(n)) if n >= 0 else "<nil>")
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(tls)
 PYEOF
-) || true
-assert_eq "$POSTABORT" "012345" "the dataset is intact after the aborted handshakes"
+assert_probe "$(marker "$TMPDIR_T/postabort.out" VALUE)" "012345" \
+    "the dataset is intact after the aborted handshakes" "$TMPDIR_T/postabort.out"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Fail closed
@@ -706,34 +1146,46 @@ rc_of "$BIN" create cache tlsleader -p "$LEADER_PORT" \
 assert_ok "$(rc_of ready_tls 127.0.0.1 "$LEADER_PORT" "$CERTS/cache.pem" localhost 20)" \
     "a TLS cache with no replication configuration starts normally"
 
-REPL_ANSWER=$(python3 - "$LEADER_PORT" "$CERTS/cache.pem" 2>/dev/null <<'PYEOF'
-import socket, ssl, sys
+python3 - "$LEADER_PORT" "$CERTS/cache.pem" >"$TMPDIR_T/repl.out" 2>&1 <<'PYEOF' || true
+import sys
+from cachetls_probe import Owed, read_token, session, shut, text_or_blank
+
 port, cafile = int(sys.argv[1]), sys.argv[2]
-ctx = ssl.create_default_context(cafile=cafile)
-raw = socket.create_connection(("127.0.0.1", port), timeout=8)
-tls = ctx.wrap_socket(raw, server_hostname="localhost")
-f = tls.makefile("rwb")
-f.write(b"replicate\n"); f.flush()
-first = f.readline().rstrip(b"\r\n")
-print("FIRST", first.decode(errors="replace")[:5])
-# A refusal leaves this an ordinary client connection, so the next commands are
-# still answered.  A promotion would have made the socket a replication stream
-# with this runtime as its only writer, and these would return the dump, the
-# "commands are not accepted" line, or nothing at all.
-#
-# Line protocol and not RESP: the first byte this connection sent was "r", so
-# it was detected as a line client and stays one.
-f.write(b"set after-replicate still-a-client\n"); f.flush()
-f.readline()
-f.write(b"get after-replicate\n"); f.flush()
-print("AFTER", f.readline().rstrip(b"\r\n").decode(errors="replace"))
-tls.close()
+owed = Owed("FIRST", "AFTER")
+
+tls, tok = session(port, cafile, 8)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
+try:
+    f = tls.makefile("rwb")
+    f.write(b"replicate\n"); f.flush()
+    first = text_or_blank(f.readline().rstrip(b"\r\n"))
+    owed.say("FIRST", first[:5] if not first.startswith("<") else first)
+    # A refusal leaves this an ordinary client connection, so the next commands
+    # are still answered.  A promotion would have made the socket a replication
+    # stream with this runtime as its only writer, and these would return the
+    # dump, the "commands are not accepted" line, or nothing at all.
+    #
+    # Line protocol and not RESP: the first byte this connection sent was "r",
+    # so it was detected as a line client and stays one.
+    f.write(b"set after-replicate still-a-client\n"); f.flush()
+    f.readline()
+    f.write(b"get after-replicate\n"); f.flush()
+    owed.say("AFTER", text_or_blank(f.readline().rstrip(b"\r\n")))
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(tls)
 PYEOF
-) || true
-assert_eq "$(echo "$REPL_ANSWER" | grep '^FIRST' | cut -d' ' -f2-)" "error" \
-    "REPLICATE on a TLS cache is refused rather than promoting it to leader"
-assert_eq "$(echo "$REPL_ANSWER" | grep '^AFTER' | cut -d' ' -f2-)" "still-a-client" \
-    "a refused REPLICATE leaves the connection an ordinary client"
+assert_probe "$(marker "$TMPDIR_T/repl.out" FIRST)" "error" \
+    "REPLICATE on a TLS cache is refused rather than promoting it to leader" \
+    "$TMPDIR_T/repl.out"
+assert_probe "$(marker "$TMPDIR_T/repl.out" AFTER)" "still-a-client" \
+    "a refused REPLICATE leaves the connection an ordinary client" \
+    "$TMPDIR_T/repl.out"
 
 # (d) ...and none of this broke replication for a cleartext cache, which is the
 #     configuration every existing deployment is running.
@@ -746,23 +1198,48 @@ rc_of "$BIN" create cache plainleader -p "$FOLLOWER_PORT" -s >/dev/null
 assert_ok "$(rc_of ready_resp 127.0.0.1 "$FOLLOWER_PORT" 15)" \
     "regression guard: a cleartext cache comes up"
 
-PLAIN_REPL=$(python3 - "$FOLLOWER_PORT" 2>/dev/null <<'PYEOF'
-import socket, sys
+python3 - "$FOLLOWER_PORT" >"$TMPDIR_T/plainrepl.out" 2>&1 <<'PYEOF' || true
+import sys
+from cachetls_probe import Owed, dial, read_token, shut, text_or_blank
+
 port = int(sys.argv[1])
-s = socket.create_connection(("127.0.0.1", port), timeout=8)
-f = s.makefile("rwb")
-f.write(b"replicate\n"); f.flush()
-print(f.readline().rstrip(b"\r\n").decode(errors="replace"))
-s.close()
+owed = Owed("REPL")
+
+s, tok = dial(port, 8)
+if tok:
+    owed.settle(tok)
+    sys.exit(0)
+
+try:
+    f = s.makefile("rwb")
+    f.write(b"replicate\n"); f.flush()
+    owed.say("REPL", text_or_blank(f.readline().rstrip(b"\r\n")))
+except Exception as e:            # noqa: BLE001
+    owed.settle(read_token(e))
+finally:
+    owed.settle("<error:no-answer>")
+    shut(s)
 PYEOF
-) || true
-assert_eq "$PLAIN_REPL" "ok" \
-    "regression guard: REPLICATE on a cleartext cache still promotes it to leader"
+assert_probe "$(marker "$TMPDIR_T/plainrepl.out" REPL)" "ok" \
+    "regression guard: REPLICATE on a cleartext cache still promotes it to leader" \
+    "$TMPDIR_T/plainrepl.out"
 
 rc_of "$BIN" stop tlscache tlsline tlsmtls tlsleader plainleader >/dev/null
 sleep 0.3
 rc_of "$BIN" remove tlscache tlsline tlsmtls tlsleader plainleader >/dev/null
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
-exit "$FAIL"
+# Every assertion is accounted for in exactly one column, or the summary cannot
+# be acted on and nobody re-checks the arithmetic by eye.  Same guard as
+# test_restart_under_load.sh, and it exists because herr() takes a TOTAL of its
+# own: a caller that also pre-increments charges one assertion twice.
+if [ "$((PASS+FAIL+HERR))" -ne "$TOTAL" ]; then
+    echo "  FAIL [counters]: $PASS passed + $FAIL failed + $HERR not measurable"
+    echo "        does not equal $TOTAL counted -- this summary is wrong, not just the run"
+    FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1))
+fi
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
+if [ "$FAIL" -eq 0 ] && [ "$HERR" -eq 0 ]; then echo "  OK"
+elif [ "$FAIL" -eq 0 ]; then echo "  NOT MEASURABLE -- this run could not put the question, see above"
+else echo "  FAILED"; fi
+exit $((FAIL+HERR))
