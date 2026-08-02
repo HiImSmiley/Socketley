@@ -61,6 +61,10 @@ daemon_isolate() {
     mkdir -p "$HOME"
     SOCKETLEY_DLOG="$SOCKETLEY_TMPD/daemon.log"
     SOCKETLEY_DPID=""
+    # Which executable this run's daemons are, by path — see daemon_starting_pids.
+    # Set here so a file that never calls daemon_start still clears any value
+    # inherited from the environment.
+    SOCKETLEY_DBIN=""
 }
 
 # daemon_start BIN [daemon args...]
@@ -79,6 +83,7 @@ daemon_isolate() {
 # assertion can be counted, argued with, and waved through as flaky.
 daemon_start() {
     local bin=$1; shift
+    SOCKETLEY_DBIN=$bin
     "$bin" daemon "$@" >>"$SOCKETLEY_DLOG" 2>&1 &
     SOCKETLEY_DPID=$!
     local i
@@ -127,57 +132,132 @@ daemon_stop() {
     return 0
 }
 
+# ─── NOT BY THE PROCESS'S NAME ──────────────────────────────────────────────
+#
+# Both functions below used to open with `pgrep -x socketley`, which asks the
+# wrong question in a way that is expensive to be wrong about.
+#
+# Agents working in this tree routinely copy the binary into their own worktree
+# so a concurrent rebuild cannot truncate the file out from under a running
+# test.  The copy does not have to keep its name, and the moment it does not,
+# `pgrep -x socketley` cannot see the daemon at all: daemon_alive returns false
+# for a daemon that is up and serving, and daemon_required then stops the run
+# with "this test's daemon is no longer serving its socket" — a sentence that
+# sends whoever reads it looking for a daemon crash that never happened.  It
+# cost an agent a confusing run.  Measured, with the binary copied to
+# `sockletey-worktree-copy`:
+#
+#     daemon pid=4015933  socket=/tmp/socketley-lookup-Pm7tea/d.sock
+#     pgrep -x socketley -> 3979889 4015559 4015569      (ours is not there)
+#     /proc/net/unix     -> ... 60881938 /tmp/.../d.sock
+#     holder of inode    -> 4015933                      (ours, exactly)
+#
+# So the question is asked of the socket instead.  "Is a daemon serving this
+# socket" has an exact answer that owes nothing to what anything is called, and
+# it is also a stricter answer than the old one: the old form matched a daemon
+# whose *environment* named the socket, which stays true for a process that
+# never managed to bind.
+
+# daemon_pids SOCKET
+#
+# The pids actually serving SOCKET, space separated, empty if none.
+#
+# `[ -S "$sock" ]` is not the same question and never was: the socket file
+# outlives the process that bound it, so a test that cleans up with a CLI
+# command "because the socket is still there" reaches a dead daemon and
+# auto-starts a live one in its place.  A killed daemon leaves the file on disk
+# and its /proc/net/unix row goes away in the same instant — measured both ways
+# — which is exactly the distinction wanted here.
+#
+# In /proc/net/unix the columns are Num RefCount Protocol Flags Type St Inode
+# Path, so field 8 is the bound path and field 7 the inode; the pid is then
+# whoever holds that inode as an open descriptor.  A full /proc walk costs about
+# half a second on this machine, and it happens in cleanup and on the
+# already-failing daemon_required path, never in a measurement window.
+#
+# The Flags test is what makes this the *listening* socket rather than merely a
+# socket with that path.  Once a client is connected, the path appears on more
+# than one row — measured, with one CLI client attached:
+#
+#     ... 00000003 00000000 00000000 0001 03 60910290 /tmp/.../d.sock   accepted
+#     ... 00000002 00000000 00010000 0001 01 60912247 /tmp/.../d.sock   listening
+#
+# and taking simply the first would mean asking about whichever accepted
+# connection happened to sort first — an fd the daemon may already have closed,
+# whereupon daemon_alive reports a live daemon dead.  00010000 is SO_ACCEPTCON:
+# exactly one row per bound path carries it, and it is the row that means
+# "serving".
+daemon_pids() {
+    local sock=$1 ino fd p pids=""
+    [ -n "$sock" ] || return 0
+    ino=$(awk -v s="$sock" '$4 == "00010000" && $8 == s { print $7; exit }' \
+          /proc/net/unix 2>/dev/null) || ino=""
+    [ -n "$ino" ] || return 0
+    # readlink's stderr is redirected inside the substitution, not on the `for`:
+    # this walks every process on the machine, so "Permission denied" for another
+    # user's fd and "No such file or directory" for a pid that exited mid-loop
+    # are both expected, and both would otherwise land in exactly the output
+    # someone is reading because something has already gone wrong.
+    for fd in /proc/[0-9]*/fd/*; do
+        [ "$({ readlink "$fd"; } 2>/dev/null)" = "socket:[$ino]" ] || continue
+        p=${fd#/proc/}; p=${p%%/*}
+        case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
+    done
+    printf '%s' "${pids# }"
+}
+
+# daemon_starting_pids SOCKET
+#
+# The other half: a daemon that has been forked but has not bound yet owns no
+# socket, so daemon_pids cannot see it, and a sweep that misses it leaves it
+# running for good on this run's ports.  Those are found by environment instead
+# — but an environment match alone would also hit the test script itself, whose
+# SOCKETLEY_SOCKET is the very variable being matched, and killing the shell
+# doing the killing is the accident this whole file exists to prevent.
+#
+# So the gate is `/proc/<pid>/exe -ef` the daemon binary: a device+inode
+# comparison through the symlink, which a shell can never satisfy and a binary
+# copied under another name always will.  Nothing here looks at a name.
+daemon_starting_pids() {
+    local sock=$1 dbin=${SOCKETLEY_DBIN:-${BIN:-}} d p pids=""
+    [ -n "$sock" ] && [ -n "$dbin" ] && [ -e "$dbin" ] || return 0
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "/proc/$p/exe" -ef "$dbin" ] || continue
+        # NOT `grep -q`.  These files are sourced into scripts that run under
+        # `set -o pipefail`, and `grep -q` exits at its first match, which hands
+        # the writer a SIGPIPE; the pipeline then reports 141 and this takes the
+        # "no match" branch precisely when it matched.  An environ is small
+        # enough that tr is usually finished before grep looks, so the bug is
+        # only latent here — but "latent" is not a property worth relying on in
+        # the function that decides what to kill.  grep without -q reads to the
+        # end, so the status is grep's.
+        { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
+            | grep -x "SOCKETLEY_SOCKET=$sock" >/dev/null || continue
+        case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
+    done
+    printf '%s' "${pids# }"
+}
+
 # daemon_alive SOCKET
 #
-# True when a daemon process is actually serving SOCKET.  `[ -S "$sock" ]` is not
-# the same question: the socket file outlives the process that bound it, so a
-# test that cleans up with a CLI command "because the socket is still there"
-# reaches a dead daemon and auto-starts a live one in its place.
-#
-# The /proc reads are wrapped in `{ …; } 2>/dev/null` rather than written as
-# `tr … <"/proc/$p/…" 2>/dev/null`.  In the latter the shell opens the redirect
-# before tr exists to have its stderr redirected, so the shell's own complaint
-# goes to the terminal: every sweep over a process belonging to another user
-# printed "Permission denied" for /proc/<pid>/environ, and every sweep over a
-# pid that exited mid-loop printed "No such file or directory".  Both are
-# expected here — this walks every socketley on the machine — and both landed in
-# exactly the output someone is reading because something has already gone
-# wrong.  The brace group redirects the group's stderr first, so the open is
-# covered too.
+# True when a daemon process is actually serving SOCKET.
 daemon_alive() {
-    local sock=$1 p
+    local sock=$1
     [ -n "$sock" ] || return 1
-    for p in $(pgrep -x socketley 2>/dev/null || true); do
-        case "$({ tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null)" in
-            *" daemon "*|*" daemon") ;;
-            *) continue ;;
-        esac
-        if { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$sock"; then
-            return 0
-        fi
-    done
-    return 1
+    [ -n "$(daemon_pids "$sock")" ]
 }
 
 # daemon_sweep SOCKET
 #
-# Kill every `socketley daemon` whose environment names SOCKET.  Split out from
-# daemon_stop because the cluster tests run several daemons on several sockets
-# and kill one of them mid-test on purpose.
+# Kill every daemon serving SOCKET, and every one on its way to serving it.
+# Split out from daemon_stop because the cluster tests run several daemons on
+# several sockets and kill one of them mid-test on purpose.
 daemon_sweep() {
-    local sock=$1
+    local sock=$1 p
     [ -n "$sock" ] || return 0
-    local p
-    for p in $(pgrep -x socketley 2>/dev/null || true); do
-        case "$({ tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null)" in
-            *" daemon "*|*" daemon") ;;
-            *) continue ;;
-        esac
-        if { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$sock"; then
-            kill -9 "$p" 2>/dev/null || true
-        fi
+    for p in $(daemon_pids "$sock") $(daemon_starting_pids "$sock"); do
+        kill -9 "$p" 2>/dev/null || true
     done
     return 0
 }

@@ -51,6 +51,10 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+# For daemon_sweep in cleanup.  This file keeps its own inline isolation; sourcing
+# defines functions without running anything, so nothing here changes hands.
+# shellcheck source=lib_daemon.sh
+. "$(dirname "$0")/lib_daemon.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: restart under load ==="
@@ -134,14 +138,19 @@ cleanup() {
     # Kill by socket, not only by pid.  A CLI command run against a daemon that
     # is not up yet — or not up any more — starts one of its own, detached from
     # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
-            kill -9 "$p" 2>/dev/null || true
-        fi
-    done
+    # this test's ports.  The socket path comes from mktemp, so this can only
+    # ever hit daemons belonging to this run.
+    #
+    # This was an inline `pgrep -f 'socketley daemon'` loop.  `-f` matches the
+    # whole command line, so the pattern also matches any shell whose own
+    # command line happens to carry that string — including the runner invoking
+    # this file — and an -f match one character too broad kills the run doing
+    # the killing, which has happened twice in this project.  The environ check
+    # underneath made it safe in practice, but the shape is the one lib_daemon.sh
+    # exists to delete, and a safe instance of a dangerous shape is still a copy
+    # of it for the next file to imitate.  daemon_sweep asks the socket who is
+    # serving it instead, and matches nothing by name.
+    daemon_sweep "$SOCKETLEY_SOCKET"
     rm -rf "$TMPDIR_T"
 }
 trap cleanup EXIT
