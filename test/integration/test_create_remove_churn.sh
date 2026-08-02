@@ -128,12 +128,80 @@ PAYLOAD=2048        # bytes per exchange; see the sizing note above
 FD_TOLERANCE=6
 
 # Measured, not guessed.  See SIZING THE MEMORY BOUND above: healthy runs land
-# at 2.8-4.8 MB, a per-cycle instance leak at ~226 MB.
+# at 2.8-4.8 MB, a per-cycle instance leak at ~226 MB.  Release figures — see
+# the sanitizer note below for why this bound is not asserted in an instrumented
+# build.
 RSS_BOUND_KB=12288
 
-PASS=0; FAIL=0; TOTAL=0
+# ─── ONE CHECK THAT MEASURES THE SANITIZER, NOT THE PRODUCT ─────────────────
+#
+# This file runs in the nightly under ASan+UBSan as well as under Release, and
+# RSS_BOUND_KB has no defined meaning in an instrumented build.
+#
+# Every number in SIZING THE MEMORY BOUND above — the 466/8849/6089 kB an
+# instance holds, the 2.8-4.8 MB a healthy run grows, the 226 MB a per-cycle
+# leak produces — was measured against a daemon with no sanitizer in it.  An
+# ASan daemon keeps eight bytes of shadow for every byte of application memory
+# and a redzone around every allocation, so it starts an order of magnitude
+# higher and every page the churn faults in costs its shadow as well:
+#
+#     Release   base 18216 kB   growth   2804 kB   (2026-08-02, this machine)
+#     ASan      base 96424 kB   growth 313448 kB   (2026-08-02, this machine)
+#
+# The base alone is five times the whole Release run, and the growth is
+# twenty-five times a bound that was chosen to sit an order of magnitude BELOW
+# the leak it catches.  The nightly's first ASan run in five weeks, on the same
+# commit, reported base 95772 kB and growth 313576 kB — the two agree to within
+# a tenth of a percent, which is what a sanitizer's fixed overhead looks like
+# and not what a leak looks like.  Widening the bound to cover it would put it
+# above the 226 MB it exists to catch, i.e. it would stop bounding anything.
+#
+# So it is printed and not asserted in a sanitized build, loudly, with the
+# numbers, so nobody reads a quiet log as a checked one.  EVERYTHING ELSE STAYS
+# ASSERTED IN EVERY BUILD — created, served, ops, removed, closed, the daemon
+# identity check, the 'ls' pair, that the daemon still serves a fresh runtime,
+# and the descriptor count.  Those are what running this file under ASan is FOR,
+# and all of them passed under ASan in the run above (descriptors: delta=0).
+#
+# THE DAEMON BEING GONE IS STILL A FAILURE, in every build.  'unreadable' is
+# rejected before the exemption below is ever reached: "this build cannot answer
+# the question" and "there was no daemon left to ask" are different statements
+# and only the first one is excused here.
+#
+# Detected from the binary rather than from an environment variable, using the
+# idiom the nightly's own "Verify the build" step uses: a build that lost its
+# sanitizer flags must not be able to claim this exemption.  A stripped Release
+# binary yields nothing and is treated as not sanitized, which is the safe way
+# round — unknown keeps the strict bound.
+#
+# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
+# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
+# then reports 141 and the `if` takes the branch for "no match" precisely when
+# there was one.  grep without -q reads its input to the end, so the pipeline's
+# status is grep's.  (The same idiom in the nightly's "Verify the build" step is
+# safe only because GitHub Actions does not set pipefail; it is not safe here.)
+SANITIZED=""
+if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
+    SANITIZED="TSan"
+elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
+    SANITIZED="ASan"
+fi
+
+PASS=0; FAIL=0; SKIP=0; TOTAL=0
 SUBPID=""
 DAEMON_SURVIVED=0   # set once the identity check confirms it lived through the churn
+
+# Printed, counted in its own column, and deliberately NOT added to FAIL: unlike
+# NOT MEASURABLE in test_restart_under_load.sh, which means "this run could not
+# put the question and might next time", this means "this build cannot answer
+# this question and never will".  A job that is red every single night for a
+# reason nobody can act on gets ignored, which is the same end state as a check
+# that cannot fail.
+not_asserted() {  # label reason
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  NOT ASSERTED [$1]: $2"
+    echo "        sanitized build ($SANITIZED) — this measures the sanitizer, not the daemon"
+}
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
@@ -255,6 +323,12 @@ assert_rss_bounded() {    # base final bound_kb
     fi
     delta=$((final - base))
     echo "  rss:  base=${base}kB final=${final}kB growth=${delta}kB bound=${bound}kB"
+    if [ -n "$SANITIZED" ]; then
+        TOTAL=$((TOTAL-1))   # not_asserted takes its own
+        not_asserted "memory bounded" \
+            "RSS grew ${delta}kB from a base of ${base}kB; the ${bound}kB bound is a Release figure"
+        return
+    fi
     if [ "$delta" -le "$bound" ]; then
         PASS=$((PASS+1))
     else
@@ -798,10 +872,23 @@ sleep 0.8
 assert_fds_returned "$BASE_FD" "$(fd_count)" "$FD_TOLERANCE"
 assert_rss_bounded  "$BASE_RSS" "$(rss_kb)"  "$RSS_BOUND_KB"
 
-if [ "$FAIL" -gt 0 ]; then
+if [ "$FAIL" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
     echo "  ${TOTALS:-<no TOTALS line>}"
 fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+# Every assertion is accounted for in exactly one column, or the summary cannot
+# be acted on and nobody re-checks the arithmetic by eye.  Same guard as
+# test_restart_under_load.sh and test_abrupt_client_abort.sh.
+if [ "$((PASS+FAIL+SKIP))" -ne "$TOTAL" ]; then
+    echo "  FAIL [counters]: $PASS passed + $FAIL failed + $SKIP not asserted"
+    echo "        does not equal $TOTAL counted — this summary is wrong, not just the run"
+    FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1))
+fi
+
+if [ "$SKIP" -gt 0 ]; then
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $SKIP not asserted under $SANITIZED)"
+else
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+fi
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

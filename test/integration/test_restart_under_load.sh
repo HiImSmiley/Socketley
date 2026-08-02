@@ -97,10 +97,75 @@ FD_TOLERANCE=6
 # few thousand connections, or a whole runtime's worth per restart), not as a
 # certified allocator profile.  The actual growth is printed on every run,
 # passing or failing: use the first real numbers to tighten this, and do not
-# assume a value that has never fired is correct.
+# assume a value that has never fired is correct.  A Release figure — see the
+# sanitizer note below for why it is not asserted in an instrumented build.
 RSS_BOUND_KB=24576
 
-PASS=0; FAIL=0; HERR=0; TOTAL=0
+# ─── ONE CHECK THAT MEASURES THE SANITIZER, NOT THE PRODUCT ─────────────────
+#
+# This file runs in the nightly under ASan+UBSan and under TSan as well as under
+# Release, and RSS_BOUND_KB has no defined meaning in an instrumented build.
+#
+# The bound above is a ceiling on how much a Release daemon may grow over six
+# restarts under load.  An ASan daemon keeps eight bytes of shadow for every
+# byte of application memory and a redzone around every allocation, so it starts
+# an order of magnitude higher and every page this test's traffic faults in
+# costs its shadow as well:
+#
+#     Release   base 14204 kB   growth  2192 kB   (2026-08-02, this machine)
+#     ASan      base 78972 kB   growth 38028 kB   (2026-08-02, this machine)
+#
+# The base alone is five and a half times the Release base, and the growth is
+# seventeen times the Release growth against a bound only eleven times it.  The
+# first ASan run of this file in five weeks, on the same commit, reported base
+# 78520 kB and growth 40220 kB: the two agree within 6%, which is what a
+# sanitizer's fixed overhead looks like and not what a leak looks like.  There
+# is no bound that both catches "a whole runtime's worth per restart" in Release
+# and clears ASan's floor — one that did would have stopped bounding anything.
+#
+# So it is printed and not asserted in a sanitized build, loudly, with the
+# numbers, so nobody reads a quiet log as a checked one.  EVERYTHING ELSE STAYS
+# ASSERTED IN EVERY BUILD — restarts_ok, recovered, cache_bad, proxy_bad, both
+# traffic floors, live_at_stop, both runtimes still in 'ps', that the daemon
+# still serves a runtime created after the load, and the descriptor count.
+# Those are what running this file under a sanitizer is FOR, and all of them
+# passed under ASan in the run above (descriptors: delta=2 of a tolerance of 6;
+# cache_bad=0 proxy_bad=0 over 33311 and 15594 healthy round trips, so the
+# traffic floors are nowhere near the sanitizer's clock here).
+#
+# THE DAEMON BEING GONE IS STILL A FAILURE, in every build.  'unreadable' is
+# rejected before the exemption below is ever reached: "this build cannot answer
+# the question" and "there was no daemon left to ask" are different statements
+# and only the first one is excused here.
+#
+# NOT ASSERTED IS NOT `NOT MEASURABLE`.  This file already carries herr() below,
+# from d1fa885, for a claim this RUN could not put and might put next time.  This
+# is the other thing: this BUILD cannot answer this question and never will, so
+# retrying changes nothing.  They are counted in separate columns, and only
+# herr() ends the run non-zero — a job that is red every single night for a
+# reason nobody can act on gets ignored, which is the same end state as a check
+# that cannot fail.
+#
+# Detected from the binary rather than from an environment variable, using the
+# idiom the nightly's own "Verify the build" step uses: a build that lost its
+# sanitizer flags must not be able to claim this exemption.  A stripped Release
+# binary yields nothing and is treated as not sanitized, which is the safe way
+# round — unknown keeps the strict bound.
+#
+# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
+# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
+# then reports 141 and the `if` takes the branch for "no match" precisely when
+# there was one.  grep without -q reads its input to the end, so the pipeline's
+# status is grep's.  (The same idiom in the nightly's "Verify the build" step is
+# safe only because GitHub Actions does not set pipefail; it is not safe here.)
+SANITIZED=""
+if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
+    SANITIZED="TSan"
+elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
+    SANITIZED="ASan"
+fi
+
+PASS=0; FAIL=0; HERR=0; SKIP=0; TOTAL=0
 
 # herr LABEL REASON [DETAIL...]
 #
@@ -119,6 +184,23 @@ herr() {
     echo "  NOT MEASURABLE [$label]: $reason"
     local line
     for line in "$@"; do echo "        $line"; done
+}
+
+# not_asserted LABEL REASON
+#
+# A claim this BUILD cannot answer, as opposed to one this RUN could not put.
+# See the long note at RSS_BOUND_KB: herr() above is for a window that did not
+# open and might next time, and it ends the run non-zero; this one is for a
+# number that belongs to the sanitizer and will belong to it every night for
+# ever, and it does not.  Two columns, deliberately, so the summary line says
+# which of the two happened without anyone reading the log.
+#
+# The vocabulary is test_abrupt_client_abort.sh's, from 4414780, and not a third
+# one invented here.
+not_asserted() {  # label reason
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  NOT ASSERTED [$1]: $2"
+    echo "        sanitized build ($SANITIZED) — this measures the sanitizer, not the daemon"
 }
 
 cleanup() {
@@ -213,6 +295,12 @@ assert_rss_bounded() {    # base final bound_kb
     fi
     delta=$((final - base))
     echo "  rss:  base=${base}kB final=${final}kB growth=${delta}kB bound=${bound}kB"
+    if [ -n "$SANITIZED" ]; then
+        TOTAL=$((TOTAL-1))   # not_asserted takes its own
+        not_asserted "memory bounded" \
+            "RSS grew ${delta}kB from a base of ${base}kB; the ${bound}kB bound is a Release figure"
+        return
+    fi
     if [ "$delta" -le "$bound" ]; then
         PASS=$((PASS+1))
     else
@@ -889,17 +977,24 @@ assert_rss_bounded  "$BASE_RSS" "$(rss_kb)"  "$RSS_BOUND_KB"
 # the draft of the branch above charging one assertion to TOTAL twice — a
 # summary that does not add up cannot be acted on, and the arithmetic that
 # produces it is not the sort of thing anyone re-checks by eye.
-if [ "$((PASS+FAIL+HERR))" -ne "$TOTAL" ]; then
+if [ "$((PASS+FAIL+HERR+SKIP))" -ne "$TOTAL" ]; then
     echo "  FAIL [counters]: $PASS passed + $FAIL failed + $HERR not measurable"
-    echo "        does not equal $TOTAL counted — this summary is wrong, not just the run"
+    echo "        + $SKIP not asserted does not equal $TOTAL counted — this summary"
+    echo "        is wrong, not just the run"
     FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1))
 fi
 
-if [ "$FAIL" -gt 0 ] || [ "$HERR" -gt 0 ]; then
+if [ "$FAIL" -gt 0 ] || [ "$HERR" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
     echo "  ${TOTALS:-<no TOTALS line>}"
 fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
+# SKIP is reported but never changes the verdict or the exit status: a claim
+# this build cannot answer is not a claim that failed.  HERR still does.
+if [ "$SKIP" -gt 0 ]; then
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable, $SKIP not asserted under $SANITIZED)"
+else
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
+fi
 if [ "$FAIL" -eq 0 ] && [ "$HERR" -eq 0 ]; then echo "  OK"
 elif [ "$FAIL" -eq 0 ]; then echo "  NOT MEASURABLE -- this run could not put the question, see above"
 else echo "  FAILED"; fi
