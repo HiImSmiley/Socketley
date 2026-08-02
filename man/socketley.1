@@ -1824,7 +1824,7 @@ Delete hash field. Returns "ok" or "nil".
 Return number of hash fields.
 .TP
 .BI "hgetall " "key"
-Return all fields and values (multi-line "field value\n", "end" terminator).
+Return all fields and values (multi-line "field value\\n", "end" terminator).
 .PP
 .B TTL / Expiry:
 .TP
@@ -1880,7 +1880,7 @@ Load cache from file.
 Type enforcement: a key can only hold one data type. Writing to a key of a different type returns "error: type conflict".
 Under \fB--maxmemory\fR a write that does not fit is refused with "error: out of memory" (RESP: "OOM command not allowed when used memory > 'maxmemory'"), and the key it would have written is left exactly as it was.
 That includes a write over a key that already exists: overwriting a value, appending to it or replacing a hash field is checked against the limit like any other write.
-Multi-line responses (lrange, smembers, hgetall) terminate with "end\n".
+Multi-line responses (lrange, smembers, hgetall) terminate with "end\\n".
 .SS RESP Protocol (Redis Compatibility)
 The cache supports the RESP2 wire protocol for compatibility with Redis clients
 (redis-cli, Redis client libraries). RESP mode is auto-detected when a

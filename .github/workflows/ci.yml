@@ -93,7 +93,7 @@ jobs:
           # 2026-08-01.  scripts/install-liburing.sh below is the dependency.
           sudo apt-get install -y build-essential libssl-dev \
             netcat-openbsd bc libluajit-5.1-dev \
-            clang-18 libclang-rt-18-dev
+            clang-18 libclang-rt-18-dev groff-base
           # clang is for libFuzzer only — see the note at the top of this file.
           # Not tolerant of failure: REQUIRE_LIBFUZZER=1 below depends on it,
           # and a half-installed toolchain should fail here where the error is
@@ -105,6 +105,31 @@ jobs:
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh
+
+      - name: Man page renders
+        # A roff source can be malformed and still install.  In running text
+        # `\n` is a register reference, not two characters, so
+        #
+        #     Return all fields and values (multi-line "field value\n", ...
+        #
+        # rendered as `"field value0` with the closing quote eaten -- the
+        # hgetall response format, documented wrong, for as long as anyone has
+        # been reading that page.  groff says so plainly; nothing was asking
+        # groff.  Before the build, because it needs nothing from it and the
+        # answer is worth having in ten seconds.
+        #
+        # Table-width warnings are excluded deliberately: they are a statement
+        # about an 80-column terminal, not about the source, and there are six
+        # of them by choice.
+        run: |
+          out=$(groff -k -t -man -Tutf8 -ww man/socketley.1 2>&1 >/dev/null \
+                | grep -v "table wider than line length" || true)
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo "man/socketley.1 does not render cleanly -- see above"
+            exit 1
+          fi
+          echo "man/socketley.1 renders clean."
 
       - name: Generate Makefiles
         run: ./bin/premake5 gmake2
