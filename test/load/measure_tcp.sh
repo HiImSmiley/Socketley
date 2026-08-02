@@ -65,7 +65,7 @@ one_pass() {
         pin_load "$BENCH" proxy concurrent 127.0.0.1 "$((port + 1))" 20 100 >/dev/null 2>&1
     done
 
-    local bad=0 ran=0 out rc first=""
+    local bad=0 ran=0 out rc first="" first_out=""
     local r
     for r in $(seq 1 "$ROUNDS"); do
         out="$(pin_load "$BENCH" proxy concurrent 127.0.0.1 "$((port + 1))" 20 100 2>&1)"
@@ -79,9 +79,28 @@ one_pass() {
             return 2
         fi
         ran=$((ran + 1))
-        if [ "$rc" -ne 0 ] || echo "$out" | grep -qi INCOMPLETE; then
+        # Not `echo "$out" | grep -qi`.  This file runs under `set -o pipefail`
+        # (common.sh) and `grep -q` exits at its first match, which hands echo a
+        # SIGPIPE; the pipeline then reports 141 and this test takes the "no
+        # match" branch precisely when it matched.  It is latent only while the
+        # output is small enough that echo finishes writing first — which stops
+        # being true exactly when a round goes wrong enough to print many
+        # INCOMPLETE lines, so the check would go blind in the case it exists
+        # for.  A here-string has no pipeline and cannot do that.
+        if [ "$rc" -ne 0 ] || grep -qi INCOMPLETE <<<"$out"; then
             bad=$((bad + 1))
-            [ -z "$first" ] && first="$(echo "$out" | grep -i INCOMPLETE | head -1)"
+            if [ -z "$first" ]; then
+                # A round is bad for one of two reasons and only one of them
+                # leaves a line worth quoting.  On 2026-08-02 the nightly failed
+                # this harness with "1 of 120 rounds incomplete" and printed
+                # nothing further: the bench had exited non-zero without an
+                # INCOMPLETE line anywhere, and its output was discarded, so the
+                # log recorded a failure and no way to read it.  Whatever the
+                # reason, the exit code and the tail are kept now.
+                first="$(grep -i INCOMPLETE <<<"$out" | head -1)"
+                [ -z "$first" ] && first="bench exited $rc with no INCOMPLETE line"
+                first_out="$(tail -3 <<<"$out")"
+            fi
         fi
     done
 
@@ -93,6 +112,8 @@ one_pass() {
         "$tag" "$bad" "$ran" "$tw0" "$(awk '{print $1}' /proc/loadavg)" \
         "$([ "$dirty" = 1 ] && echo '   [dirty start]')"
     [ -n "$first" ] && echo "      first: $first"
+    [ -n "$first_out" ] && { echo "      the bench said, last 3 lines:"; \
+        while IFS= read -r l; do echo "        $l"; done <<<"$first_out"; }
 
     total_bad=$((total_bad + bad))
     total_rounds=$((total_rounds + ran))
