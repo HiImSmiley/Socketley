@@ -157,10 +157,9 @@ jobs:
         run: |
           set -e
           # Every test binary the build produced, not a list of five.  The
-          # build produces thirteen; test_conn_transfer, test_managed_runtime,
-          # the four SDK tests and the two single-header tests were compiled
-          # here and by nightly.yml and run by neither.  A name list goes stale
-          # silently when a test is added.
+          # build produces eleven; test_conn_transfer, test_managed_runtime and
+          # the four SDK tests were compiled here and by nightly.yml and run by
+          # neither.  A name list goes stale silently when a test is added.
           n=0
           for t in bin/Debug/test_*; do
             [ -f "$t" ] && [ -x "$t" ] || continue

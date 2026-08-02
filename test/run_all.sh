@@ -128,12 +128,18 @@ echo "--- Unit Tests ---"
 echo ""
 # Every unit-test binary the build produced, rather than a list of five.
 #
-# The build produces thirteen.  test_conn_transfer, test_managed_runtime, the
-# four SDK tests and the two single-header tests were compiled by every build
-# and run by nothing — not here, not in ci.yml, not in nightly.yml.  A list of
-# names goes stale the moment somebody adds a test and forgets one file, and it
-# goes stale silently, which is the one property a test runner must not have.
-# The integration half has always globbed; this half now does too.
+# premake5.lua defines eleven.  test_conn_transfer, test_managed_runtime and the
+# four SDK tests were compiled by every build and run by nothing — not here, not
+# in ci.yml, not in nightly.yml.  A list of names goes stale the moment somebody
+# adds a test and forgets one file, and it goes stale silently, which is the one
+# property a test runner must not have.  The integration half has always
+# globbed; this half now does too.
+#
+# It globs the output directory rather than premake5.lua, so anything stale left
+# in there is run too — which is how the count above was first written down as
+# thirteen: bin/Release still held test_single_header and test_single_header_lua
+# from February, with no project, no source and nothing that rebuilds them.
+# They passed, and passing said nothing about this tree.
 unit_found=0
 for t in "$BIN_DIR"/test_*; do
     [ -f "$t" ] && [ -x "$t" ] || continue

@@ -979,8 +979,8 @@ jobs:
       - name: Unit tests (Release)
         run: |
           set -e
-          # Every test binary the build produced — see the note in ci.yml.  Eight
-          # of the thirteen were built by this job and run by nobody.
+          # Every test binary the build produced — see the note in ci.yml.  Six
+          # of the eleven were built by this job and run by nobody.
           n=0
           for t in bin/Release/test_*; do
             [ -f "$t" ] && [ -x "$t" ] || continue
