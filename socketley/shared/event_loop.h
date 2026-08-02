@@ -310,6 +310,12 @@ public:
     // when, the descriptor has something armed.  Use it on its own only to take
     // an operation back from a descriptor that is *staying* open.
     bool submit_cancel_fd(int fd);
+
+    // The same, for an operation armed on a fixed-file index rather than on a
+    // descriptor number.  Submitted by free_fixed_file_slot() before it
+    // unregisters the file, because a cancel can only match while the index
+    // still resolves to one.
+    bool submit_cancel_fixed(uint32_t idx);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
     void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);

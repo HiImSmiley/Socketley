@@ -1517,6 +1517,36 @@ bool event_loop::submit_timeout_remove(io_request* target)
     return true;
 }
 
+// The same withdrawal, for an operation armed on a fixed-file index.
+//
+// close_fd() cannot reach one: it reads m_fd_armed[fd], and a fixed submission
+// is counted in m_fixed_armed[idx] instead, so the descriptor number looks idle
+// and its fast path closes without cancelling anything.  This is the other half
+// of that question, and until it existed the answer to "how does a fixed
+// operation get withdrawn" was that it did not.
+//
+// IORING_ASYNC_CANCEL_FD_FIXED makes the kernel read the fd field as an index
+// into the registered table rather than as a descriptor number; ALL takes every
+// request on it in one SQE, as the raw path does.  It must be submitted while
+// the index still resolves to a file — free_fixed_file_slot() calls it before
+// its unregister for that reason.
+//
+// No user_data: there is no storage to keep alive and nothing acts on the
+// answer, exactly as on the untracked branch of submit_cancel_fd().  The
+// operations it withdraws report -ECANCELED to their own owners, which is where
+// m_fixed_armed[idx] is decremented and the deferred index finally freed.
+bool event_loop::submit_cancel_fixed(uint32_t idx)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_cancel_fd(sqe, static_cast<int>(idx),
+                            IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
+    io_uring_sqe_set_data(sqe, nullptr);
+    m_pending_submissions++;
+    return true;
+}
+
 bool event_loop::submit_cancel_fd(int fd)
 {
     if (fd < 0)
@@ -2065,7 +2095,31 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     uint32_t w = idx / 64;
     uint32_t bit = idx % 64;
 
-    // Unregister first, and unconditionally.  This is what drops the kernel's
+    // Anything still armed on this index is withdrawn first, while the index
+    // still resolves to a file — the fixed-file twin of the rule close_fd()
+    // states for descriptor numbers, and for the same reason: after the
+    // unregister below the kernel looks the index up and finds nothing, so the
+    // cancel matches nothing and answers -ENOENT.
+    //
+    // Without this an operation armed on a fixed index had no way to be
+    // withdrawn at all.  close_fd() cancels by descriptor number and a fixed
+    // operation is not counted against one — arm(req, fixed_target(idx)) puts
+    // it in a different table — so a multishot recv on a direct connection
+    // could only ever end by itself, and a multishot recv holds its own
+    // reference to the file, so "by itself" means the peer or the socket.  On
+    // this project's development machine shutdown() ends it through the socket
+    // wait queue every time.  On the nightly runner's kernel it does not, and
+    // the harness reported the result there for months in the only words it
+    // had: "1 operation(s) still owed at end of input: recv-multishot=1", after
+    // 1970 rounds of polling in 2010 ms — a ring that was being serviced and an
+    // operation that was never going to report.
+    // idx is already known to be in range — the guard at the top of this
+    // function returned for anything else — and m_fixed_armed is an array
+    // member, so the count is the whole test.
+    if (m_fixed_armed[idx] > 0)
+        submit_cancel_fixed(idx);
+
+    // Unregister, and unconditionally.  This is what drops the kernel's
     // reference to the socket; until it runs the descriptor's own close() has
     // not really closed anything.  It is safe to do with submissions still
     // queued against the index — they resolve to nothing and fail -EBADF, which

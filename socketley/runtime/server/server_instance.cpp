@@ -1543,20 +1543,12 @@ void server_instance::teardown(event_loop& loop)
         // this was invisible until a fuzz run walked the pool at rest.
         conn->cache_pending = 0;
 
-        // Shutdown the connection before closing it.  Like for the listen fd,
-        // shutdown() completes any pending io_uring read/write ops synchronously
-        // (the kernel wakes up the socket wait queue, completing the ops and
-        // placing their CQEs in the ring before we return from shutdown()).
-        // This avoids the cancel-SQE fd-closed race described above.
-        shutdown(fd, SHUT_RDWR);
-        close_tracked(fd);
-
-        // And the slot, for the reason written out over release_conn(): this is
-        // what unregisters the file, and until it runs the kernel still holds a
-        // reference to that socket and the close() above did not really close
-        // it.  release_conn() and pool_release() both call it; this path — the
-        // one a stop takes — did not, so it was the only way a connection could
-        // reach the end of its life with its file still registered.
+        // The slot first, which is what unregisters the file — and until that
+        // runs the kernel still holds a reference to this socket, so the
+        // close() below does not really close it.  release_conn() and
+        // pool_release() both call it; this path, the one a stop takes, did
+        // not, so it was the only way a connection could reach the end of its
+        // life with its file still registered.
         //
         // What that costs is a read the socket can no longer end.  A multishot
         // recv armed through submit_recv_multishot_fixed_file() is counted on
@@ -1570,7 +1562,20 @@ void server_instance::teardown(event_loop& loop)
         // it — "1 operation(s) still owed at end of input: recv-multishot=1",
         // on no descriptor the loop can name, because the operation was never
         // counted against one.
+        //
+        // Before the shutdown and the close, which is the order
+        // cache_instance::teardown() has always used for the same three calls.
+        // The sibling runtime doing exactly this is also the reason to read the
+        // omission here as an oversight rather than a difference somebody meant.
         release_fixed_slot(conn.get());
+
+        // Shutdown the connection before closing it.  Like for the listen fd,
+        // shutdown() completes any pending io_uring read/write ops synchronously
+        // (the kernel wakes up the socket wait queue, completing the ops and
+        // placing their CQEs in the ring before we return from shutdown()).
+        // This avoids the cancel-SQE fd-closed race described above.
+        shutdown(fd, SHUT_RDWR);
+        close_tracked(fd);
 
         // The file read and the file→pipe splice target the file fd, not the
         // socket, so the shutdown above does not touch them.  Closing the file
