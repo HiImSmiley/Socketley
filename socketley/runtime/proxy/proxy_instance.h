@@ -680,6 +680,11 @@ private:
                            struct io_uring_cqe* cqe, io_request* req);
     void setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn);
     void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
+    // Waits for the socket end of a splice pipeline to have something, and only
+    // then lets the splice go in.  See the definition for what arming the splice
+    // directly costs — it is a kernel thread per idle connection and, on the
+    // backend leg, a resubmit loop with no bound.
+    bool arm_splice_in_poll(int src_fd, io_request* req);
 
     // Connection pool: reuse idle backend connections
     // Both take the endpoint as well as the index: a pooled socket goes back
@@ -954,6 +959,16 @@ private:
     std::unique_ptr<timer_op> m_response_sweep_timer;
     bool m_response_sweep_armed{false};
     bool m_response_sweep_warned{false};
+
+#ifdef SOCKETLEY_TRACE
+    // Every live proxy on this process, so one instance's periodic sweep can
+    // report on all of them.  The stall being chased shows up on a *member*
+    // proxy while only the gateway has a timer running, and the two are
+    // different instances sharing one loop.
+    static void trace_register(proxy_instance* p);
+    static void trace_unregister(proxy_instance* p);
+    static void trace_splice_sweep();
+#endif
 
     static constexpr int MAX_FDS = 65536;
     std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];

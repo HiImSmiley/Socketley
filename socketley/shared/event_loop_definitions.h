@@ -308,10 +308,16 @@ enum op_type : uint8_t
     op_connect               = 17,    // async connect via io_uring
     op_health_check          = 18,    // async health check (connect/write/read phases)
     op_poll                  = 19,    // wait for readiness (used to finish a non-blocking connect)
-    op_poll_abort            = 20     // wait for a peer to die (POLLERR/POLLHUP), reading nothing
+    op_poll_abort            = 20,    // wait for a peer to die (POLLERR/POLLHUP), reading nothing
+    // Readiness for the socket end of a splice pipeline, armed in place of the
+    // splice itself while the socket is quiet.  It is a separate kind because it
+    // reports to the splice handler rather than to the connect one, and because
+    // "waiting to splice" and "splicing" have to be told apart in a breakdown:
+    // one of them costs a kernel thread and the other does not.
+    op_splice_poll           = 21
 };
 
-inline constexpr uint8_t op_type_count = 21;
+inline constexpr uint8_t op_type_count = 22;
 
 // For diagnostics only.  A count of outstanding operations says an owner cannot
 // be released yet; the kind says why, which is the difference between reading a
@@ -341,6 +347,7 @@ inline const char* io_op_name(uint8_t t)
         case op_health_check:            return "health-check";
         case op_poll:                    return "poll";
         case op_poll_abort:              return "poll-abort";
+        case op_splice_poll:             return "splice-poll";
         default:                         return "unknown";
     }
 }

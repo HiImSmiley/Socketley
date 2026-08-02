@@ -19,6 +19,10 @@
 #include <netinet/tcp.h>
 #include <algorithm>
 #include <liburing.h>
+#ifdef SOCKETLEY_TRACE
+#include <dirent.h>
+#include <cstdio>
+#endif
 
 // Defined below, next to the read handlers they belong to; handle_accept needs
 // them earlier than that.
@@ -812,8 +816,203 @@ bool proxy_instance::resolve_backend(backend_info& b)
     return true;
 }
 
+#ifdef SOCKETLEY_TRACE
+namespace {
+std::vector<proxy_instance*>& skl_proxy_registry()
+{
+    static std::vector<proxy_instance*> v;
+    return v;
+}
+}
+
+void proxy_instance::trace_register(proxy_instance* p)
+{
+    auto& v = skl_proxy_registry();
+    for (auto* e : v) if (e == p) return;
+    v.push_back(p);
+}
+
+void proxy_instance::trace_unregister(proxy_instance* p)
+{
+    auto& v = skl_proxy_registry();
+    v.erase(std::remove(v.begin(), v.end(), p), v.end());
+}
+
+// Report every splice pipeline on this process that has bytes somewhere and has
+// not moved in a while.  The two states this exists to tell apart:
+//
+//   sock_unread>0, in_pend=1   the splice is armed, the data is on the socket,
+//                              and the kernel has not answered.
+//   pipe>0,        in_pend=0   the kernel moved the bytes and the completion
+//                              that would have pushed them on never arrived.
+//
+// Which of the two it is names the hop, and neither is visible from the flags.
+// How many io-wq worker threads this process currently has, and how many of
+// them are not runnable.  Every IORING_OP_SPLICE is prepped REQ_F_FORCE_ASYNC by
+// the kernel, so it never runs on the submitter: it is handed to an io-wq
+// worker, which then sits inside splice() until the socket has data.  A splice
+// armed on a quiet socket therefore *holds a thread*, and how many threads there
+// are is not something this process ever asked for or can see from the ring.
+// `parked` counts the workers sitting in wait_woken — the wait sk_wait_data
+// uses, i.e. a worker inside tcp_splice_read with no data yet.  Those are the
+// ones a splice armed on a quiet socket is holding.
+static void skl_count_iowq(int& total, int& parked)
+{
+    total = 0; parked = 0;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return;
+    while (struct dirent* e = readdir(d))
+    {
+        if (e->d_name[0] == '.') continue;
+        char p[128];
+        std::snprintf(p, sizeof(p), "/proc/self/task/%s/comm", e->d_name);
+        FILE* f = std::fopen(p, "r");
+        if (!f) continue;
+        char comm[64] = {0};
+        const bool is_wrk = std::fgets(comm, sizeof(comm), f) &&
+                            std::strncmp(comm, "iou-wrk", 7) == 0;
+        std::fclose(f);
+        if (!is_wrk) continue;
+        total++;
+        std::snprintf(p, sizeof(p), "/proc/self/task/%s/wchan", e->d_name);
+        FILE* g = std::fopen(p, "r");
+        if (!g) continue;
+        char wch[64] = {0};
+        if (std::fgets(wch, sizeof(wch), g) && std::strstr(wch, "wait_woken"))
+            parked++;
+        std::fclose(g);
+    }
+    closedir(d);
+}
+
+// NOTHING HERE MAY ioctl() A PIPE.  A splice from a socket into a pipe holds
+// that pipe's mutex for the whole time it is waiting for the socket to produce
+// data (splice_file_to_pipe takes pipe_lock around the socket read), and
+// FIONREAD on a pipe takes the same mutex.  Asking that question from this
+// thread puts the event loop into uninterruptible sleep until some client
+// happens to send a byte — the whole daemon, for every runtime on the loop.
+// Measured: a probe that did exactly this wedged the daemon permanently and
+// every one of its threads read D / pipe_ioctl.  The socket ioctls below are
+// safe because sk_wait_data drops the socket lock while it waits.
+void proxy_instance::trace_splice_sweep()
+{
+    const double now = ::skl_trace::now_ms();
+
+    // Armed splices across every proxy on this loop, against the number of
+    // io-wq threads there are to run them.  A splice only ever runs on an io-wq
+    // worker, and one waiting on a quiet socket holds its worker for the whole
+    // wait, so these two numbers are the supply and the demand.
+    int armed = 0, parked_pipelines = 0;
+    for (auto* inst : skl_proxy_registry())
+    {
+        if (!inst) continue;
+        size_t rem = inst->m_backend_count;
+        for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
+        {
+            auto* b = inst->m_backend_slots[fd].get();
+            if (!b) continue;
+            rem--;
+            armed += (int)b->splice_in_pending + (int)b->splice_out_pending;
+        }
+        size_t remc = inst->m_client_count;
+        for (int fd = 0; fd < MAX_FDS && remc > 0; ++fd)
+        {
+            auto* c = inst->m_client_slots[fd].get();
+            if (!c) continue;
+            remc--;
+            armed += (int)c->splice_in_pending + (int)c->splice_out_pending;
+            if (c->splice_in_pending) parked_pipelines++;
+        }
+    }
+
+    {
+        static double last_wq = 0.0;
+        static bool asked_max = false;
+        if (now - last_wq > 240.0)
+        {
+            last_wq = now;
+            int t = 0, p = 0;
+            skl_count_iowq(t, p);
+            SKL_TRACE_LOG("iowq workers=%d parked=%d armed_splices=%d client_in_armed=%d",
+                          t, p, armed, parked_pipelines);
+            if (!asked_max)
+            {
+                asked_max = true;
+                for (auto* inst : skl_proxy_registry())
+                {
+                    if (!inst || !inst->m_loop) continue;
+                    unsigned vals[2] = { 0, 0 };
+                    const int r = io_uring_register_iowq_max_workers(inst->m_loop->get_ring(), vals);
+                    SKL_TRACE_LOG("iowq-max rc=%d bounded=%u unbounded=%u", r, vals[0], vals[1]);
+                    break;
+                }
+            }
+        }
+    }
+
+    for (auto* inst : skl_proxy_registry())
+    {
+        if (!inst) continue;
+        size_t remaining = inst->m_backend_count;
+        for (int fd = 0; fd < MAX_FDS && remaining > 0; ++fd)
+        {
+            auto* b = inst->m_backend_slots[fd].get();
+            if (!b) continue;
+            remaining--;
+            if (!b->splice_active) continue;
+
+            const double idle = now - b->tr.splice_cqe_ms;
+            if (idle < 400.0) continue;
+
+            int sock_un = 0, cl_un = 0;
+            if (ioctl(fd, FIONREAD, &sock_un) < 0) {}
+            proxy_client_connection* c = nullptr;
+            if (b->client_fd >= 0 && b->client_fd < MAX_FDS &&
+                inst->m_conn_idx[b->client_fd].side == conn_client)
+            {
+                c = inst->m_conn_idx[b->client_fd].client;
+                if (ioctl(b->client_fd, FIONREAD, &cl_un) < 0) {}
+            }
+
+            // What is owed on this pipeline, from the counters rather than from
+            // the pipe: bytes taken off a socket that have not reached the peer.
+            const long long owed_b = (long long)(b->tr.sp_in - b->tr.sp_out);
+            const long long owed_c = c ? (long long)(c->tr.sp_in - c->tr.sp_out) : 0;
+
+            // Moving normally and nothing owed anywhere: an idle keep-alive
+            // pipeline, which is the ordinary state and not worth a line.
+            if (sock_un == 0 && cl_un == 0 && owed_b == 0 && owed_c == 0)
+                continue;
+
+            SKL_TRACE_LOG("sp-stall inst=%.*s bfd=%d cfd=%d idle=%.0fms "
+                          "b_inflight=%u c_inflight=%u "
+                          "b_in_pend=%d b_out_pend=%d b_closing=%d "
+                          "c_in_pend=%d c_out_pend=%d c_closing=%d "
+                          "backend_unread=%d client_unread=%d owed_b=%lld owed_c=%lld "
+                          "b_sp_in=%llu b_sp_out=%llu b_lastres=%d b_leg=%u "
+                          "c_sp_in=%llu c_sp_out=%llu c_lastres=%d c_leg=%u",
+                (int)inst->get_name().size(), inst->get_name().data(), fd, b->client_fd, idle,
+                inst->m_loop ? inst->m_loop->fd_inflight(fd) : 0u,
+                (inst->m_loop && b->client_fd >= 0) ? inst->m_loop->fd_inflight(b->client_fd) : 0u,
+                (int)b->splice_in_pending, (int)b->splice_out_pending, (int)b->closing,
+                c ? (int)c->splice_in_pending : -1, c ? (int)c->splice_out_pending : -1,
+                c ? (int)c->closing : -1,
+                sock_un, cl_un, owed_b, owed_c,
+                (unsigned long long)b->tr.sp_in, (unsigned long long)b->tr.sp_out,
+                b->tr.last_splice_res, b->tr.splice_leg,
+                c ? (unsigned long long)c->tr.sp_in : 0ULL,
+                c ? (unsigned long long)c->tr.sp_out : 0ULL,
+                c ? c->tr.last_splice_res : 0, c ? c->tr.splice_leg : 0u);
+        }
+    }
+}
+#endif
+
 bool proxy_instance::setup(event_loop& loop)
 {
+#ifdef SOCKETLEY_TRACE
+    trace_register(this);
+#endif
     // Nothing from the previous run is cleaned up here any more.  teardown()
     // hands everything it cannot free to retire(), which owns it for as long as
     // the ring might still touch it.  Freeing it here was the crash: "all
@@ -1072,6 +1271,9 @@ bool proxy_instance::setup(event_loop& loop)
 
 void proxy_instance::teardown(event_loop& /*loop*/)
 {
+#ifdef SOCKETLEY_TRACE
+    trace_unregister(this);
+#endif
     // Everything here is closed and then handed to the release path, which
     // keeps whatever the ring is still working on — the struct, its buffers,
     // and its io_requests, still pointing at this instance — until the last
@@ -1337,6 +1539,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             break;
         }
         case op_splice:
+        case op_splice_poll:
             handle_splice(cqe, req);
             break;
         case op_connect:
@@ -5173,6 +5376,60 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
 
     conn->splice_active = true;
     bconn->splice_active = true;
+#ifdef SOCKETLEY_TRACE
+    conn->tr.splice_cqe_ms  = ::skl_trace::now_ms();
+    bconn->tr.splice_cqe_ms = ::skl_trace::now_ms();
+#endif
+}
+
+// Arm the socket half of a splice pipeline.
+//
+// WHY THIS IS A POLL AND NOT THE SPLICE
+//
+// io_uring never runs IORING_OP_SPLICE on the submitting thread: the opcode is
+// prepped REQ_F_FORCE_ASYNC, so every splice is handed to an io-wq worker and
+// executed there synchronously.  A splice reading from a socket that has no data
+// yet therefore does not "wait in the kernel" for free — it sits inside
+// tcp_splice_read on a worker thread, and it holds the destination pipe's mutex
+// the whole time, because splice_file_to_pipe takes pipe_lock around the read.
+//
+// Arming it on a quiet socket, which is what an idle keep-alive connection is
+// almost all of the time, costs one kernel thread per connection for as long as
+// the peer says nothing.  Whether it *also* burns a CPU depends on an accident:
+// tcp_splice_read decides whether to wait from the socket file's O_NONBLOCK, not
+// from the splice flags.  Accepted client sockets here are blocking, so that leg
+// parks a thread; backend sockets are opened SOCK_NONBLOCK for the async
+// connect, so that leg returns -EAGAIN at once and the completion handler
+// resubmits it — an unbounded resubmit loop for as long as the backend has
+// nothing to say.
+//
+// Measured on this tree, a --protocol tcp proxy with nothing whatsoever
+// happening on it:
+//
+//     idle connections   daemon CPU   io-wq threads   parked in the socket wait
+//                    0         0.0%               0                          0
+//                    4        95.7%               7                          4
+//                   16       143.0%              20                         16
+//                   48       210.6%              53                         48
+//
+// Four silent connections cost a core.  Forty-eight cost two cores and fifty
+// threads.  That is the whole cost of a proxy that is doing nothing at all, and
+// it is also what makes a splice that *does* have work wait: every worker is
+// parked in someone else's idle read, and the io-wq run queue is being churned
+// by the resubmit loop.
+//
+// A poll costs no thread and no CPU.  Once it fires the splice is submitted with
+// data already waiting, so the worker it runs on returns immediately, holds the
+// pipe mutex for microseconds, and goes back to the pool.  splice_in_pending
+// stays set across both steps on purpose: every teardown path already reads it
+// as "this connection still owes a completion", and that is true of the poll
+// exactly as it was of the splice.
+bool proxy_instance::arm_splice_in_poll(int src_fd, io_request* req)
+{
+    if (!m_loop || src_fd < 0)
+        return false;
+    req->type = op_splice_poll;
+    return m_loop->submit_poll_add(src_fd, POLLIN, req);
 }
 
 void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn)
@@ -5190,8 +5447,7 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     if (!conn->splice_in_pending && !conn->read_pending)
     {
         conn->splice_in_pending = true;
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                              PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+        if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
         {
             conn->splice_in_pending = false;
             close_pair(conn->fd, conn->backend_fd);
@@ -5203,8 +5459,7 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     if (!bconn->splice_in_pending)
     {
         bconn->splice_in_pending = true;
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(bconn->fd, bconn->pipe_to_client[1],
-                              PROXY_READ_BUF_SIZE, &bconn->splice_in_req)))
+        if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(bconn->fd, &bconn->splice_in_req)))
         {
             bconn->splice_in_pending = false;
             close_pair(bconn->client_fd, bconn->fd);
@@ -5219,6 +5474,52 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         return;
 
     auto& entry = m_conn_idx[req->fd];
+#ifdef SOCKETLEY_TRACE
+    if (entry.side == conn_client)  entry.client->tr.splice_cqe_ms  = ::skl_trace::now_ms();
+    if (entry.side == conn_backend) entry.backend->tr.splice_cqe_ms = ::skl_trace::now_ms();
+#endif
+
+    // The readiness half of the inbound leg reporting.  See arm_splice_in_poll:
+    // the splice is only submitted once the socket has something, so that the
+    // io-wq worker it runs on is not spent waiting.  A poll that reports a
+    // failure — a cancellation from a teardown, an error on the socket — is
+    // treated exactly as a failed splice was: the pair goes.
+    if (req->type == op_splice_poll)
+    {
+        if (entry.side == conn_client)
+        {
+            auto* conn = entry.client;
+            if (SOCKETLEY_UNLIKELY(req != &conn->splice_in_req))
+                return;
+            conn->splice_in_req.type = op_splice;
+            if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing ||
+                                   conn->pipe_to_backend[1] < 0 ||
+                                   !m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
+                                                          PROXY_READ_BUF_SIZE,
+                                                          &conn->splice_in_req)))
+            {
+                conn->splice_in_pending = false;
+                close_pair(conn->fd, conn->backend_fd);
+            }
+        }
+        else if (entry.side == conn_backend)
+        {
+            auto* conn = entry.backend;
+            if (SOCKETLEY_UNLIKELY(req != &conn->splice_in_req))
+                return;
+            conn->splice_in_req.type = op_splice;
+            if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing ||
+                                   conn->pipe_to_client[1] < 0 ||
+                                   !m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
+                                                          PROXY_READ_BUF_SIZE,
+                                                          &conn->splice_in_req)))
+            {
+                conn->splice_in_pending = false;
+                close_pair(conn->client_fd, conn->fd);
+            }
+        }
+        return;
+    }
 
     if (entry.side == conn_client)
     {
@@ -5237,9 +5538,12 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 // EAGAIN: pipe full or socket has no data yet — retry
                 if (cqe->res == -EAGAIN && !conn->closing)
                 {
+                    // Back through the readiness poll, not straight back into
+                    // the ring.  A splice resubmitted on a socket that answered
+                    // EAGAIN answers EAGAIN again, so the direct retry was a
+                    // loop bounded by nothing at all.
                     conn->splice_in_pending = true;
-                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                    if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                     {
                         conn->splice_in_pending = false;
                         close_pair(conn->fd, conn->backend_fd);
@@ -5319,12 +5623,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
-            // Resubmit the inbound splice (client -> pipe)
+            // Re-arm the inbound leg (client -> pipe).  The connection is quiet
+            // again at this point, which is exactly the state a splice must not
+            // be left parked in — so this waits on readiness instead.
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 conn->splice_in_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                 {
                     conn->splice_in_pending = false;
                     close_pair(conn->fd, conn->backend_fd);
@@ -5353,9 +5658,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 // EAGAIN: pipe full or backend has no data yet — retry
                 if (cqe->res == -EAGAIN && !conn->closing)
                 {
+                    // The same loop as on the client leg, and this is the one
+                    // that actually ran: a backend socket is opened
+                    // SOCK_NONBLOCK for the async connect, so tcp_splice_read
+                    // answers EAGAIN the instant the backend has nothing to say
+                    // — which, between requests, is all the time.
                     conn->splice_in_pending = true;
-                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
-                                          PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                    if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                     {
                         conn->splice_in_pending = false;
                         close_pair(conn->client_fd, conn->fd);
@@ -5441,12 +5750,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
-            // Resubmit the inbound splice (backend -> pipe)
+            // Re-arm the inbound leg (backend -> pipe), on readiness for the
+            // reason given above: the exchange is over and this socket is quiet
+            // until the next request comes down the other side.
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 conn->splice_in_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
-                                      PROXY_READ_BUF_SIZE, &conn->splice_in_req)))
+                if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                 {
                     conn->splice_in_pending = false;
                     close_pair(conn->client_fd, conn->fd);
@@ -5855,15 +6165,21 @@ void proxy_instance::close_pair(int client_fd, int backend_fd)
                     }
                     [[maybe_unused]] unsigned long long be_in = 0, be_out = 0;
                     [[maybe_unused]] int pipe_c = 0, pipe_b = 0, unread_b = 0;
-                    if (conn->pipe_to_backend[0] >= 0)
-                        ioctl(conn->pipe_to_backend[0], FIONREAD, &pipe_c);
+                    // The two pipe residencies used to be read with FIONREAD.
+                    // They must not be: a splice from a socket into a pipe holds
+                    // that pipe's mutex for the whole time it waits for the
+                    // socket, and pipe_ioctl takes the same mutex — so this
+                    // trace could park the event loop in uninterruptible sleep
+                    // until some unrelated client sent a byte.  The residency is
+                    // already implied by the counters below (sp_in - sp_out), so
+                    // the question did not need asking of the kernel at all.
+                    pipe_c = (int)(long long)(conn->tr.sp_in - conn->tr.sp_out);
                     if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
                         m_conn_idx[conn->backend_fd].side == conn_backend)
                     {
                         [[maybe_unused]] auto* tb2 = m_conn_idx[conn->backend_fd].backend;
                         be_in = tb2->tr.sp_in; be_out = tb2->tr.sp_out;
-                        if (tb2->pipe_to_client[0] >= 0)
-                            ioctl(tb2->pipe_to_client[0], FIONREAD, &pipe_b);
+                        pipe_b = (int)(long long)(tb2->tr.sp_in - tb2->tr.sp_out);
                         ioctl(conn->backend_fd, FIONREAD, &unread_b);
                     }
                     // Conservation: c_in == c_out + pipe_c, and be_in == be_out + pipe_b.
@@ -6884,6 +7200,10 @@ void proxy_instance::arm_response_deadline_sweep()
 // which is why the surviving backends look flawless while throughput collapses.
 void proxy_instance::response_deadline_sweep()
 {
+#ifdef SOCKETLEY_TRACE
+    // The only periodic tick this process has while a request is outstanding.
+    trace_splice_sweep();
+#endif
     const auto now = std::chrono::steady_clock::now();
 
     // A snapshot, not the live count: giving up on a request can tear the pair

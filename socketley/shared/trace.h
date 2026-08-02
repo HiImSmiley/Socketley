@@ -62,6 +62,10 @@ struct conn_stats
     uint64_t sp_out{0};   // pipe   -> socket (leg 2 on a client, leg 4 on a backend)
     int      last_splice_res{1};
     unsigned splice_leg{0};       // 1=c->pipe 2=pipe->be 3=be->pipe 4=pipe->c
+    // When a splice on this connection last completed.  A pipeline waiting on a
+    // peer and a pipeline nobody armed look identical from the flags alone; how
+    // long it has been since anything moved is what tells them apart.
+    double   splice_cqe_ms{0.0};
 };
 
 } // namespace skl_trace
