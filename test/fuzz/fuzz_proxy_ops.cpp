@@ -717,11 +717,25 @@ struct backend_sock
                               // recognised — see check_backend_pool()
 
     // Invariant B's state.  True from the moment a response is started until
-    // the moment it is finished; a socket the proxy *files in its pool* while
-    // this is set is a socket pooled off a message boundary.  "Files" and not
-    // "holds": see check_backend_pool(), and in_pool below, which is what tells
-    // the two apart.
+    // the moment it is finished.  On its own it says only that *this end* has
+    // an unfinished message somewhere behind it; whether the proxy filed the
+    // socket inside that message is answered by the two counters below, not by
+    // this flag.  See check_backend_pool().
     bool     resp_pending{false};
+
+    // Where this end's writing has got to, and where the last message boundary
+    // in it falls.  Together they place every byte on this wire: everything
+    // before complete_at is whole messages, everything from complete_at to
+    // tx_bytes is the unfinished one.
+    //
+    // These are what let invariant B be stated as the geometric fact it claims
+    // to be.  The proxy's own position in the stream is tx_bytes minus whatever
+    // it has not consumed yet, and a filing is off a boundary exactly when that
+    // position is past complete_at.  resp_pending cannot answer it: it is true
+    // for a socket filed correctly at complete_at and then written to again,
+    // which is the harness's own later traffic and not a pooling mistake.
+    size_t   tx_bytes{0};
+    size_t   complete_at{0};
 
     // Whether this socket was in the proxy's pool at the end of the previous
     // step.  A false→true transition is the filing decision, and the filing
@@ -918,10 +932,20 @@ int build_request(int shape, int slot, std::string& out)
 // a backend speaking unbidden, which the proxy must forward to whoever owns the
 // socket and nobody else).  Sets `complete` to whether the stream is left at a
 // message boundary, which is the fact invariant B is stated over.
-void build_response(int shape, uint32_t id, std::string& out, bool& complete)
+// `boundary_at` is where the last message boundary falls *inside this buffer* —
+// the offset one past the end of the last complete message in it, or 0 if there
+// is no boundary in it at all.  For every shape it is simply the whole buffer or
+// nothing, because one call writes one message; RS_OK_PLUS_TAIL is the exception
+// this parameter exists for, and it is exactly the shape invariant B is about.
+// Without it a complete answer with the head of another behind it would record
+// its boundary at the end of the *write* rather than at the end of the *message*,
+// and the arithmetic in check_backend_pool() would call the defect a boundary.
+void build_response(int shape, uint32_t id, std::string& out, bool& complete,
+                    size_t& boundary_at)
 {
     out.clear();
     complete = true;
+    boundary_at = 0;
 
     char ack[48];
     ack[0] = '\0';
@@ -1031,6 +1055,8 @@ void build_response(int shape, uint32_t id, std::string& out, bool& complete)
             out = "HTTP/1.1 200 OK\r\n";
             out += ack;
             out += "Content-Length: 5\r\n\r\nhello";
+            // The one boundary in this buffer, and it is not at the end of it.
+            boundary_at = out.size();
             out += "HTTP/1.1 200 OK\r\n";
             out += ack;
             out += "Content-Length: 9\r\n\r\nstr";
@@ -1059,6 +1085,13 @@ void build_response(int shape, uint32_t id, std::string& out, bool& complete)
             out += "Content-Length: 6\r\n\r\nstrayx";
             break;
     }
+
+    // A shape that finishes its message ends at a boundary, wherever it ends.
+    // The shapes that do not, and that carry no boundary earlier in the buffer
+    // either, leave this at 0 — there is no place in what they wrote that a
+    // borrower could start reading from.
+    if (complete)
+        boundary_at = out.size();
 }
 
 // ─────────────────────────────── the harness's TLS ──────────────────────────
@@ -1638,6 +1671,8 @@ void bsock_close(backend_sock& b)
     b.backend = -1;
     b.peer_port = 0;
     b.resp_pending = false;
+    b.tx_bytes = 0;
+    b.complete_at = 0;
     b.in_pool = false;
     b.pool_seen = false;
     b.owed_n = 0;
@@ -1745,6 +1780,8 @@ int backend_accept(world& w, int idx)
     b.backend = idx;
     b.peer_port = ntohs(peer.sin_port);
     b.resp_pending = false;
+    b.tx_bytes = 0;
+    b.complete_at = 0;
     b.in_pool = false;
     b.pool_seen = false;
     b.owed_n = 0;
@@ -1988,7 +2025,8 @@ void bsock_respond(world& w, int idx, int shape)
 
     static std::string buf;
     bool complete = true;
-    build_response(shape, id, buf, complete);
+    size_t boundary_at = 0;
+    build_response(shape, id, buf, complete, boundary_at);
 
     ssize_t n;
     if (b.ssl)
@@ -2022,6 +2060,15 @@ void bsock_respond(world& w, int idx, int shape)
     // A short write leaves the answer unfinished as surely as a shape that was
     // never going to finish it.
     b.resp_pending = !complete || static_cast<size_t>(n) != buf.size();
+
+    // Where the wire now runs to, and where the last boundary on it is.  A
+    // boundary only counts if the write actually reached it: a short write that
+    // stopped before the end of the message left no place on this wire that a
+    // borrower could start reading from, however complete the shape was going
+    // to be.
+    if (boundary_at > 0 && static_cast<size_t>(n) >= boundary_at)
+        b.complete_at = b.tx_bytes + boundary_at;
+    b.tx_bytes += static_cast<size_t>(n);
 
     // Recorded here rather than above, because an answer that never left this
     // end answered nothing: a return through either failure branch above must
@@ -2331,9 +2378,49 @@ void check_struct_pools(proxy_instance* rt, bool deep)
 // borrower survives it is the probe's question, and crosstalk's, not this one's.
 //
 // Three separate agents diagnosed the at-rest form as a defect on 2026-08-01
-// before it was written down.  That is the cost this shape removes, and it
-// removes none of the defect: a socket filed mid-message is filed mid-message
-// on the very first walk that sees it.
+// before it was written down.
+//
+// ─── AND WHY "JUST FILED" IS NOT ON ITS OWN ENOUGH ──────────────────────────
+//
+// in_pool narrows *when* the question is asked.  It does not make resp_pending
+// the right thing to ask, and a sixth artefact of this id came in against the
+// narrowed form on 2026-08-02 to prove it.
+//
+// The gap is that the proxy's filing decision and this walk's first sight of it
+// are not the same instant.  detach_and_pool_backend takes the decision when the
+// response frames complete, but the socket does not reach the pool until the
+// read it cancelled has come back -ECANCELED through finish_pool_drain, which is
+// at least one more pump away.  A backend that writes again inside that window
+// sets resp_pending on a socket whose filing was already decided, at a boundary,
+// against a stream with nothing unread on it — and the old form charged the
+// filing for it.  That reproducer answered its one request completely at step
+// 57, wrote an unsolicited half-response at step 58, and the drain landed at
+// step 59; the filing was right and the two bytes of state that said otherwise
+// were both written after it.
+//
+// resp_pending cannot tell those apart, because it is a fact about this end's
+// writing and the claim is a fact about the proxy's *reading*.  So the claim is
+// stated as the geometric fact it has always named.  This end knows where every
+// message boundary on the wire is (complete_at) and how far it has written
+// (tx_bytes); the proxy's own position is tx_bytes less whatever it has not
+// consumed, and the socket was filed off a boundary exactly when that position
+// is past complete_at.
+//
+// That measurement is stable, which is what makes it answerable from a walk that
+// may be several steps late.  Nothing is armed on a pooled fd — pool-armed above
+// forbids it by name — so the proxy consumes nothing further from it and its
+// position at this walk is its position at the filing.  Bytes the harness writes
+// afterwards raise tx_bytes and the unread count together and cancel out
+// exactly, which is precisely the artefact class, and they are silent now for a
+// reason rather than by exclusion.
+//
+// Nothing is lost.  The defect efdbabd fixed is a complete answer with the head
+// of another behind it in one write: the proxy consumes all of it, so its
+// position is the end of both and complete_at is the end of the first, and the
+// difference between them is the report.  Checked by putting that fix back out
+// and watching this fire on proxy/response_with_a_tail — "56 bytes past the last
+// message boundary ... written 114 bytes, the last whole message ends at 58, and
+// 0 are still unread".
 void check_backend_pool(world& w, proxy_instance* rt)
 {
     for (int i = 0; i < NBSOCK; i++)
@@ -2440,9 +2527,63 @@ void check_backend_pool(world& w, proxy_instance* rt)
                 if (!just_filed || !w.bs[i].resp_pending)
                     break;
 
-                fuzzrt::set_detail("the socket to 127.0.0.1:%u was filed in the pool while "
-                                   "the backend's answer on it was unfinished",
-                                   static_cast<unsigned>(pb.port));
+                // ── where the proxy's end of this stream actually sits ──
+                //
+                // Everything this end has written is either a whole message
+                // (up to complete_at) or the unfinished one behind it (up to
+                // tx_bytes).  The proxy's own position is everything it has
+                // taken off the socket, which is tx_bytes less whatever is
+                // still waiting for it — and the filing is off a boundary
+                // exactly when that position is past complete_at.
+                //
+                // The position does not move once the socket is in the pool.
+                // Nothing is armed on a pooled fd — pooled-fd-armed above
+                // forbids it by name — so the proxy reads no further, and this
+                // measurement at the walk is the position it had at the filing
+                // however many steps ago that was.  That is what makes the
+                // question answerable here at all, and it is the whole
+                // difference between this and asking whether resp_pending
+                // happens to be set: the flag drifts with the harness's own
+                // later writes, and this does not.
+                int nread = 0;
+                if (::ioctl(pb.fd, FIONREAD, &nread) != 0 || nread < 0)
+                    nread = 0;
+                const size_t unconsumed =
+                    static_cast<size_t>(nread) +
+                    (pb.ssl ? static_cast<size_t>(std::max(0, SSL_pending(pb.ssl))) : 0);
+
+                // On a cleartext leg the two counts are in the same units and
+                // the position is exact.  On an encrypted one they are not —
+                // this end counts the plaintext it handed to SSL_write and the
+                // socket holds ciphertext — so the arithmetic is not available
+                // and the question is asked in the one form that needs no
+                // units: nothing left unconsumed anywhere means the proxy took
+                // every byte this end wrote, the unfinished message with them.
+                bool off_boundary;
+                if (pb.ssl)
+                {
+                    off_boundary = (unconsumed == 0);
+                }
+                else
+                {
+                    const size_t consumed = w.bs[i].tx_bytes > unconsumed
+                                                ? w.bs[i].tx_bytes - unconsumed
+                                                : 0;
+                    off_boundary = consumed > w.bs[i].complete_at;
+                }
+
+                if (!off_boundary)
+                    break;
+
+                fuzzrt::set_detail("the socket to 127.0.0.1:%u was filed in the pool with the "
+                                   "proxy's end of the stream %zu bytes past the last message "
+                                   "boundary on it (this end has written %zu bytes, the last "
+                                   "whole message ends at %zu, and %zu are still unread)",
+                                   static_cast<unsigned>(pb.port),
+                                   (w.bs[i].tx_bytes > unconsumed
+                                        ? w.bs[i].tx_bytes - unconsumed
+                                        : 0) - w.bs[i].complete_at,
+                                   w.bs[i].tx_bytes, w.bs[i].complete_at, unconsumed);
                 RT_FINDING("pool-off-boundary", false,
                            "a backend socket was filed in the connection pool somewhere other "
                            "than a message boundary — the tail of this response is still to "
