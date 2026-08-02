@@ -43,7 +43,7 @@ assert_ok() {
 
 assert_contains() {
     TOTAL=$((TOTAL+1))
-    if echo "$1" | grep -q "$2"; then
+    if grep -q "$2" <<<"$1"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -93,7 +93,7 @@ assert_ok "$RC" "remove server" "$OUT"
 # Test: ls no longer shows testsvr
 OUT=$("$BIN" ls 2>&1) || daemon_required "ls"
 TOTAL=$((TOTAL+1))
-if ! echo "$OUT" | grep -q "testsvr"; then
+if ! grep -q "testsvr" <<<"$OUT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

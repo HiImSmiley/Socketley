@@ -80,7 +80,7 @@ assert_rc() {
 # assert_contains LABEL HAYSTACK NEEDLE
 assert_contains() {
     local label=$1 hay=$2 needle=$3
-    if printf '%s' "$hay" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<<"$hay"; then
         ok
     else
         bad "$label: expected '$needle' in: $hay"
@@ -157,7 +157,7 @@ assert_same "cache took the eviction change and nothing else" \
 RC=0; OUT=$("$BIN" import no_such_runtime '{}' 2>&1) || RC=$?
 assert_rc "import against a missing runtime exits 1" 1 "$RC"
 assert_contains "the missing runtime is named, not the command" "$OUT" "runtime not found: no_such_runtime"
-if printf '%s' "$OUT" | grep -qF "runtime not found: import"; then
+if grep -qF "runtime not found: import" <<<"$OUT"; then
     bad "'import' is still being treated as a runtime name"
 else
     ok

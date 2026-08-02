@@ -219,8 +219,8 @@ cleanup() {
     # this test's ports.  The socket path comes from mktemp, so matching on it
     # can only ever hit daemons belonging to this run.
     for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+        if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
+                < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true
         fi
     done
@@ -812,7 +812,7 @@ fi
 LS_OUT=$("$BIN" ls 2>&1 || true)
 
 TOTAL=$((TOTAL+1))
-if printf '%s\n' "$LS_OUT" | grep -q 'sentinel_keep'; then
+if grep -q 'sentinel_keep' <<<"$LS_OUT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
@@ -821,7 +821,7 @@ else
 fi
 
 TOTAL=$((TOTAL+1))
-if printf '%s\n' "$LS_OUT" | grep -q 'churn_'; then
+if grep -q 'churn_' <<<"$LS_OUT"; then
     FAIL=$((FAIL+1))
     echo "  FAIL [nothing left behind]: removed runtimes are still listed:"
     printf '%s\n' "$LS_OUT" | grep 'churn_' | head -5 | sed 's/^/        /' || true

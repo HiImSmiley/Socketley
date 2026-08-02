@@ -18,7 +18,7 @@ trap cleanup EXIT
 
 assert_contains() {
     TOTAL=$((TOTAL+1))
-    if echo "$1" | grep -q "$2"; then
+    if grep -q "$2" <<<"$1"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -45,7 +45,7 @@ daemon_start "$BIN"
 OUT=$("$BIN" dashboard 2>&1) || true
 TOTAL=$((TOTAL+1))
 # Either shows a URL or says not configured — both are valid
-if echo "$OUT" | grep -qE "Dashboard:|not configured|not enabled|metrics"; then
+if grep -qE "Dashboard:|not configured|not enabled|metrics" <<<"$OUT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

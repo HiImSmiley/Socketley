@@ -61,8 +61,8 @@ cleanup() {
     # this test's ports.  The socket path comes from mktemp, so matching on it
     # can only ever hit daemons belonging to this run.
     for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+        if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
+                < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true
         fi
     done
@@ -158,7 +158,7 @@ for _ in $(seq 1 60); do grep -q ready "$TMPD/plainbe.log" 2>/dev/null && break;
 
 # The whole test rests on this backend really being TLS.  If it is not, every
 # assertion below would pass for the wrong reason.
-if echo | timeout 8 openssl s_client -connect "127.0.0.1:$TLS_BE" -brief 2>&1 | grep -qi "TLSv1"; then
+if grep -qi "TLSv1" < <(echo | timeout 8 openssl s_client -connect "127.0.0.1:$TLS_BE" -brief 2>&1); then
     ok
 else
     bad "setup" "the TLS backend did not complete a handshake -- nothing below would mean anything"
@@ -257,7 +257,7 @@ if "$BIN" stats tlsdown >/dev/null 2>&1; then ok; else
     bad "setup" "the proxy refused --tls/--cert/--key and did not start"
 fi
 
-if echo | timeout 8 openssl s_client -connect "127.0.0.1:$PX_DOWN" -brief 2>&1 | grep -qi "TLSv1"; then
+if grep -qi "TLSv1" < <(echo | timeout 8 openssl s_client -connect "127.0.0.1:$PX_DOWN" -brief 2>&1); then
     ok
 else
     bad "a --tls listener completes a TLS handshake" "no handshake on the port"

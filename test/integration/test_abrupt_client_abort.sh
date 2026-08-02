@@ -197,8 +197,8 @@ cleanup() {
     # this test's ports.  The socket path comes from mktemp, so matching on it
     # can only ever hit daemons belonging to this run.
     for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+        if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
+                < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true
         fi
     done

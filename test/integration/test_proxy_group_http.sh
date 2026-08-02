@@ -67,8 +67,8 @@ cleanup() {
             *" daemon "*|*" daemon") ;;
             *) continue ;;
         esac
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+        if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
+                < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true
         fi
     done
@@ -80,11 +80,11 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$2]: $1"; }
 
 assert_contains() {
-    if echo "$1" | grep -q "$2"; then ok; else bad "expected '$2' in output" "$3"; fi
+    if grep -q "$2" <<<"$1"; then ok; else bad "expected '$2' in output" "$3"; fi
 }
 
 assert_not_contains() {
-    if echo "$1" | grep -q "$2"; then bad "did not expect '$2' in output" "$3"; else ok; fi
+    if grep -q "$2" <<<"$1"; then bad "did not expect '$2' in output" "$3"; else ok; fi
 }
 
 # listening PORT [TIMEOUT_S]

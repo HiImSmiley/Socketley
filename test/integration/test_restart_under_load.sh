@@ -922,7 +922,7 @@ assert_field_min proxy_ok "$MIN_OK" "enough proxy traffic to mean something"
 PS_OUT=$("$BIN" ps 2>&1 || true)
 for n in "$CACHE_NAME" "$PROXY_NAME"; do
     TOTAL=$((TOTAL+1))
-    if printf '%s\n' "$PS_OUT" | grep -q "$n"; then
+    if grep -q "$n" <<<"$PS_OUT"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -953,7 +953,7 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 TOTAL=$((TOTAL+1))
-if printf '%s\n' "$FINAL_RT" | grep -q '^SERVES_OK$'; then
+if grep -q '^SERVES_OK$' <<<"$FINAL_RT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

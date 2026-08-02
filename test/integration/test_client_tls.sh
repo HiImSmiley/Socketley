@@ -65,8 +65,8 @@ cleanup() {
     # command line is deliberate: a -f pattern also matches the shell carrying
     # the pattern, which is this script.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
-        if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null \
-           | grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET"; then
+        if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
+                < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true
         fi
     done
@@ -367,8 +367,8 @@ if [ $? -ne 0 ]; then ok; else bad "--ca without --tls is refused" "it was accep
 # sending datagrams in the clear under a TLS configuration.
 "$BIN" create client tudp -t "127.0.0.1:$PEER" --udp --tls -s >/dev/null 2>&1
 sleep 0.5
-if "$BIN" ps -a 2>/dev/null | grep -q "tudp.*failed" \
-   || ! "$BIN" ps 2>/dev/null | grep -q "tudp"; then ok; else
+if grep -q "tudp.*failed" < <("$BIN" ps -a 2>/dev/null) \
+   || ! grep -q "tudp" < <("$BIN" ps 2>/dev/null); then ok; else
     bad "--tls on a UDP client is refused" \
         "a UDP client came up under a TLS configuration and is sending datagrams in the clear"
 fi

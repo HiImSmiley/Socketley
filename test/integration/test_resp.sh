@@ -30,7 +30,7 @@ assert_eq() {
 
 assert_contains() {
     TOTAL=$((TOTAL+1))
-    if echo "$1" | grep -q "$2"; then
+    if grep -q "$2" <<<"$1"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -71,7 +71,7 @@ assert_contains "$RESULT" ":1" "RESP DEL"
 # Test: GET after DEL returns null bulk string ($-1)
 RESULT=$(send_resp '*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n')
 TOTAL=$((TOTAL+1))
-if echo "$RESULT" | grep -qF '$-1'; then
+if grep -qF '$-1' <<<"$RESULT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

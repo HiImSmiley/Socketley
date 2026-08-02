@@ -58,7 +58,7 @@ create_ok "proxy with $BACKENDS backends created" \
 sleep 2
 
 TOTAL=$((TOTAL+1))
-if "$BIN" stats manybe 2>/dev/null | grep -q "^backends:$BACKENDS$"; then
+if grep -q "^backends:$BACKENDS$" < <("$BIN" stats manybe 2>/dev/null); then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

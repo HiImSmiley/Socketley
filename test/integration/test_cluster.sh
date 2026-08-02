@@ -100,7 +100,7 @@ trap cleanup EXIT
 
 assert_contains() {
     TOTAL=$((TOTAL+1))
-    if echo "$1" | grep -q "$2"; then
+    if grep -q "$2" <<<"$1"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -111,7 +111,7 @@ assert_contains() {
 
 assert_not_contains() {
     TOTAL=$((TOTAL+1))
-    if ! echo "$1" | grep -q "$2"; then
+    if ! grep -q "$2" <<<"$1"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -355,11 +355,11 @@ sleep 12
 OUT=$(node1 cluster ls 2>&1)      || daemon_required "cluster ls" "$SOCK_NODE1"
 # node2 should be stale or its heartbeat should be old
 TOTAL=$((TOTAL+1))
-if echo "$OUT" | grep "node2" | grep -q "stale"; then
+if grep -q "stale" < <(grep "node2" <<<"$OUT"); then
     PASS=$((PASS+1))
 else
     # If node2 unpublished on shutdown, it might be gone entirely
-    if ! echo "$OUT" | grep -q "node2"; then
+    if ! grep -q "node2" <<<"$OUT"; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
@@ -490,7 +490,7 @@ fi
 # Up and serving is not the same as in the cluster, and the gap between them is
 # the whole defect: assert both, from the peer's side.
 TOTAL=$((TOTAL+1))
-if rj ls 2>/dev/null | grep -q "clst_rj"; then
+if grep -q "clst_rj" < <(rj ls 2>/dev/null); then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
@@ -500,7 +500,7 @@ fi
 sleep 4
 OUT=$(wit cluster ls 2>&1 || true)
 TOTAL=$((TOTAL+1))
-if echo "$OUT" | grep '^rejoin1' | grep -qv "stale"; then
+if grep -qv "stale" < <(grep '^rejoin1' <<<"$OUT"); then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
@@ -564,7 +564,7 @@ sleep 3
 OUT=$(wit cluster ls 2>&1 || true)
 for who in witness rejoin1; do
     TOTAL=$((TOTAL+1))
-    if echo "$OUT" | grep "^$who" | grep -qv "stale"; then
+    if grep -qv "stale" < <(grep "^$who" <<<"$OUT"); then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
