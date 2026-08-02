@@ -134,8 +134,26 @@ TMPDIR_T=$(mktemp -d /tmp/socketley-cachetls-XXXXXX)
 export HOME="$TMPDIR_T/home"
 export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
 mkdir -p "$HOME"
-STATE_DIR="$HOME/.local/share/socketley/runtimes"
 DPID=""
+
+# Where this daemon's state actually lives, found rather than constructed.
+#
+# It used to be spelled out as $HOME/.local/share/socketley/runtimes, which was
+# right until a daemon on a non-default socket got a state directory keyed to
+# that socket — this test sets SOCKETLEY_SOCKET, so its daemon is keyed, and the
+# constructed path named a directory nothing writes to.  The precondition below
+# then failed on a state file that had been written correctly all along.
+#
+# Found by looking, because the keying rule lives in paths.cpp and a copy of it
+# here would go stale silently the next time it changes.  This HOME belongs to
+# this test and holds exactly one daemon's directory.
+state_dir() {
+    local base="$HOME/.local/share/socketley" d
+    for d in "$base"/runtimes.*; do
+        [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+    done
+    printf '%s\n' "$base/runtimes"
+}
 
 TLS_PORT=19741
 LINE_PORT=19742
@@ -1096,7 +1114,7 @@ kill "$DPID" 2>/dev/null || true
 wait "$DPID" 2>/dev/null || true
 DPID=""
 
-RESTORE_JSON="$STATE_DIR/tlsrestore.json"
+RESTORE_JSON="$(state_dir)/tlsrestore.json"
 TOTAL=$((TOTAL+1))
 if [ -f "$RESTORE_JSON" ]; then
     PASS=$((PASS+1))
