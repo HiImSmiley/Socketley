@@ -97,6 +97,9 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .B dashboard
 .br
 .B socketley
+.B help | \-\-help | \-h
+.br
+.B socketley
 .B version | \-\-version | \-v
 .br
 .B socketley
@@ -789,6 +792,21 @@ that succeeds only proves something is listening on the path, not that the
 thing listening is a daemon, and a command written to a stranger is a command
 delivered to a stranger. A path held by something that does not answer this is
 refused, with nothing sent to it.
+.RE
+.TP
+.B help \fR| \fB\-\-help\fR | \fB\-h\fR
+Open the interactive help browser. It is a menu, not a page: it reads from the
+terminal and waits, so it is for a person at a keyboard and not for a script or
+a pipe. Takes no topic argument \(em everything is reached from the menu.
+.RS
+.PP
+Does not require, and does not start, a daemon. The browser is
+.I /usr/share/socketley/socketley\-help.sh
+where socketley is installed, and
+.I man/socketley\-help.sh
+under the source tree the binary was built in otherwise; if neither is readable
+the command says so and exits 1. This page is the reference and that browser is the tour \(em they
+cover the same ground and are kept in step with each other.
 .RE
 .TP
 .B version \fR| \fB\-\-version\fR | \fB\-v\fR
