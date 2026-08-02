@@ -97,8 +97,9 @@ quick_start() {
     echo ""
 
     echo -e "${BOLD}Step 4: Check Status${NC}"
-    echo -e "  ${CYAN}socketley ls${NC}    # All runtimes"
-    echo -e "  ${CYAN}socketley ps${NC}    # Running only"
+    echo -e "  ${CYAN}socketley ls${NC}      # All runtimes"
+    echo -e "  ${CYAN}socketley ps${NC}      # Running only"
+    echo -e "  ${CYAN}socketley ps -a${NC}   # Running, stopped and failed"
     echo ""
 
     echo -e "${BOLD}Step 5: Stop & Cleanup${NC}"
@@ -208,11 +209,15 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ls --name --port --status${NC}  # show only selected columns"
     echo ""
 
-    echo -e "${BOLD}ps [--json|-j|--format json] [--silent|-s] [columns...]${NC}"
+    echo -e "${BOLD}ps [-a|--all] [--json|-j|--format json] [--silent|-s] [columns...]${NC}"
     echo "  List running runtimes (same format as ls, includes uptime)"
+    echo "  A runtime that did not come up is 'failed' and does NOT appear here --"
+    echo "  if nothing is running you get no output at all. Use ps -a, or ls."
+    echo "  -a / --all: List every state, with STATUS showing Created/Stopped/Failed"
     echo "  --json / --format json: Output as JSON array for scripting"
     echo "  --silent / -s: Print only runtime names (one per line)"
     echo "  Column selectors: --id --name --type --port --uptime --conn --owner --created"
+    echo -e "  ${CYAN}socketley ps -a${NC}  # includes anything that failed to start"
     echo ""
 
     echo -e "${BOLD}stats <name|pattern>...${NC}"

@@ -126,6 +126,37 @@ private:
     std::streambuf*   m_saved;
 };
 
+// The STATUS column for a listing that can carry a runtime in any state.
+//
+// A running runtime shows how long it has been up.  Every other state shows the
+// state's name instead, because "how long has it been up" has no answer for a
+// runtime that never came up — and printing an uptime for one is how a listing
+// makes a failed runtime look healthy.
+std::string state_column(const runtime_instance* inst)
+{
+    switch (inst->get_state())
+    {
+        case runtime_created: return "Created";
+        case runtime_running: return format_uptime(inst->get_start_time());
+        case runtime_stopped: return "Stopped";
+        case runtime_failed:  return "Failed";
+        default:              return "Unknown";
+    }
+}
+
+// The same thing for the machine-readable form.
+const char* state_json(runtime_state s)
+{
+    switch (s)
+    {
+        case runtime_created: return "created";
+        case runtime_running: return "running";
+        case runtime_stopped: return "stopped";
+        case runtime_failed:  return "failed";
+        default:              return "unknown";
+    }
+}
+
 }   // namespace
 
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
@@ -1294,20 +1325,30 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
+// `ps`, and `ps -a`.
+//
+// Bare `ps` lists running runtimes and nothing else, which is what the name
+// promises and what every script in test/integration and examples/ that greps
+// this output already assumes.  It is also why a runtime that failed to start
+// produced no row at all — and when nothing else was up, no output at all.  The
+// operator who has just watched a runtime not come up types the command named
+// after "what is running", gets an empty screen, and reads it as "the runtime
+// does not exist" rather than "it exists and is broken".  `failed` is exactly
+// the state you go looking for, and it was the one state this could not show.
+//
+// So the widening is opt-in, spelled the way `docker ps -a` is spelled, and the
+// rows it adds carry their state in the STATUS column so that a script which
+// asks for them can still tell them apart.  Default output is untouched, byte
+// for byte.
 int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 {
     std::shared_lock lock(m_manager.mutex);
 
     const auto& runtimes = m_manager.list();
 
-    bool has_running = std::any_of(runtimes.begin(), runtimes.end(),
-        [](const auto& p) { return p.second->get_state() == runtime_running; });
-
-    if (!has_running)
-        return 0;
-
     bool silent = false;
     bool json_format = false;
+    bool all = false;
     bool col_id = false, col_name = false, col_type = false, col_port = false;
     bool col_uptime = false, col_conn = false, col_owner = false, col_created = false;
 
@@ -1319,6 +1360,8 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--silent"):  silent     = true; break;
             case fnv1a("--json"):
             case fnv1a("-j"):        json_format = true; break;
+            case fnv1a("-a"):
+            case fnv1a("--all"):     all         = true; break;
             case fnv1a("--id"):      col_id      = true; break;
             case fnv1a("--name"):    col_name    = true; break;
             case fnv1a("--type"):    col_type    = true; break;
@@ -1337,6 +1380,16 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
+    // Nothing to list means no output, not an empty table — the same silence
+    // `ls` keeps for an empty inventory.  The flags are parsed above this
+    // rather than below it because `-a` decides what "nothing to list" means.
+    const auto listed = [&](const runtime_instance* inst)
+    { return all || inst->get_state() == runtime_running; };
+
+    if (std::none_of(runtimes.begin(), runtimes.end(),
+                     [&](const auto& p) { return listed(p.second.get()); }))
+        return 0;
+
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_uptime || col_conn || col_owner || col_created;
 
@@ -1347,19 +1400,26 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         bool first = true;
         for (const auto& [name, instance] : runtimes)
         {
-            if (instance->get_state() != runtime_running)
+            if (!listed(instance.get()))
                 continue;
             if (!first) out << ",";
             first = false;
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
+            const bool running = instance->get_state() == runtime_running;
+            // The literal "running" used to be written here because every row
+            // this could print was running.  Under -a that would be a row for a
+            // failed runtime claiming to be up, which is worse than no row.
+            // uptime goes empty for the same reason: a runtime that never
+            // started has no start time to measure from.
             out << "{\"id\":\"" << instance->get_id()
                 << "\",\"name\":\"" << name
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
-                << ",\"status\":\"running"
-                << "\",\"uptime\":\"" << format_uptime(instance->get_start_time())
+                << ",\"status\":\"" << state_json(instance->get_state())
+                << "\",\"uptime\":\""
+                << (running ? format_uptime(instance->get_start_time()) : std::string())
                 << "\",\"connections\":" << instance->get_connection_count()
                 << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
                 << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
@@ -1387,7 +1447,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 
         for (const auto& [name, instance] : runtimes)
         {
-            if (instance->get_state() != runtime_running)
+            if (!listed(instance.get()))
                 continue;
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
@@ -1397,7 +1457,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
                 << std::setw(6)  << instance->get_connection_count()
                 << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
-                << std::setw(20) << format_uptime(instance->get_start_time())
+                << std::setw(20) << state_column(instance.get())
                 << format_time_ago(instance->get_created_time()) << "\n";
         }
     }
@@ -1420,7 +1480,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 
         for (const auto& [name, instance] : runtimes)
         {
-            if (instance->get_state() != runtime_running)
+            if (!listed(instance.get()))
                 continue;
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
@@ -1432,7 +1492,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             if (col_port)    col(port > 0 ? std::to_string(port) : "-");
             if (col_conn)    col(std::to_string(instance->get_connection_count()));
             if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
-            if (col_uptime)  col(format_uptime(instance->get_start_time()));
+            if (col_uptime)  col(state_column(instance.get()));
             if (col_created) col(format_time_ago(instance->get_created_time()));
             out << '\n';
         }

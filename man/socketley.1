@@ -675,12 +675,36 @@ With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
 .BR \-\-group .
 .RE
 .TP
-.B ps \fR[\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fB\-\-silent\fR | \fB\-s\fR] [\fIcolumns\fR]
+.B ps \fR[\fB\-a\fR | \fB\-\-all\fR] [\fB\-\-json\fR | \fB\-j\fR | \fB\-\-format json\fR] [\fB\-\-silent\fR | \fB\-s\fR] [\fIcolumns\fR]
 List only running runtimes. Same format as
 .BR ls .
 With \fB\-\-json\fR, outputs a JSON array (includes uptime field).
 With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
 .RS
+.PP
+A runtime that did not come up is in state
+.BR failed ,
+and
+.B ps
+does not list it \(em so a runtime that failed to start produces no row here,
+and if nothing else is running, no output at all. That is the state you go
+looking for when something did not start, so look for it with
+.B ps \-a
+or
+.BR ls .
+.PP
+.B \-a\fR, \fB\-\-all
+.br
+List runtimes in every state, not only
+.BR running .
+The STATUS column then carries the state
+.RB ( Created ,
+.BR Stopped ,
+.BR Failed )
+in place of an uptime, and \fB\-\-json\fR reports it in the \fBstatus\fR field.
+Bare
+.B ps
+is unchanged, so anything parsing it keeps seeing running runtimes only.
 .PP
 .B Column selectors:
 .BR \-\-id ,
