@@ -99,7 +99,19 @@ jobs:
           # Prove the binary is actually instrumented.  A Sanitize build that
           # silently lost its flags runs the whole suite and finds nothing,
           # which looks exactly like a clean run.
-          if ! nm -C bin/Sanitize/socketley 2>/dev/null | grep -q '__asan_'; then
+          #
+          # NOT `grep -q`.  `grep -q` exits at its first match, which hands `nm`
+          # a SIGPIPE; under `set -o pipefail` the pipeline then reports 141 and
+          # this `if !` takes the "no ASan symbols" branch precisely when the
+          # symbols were there.  Measured on a 25k-line producer: pattern
+          # present, no pipefail -> 0; pattern present, pipefail -> 141.  This
+          # step is safe today only because GitHub Actions runs `run:` blocks as
+          # `bash -e` without pipefail -- but three other blocks in this same
+          # file open with `set -o pipefail`, so the gate that decides whether
+          # the whole sanitizer job means anything is one copied line away from
+          # inverting.  grep without -q reads to the end, so the status is
+          # grep's, whatever the shell options are.
+          if ! nm -C bin/Sanitize/socketley 2>/dev/null | grep '__asan_' >/dev/null; then
             echo "bin/Sanitize/socketley has no ASan symbols — it was not built with sanitizers."
             exit 1
           fi
@@ -705,7 +717,11 @@ jobs:
         # where the invariants held.
         run: |
           test -x bin/Debug/socketley || { echo "no bin/Debug/socketley"; exit 1; }
-          if ! strings bin/Debug/socketley | grep -q 'nothing in flight on either half'; then
+          # NOT `grep -q` -- see the ASan verification step above.  `strings` on
+          # this binary is 25k lines, so `grep -q` exiting at the first match
+          # reliably kills it with SIGPIPE; the only reason this reads correctly
+          # today is that GitHub Actions does not set pipefail for `run:`.
+          if ! strings bin/Debug/socketley | grep 'nothing in flight on either half' >/dev/null; then
             echo "The invariant messages are not in the binary: SOCKETLEY_INVARIANTS did not reach the compiler."
             echo "This job would have reported success while checking nothing."
             exit 1
@@ -859,7 +875,10 @@ jobs:
           cd make && make config=tsan_x64 -j"$(nproc)"
           cd ..
           test -x bin/TSan/socketley || { echo "no bin/TSan/socketley"; exit 1; }
-          if ! nm -C bin/TSan/socketley 2>/dev/null | grep -q '__tsan_'; then
+          # NOT `grep -q` -- see the ASan verification step above.  Same shape,
+          # same producer, same one-line distance from reporting "not built with
+          # -fsanitize=thread" about a binary that is.
+          if ! nm -C bin/TSan/socketley 2>/dev/null | grep '__tsan_' >/dev/null; then
             echo "bin/TSan/socketley has no TSan symbols — it was not built with -fsanitize=thread."
             exit 1
           fi
