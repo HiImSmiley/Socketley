@@ -149,12 +149,15 @@ if printf '%s' "$PSA" | grep -q "upsrv"; then ok; else
         "-a replaced the listing instead of widening it: ${PSA:-<nothing>}"
 fi
 
-if printf '%s' "$PSA" | grep -q '"name":"upsrv"' || \
-   printf '%s' "$("$BIN" ps -a --json 2>&1)" | grep -q '"name":"upsrv","type":"server".*"status":"running"'; then
+# Asked of the same snapshot as the brokencli row above, and in the same shape,
+# so that "one row went to its real state" and "the other stayed running" are
+# two readings of one listing rather than two listings taken a moment apart.
+if printf '%s' "$PSAJ" | grep -q '"name":"upsrv","type":"server","port":[0-9]*,"status":"running"'; then
     ok
 else
     bad "ps -a --json still reports a running runtime as running" \
-        "got: $PSAJ"
+        "expected upsrv with status running; got:" \
+        "  ${PSAJ:-<no output at all>}"
 fi
 
 # ─── 5. the documentation says where to look ─────────────────────────────────
@@ -164,16 +167,14 @@ fi
 MAN=$HERE/../../man/socketley.1
 HELP=$HERE/../../man/socketley-help.sh
 
-if grep -q '^\.B ps \\fR\[\\fB\\-a\\fR' "$MAN" 2>/dev/null || \
-   grep -qE '^\\fB\\-a\\fR, \\fB\\-\\-all\\fR' "$MAN" 2>/dev/null; then
+if grep -q '^\.B ps \\fR\[\\fB\\-a\\fR' "$MAN" 2>/dev/null; then
     ok
 else
     bad "the man page documents ps -a" \
         "the ps synopsis in man/socketley.1 does not mention -a/--all"
 fi
 
-if grep -q "failed" "$MAN" && \
-   awk '/^\.B ps /,/^\.SS|^\.SH/' "$MAN" | grep -qi "failed"; then
+if awk '/^\.B ps /,/^\.SS|^\.SH/' "$MAN" | grep -qi "failed"; then
     ok
 else
     bad "the man page says a failed runtime is not in bare ps" \
