@@ -450,9 +450,20 @@ struct mesh_config
 // evidence is taken out of rotation for every client.
 struct async_health_check
 {
+    // Ciphertext in, on a probe whose backend leg is TLS.  Deliberately larger
+    // than `buf`: a server's first flight is a certificate chain, and reading
+    // one a quarter of a kilobyte at a time costs a completion per quarter
+    // kilobyte.  Nothing is allocated for it on a cleartext probe.
+    static constexpr size_t TLS_READ_SIZE = 4096;
+
     int fd{-1};
     size_t backend_idx{0};
-    enum phase : uint8_t { idle, connecting, writing, reading, done };
+    // connecting → (tls_writing ⇄ tls_reading)* → writing → reading.
+    // The two tls_ phases exist only on an encrypted leg and only until the
+    // handshake finishes; the request and its answer then run through the same
+    // writing/reading pair a cleartext probe uses, one record layer lower.
+    enum phase : uint8_t { idle, connecting, tls_writing, tls_reading,
+                           writing, reading, done };
     phase current{idle};
     // Whether the ring still owes this probe a completion.  `current` cannot
     // answer that: the deadline moves a probe to `done` while its operation is
@@ -462,7 +473,33 @@ struct async_health_check
     // The connect target, kept apart from the response buffer it used to share.
     struct sockaddr_in addr{};
     char buf[256];
+    // How much of `buf` holds decrypted response bytes.  A status line can
+    // arrive split across two records, and a verdict read off the first of them
+    // would call a healthy backend dead for answering in two pieces.
+    uint16_t plain_len{0};
     std::string write_buf;
+    // How much of write_buf has reached the wire.  A short write is ordinary
+    // and was previously treated as a completed one: mid-handshake that is a
+    // record stream with a hole in it, and mid-request a truncated GET.
+    size_t write_off{0};
+
+    // ── the record layer, when this backend is reached over TLS ──
+    //
+    // The same memory BIO pair the data path uses — see start_backend_tls —
+    // driven one completion at a time by this probe's own operations.  No SQE
+    // ever names the SSL or its BIOs: ciphertext is copied into cipher_in and
+    // out into write_buf before anything is submitted, and both of those belong
+    // to this struct.  That is what makes the session safe to release exactly
+    // when the struct is, which is what the destructor below does — and why it
+    // is a destructor rather than a call in drop_health_check().  A probe with
+    // an operation still in flight is not released there at all; it is handed
+    // to retire(), which holds this same object until the completion lands.
+    // One free reachable from both paths, and it cannot be forgotten on either.
+    SSL* ssl{nullptr};
+    tls_conn_state tls_state{tls_conn_none};
+    std::string cipher_in;
+
+    ~async_health_check() { tls_context::free_ssl(ssl); }
 };
 
 // Connection pool entry for backend reuse
@@ -1066,6 +1103,21 @@ private:
     // Give up on a probe: retire it if the ring still owes it a completion,
     // release it otherwise, and leave the slot empty for the next sweep.
     void drop_health_check(size_t idx);
+    // The probe's three submissions, in one place each because every step of it
+    // now has two spellings — one per leg — and the difference is confined to
+    // these.  All three report whether the submission reached the ring; a
+    // caller that ignores that leaves a probe waiting for a completion that
+    // cannot come, and the slot stays occupied until the next sweep drops it.
+    bool health_submit_write(async_health_check* hc);
+    bool health_submit_read(async_health_check* hc);
+    // One turn of an encrypted probe: whatever the session now owes the wire
+    // goes out, and when it owes nothing the peer speaks next.  Picks the
+    // phase from tls_state, so the same function drives the handshake and the
+    // request that follows it.
+    bool health_tls_arm(async_health_check* hc);
+    // Inbound ciphertext from cipher_in into the read BIO.  False is fatal for
+    // the probe by contract, exactly as it is for a connection.
+    bool health_tls_feed(async_health_check* hc, int len);
 
     // C++ proxy intercept hooks
     proxy_hook m_cb_on_proxy_request;

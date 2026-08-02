@@ -26,15 +26,20 @@
 #   that fails either check is answered 502 (or retried, with --retry) and is
 #   charged to its circuit breaker -- the request is never re-sent in the clear.
 #
-# TWO COSTS WORTH KNOWING
+# ONE COST WORTH KNOWING
 #   * A TLS backend connection is never returned to the connection pool, so
 #     each request to one pays for a handshake. The pool is keyed by host and
 #     port, and a TLS connection carries a session and a verified identity
 #     that a host and a port cannot express; handing one to the next request
 #     would be a guess about who the peer is.
-#   * --health-check http is refused against a TLS backend: a plaintext GET at
-#     a TLS port fails, so every backend would be marked unhealthy while they
-#     were all fine. Use --health-check tcp.
+#
+# HEALTH CHECKS OVER TLS
+#   --health-check http works against a TLS backend. The probe handshakes
+#   through the same record layer the data path uses and fetches --health-path
+#   over it, so it can tell a listening socket from a working server -- which
+#   --health-check tcp cannot. It verifies the backend's certificate to the
+#   same standard as well: one that does not verify is marked unhealthy, never
+#   reported healthy.
 #
 # USAGE:
 #   ./tls-proxy.sh
@@ -148,11 +153,6 @@ echo "      #              authenticate nobody"
 echo ""
 echo "  socketley create proxy oops -p 8445 --backend b:1 --client-cert c.pem"
 echo "      # --client-cert: needs --client-key <file> as well"
-echo ""
-echo "  socketley create proxy oops -p 8445 --backend https://b:1 \\"
-echo "      --ca ca.pem --health-check http"
-echo "      # starts nothing: an HTTP probe against a TLS backend would mark"
-echo "      # every backend unhealthy.  Use --health-check tcp."
 echo ""
 echo "And a backend whose certificate does not verify is answered 502 with the"
 echo "reason logged by the daemon -- never a cleartext retry."

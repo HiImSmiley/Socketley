@@ -1090,19 +1090,12 @@ bool proxy_instance::setup(event_loop& loop)
 
     if (any_backend_tls)
     {
-        // An HTTP health probe writes a plaintext GET straight at the backend
-        // socket, which a TLS backend answers with a handshake failure — so
-        // every backend would be marked unhealthy and the proxy would refuse
-        // every request while the backends were all fine.  Refusing to start
-        // says which two options disagree; coming up would look like an
-        // outage in the backends.
-        if (m_mesh.health_check == mesh_config::health_http)
-        {
-            LOG_ERROR("proxy: --health-check http probes a TLS backend in cleartext and "
-                      "would mark every backend unhealthy -- use --health-check tcp");
-            return false;
-        }
-
+        // --health-check http used to be refused here, because the probe wrote
+        // a plaintext GET straight at the backend socket and a TLS backend
+        // answers that with a handshake failure: every backend would have been
+        // marked unhealthy while they were all fine.  The probe handshakes now
+        // — see handle_health_cqe — so the refusal is gone and the only thing
+        // left to say is that the context below is what it verifies against.
         auto ctx = std::make_unique<tls_context>();
         // --ca is this leg's trust store; without one the system store is used.
         // Either way the chain is verified and the endpoint's name is checked
@@ -6624,6 +6617,88 @@ void proxy_instance::drop_health_check(size_t idx)
     retire(std::shared_ptr<void>(std::move(probe)), owed, n);
 }
 
+bool proxy_instance::health_submit_write(async_health_check* hc)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || hc->fd < 0 ||
+                           hc->write_off >= hc->write_buf.size()))
+        return false;
+    hc->req.type = op_health_check;
+    hc->op_pending = true;
+    const size_t left = hc->write_buf.size() - hc->write_off;
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(hc->fd,
+                                                 hc->write_buf.data() + hc->write_off,
+                                                 static_cast<uint32_t>(left), &hc->req)))
+    {
+        hc->op_pending = false;
+        return false;
+    }
+    return true;
+}
+
+bool proxy_instance::health_submit_read(async_health_check* hc)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || hc->fd < 0))
+        return false;
+    // Ciphertext goes into the probe's own buffer, plaintext into the one the
+    // verdict is read out of.  Either way it is memory this struct owns and
+    // retire() holds for as long as the ring can reach it.
+    char* dst = hc->ssl ? hc->cipher_in.data() : hc->buf;
+    const size_t len = hc->ssl ? hc->cipher_in.size() : sizeof(hc->buf) - 1;
+    if (SOCKETLEY_UNLIKELY(len == 0))
+        return false;
+    hc->req.type = op_health_check;
+    hc->op_pending = true;
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(hc->fd, dst,
+                                                static_cast<uint32_t>(len), &hc->req)))
+    {
+        hc->op_pending = false;
+        return false;
+    }
+    return true;
+}
+
+bool proxy_instance::health_tls_feed(async_health_check* hc, int len)
+{
+    size_t off = 0;
+    while (off < static_cast<size_t>(len))
+    {
+        const int n = tls_context::bio_write_in(hc->ssl, hc->cipher_in.data() + off,
+                                                static_cast<int>(static_cast<size_t>(len) - off));
+        if (SOCKETLEY_UNLIKELY(n <= 0))
+            return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool proxy_instance::health_tls_arm(async_health_check* hc)
+{
+    hc->write_buf.clear();
+    hc->write_off = 0;
+
+    char out[async_health_check::TLS_READ_SIZE];
+    for (;;)
+    {
+        const int n = tls_context::bio_read_out(hc->ssl, out, sizeof(out));
+        if (n <= 0)
+            break;
+        hc->write_buf.append(out, static_cast<size_t>(n));
+    }
+
+    // Which pair of phases this belongs to is not remembered anywhere: it is
+    // read off the session's own state, which the handshake sets exactly once.
+    const bool shaking = (hc->tls_state == tls_conn_handshake);
+    if (!hc->write_buf.empty())
+    {
+        hc->current = shaking ? async_health_check::tls_writing
+                              : async_health_check::writing;
+        return health_submit_write(hc);
+    }
+    hc->current = shaking ? async_health_check::tls_reading
+                          : async_health_check::reading;
+    return health_submit_read(hc);
+}
+
 void proxy_instance::health_check_sweep()
 {
     // Skip if previous checks are still in flight
@@ -6807,20 +6882,65 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
         }
 
         auto& b = m_backends[idx];
+
+        // An HTTPS probe is this same probe one layer down.  The request is the
+        // same GET, the verdict is read off the same status line, and what
+        // changes is that the bytes on the wire are TLS records — and that the
+        // backend has to prove who it is before it can be called healthy at
+        // all.  That last part is not a side effect: a probe that accepted any
+        // certificate would report a backend healthy that the data path is
+        // about to refuse to send a request to, and an operator would be
+        // looking at a rotation full of endpoints nothing can reach.
+        //
+        // Same session factory as the data path — create_ssl_client, which
+        // will not build a session without a name to pin it to — so the chain
+        // is checked against --ca or the system store, the certificate against
+        // this endpoint's own name, TLS 1.2 minimum, with nothing to switch
+        // off.  Same memory BIO pair, same io_uring submissions, and the
+        // handshake advanced one completion at a time.
+        if (b.tls)
+        {
+            // No trust store, or no name to pin: this proxy cannot verify
+            // anything here, so it records nothing rather than charging the
+            // peer for a question it was never asked.  Neither is reachable
+            // from a started proxy — start() builds the context whenever any
+            // backend is TLS, and a backend that did not resolve is skipped by
+            // the sweep — which is why they cost the backend nothing.
+            if (SOCKETLEY_UNLIKELY(!m_backend_tls || b.resolved_host.empty()))
+            {
+                drop_health_check(slot);
+                return;
+            }
+
+            hc->ssl = m_backend_tls->create_ssl_client(b.resolved_host);
+            if (SOCKETLEY_UNLIKELY(!hc->ssl))
+            {
+                drop_health_check(slot);
+                return;
+            }
+            hc->tls_state = tls_conn_handshake;
+            hc->cipher_in.resize(async_health_check::TLS_READ_SIZE);
+
+            // The first turn produces the ClientHello and nothing else; the
+            // peer speaks next.  A negative here is local — no memory, no
+            // usable cipher — rather than a rejection, because there is
+            // nothing on the wire yet to be rejected.
+            if (SOCKETLEY_UNLIKELY(tls_context::do_handshake(hc->ssl) < 0) ||
+                SOCKETLEY_UNLIKELY(!health_tls_arm(hc)))
+                drop_health_check(slot);
+            return;
+        }
+
         hc->write_buf = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
                         b.resolved_host + "\r\nConnection: close\r\n\r\n";
+        hc->write_off = 0;
         hc->current = async_health_check::writing;
-        hc->req.type = op_health_check;
-        hc->op_pending = true;
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(hc->fd, hc->write_buf.data(),
-                                 static_cast<uint32_t>(hc->write_buf.size()), &hc->req)))
-        {
-            // Our shortage, not the backend's: no verdict is recorded.
-            hc->op_pending = false;
+        // Our shortage, not the backend's: no verdict is recorded.
+        if (SOCKETLEY_UNLIKELY(!health_submit_write(hc)))
             drop_health_check(slot);
-        }
     }
-    else if (hc->current == async_health_check::writing)
+    else if (hc->current == async_health_check::tls_writing ||
+             hc->current == async_health_check::writing)
     {
         if (cqe->res <= 0)
         {
@@ -6829,21 +6949,127 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
             return;
         }
 
-        // Write succeeded — read response.  Into the probe's own buffer, which
-        // nothing else shares: the connect address has a field of its own.
-        hc->current = async_health_check::reading;
-        hc->req.type = op_health_check;
-        hc->op_pending = true;
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(hc->fd, hc->buf, sizeof(hc->buf) - 1, &hc->req)))
+        // A short write is ordinary and used to be treated as a completed one.
+        // Mid-handshake that leaves the record stream with a hole in it and the
+        // peer answering an alert; mid-request it leaves a truncated GET the
+        // backend answers 4xx to.  Both would be recorded against the backend,
+        // and neither is the backend's doing.
+        hc->write_off += static_cast<size_t>(cqe->res);
+        if (SOCKETLEY_UNLIKELY(hc->write_off < hc->write_buf.size()))
         {
-            hc->op_pending = false;
-            drop_health_check(slot);
+            if (SOCKETLEY_UNLIKELY(!health_submit_write(hc)))
+                drop_health_check(slot);
+            return;
         }
+
+        // Read the answer.  Into the probe's own buffer, which nothing else
+        // shares: the connect address has a field of its own.
+        hc->current = (hc->tls_state == tls_conn_handshake)
+                    ? async_health_check::tls_reading
+                    : async_health_check::reading;
+        if (SOCKETLEY_UNLIKELY(!health_submit_read(hc)))
+            drop_health_check(slot);
+    }
+    else if (hc->current == async_health_check::tls_reading)
+    {
+        // A peer that closes or errors in the middle of a handshake has failed
+        // this probe: it is the same peer the data path would have to give up
+        // on, and the request that found out would be answered 502.
+        if (cqe->res <= 0 || SOCKETLEY_UNLIKELY(!health_tls_feed(hc, cqe->res)))
+        {
+            record(false);
+            drop_health_check(slot);
+            return;
+        }
+
+        const int r = tls_context::do_handshake(hc->ssl);
+        if (r < 0)
+        {
+            // Every verification failure lands here — an unknown CA, an expired
+            // chain, a certificate that is not valid for the name this endpoint
+            // was configured under — along with a peer that refused outright.
+            // A backend this proxy would not send a request to is not a healthy
+            // backend, and recording it as one is the exact hole this probe was
+            // not allowed to become.  do_handshake has already logged which.
+            record(false);
+            drop_health_check(slot);
+            return;
+        }
+        if (r == 0)
+        {
+            // Another round.  Its records go out below if it produced any, and
+            // it is the peer's turn again if it did not.
+            if (SOCKETLEY_UNLIKELY(!health_tls_arm(hc)))
+                drop_health_check(slot);
+            return;
+        }
+
+        hc->tls_state = tls_conn_ready;
+        if (SOCKETLEY_UNLIKELY(idx >= m_backends.size()))
+        {
+            drop_health_check(slot);
+            return;
+        }
+
+        const std::string request = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
+                                    m_backends[idx].resolved_host +
+                                    "\r\nConnection: close\r\n\r\n";
+        // Partial writes are not enabled on this context, so this is
+        // all-or-nothing; a short count would mean the record layer and this
+        // probe disagree about what was sent.  Either way it is local, so no
+        // verdict is recorded on it.
+        const int w = tls_context::ssl_write(hc->ssl, request.data(),
+                                             static_cast<int>(request.size()));
+        if (SOCKETLEY_UNLIKELY(w <= 0 || static_cast<size_t>(w) != request.size()) ||
+            SOCKETLEY_UNLIKELY(!health_tls_arm(hc)))
+            drop_health_check(slot);
     }
     else if (hc->current == async_health_check::reading)
     {
         bool got_2xx = false;
-        if (cqe->res > 12)
+
+        if (hc->ssl)
+        {
+            if (cqe->res <= 0 || SOCKETLEY_UNLIKELY(!health_tls_feed(hc, cqe->res)))
+            {
+                record(false);
+                drop_health_check(slot);
+                return;
+            }
+
+            // Decrypt everything the record layer now has.  Accumulated rather
+            // than judged per read: a status line split across two records is
+            // ordinary, and a verdict taken off the first of them would call a
+            // healthy backend dead for answering in two pieces.
+            bool peer_done = false;
+            while (hc->plain_len < sizeof(hc->buf) - 1)
+            {
+                const int n = tls_context::ssl_read(
+                    hc->ssl, hc->buf + hc->plain_len,
+                    static_cast<int>(sizeof(hc->buf) - 1 - hc->plain_len));
+                if (n > 0)
+                {
+                    hc->plain_len = static_cast<uint16_t>(hc->plain_len + n);
+                    continue;
+                }
+                // Below zero is the peer's close_notify or a record this
+                // session cannot use; either way nothing more is coming.
+                peer_done = (n < 0);
+                break;
+            }
+
+            if (hc->plain_len <= 12 && !peer_done)
+            {
+                // Not enough of the status line yet.  The sweep's own 500 ms
+                // deadline is what bounds this, exactly as it bounds every
+                // other step of the probe.
+                if (SOCKETLEY_UNLIKELY(!health_submit_read(hc)))
+                    drop_health_check(slot);
+                return;
+            }
+            got_2xx = (hc->plain_len > 12 && hc->buf[9] == '2');
+        }
+        else if (cqe->res > 12)
         {
             hc->buf[cqe->res] = '\0';
             if (hc->buf[9] == '2')

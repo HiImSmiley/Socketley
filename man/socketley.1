@@ -1494,15 +1494,15 @@ is answered 502 (or retried, where
 is set) and is charged to its circuit breaker \(em the request is never sent
 in the clear as a fallback.
 .PP
-Two costs come with the backend leg. Connections to a TLS backend are
+One cost comes with the backend leg. Connections to a TLS backend are
 .B not pooled,
 so each request pays for a handshake: a pooled socket is handed out on a host
 and a port, which cannot express the session and peer identity a TLS
-connection carries. And
+connection carries.
 .B \-\-health\-check http
-is refused alongside it, because a plaintext probe against a TLS port would
-mark every backend unhealthy; use
-.BR "\-\-health\-check tcp" .
+works alongside it and probes over TLS, verifying the backend's certificate to
+the same standard the data path does \(em a backend it cannot verify is marked
+unhealthy rather than reported healthy.
 .SS Sidecar Mode
 .TP
 .B \-\-sidecar
@@ -3348,7 +3348,7 @@ socketley create proxy secure \-p 8443 \\
     \-\-ca mesh\-ca.pem \\
     \-\-backend https://10.0.0.1:9000 -s
 # Backend connections are not pooled: one handshake per request.
-# --health-check http is refused against a TLS backend; use tcp.
+# --health-check http probes over TLS and verifies the backend too.
 .fi
 .PP
 TLS to the backend only \(em the proxy listens in cleartext on loopback and
@@ -4346,12 +4346,24 @@ presenting a certificate to a backend that asks for one. A TLS backend
 connection is always verified, against
 .B \-\-ca
 or the system store, with the endpoint's name checked and TLS 1.2 as the
-minimum version; there is no option to turn that off. Two consequences worth
+minimum version; there is no option to turn that off. One consequence worth
 knowing: such connections are never pooled, so each request pays for a
-handshake, and
+handshake.
+.PP
 .B "\-\-health\-check http"
-is refused against a TLS backend because a plaintext probe would mark every
-backend unhealthy.
+works against a TLS backend and probes it over TLS. The probe runs the same
+record layer the data path does \(em a memory BIO pair, records carried by
+ordinary io_uring submissions, the handshake advanced one completion at a time
+\(em and is held to the same standard: the chain against
+.B \-\-ca
+or the system store, the certificate against the endpoint's own name, TLS 1.2
+minimum. A backend whose certificate does not verify is marked
+.B unhealthy
+rather than reported healthy, which is the only answer that agrees with what
+the data path would do with it. Everything above the record layer is unchanged:
+the same
+.BI \-\-health\-path " path"
+is fetched, and only a 2xx counts.
 .PP
 A
 .B client
