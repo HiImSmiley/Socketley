@@ -2963,11 +2963,13 @@ socketley create proxy edge -p 8443 \\
     \-\-sidecar \-s
 .fi
 .PP
-Two things to plan for: a TLS backend connection is never returned to the
-connection pool, so every request to one pays for a handshake, and
+One thing to plan for: a TLS backend connection is never returned to the
+connection pool, so every request to one pays for a handshake.
 .B \-\-health\-check http
-is refused against a TLS backend \(em use
-.BR "\-\-health\-check tcp" .
+works against a TLS backend and probes it over TLS, verified to the same
+standard as the data path \(em see
+.B LIMITATIONS
+for what the probe does and does not establish.
 See
 .B "mTLS Flags"
 under
