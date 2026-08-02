@@ -38,6 +38,7 @@ echo "=== Proxy TCP path — $PASSES passes of $ROUNDS rounds ==="
 announce_environment
 
 total_bad=0
+total_unstable=0
 total_rounds=0
 dirty_passes=0
 
@@ -65,7 +66,7 @@ one_pass() {
         pin_load "$BENCH" proxy concurrent 127.0.0.1 "$((port + 1))" 20 100 >/dev/null 2>&1
     done
 
-    local bad=0 ran=0 out rc first="" first_out=""
+    local bad=0 ran=0 out rc first="" first_out="" unstable=0 first_unstable=""
     local r
     for r in $(seq 1 "$ROUNDS"); do
         out="$(pin_load "$BENCH" proxy concurrent 127.0.0.1 "$((port + 1))" 20 100 2>&1)"
@@ -79,43 +80,72 @@ one_pass() {
             return 2
         fi
         ran=$((ran + 1))
-        # Not `echo "$out" | grep -qi`.  This file runs under `set -o pipefail`
-        # (common.sh) and `grep -q` exits at its first match, which hands echo a
-        # SIGPIPE; the pipeline then reports 141 and this test takes the "no
-        # match" branch precisely when it matched.  It is latent only while the
-        # output is small enough that echo finishes writing first — which stops
-        # being true exactly when a round goes wrong enough to print many
-        # INCOMPLETE lines, so the check would go blind in the case it exists
-        # for.  A here-string has no pipeline and cannot do that.
-        if [ "$rc" -ne 0 ] || grep -qi INCOMPLETE <<<"$out"; then
-            bad=$((bad + 1))
-            if [ -z "$first" ]; then
-                # A round is bad for one of two reasons and only one of them
-                # leaves a line worth quoting.  On 2026-08-02 the nightly failed
-                # this harness with "1 of 120 rounds incomplete" and printed
-                # nothing further: the bench had exited non-zero without an
-                # INCOMPLETE line anywhere, and its output was discarded, so the
-                # log recorded a failure and no way to read it.  Whatever the
-                # reason, the exit code and the tail are kept now.
-                first="$(grep -i INCOMPLETE <<<"$out" | head -1)"
-                [ -z "$first" ] && first="bench exited $rc with no INCOMPLETE line"
-                first_out="$(tail -3 <<<"$out")"
-            fi
-        fi
+
+        # The bench exits 2 for two different reasons and they are not the same
+        # claim.  bench.c raises g_incomplete_runs from
+        #
+        #   INCOMPLETE — a run completed fewer operations than it asked for.
+        #                That is a statement about the proxy: something was sent
+        #                and did not come back.
+        #   UNSTABLE   — the repetitions of one test span more than 100x in
+        #                throughput.  That is a statement about the machine:
+        #                "at least one run measured something other than
+        #                throughput", in bench.c's own words.
+        #
+        # This harness counted both as "rounds incomplete", which is how the
+        # nightly of 2026-08-02 reported `1 of 120 rounds incomplete` for a
+        # round whose bench had printed `Success: 2000  Failed: 0` — every
+        # operation had completed, and the exit code was the stability check
+        # firing on a 2-core shared runner the harness itself declares unfit for
+        # comparison ("this measures the scheduler as much as it measures
+        # socketley").  A machine reading, counted as a product defect.
+        #
+        # Not `echo "$out" | grep -q`: this file runs under `set -o pipefail`
+        # and `grep -q` exits at its first match, handing echo a SIGPIPE, so the
+        # pipeline reports 141 and the test takes the "no match" branch
+        # precisely when it matched.  A here-string has no pipeline.
+        local marker=""
+        marker="$(grep -m1 -E 'socketley-bench: (INCOMPLETE|UNSTABLE)' <<<"$out" || true)"
+
+        case "$marker" in
+            *INCOMPLETE*)
+                bad=$((bad + 1))
+                [ -z "$first" ] && first="$marker"
+                ;;
+            *UNSTABLE*)
+                unstable=$((unstable + 1))
+                [ -z "$first_unstable" ] && first_unstable="$marker"
+                ;;
+            *)
+                # Exited non-zero and said neither.  Unclassified, so it counts
+                # against the proxy: the alternative is a silent exit code, and
+                # this harness has already been red once for a round it could
+                # not describe.
+                if [ "$rc" -ne 0 ]; then
+                    bad=$((bad + 1))
+                    [ -z "$first" ] && {
+                        first="bench exited $rc and printed neither marker"
+                        first_out="$(tail -3 <<<"$out")"
+                    }
+                fi
+                ;;
+        esac
     done
 
     kill "$DAEMON_PID" 2>/dev/null
     wait "$DAEMON_PID" 2>/dev/null
     rm -rf "$rundir"
 
-    printf "  %-10s %2d of %d rounds incomplete   (TIME_WAIT before %s, load %s)%s\n" \
-        "$tag" "$bad" "$ran" "$tw0" "$(awk '{print $1}' /proc/loadavg)" \
+    printf "  %-10s %2d of %d rounds incomplete, %d unstable   (TIME_WAIT before %s, load %s)%s\n" \
+        "$tag" "$bad" "$ran" "$unstable" "$tw0" "$(awk '{print $1}' /proc/loadavg)" \
         "$([ "$dirty" = 1 ] && echo '   [dirty start]')"
     [ -n "$first" ] && echo "      first: $first"
     [ -n "$first_out" ] && { echo "      the bench said, last 3 lines:"; \
         while IFS= read -r l; do echo "        $l"; done <<<"$first_out"; }
+    [ -n "$first_unstable" ] && echo "      unstable: $first_unstable"
 
     total_bad=$((total_bad + bad))
+    total_unstable=$((total_unstable + unstable))
     total_rounds=$((total_rounds + ran))
     dirty_passes=$((dirty_passes + dirty))
     return 0
@@ -136,4 +166,27 @@ note=""
 if [ "$total_bad" -gt "$MAX_BAD" ]; then
     fail "$total_bad of $total_rounds rounds incomplete, tolerated $MAX_BAD$note"
 fi
+
+# An UNSTABLE round is bench.c saying "at least one repetition measured
+# something other than throughput".  Whether that is about socketley depends
+# entirely on whether this machine could be measured at all:
+#
+#   pinned   — the daemon and the load generator have cores of their own, a
+#              100x spread between repetitions of one test is not the scheduler,
+#              and it fails here like any other bad round.
+#   unpinned — announce_environment has already printed that results are NOT
+#              comparable because the two share cores.  A harness that says that
+#              and then fails the build on a spread is asserting the thing it
+#              just disclaimed.  Reported, counted, and not a verdict.
+#
+# This is the whole of the 2026-08-02 nightly failure: one unstable round in 120
+# on a 2-core runner, reported as "1 of 120 rounds incomplete" over a bench that
+# had printed Success: 2000  Failed: 0.
+if [ "$total_unstable" -gt 0 ]; then
+    if [ "${PIN_AVAILABLE:-0}" = 1 ]; then
+        fail "$total_unstable of $total_rounds rounds unstable on a pinned machine$note"
+    fi
+    note="$note ($total_unstable unstable round(s); this machine is unpinned, so that is not a verdict about socketley)"
+fi
+
 pass "$total_rounds rounds, $total_bad incomplete$note"
