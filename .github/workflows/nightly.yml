@@ -554,38 +554,77 @@ jobs:
         #     one.  The report now carries the connection total beside the
         #     since-the-request count, so the claim can be checked against the
         #     wire instead of contradicting it.
-        #     This was NEVER the undiagnosed shape below — there nothing at all
-        #     is written to the client, here a whole answer is — and the two are
-        #     now told apart by the report itself: the undiagnosed one reads
-        #     "0 bytes in total on this connection".
+        #     This was NEVER the shape that used to stand below as undiagnosed —
+        #     there nothing at all is written to the client, here a whole answer
+        #     is — and the two are told apart by the report itself: that one
+        #     read "0 bytes in total on this connection".
         #
-        # AND ONE THAT IS NOT DIAGNOSED, so do not assume it belongs in the list
-        # above.  client-closed-without-answer, in the shape WITHOUT a
-        # half-close: the client is torn down with nothing written to it at all.
-        # Reached by mutation and confirmed to fire identically on an unmodified
-        # build, so it predates the 2026-08-01 fixes and none of them caused it.
-        # It is the same id 84d624c and 984dadc were written for, in the
-        # error-answer path rather than the deadline or the pool, and whether
-        # the proxy owes a 502 there has not been settled.  It is untouched by
-        # the harness fix above, which only ever declines to count a request
-        # written after a Connection: close the client has read: here there is
-        # no response, so there is no announcement, so the ledger is not frozen
-        # and the finding stands.  Read the total in the report to tell them
-        # apart — this one says "0 bytes in total on this connection".
-        # Not demoted: an id demoted for an undiagnosed shape silences every
-        # other shape it covers, and this id covers the loss those two commits
-        # fixed.
+        # THE SHAPE THAT WAS UNDIAGNOSED IS NO LONGER REACHED, and its entry is
+        # gone rather than reworded.  It was client-closed-without-answer with
+        # nothing at all on the client's wire, and 1eb7d53 left it here with the
+        # sentence "whether the proxy owes a 502 there has not been settled".
+        # ea10b66 settled it and shipped the answer: a backend that refused gets
+        # 502, a shortage belonging to this machine (EADDRNOTAVAIL, EMFILE,
+        # ENOBUFS, ENOMEM, ENFILE, EADDRINUSE) gets 503, no backend at all gets
+        # 503, and TCP mode closes in silence because there is no request and no
+        # status line on that path.  Thirteen paths changed answer and five of
+        # them had answered nothing at all before — which is exactly the class
+        # this shape lived in.
         #
-        # A THIRD SHAPE UNDER THE SAME ID, found while the above was being
-        # checked and left standing on purpose.  The backend answers with no
-        # status line, the proxy forwards 37 bytes of it to the client, the
-        # backend half-closes, and the client — never told the connection was
-        # ending, because nothing the proxy sent said so — asks again and is
-        # closed in silence.  It fires identically before and after the harness
-        # change.  Either the proxy owes an answer to the second request or it
-        # owes a Connection: close on the first; the report reads "received 0
-        # bytes ... (37 bytes in total on this connection)", which is now exactly
-        # what happened.  Not diagnosed further here.
+        # REPLAYED 2026-08-02 to find out rather than to assume.  GCC replay
+        # driver, Sanitize, the 67 tracked proxy seeds, FUZZ_PROXY_SKIP empty,
+        # seeds 1-24 at 45 s of blind mutation each.  Not one report reads
+        # "0 bytes in total".  client-closed-without-answer still fires — seeds
+        # 5, 7, 13, 20 and 23 — and every one of them carries 37, 71 or 112
+        # bytes, which is the shape below and a different defect under the same
+        # id.  Seeds 9, 21 and 24 reach request-on-unfinished-socket, already
+        # recorded as STILL OPEN above.
+        #
+        # AND THE ORACLE WAS WATCHED FAILING, because "not reached" from a check
+        # nobody has seen fail is not a finding.  Rebuild with
+        # answer_gateway_failure returning false and changing nothing else:
+        # FUZZ_SEED=1, 30 s, the report comes straight back — "sent 1 complete
+        # request(s) and then half-closed and received 0 bytes before the proxy
+        # closed it (0 bytes in total on this connection)", under
+        # answer-lost-to-a-half-close, its sibling from the same reporting
+        # function.  So the instrument that says "the proxy wrote nothing to
+        # this client" is alive and is answering that function.  Worth knowing
+        # for next time: with the half-close sibling demoted, that same broken
+        # build reaches only 37 and 71 bytes under client-closed-without-answer
+        # itself, so the non-half-close 0-byte shape is not in the mutation
+        # space around these seeds at this budget, with the answers or without
+        # them.  This is not proof the loss cannot happen.  If a "0 bytes in
+        # total" report does come back, answer_gateway_failure declined — read
+        # response_started first, because that is the one thing inside it that
+        # still refuses on purpose.
+        #
+        # THE SHAPE THAT IS STILL OPEN, and it is the only one of the three.
+        # The backend answers something the proxy cannot frame — no status line,
+        # or a header block with a bare LF — the proxy forwards those bytes to
+        # the client, the backend half-closes, and the client, never told the
+        # connection was ending because nothing the proxy sent said so, asks
+        # again and is closed in silence.  Fires on this tree: seeds 5 and 23 at
+        # 37 bytes, 7 and 13 at 71, 20 at 112, and seed 3 at 112 over a 60 s
+        # budget.
+        # THE QUESTION THIS ENTRY USED TO CARRY IS ANSWERED, and the answer is
+        # neither of the two it offered.  ea10b66 traced it: those bytes are not
+        # a response.  http_response_scan_chunk finds no CRLFCRLF in them, so
+        # headers_parsed is false and `unknown` is false — the proxy is in "the
+        # rest of this header block is still coming" state, not in
+        # "close-delimited response" state.  It cannot owe a Connection: close
+        # on the first response because there is no first response to attach a
+        # field to, and this proxy has no response header rewriter to attach one
+        # with — backend bytes are forwarded verbatim, which is what makes
+        # responses stream.  It cannot answer the second request either: a
+        # status line written behind those bytes lands at an offset the proxy
+        # has itself established is not a message boundary, the client-side twin
+        # of the fault efdbabd fixed in the pool direction, and response_started
+        # bars it.  So the answering policy exists and this shape escapes it on
+        # purpose.
+        # WHAT IS PAID INSTEAD is the breaker charge ea10b66 added: the client
+        # on that request is lost and nothing can be done for it, and the next
+        # one is routed somewhere else.  The id stays open because bounding how
+        # many clients a loss happens to is not removing the loss.
         #
         # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
         # one of the harness's checks: it is socketley/shared/invariants.h
