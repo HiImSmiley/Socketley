@@ -37,6 +37,30 @@ echo "Testing binary: $SYS_BIN"
 # Use a fixed test socket path (avoids system-mode path resolution issues)
 export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
 
+# ...and a HOME of this run's own, because the socket is not the only path the
+# daemon resolves.  SOCKETLEY_SOCKET moves the socket; the state directory comes
+# from HOME, so a shared daemon started with only the socket overridden persists
+# into the developer's real ~/.local/share/socketley/runtimes.  Measured, with
+# nothing but SOCKETLEY_SOCKET set:
+#
+#     $ socketley create server sl_probe_tmp -p 19883 -s
+#     $ ls ~/.local/share/socketley/runtimes/
+#     sl_probe_tmp.json
+#
+# Two ways that costs somebody a morning.  A runtime a test fails to remove is
+# left in the developer's own inventory, where their own daemon restores it on
+# its next start.  And in the other direction, a developer whose runtimes are
+# marked was_running has them restored BY THIS SUITE at the moment the shared
+# daemon comes up — real services binding their real ports, in the middle of a
+# test run, reported afterwards as a port collision in whichever test was
+# unlucky.  The suite has been chasing exactly that shape of contamination.
+#
+# The directory is this run's alone and goes with it.  The individual tests that
+# call daemon_isolate already set their own HOME and are unaffected.
+SUITE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/socketley-suite-home.XXXXXX") || {
+    echo "ERROR: could not create a private HOME for this run"; exit 1; }
+export HOME="$SUITE_HOME"
+
 # Kill every daemon running THIS binary.
 #
 # Identity is the executable behind the process, read out of /proc/<pid>/exe,
@@ -71,6 +95,15 @@ cleanup() {
     fi
     sweep_own_daemons
     rm -f "$SOCKETLEY_SOCKET"
+    # After the daemons are gone, never before: the private HOME holds their
+    # state directory, and removing it out from under a live daemon is the
+    # "answers for a state directory that has been deleted underneath it" case
+    # this backstop exists to prevent.  Guarded on the name it was created with
+    # so that an unset or inherited value cannot turn this into rm -rf on
+    # somebody's home directory.
+    case "${SUITE_HOME:-}" in
+        */socketley-suite-home.*) rm -rf "$SUITE_HOME" ;;
+    esac
 }
 trap cleanup EXIT
 
