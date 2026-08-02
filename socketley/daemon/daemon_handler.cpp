@@ -811,6 +811,33 @@ int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
 
     bool autostart = false;
 
+    // ─── One flag has to be known before the others are read ────────────────
+    //
+    // --lua is acted on the moment it is parsed, and what it does depends on
+    // whether this runtime will live in a worker: an out-of-process placeholder
+    // compiles the script and discards it, an in-process runtime loads and runs
+    // it (see runtime_instance::load_lua_script).  Flags arrive in whatever
+    // order the operator typed them, so `--lua x --out-of-process` would
+    // otherwise have executed the script in the daemon before anyone knew it
+    // belonged to a worker -- and `--out-of-process --lua x` would not.  A
+    // create whose behaviour depends on argument order is a bug waiting for
+    // someone to reorder a command line.
+    //
+    // Scanned rather than reordered: the flag takes no value, so finding it is
+    // exact, and marking early is idempotent with the case below that marks it
+    // again when the loop reaches it.
+    if (type == runtime_proxy)
+    {
+        for (size_t i = 3; i < pa.count; ++i)
+        {
+            if (std::string_view(pa.args[i]) == "--out-of-process")
+            {
+                static_cast<proxy_instance*>(instance)->mark_out_of_process();
+                break;
+            }
+        }
+    }
+
     for (size_t i = 3; i < pa.count; ++i)
     {
         int result = parse_common_flags(instance, pa, i, autostart);

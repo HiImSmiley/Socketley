@@ -4426,6 +4426,34 @@ at a status line.
 moves the proxy out of the daemon. What it refuses, and what it costs, is worth
 stating plainly.
 .PP
+.B "The script runs in the worker and nowhere else."
+An out\-of\-process proxy exists twice: the worker that owns the listening socket
+and serves every byte, and a placeholder in the daemon that carries its name,
+port, group and state so
+.BR ls ,
+.B stats
+and the endpoint table have something to answer with. The script belongs to the
+worker. The placeholder compiles it \(em so a file that does not parse is still
+refused by
+.B create
+on the spot, rather than becoming "the worker exited and the runtime is failed"
+\(em and then discards it without executing a line.
+.IP
+It used to load it as well, so every top\-level line ran twice, and the two
+copies did not do the same thing: the daemon's placeholder holds the runtime
+manager and the worker does not, so a top\-level
+.B socketley.create()
+created a runtime from inside the daemon while the identical line in the worker
+was refused.
+.IP
+One thing is given up with it. A script's
+.B routes
+declaration is read from the placeholder, so an out\-of\-process runtime
+publishes none \(em a gateway in front of one forwards to it without the 405 it
+could otherwise refuse at the edge. The declaration is a handler's feature
+rather than a proxy's, and only a proxy can be moved out of process today, so
+nothing that can currently be split declares routes at all.
+.PP
 .B "The cross\-runtime management API is refused inside a worker."
 A worker is a separate process holding one runtime and no runtime manager, so
 .BR socketley.create ,

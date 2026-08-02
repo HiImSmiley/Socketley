@@ -147,6 +147,21 @@ static const char* state_to_string(runtime_state s)
     return "unknown";
 }
 
+bool lua_context::script_compiles(std::string_view path, std::string& err)
+{
+    // Its own state, with nothing registered on it.  load_file compiles the
+    // chunk and leaves it on the stack unexecuted, so no top-level line runs
+    // and there is nothing for a top-level line to reach even if one did.
+    sol::state probe;
+    sol::load_result chunk = probe.load_file(std::string(path));
+    if (chunk.valid())
+        return true;
+
+    sol::error e = chunk;
+    err = e.what();
+    return false;
+}
+
 bool lua_context::load_script(std::string_view path, runtime_instance* owner)
 {
     register_bindings(owner);

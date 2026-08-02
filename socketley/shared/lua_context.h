@@ -23,6 +23,22 @@ public:
     // Load and execute a Lua script, registering callbacks
     bool load_script(std::string_view path, runtime_instance* owner);
 
+    // Compile a script without running a line of it, and say whether it parses.
+    //
+    // For an out-of-process runtime the script belongs to the worker, and the
+    // daemon's placeholder must not execute it -- see
+    // runtime_instance::load_lua_script.  But refusing to run it is not a
+    // reason to stop looking at it: a syntax error is the one thing `create`
+    // could always report immediately, and turning that into "the worker
+    // exited, the runtime is failed" would be a worse message for what is
+    // usually a typo.  So the placeholder compiles and discards.
+    //
+    // Static and owning its own state: it registers no bindings and takes no
+    // runtime, precisely so that nothing a script does at its top level can
+    // reach anything.  A chunk that compiles is not a chunk that is safe to
+    // run -- that judgement stays with the worker, which is where it runs.
+    static bool script_compiles(std::string_view path, std::string& err);
+
     // Get the Lua state (for callback invocation)
     sol::state& state() { return m_lua; }
 
@@ -256,6 +272,8 @@ public:
     ~lua_context() = default;
 
     bool load_script(std::string_view, runtime_instance*) { return true; }
+    // Without Lua there is no chunk to compile, so nothing can fail to.
+    static bool script_compiles(std::string_view, std::string&) { return true; }
     void update_self_state(const char*) {}
 
     bool has_on_start()          const { return false; }

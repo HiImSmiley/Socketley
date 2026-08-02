@@ -419,8 +419,48 @@ void runtime_instance::print_bash_message(std::string_view msg) const
     std::cout << std::endl;
 }
 
+// ─── Whose process does a script belong to? ─────────────────────────────────
+//
+// An out-of-process runtime exists twice: the worker that owns the listening
+// socket and serves every byte, and a placeholder in the daemon that holds its
+// name, port, group and state so `ls`, `stats` and the endpoint table have
+// something to answer with.  The script belongs to the worker.
+//
+// The placeholder used to load it too, so every top-level line ran twice -- and
+// the two copies did not even do the same thing, because the daemon's holds the
+// runtime manager and the worker's does not.  A top-level socketley.create()
+// therefore created a runtime FROM THE PLACEHOLDER while the identical line in
+// the worker was refused, which is the inverse of the asymmetry that was
+// intended: the refusal is there because a worker is not where the inventory
+// is, and the daemon quietly obliging is the same mistake read backwards.
+//
+// The placeholder now compiles the file and discards it.  That keeps the one
+// report `create` could always make -- a script that does not parse is refused
+// on the spot rather than becoming "the worker exited and the runtime is
+// failed" -- without executing a line of it.
+//
+// What the daemon gives up by not running it: a script's `routes` declaration
+// is read from the placeholder's context by publish_endpoints, so an
+// out-of-process runtime no longer publishes one.  Stated in LIMITATIONS.  The
+// feature is a handler's, not a proxy's -- the example says so in its own first
+// paragraph -- and only a proxy can be out-of-process today, so nothing in the
+// tree declared routes from a process that this affects.  The two other
+// readers of the placeholder's context already skipped out-of-process
+// runtimes before this change.
 bool runtime_instance::load_lua_script(std::string_view path)
 {
+    if (m_out_of_process)
+    {
+        std::string err;
+        if (!lua_context::script_compiles(path, err))
+        {
+            std::cerr << "[lua] script error: " << err << std::endl;
+            return false;
+        }
+        m_lua_script_path = path;
+        return true;
+    }
+
     m_lua = std::make_unique<lua_context>();
 
     if (!m_lua->load_script(path, this))
@@ -440,6 +480,22 @@ bool runtime_instance::reload_lua_script()
 
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
+
+    // Same rule as load_lua_script: the placeholder does not run the script, so
+    // it has nothing to reload.  Re-checking that the file still parses is
+    // worth doing anyway -- `reload-lua` on a broken file should say so here
+    // rather than in the worker's exit status -- but the reload that matters
+    // is the worker's, and this daemon-side object has no callbacks to replace.
+    if (m_out_of_process)
+    {
+        std::string err;
+        if (!lua_context::script_compiles(m_lua_script_path, err))
+        {
+            std::cerr << "[lua] script error: " << err << std::endl;
+            return false;
+        }
+        return true;
+    }
 
     m_lua.reset();
     m_lua = std::make_unique<lua_context>();
