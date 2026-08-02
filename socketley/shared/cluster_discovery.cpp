@@ -454,12 +454,21 @@ void cluster_discovery::scan()
     {
         std::string_view fname(entry->d_name);
 
-        // Only process .json files
+        // Only process .json files.
+        //
+        // This one test is also what keeps a half-written file out.  publish()
+        // writes "<name>.json" + ".tmp" and renames it into place, so the
+        // temporary is "<name>.json.tmp" — it does not end in ".json" and never
+        // reaches the line below.  A guard for ".tmp.json" used to stand here
+        // as if it were the thing doing that; it was the suffix written
+        // backwards, no writer in the tree produces that spelling, and the
+        // branch had never been taken.  Traced against a running daemon: the
+        // only names that ever appear in the cluster directory are
+        // "<name>.json" and, for the moment between the write and the rename,
+        // "<name>.json.tmp".  If the temporary file is ever renamed — say to
+        // "<name>.tmp.json" — this test stops hiding it and something here has
+        // to change with it.
         if (fname.size() < 6 || fname.substr(fname.size() - 5) != ".json")
-            continue;
-
-        // Skip .tmp files
-        if (fname.size() > 9 && fname.substr(fname.size() - 9) == ".tmp.json")
             continue;
 
         // Extract daemon name from filename (strip .json)

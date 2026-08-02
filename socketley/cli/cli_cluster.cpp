@@ -128,9 +128,13 @@ std::vector<cluster_daemon> load_cluster_dir(const std::string& dir)
     while ((entry = readdir(d)) != nullptr)
     {
         std::string_view fname(entry->d_name);
+        // The ".json" test is also what keeps a half-written file out:
+        // cluster_discovery::publish() writes "<name>.json.tmp" and renames it
+        // into place, and that name does not end in ".json".  A second guard
+        // for ".tmp.json" stood here — the suffix written backwards, matching
+        // nothing any writer in this tree produces.  See the longer note in
+        // cluster_discovery.cpp::scan().
         if (fname.size() < 6 || fname.substr(fname.size() - 5) != ".json")
-            continue;
-        if (fname.size() > 9 && fname.substr(fname.size() - 9) == ".tmp.json")
             continue;
 
         std::string path = dir + "/" + std::string(fname);
