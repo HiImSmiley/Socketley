@@ -1383,6 +1383,7 @@ void client_report_close(world& w, client_sock& c)
     if (c.run_epoch != w.epoch || !live_rt())
         return;
 
+
     // Both numbers, always.  The claim is about the bytes since the last
     // request; the total is what makes it checkable against the wire, and a
     // total of 0 is the shape where the proxy wrote nothing to this client at
@@ -2944,8 +2945,34 @@ void run_step(world& w, const step& s)
             client_sock& c = w.cli[s.a % NCLIENTS];
             if (w.rt)
             {
-                w.rt->lua_close_client(c.proxy_fd >= 0 ? c.proxy_fd
-                                                       : static_cast<int>(s.b));
+                const int target = c.proxy_fd >= 0 ? c.proxy_fd
+                                                   : static_cast<int>(s.b);
+                w.rt->lua_close_client(target);
+
+                // Marked on the connection that was actually closed, not on the
+                // client this step names.
+                //
+                // proxy_fd is a raw descriptor number and this call is the one
+                // interface that takes one, so a number left over from a
+                // previous run of the runtime still looks live: stop() closes
+                // the proxy's end and frees the number, a restart hands the very
+                // same number to the next client that connects, and the harness
+                // is then holding it under two clients at once.  Measured on the
+                // artefact this came in on -- cli[0] fd=9 proxy_fd=10 and cli[1]
+                // fd=8 proxy_fd=10, with 10 belonging to cli[1] -- so asking for
+                // client[0] closed client[1]'s connection.  The proxy is right
+                // to do that: it was handed a descriptor that names a live
+                // client, and a bare fd carries no generation for it to check.
+                // What was wrong is that the harness then credited the close to
+                // client[0] and went on to report client[1], which had asked for
+                // nothing, as a client the proxy closed without an answer.
+                //
+                // Keyed on the descriptor, so it is right however the collision
+                // arose -- including the s.b path above, which is an arbitrary
+                // number and can name a live connection just as easily.
+                for (int k = 0; k < NCLIENTS; k++)
+                    if (w.cli[k].proxy_fd == target)
+                        w.cli[k].self_closed = true;
                 c.self_closed = true;
             }
             break;
