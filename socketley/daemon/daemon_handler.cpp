@@ -1190,6 +1190,16 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
+    // `-s` with no column named is the documented listing: "prints only runtime
+    // names (one per line)".  It used to suppress the header and print the
+    // whole eight-column table underneath it, so the operator who read that
+    // sentence and wrote `for n in $(socketley ls -s)` iterated over ids,
+    // ports, connection counts and the words "Up" and "seconds".  Naming a
+    // column is a request for that column and still means header-off only.
+    if (silent && !col_id && !col_name && !col_type && !col_port &&
+        !col_status && !col_conn && !col_owner && !col_created && !col_group)
+        col_name = true;
+
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_status || col_conn || col_owner || col_created || col_group;
 
@@ -1389,6 +1399,12 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
     if (std::none_of(runtimes.begin(), runtimes.end(),
                      [&](const auto& p) { return listed(p.second.get()); }))
         return 0;
+
+    // As in cmd_ls: `-s` alone is the names-only listing both the man page and
+    // the help script promise; a named column keeps it meaning header-off.
+    if (silent && !col_id && !col_name && !col_type && !col_port &&
+        !col_uptime && !col_conn && !col_owner && !col_created)
+        col_name = true;
 
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_uptime || col_conn || col_owner || col_created;
