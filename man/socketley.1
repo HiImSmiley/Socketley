@@ -2869,6 +2869,22 @@ still arriving is held until the terminating blank line, subject to the
 and a 10 second header deadline
 .RB ( "408 Request Timeout" ).
 .PP
+There is a second, larger limit behind the header one, and it counts the
+whole of what is buffered for an exchange rather than one header block: at
+most 1 MiB is held for a connection whose request has already been
+forwarded \(em the body it sends past its declared
+.BR Content\-Length ,
+and the requests pipelined behind it. Nothing drains that until the
+response in front of it is finished, so a client that writes faster than
+the backend answers reaches it on a well\-formed connection. It is
+answered
+.B 413 Request Entity Too Large
+and the connection is closed. The one exception is the same one the
+gateway statuses make: if part of the backend's response is already on
+that client's wire, no status line is written behind it \(em it would land
+at an offset that is not a message boundary \(em and the connection is
+closed with the response left visibly truncated.
+.PP
 The header deadline starts at the first byte of a request and ends when
 its header block does. It is fixed, is not configurable, and is
 deliberately independent of

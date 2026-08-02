@@ -755,6 +755,19 @@ private:
     // line written behind bytes already on the wire — that would put it at an
     // offset the client cannot read as the start of a message.
     bool answer_gateway_failure(proxy_client_connection* conn, bool ours);
+    // The three conditions in that last paragraph, on their own, because they
+    // are not the gateway statuses' rule — they are the rule for *any* status
+    // this proxy writes on its own account, and there is now more than one
+    // caller.  Kept as one function rather than repeated at each site: the
+    // response_started half in particular is the whole reason a truncated
+    // response is left truncated rather than made unreadable, and a second copy
+    // of it is a second chance to leave it out.
+    bool client_answerable(const proxy_client_connection* conn) const;
+    // A connection whose buffered request has passed MAX_PARTIAL_SIZE.  Sibling
+    // of the 431 the header block gets: same shape, same reason, one size class
+    // up.  Returns what client_answerable said, so the caller can see whether
+    // the close it is about to do is the whole of what this client got.
+    bool answer_request_too_large(proxy_client_connection* conn);
     // Re-arm the listener, falling back to the backoff timer when the
     // submission does not reach the ring.  Without that the proxy stops
     // accepting connections silently — there is no completion to report it.

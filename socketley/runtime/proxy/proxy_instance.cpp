@@ -2690,8 +2690,35 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
+    // More buffered than this proxy will hold for one request, and — this is the
+    // part that decides the status — not a malformed request at all.  What is in
+    // `partial` here is everything the client sent past the point the request in
+    // flight accounts for: the body beyond its declared length, or the requests
+    // pipelined behind it.  It gets there on a perfectly well-formed connection
+    // whenever the client writes faster than the backend answers, because
+    // nothing drains those bytes until the response that precedes them is
+    // finished.  So this is not the 400 path and not slowloris; it is one client
+    // asking this proxy to hold more than a megabyte on its behalf.
+    //
+    // 413 says so, and is the sibling of the 431 the header block gets a few
+    // lines down: same shape, same reason, one size class up.  Silence was the
+    // whole of what it used to get — no status, no framing error, nothing to
+    // tell a proxy that has gone away from a backend that has.
+    //
+    // BOTH CASES IN client_answerable ARE REACHABLE HERE, and only one of them
+    // may be answered.  Measured against a backend holding its response: with a
+    // 512 KiB flood behind the request the exchange completes normally, with a
+    // 3 MiB flood the connection goes.  With the backend still silent the client
+    // had received nothing, so a status line starts at a message boundary and
+    // 413 is what it gets.  With the backend already streaming — the same flood
+    // sent after its first bytes had arrived — 62 bytes of a response were
+    // already on that client's wire, and a 413 written behind them would be read
+    // as their continuation.  client_answerable declines that one on
+    // response_started, exactly as it declines it for a gateway failure, and the
+    // truncated response is left truncated: the client can see that it is.
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE))
     {
+        answer_request_too_large(conn);
         close_pair(fd, conn->backend_fd);
         return;
     }
@@ -7991,7 +8018,7 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
 // already being computed on every connect failure and spent only on the circuit
 // breaker, so a local shortage and a dead backend reached the client as the
 // same 502 and every path that could not answer at all closed in silence.
-bool proxy_instance::answer_gateway_failure(proxy_client_connection* conn, bool ours)
+bool proxy_instance::client_answerable(const proxy_client_connection* conn) const
 {
     // TCP mode is exempt on principle rather than convenience.  There is no
     // request and no status line on that path, so a byte pipe whose backend
@@ -8008,6 +8035,24 @@ bool proxy_instance::answer_gateway_failure(proxy_client_connection* conn, bool 
     // from the client's end.  The close is all there is here, and it is honest:
     // the client has a truncated response and can see that it is truncated.
     if (conn->response_started)
+        return false;
+    return true;
+}
+
+// The buffered request has outgrown what this proxy will hold for it.  See the
+// call site in handle_client_read for how it gets there and why it is not the
+// malformed-input path it looks like.
+bool proxy_instance::answer_request_too_large(proxy_client_connection* conn)
+{
+    if (!client_answerable(conn))
+        return false;
+    send_error(conn, "413 Request Entity Too Large", "Request Too Large\n");
+    return true;
+}
+
+bool proxy_instance::answer_gateway_failure(proxy_client_connection* conn, bool ours)
+{
+    if (!client_answerable(conn))
         return false;
     if (ours)
         send_error(conn, "503 Service Unavailable", "Service Unavailable\n");
