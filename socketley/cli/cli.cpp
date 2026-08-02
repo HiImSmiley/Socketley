@@ -21,6 +21,44 @@
 #include "../shared/daemon_client.h"
 #include "../shared/paths.h"
 
+// Is the daemon executing a file that has since been replaced at the path it
+// was started from — that is, has this tree been rebuilt under a running
+// daemon.
+//
+// Decided on the inode, because the version cannot decide it.  Nothing in
+// premake5.lua defines SOCKETLEY_VERSION, so it is a single literal in cli.h
+// and every build of a release carries it; two builds a minute apart compare
+// equal, and the whole case worth reporting is a same-version rebuild.
+//
+// Reported only when both sides name the same path.  Comparing inodes across
+// different paths would say "your daemon is stale" to anyone running the CLI
+// from a copy while a daemon runs the original — which is how every agent in
+// this tree works, and it is the misidentification c1875e3 was written to
+// undo.  A message printed when nothing is wrong is how a message printed when
+// something is wrong gets ignored.
+static bool daemon_exe_was_replaced(const socketley::daemon_ident& id)
+{
+    // A daemon that did not report an executable has not reported a different
+    // one.  Builds exist that answer `ping` with a version and a pid and stop
+    // there, and terse is not the same as mismatched.
+    if (!id.has_exe)
+        return false;
+
+    std::string self;
+    uint64_t    dev = 0, ino = 0;
+    if (!socketley::self_exe_identity(self, dev, ino))
+        return false;
+    socketley::split_deleted_suffix(self);
+
+    if (self != id.exe_path)
+        return false;
+
+    // Either signal is conclusive once the paths agree.  They are not the same
+    // signal: a filesystem is free to hand the replacement the inode number the
+    // unlinked file just gave up, and then only the marker shows it.
+    return id.exe_deleted || dev != id.exe_dev || ino != id.exe_ino;
+}
+
 // Is *anything* listening on the socket path.
 //
 // Deliberately still the weak question, and used in exactly one place: the poll
@@ -177,15 +215,21 @@ int cli_dispatch(int argc, char** argv)
             // in every case.  A short deadline because there is nothing to wait
             // for: this command has never needed a daemon and must not start
             // hanging on one that is busy or on a path someone else owns.
-            std::string dver;
+            socketley::daemon_ident id;
             switch (socketley::daemon_probe(daemon_handler::socket_path.c_str(),
-                                            &dver, 300))
+                                            &id, 300))
             {
                 case socketley::daemon_identity::daemon:
-                    if (dver != SOCKETLEY_VERSION)
+                    // The version first: when it differs it is the more
+                    // specific thing to say, and the executable differs too.
+                    if (id.version != SOCKETLEY_VERSION)
                         std::cerr << "the daemon serving " << daemon_handler::socket_path
-                                  << " is version " << dver
+                                  << " is version " << id.version
                                   << "; restart it to run " << SOCKETLEY_VERSION << "\n";
+                    else if (daemon_exe_was_replaced(id))
+                        std::cerr << "the daemon serving " << daemon_handler::socket_path
+                                  << " is running an earlier build of " << id.exe_path
+                                  << "; restart it to run this one\n";
                     break;
 
                 case socketley::daemon_identity::predates_ping:

@@ -1536,7 +1536,31 @@ int daemon_handler::cmd_ping(ipc_connection* conn)
 
     std::ostringstream out;
     out << socketley::daemon_ident_prefix << SOCKETLEY_VERSION
-        << ' ' << getpid() << '\n';
+        << ' ' << getpid();
+
+    // And which executable this daemon is, exactly.
+    //
+    // The version cannot answer that.  Nothing in premake5.lua defines
+    // SOCKETLEY_VERSION, so it is one literal in cli.h that every build of a
+    // release carries: a daemon started before a rebuild and a CLI built after
+    // it report the same string, which is the one case an operator actually
+    // hits — "I rebuilt and my new flag is rejected" is a same-version rebuild
+    // against a daemon still holding its runtimes.  The inode does answer it.
+    //
+    // Read fresh rather than cached, because the interesting change happens
+    // while the daemon is running: the link gains " (deleted)" the moment the
+    // file it was started from is unlinked, and a value captured at startup
+    // would be the one value that can never show it.  Two syscalls against a
+    // page-cached /proc entry, in a command that already costs an accept, a
+    // read, a write and a close.
+    //
+    // The path goes last in the reply, because a path may contain spaces.
+    std::string exe;
+    uint64_t    dev = 0, ino = 0;
+    if (socketley::self_exe_identity(exe, dev, ino))
+        out << ' ' << dev << ':' << ino << ' ' << exe;
+
+    out << '\n';
     conn->write_buf = out.str();
     return 0;
 }

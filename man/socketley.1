@@ -751,21 +751,45 @@ Continuously refresh the cluster view every 2 seconds (Ctrl+C to stop).
 .TP
 .B ping
 Ask the daemon to identify itself. Prints
-.BI "socketley\-daemon " "version pid"
-for the daemon serving the socket. Every command runs this first, before it
-sends anything: a
+.BI "socketley\-daemon " "version pid dev" : "ino path"
+for the daemon serving the socket, where the last two fields name the
+executable it is running \(em its device and inode, and its
+.I /proc/self/exe
+link, which carries
+.B (deleted)
+once the file it was started from has been replaced. The path is last because a
+path may contain spaces. A daemon built before those fields existed answers with
+the version and pid alone, and is not treated as a different build for it.
+.RS
+.PP
+Every command runs this first, before it sends anything: a
 .BR connect (2)
 that succeeds only proves something is listening on the path, not that the
 thing listening is a daemon, and a command written to a stranger is a command
 delivered to a stranger. A path held by something that does not answer this is
 refused, with nothing sent to it.
+.RE
 .TP
 .B version \fR| \fB\-\-version\fR | \fB\-v\fR
 Print the socketley version number and exit. Does not require, and does not
-start, a daemon. If one is running on the socket and reports a different
-version \(em an upgraded binary over a daemon still holding its runtimes \(em
-that is reported on standard error; standard output is the version number
-either way.
+start, a daemon. Standard output is the version number in every case; anything
+about the daemon on the socket goes to standard error, so
+.B $(socketley version)
+is unaffected by all of it.
+.RS
+.PP
+Reported there: a daemon whose version differs, and \(em since the version is
+one compile-time literal that every build of a release carries \(em a daemon
+still executing a file that has since been replaced at the path it was started
+from. That second one is the ordinary case of rebuilding while a daemon holds
+its runtimes, and the reason a new flag can be rejected by a daemon reporting
+the same version as the binary that has it.
+.PP
+It is reported only when the daemon and this CLI name the same executable path.
+Running the CLI from a copy elsewhere on disk says nothing: a copy is not
+evidence about anybody's build, and comparing inodes across different paths
+would report one on every command.
+.RE
 .TP
 .BI "\-\-lua " "lua_file"
 Load Lua orchestration configuration. Optionally configures daemon name

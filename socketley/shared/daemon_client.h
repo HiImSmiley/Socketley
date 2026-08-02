@@ -47,16 +47,60 @@ enum class daemon_identity
     predates_ping
 };
 
+// What a daemon says about itself when it is asked.
+struct daemon_ident
+{
+    // The version literal the daemon was compiled with.
+    std::string version;
+
+    // Which executable the daemon is running, exactly: the path from
+    // readlink("/proc/self/exe") with any " (deleted)" marker moved into the
+    // flag, and the device and inode that link resolves to.
+    //
+    // The version alone cannot answer "is this daemon my build".  Nothing in
+    // premake5.lua defines SOCKETLEY_VERSION, so it is one literal in cli.h and
+    // every build of a release carries it — two builds a minute apart compare
+    // equal.  The inode does not: a rebuild produces a different file, and the
+    // daemon goes on executing the one it started with.
+    std::string exe_path;
+    bool        exe_deleted = false;
+    uint64_t    exe_dev = 0;
+    uint64_t    exe_ino = 0;
+
+    // Whether the reply carried the executable fields at all.  A daemon built
+    // after `ping` existed but before it named its executable answers with a
+    // version and a pid and stops there; that daemon is a real thing that can
+    // be running, and being terse is not the same as being a different build.
+    // Every reader of the fields above must gate on this and stay silent when
+    // it is false.
+    bool has_exe = false;
+};
+
 // One round trip against SOCKET_PATH: connect, ask `ping`, read the reply.
 //
-// VERSION_OUT, when given, receives the daemon's version string on `daemon` and
-// is left untouched otherwise.  TIMEOUT_MS bounds the wait for the reply; the
-// default matches the read timeout ipc_client.cpp already applies to every real
-// command, so a daemon too busy to answer this was already too busy to serve
-// the command that follows it.
-daemon_identity daemon_probe(const char* socket_path,
-                             std::string*  version_out = nullptr,
-                             int           timeout_ms  = 5000);
+// OUT, when given, is filled in on `daemon` and left untouched otherwise.
+// TIMEOUT_MS bounds the wait for the reply; the default matches the read
+// timeout ipc_client.cpp already applies to every real command, so a daemon too
+// busy to answer this was already too busy to serve the command that follows it.
+daemon_identity daemon_probe(const char*   socket_path,
+                             daemon_ident* out        = nullptr,
+                             int           timeout_ms = 5000);
+
+// This process's own executable: readlink("/proc/self/exe") verbatim, marker
+// and all, plus the device and inode that link resolves to.
+//
+// stat() goes through the magic link rather than through the path, because that
+// is what resolves to the inode this process is actually executing — and it
+// keeps working after that inode has lost its name, which is the case worth
+// detecting.  False when /proc cannot be read, in which case no comparison is
+// possible and none may be reported.
+bool self_exe_identity(std::string& raw_path, uint64_t& dev, uint64_t& ino);
+
+// Take " (deleted)" off the end of a /proc exe link, returning whether it was
+// there.  The kernel appends it once the file a running process was started
+// from is unlinked, which is precisely what replacing a binary does, so the
+// marker is a signal and must not be left in a path being compared.
+bool split_deleted_suffix(std::string& path);
 
 // Attach this process to a running Socketley daemon.
 // Shows up in `socketley ps/ls`; `socketley stop <name>` sends SIGTERM.

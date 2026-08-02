@@ -1,10 +1,13 @@
 #include "daemon_client.h"
 #include "paths.h"
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 
@@ -12,8 +15,39 @@ namespace socketley {
 
 static std::string g_attached_name;
 
-daemon_identity daemon_probe(const char* socket_path,
-                             std::string*  version_out,
+static constexpr std::string_view deleted_marker = " (deleted)";
+
+bool split_deleted_suffix(std::string& path)
+{
+    if (path.size() <= deleted_marker.size() ||
+        path.compare(path.size() - deleted_marker.size(),
+                     deleted_marker.size(), deleted_marker) != 0)
+        return false;
+
+    path.resize(path.size() - deleted_marker.size());
+    return true;
+}
+
+bool self_exe_identity(std::string& raw_path, uint64_t& dev, uint64_t& ino)
+{
+    char    buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0)
+        return false;
+    buf[n] = '\0';
+
+    struct stat st{};
+    if (stat("/proc/self/exe", &st) != 0)
+        return false;
+
+    raw_path.assign(buf, static_cast<size_t>(n));
+    dev = static_cast<uint64_t>(st.st_dev);
+    ino = static_cast<uint64_t>(st.st_ino);
+    return true;
+}
+
+daemon_identity daemon_probe(const char*   socket_path,
+                             daemon_ident* out,
                              int           timeout_ms)
 {
     // SOCK_CLOEXEC for the same reason as every other socket the CLI opens:
@@ -51,7 +85,13 @@ daemon_identity daemon_probe(const char* socket_path,
     // until the NUL rather than trusting one read() to hold the lot: the
     // identifying line is short enough that it always does in practice, but
     // "in practice" is the reasoning that put this defect here.
-    char   buf[256];
+    //
+    // Sized past PATH_MAX because the reply now ends in the daemon's executable
+    // path.  The classification below does not depend on the frame fitting
+    // anyway — see there — but a buffer that a legitimate path could overrun is
+    // not a thing to leave standing in the function that decides whether to
+    // trust the peer.
+    char   buf[4160];
     size_t total = 0;
     bool   framed = false;
     while (total < sizeof(buf))
@@ -71,26 +111,59 @@ daemon_identity daemon_probe(const char* socket_path,
     if (total == 0)
         return daemon_identity::mute;
 
-    if (framed && buf[0] == 0)
+    // The identification is the exit byte and the prefix, and nothing else.
+    // Deliberately not gated on the frame being complete: a reply too long for
+    // the buffer would otherwise fall through to `foreign` and the CLI would
+    // refuse to talk to a daemon that had just named itself correctly.  A
+    // truncated reply is still a daemon; it is only a daemon we know less
+    // about, and the fields below are what get skipped.
+    if (total >= 1 + daemon_ident_prefix.size() && buf[0] == 0 &&
+        memcmp(buf + 1, daemon_ident_prefix.data(), daemon_ident_prefix.size()) == 0)
     {
-        const char* body = buf + 1;
-        const size_t body_len = static_cast<size_t>(
-            static_cast<const char*>(memchr(buf + 1, '\0', total - 1)) - body);
-
-        if (body_len >= daemon_ident_prefix.size() &&
-            memcmp(body, daemon_ident_prefix.data(), daemon_ident_prefix.size()) == 0)
+        if (out && framed)
         {
-            if (version_out)
+            const char*  body     = buf + 1;
+            const size_t body_len = static_cast<size_t>(
+                static_cast<const char*>(memchr(buf + 1, '\0', total - 1)) - body);
+
+            std::string_view rest(body + daemon_ident_prefix.size(),
+                                  body_len - daemon_ident_prefix.size());
+            if (!rest.empty() && rest.back() == '\n')
+                rest.remove_suffix(1);
+
+            auto take = [&rest]() -> std::string_view
             {
-                const char*  v   = body + daemon_ident_prefix.size();
-                const size_t rest = body_len - daemon_ident_prefix.size();
-                size_t       len  = 0;
-                while (len < rest && v[len] != ' ' && v[len] != '\n')
-                    ++len;
-                version_out->assign(v, len);
+                const size_t sp = rest.find(' ');
+                std::string_view tok = rest.substr(0, sp);
+                rest = (sp == std::string_view::npos) ? std::string_view()
+                                                      : rest.substr(sp + 1);
+                return tok;
+            };
+
+            out->version = std::string(take());
+            take();                                   // the pid; nothing reads it
+            const std::string_view devino = take();
+
+            // Everything left is the path, verbatim rather than tokenised: an
+            // executable may live somewhere with a space in the name, and it is
+            // last in the reply for exactly that reason.
+            const std::string_view exe = rest;
+
+            const size_t colon = devino.find(':');
+            uint64_t     d = 0, i = 0;
+            if (!exe.empty() && colon != std::string_view::npos &&
+                std::from_chars(devino.data(), devino.data() + colon, d).ec == std::errc() &&
+                std::from_chars(devino.data() + colon + 1,
+                                devino.data() + devino.size(), i).ec == std::errc())
+            {
+                out->exe_path = std::string(exe);
+                out->exe_deleted = split_deleted_suffix(out->exe_path);
+                out->exe_dev = d;
+                out->exe_ino = i;
+                out->has_exe = true;
             }
-            return daemon_identity::daemon;
         }
+        return daemon_identity::daemon;
     }
 
     // A daemon built before `ping` existed routes it to the `default:` arm of
