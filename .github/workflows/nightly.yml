@@ -659,6 +659,48 @@ jobs:
         # one is routed somewhere else.  The id stays open because bounding how
         # many clients a loss happens to is not removing the loss.
         #
+        # AND IT NO LONGER ABORTS, which is why a nightly that reaches it is not
+        # broken.  The oracle is split at the discriminator this entry already
+        # names — the total bytes on the connection — and the shape above is
+        # reported through fuzz_observe() instead of RT_FINDING:
+        #
+        #   [fuzz] observation: client fd 9 (proxy fd 10) sent 2 complete
+        #   request(s) and received 0 bytes before the proxy closed it (71 bytes
+        #   in total on this connection) — the backend sent bytes this proxy
+        #   cannot frame ...
+        #
+        # Same words, same two counts, no abort.  It is not demoted and
+        # FUZZ_PROXY_SKIP is still empty: skipping the id was the obvious lever
+        # and it is the wrong one, because the id covers two shapes and the skip
+        # would take both.  A decision reported as a defect every night is an
+        # oracle people stop reading, and it would have cost us the sharper of
+        # the two.
+        #
+        # THE 0-BYTE ARM STILL ABORTS and is the one to read.  "0 bytes in total
+        # on this connection" means the proxy wrote nothing at all, which is
+        # answer_gateway_failure declining — read response_started first, it is
+        # the one thing inside it that refuses on purpose.  That arm is a live
+        # defect check and nothing about this change touches it.
+        #
+        # WATCHED BOTH WAYS, because a split nobody has seen fall on either side
+        # proves nothing.  With every error answer the proxy writes suppressed —
+        # 1eb7d53's method, send_error returning without queuing — the 0-byte arm
+        # aborts on its own words: "sent 1 complete request(s) and received 0
+        # bytes before the proxy closed it (0 bytes in total on this
+        # connection)", under client-closed-without-answer itself and with no
+        # half-close in it.  Restored: silent.  And the 71-byte case goes from
+        # abort to observation on the identical input.
+        #
+        # FUZZ_STRICT=1 makes every observation abort again, which is the way
+        # back for anyone digging: it turns the 71-byte case into a hard failure
+        # with the input dumped, without touching this file.
+        #
+        # The sibling id answer-lost-to-a-half-close is deliberately NOT split.
+        # It shares the reporting function and the same counts, but nobody has
+        # decided its >0-byte shape, and it is also the instrument this entry
+        # relies on above.  If it starts firing at N bytes that is a new
+        # decision, not one this change should have made in advance.
+        #
         # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
         # one of the harness's checks: it is socketley/shared/invariants.h
         # aborting on its own account, and SKL_INV_PAIR has no id and no

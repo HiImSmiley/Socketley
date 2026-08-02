@@ -1402,13 +1402,54 @@ void client_report_close(world& w, client_sock& c)
                    "backend, so whatever it did there happened and the client will never "
                    "learn the outcome");
     }
-    else
+    else if (c.rx_total == 0)
     {
         RT_FINDING("client-closed-without-answer", false,
                    "a client that had sent a whole request was closed without one byte of "
                    "an answer — no status, no framing error, nothing to distinguish a proxy "
                    "that has gone away from a backend that has, and nothing in any log on "
                    "the client's side");
+    }
+    else
+    {
+        // ── the same loss, already decided, reported and not aborted ─────────
+        //
+        // Bytes did reach this client and then it was closed with nothing since
+        // its last request.  ea10b66 traced that shape and shipped the answer:
+        // the backend sent something this proxy cannot frame, those bytes were
+        // forwarded, and from there the proxy owes neither of the two things it
+        // could owe.  Not a Connection: close — http_response_scan_chunk never
+        // reaches headers_parsed on them, so there is no parsed response to hang
+        // the field on, and backend bytes are forwarded verbatim because that is
+        // what makes responses stream, so there is no rewriter to hang it with.
+        // Not an answer either — a status line written behind those bytes lands
+        // at an offset the proxy has itself established is not a message
+        // boundary, the client-side twin of the fault efdbabd fixed in the pool
+        // direction, and response_started bars it.  The breaker charge ea10b66
+        // added is what is paid instead.
+        //
+        // The loss is real and this does not pretend otherwise: it is printed,
+        // with the same words and the same two byte counts.  What it is not is a
+        // violation, because a decision reported as a defect every night is an
+        // oracle people stop reading — and this id is too coarse to demote,
+        // since FUZZ_PROXY_SKIP would take the arm above with it.  That arm is
+        // the sharper of the two: a total of 0 means answer_gateway_failure
+        // declined, which is a live defect and still aborts.
+        //
+        // Split here rather than at the id, because the discriminator is a fact
+        // about the wire the report already carries.  FUZZ_STRICT=1 makes every
+        // observation abort, which is the way back to the old behaviour for
+        // anyone digging.
+        // Big enough for the whole of g_detail plus the sentence below it, so
+        // the observation is never a truncated version of the finding's words.
+        char msg[sizeof(fuzzrt::g_detail) + 256];
+        std::snprintf(msg, sizeof(msg),
+                      "%s — the backend sent bytes this proxy cannot frame and they were "
+                      "forwarded, so it can neither announce the close nor answer behind "
+                      "them (ea10b66); the client on that request is lost and the breaker "
+                      "is charged for it",
+                      fuzzrt::g_detail);
+        fuzz_observe(msg, ::fuzz::current_data(), ::fuzz::current_size());
     }
     fuzzrt::g_detail[0] = 0;
 }
