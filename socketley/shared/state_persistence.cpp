@@ -832,7 +832,7 @@ bool state_persistence::write_json(const runtime_config& cfg) const
 
     // fsync before rename to guarantee data is on disk — prevents
     // partial/empty state files on power loss or kernel crash
-    int fd = ::open(tmp_path.c_str(), O_RDONLY);
+    int fd = ::open(tmp_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) { if (fsync(fd) < 0) {} ::close(fd); }
 
     f.close();

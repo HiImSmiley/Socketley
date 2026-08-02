@@ -324,7 +324,11 @@ bool cache_instance::setup(event_loop& loop)
     if (port == 0)
         port = 9000;
 
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    // SOCK_CLOEXEC, same reasoning as the server and proxy listeners: a cache
+    // lives in the daemon, and the daemon forks proxy workers that have no use
+    // for this port and every opportunity to keep it bound after the cache is
+    // gone.
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
 
@@ -4690,7 +4694,7 @@ bool cache_instance::connect_to_master()
     if (e != std::errc{})
         return false;
 
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
 

@@ -31,7 +31,12 @@ metrics_endpoint::~metrics_endpoint()
 
 bool metrics_endpoint::start(uint16_t port)
 {
-    m_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC because the daemon forks proxy workers.  This listener sets
+    // SO_REUSEADDR and *not* SO_REUSEPORT, so an inherited copy is the one kind
+    // of leak that cannot be worked around: the metrics port stays bound by a
+    // worker after the daemon is gone, and the next daemon's start() fails on
+    // bind with nothing on the machine to explain what holds the port.
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
 
@@ -198,7 +203,14 @@ void metrics_endpoint::serve_loop()
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        int client_fd = accept(m_listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
+        // accept4 rather than accept: this is the only accept() syscall in the
+        // daemon — every other connection arrives through io_uring, where the
+        // same flag is an SQE field — and it runs on its own thread, so a fork
+        // for a proxy worker can land between the accept and any fcntl that
+        // tried to set FD_CLOEXEC afterwards.  Set at creation, there is no
+        // such window.
+        int client_fd = accept4(m_listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
+                                &client_len, SOCK_CLOEXEC);
         if (client_fd < 0)
             continue;
 

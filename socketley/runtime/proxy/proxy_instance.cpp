@@ -1138,7 +1138,11 @@ bool proxy_instance::setup(event_loop& loop)
     if (port == 0)
         port = 8080;
 
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    // SOCK_CLOEXEC: in the daemon this listener belongs to one proxy and must
+    // not reach any worker the daemon forks for another; in a worker it is the
+    // only listener there is, opened after the exec from the config frame, so
+    // the flag costs it nothing.  Same reasoning as the server's listener.
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
 
@@ -5707,7 +5711,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             return false;
     }
 
-    bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (bfd < 0)
     {
         // Out of descriptors is our shortage, not the backend's.
@@ -5906,12 +5910,17 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr || bconn->ssl != nullptr))
         return;
 
-    // Create pipe for client -> backend direction
-    if (pipe2(conn->pipe_to_backend, O_NONBLOCK) < 0)
+    // Create pipe for client -> backend direction.
+    //
+    // O_CLOEXEC on both pairs: these live for the whole splice-mode connection,
+    // so a proxy worker forked mid-transfer would inherit four descriptors per
+    // connection in flight and hold them until it exits — the busiest leak of
+    // the set, because it scales with concurrency rather than with runtimes.
+    if (pipe2(conn->pipe_to_backend, O_NONBLOCK | O_CLOEXEC) < 0)
         return;
 
     // Create pipe for backend -> client direction
-    if (pipe2(bconn->pipe_to_client, O_NONBLOCK) < 0)
+    if (pipe2(bconn->pipe_to_client, O_NONBLOCK | O_CLOEXEC) < 0)
     {
         close_tracked(conn->pipe_to_backend[0]);
         close_tracked(conn->pipe_to_backend[1]);
@@ -7275,7 +7284,7 @@ void proxy_instance::health_check_sweep()
         if (b.is_group)
             continue;
 
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
         {
             if (i < m_backend_health.size())

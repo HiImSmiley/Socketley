@@ -104,6 +104,44 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (child == 0)
     {
         // ── child ───────────────────────────────────────────────────────────
+        //
+        // ─── WHAT CROSSES THE EXEC, AND NOTHING ELSE ────────────────────────
+        //
+        // Exactly four descriptors are meant to reach the worker.  The list is
+        // written down because for a long time it was not, and what actually
+        // crossed was every socket the daemon had open — read out of a live
+        // worker's /proc/<pid>/fd:
+        //
+        //     fd 5 -> unix .../daemon.sock  SO_ACCEPTCON   the IPC listener
+        //     fd 6 -> tcp 0.0.0.0:4CEA      LISTEN         another runtime's port
+        //     fd 8 -> unix .../daemon.sock                 an accepted CLI connection
+        //
+        // none of which this process has any use for, and all of which it then
+        // held for its whole life.  The listener made "is a daemon serving this
+        // socket" answer yes with no daemon left alive; the port stayed bound
+        // by a worker belonging to a different runtime.  The fix is at every
+        // creation site rather than here, because a descriptor that is
+        // inheritable for even a moment is inheritable during exactly the
+        // moment this function runs.
+        //
+        // The deliberate set:
+        //
+        //   0  /dev/null, opened below.  The worker must never read the
+        //      terminal the daemon was started from.
+        //   1  the daemon's stdout, inherited unchanged.
+        //   2  the daemon's stderr, inherited unchanged.  1 and 2 are the point
+        //      of the exercise: a worker's log lines have to land where the
+        //      operator is already looking, so these two are inherited on
+        //      purpose and are the reason no blanket close-range runs here.
+        //   3  the control socket, dup2'd onto child_control_fd below.
+        //
+        // The worker's own listening socket is NOT in this set and must not be:
+        // it binds its own port after the exec, from the port in the config
+        // frame, and nothing is passed with SCM_RIGHTS.  Verified rather than
+        // assumed — a worker started with the leak closed still binds and still
+        // serves, and its listener is a descriptor number that did not exist
+        // before the exec.
+        //
         // Nothing here may allocate or take a lock that the parent could have
         // held at fork time.  dup2 clears FD_CLOEXEC on the copy, which is what
         // lets the control socket survive the exec.
@@ -242,6 +280,13 @@ void proxy_supervisor::shutdown()
         // does not block on a child.
         if (::waitpid(m_pid, nullptr, WNOHANG) > 0)
             m_pid = 0;
+
+        // The placeholder stops naming a process the moment this supervisor
+        // stops owning one, whether or not the reap above succeeded: SIGTERM has
+        // been sent and the runtime is on its way out, so `stats` must not go on
+        // printing a pid as if the runtime were still there to look at.
+        if (m_placeholder)
+            m_placeholder->set_pid(0);
     }
     close_control();
 }
@@ -354,6 +399,11 @@ bool proxy_supervisor::check_liveness()
         return false;      // still running, or not ours to reap
 
     m_pid = 0;
+    // The placeholder's copy goes with it: `stats` prints this number, and a pid
+    // that has been reaped is worse than no pid at all — it is a number the
+    // operator will go and look at, and by then it can belong to anything.
+    if (m_placeholder)
+        m_placeholder->set_pid(0);
     close_control();
     m_in.clear();
 

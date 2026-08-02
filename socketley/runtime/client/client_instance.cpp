@@ -111,7 +111,8 @@ bool client_instance::try_connect()
     // would verify the peer against its own claim.
     m_tls_peer_name = host;
 
-    m_conn->fd = socket(AF_INET, m_udp ? (SOCK_DGRAM | SOCK_NONBLOCK) : (SOCK_STREAM | SOCK_NONBLOCK), 0);
+    m_conn->fd = socket(AF_INET,
+                        (m_udp ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_conn->fd < 0)
         return false;
 
@@ -135,7 +136,8 @@ bool client_instance::try_connect()
 
         // Need a new socket since connect() may have tainted the old one
         close_tracked(m_conn->fd);
-        m_conn->fd = socket(AF_INET, m_udp ? (SOCK_DGRAM | SOCK_NONBLOCK) : (SOCK_STREAM | SOCK_NONBLOCK), 0);
+        m_conn->fd = socket(AF_INET,
+                        (m_udp ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (m_conn->fd < 0)
             return false;
         if (!m_udp)

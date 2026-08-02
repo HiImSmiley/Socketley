@@ -130,7 +130,7 @@ void event_loop::shutdown_ring()
 // connecting, so "no CQE waiting straight after submit" is the success signal.
 static bool probe_accept_variant(bool multishot, bool poll_first)
 {
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd < 0)
         return false;
 
@@ -156,10 +156,14 @@ static bool probe_accept_variant(bool multishot, bool poll_first)
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     if (sqe)
     {
+        // SOCK_CLOEXEC here for the same reason the port is bound and listened
+        // on for real: the probe is only worth its cost if it submits the shape
+        // the runtimes submit.  A kernel that refused this flag would refuse it
+        // on the live path too, and the probe saying so is the right answer.
         if (multishot)
-            io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
+            io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         else
-            io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
+            io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (poll_first)
             sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
         io_uring_sqe_set_data(sqe, nullptr);
@@ -1321,12 +1325,32 @@ struct io_uring* event_loop::get_ring()
     return &m_ring;
 }
 
+// ── SOCK_CLOEXEC on every accept, and why it is an SQE field here ───────────
+//
+// There is no accept() or accept4() call in the daemon: every connection it
+// owns arrives through one of these three submissions, and the flags argument
+// the kernel reads is the trailing int on the prep, not a flag on any socket()
+// this process ever made.  So "the accepted connection must not cross an exec"
+// cannot be arranged at creation time the way SOCK_CLOEXEC arranges it for a
+// listener — it has to be said on each submission, and a submission that
+// forgets is a connection the next proxy worker inherits.
+//
+// It was forgotten on all of them.  Measured on a worker spawned while one CLI
+// command was in flight, /proc/<worker>/fd held the daemon's accepted IPC
+// connection as fd 8 alongside the listener as fd 5 — a private channel between
+// the daemon and one CLI process, open in an unrelated child, for as long as
+// that child lives.
+//
+// The kernel takes SOCK_CLOEXEC and SOCK_NONBLOCK here and rejects anything
+// else with -EINVAL, on the one-shot and the multishot form alike; this is the
+// same accept_flags field accept4() would have been given.
 bool event_loop::submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
-    io_uring_prep_accept(sqe, listen_fd, reinterpret_cast<struct sockaddr*>(addr), addrlen, 0);
+    io_uring_prep_accept(sqe, listen_fd, reinterpret_cast<struct sockaddr*>(addr), addrlen,
+                         SOCK_CLOEXEC);
     io_uring_sqe_set_data(sqe, req);
     arm(req, raw_target(listen_fd));
     return true;
@@ -1340,13 +1364,13 @@ bool event_loop::submit_multishot_accept(int listen_fd, io_request* req)
     if (m_multishot_supported)
     {
         // Multishot: one SQE handles ALL incoming connections
-        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (m_accept_poll_first)
             sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else
     {
-        io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
     }
     io_uring_sqe_set_data(sqe, req);
     arm(req, raw_target(listen_fd));
@@ -1363,20 +1387,26 @@ bool event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
         // Direct-descriptor multishot accept: accepted fds go straight into
         // the fixed file table, skipping the per-process fd table entirely.
         // cqe->res will contain the fixed file index, not an fd number.
-        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        //
+        // SOCK_CLOEXEC is set on this branch too even though a direct
+        // descriptor has no number in the process fd table to inherit: the
+        // branch below it is reached whenever registration is not in force, and
+        // that one does, so leaving it off here would make whether a connection
+        // crosses an exec depend on a capability probe.
+        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         sqe->file_index = IORING_FILE_INDEX_ALLOC;
         if (m_accept_poll_first)
             sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else if (m_multishot_supported)
     {
-        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (m_accept_poll_first)
             sqe->ioprio |= IORING_ACCEPT_POLL_FIRST;
     }
     else
     {
-        io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
+        io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
     }
     io_uring_sqe_set_data(sqe, req);
     arm(req, raw_target(listen_fd));

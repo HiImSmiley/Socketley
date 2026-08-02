@@ -781,8 +781,10 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             return;
         }
 
-        // Open file and get size
-        int ffd = open(resolved.c_str(), O_RDONLY);
+        // Open file and get size.  O_CLOEXEC: this is on the request path, so a
+        // proxy worker forked while a file is being served would otherwise
+        // inherit a descriptor on a file it has no business holding open.
+        int ffd = open(resolved.c_str(), O_RDONLY | O_CLOEXEC);
         if (ffd < 0)
         {
             conn->write_queue.push(http_404_response(conn->http_keep_alive));
@@ -1183,7 +1185,7 @@ bool server_instance::setup(event_loop& loop)
 
     if (m_udp)
     {
-        m_udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        m_udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (m_udp_fd < 0)
             return false;
 
@@ -1240,7 +1242,17 @@ bool server_instance::setup(event_loop& loop)
     }
 
     // TCP mode
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    //
+    // SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
+    // daemon forks a proxy worker for every runtime created with
+    // --out-of-process.  Without the flag every such worker inherits this port
+    // — measured, as fd 6 of a worker whose own port was a different one — and
+    // holds it after this runtime is stopped and after the daemon exits.  The
+    // shutdown() in teardown() unhashes the socket for every dup at once and so
+    // hides it on the ordinary stop path; a daemon that is killed rather than
+    // stopped never reaches that line, and then the port is bound by a process
+    // with no runtime and no daemon to account for it.
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
 
@@ -1353,7 +1365,9 @@ bool server_instance::setup(event_loop& loop)
     // Create splice pipe for zero-copy HTTP file serving
     if (m_splice_pipe[0] < 0 && !m_http_dir.empty())
     {
-        if (pipe2(m_splice_pipe, O_NONBLOCK) == 0)
+        // O_CLOEXEC as well: this pipe lives as long as the runtime does, so
+        // without it every proxy worker forked afterwards carries both halves.
+        if (pipe2(m_splice_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
             fcntl(m_splice_pipe[0], F_SETPIPE_SZ, 1048576);  // 1MB pipe buffer
         else
             m_splice_pipe[0] = m_splice_pipe[1] = -1;
@@ -4711,7 +4725,7 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
         }
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
 

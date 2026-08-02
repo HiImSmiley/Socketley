@@ -22,7 +22,11 @@
 
 static bool daemon_is_running()
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC on all three of the CLI's sockets, for the same reason as
+    // the daemon's: ensure_daemon() below forks and execs a daemon, and the
+    // only descriptors that exec is meant to receive are the three it opens
+    // /dev/null onto.  Nothing here is ever handed to a child on purpose.
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
 
@@ -721,7 +725,7 @@ int cli_interactive(int argc, char** argv)
     }
 
     // Connect to daemon
-    int ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (ipc_fd < 0)
     {
         std::cerr << "failed to connect to daemon\n";

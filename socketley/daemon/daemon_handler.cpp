@@ -165,7 +165,7 @@ void daemon_handler::set_cluster_discovery(cluster_discovery* cd)
 
 bool daemon_handler::is_running()
 {
-    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe < 0)
         return false;
 
@@ -184,7 +184,15 @@ bool daemon_handler::setup()
 {
     unlink(socket_path.c_str());
 
-    m_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    // SOCK_CLOEXEC: this is the socket every CLI command arrives on, and the
+    // daemon forks and execs a proxy worker for every runtime created with
+    // --out-of-process.  Without the flag the worker inherits it — measured, as
+    // fd 5 of a live worker, an SO_ACCEPTCON row on the daemon's own path — and
+    // then answers the question "is a daemon serving this socket" in the
+    // affirmative for as long as it lives.  The test suite asks exactly that
+    // question, by inode, to decide whether a daemon is up; a worker that
+    // outlives a killed daemon made it say yes with no daemon in existence.
+    m_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
 
@@ -2658,6 +2666,31 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
             {
                 conn->write_buf += "figures:pushed\nfigures_age_ms:";
                 conn->write_buf += std::to_string(inst->worker_stats_age_ms());
+                conn->write_buf += '\n';
+            }
+
+            // Which process this runtime is actually in.
+            //
+            // The supervisor has called set_pid(child) since the split landed
+            // and nothing ever printed it, so the one question an operator has
+            // about an out-of-process runtime — where do I look for it, which
+            // process do I strace, whose RSS is this — had no answer from the
+            // tool that knows it.  `figures:pushed` says the runtime is
+            // elsewhere without saying where.
+            //
+            // Printed from the daemon's own record rather than from
+            // get_stats(), because for a worker-backed runtime that string was
+            // built in the child and pushed: the child knows its pid and the
+            // daemon knows which child it is, and only the daemon's answer is
+            // still right after a restart has replaced the process.
+            //
+            // Emitted only when there is a process to name, so an in-process
+            // runtime's output is unchanged.  Managed external runtimes set the
+            // same field and get the same line, which is the same question.
+            if (const pid_t rpid = inst->get_pid(); rpid > 0)
+            {
+                conn->write_buf += "pid:";
+                conn->write_buf += std::to_string(static_cast<long long>(rpid));
                 conn->write_buf += '\n';
             }
 

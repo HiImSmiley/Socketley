@@ -687,7 +687,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     // minutes, on the thread every other runtime needs, no matter what
     // timeout_ms said. The socket stays non-blocking for the rest of the call
     // so every later wait goes through the same deadline.
-    int sock = ::socket(addrs->ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int sock = ::socket(addrs->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) { freeaddrinfo(addrs); result["error"] = "socket() failed"; return result; }
 
     if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0)

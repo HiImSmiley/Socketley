@@ -17,7 +17,7 @@ static int daemon_ipc(const char* cmd)
     auto paths = socketley_paths::resolve();
     std::string sock_path = paths.socket_path.string();
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
 
     struct sockaddr_un addr{};

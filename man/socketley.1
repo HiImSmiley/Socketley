@@ -4540,6 +4540,21 @@ for such a runtime, and neither line for an in\-process one. Every other figure
 is identical on both paths \(em which is the property the split exists to have,
 and exactly what made this one invisible without a label.
 .PP
+.B "And which process it is."
+.B stats
+prints
+.BI pid: n
+for a runtime that has one \(em an out\-of\-process proxy's worker, or a managed
+external runtime's child. It is the one question
+.B figures:pushed
+raises without answering: the runtime is elsewhere, and this says where, so the
+process to strace, to read
+.B /proc
+for, or to account a machine's memory to can be named. An in\-process runtime
+prints no such line, and neither does one whose worker has been stopped or
+reaped \(em a pid that has been returned to the system is worse than none,
+because it is a number somebody will go and look at.
+.PP
 The age is measured from the moment the worker read its counters, which travels
 with them, not from the moment the daemon took the frame off the socket. Those
 are not the same instant: frames wait in the socket until something drains it,

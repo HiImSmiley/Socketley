@@ -1066,7 +1066,7 @@ bool cache_store::save_v2(std::string_view path) const
     }
 
     // Phase 2: mmap temp file and serialize directly into mapped region
-    int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd_raw < 0) return false;
 
     if (ftruncate(fd_raw, static_cast<off_t>(total_size)) < 0)
@@ -1164,7 +1164,7 @@ bool cache_store::save_v2(std::string_view path) const
 bool cache_store::load(std::string_view path)
 {
     // mmap path: zero-copy read from page cache
-    int fd_raw = open(std::string(path).c_str(), O_RDONLY);
+    int fd_raw = open(std::string(path).c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_raw < 0)
         return false;
 
