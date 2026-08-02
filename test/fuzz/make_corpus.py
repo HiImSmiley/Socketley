@@ -1635,6 +1635,29 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_WHOLE), xop("FIN", 0), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
+    # The same ordering with the one byte that changes the ending: the request
+    # says `Connection: close`, so the keep-alive detach is refused for it.
+    #
+    # handle_client_read HOLDS a client that half-closes while its answer is
+    # still owed, rather than throwing the answer away, and that hold has to be
+    # ended by whatever delivers the answer.  Only the detach above ever did,
+    # through reset_client_for_next_request -- and the detach is refused for a
+    # `Connection: close` on either leg and for a spliced response, so those
+    # three had no ending at all and the pair was held until the runtime
+    # stopped.  19d6003.
+    #
+    # The FIN has to fall between the backend reading the request and answering
+    # it, which is why this accepts and reads by hand instead of using BE_SERVE:
+    # the hold is only taken if the answer is genuinely still outstanding when
+    # the client shuts its write side.
+    s["half_close_before_answer"] = prog(
+        px_head(SH_ONE),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_CONN_CLOSE), xop("PUMP", 3),
+        xop("BE_ACCEPT", 0), xop("BE_RECV", 0),
+        xop("FIN", 0), xop("PUMP", 3),
+        xop("BE_RESPOND", 0, A_OK), xop("PUMP", 3), xop("STOP"))
+
     s["stop_start_with_a_request_in_flight"] = prog(
         px_head(SH_ONE),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
