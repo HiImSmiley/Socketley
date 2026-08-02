@@ -114,7 +114,71 @@ FD_TOLERANCE=6
 # fired.
 RSS_BOUND_KB=24576
 
-PASS=0; FAIL=0; TOTAL=0
+PASS=0; FAIL=0; TOTAL=0; SKIP=0
+
+# ─── THREE CHECKS THAT MEASURE THE SANITIZER, NOT THE PRODUCT ───────────────
+#
+# This file runs in the nightly under TSan as well as under Release, and under
+# ASan+UBSan once that job builds again.  Three of its assertions have no
+# defined meaning in a sanitized build:
+#
+#   * RSS_BOUND_KB.  24 MB of growth, against a Release daemon whose baseline
+#     is about 7 MB.  TSan's baseline is 88-100 MB before a byte of traffic and
+#     its shadow memory grows with every word the program touches.  Measured on
+#     the same commit, the same test, in nightly run 30719890629: the
+#     non-sanitized invariants job grew 5724 kB and passed; the TSan job grew
+#     1818092 kB.  Reproduced here on 2026-08-02 with a local tsan_x64 build:
+#     base 88316 kB, growth 1653100 kB.  A factor of roughly three hundred, in
+#     both places.  That number is TSan's, not the daemon's.
+#
+#   * MIN_OK, twice.  A floor on healthy round trips completed inside a fixed
+#     1.5 s window, set an order of magnitude below the ~1500 a Release build
+#     manages.  TSan is several times slower, so the same window yields tens:
+#     19 and 3 on the runner, 30 and 13 here.  That is the sanitizer's clock.
+#
+# They are printed and not asserted in a sanitized build, loudly, with the
+# numbers, so nobody reads a quiet log as a checked one.  Everything else stays
+# asserted in every build -- cache_bad, proxy_bad, the resets, the abort floors,
+# the drain, the descriptors, and that the daemon still serves a fresh runtime.
+# Those are what running this file under TSan is FOR, and all of them passed
+# under TSan in both runs above.
+#
+# ZERO IS STILL A FAILURE, in every build.  "Barely any traffic got through
+# because the sanitizer is slow" and "no traffic got through at all" are not the
+# same statement, and only the first one is excused here.
+#
+# Detected from the binary rather than from an environment variable, using the
+# idiom the nightly's own "Verify the build" step uses: a build that lost its
+# sanitizer flags must not be able to claim this exemption.  A stripped Release
+# binary yields nothing and is treated as not sanitized, which is the safe way
+# round -- unknown keeps the strict bounds.
+#
+# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
+# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
+# then reports 141 and the `if` takes the branch for "no match" precisely when
+# there was one.  The first draft of this detection did exactly that and every
+# assertion below stayed armed under TSan.  grep without -q reads its input to
+# the end, so the pipeline's status is grep's.  (The same idiom in the nightly's
+# "Verify the build" step is safe only because GitHub Actions does not set
+# pipefail; it is not safe here.)
+SANITIZED=""
+if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
+    SANITIZED="TSan"
+elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
+    SANITIZED="ASan"
+fi
+
+# Printed, counted in its own column, and deliberately NOT added to FAIL: unlike
+# NOT MEASURABLE in test_restart_under_load.sh, which means "this run could not
+# put the question and might next time", this means "this build cannot answer
+# this question and never will".  A job that is red every single night for a
+# reason nobody can act on gets ignored, which is the same end state as a check
+# that cannot fail.
+not_asserted() {  # label reason
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  NOT ASSERTED [$1]: $2"
+    echo "        sanitized build ($SANITIZED) — this measures the sanitizer, not the daemon"
+}
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
@@ -199,6 +263,11 @@ assert_rss_bounded() {    # base final bound_kb
     fi
     delta=$((final - base))
     echo "  rss:  base=${base}kB final=${final}kB growth=${delta}kB bound=${bound}kB"
+    if [ -n "$SANITIZED" ]; then
+        TOTAL=$((TOTAL-1))   # not_asserted takes its own
+        not_asserted "memory bounded" "RSS grew ${delta}kB; the ${bound}kB bound is a Release figure"
+        return
+    fi
     if [ "$delta" -le "$bound" ]; then
         PASS=$((PASS+1))
     else
@@ -782,6 +851,28 @@ assert_field_min() {  # name minimum label
     fi
 }
 
+# A sufficiency floor whose number is a throughput figure: how much healthy
+# traffic the window produced.  Same as assert_field_min in a normal build; in a
+# sanitized one the floor is not asserted, because the window is measuring the
+# sanitizer's clock.  Zero still fails either way -- nothing got through at all
+# is a defect in any build, and it is the case the floor was written for.
+assert_field_min_throughput() {  # name minimum label
+    local n
+    n=$(field "$1")
+    if [ -z "$n" ] || [ -z "$SANITIZED" ]; then
+        assert_field_min "$@"
+        return
+    fi
+    TOTAL=$((TOTAL+1))
+    if [ "$n" -eq 0 ]; then
+        FAIL=$((FAIL+1))
+        echo "  FAIL [$3]: $1=$n — not one healthy round trip completed, so every zero above is meaningless"
+        return
+    fi
+    TOTAL=$((TOTAL-1))       # not_asserted takes its own
+    not_asserted "$3" "$1=$n against a floor of $2 calibrated on a Release build"
+}
+
 TOTAL=$((TOTAL+1))
 if [ -n "$TOTALS" ]; then
     PASS=$((PASS+1))
@@ -806,8 +897,8 @@ assert_field_eq cache_reset 0 "cache closed a healthy connection"
 assert_field_eq proxy_reset 0 "proxy closed a healthy connection"
 
 # Zeroes above are worthless if barely any healthy traffic got through.
-assert_field_min cache_ok "$MIN_OK" "enough healthy cache traffic to mean something"
-assert_field_min proxy_ok "$MIN_OK" "enough healthy proxy traffic to mean something"
+assert_field_min_throughput cache_ok "$MIN_OK" "enough healthy cache traffic to mean something"
+assert_field_min_throughput proxy_ok "$MIN_OK" "enough healthy proxy traffic to mean something"
 
 # ── The point of the test ──────────────────────────────────────────────────
 # Every client is gone. A connection that nothing will ever wake keeps this
@@ -901,10 +992,22 @@ sleep 0.8
 assert_fds_returned "$BASE_FD" "$(fd_count)" "$FD_TOLERANCE"
 assert_rss_bounded  "$BASE_RSS" "$(rss_kb)"  "$RSS_BOUND_KB"
 
-if [ "$FAIL" -gt 0 ]; then
+if [ "$FAIL" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
     echo "  ${TOTALS:-<no TOTALS line>}"
 fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+# The summary has to add up, or it cannot be acted on and nobody re-checks the
+# arithmetic by eye.  Same guard as test_restart_under_load.sh.
+if [ "$((PASS+FAIL+SKIP))" -ne "$TOTAL" ]; then
+    echo "  FAIL [counters]: $PASS passed + $FAIL failed + $SKIP not asserted"
+    echo "        does not equal $TOTAL counted — this summary is wrong, not just the run"
+    FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1))
+fi
+
+if [ "$SKIP" -gt 0 ]; then
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $SKIP not asserted under $SANITIZED)"
+else
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+fi
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
