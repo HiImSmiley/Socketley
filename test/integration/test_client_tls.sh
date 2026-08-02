@@ -48,7 +48,7 @@ PASS=0; FAIL=0; TOTAL=0
 NAMES="tok tplain tbadca texpired tbadname tnoca tcleartext"
 
 cleanup() {
-    for n in $NAMES tudp tcache thalf1 thalf2 tnotls; do
+    for n in $NAMES tudp tudp2 tcache thalf1 thalf2 tnotls; do
         "$BIN" stop "$n" >/dev/null 2>&1 || true
         "$BIN" remove "$n" >/dev/null 2>&1 || true
     done
@@ -363,14 +363,41 @@ if [ $? -ne 0 ]; then ok; else bad "--key without --cert is refused" "it was acc
 if [ $? -ne 0 ]; then ok; else bad "--ca without --tls is refused" "it was accepted"; fi
 
 # --tls on a UDP client would need DTLS.  The flags are accepted in either
-# order, so this is caught at start: the runtime goes to `failed` rather than
-# sending datagrams in the clear under a TLS configuration.
+# order, so this is caught at start rather than at parse -- and what happens
+# then depends on how the runtime was started, so both ways are asked.
+#
+# `create -s` refuses: exit 2, "could not start runtime", and the runtime it had
+# already made is unwound, so nothing named tudp is left in any listing.  The
+# assertion this replaced looked for the string "failed" in `ps -a` or for the
+# absence of tudp from `ps`.  The first half could never match -- the runtime is
+# gone, not failed -- so the whole thing rested on the second, which is also
+# satisfied by a create that failed for any other reason, a typo in the flag
+# among them.  So the exit code is asserted too, and the absence is asked of
+# `ls` as well, because `ps` without -a would not show this runtime even if it
+# did exist and had come up.
 "$BIN" create client tudp -t "127.0.0.1:$PEER" --udp --tls -s >/dev/null 2>&1
+CREATE_RC=$?
 sleep 0.5
-if grep -q "tudp.*failed" < <("$BIN" ps -a 2>/dev/null) \
-   || ! grep -q "tudp" < <("$BIN" ps 2>/dev/null); then ok; else
-    bad "--tls on a UDP client is refused" \
+LISTED=$("$BIN" ps -a 2>/dev/null; "$BIN" ls 2>/dev/null)
+if [ $CREATE_RC -ne 0 ] && ! printf '%s\n' "$LISTED" | grep -q "tudp"; then ok; else
+    bad "--tls on a UDP client is refused where it is started" \
         "a UDP client came up under a TLS configuration and is sending datagrams in the clear"
+fi
+
+# Started in two steps the runtime survives the refusal, and `failed` is where
+# it has to stay: created is a runtime nobody has tried to start yet, and
+# running is the outcome this whole section exists to prevent.  This is the arm
+# the old assertion was written for and never reached.
+"$BIN" create client tudp2 -t "127.0.0.1:$PEER" --udp --tls >/dev/null 2>&1
+"$BIN" start tudp2 >/dev/null 2>&1
+START_RC=$?
+sleep 0.5
+if [ $START_RC -ne 0 ] \
+   && "$BIN" ps -a 2>/dev/null | awk '$2 == "tudp2" && /Failed/ { f=1 } END { exit !f }'; then
+    ok
+else
+    bad "a UDP client that was refused TLS stays visible and failed" \
+        "$("$BIN" ps -a 2>/dev/null | tr '\n' '|')"
 fi
 
 # ── 10. a cache still refuses TLS ────────────────────────────────────────────
