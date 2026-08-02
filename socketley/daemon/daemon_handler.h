@@ -103,6 +103,11 @@ private:
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
     int cmd_dashboard(ipc_connection* conn);
 
+    // The daemon saying which daemon it is.  Asked by every CLI command before
+    // it sends anything, so that "something accepted my connection" stops being
+    // read as "a daemon is here"; see shared/daemon_client.h.
+    int cmd_ping(ipc_connection* conn);
+
     // Bring cluster discovery up under NAME in DIR, replacing whatever is
     // running.  On failure nothing is left running and m_cluster_error says
     // why, in the words the operator gets.

@@ -12,6 +12,8 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../shared/cluster_discovery.h"
+#include "../shared/daemon_client.h"
+#include "../cli/cli.h"
 #include "../shared/tls_context.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
@@ -773,6 +775,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
+        case fnv1a("ping"):          return cmd_ping(conn);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -1435,6 +1438,29 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
+    conn->write_buf = out.str();
+    return 0;
+}
+
+// The one command whose answer is the daemon itself.
+//
+// A CLI that has only connect() to go on cannot tell a daemon from a stranger
+// bound to the same path, and it was writing the operator's command into
+// whichever it found.  This is what it asks first.  The reply has to be
+// something no other program produces by accident, so it leads with a literal
+// that names this project, and it carries the version and pid because the
+// second question after "is this a daemon" is always "which one".
+//
+// Cheap on purpose: no lock, no runtime touched, one string.  It runs ahead of
+// every CLI command in the tree.
+int daemon_handler::cmd_ping(ipc_connection* conn)
+{
+    if (!conn)
+        return 0;
+
+    std::ostringstream out;
+    out << socketley::daemon_ident_prefix << SOCKETLEY_VERSION
+        << ' ' << getpid() << '\n';
     conn->write_buf = out.str();
     return 0;
 }

@@ -18,13 +18,25 @@
 #include "ipc_client.h"
 #include "../daemon/daemon_handler.h"
 #include "../runtime/proxy/proxy_worker.h"
+#include "../shared/daemon_client.h"
 #include "../shared/paths.h"
 
-static bool daemon_is_running()
+// Is *anything* listening on the socket path.
+//
+// Deliberately still the weak question, and used in exactly one place: the poll
+// that waits for the daemon this process has just forked.  By the time it runs,
+// the strong question below has already established that the path was free, so
+// whatever is answering now appeared in the last few milliseconds and is the
+// child.  Asking the strong question here instead would be a regression, not an
+// improvement: a daemon binds and listens before it restores its runtimes and
+// only enters its event loop afterwards, so a daemon coming back with a dozen
+// persisted runtimes accepts connections for as long as the restore takes and
+// answers none of them.  The poll's budget is one second.
+static bool socket_answers()
 {
-    // SOCK_CLOEXEC on all three of the CLI's sockets, for the same reason as
-    // the daemon's: ensure_daemon() below forks and execs a daemon, and the
-    // only descriptors that exec is meant to receive are the three it opens
+    // SOCK_CLOEXEC on all of the CLI's sockets, for the same reason as the
+    // daemon's: ensure_daemon() below forks and execs a daemon, and the only
+    // descriptors that exec is meant to receive are the three it opens
     // /dev/null onto.  Nothing here is ever handed to a child on purpose.
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -39,14 +51,59 @@ static bool daemon_is_running()
     return ok;
 }
 
+// Make sure a daemon is serving the socket, and — before anything is written to
+// it — that the thing serving it is a daemon.
+//
+// The two failures are not symmetric, which is what decides where the strict
+// check goes.  A false negative forks a spare daemon; that daemon finds the
+// socket taken and exits 0, so it costs one process.  A false positive means
+// the whole session is delivered to a stranger: `create server db -p 9000` is
+// written out in full to whatever accepted the connection, and a peer that
+// writes back two zero bytes — a well-formed reply frame of exit 0 with no text
+// — makes the CLI report success in a shell whose convention is that silence
+// means it worked.  Nothing was created; the operator is told it was.
+//
+// So this refuses rather than forking when the path is occupied by something it
+// cannot identify.  Forking there would be worse than either: the new daemon
+// unlinks the path and binds over it, which is how you take a socket away from
+// whatever legitimately owns it.
 static bool ensure_daemon(char* /*argv0*/)
 {
-    if (daemon_is_running())
-        return true;
+    switch (socketley::daemon_probe(daemon_handler::socket_path.c_str()))
+    {
+        case socketley::daemon_identity::daemon:
+        // A daemon too old to answer `ping` is still a daemon, and locking an
+        // operator out of runtimes they are already running — with a message
+        // accusing their own daemon of being an impostor — would be a worse
+        // outcome than the defect this probe exists to close.  `socketley
+        // version` is where the mismatch is reported.
+        case socketley::daemon_identity::predates_ping:
+            return true;
+
+        case socketley::daemon_identity::foreign:
+            std::cerr << "the socket at " << daemon_handler::socket_path
+                      << " is held by something that is not a socketley daemon\n"
+                      << "  Nothing was sent to it. Point SOCKETLEY_SOCKET "
+                         "elsewhere, or free the path.\n";
+            return false;
+
+        case socketley::daemon_identity::mute:
+            std::cerr << "the daemon socket at " << daemon_handler::socket_path
+                      << " accepted a connection and did not answer\n"
+                      << "  Nothing was sent to it. Either a daemon there is "
+                         "wedged, or the path belongs to something else.\n";
+            return false;
+
+        case socketley::daemon_identity::absent:
+            break;   // the path is free — including when a stale file is on it
+    }
 
     pid_t pid = fork();
     if (pid < 0)
+    {
+        std::cerr << "failed to start daemon\n";
         return false;
+    }
 
     if (pid == 0)
     {
@@ -79,10 +136,11 @@ static bool ensure_daemon(char* /*argv0*/)
     for (int i = 0; i < 50; ++i)   // 50 * 20ms = 1s max
     {
         usleep(20000);
-        if (daemon_is_running())
+        if (socket_answers())
             return true;
     }
 
+    std::cerr << "failed to start daemon\n";
     return false;
 }
 
@@ -107,6 +165,47 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("version"):
         {
             std::cout << SOCKETLEY_VERSION << "\n";
+
+            // And, on stderr, what is actually serving the socket — because a
+            // second build of this tree is the one case where the version the
+            // operator just printed is not the version answering their
+            // commands.  A daemon holds its runtimes across an upgrade, so
+            // "I rebuilt and my new flag is rejected" has exactly this cause
+            // and nothing anywhere else reported it.
+            //
+            // stderr, not stdout, so `$(socketley version)` is byte-identical
+            // in every case.  A short deadline because there is nothing to wait
+            // for: this command has never needed a daemon and must not start
+            // hanging on one that is busy or on a path someone else owns.
+            std::string dver;
+            switch (socketley::daemon_probe(daemon_handler::socket_path.c_str(),
+                                            &dver, 300))
+            {
+                case socketley::daemon_identity::daemon:
+                    if (dver != SOCKETLEY_VERSION)
+                        std::cerr << "the daemon serving " << daemon_handler::socket_path
+                                  << " is version " << dver
+                                  << "; restart it to run " << SOCKETLEY_VERSION << "\n";
+                    break;
+
+                case socketley::daemon_identity::predates_ping:
+                    std::cerr << "the daemon serving " << daemon_handler::socket_path
+                              << " is from a build older than " << SOCKETLEY_VERSION
+                              << "; restart it to run " << SOCKETLEY_VERSION << "\n";
+                    break;
+
+                case socketley::daemon_identity::foreign:
+                    std::cerr << "the socket at " << daemon_handler::socket_path
+                              << " is held by something that is not a socketley daemon\n";
+                    break;
+
+                // Nothing there, or there and busy.  Neither is worth a word:
+                // the first is the ordinary case, and the second is what a
+                // daemon restoring its runtimes looks like from outside.
+                case socketley::daemon_identity::absent:
+                case socketley::daemon_identity::mute:
+                    break;
+            }
             return 0;
         }
 
@@ -153,11 +252,13 @@ int cli_dispatch(int argc, char** argv)
             }
 
             // Configuration mode — ensure daemon is running, then send IPC
+            // The message belongs to ensure_daemon: "failed to start daemon" is
+            // one of three reasons it can say no, and the other two are about a
+            // path it refused to write to rather than a daemon it could not
+            // start.  Reprinting it here would put the wrong sentence under the
+            // right one.
             if (!ensure_daemon(argv[0]))
-            {
-                std::cerr << "failed to start daemon\n";
                 return 2;
-            }
 
             for (int i = 2; i < argc; ++i)
             {
@@ -225,10 +326,7 @@ int cli_dispatch(int argc, char** argv)
 
     // All other commands need the daemon — auto-start if not running
     if (!ensure_daemon(argv[0]))
-    {
-        std::cerr << "failed to start daemon\n";
         return 2;
-    }
 
     switch (fnv1a(cmd.data()))
     {
@@ -288,6 +386,12 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("show"):
         case fnv1a("owner"):
         case fnv1a("dashboard"):
+        // Typed by hand it answers "which daemon is on this socket", which is
+        // the question the probe above asks on every command and the one an
+        // operator asks when a socket is behaving oddly.  Without this case it
+        // fell through to the runtime-action and piped-stdin arms and was
+        // answered "empty message", which is a reply to a different question.
+        case fnv1a("ping"):
             return cli_forward(argc, argv);
 
         case fnv1a("cluster"):

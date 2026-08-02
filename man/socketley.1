@@ -725,8 +725,23 @@ Show cluster summary: daemon counts, runtime totals, group membership.
 Continuously refresh the cluster view every 2 seconds (Ctrl+C to stop).
 .RE
 .TP
+.B ping
+Ask the daemon to identify itself. Prints
+.BI "socketley\-daemon " "version pid"
+for the daemon serving the socket. Every command runs this first, before it
+sends anything: a
+.BR connect (2)
+that succeeds only proves something is listening on the path, not that the
+thing listening is a daemon, and a command written to a stranger is a command
+delivered to a stranger. A path held by something that does not answer this is
+refused, with nothing sent to it.
+.TP
 .B version \fR| \fB\-\-version\fR | \fB\-v\fR
-Print the socketley version number and exit.
+Print the socketley version number and exit. Does not require, and does not
+start, a daemon. If one is running on the socket and reports a different
+version \(em an upgraded binary over a daemon still holding its runtimes \(em
+that is reported on standard error; standard output is the version number
+either way.
 .TP
 .BI "\-\-lua " "lua_file"
 Load Lua orchestration configuration. Optionally configures daemon name
