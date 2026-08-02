@@ -515,6 +515,37 @@ struct pooled_backend
     std::string host;
     uint16_t port;
     std::chrono::steady_clock::time_point idle_since;
+
+    // ── the session, for a socket that has one ──
+    //
+    // A TLS backend socket is nothing without its record layer.  The transport
+    // here is a memory BIO pair rather than SSL_set_fd, so every sequence
+    // number, every key schedule and every byte OpenSSL has read but not yet
+    // handed over lives inside this object and nowhere else — pooling the
+    // descriptor and building a fresh SSL for the next borrower would put a
+    // brand new record layer on a stream already several records in, which is
+    // not reuse at all.  So the session travels with the descriptor, and the
+    // pool owns both: whoever closes the fd frees this.
+    //
+    // Null for a cleartext socket, which is what nearly every entry is.
+    SSL* ssl{nullptr};
+    // Which tls_context created `ssl`.
+    //
+    // The endpoint above answers three of the four things a TLS connection
+    // carries beyond an address — the SNI name sent, the name the certificate
+    // was verified against, and the peer — because start_backend_tls derives
+    // all three from exactly this host, through exactly the same
+    // backend_endpoint_of call that fills it in.  The fourth is the client
+    // certificate presented and the trust store the chain was checked against,
+    // and those belong to the context rather than to the connection: one per
+    // proxy instance, built in start() from --client-cert/--client-key/--ca.
+    //
+    // teardown() empties this pool before start() can build a new context, so
+    // an entry outliving its context should be impossible.  It is compared
+    // anyway, for the reason backend_pool_eligible gives about the endpoint
+    // key: a checked fact costs a pointer compare, and an argument about
+    // lifetimes costs whatever the next change to start() costs.
+    const tls_context* tls_owner{nullptr};
 };
 
 class proxy_instance : public runtime_instance
@@ -746,9 +777,39 @@ private:
     // Connection pool: reuse idle backend connections
     // Both take the endpoint as well as the index: a pooled socket goes back
     // only to the peer it was opened to.  See pooled_backend.
-    int acquire_pooled_backend(size_t backend_idx, std::string_view host, uint16_t port);
+    //
+    // `want_tls` is part of the key rather than a preference.  An encrypted
+    // socket handed to a request that will write a plaintext request into it
+    // sends that request as a TLS record nobody can read, and a cleartext
+    // socket handed to a TLS request sends the ClientHello of a handshake the
+    // peer already finished — so the two never mix, and asking makes that a
+    // checked fact instead of a consequence of how the backends happen to be
+    // configured.  On success `out_ssl` receives the session that belongs to
+    // the returned descriptor: non-null exactly when want_tls, and the caller
+    // owns it from that moment.
+    int acquire_pooled_backend(size_t backend_idx, std::string_view host, uint16_t port,
+                               bool want_tls, SSL** out_ssl);
+    // `bconn` is the connection being given up.  release_to_pool takes its
+    // session with the descriptor when it files one, and leaves it alone when
+    // it closes one — so backend_pool_release, which runs after every call
+    // here, frees exactly the sessions that were not pooled.
     void release_to_pool(int backend_fd, size_t backend_idx,
-                         std::string_view host, uint16_t port);
+                         std::string_view host, uint16_t port,
+                         proxy_backend_connection* bconn);
+    // Give up a pooled entry: the descriptor and, if it has one, the session.
+    // Every path that stops holding an entry goes through here — the stale
+    // sweep, the probe's three refusals, the full-pool eviction, teardown —
+    // because a session freed anywhere else is a session leaked everywhere
+    // else.  `reset` sends a TCP reset rather than a graceful close; see the
+    // definition for when that is the right signal.
+    void discard_pooled(pooled_backend& pb, bool reset);
+    // Ask a pooled TLS socket whether anything is waiting on it that the next
+    // borrower must not inherit.  See the definition — this is the whole of
+    // the TLS half of ed07f12's argument.
+    //
+    // Returns true when the socket may be reused.  A false answer has already
+    // discarded the entry.
+    bool probe_pooled_tls(pooled_backend& pb);
     // Start the periodic sweep if it is not already running.  Idempotent; see
     // the definition for why it is armed on demand rather than always.
     void arm_idle_sweep();
@@ -1070,6 +1131,11 @@ private:
     // property of the backend rather than of one connection, so it repeats on
     // every socket that backend has.
     bool m_pool_unbidden_warned{false};
+    // The same finding on an encrypted socket, and a separate flag because it
+    // is a separate diagnosis: there the bytes are the evidence, here the bytes
+    // are routine and what OpenSSL made of them is the evidence.  An operator
+    // reading one of these needs to know which question was answered.
+    bool m_pool_tls_unbidden_warned{false};
 
     // ─── TLS ───────────────────────────────────────────────────────────────
     //

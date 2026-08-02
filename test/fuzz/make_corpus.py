@@ -1759,16 +1759,62 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
-    # Two requests over a TLS backend leg.  The second must not find the first
-    # one's socket in the pool: a pooled socket carries a negotiated identity
-    # that the pool's key — a host and a port — cannot express.
-    s["tls_backend_is_never_pooled"] = prog(
+    # Two requests over a TLS backend leg.  The second finds the first one's
+    # socket in the pool and does not handshake again — the session is pooled
+    # with the descriptor, and the endpoint it is filed under is the same one
+    # the certificate was verified against.
+    s["tls_backend_is_pooled"] = prog(
         px_head(SH_ONE, tls_back=True),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
         xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
         xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # Invariant C over the pooled TLS path, and the reason the probe in
+    # acquire_pooled_backend has to decrypt rather than peek.  The backend
+    # volunteers an answer on the socket after the exchange on it is over; the
+    # next client borrows that socket.  What is waiting is a record, and a
+    # record that is application data is indistinguishable from a session
+    # ticket until it has been decrypted — so a probe that only asks the kernel
+    # whether bytes are present either throws every pooled connection away or
+    # hands this one to client 1.  Fires when the probe is removed.
+    s["pooled_tls_socket_speaks_unbidden"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("BE_RESPOND", 0, A_UNSOLICITED), xop("PUMP", 3),
+        xop("CONNECT", 1), xop("REQUEST", 1, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3),
+        xop("RECV", 1), xop("RECV", 0), xop("STOP"))
+
+    # A pooled TLS socket that nobody comes back for in time.  The stale sweep
+    # and the stale branch of the probe both have to give up the session as
+    # well as the descriptor, and this is the path that says so — under ASan a
+    # session left behind here is a leak, and one freed twice is worse.
+    s["pooled_tls_socket_aged_out"] = prog(
+        px_head(SH_ONE, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("AGE", 90), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
+
+    # A pooled TLS socket to one member of a group, and a request routed to a
+    # different member.  The endpoint is the whole of the identity check, so
+    # this is where crossing it would show.
+    s["tls_group_pool_two_members"] = prog(
+        px_head(SH_GROUP, group=0x03, tls_back=True),
+        xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
+        xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0),
+        xop("STOP"))
 
     s["tls_backend_handshake_never_finishes"] = prog(
         px_head(SH_ONE, tls_back=True),

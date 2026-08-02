@@ -64,6 +64,24 @@
 //     bytes are well formed, the framing is correct, and they are simply the
 //     wrong bytes.
 //
+//     C holds over an encrypted backend leg too, and that is not a free
+//     extension of it.  The proxy pools TLS backend sockets, so the socket a
+//     client's request goes out on may be one a previous client used; what
+//     stops the previous exchange leaking into this one is a probe that
+//     decrypts whatever is waiting and asks whether any of it was application
+//     data.  `pooled_tls_socket_speaks_unbidden` is C over that path, and it
+//     fires when the probe is taken out.
+//
+//  D. A POOLED SOCKET IS THE CONNECTION IT IS FILED AS.  Two statements, both
+//     from outside the proxy, because both halves of what the proxy compares
+//     come from the same function of its own.  `pooled-entry-endpoint` asks
+//     the kernel, through getpeername(), whether a pooled socket really goes
+//     to the endpoint it is filed under — which is the whole identity check
+//     on the acquire side, and on an encrypted leg is also the SNI name and
+//     the name the peer's certificate was verified against.
+//     `pooled-entry-session` asks whether an entry's session and the leg the
+//     harness configured agree.  See check_backend_pool().
+//
 // ─── AND WHERE EACH OF THE THREE IS ENTITLED TO SPEAK ────────────────────────
 //
 // All three are stated over the harness's own bookkeeping while the program
@@ -594,6 +612,19 @@ void print_program()
 
 event_loop*        g_loop = nullptr;
 fuzzrt::ring_watch g_watch;
+
+// Connection reuse, counted at the backend's end.  g_be_accepts is one TCP
+// handshake — and on an encrypted leg one TLS handshake — that the proxy paid
+// for; g_be_requests is one request that arrived on a backend socket.  Both are
+// the harness's own observations, made by the peer doing the work, so neither
+// depends on the proxy's account of its pool.
+//
+// Printed per input when FUZZ_PROXY_POOL_REPORT is set, which is off in CI and
+// on when somebody is measuring: a seed whose accepts stop tracking its
+// requests is a seed that started reusing connections, and that is the whole of
+// what pooling buys.
+unsigned long g_be_accepts  = 0;
+unsigned long g_be_requests = 0;
 
 std::vector<std::unique_ptr<proxy_instance>>* g_graveyard = nullptr;
 
@@ -1697,6 +1728,14 @@ int backend_accept(world& w, int idx)
     // Invariant 3, at the other moment the kernel hands this process a number.
     g_watch.fresh_fd(fd, "harness backend accept4()");
 
+    // What connection reuse is worth, counted where it cannot be argued with:
+    // one accept here is one TCP handshake the proxy paid for, and on an
+    // encrypted leg one TLS handshake on top of it.  Against the requests
+    // counted in bsock_note_request() this is handshakes-per-request, measured
+    // from outside the proxy by the peer that had to do them.  See the report
+    // at the end of LLVMFuzzerTestOneInput.
+    g_be_accepts++;
+
     fuzzrt::set_abortive(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -1806,6 +1845,8 @@ void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
         // the second time in the same exchange.
         return;
     }
+
+    g_be_requests++;
 
     if (b.owed_n < 8)
         b.owed[b.owed_n++] = id;
@@ -2317,6 +2358,68 @@ void check_backend_pool(world& w, proxy_instance* rt)
                            "a descriptor in the backend pool is still in the dispatch index, "
                            "so a completion naming it would be routed into a connection that "
                            "has been given away");
+
+            // ── the key against the kernel ──
+            //
+            // A pooled socket is handed to the next request whose endpoint
+            // equals the one it is filed under, so the filed endpoint is the
+            // whole of the identity check on the acquire side and nothing
+            // downstream re-derives it.  That makes the filing the only place
+            // it can be wrong, and the proxy cannot check it: both halves come
+            // out of its own backend_endpoint_of().  getpeername() is a second
+            // source — the address the kernel actually has this socket
+            // connected to — so a socket filed under an endpoint it does not
+            // go to is caught here rather than by whoever borrows it.
+            //
+            // This is what makes "a pooled socket cannot cross host or port"
+            // a checked fact.  It matters more once a socket carries a
+            // session: on a TLS leg the endpoint filed here is also the SNI
+            // name sent and the name the certificate was verified against —
+            // start_backend_tls derives both from the same call — so a
+            // mis-filed endpoint is a mis-filed peer identity too.
+            struct sockaddr_in peer{};
+            socklen_t peerlen = sizeof(peer);
+            if (::getpeername(pb.fd, reinterpret_cast<struct sockaddr*>(&peer), &peerlen) == 0)
+            {
+                char ip[INET_ADDRSTRLEN] = {0};
+                ::inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+                const uint16_t rport = ntohs(peer.sin_port);
+                fuzzrt::set_detail("filed under %s:%u, actually connected to %s:%u",
+                                   pb.host.c_str(), static_cast<unsigned>(pb.port),
+                                   ip, static_cast<unsigned>(rport));
+                RT_FINDING("pooled-entry-endpoint",
+                           rport == pb.port && pb.host == ip,
+                           "a socket in the backend pool is filed under an endpoint it is not "
+                           "connected to — the pool hands it to the next request for that "
+                           "endpoint, so that request goes to a peer nobody routed it to, and "
+                           "on an encrypted leg to a peer whose certificate was checked "
+                           "against a different name");
+                fuzzrt::g_detail[0] = 0;
+            }
+
+            // ── the session against the configuration ──
+            //
+            // An entry's session and the leg it belongs to have to agree, and
+            // the harness knows which leg it configured, so this is stated
+            // from outside the proxy rather than from its own flags.
+            //
+            // Both directions are defects and neither is quiet.  A socket from
+            // an encrypted leg pooled *without* its session is a descriptor
+            // whose record layer has been thrown away: the next borrower
+            // writes a plaintext request into a stream the peer is decrypting,
+            // and every byte of it is garbage or an alert.  A socket from a
+            // cleartext leg pooled *with* one could only have got it from
+            // somewhere else.
+            fuzzrt::set_detail("the backend leg is %s and the pooled entry %s a session",
+                               w.tls_back ? "encrypted" : "cleartext",
+                               pb.ssl ? "carries" : "does not carry");
+            RT_FINDING("pooled-entry-session",
+                       (pb.ssl != nullptr) == (w.tls_back && tls_available()),
+                       "a backend pool entry disagrees with its own leg about whether it has "
+                       "a TLS session — a pooled descriptor and the record layer that owns "
+                       "its stream are one thing, and either half without the other is handed "
+                       "to the next request as a connection it cannot speak on");
+            fuzzrt::g_detail[0] = 0;
 
             // Which of the harness's own backend sockets this is.  The proxy's
             // end of that connection is the peer the harness accepted, so the
@@ -2860,6 +2963,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     reap_graveyard();
     reset_ids();
 
+    g_be_accepts  = 0;
+    g_be_requests = 0;
+
     world w;
     g_world = &w;
 
@@ -2923,6 +3029,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     // finding said twice.
     if (g_graveyard->empty())
         g_watch.sweep_descriptors("end of input");
+
+    // What the pool saved on this input, from the backend's end.  Off unless
+    // asked for: it is a measurement rather than an invariant, and a number
+    // printed on every input of a mutation run is a number nobody reads.
+    if (std::getenv("FUZZ_PROXY_POOL_REPORT"))
+        std::fprintf(stderr,
+                     "pool: backend accepts=%lu requests=%lu  (tls_back=%d tls_front=%d)\n",
+                     g_be_accepts, g_be_requests,
+                     w.tls_back && tls_available() ? 1 : 0,
+                     w.tls_front && tls_available() ? 1 : 0);
 
     g_world = nullptr;
     ::fuzz::set_current(nullptr, 0);

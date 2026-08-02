@@ -26,12 +26,25 @@
 #   that fails either check is answered 502 (or retried, with --retry) and is
 #   charged to its circuit breaker -- the request is never re-sent in the clear.
 #
-# ONE COST WORTH KNOWING
-#   * A TLS backend connection is never returned to the connection pool, so
-#     each request to one pays for a handshake. The pool is keyed by host and
-#     port, and a TLS connection carries a session and a verified identity
-#     that a host and a port cannot express; handing one to the next request
-#     would be a guess about who the peer is.
+# CONNECTION REUSE ON THE TLS LEG
+#   * A TLS backend connection IS returned to the connection pool, together
+#     with its session -- a reused connection carries on the record layer it
+#     already had rather than starting a new one over an old socket. Forty
+#     requests to one https:// backend cost one handshake, not forty.
+#   * It goes back only to the endpoint it was opened to. That endpoint is
+#     also the name pinned to the session before the ClientHello and the name
+#     the certificate was verified against, so the key cannot separate the
+#     socket from its identity. The trust store and client certificate belong
+#     to the runtime and are rebuilt at every start, and the pool is emptied
+#     at every stop, so no pooled session outlives the configuration that
+#     verified it.
+#   * Before reuse, whatever is waiting on the socket is decrypted and looked
+#     at. A TLS peer that has said nothing still sends records -- a session
+#     ticket, a key update, a close_notify -- and those are consumed and the
+#     connection kept. Application data is a response belonging to an exchange
+#     that is over, and the connection is dropped rather than handed to the
+#     next client, which is the encrypted form of the same rule the cleartext
+#     pool applies to unread bytes.
 #
 # HEALTH CHECKS OVER TLS
 #   --health-check http works against a TLS backend. The probe handshakes

@@ -1514,11 +1514,20 @@ is answered 502 (or retried, where
 is set) and is charged to its circuit breaker \(em the request is never sent
 in the clear as a fallback.
 .PP
-One cost comes with the backend leg. Connections to a TLS backend are
-.B not pooled,
-so each request pays for a handshake: a pooled socket is handed out on a host
-and a port, which cannot express the session and peer identity a TLS
-connection carries.
+Connections to a TLS backend are pooled and reused, like cleartext ones \(em a
+run of forty requests to one
+.B https://
+backend costs one handshake rather than forty. The session is pooled with the
+descriptor, so the reused connection is the same record layer part way through
+the same stream, not a new one over an old socket. A pooled socket goes back
+only to the endpoint it was opened to, which is also the name its certificate
+was verified against and the name sent as SNI, and never survives a restart:
+the trust store and client certificate the leg verifies against are rebuilt
+when the runtime starts, and the pool is emptied when it stops. Before a socket
+is reused, whatever is waiting on it is decrypted and inspected \(em a session
+ticket or a key update is consumed and the connection kept, application data is
+a response nobody asked for and the connection is dropped rather than handed to
+the next client.
 .B \-\-health\-check http
 works alongside it and probes over TLS, verifying the backend's certificate to
 the same standard the data path does \(em a backend it cannot verify is marked
@@ -2942,14 +2951,32 @@ handed back to a request routed to that same member; a member that leaves
 the group has its pooled connections closed at once rather than left to
 the idle sweep.
 .PP
-It does not cover a
+Reuse covers a
 .B TLS
-backend. The pool is keyed by host and port, and a TLS connection carries more
-than an address \(em a negotiated session, a peer identity that was verified
-against a name, and possibly a client certificate \(em none of which that key
-can express. Handing one to the next request for the same endpoint would be a
-guess about identity, so such connections are closed after their response and
-each request to a TLS backend pays for a fresh handshake.
+backend too, and the session is pooled with the descriptor rather than the
+descriptor alone \(em a reused connection carries on the record layer it
+already had, at the sequence number it had reached. A TLS connection carries
+more than an address: a negotiated session, a peer identity verified against a
+name, a client certificate that may have been presented, and a record layer
+part way through a stream. The endpoint the socket is filed under answers three
+of those, because it is what the name was pinned to before the handshake and
+what the certificate was checked against; the client certificate and the trust
+store belong to the runtime and are rebuilt on every start, and the pool is
+emptied on every stop, so a pooled session can never outlive the configuration
+that verified it.
+.PP
+What a pooled TLS socket cannot do is inherit an answer nobody asked for. A
+cleartext socket with bytes waiting on it is destroyed rather than reused,
+because a socket in the pool has been asked nothing since its last answer
+completed. That test cannot be carried across a record layer unchanged: a
+TLS peer that has said nothing still sends records \(em a session ticket, a key
+update, a
+.BR close_notify .
+So the socket is drained into the session and the question is put to the record
+layer instead of to the kernel: records that produce no application data are
+the peer's own housekeeping and the connection is kept, and application data is
+a response that belongs to a previous exchange and the connection is dropped.
+The second case is logged once per runtime.
 .SS Retries
 When
 .B \-\-retry
@@ -2983,8 +3010,11 @@ socketley create proxy edge -p 8443 \\
     \-\-sidecar \-s
 .fi
 .PP
-One thing to plan for: a TLS backend connection is never returned to the
-connection pool, so every request to one pays for a handshake.
+A TLS backend connection is returned to the connection pool and reused, so a
+busy sidecar pays for a handshake per idle period rather than per request. The
+pooled socket keeps its session, goes back only to the endpoint it was opened
+to, and is dropped rather than reused if the backend has left application data
+on it.
 .B \-\-health\-check http
 works against a TLS backend and probes it over TLS, verified to the same
 standard as the data path \(em see
@@ -3369,7 +3399,8 @@ socketley create proxy secure \-p 8443 \\
     \-\-client\-cert backend\-client.pem \-\-client\-key backend\-client\-key.pem \\
     \-\-ca mesh\-ca.pem \\
     \-\-backend https://10.0.0.1:9000 -s
-# Backend connections are not pooled: one handshake per request.
+# Backend connections are pooled with their sessions: a handshake per
+# idle period, not per request.
 # --health-check http probes over TLS and verifies the backend too.
 .fi
 .PP
@@ -4441,9 +4472,10 @@ presenting a certificate to a backend that asks for one. A TLS backend
 connection is always verified, against
 .B \-\-ca
 or the system store, with the endpoint's name checked and TLS 1.2 as the
-minimum version; there is no option to turn that off. One consequence worth
-knowing: such connections are never pooled, so each request pays for a
-handshake.
+minimum version; there is no option to turn that off. Such connections are
+pooled and reused, with their sessions, so a handshake is paid per idle period
+rather than per request; a pooled socket is only ever returned to the endpoint
+it was opened to, which is the name it was verified against.
 .PP
 .B "\-\-health\-check http"
 works against a TLS backend and probes it over TLS. The probe runs the same

@@ -167,11 +167,12 @@ proxy_instance::~proxy_instance()
 {
     close_tracked(m_listen_fd);
 
-    // Close any pooled backend connections
+    // Close any pooled backend connections, and free the sessions the
+    // encrypted ones hold — the pool owns both.
     for (auto& pool : m_backend_pool)
     {
         for (auto& pb : pool)
-            close_tracked(pb.fd);
+            discard_pooled(pb, false);
     }
 }
 
@@ -633,14 +634,12 @@ void proxy_instance::drop_departed_endpoints()
     for (auto& pool : m_backend_pool)
     {
         pool.erase(std::remove_if(pool.begin(), pool.end(),
-                                  [&](const pooled_backend& pb) {
+                                  [&](pooled_backend& pb) {
                                       if (still_a_member(pb.host, pb.port))
                                           return false;
-                                      if (pb.fd >= 0)
-                                      {
-                                          shutdown(pb.fd, SHUT_RDWR);
-                                          close_tracked(pb.fd);
-                                      }
+                                      // Session and descriptor together — see
+                                      // discard_pooled.
+                                      discard_pooled(pb, true);
                                       return true;
                                   }),
                    pool.end());
@@ -1237,7 +1236,18 @@ bool proxy_instance::setup(event_loop& loop)
     // would be refused for circuit_timeout after a restart that fixed it.
     m_group_breakers.clear();
 
-    // Initialize connection pool (one pool per backend)
+    // Initialize connection pool (one pool per backend).
+    //
+    // teardown() empties this, so by the time a start gets here there should be
+    // nothing to give up — but clear() on a vector of entries that own a
+    // descriptor and a session would leak both silently, and "should be" is not
+    // a reason to write the version that leaks if it is ever wrong.  This is
+    // also the point past which a pooled session must not survive: the backend
+    // tls_context above has just been rebuilt, so anything still on a shelf was
+    // verified against a trust store that is no longer the one in force.
+    for (auto& pool : m_backend_pool)
+        for (auto& pb : pool)
+            discard_pooled(pb, true);
     m_backend_pool.clear();
     m_backend_pool.resize(m_backends.size());
 
@@ -1357,18 +1367,16 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     m_client_count = 0;
     m_backend_count = 0;
 
-    // Close pooled backend connections
+    // Close pooled backend connections, and free the sessions the encrypted
+    // ones are holding.  This runs before start() can build a new
+    // tls_context, which is what makes an entry outliving the context that
+    // produced it impossible rather than merely unlikely — and
+    // acquire_pooled_backend checks tls_owner anyway, because "impossible"
+    // here means "impossible given the order of two functions".
     for (auto& pool : m_backend_pool)
     {
         for (auto& pb : pool)
-        {
-            if (pb.fd >= 0)
-            {
-                shutdown(pb.fd, SHUT_RDWR);
-                close_tracked(pb.fd);
-                pb.fd = -1;
-            }
-        }
+            discard_pooled(pb, true);
         pool.clear();
     }
 
@@ -1578,14 +1586,15 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 {
                     pool.erase(
                         std::remove_if(pool.begin(), pool.end(),
-                            [&](const pooled_backend& pb) {
+                            [&](pooled_backend& pb) {
                                 bool stale = (now - pb.idle_since) >
                                              std::chrono::seconds(POOL_IDLE_TIMEOUT_SEC);
-                                if (stale && pb.fd >= 0)
-                                {
-                                    shutdown(pb.fd, SHUT_RDWR);
-                                    close_tracked(pb.fd);
-                                }
+                                // discard_pooled, so that a session ages out
+                                // with the descriptor it belongs to.  A pool
+                                // entry freed anywhere but there is the one
+                                // that leaks an SSL.
+                                if (stale)
+                                    discard_pooled(pb, true);
                                 return stale;
                             }),
                         pool.end());
@@ -4884,6 +4893,205 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     return &m_scratch_backend;
 }
 
+// Stop holding a pooled entry.  The descriptor and the session go together
+// because the pool owns both together — freeing one without the other is either
+// a leaked SSL or a record layer still pointing at a number somebody else has.
+//
+// `reset` picks the signal.  A socket given up because something is wrong with
+// it — unread bytes, application data behind a session, a record that would not
+// parse — leaves with shutdown(SHUT_RDWR) so the peer gets a reset rather than
+// being left holding a half-open connection this proxy will never read again,
+// and so those bytes are not mistaken for a message that ended cleanly.  A
+// socket given up because nobody wanted it in time is closed plainly.
+//
+// No close_notify either way, and that is deliberate rather than an omission.
+// Writing one means encrypting an alert into the write BIO and then getting it
+// onto the wire, which is a submission and a completion on a path that has
+// neither — the idle sweep has no connection struct to hang a write on, and the
+// probe is on the request's critical path.  Nothing is lost by leaving it out:
+// every response this session carried is complete (that is what let the socket
+// be pooled), so there is no truncation for the peer to be misled about, and a
+// TLS peer reading EOF without close_notify treats the connection as broken,
+// which is exactly what it is.  It is also what this proxy has always done to a
+// backend session it tears down — see backend_pool_release.
+void proxy_instance::discard_pooled(pooled_backend& pb, bool reset)
+{
+    if (pb.ssl)
+    {
+        tls_context::free_ssl(pb.ssl);
+        pb.ssl = nullptr;
+    }
+    pb.tls_owner = nullptr;
+    if (pb.fd >= 0)
+    {
+        if (reset)
+            shutdown(pb.fd, SHUT_RDWR);
+        close_tracked(pb.fd);
+        pb.fd = -1;
+    }
+}
+
+// ─── the probe, for a socket that has a session ─────────────────────────────
+//
+// ed07f12 settled what a readable pooled socket means, and its answer does not
+// survive being carried across a record layer unchanged.
+//
+// In cleartext the reasoning is airtight and needs nothing but the kernel: a
+// socket is in this pool because a request went out on it and the whole of its
+// answer came back, nothing has been asked of it since, so a byte waiting on it
+// is a byte nobody asked for.  recv(MSG_PEEK) answers that directly, and a
+// positive result is a confidentiality defect — the next borrower would read
+// those bytes as the head of its own response.
+//
+// Under TLS the same syscall answers a different question.  What is waiting on
+// the socket is a record, and a peer that has said nothing at all still sends
+// records: a TLS 1.3 server routinely posts NewSessionTicket after the exchange
+// it belongs to is over, either end may send KeyUpdate whenever it likes, and
+// close_notify is an alert.  None of those is the peer speaking unbidden in any
+// sense a client could be harmed by, and all three make recv() return a
+// positive number.  Keeping ed07f12's test would throw away a working
+// connection every time a backend rotated a ticket — which is to say, on most
+// of them, which is to say TLS pooling would be pooling in name only.
+//
+// Relaxing it is worse.  A record *may* be application data: the backend's
+// second answer, or the tail of one this proxy judged finished, sitting at an
+// offset no request can start from.  That is the same defect it always was, and
+// it is now invisible from outside — the bytes are indistinguishable from a
+// ticket until they are decrypted.
+//
+// So the question is asked of OpenSSL instead of the kernel, and it is asked
+// about application data rather than about bytes:
+//
+//   drain whatever ciphertext is on the socket into the record layer, then ask
+//   SSL_read whether anything comes out of it.
+//
+// and the four answers map onto ed07f12's four exactly:
+//
+//   nothing came out           the records were the peer's housekeeping — a
+//   (ssl_read -> 0)            ticket, a KeyUpdate, or a partial record still
+//                              waiting for the rest of itself.  The session is
+//                              healthy and the stream is at a message boundary.
+//                              This is the EAGAIN case, and it is now reached
+//                              through work rather than through idleness.
+//   application data           the defect.  Whatever this is, it is queued
+//   (ssl_read -> n > 0)        ahead of the next request's answer and the next
+//                              client would read it as its own.  Destroyed, for
+//                              the same reason ed07f12 destroys rather than
+//                              re-shelves: decrypting it does not put it back,
+//                              so the trap stays set for whoever comes next.
+//   close_notify, or a         the session is over, or the record layer cannot
+//   record that will not       go on.  Nothing left to reuse.
+//   parse (ssl_read -> -1)
+//   FIN or reset on the        as before, and read off the socket rather than
+//   socket                     out of the session.
+//
+// Consuming rather than peeking is forced: a record cannot be judged without
+// being decrypted, and decrypting it means feeding it to the record layer,
+// which advances the sequence number.  That is safe here and nowhere else —
+// the session is pooled with the socket, so what this consumes is consumed on
+// the connection that will carry the next request, not on some other one.  It
+// is also why the reads below are bounded: bio_write_in enforces the
+// per-connection buffer cap and answers -1 when a peer runs past it, and a
+// pooled socket that has 512 KB of unconsumed records on it is not a candidate
+// for reuse under any reading.
+//
+// Whatever the record layer wants to say back — a KeyUpdate answering a
+// KeyUpdate is the case that exists — is left in the write BIO.  It goes out
+// ahead of the request, because tls_flush drains that BIO after ssl_write has
+// appended to it and a memory BIO is a queue: the correct order, with no
+// special case for it here.
+bool proxy_instance::probe_pooled_tls(pooled_backend& pb)
+{
+    if (SOCKETLEY_UNLIKELY(!pb.ssl || pb.fd < 0))
+    {
+        discard_pooled(pb, false);
+        return false;
+    }
+
+    // Ciphertext off the socket and into the record layer, all of it, because
+    // "is there application data" cannot be answered from a prefix.
+    char cipher[16384];
+    for (;;)
+    {
+        const ssize_t r = recv(pb.fd, cipher, sizeof(cipher), MSG_DONTWAIT);
+        if (r > 0)
+        {
+            size_t off = 0;
+            bool fed = true;
+            while (off < static_cast<size_t>(r))
+            {
+                const int n = tls_context::bio_write_in(pb.ssl, cipher + off,
+                                                        static_cast<int>(static_cast<size_t>(r) - off));
+                if (SOCKETLEY_UNLIKELY(n <= 0))
+                {
+                    // The buffer cap, or a BIO that failed.  Fatal by contract
+                    // and fatal here too: there is nowhere to put what was not
+                    // taken, and a record layer fed a stream with a hole in it
+                    // has no framing left to recover.
+                    fed = false;
+                    break;
+                }
+                off += static_cast<size_t>(n);
+            }
+            if (SOCKETLEY_UNLIKELY(!fed))
+            {
+                discard_pooled(pb, true);
+                return false;
+            }
+            continue;
+        }
+        if (r == 0)
+        {
+            // A FIN while the socket sat idle.  Nothing left to reuse — the
+            // same verdict the cleartext probe gives, for the same reason.
+            discard_pooled(pb, false);
+            return false;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;                       // the socket is drained
+        if (errno == EINTR)
+            continue;
+        // RST, or a descriptor that has gone wrong underneath us.
+        discard_pooled(pb, false);
+        return false;
+    }
+
+    // And the question itself.  One call is enough to answer it: SSL_read
+    // processes every whole record it has before it can decide it has no
+    // application data, so a 0 here means the record layer looked at all of
+    // them and none was for the application.
+    char plain[16384];
+    const int n = tls_context::ssl_read(pb.ssl, plain, sizeof(plain));
+    if (SOCKETLEY_UNLIKELY(n > 0))
+    {
+        // Once per instance, as on the cleartext side, and worded so the two
+        // are not confused: this backend did not merely write on an idle
+        // socket, it wrote *application data* on one, which is the finding.
+        if (!m_pool_tls_unbidden_warned)
+        {
+            m_pool_tls_unbidden_warned = true;
+            LOG_WARN("proxy: a pooled TLS backend socket had application data waiting on it "
+                     "— the backend sent a response nobody asked for, or an answer this "
+                     "proxy judged finished was not.  The connection is dropped rather than "
+                     "reused; reusing it would give that data to the next client.  (Session "
+                     "tickets and key updates are not this: they are consumed and the "
+                     "connection is kept.)");
+        }
+        discard_pooled(pb, true);
+        return false;
+    }
+    if (SOCKETLEY_UNLIKELY(n < 0))
+    {
+        // close_notify, or a record the session cannot use.  Either way this
+        // one is finished; ssl_read has already logged which, when there was
+        // anything to log.
+        discard_pooled(pb, false);
+        return false;
+    }
+
+    return true;
+}
+
 // Try to get a pooled backend connection for the given endpoint.
 //
 // The index picks the shelf and the endpoint picks the socket.  For a plain
@@ -4891,10 +5099,33 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
 // formality; for a group entry the shelf holds sockets to every member that
 // has been used, and handing one of them to a request routed elsewhere would
 // deliver it to the wrong runtime.
+//
+// For an encrypted socket the endpoint is doing more work than that, and it is
+// worth being explicit about how much, because the comment this replaces said
+// it could not be done.  A TLS connection carries an SNI name, a peer whose
+// certificate was checked against a name, a client certificate that may have
+// been presented, and a record layer part way through a stream.  Three of those
+// four are not independent of this key at all: start_backend_tls builds the
+// session with create_ssl_client(host), where `host` comes from the same
+// backend_endpoint_of() call that release_to_pool files the entry under and
+// this function compares.  Same host string, same SNI, same name verified,
+// same peer — not because the key describes the identity, but because the
+// identity is derived from the key and from nothing else.  The fourth, the
+// client certificate and the trust store, belongs to the tls_context, and
+// tls_owner below is what holds it: see pooled_backend.  The record layer is
+// answered by pooling the session rather than the descriptor alone.
 int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view host,
-                                           uint16_t port)
+                                           uint16_t port, bool want_tls, SSL** out_ssl)
 {
+    if (out_ssl)
+        *out_ssl = nullptr;
     if (backend_idx >= m_backend_pool.size() || host.empty() || port == 0)
+        return -1;
+    // A TLS request with no context to have built the session against cannot
+    // be matched to anything: tls_owner would have nothing to equal.  This is
+    // unreachable — conn_backend_tls is false without m_backend_tls — and it
+    // is the backstop for the day it is not.
+    if (want_tls && !m_backend_tls)
         return -1;
 
     auto& pool = m_backend_pool[backend_idx];
@@ -4910,6 +5141,23 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
     {
         if (pool[scan].port != port || pool[scan].host != host)
             continue;
+        // Encryption is part of the key, not a preference — see the header.
+        // A mismatch is stepped over rather than dropped for the same reason a
+        // foreign endpoint is: the entry is perfectly good for somebody else.
+        if ((pool[scan].ssl != nullptr) != want_tls)
+            continue;
+        // And the identity the endpoint cannot carry.  An entry built against
+        // a context this instance has replaced was verified against a
+        // different trust store, or presented a different client certificate,
+        // than the request now asking for it — so it is not this request's
+        // connection whatever its address says.  Dropped rather than stepped
+        // over: unlike a foreign endpoint, nobody is coming for it.
+        if (want_tls && pool[scan].tls_owner != m_backend_tls.get())
+        {
+            discard_pooled(pool[scan], true);
+            pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(scan));
+            continue;
+        }
 
         auto pb = std::move(pool[scan]);
         pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(scan));
@@ -4917,11 +5165,7 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
         // Check if stale
         if ((now - pb.idle_since) > std::chrono::seconds(POOL_IDLE_TIMEOUT_SEC))
         {
-            if (pb.fd >= 0)
-            {
-                shutdown(pb.fd, SHUT_RDWR);
-                close_tracked(pb.fd);
-            }
+            discard_pooled(pb, true);
             continue;
         }
 
@@ -4974,6 +5218,22 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
         // than being left with a half-open socket this proxy will never read,
         // and so the unread bytes leave with a reset instead of being mistaken
         // for a graceful end of message.
+        //
+        // A socket carrying a session is asked the same question by
+        // probe_pooled_tls(), which has to decrypt to answer it.  The
+        // discrimination is identical and the mechanism cannot be: see there.
+        if (pb.ssl != nullptr)
+        {
+            if (!probe_pooled_tls(pb))
+                continue;
+            if (out_ssl)
+                *out_ssl = pb.ssl;
+            // The caller owns the session from here; the entry is already off
+            // the shelf, and nothing else may free it.
+            pb.ssl = nullptr;
+            return pb.fd;
+        }
+
         char probe;
         ssize_t r = recv(pb.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
         if (SOCKETLEY_UNLIKELY(r > 0))
@@ -4990,14 +5250,13 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
                          "finished was not.  The connection is dropped rather than reused; "
                          "reusing it would give those bytes to the next client.");
             }
-            shutdown(pb.fd, SHUT_RDWR);
-            close_tracked(pb.fd);
+            discard_pooled(pb, true);
             continue;
         }
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
         {
             // Dead connection
-            close_tracked(pb.fd);
+            discard_pooled(pb, false);
             continue;
         }
         return pb.fd;
@@ -5043,8 +5302,16 @@ void proxy_instance::arm_idle_sweep()
 // comes through here — close_pair_close_backend, detach_and_pool_backend and
 // finish_pool_drain — so this is where it is decided whether the socket may
 // change hands at all.
+// The session travels with the descriptor or it does not travel at all.
+// `bconn` is the connection being given up: on the one path that files an
+// entry, the session is moved out of it here and backend_pool_release — which
+// every caller runs afterwards, and which frees whatever session it still finds
+// — has nothing left to free.  On every path that closes instead, the session
+// is deliberately left where it is, so that same call frees it.  One owner at
+// every instant, and the transfer is the same statement as the filing.
 void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
-                                     std::string_view host, uint16_t port)
+                                     std::string_view host, uint16_t port,
+                                     proxy_backend_connection* bconn)
 {
     if (backend_fd < 0 || backend_idx >= m_backend_pool.size())
         return;
@@ -5083,17 +5350,27 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
     if (pool.size() >= MAX_POOL_PER_BACKEND)
     {
         // Pool full — close the oldest (swap with last, then pop)
-        if (pool.front().fd >= 0)
-        {
-            shutdown(pool.front().fd, SHUT_RDWR);
-            close_tracked(pool.front().fd);
-        }
+        discard_pooled(pool.front(), true);
         pool.front() = std::move(pool.back());
         pool.pop_back();
     }
 
+    // The session, if this connection has one, moves here.  backend_pool_
+    // eligible() has already established that it is one that may be reused —
+    // handshake finished, no alert owed, the peer has not said close_notify —
+    // so this is the transfer and not the decision.
+    SSL* ssl = nullptr;
+    if (bconn && bconn->ssl)
+    {
+        ssl = bconn->ssl;
+        bconn->ssl = nullptr;
+        bconn->tls_state = tls_conn_none;
+        bconn->tls_peer_closed = false;
+    }
+
     pool.push_back({backend_fd, backend_idx, std::string(host), port,
-                    std::chrono::steady_clock::now()});
+                    std::chrono::steady_clock::now(), ssl,
+                    ssl ? m_backend_tls.get() : nullptr});
 
     // Something is in the pool now, so there is something for the sweep to
     // reclaim.  No-op while it is already running.
@@ -5213,18 +5490,21 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // which is why this used to be skipped altogether and why an @group gateway
     // paid for a TCP handshake, and left a TIME_WAIT behind, on every request.
     //
-    // Never for a TLS backend.  Nothing is filed under one — backend_pool_
-    // eligible refuses to pool a connection carrying a session, and says why
-    // there — so this would find nothing anyway; asking explicitly is what
-    // keeps the two halves of that decision from drifting apart.
-    if (!backend_tls)
+    // For a TLS backend too, now.  This used to be skipped, on the argument
+    // that the pool's key cannot express the identity a session carries; the
+    // key was never doing that work alone, and acquire_pooled_backend says
+    // which part each half does.  What is passed here is the same
+    // backend_endpoint_of answer start_backend_tls builds the session from, so
+    // a socket can only come back for the name it was verified against.
+    SSL* pooled_ssl = nullptr;
     {
         std::string_view host;
         uint16_t port = 0;
         if (backend_endpoint_of(conn, m_backends, host, port) &&
             conn->backend_idx < m_backend_pool.size())
         {
-            bfd = acquire_pooled_backend(conn->backend_idx, host, port);
+            bfd = acquire_pooled_backend(conn->backend_idx, host, port, backend_tls,
+                                         &pooled_ssl);
         }
     }
 
@@ -5238,6 +5518,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             // the connection to it is established and working.  Left
             // unclassified, it charged the breaker and answered the client 502,
             // which is a verdict about a backend that was never asked.
+            //
+            // The session goes with the descriptor, here as everywhere: this
+            // function is its owner from the moment acquire handed it over.
+            tls_context::free_ssl(pooled_ssl);
+            pooled_ssl = nullptr;
             close_tracked(bfd);
             ours();
             return false;
@@ -5246,6 +5531,24 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         conn->backend_fd = bfd;
 
         auto bconn = backend_pool_acquire(bfd);
+        // The session this descriptor's record layer belongs to, before
+        // anything else can look at the struct.  reset() has just cleared both
+        // fields — a struct out of the struct pool must never carry the
+        // previous connection's session — so this is the assignment and not an
+        // overwrite, and there is nothing here to free.
+        //
+        // tls_conn_ready, not tls_conn_handshake: this connection finished its
+        // handshake before it was ever pooled (backend_pool_eligible requires
+        // it) and there is no second one.  That is the whole saving.  It also
+        // has to be said, because tls_flush holds application data back in any
+        // other state and the request would sit in the write queue for a
+        // handshake that is not going to happen.
+        if (pooled_ssl)
+        {
+            bconn->ssl = pooled_ssl;
+            bconn->tls_state = tls_conn_ready;
+            pooled_ssl = nullptr;
+        }
         bconn->client_fd = conn->fd;
         bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
                             bconn->generation };
@@ -5970,25 +6273,44 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // Only pool HTTP connections — TCP connections are long-lived streams
     if (protocol != protocol_http)
         return false;
-    // Never a TLS backend connection.  This is the deliberate, conservative
-    // answer to the one place the two mechanisms meet.
+    // ── a connection carrying a session ──
     //
-    // A pooled socket is handed to whoever asks for the same endpoint next,
-    // and the key that decides that is a host and a port.  A TLS connection
-    // carries more than an endpoint: a negotiated session, a peer identity
-    // that was verified against a name, a client certificate that may have
-    // been presented, and a record layer sitting at a sequence number that
-    // belongs to this exchange.  None of that is expressible in the key, so a
-    // key that matched would still be a guess about identity — and the cost of
-    // guessing wrong is one client receiving another's session.
+    // This used to be a flat refusal, and the reason given was that the pool
+    // is keyed on a host and a port while a TLS connection carries more: a
+    // negotiated session, a peer verified against a name, a client certificate
+    // that may have been presented, and a record layer part way through a
+    // stream.  Every one of those is true.  What was wrong was the conclusion
+    // that none of it is expressible — three of the four are functions of the
+    // key already and the fourth is a function of the instance, which is what
+    // acquire_pooled_backend and pooled_backend now say in the two places they
+    // are decided.  The record layer is answered by pooling the session with
+    // the descriptor instead of the descriptor alone.
     //
-    // Refusing costs a handshake per request on the TLS leg, which is real:
-    // an unused socket is thrown away and dialled again.  It is the cheaper
-    // side of the trade by a wide margin, and the expensive side is not
-    // detectable from outside.  If this is ever revisited, the key has to
-    // carry the negotiated identity, not merely the address.
+    // What is decided *here* is narrower and is about this connection rather
+    // than about identity: whether there is a session worth reusing at all.
     if (bconn->ssl != nullptr)
-        return false;
+    {
+        // A handshake that has not finished has negotiated nothing.  The next
+        // borrower would have to carry it on, which means the request waiting
+        // behind it waits on a peer that may never answer — and tls_flush
+        // would hold that request back, correctly, for as long as it took.
+        if (bconn->tls_state != tls_conn_ready)
+            return false;
+        // close_notify, or a record the session could not use.  Either ends
+        // it; there is no more application data to be had on this one, and a
+        // request written into it would be written into a stream the peer has
+        // already stopped reading.
+        if (bconn->tls_peer_closed)
+            return false;
+        // The record layer still owes the wire bytes.  On this path that is an
+        // alert on its way out — the diagnosis the far end is entitled to —
+        // and pooling would strand it in a write BIO nobody is draining.  The
+        // write-queue test below is the same rule one layer up and does not
+        // cover this: application data is queued there, but a record layer's
+        // own traffic is queued nowhere.
+        if (tls_context::has_pending_out(bconn->ssl))
+            return false;
+    }
     if (bconn->closing || bconn->splice_active)
         return false;
     if (!bconn->write_queue.empty() || bconn->write_batch_count > 0)
@@ -6071,8 +6393,9 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
 
     if (can_pool)
     {
-        // Release fd to pool — pool takes ownership, don't close
-        release_to_pool(backend_fd, cconn->backend_idx, host, port);
+        // Release fd to pool — pool takes ownership of the descriptor and, on
+        // a TLS leg, of the session with it; don't close either.
+        release_to_pool(backend_fd, cconn->backend_idx, host, port, bconn);
     }
     else
     {
@@ -6549,7 +6872,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
 
     if (can_pool)
     {
-        release_to_pool(backend_fd, b_idx, host_key, port);
+        release_to_pool(backend_fd, b_idx, host_key, port, bconn);
     }
     else
     {
@@ -6624,7 +6947,7 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
                          conn->pool_backend_idx < m_backend_pool.size() &&
                          !conn->pool_host.empty() && conn->pool_port != 0))
     {
-        release_to_pool(fd, conn->pool_backend_idx, conn->pool_host, conn->pool_port);
+        release_to_pool(fd, conn->pool_backend_idx, conn->pool_host, conn->pool_port, conn);
     }
     else
     {
