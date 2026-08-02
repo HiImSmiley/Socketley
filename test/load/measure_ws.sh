@@ -19,33 +19,43 @@
 # FAILS WHEN:  any round reports any failure kind, or the upgrade never worked.
 #              The original always exited 0.
 #
-# ─── THIS HARNESS HAS NEVER PRODUCED A MEASUREMENT ──────────────────────────
+# ─── WHAT THIS HARNESS FOUND, AND WHAT IT MEASURES NOW ──────────────────────
 #
-# It reports NO DATA on the probe, on the runner and on a developer box, and it
-# has done so since it was written — the nightly could not build between
-# 2026-07-28 and 2026-08-01, so 2026-08-01's run (30719890629) is the first time
-# anyone saw the result.  What actually happens, taken apart stage by stage
-# against a Release build on 2026-08-02:
+# It reported NO DATA from the day it was written until 2026-08-02, on the
+# probe, on the runner and on a developer box — the nightly could not build
+# between 2026-07-28 and 2026-08-01, so 2026-08-01's run (30719890629) is the
+# first time anyone saw the result.  Taken apart stage by stage, what it had
+# found was this:
 #
-#   * the upgrade SUCCEEDS.  The proxy returns "HTTP/1.1 101 Switching
+#   * the upgrade SUCCEEDED.  The proxy returned "HTTP/1.1 101 Switching
 #     Protocols" with the backend's Sec-WebSocket-Accept, for GET /pxw and for
 #     GET /pxw/ alike.
-#   * the first data frame is never echoed.  The client sends one masked text
-#     frame and waits; nothing comes back and the connection is not closed, so
-#     wsharness.py records "timeout" — which is what the probe sees.
+#   * the first data frame was never echoed.  The client sent one masked text
+#     frame and waited; nothing came back and the connection was not closed, so
+#     wsharness.py recorded "timeout" — which is what the probe saw.
 #   * the same two clients sending the same frames straight to the backend,
-#     bypassing the proxy, are echoed correctly.
+#     bypassing the proxy, were echoed correctly.
 #
-# So the failure is downstream of the handshake, not in it: the proxy has no
-# Upgrade path at all — no occurrence of 101, "Switching Protocols" or any
-# notion of a tunnel anywhere in socketley/runtime/proxy/ — so it relays the
-# 101 as an ordinary HTTP response and then goes back to expecting a request on
-# a connection that now carries frames.  Whether the proxy owes a WebSocket
-# tunnel is a product question and is NOT decided here.
+# The failure was downstream of the handshake: the proxy had no Upgrade path at
+# all — no occurrence of 101, "Switching Protocols" or any notion of a tunnel
+# anywhere in socketley/runtime/proxy/ — so it relayed the 101 as an ordinary
+# HTTP response and then went back to expecting a request on a connection that
+# now carried frames.  Every frame the client sent was buffered and none was
+# forwarded, because the branch it fell into forwards min(body_remaining, n)
+# bytes and an upgrade request declares no body.
 #
-# The verdict below therefore stays NO DATA, which is true: nothing was
-# measured.  Its wording used to add "harness or setup is broken", which is not
-# true and sent the reader to this file instead of to the proxy.
+# The proxy now relays the connection after a 101.  This harness measures the
+# repeatability of that under concurrent load; the claims themselves — that the
+# upgrade reaches the backend intact, that frames flow both ways, that either
+# side can close, that the socket is never pooled — are stated one by one in
+# test/integration/test_proxy_websocket_tunnel.sh.
+#
+# One thing this harness still cannot see, and it is what hid half the defect:
+# its backend answers 101 on the strength of Sec-WebSocket-Key alone.  A proxy
+# that strips the Upgrade and Connection headers — which is what a proxy does
+# to hop-by-hop headers by default, and what this one did — therefore still gets
+# a 101 out of it, while the request the backend actually received was an
+# ordinary GET.  The integration test uses a strict backend for that reason.
 
 HARNESS_NAME="measure_ws"
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -87,8 +97,10 @@ sleep 1.5
 
 if ! out="$(pin_load python3 "$LIB/wsharness.py" --mode drive --port "$PX" --prefix /pxw/ --clients 2 --count 2 2>&1)"; then
     echo "  probe output: $out"
-    echo "  A 'timeout' here is the known state described at the top of this file:"
-    echo "  the upgrade completes and the frames after it are not relayed."
+    echo "  A 'timeout' here is the state described at the top of this file: the"
+    echo "  upgrade completes and the frames after it are not relayed.  That is a"
+    echo "  proxy regression, not a harness fault — see"
+    echo "  test/integration/test_proxy_websocket_tunnel.sh, which says which part."
     nothing_measured "the probe did not complete one WebSocket exchange through the proxy"
 fi
 

@@ -344,6 +344,20 @@ struct http_response_framing
     // previous answer still queued on it, and the next borrower reads someone
     // else's response as the start of its own.  Never pool one of these.
     bool unknown{false};
+
+    // The backend answered 101 Switching Protocols, so this connection has
+    // stopped carrying HTTP messages altogether: what follows the blank line
+    // is the protocol the two endpoints agreed on, and it has no message
+    // boundaries this scan can point at — it has no messages.
+    //
+    // Once set it is never cleared.  There is no way back: a stream does not
+    // switch to WebSocket and then resume being a sequence of requests and
+    // responses on the same socket.  That is why it is the one thing here that
+    // shuts the scan off entirely rather than merely marking a doubt, and why
+    // http_response_frame_complete() answers no for it for ever — the socket
+    // can never return to the pool, because there is no boundary to return it
+    // at.  See http_response_scan_chunk.
+    bool switched_protocols{false};
 };
 
 // Fold `avail` bytes of message body into the countdown, and answer the one
@@ -393,6 +407,21 @@ inline void http_response_consume_body(http_response_framing& st, size_t avail)
 // consumes the one-shot header scan below without giving it anything to scan.
 inline void http_response_scan_chunk(http_response_framing& st, std::string_view chunk)
 {
+    // The connection switched protocols.  These bytes are not HTTP and must not
+    // be read as though they were — not to find a header block in them, not to
+    // count them against a body length, not for anything.
+    //
+    // This is the difference between refusing to pool a tunnel on purpose and
+    // refusing it by luck.  Without it the scan goes on looking for status
+    // lines in WebSocket payload, and a payload that happens to spell
+    // "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" is read as a complete
+    // response — so the proxy detaches the pair and files a live WebSocket
+    // socket in the connection pool, where the next request picks it up.  The
+    // frame header in front of a real payload is what usually stops that, which
+    // is to say the guard was two bytes of coincidence chosen by the peer.
+    if (SOCKETLEY_UNLIKELY(st.switched_protocols))
+        return;
+
     // Past the header block: nothing left to read, only a length to count down.
     if (st.headers_parsed)
     {
@@ -510,8 +539,27 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
             return;
         }
 
-        // 1xx informational: no body, so the next block starts directly behind
-        // this one.  Keep walking.
+        // 101 Switching Protocols is in the 1xx range and is not an interim
+        // block.  An interim block is followed by another header block; a 101 is
+        // followed by a different protocol, and walking into it would read
+        // whatever the two endpoints now speak as HTTP.
+        //
+        // headers_parsed is set with it, and deliberately: the block did
+        // resolve, and every reader of that field means "this proxy could tell
+        // what the backend said".  handle_backend_read's EOF path is the one
+        // that matters — it charges the circuit breaker when a backend produced
+        // bytes whose framing never resolved, and a WebSocket session closing
+        // normally is not that.
+        if (code == 101)
+        {
+            st.headers_parsed     = true;
+            st.status_code        = code;
+            st.switched_protocols = true;
+            return;
+        }
+
+        // Other 1xx informational: no body, so the next block starts directly
+        // behind this one.  Keep walking.
         if (code >= 100 && code < 200)
         {
             // Except that a 1xx claiming a transfer coding contradicts itself:
@@ -572,6 +620,12 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
 // head of its own answer: the crossed-delivery bug wearing a different hat.
 inline bool http_response_frame_complete(const http_response_framing& st)
 {
+    // A connection that switched protocols has no message boundary at all: it
+    // stopped carrying messages when the 101 went past.  Nothing later can
+    // make it reusable, and this is stated first because the fields below
+    // describe a response, which is not what this socket is carrying any more.
+    if (st.switched_protocols)
+        return false;
     // Either no response has started on this socket or its header block never
     // resolved.  Both mean there is no message boundary to reuse from — and if
     // a request has already gone out, its answer is still to come and would

@@ -9,7 +9,11 @@ The daemon must be running. When installed via package, it runs as a systemd ser
 ## Examples
 
 ### HTTP Proxy
-Basic HTTP reverse proxy with path-based routing.
+Basic HTTP reverse proxy with path-based routing. `ws://` works through it on
+the same port with no extra flag: an upgrade request keeps the two headers that
+constitute the offer, the backend's `101` is relayed verbatim, and the
+connection becomes a byte relay until one end closes. The proxy never parses a
+frame — see `LIMITATIONS` in the man page for what follows from that.
 
 ### Load Balancer
 Round-robin and random load balancing across backends.

@@ -1269,6 +1269,26 @@ Load balancing strategy:
 Default port: 8080
 .PP
 HTTP mode: Requests to /<proxy-name>/* are forwarded with prefix stripped.
+.PP
+In
+.B http
+mode a request carrying an upgrade offer \(em an
+.B Upgrade
+header together with a
+.B Connection
+header listing the
+.B upgrade
+token \(em is forwarded with both of those headers intact, rather than having
+them stripped as hop-by-hop. If the backend answers
+.BR "101 Switching Protocols" ,
+that response is relayed verbatim and the connection becomes a bidirectional
+byte relay until one end closes. This is what makes
+.B ws://
+work through a proxy in http mode. See
+.B WebSocket and other protocol upgrades
+under
+.BR LIMITATIONS
+for what the proxy does and does not do with such a connection.
 .SS Health Check Flags
 .TP
 .BI "\-\-health\-check " "[tcp|http]"
@@ -4283,6 +4303,79 @@ Legacy services, third-party processes, fleet visibility for external apps.
 .B "Mixed"
 Embedded engine with daemon monitoring \(em maximum performance with fleet management.
 .SH LIMITATIONS
+.SS WebSocket and other protocol upgrades
+A proxy in
+.B http
+mode relays a connection that has switched protocols, which is what makes a
+.B ws://
+client work through it. What that consists of, and what it deliberately is
+not:
+.PP
+The upgrade is negotiated by the two endpoints and by nothing in between. The
+proxy forwards the request's
+.B Upgrade
+and
+.B Connection
+headers unchanged instead of stripping them as hop-by-hop, relays the
+.B 101
+verbatim, and computes no part of it \(em there is no
+.B Sec\-WebSocket\-Accept
+calculation here, no check that the key matches, and no opinion about the
+protocol named. It keys off the 101 and not off the token, so any upgrade two
+endpoints agree on is relayed the same way.
+.PP
+.B "Frames are never parsed."
+After the 101 the connection carries opaque bytes. The proxy does not know
+where one frame ends and the next begins, so there is no fragmentation
+handling, no ping or pong answered on a backend's behalf, no
+.B permessage\-deflate
+negotiation, and no per-message limit \(em
+.B \-\-max\-connections
+still counts connections, and nothing counts frames. The
+.B on_proxy_request
+and
+.B on_proxy_response
+callbacks still see these bytes, but they see whatever a read delivered rather
+than whole frames, and a callback that rewrites them corrupts the stream: a
+frame carries its own length and a client-to-server frame is masked.
+.PP
+.B "A tunnelled backend connection is never pooled."
+There is no message boundary to return it at, so one WebSocket costs one
+backend TCP connection for its whole life, however long that is. A proxy in
+front of many long-lived WebSocket clients holds that many backend sockets.
+.PP
+The deadlines behave as follows.
+.B \-\-backend\-timeout
+bounds the wait for the backend's first response byte, and the 101 is that
+byte \(em so it applies to the handshake and stops applying the moment the
+switch happens. A tunnel is not measured against it and cannot be answered
+.B 504
+for being quiet, which is the point: nothing may arrive for minutes.
+.B \-\-idle\-timeout
+still applies, and on such a connection it measures bytes in
+.I either
+direction rather than only what the client sends: a stream the backend is
+feeding is not idle. A tunnel that is genuinely silent both ways for longer
+than the timeout is closed by it, as any other connection would be.
+.PP
+For the circuit breaker a tunnel is one successful response \(em the 101 \(em
+and nothing more; a session ending is a connection closing and is not charged
+to the backend. In
+.B stats
+the bytes relayed afterwards are counted in
+.B bytes_in
+and
+.BR bytes_out ,
+and
+.B total_messages
+counts the reads that carried them rather than frames or requests, so a proxy
+carrying WebSocket traffic reports figures that do not correspond to messages
+in either protocol's sense.
+.PP
+A proxy in
+.B \-\-protocol tcp
+mode is unaffected by any of this: it was already a byte relay and never looked
+at a status line.
 .SS Out\-of\-process proxies
 .B \-\-out\-of\-process
 is the first step of moving the proxy out of the daemon, and what it does

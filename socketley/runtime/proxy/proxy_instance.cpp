@@ -2736,6 +2736,57 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     drive_client_request(conn, fd);
 }
 
+// See the declaration for why the answer lives on the backend.
+bool proxy_instance::conn_tunnelled(const proxy_client_connection* conn) const
+{
+    if (conn->backend_fd < 0 || conn->backend_fd >= MAX_FDS)
+        return false;
+    const auto& be = m_conn_idx[conn->backend_fd];
+    if (be.side != conn_backend)
+        return false;
+    // Mutual, like every other cross-half read in this file: a descriptor
+    // number does not prove identity once numbers are reused, and reading a
+    // stranger's framing state would relay this client's bytes on the strength
+    // of somebody else's 101.
+    if (be.backend->client_fd != conn->fd)
+        return false;
+    return be.backend->http_frame.switched_protocols;
+}
+
+// The connection has just stopped being HTTP.  Two things the request path set
+// up on the assumption that an answer to a request was coming back have to be
+// undone, and both of them are bounds that would otherwise end the tunnel.
+//
+//   The header deadline.  A frame the client sent in the same segment as its
+//   upgrade request is sitting in conn->partial, and bound_pipelined_hold()
+//   correctly read that as "a request held back behind the exchange in flight"
+//   — it could not have known better, because the 101 had not come back yet.
+//   Left armed it answers 408 and closes, ten seconds into a connection that is
+//   working perfectly.  Nothing else can disarm it: the bytes it is waiting on
+//   are not a header block and never will be.
+//
+//   Those buffered bytes themselves.  They are the first bytes of the tunnel
+//   and nothing else is going to come and collect them — the client is waiting
+//   for its echo, not sending — so they have to go out here or the session
+//   hangs on its first frame.
+//
+// The response deadline needs nothing: it bounds the wait for a backend's FIRST
+// response byte, and the 101 is that byte, so handle_backend_read has already
+// cleared it one screen above this being called.  That is why --backend-timeout
+// does not have to learn about tunnels — the tunnel begins after the only thing
+// it measures is over.
+void proxy_instance::begin_tunnel(proxy_client_connection* cconn)
+{
+    cconn->awaiting_headers = false;
+
+    if (!cconn->partial.empty() && !cconn->closing && cconn->backend_fd >= 0)
+    {
+        std::string pending;
+        pending.swap(cconn->partial);
+        forward_to_backend(cconn, pending);
+    }
+}
+
 // A request pipelined behind the one now in flight waits for that exchange to
 // end, and what ends it is the response being judged finished.  There is a
 // shape where that judgement never comes: a backend whose header block straddles
@@ -2765,7 +2816,44 @@ void proxy_instance::bound_pipelined_hold(proxy_client_connection* conn)
 // handle_client_read; it is the same code, and the same order.
 void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
 {
-    if (!conn->header_parsed)
+    // ── the tunnel ──────────────────────────────────────────────────────────
+    //
+    // This connection carries a protocol the two endpoints negotiated between
+    // themselves; the proxy relays it and does not read it.  No parsing, no
+    // framing, no header block, no body length — those questions have no
+    // answers here, which is precisely why this branch is first: every one of
+    // them below would be asked of bytes that cannot answer.
+    //
+    // What the second branch below did with them instead, and why the harness
+    // saw a hang: header_parsed is still true from the upgrade request, so a
+    // frame landed in "the rest of this request's body", where the amount to
+    // forward is min(body_remaining, size) — and an upgrade request declares no
+    // body, so body_remaining is zero.  Every frame the client sent was
+    // buffered and none was forwarded.  The connection then sat there until the
+    // pipelined-request bound answered it 408.
+    //
+    // RELAY MECHANISM.  Ordinary read and write, not splice.  A tunnel is idle
+    // most of the time by nature, and a splice armed on a quiet socket costs an
+    // io-wq kernel thread for as long as the peer says nothing (df093ed: four
+    // such connections burned 95.7% of a core, forty-eight burned two cores and
+    // fifty threads).  The poll-first pattern that fixed it would apply here
+    // too, but a multishot recv already IS a poll until data arrives, so it
+    // reaches the same idle cost with none of the machinery — no pipe pair per
+    // connection, no 256 KB of pipe buffer, and no bypass on a TLS leg, where
+    // splice cannot go at all and a WebSocket over an https:// listener is an
+    // entirely ordinary thing to ask for.  Zero-copy buys nothing against
+    // frames this size.  Measured idle cost: see
+    // test/integration/test_proxy_websocket_tunnel.sh and the commit message.
+    if (SOCKETLEY_UNLIKELY(conn_tunnelled(conn)))
+    {
+        if (!conn->partial.empty())
+        {
+            std::string relay;
+            relay.swap(conn->partial);
+            forward_to_backend(conn, relay);
+        }
+    }
+    else if (!conn->header_parsed)
     {
         // Slowloris / oversized header protection
         if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_HEADER_SIZE))
@@ -3296,7 +3384,8 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // handler, which meant nothing short of a running daemon could call it and
     // it was the last parser in the tree with no fuzz target.  It is the same
     // code, in a form test/fuzz/fuzz_http_response.cpp can drive directly.
-    const bool framed_before = conn->http_frame.headers_parsed;
+    const bool framed_before  = conn->http_frame.headers_parsed;
+    const bool tunnel_before  = conn->http_frame.switched_protocols;
     if (m_protocol == protocol_http)
         http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
 
@@ -3333,6 +3422,27 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // Return provided buffer after scanning
     if (is_provided)
         m_loop->return_buf(BUF_GROUP_ID, buf_id);
+
+    // ── the switch ──────────────────────────────────────────────────────────
+    //
+    // The backend answered 101 and the whole of that answer has just been
+    // forwarded verbatim, headers and all — the proxy adds nothing to it,
+    // removes nothing from it and computes no part of it.  From the next byte
+    // on, this pair is a byte relay in both directions until one end closes.
+    //
+    // Here and not in the client read handler because this is the only place
+    // the 101 exists: it arrives on the backend leg, once, and the client leg
+    // has no way to know it happened except by asking.  Stated as the
+    // false-to-true transition of a field the scan sets exactly once, so it
+    // runs exactly once per connection without a flag to remember it by.
+    if (m_protocol == protocol_http && !tunnel_before &&
+        conn->http_frame.switched_protocols &&
+        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& ce = m_conn_idx[conn->client_fd];
+        if (ce.side == conn_client && ce.client->backend_fd == fd)
+            begin_tunnel(ce.client);
+    }
 
     // Check if HTTP response is complete — detach backend and pool it.
     //
@@ -3665,6 +3775,58 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     std::string_view body_section(conn->partial.data() + body_off,
                                   conn->partial.size() - body_off);
 
+    // ── an upgrade request, and why two hop-by-hop headers survive it ──
+    //
+    // Connection and Upgrade are hop-by-hop and are stripped below, which is
+    // right for every request except the one whose entire meaning they are.
+    // "Connection: Upgrade" + "Upgrade: websocket" is not a pair of headers
+    // about this hop; it is the offer, and a backend that does not receive it
+    // has not been asked to switch protocols.  RFC 7230 Section 6.7 says so
+    // directly: a proxy that will relay the switch MUST forward both.
+    //
+    // What it cost to strip them is not visible from the client's side at all,
+    // which is why it survived: a lenient backend answers 101 on the strength
+    // of Sec-WebSocket-Key alone, so the handshake appears to succeed while the
+    // request the backend actually saw was an ordinary GET.  A strict one —
+    // socketley's own server runtime among them, which requires the Upgrade
+    // header before it will look at the key — answers with a plain HTTP
+    // response instead, and the client sees a WebSocket connection that was
+    // never negotiated.
+    //
+    // Both are required, and the token is looked for in the Connection list
+    // rather than at its front: "Connection: keep-alive, Upgrade" is an
+    // ordinary spelling.  An Upgrade header without the token in Connection is
+    // not an offer at all (RFC 9110 Section 7.8) and is stripped as before, so
+    // this cannot be used to smuggle a hop-by-hop header past the proxy by
+    // naming it alone.
+    bool upgrade_offered = false;
+    {
+        bool conn_has_upgrade = false, has_upgrade_field = false;
+        size_t u_pos = 0;
+        while (u_pos < headers_section.size())
+        {
+            auto nl = headers_section.find("\r\n", u_pos);
+            if (nl == std::string_view::npos)
+                nl = headers_section.size();
+            const std::string_view line = headers_section.substr(u_pos, nl - u_pos);
+            u_pos = nl + 2;
+            const auto colon = line.find(':');
+            if (colon == std::string_view::npos)
+                continue;
+            if (header_name_equals(line, "connection", 10))
+            {
+                if (http_list_has_token(http_trim_ows(line.substr(colon + 1)), "upgrade", 7))
+                    conn_has_upgrade = true;
+            }
+            else if (header_name_equals(line, "upgrade", 7))
+            {
+                if (!http_trim_ows(line.substr(colon + 1)).empty())
+                    has_upgrade_field = true;
+            }
+        }
+        upgrade_offered = conn_has_upgrade && has_upgrade_field;
+    }
+
     bool host_written = false;
     size_t h_pos = 0;
     while (h_pos < headers_section.size())
@@ -3687,15 +3849,17 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             }
         }
 
-        // Skip hop-by-hop headers (RFC 7230 Section 6.1)
+        // Skip hop-by-hop headers (RFC 7230 Section 6.1) — except the two that
+        // make up an upgrade offer, on a request that carries one.  See above.
         bool skip = false;
         if (header_name_equals(hdr_line, "connection", 10) ||
-            header_name_equals(hdr_line, "keep-alive", 10) ||
-            header_name_equals(hdr_line, "proxy-authenticate", 18) ||
-            header_name_equals(hdr_line, "proxy-authorization", 19) ||
-            header_name_equals(hdr_line, "te", 2) ||
-            header_name_equals(hdr_line, "trailer", 7) ||
             header_name_equals(hdr_line, "upgrade", 7))
+            skip = !upgrade_offered;
+        else if (header_name_equals(hdr_line, "keep-alive", 10) ||
+                 header_name_equals(hdr_line, "proxy-authenticate", 18) ||
+                 header_name_equals(hdr_line, "proxy-authorization", 19) ||
+                 header_name_equals(hdr_line, "te", 2) ||
+                 header_name_equals(hdr_line, "trailer", 7))
             skip = true;
         // Transfer-Encoding is on RFC 7230 Section 6.1's list too and is
         // deliberately not on this one.  This proxy forwards the request body
@@ -3793,12 +3957,18 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         result += "\r\n";
     }
 
-    // Request keep-alive to enable backend connection pooling,
-    // unless the client sent Connection: close
-    if (conn->client_conn_close)
-        result += "Connection: close\r\n";
-    else
-        result += "Connection: keep-alive\r\n";
+    // Request keep-alive to enable backend connection pooling, unless the
+    // client sent Connection: close — or unless this request carries an upgrade
+    // offer, whose own Connection header has just been forwarded verbatim.
+    // Adding one here as well would put two Connection fields on the request,
+    // with conflicting tokens, and leave the backend to pick.
+    if (!upgrade_offered)
+    {
+        if (conn->client_conn_close)
+            result += "Connection: close\r\n";
+        else
+            result += "Connection: keep-alive\r\n";
+    }
 
     result += "\r\n";
 
@@ -5855,6 +6025,12 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // pool a socket with the rest of somebody's response still on it.  Cheap to
     // ask, and the question does not depend on which read mode is in force,
     // which is the point: it stops the answer being a coincidence.
+    //
+    // This is also where a tunnel is refused.  A connection that answered 101
+    // has no message boundary at all — it stopped carrying messages — and
+    // http_response_frame_complete() says so as its first act rather than
+    // failing to find the end of a response that does not exist.  Handing one
+    // to the pool would give the next request a live WebSocket session.
     if (!backend_response_complete(bconn))
         return false;
     if (!cconn)
@@ -8155,6 +8331,23 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
 
     if (SOCKETLEY_UNLIKELY(cconn->closing))
         return;
+
+    // --idle-timeout reaps a client that has said nothing for too long, and
+    // "said nothing" is measured by that client's own reads and nothing else.
+    // On a request/response exchange that is the right measure: between
+    // requests a keep-alive connection genuinely is doing nothing, and a
+    // response on its way out belongs to a request that was counted when it
+    // arrived.
+    //
+    // A tunnel has no such cycle.  The peer talking IS the connection working,
+    // and a WebSocket where the server pushes and the client only listens —
+    // a feed, a notification stream, anything one-directional — reads as
+    // perfectly idle from the client side while it is delivering.  It would be
+    // cut off mid-stream, at exactly the interval an operator set to reap
+    // connections that are doing nothing.
+    if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0) &&
+        conn->http_frame.switched_protocols)
+        cconn->last_activity = std::chrono::steady_clock::now();
 
     std::string hook_storage;
     bool hook_modified = false;

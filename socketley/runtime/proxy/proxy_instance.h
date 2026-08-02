@@ -610,6 +610,26 @@ private:
     // a response this proxy cannot frame cannot strand one for ever.
     void bound_pipelined_hold(proxy_client_connection* conn);
 
+    // ── the protocol switch ─────────────────────────────────────────────────
+    //
+    // Whether this client connection has stopped being a sequence of HTTP
+    // exchanges, because the backend answered 101 Switching Protocols on it.
+    //
+    // Asked of the backend's response-framing state rather than remembered on
+    // the client.  The 101 is only ever seen in one place — the response scan,
+    // which reads every status code for the pool's sake already — so there is
+    // one fact and no copy of it to keep in step.  A tunnel is by construction
+    // never detached and never pooled, so the pair stays a pair for as long as
+    // the switch means anything, and a client with no backend answers false
+    // without needing to.
+    bool conn_tunnelled(const proxy_client_connection* conn) const;
+
+    // The handover, run once, on the completion that carried the 101 and after
+    // it has been forwarded.  See the definition: what it has to do is unpick
+    // the two things the request path set up on the assumption that an answer
+    // to a request was coming back.
+    void begin_tunnel(proxy_client_connection* cconn);
+
     // Returns http_request_parse::invalid for a request that must never reach a
     // backend, which is a verdict the old bool return could not express at all.
     http_request_parse parse_http_request_line(proxy_client_connection* conn);
