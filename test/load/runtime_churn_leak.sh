@@ -18,7 +18,8 @@
 #              the daemon logged a retired-instance warning.  The original
 #              printed all three and exited 0 regardless.
 #
-#   CYCLES=n           create/remove cycles (default 60)
+#   CYCLES=n           counted create/remove cycles (default 60)
+#   WARMUPS=n          cycles run and discarded before the baseline (default 10)
 #   FD_GROWTH_MAX=n    tolerated descriptor growth (default 8)
 #   RSS_GROWTH_PCT=n   tolerated RSS growth in percent (default 40)
 
@@ -29,6 +30,7 @@ require_bin
 require_lib httpharness.py
 
 CYCLES="${CYCLES:-60}"
+WARMUPS="${WARMUPS:-10}"
 FD_MAX="${FD_GROWTH_MAX:-8}"
 RSS_PCT="${RSS_GROWTH_PCT:-40}"
 BE="${BE_PORT:-26000}"
@@ -54,37 +56,54 @@ kill -0 "$BPID" 2>/dev/null || nothing_measured "the echo backend did not start 
 
 start_daemon "$RUNDIR" || nothing_measured "daemon did not start"
 
-# NOT CALIBRATED FOR A REAL DAEMON.  Until the DAEMON_PID fix in common.sh this
-# baseline, and every sample below, described a bash subshell: 2160 kB and five
-# descriptors, identical at cycle 0, 20, 40 and 60, in the nightly and
-# everywhere else.  The harness could not fail, so its allowance was never
-# tested against anything.
+# ─── WARM-UPS, AND WHY THERE ARE TEN OF THEM ────────────────────────────────
 #
-# Against the daemon it now reads, on a Release build on 2026-08-02, this check
-# FAILS — and the numbers say warm-up rather than leak:
+# Discipline 4 in common.sh: the first rounds pay for page faults and allocator
+# growth, they are run and thrown away, never counted.  Every measure_* harness
+# has done that from the start.  This one did not, and it did not matter while
+# DAEMON_PID named a bash subshell — the baseline and every later sample read
+# the same 2160 kB whatever the daemon did.
 #
-#     60 cycles:   7100 kB -> 23240 kB   (+227%, allowance 40%)
-#    180 cycles:   7056 kB -> 23300 kB   (+230%)
+# Against the daemon it now reads, the omission is the whole verdict.  Sampled
+# every cycle on a Release build, quiet machine, 2026-08-02:
 #
-# and in the 180-cycle run RSS was 22776 kB by cycle 20 and 23300 kB by cycle
-# 180 — 524 kB across a hundred and sixty cycles, flattening, with descriptors
-# at 6 from first sample to last in both runs.  Tripling the cycle count moved
-# the verdict by three points, which is a fixed start-up cost and not a
-# per-cycle leak.
+#     cycle  0    7116 kB          cycle  9   22784 kB   (+28)
+#     cycle  1   14016 kB (+6900)  cycle 15   23052 kB   (+4)
+#     cycle  2   18516 kB (+4500)  cycle 24   23180 kB   (+128)
+#     cycle  4   21428 kB (+2624)  cycle 45   23192 kB   (+4)
 #
-# restart_under_load.sh serves one request before taking its baseline, for
-# exactly this reason.  One cycle is not enough here: with the baseline taken
-# after a single create/serve/remove it reads 14060 kB and the check still fails
-# at 65%, because this daemon is still settling through roughly the first twenty
-# cycles.  Where the baseline belongs, and what the allowance should be once it
-# is measured from a warm daemon rather than guessed against bash, is a
-# calibration this run cannot decide: it wants a quiet machine and more than one
-# sample, and picking the number that makes this line pass is how the allowance
-# came to be untested in the first place.  Left failing on purpose.
+# 16 MB of the growth is the first nine cycles and 140 kB is the thirty after
+# cycle 15.  Descriptors are 6 at every single sample.  That is a daemon
+# allocating what it needs to hold one proxy runtime, once, and it was being
+# reported as a 228% leak.
+#
+# TEN is where the per-cycle delta has decayed into the noise (+28 kB at cycle
+# 9, and zero for most cycles after it), taken from the profile above rather
+# than chosen to make this line pass.  It is not three, as elsewhere in the
+# suite, because a cycle here creates and destroys a whole runtime rather than
+# opening a connection.
+#
+# THE ALLOWANCE IS NOT TOUCHED.  It stays at the 40% it has always been.  What
+# changes is that it is now compared against a warm daemon, which is the only
+# comparison in which "did the churn leak" is the question being asked.  With
+# that baseline the observed growth is about 1%, so 40% is now very loose and is
+# the next thing worth calibrating — from a few dozen runs, not from these.
+warm=0
+while [ "$warm" -lt "$WARMUPS" ]; do
+    warm=$((warm + 1))
+    P=$((PORT_BASE + warm % PORT_SPAN))
+    "$BIN" create proxy "wu$warm" -p "$P" --backend "127.0.0.1:$BE" --protocol http -s >/dev/null 2>&1
+    pin_load python3 "$LIB/httpharness.py" --mode drive --port "$P" --prefix "/wu$warm" \
+        --clients 4 --count 8 >/dev/null 2>&1
+    "$BIN" remove "wu$warm" >/dev/null 2>&1
+done
+daemon_alive || fail "the daemon died during the $WARMUPS warm-up cycles"
+sleep 1
+
 base_rss="$(daemon_rss_kb)"
 base_fd="$(daemon_fds)"
 [ "$base_fd" -gt 0 ] 2>/dev/null || nothing_measured "could not read the daemon's descriptor count"
-echo "  baseline: ${base_rss} kB RSS, $base_fd descriptors"
+echo "  baseline: ${base_rss} kB RSS, $base_fd descriptors (after $WARMUPS discarded warm-up cycles)"
 
 served=0
 completed=0
