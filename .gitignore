@@ -80,6 +80,11 @@ test/benchmark/results/
 CLAUDE.md
 CONTRIBUTING.md
 
+# Agent worktrees.  git checkouts of this repository living inside it; adding
+# them would commit a copy of the tree to itself.  Only worktrees/ — anything
+# else under .claude/ is ordinary project configuration and stays trackable.
+.claude/worktrees/
+
 # IDE and editor
 .vscode/
 .idea/
