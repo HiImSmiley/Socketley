@@ -340,6 +340,19 @@ bool proxy_supervisor::check_liveness()
 
     LOG_WARN("proxy worker exited unexpectedly");
 
+    // The one thing a child can tell us about itself on the way out: this is not
+    // a crash, it is a configuration it will never accept.  Restarting is the
+    // right answer to a crash and produces nothing here but five more copies of
+    // the same refusal, so the runtime is left `failed` where the operator can
+    // see it — and the reason is already in the log, written by the child.
+    if (WIFEXITED(status) && WEXITSTATUS(status) == worker_proto::exit_config_refused)
+    {
+        LOG_ERROR("proxy worker refused its configuration; not restarting it");
+        if (m_placeholder)
+            m_placeholder->mark_failed();
+        return true;
+    }
+
     if (m_policy == death_policy::fail)
     {
         if (m_placeholder)

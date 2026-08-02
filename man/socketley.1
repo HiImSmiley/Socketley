@@ -1455,9 +1455,12 @@ Settable only at
 rejects it, because honouring it would mean moving a configured runtime
 between address spaces underneath whatever already points at it.
 .IP
-Lua callbacks run inside the worker, against the worker's own state; a
-script that reaches for other runtimes through the management API does not
-find them there. See
+Lua callbacks run inside the worker, against the worker's own state. A script
+that reaches for other runtimes through the management API is refused there by
+name rather than answering nothing \(em and if it does so at its top level the
+script does not load and the runtime is left
+.BR failed .
+See
 .B "Out-of-process proxies"
 under
 .BR LIMITATIONS .
@@ -4409,14 +4412,52 @@ mode is unaffected by any of this: it was already a byte relay and never looked
 at a status line.
 .SS Out\-of\-process proxies
 .B \-\-out\-of\-process
-is the first step of moving the proxy out of the daemon, and what it does
-not yet cover is worth stating plainly.
+moves the proxy out of the daemon. What it refuses, and what it costs, is worth
+stating plainly.
 .PP
-A worker holds no runtime manager, so the cross\-runtime parts of the Lua
-management API \(em creating, listing or sending to other runtimes, and
-cache access by name \(em find nothing from inside one. Connection and
-request callbacks run normally against the worker's own state. Interactive
-mode
+.B "The cross\-runtime management API is refused inside a worker."
+A worker is a separate process holding one runtime and no runtime manager, so
+.BR socketley.create ,
+.BR .start ,
+.BR .stop ,
+.BR .remove ,
+.BR .send ,
+.BR .list ,
+.BR .get ,
+.B .pipe
+and the whole
+.B socketley.cluster
+table have no inventory to act on. They are not offered, and they do not quietly
+answer nothing: each raises a Lua error naming the call, the reason and the way
+out. Every one of them used to return a false, a nil or an empty table \(em
+which is exactly what a
+.I successful
+call returns on a daemon with nothing in it, so neither the script nor the
+operator could tell the two apart.
+.IP
+Called from a callback, the refusal is reported by whatever ran it: a filter
+that raised has not said "carry on", so the request is answered
+.B 500
+and the message goes to the log. Called at the script's top level, the script
+does not load \(em and a worker whose script did not load does not serve. It
+exits saying this is a configuration it will never accept, and the supervisor
+leaves the runtime
+.B failed
+rather than forking five more copies of the same refusal. It used to start
+anyway and relay with none of the filters, routes or callbacks that were
+written, behind a single warning.
+.IP
+Everything that does not reach for the runtime map works normally:
+.BR socketley.log ,
+.BR .http ,
+.BR .json_encode / .json_decode ,
+the timers,
+.BR .subscribe ,
+the
+.B self
+table, and the connection and request callbacks.
+.PP
+Interactive mode
 .RB ( "start \-i" )
 is not offered for a proxy on either path.
 .PP

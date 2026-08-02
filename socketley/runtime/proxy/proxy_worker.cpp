@@ -15,6 +15,7 @@
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
+#include "../../shared/lua_context.h"
 #include "../../shared/runtime_config_apply.h"
 #include "../../shared/runtime_factory.h"
 #include "../../shared/runtime_instance.h"
@@ -115,7 +116,7 @@ public:
             m_proxy->stop(m_loop);
         m_loop.shutdown_ring();
 
-        return 0;
+        return m_exit_code;
     }
 
 private:
@@ -296,9 +297,27 @@ private:
         if (!cfg.ca_path.empty())       m_proxy->set_ca_path(cfg.ca_path);
         if (!cfg.target.empty())        m_proxy->set_target(cfg.target);
 
-        if (!cfg.lua_script.empty())
-            if (!m_proxy->load_lua_script(cfg.lua_script))
-                LOG_WARN("proxy worker: could not load lua script");
+        // A script that does not load is a configuration this worker cannot
+        // serve, not a warning to carry on past.
+        //
+        // It used to be one: the proxy started anyway, relaying with none of the
+        // filters, routes or callbacks the operator wrote, and the only trace
+        // was a WARN in the daemon's log.  The in-process path has never allowed
+        // that — `create --lua` refuses outright and exits 1 — so a proxy could
+        // be rejected by the daemon and silently accepted, gutted, by the same
+        // binary one flag later.
+        //
+        // Exiting is how a worker says so.  The supervisor already treats a dead
+        // child as the runtime's problem; exit_config_refused tells it not to
+        // fork a sixth copy of the same refusal.
+        if (!cfg.lua_script.empty() && !m_proxy->load_lua_script(cfg.lua_script))
+        {
+            LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
+                      "without it (the script's own error is above)");
+            m_exit_code = worker_proto::exit_config_refused;
+            m_done      = true;
+            return;
+        }
 
         apply_proxy_config(*m_proxy, cfg);
 
@@ -339,7 +358,13 @@ private:
 
     void on_start()
     {
-        if (!m_proxy || m_proxy->get_state() == runtime_running)
+        // A worker that has decided to exit must not bind anything on the way
+        // out.  start and config arrive together — the supervisor sends both
+        // before the first drain — so a refusal in on_config() is followed by
+        // this in the same batch, and without the guard the worker took the port,
+        // reported "proxy failed to start", and exited: a listener opened and
+        // closed for a configuration it had already refused.
+        if (m_done || !m_proxy || m_proxy->get_state() == runtime_running)
             return;
         if (!m_proxy->start(m_loop))
             LOG_ERROR("proxy worker: proxy failed to start");
@@ -361,6 +386,7 @@ private:
     std::shared_ptr<const endpoint_table>  m_pending_endpoints;
     std::string                            m_in;
     bool                                   m_done{false};
+    int                                    m_exit_code{0};
 };
 
 } // namespace
@@ -369,6 +395,13 @@ int proxy_worker_main(int control_fd)
 {
     if (control_fd < 0)
         return 2;
+
+    // Before any interpreter exists, because it decides what one is built with.
+    // This process holds one runtime and no map of runtimes, so the cross-runtime
+    // half of the Lua management API has nothing here to answer from and says so
+    // instead of answering nothing.
+    lua_context::set_worker_process(true);
+
     worker w(control_fd);
     return w.run();
 }

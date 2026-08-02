@@ -136,8 +136,26 @@ public:
     // Cross-runtime pub/sub dispatch (called from runtime_instance)
     void dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message);
 
+    // ── "This process holds no runtime manager, and never will" ──────────────
+    //
+    // A worker process runs one runtime and nothing else.  There is no map of
+    // runtimes in it to list, create in, or send to, and there cannot be: the
+    // map lives in the daemon, one process away, and the answer to "may a
+    // runtime make a synchronous call into another one" was already settled as
+    // no — that is why `server --cache` is an async continuation and not a
+    // blocking lookup.  A management call from here has no honest answer.
+    //
+    // A process fact rather than a per-instance one, because that is what it is.
+    // Set once, before anything is created; every lua_context built afterwards
+    // sees it.
+    static void set_worker_process(bool on);
+    static bool in_worker_process();
+
 private:
     void register_bindings(runtime_instance* owner);
+    // Overwrite the cross-runtime calls with a refusal that names them.  Only
+    // called when in_worker_process().
+    void refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl);
     void register_server_table(runtime_instance* owner, sol::table& self);
     void register_client_table(runtime_instance* owner, sol::table& self);
     void register_cache_table(runtime_instance* owner, sol::table& self);
@@ -189,6 +207,11 @@ private:
 
     uint32_t m_tick_ms{0};
     uint32_t m_callback_mask{0};
+
+    // See set_worker_process().  Written once at process start, before any
+    // interpreter exists, and read-only afterwards — so it needs no atomic and
+    // no lock, and a plain bool is what it means.
+    static bool s_worker_process;
 
     // Timer lifetime guard — set to false in destructor; timers check before firing
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
@@ -271,6 +294,10 @@ public:
     }
     uint32_t get_tick_ms()       const { return 0; }
     void dispatch_publish(std::string_view, std::string_view, std::string_view) {}
+    // The worker calls this before it builds anything; without Lua there is no
+    // management API to refuse, so it records nothing.
+    static void set_worker_process(bool) {}
+    static bool in_worker_process() { return false; }
     // on_*() callbacks omitted — only called when has_*() returns true,
     // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.
 };

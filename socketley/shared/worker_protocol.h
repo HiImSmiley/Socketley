@@ -79,6 +79,16 @@ enum class frame_type : uint16_t
     shutdown  = 20,  // payload: empty
 };
 
+// ── What a worker's exit status means ───────────────────────────────────────
+//
+// A child that dies is restarted by default, which is right for a crash and
+// wrong for a configuration it can never accept: forking it five more times
+// produces five more copies of the same refusal.  So the one case the worker
+// can recognise about itself says so on the way out, and the supervisor leaves
+// the runtime `failed` instead of retrying.  Everything else keeps the old
+// policy, because everything else might work on the next try.
+inline constexpr int exit_config_refused = 3;
+
 // ── Frame encoding ──────────────────────────────────────────────────────────
 
 inline void put_u16(std::string& out, uint16_t v)

@@ -1227,6 +1227,91 @@ static sol::object json_decode_value(sol::state& lua, const char*& p, const char
     }
 }
 
+namespace
+{
+
+// ── What a worker cannot answer, said in the way this tree says it ──────────
+//
+// Named, with the reason and the way out, like tls_config_refusal — and for the
+// same reason.  Every one of these calls used to return a false, a nil or an
+// empty table from inside a worker, which is exactly what a *successful* call
+// on an empty daemon returns.  A script could not tell "there are no other
+// runtimes" from "this call cannot see any runtimes from here", so it carried
+// on routing, sending and creating against nothing, and the operator was told
+// nothing at all.
+//
+// Raised rather than returned, because the return value is the thing that
+// cannot carry it: `if socketley.create(...) then` is how these are written and
+// a false is what it already handles.
+std::string worker_refusal(const char* call)
+{
+    return std::string("socketley.") + call +
+           "() is refused in an out-of-process proxy worker: the worker is a "
+           "separate process and holds no runtime manager, so there is no "
+           "inventory here for this call to act on — it would answer nothing "
+           "and look exactly like a daemon with nothing in it. Run this proxy "
+           "without --out-of-process, or move the call to a runtime that lives "
+           "in the daemon.";
+}
+
+}  // namespace
+
+void lua_context::set_worker_process(bool on) { s_worker_process = on; }
+bool lua_context::in_worker_process() { return s_worker_process; }
+
+bool lua_context::s_worker_process = false;
+
+// Replace the cross-runtime half of the management API with something that says
+// why it is not there.
+//
+// The raise is built by a Lua factory and is therefore Lua's own error(): no C++
+// exception is thrown through LuaJIT's frames to produce it.  What a script sees
+// is an ordinary runtime error at the call site, which every callback in this
+// tree already catches and prints with the callback's name attached — so a
+// refusal in on_proxy_request reads as
+//
+//   [lua] on_proxy_request error: lua: error: px.lua:7: socketley.list() is
+//   refused in an out-of-process proxy worker: ...
+//
+// and a refusal at the top level fails the script load, which the worker treats
+// as a configuration it cannot serve.
+void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl)
+{
+    auto factory = m_lua.safe_script(
+        "return function(msg) return function() error(msg, 2) end end",
+        sol::script_pass_on_error);
+    if (!factory.valid())
+    {
+        // Cannot happen with a working interpreter, and if it does the honest
+        // thing is to say so rather than leave the old bindings in place while
+        // believing they are gone.
+        std::cerr << "[lua] could not install the out-of-process refusals; the "
+                     "cross-runtime management API is left bound and will "
+                     "answer nothing" << std::endl;
+        return;
+    }
+    sol::function make = factory;
+
+    // Everything that reaches for the runtime map, and nothing that does not.
+    // socketley.log, .http, .json_*, the timers and .subscribe all work in a
+    // worker exactly as they do in the daemon, and .subscribe in particular is
+    // delivered to now — see runtime_manager::set_publish_sink.
+    for (const char* call : {"create", "start", "stop", "remove", "send", "list",
+                             "get", "pipe"})
+    {
+        sol::function f = make(worker_refusal(call));
+        sk[call] = f;
+    }
+
+    // The cluster view is the runtime map plus what discovery has heard, and a
+    // worker has neither.
+    for (const char* call : {"daemons", "runtimes", "group", "stats"})
+    {
+        sol::function f = make(worker_refusal((std::string("cluster.") + call).c_str()));
+        cluster_tbl[call] = f;
+    }
+}
+
 void lua_context::register_bindings(runtime_instance* owner)
 {
     // Register socketley.log() and management API
@@ -1657,6 +1742,13 @@ void lua_context::register_bindings(runtime_instance* owner)
 
         return result;
     };
+
+    // Last, and over the top of the bindings above: a worker gets the same table
+    // with the calls it cannot honour replaced by a refusal that names them.
+    // Done here rather than by not binding them at all, so the two builds differ
+    // in one place and the list of what is refused is readable in one place.
+    if (in_worker_process())
+        refuse_cross_runtime_api(sk, cluster_tbl);
 
     sk["cluster"] = cluster_tbl;
 
