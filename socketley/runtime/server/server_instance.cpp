@@ -1551,6 +1551,27 @@ void server_instance::teardown(event_loop& loop)
         shutdown(fd, SHUT_RDWR);
         close_tracked(fd);
 
+        // And the slot, for the reason written out over release_conn(): this is
+        // what unregisters the file, and until it runs the kernel still holds a
+        // reference to that socket and the close() above did not really close
+        // it.  release_conn() and pool_release() both call it; this path — the
+        // one a stop takes — did not, so it was the only way a connection could
+        // reach the end of its life with its file still registered.
+        //
+        // What that costs is a read the socket can no longer end.  A multishot
+        // recv armed through submit_recv_multishot_fixed_file() is counted on
+        // the fixed index, not on the descriptor number, so close_fd() sees
+        // m_fd_armed[fd] == 0, takes its fast path and submits no cancel — and
+        // a multishot recv holds its own reference to the file, so nothing else
+        // is going to end it either.  On this machine shutdown() does: the
+        // socket's wait queue completes the recv before close_tracked() runs.
+        // The nightly runner's kernel does not, and the fuzz harness has been
+        // reporting the result there since June, in the only words it has for
+        // it — "1 operation(s) still owed at end of input: recv-multishot=1",
+        // on no descriptor the loop can name, because the operation was never
+        // counted against one.
+        release_fixed_slot(conn.get());
+
         // The file read and the file→pipe splice target the file fd, not the
         // socket, so the shutdown above does not touch them.  Closing the file
         // ends them; the ops themselves keep the struct out of the pool until

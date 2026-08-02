@@ -423,6 +423,14 @@ struct ring_watch
         // too short to measure cannot be called starved by rounding alone.
         m_last_pass_starved = elapsed_ms > 3 * static_cast<long long>(spent) + 1;
 
+        // Kept for the report.  "The starvation guard did not fire" is a verdict
+        // with no number behind it, and the one question it leaves open is how
+        // close it came — a pass that spent 30 rounds in 40 ms and one that
+        // spent 30 in 89 ms both say "not starved" and mean very different
+        // things about the machine that produced the finding.
+        m_last_rounds_spent = spent;
+        m_last_elapsed_ms   = elapsed_ms;
+
         return loop->owner_inflight(owner) == 0;
     }
 
@@ -454,6 +462,8 @@ struct ring_watch
     }
 
     bool m_last_pass_starved{false};
+    int  m_last_rounds_spent{0};
+    long long m_last_elapsed_ms{0};
 
     // A drain that needed the escalation is not a failure, but it is worth
     // seeing: it is the early shape of a latency regression, and absorbing it
@@ -487,6 +497,45 @@ struct ring_watch
             off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
                                  " %s=%u", io_op_name(t), by_type[t]);
         }
+
+        // WHICH DESCRIPTORS, and how hard this waited.  Both were missing from
+        // the nightly of 2026-08-02, which is why that finding could not be
+        // read from anywhere but the machine that produced it.
+        //
+        // The descriptor is the question the op kind cannot answer.  A
+        // multishot recv holds its own reference to the file, so neither the
+        // shutdown() nor the close() in server_instance::teardown() ends one on
+        // a descriptor that teardown does not know about — and close_fd()'s
+        // cancel, which would, is submitted with get_sqe() and silently not
+        // submitted when the ring is full (event_loop.cpp, submit_cancel_fd
+        // returns false and close_fd ignores it).  So "on which descriptor" and
+        // "one teardown walked, or one it never saw" are the same question.
+        //
+        // Bounded at eight: a report is for reading, and if eight descriptors
+        // are stuck the ninth adds nothing.
+        int listed = 0;
+        for (int fd = 0; fd < 4096 && listed < 8 && off > 0 &&
+                         off < static_cast<int>(sizeof(buf)); fd++)
+        {
+            // fd_inflight() answers 0 for anything outside the tracked range,
+            // so it is the whole test.
+            if (loop->fd_inflight(fd) == 0)
+                continue;
+            off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
+                                 "%s fd=%d(%u)", listed == 0 ? " on" : "", fd,
+                                 loop->fd_inflight(fd));
+            ++listed;
+        }
+        if (listed == 0 && off > 0 && off < static_cast<int>(sizeof(buf)))
+            off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
+                                 " on no tracked descriptor at all");
+
+        if (off > 0 && off < static_cast<int>(sizeof(buf)))
+            std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
+                          "; last pass spent %d round(s) in %lldms (starved=%s)",
+                          m_last_rounds_spent, m_last_elapsed_ms,
+                          m_last_pass_starved ? "yes" : "no");
+
         set_detail("%s", buf);
     }
 };
