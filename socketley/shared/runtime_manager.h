@@ -149,6 +149,25 @@ private:
     std::function<void(const endpoint_table&)> m_endpoint_sink;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
 
+    // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER
+    // them.  A runtime revokes its origin as it goes — ~server_instance calls
+    // requests().drop_origin(this), because a runtime can be freed without ever
+    // having been stopped — and that call needs a channel that is still alive.
+    //
+    // It used to sit below them, with the reasoning that the channel had to go
+    // first so "its queue is emptied while the runtimes it names are still
+    // alive".  The queue does not need them: an entry carries its own copy of
+    // the target name and the payload, an origin is a bare pointer, and
+    // ~request_channel clears three containers and dereferences nothing.  So
+    // that order bought nothing and cost the reverse — the channel died first
+    // and every instance destructor after it called into freed storage.  UBSan
+    // in the nightly, on the first run after test_sdk_engine started being
+    // executed at all:
+    //
+    //     server_instance.cpp:47:36: runtime error: member call on address
+    //     0x7fff... which does not point to an object of type 'request_channel'
+    request_channel m_requests;
+
     runtime_map runtimes;
 
     // The graveyard: instances that are gone as far as every reader is
@@ -157,12 +176,6 @@ private:
     // shutdown for whatever never completed.
     std::vector<std::unique_ptr<runtime_instance>> m_retired;
     size_t m_retired_warn_at = 32;
-
-    // Declared after the map on purpose.  The channel holds pointers to
-    // instances the map owns, and members are destroyed in reverse order of
-    // declaration — so this one goes first, and its queue is emptied while the
-    // runtimes it names are still alive.
-    request_channel m_requests;
 
     // Set by a reader on another thread, read by the event-loop thread on every
     // sweep, so it has to be an atomic even though it only ever goes false→true.
