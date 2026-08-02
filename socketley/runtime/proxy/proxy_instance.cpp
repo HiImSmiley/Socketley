@@ -1691,6 +1691,8 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 // that function asks, out of the same predicate, or the invariant is not the
 // specification for it.
 static inline bool backend_response_complete(const proxy_backend_connection* bconn);
+static inline bool client_answer_owed(const proxy_client_connection* cconn,
+                                      const proxy_backend_connection* bconn);
 
 // Invariant (1) from invariants.h, in the form this runtime takes.  A proxied
 // connection is half of a pair and only the pair can answer the question: a
@@ -1771,9 +1773,7 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     {
         x.stated      = true;
         x.half_closed = cconn->client_eof;
-        x.answer_owed = cconn->connect_pending ||
-                        (bconn && !(cconn->response_started &&
-                                    backend_response_complete(bconn)));
+        x.answer_owed = client_answer_owed(cconn, bconn);
     }
 
     SKL_INV_PAIR_X(where, c, b, x);
@@ -2261,6 +2261,24 @@ static inline bool backend_response_complete(const proxy_backend_connection* bco
     return http_response_frame_complete(bconn->http_frame);
 }
 
+// "A request left this client for a backend and its answer has not come back."
+//
+// Three places have to agree on this and used to state it three times.
+// handle_client_read decides on it whether to HOLD a half-closed client;
+// handle_backend_read decides on it whether that hold is OVER; and invariant
+// (1b) reports a pair that is held while it reads false.  Writing it once is
+// what makes the invariant the specification for the hold rather than a second
+// opinion about it — when the two disagree the hold is wrong, and they cannot
+// disagree if there is only one of them.
+//
+// `bconn` is the backend this client is paired with, or null when it has none.
+static inline bool client_answer_owed(const proxy_client_connection* cconn,
+                                      const proxy_backend_connection* bconn)
+{
+    return cconn->connect_pending ||   // the request has not reached a backend yet
+           (bconn && !(cconn->response_started && backend_response_complete(bconn)));
+}
+
 void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -2418,9 +2436,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             // it either, because with no deadline there is no sweep to answer
             // 502/504 in its place.  A guard that switches off with an optional
             // feature is how the guard above this one came to be unreachable.
-            const bool answer_owed =
-                conn->connect_pending ||   // the request has not reached a backend yet
-                (b && !(conn->response_started && backend_response_complete(b)));
+            const bool answer_owed = client_answer_owed(conn, b);
 
             if (answer_owed)
             {
@@ -3490,6 +3506,47 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 detach_and_pool_backend(ce.client, fd);
                 return;
             }
+        }
+    }
+
+    // ── the end of the hold ─────────────────────────────────────────────────
+    //
+    // A client that half-closes while its answer is still owed is HELD rather
+    // than closed — see handle_client_read, which sets client_eof and returns
+    // instead of tearing the pair down, so that the answer already asked for is
+    // finished rather than thrown away.  That hold has to be ended by whatever
+    // delivers the answer, and until now only one path did: the detach above,
+    // through reset_client_for_next_request, which closes on client_eof.
+    //
+    // Everything that falls PAST the detach had no ending at all.  The detach is
+    // refused for a client that sent `Connection: close` (it must not go back in
+    // the keep-alive pool), for a backend whose own response said the same, and
+    // for a response relayed by splice — and none of those three reaches
+    // reset_client_for_next_request.  So the client sat there answered in full,
+    // half-closed, write queue empty and nothing of its own in flight, while the
+    // only thing armed anywhere was the backend's idle read; and that read
+    // completes only if the backend sends something, which it will not, because
+    // its response is finished and the client has said it will send no more.
+    // Nothing could ever wake the pair again and both descriptors were held
+    // until the runtime stopped.
+    //
+    // Asked out of client_answer_owed(), the same predicate the hold is taken on
+    // and invariant (1b) reports against, so the three cannot drift: the hold
+    // ends exactly when the condition that justified it stops being true.
+    //
+    // close_pair defers on whatever is still in flight and on whatever is still
+    // queued — the client's own write of the response tail included — so the
+    // answer goes out before the descriptors do.
+    if (m_protocol == protocol_http && conn->client_fd >= 0 &&
+        conn->client_fd < MAX_FDS)
+    {
+        auto& ce = m_conn_idx[conn->client_fd];
+        if (ce.side == conn_client && ce.client->client_eof &&
+            !ce.client->closing && !client_answer_owed(ce.client, conn))
+        {
+            ce.client->closing = true;
+            close_pair(ce.client->fd, fd);
+            return;
         }
     }
 
