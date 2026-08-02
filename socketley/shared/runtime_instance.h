@@ -196,10 +196,35 @@ public:
             std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
             m_stat_detail = std::move(detail);
         }
+        m_worker_stats_ns.store(steady_ns(), std::memory_order_relaxed);
         // Published after the detail it promises, with a release so a reader
         // that sees the flag also sees the text.  Setting it first would let
         // the first `stats` after a worker starts print nothing at all.
         m_worker_backed.store(true, std::memory_order_release);
+    }
+
+    // How old these figures are, in milliseconds, or -1 when none has arrived.
+    //
+    // ─── WHY THIS IS REPORTED RATHER THAN REMOVED ───────────────────────────
+    //
+    // A worker's figures are pushed, not read.  Making them live would mean the
+    // daemon asking the child a question and waiting for the answer, on the
+    // event-loop thread, with a process it does not control on the other end —
+    // which is the synchronous cross-runtime call this design already answered
+    // no to everywhere else.  The child publishes every 250ms and the daemon
+    // drains the socket before any command that prints them, so the number is
+    // recent; what it is not is instantaneous, and the difference is invisible
+    // in every figure the CLI prints.  So it is stated.
+    //
+    // Not folded into the pushed detail text: that text is built by the worker
+    // and would then be reporting its own age at the moment it was written,
+    // which is always zero.  Age is a property of the read, not of the write.
+    long long worker_stats_age_ms() const
+    {
+        const int64_t at = m_worker_stats_ns.load(std::memory_order_relaxed);
+        if (at == 0)
+            return -1;
+        return static_cast<long long>((steady_ns() - at) / 1'000'000);
     }
 
     // True once a worker has reported at least once.  Read by the placeholder's
@@ -436,6 +461,20 @@ private:
     mutable std::mutex m_stat_detail_mutex;
     std::string m_stat_detail;
     std::atomic<bool> m_worker_backed{false};
+
+    // When the last worker push landed, on the monotonic clock, or 0 for never.
+    // Monotonic and not wall-clock: this is an interval, and a wall clock that
+    // steps — ntp, a suspend — would report a figure as hours old or as arriving
+    // from the future.  Outside m_stat_detail_mutex on purpose, so that reading
+    // the age never has to wait behind a detail-string copy.
+    std::atomic<int64_t> m_worker_stats_ns{0};
+
+    static int64_t steady_ns()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
 
     std::string m_name;
     std::string m_id;

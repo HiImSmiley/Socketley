@@ -2583,6 +2583,32 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
         if (inst)
         {
             conn->write_buf += inst->get_stats();
+
+            // Say how old these are when they were not read here.
+            //
+            // Every figure above is identical whichever side the runtime runs
+            // on — that is the property the split was built to have — and that
+            // is exactly what makes the difference invisible: an in-process
+            // runtime's counters are read at this instant, a worker's were
+            // pushed up to a quarter of a second ago and drained by the
+            // poll_proxy_workers() above.  The values agree; their age does not,
+            // and an operator comparing a proxy's byte count against a backend's
+            // has no way to know which of the two they are holding.
+            //
+            // Reported rather than removed: making it live would mean asking the
+            // child and waiting for the answer on this thread.  See
+            // runtime_instance::worker_stats_age_ms().
+            //
+            // Only for a runtime that has actually reported.  An in-process one
+            // never prints these lines, so nothing that reads `stats` today sees
+            // a new field appear.
+            if (inst->worker_backed())
+            {
+                conn->write_buf += "figures:pushed\nfigures_age_ms:";
+                conn->write_buf += std::to_string(inst->worker_stats_age_ms());
+                conn->write_buf += '\n';
+            }
+
             conn->write_buf += '\n';
         }
     }

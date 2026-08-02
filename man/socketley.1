@@ -1464,7 +1464,10 @@ callbacks. A script that reaches for other runtimes through the management
 API is refused there by name rather than answering nothing \(em and if it does
 so at its top level the script does not load and the runtime is left
 .BR failed .
-See
+The figures the daemon reports for it were pushed by the worker rather than
+read live, and
+.B stats
+says how old they are. See
 .B "Out-of-process proxies"
 under
 .BR LIMITATIONS .
@@ -4481,11 +4484,21 @@ Interactive mode
 .RB ( "start \-i" )
 is not offered for a proxy on either path.
 .PP
-The figures the daemon reports for a worker are as recent as the worker's
-last publish \(em a quarter of a second, and refreshed on demand before
+.B "A worker's figures are pushed, and stats says how old they are."
+The child publishes them every quarter\-second and the daemon drains the control
+socket before any command that prints them, so they are recent \(em but they are
+not read at the moment of the question the way an in\-process runtime's are.
+Making them live would mean the daemon asking the child and waiting for the
+answer on its event\-loop thread, which is the synchronous cross\-runtime call
+this design refuses everywhere else. So the difference is reported instead:
 .B stats
-answers. An in\-process runtime's are read live. The values agree; their
-age does not.
+prints
+.B figures:pushed
+and
+.BI figures_age_ms: n
+for such a runtime, and neither line for an in\-process one. Every other figure
+is identical on both paths \(em which is the property the split exists to have,
+and exactly what made this one invisible without a label.
 .PP
 Only the proxy can be split. The other runtimes still reach across
 runtime boundaries through pointers and cannot be moved until they route

@@ -554,6 +554,8 @@ flags_options() {
     echo "    means the script does not load and the runtime is left failed."
     echo "    socketley.log, .http, .json_*, the timers and .subscribe all work, and"
     echo "    a cache PUBLISH is delivered to the worker's subscribers."
+    echo "    'stats' adds figures:pushed and figures_age_ms:<n> for a worker - its"
+    echo "    counters are pushed every 250ms, not read at the moment you ask."
     echo "  It bounds only the wait for the FIRST response byte, never the body,"
     echo "  and the expiry is charged to the backend's circuit breaker. --sidecar"
     echo "  does not change it but does turn that breaker on, so if an endpoint"
