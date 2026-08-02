@@ -15,6 +15,10 @@
 # │ release-lto       │ compile-only smoke of the Release/LTO configuration    │
 # └───────────────────┴────────────────────────────────────────────────────────┘
 #
+# A manual dispatch can run one of those on its own — `only: load` is twelve
+# minutes against three hours for the whole workflow, which is what asking "did
+# that red job do it again" is worth.  The scheduled run ignores the input.
+#
 # ─── WHAT THE NIGHTLY DOES NOT COVER ────────────────────────────────────────
 #
 #   * multi-machine anything: clustering across hosts, real DNS, real TLS peers.
@@ -49,6 +53,27 @@ on:
         description: 'Seconds per fuzz target'
         required: false
         default: '600'
+      # One job at a time, for the case this workflow is otherwise bad at: a
+      # single job comes back red, the question is whether it does so again, and
+      # the answer costs three hours of runners because the long fuzz run is in
+      # the same workflow.  `load` alone is twelve minutes.
+      #
+      # Only ever narrows, and only on a manual dispatch: the scheduled run
+      # ignores this and runs everything, because a nightly that can be
+      # configured to skip its own jobs is a nightly nobody can read.
+      only:
+        description: 'Run one job only (a repeat observation), or all of them'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - load
+          - fuzz
+          - sanitizers
+          - invariants
+          - tsan
+          - release-lto
 
 concurrency:
   group: nightly
@@ -73,6 +98,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   sanitizers:
     name: ASan + UBSan suite
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'sanitizers' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -150,6 +179,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   fuzz:
     name: Long fuzz run
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'fuzz' }}
     runs-on: ubuntu-24.04
     # The fuzz step alone is allowed 200 minutes (see BUDGET below); the two
     # builds ahead of it take about eight.  A job ceiling under the sum of its
@@ -728,6 +761,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   invariants:
     name: Invariants (warn-only) under load
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'invariants' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -835,6 +872,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   load:
     name: Load harnesses (Release)
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'load' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -896,6 +937,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   tsan:
     name: TSan (expected quiet)
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'tsan' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -946,6 +991,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   release-lto:
     name: Release/LTO build smoke
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch'
+          || inputs.only == 'all'
+          || inputs.only == 'release-lto' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
