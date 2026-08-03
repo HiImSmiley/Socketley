@@ -371,6 +371,7 @@ std::string resolve_absolute(std::string_view path)
 state_persistence::state_persistence(const fs::path& state_dir)
     : m_state_dir(state_dir)
 {
+    m_writer = std::thread(&state_persistence::writer_loop, this);
 }
 
 fs::path state_persistence::config_path(std::string_view name) const
@@ -863,16 +864,93 @@ void state_persistence::save_runtime(const runtime_instance* instance)
 {
     if (instance->is_lua_created())
         return;
-    runtime_config cfg = read_from_instance(instance);
-    write_json(cfg);
+    // Read off the instance HERE, on the caller's thread.  The writer must not
+    // touch a runtime_instance: by the time it runs, a `create` followed by a
+    // `remove` may already have freed it.  A runtime_config is a value and
+    // survives the crossing.
+    job j;
+    j.k = job::write_cfg;
+    j.cfg = read_from_instance(instance);
+    enqueue(std::move(j));
 }
 
 void state_persistence::remove_runtime(std::string_view name)
 {
-    fs::remove(config_path(name));
+    job j;
+    j.k = job::remove_file;
+    j.name = std::string(name);
+    enqueue(std::move(j));
+}
+
+// ─── the writer ─────────────────────────────────────────────────────────────
+
+void state_persistence::enqueue(job j)
+{
+    {
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_queue.push_back(std::move(j));
+    }
+    m_cv.notify_one();
+}
+
+void state_persistence::writer_loop()
+{
+    for (;;)
+    {
+        job j;
+        {
+            std::unique_lock<std::mutex> lk(m_mx);
+            m_cv.wait(lk, [&]{ return m_stop || !m_queue.empty(); });
+            if (m_queue.empty())
+                return;                     // stopping, and nothing left owed
+            j = std::move(m_queue.front());
+            m_queue.pop_front();
+        }
+
+        switch (j.k)
+        {
+            case job::write_cfg:    write_json(j.cfg); break;
+            case job::remove_file:  { std::error_code ec;
+                                      fs::remove(config_path(j.name), ec); } break;
+            case job::flip_running: flip_was_running(j.name, j.running); break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            ++m_done;
+        }
+        m_cv.notify_all();
+    }
+}
+
+void state_persistence::drain()
+{
+    std::unique_lock<std::mutex> lk(m_mx);
+    m_cv.wait(lk, [&]{ return m_queue.empty(); });
+}
+
+state_persistence::~state_persistence()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_stop = true;
+    }
+    m_cv.notify_all();
+    if (m_writer.joinable())
+        m_writer.join();
 }
 
 void state_persistence::set_was_running(std::string_view name, bool running)
+{
+    job j;
+    j.k = job::flip_running;
+    j.name = std::string(name);
+    j.running = running;
+    enqueue(std::move(j));
+}
+
+// The old body, now on the writer thread.  Unchanged apart from the name.
+void state_persistence::flip_was_running(std::string_view name, bool running)
 {
     fs::path path = config_path(name);
 
@@ -915,6 +993,15 @@ void state_persistence::set_was_running(std::string_view name, bool running)
 
 std::vector<runtime_config> state_persistence::load_all()
 {
+    // Everything asked for before this call has to be visible to it.  The
+    // writes are on another thread now, so read-after-write on the same object
+    // would otherwise be a race — and it is not a theoretical one: a unit test
+    // that saved a runtime and loaded it back caught this immediately.
+    //
+    // Blocking here is free.  load_all() runs at startup and in tests, never on
+    // the event loop thread, which is the only place the stall mattered.
+    drain();
+
     std::vector<runtime_config> configs;
 
     std::error_code ec;

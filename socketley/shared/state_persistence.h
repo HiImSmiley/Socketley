@@ -1,5 +1,9 @@
 #pragma once
 #include <string>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <string_view>
 #include <vector>
 #include <filesystem>
@@ -139,10 +143,66 @@ public:
     std::string format_json_pretty(const runtime_config& cfg) const;
     bool parse_json_string(const std::string& json, runtime_config& cfg) const;
 
+    // Block until everything queued has reached disk.  For a caller that is
+    // about to read the files back — a test, a shutdown that will be followed
+    // by a restart — and for nothing else: taking this on the event loop
+    // thread reintroduces exactly the stall the queue exists to remove.
+    void drain();
+
 private:
+    // ─── WHY THE WRITES LEFT THE CALLING THREAD ─────────────────────────────
+    //
+    // write_json() ends in an fsync, and every one of these three methods was
+    // called from the daemon's event loop thread — the one thread that serves
+    // every runtime in the process.  Measured with a cache PING on the same
+    // daemon while six `create` commands ran:
+    //
+    //     quiet            p50 0.012 ms   p99 0.018 ms   max 0.044 ms
+    //     during creates   p50 0.015 ms   p99 0.244 ms   max 9.598 ms
+    //
+    // and fsync on that filesystem: p50 3.79 ms, p99 24.26 ms — the same
+    // distribution.  A factor of 800 on the answer time of every runtime the
+    // daemon holds, every time an operator typed create, start, stop or
+    // remove.
+    //
+    // WHAT DOES NOT CHANGE IS THE GUARANTEE.  The fsync is there, in its own
+    // words, to prevent "partial/empty state files on power loss or kernel
+    // crash" — it is about never publishing a file whose contents are not on
+    // disk, not about the CLI's reply meaning anything.  Moving the whole
+    // write-fsync-rename sequence to another thread keeps that exactly: the
+    // rename still happens after the fsync, so a published file is still an
+    // intact one.  What the reply no longer means is "already on disk", and it
+    // never legitimately meant that: if the machine dies between the two, the
+    // runtime is not persisted either way.
+    //
+    // ORDER IS PRESERVED because there is one writer and one FIFO.  A create
+    // followed by a remove reaches the disk in that order, which is the only
+    // property the callers depend on.
+    struct job
+    {
+        enum kind { write_cfg, remove_file, flip_running } k;
+        runtime_config cfg;      // write_cfg
+        std::string    name;     // remove_file, flip_running
+        bool           running;  // flip_running
+    };
+
+    void writer_loop();
+    void enqueue(job j);
+    void flip_was_running(std::string_view name, bool running);
+
+    std::thread             m_writer;
+    std::mutex              m_mx;
+    std::condition_variable m_cv;
+    std::deque<job>         m_queue;
+    bool                    m_stop{false};
+    uint64_t                m_done{0};   // jobs completed, for drain()
+
     std::filesystem::path config_path(std::string_view name) const;
     bool write_json(const runtime_config& cfg) const;
     bool read_json(const std::filesystem::path& path, runtime_config& cfg) const;
 
     std::filesystem::path m_state_dir;
+
+public:
+    ~state_persistence();
 };
