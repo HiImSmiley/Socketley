@@ -1212,7 +1212,11 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
 
         if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
                              && req->owner != nullptr, 1))
+        {
+            SKL_TIMING_HANDLER_BEGIN(req);
             req->owner->on_cqe(cqe);
+            SKL_TIMING_HANDLER_END(m_op_timing);
+        }
         else
             drop_completion(cqe, req);
 
