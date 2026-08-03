@@ -112,8 +112,8 @@ public:
         // there is still a ring for teardown() to cancel into, and only then
         // end the ring.  Reversing these two is what turned a clean shutdown
         // into a segfault the last time it was got wrong.
-        if (m_proxy && m_proxy->get_state() == runtime_running)
-            m_proxy->stop(m_loop);
+        if (m_rt && m_rt->get_state() == runtime_running)
+            m_rt->stop(m_loop);
         m_loop.shutdown_ring();
 
         return m_exit_code;
@@ -147,26 +147,26 @@ private:
     {
         std::string payload;
         payload.push_back(static_cast<char>(
-            m_proxy ? static_cast<uint8_t>(m_proxy->get_state())
+            m_rt ? static_cast<uint8_t>(m_rt->get_state())
                     : static_cast<uint8_t>(runtime_created)));
         if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
     void push_stats()
     {
-        if (!m_proxy)
+        if (!m_rt)
             return;
 
         // On the event-loop thread, which is the only thread allowed to walk
         // the proxy's connection tables.  Everything that leaves this process
         // is a copy taken here.
         worker_proto::stats_wire s;
-        s.total_connections  = m_proxy->m_stat_total_connections.load(std::memory_order_relaxed);
-        s.total_messages     = m_proxy->m_stat_total_messages.load(std::memory_order_relaxed);
-        s.bytes_in           = m_proxy->m_stat_bytes_in.load(std::memory_order_relaxed);
-        s.bytes_out          = m_proxy->m_stat_bytes_out.load(std::memory_order_relaxed);
-        s.active_connections = static_cast<uint64_t>(m_proxy->get_connection_count());
-        s.detail             = m_proxy->get_stats();
+        s.total_connections  = m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
+        s.total_messages     = m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
+        s.bytes_in           = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
+        s.bytes_out          = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
+        s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
+        s.detail             = m_rt->get_stats();
 
         // Stamped here, after the reads and before the write, because this is
         // the moment the figures describe.  The daemon cannot recover it: what
@@ -252,7 +252,7 @@ private:
         // A second config for a proxy that is already up would have to rebuild
         // it, and the daemon does not send one: a change of backends is a stop
         // and a start.  Saying so is better than half-applying it.
-        if (m_proxy)
+        if (m_rt)
         {
             LOG_WARN("proxy worker: ignoring config for an already-configured worker");
             return;
@@ -270,7 +270,7 @@ private:
         //
         // Guarded on ring_open() rather than on reaching here once: a config
         // that got as far as the ring and then failed to build a proxy leaves
-        // m_proxy null, and a second config frame must not build a second ring
+        // m_rt null, and a second config frame must not build a second ring
         // over the first.
         if (!m_loop.ring_open() && !m_loop.init())
         {
@@ -279,34 +279,39 @@ private:
             return;
         }
 
-        auto inst = create_runtime(runtime_proxy, cfg.name);
+        // The type comes from the frame the daemon sent, not from this file.
+        // Everything below is either a setter every runtime has or is guarded
+        // on the cast, so a worker is not a proxy worker any more.
+        auto inst = create_runtime(cfg.type, cfg.name);
         if (!inst)
         {
             LOG_ERROR("proxy worker: could not create proxy instance");
             return;
         }
         m_owned = std::move(inst);
-        m_proxy = static_cast<proxy_instance*>(m_owned.get());
+        m_rt    = m_owned.get();
+        m_proxy = (cfg.type == runtime_proxy)
+                    ? static_cast<proxy_instance*>(m_owned.get()) : nullptr;
 
-        m_proxy->set_event_loop(&m_loop);
-        m_proxy->set_id(cfg.id);
-        if (cfg.port > 0)               m_proxy->set_port(cfg.port);
-        if (!cfg.group.empty())         m_proxy->set_group(cfg.group);
-        if (!cfg.log_file.empty())      m_proxy->set_log_file(cfg.log_file);
-        if (!cfg.write_file.empty())    m_proxy->set_write_file(cfg.write_file);
-        if (cfg.bash_output)            m_proxy->set_bash_output(true);
-        if (cfg.bash_prefix)            m_proxy->set_bash_prefix(true);
-        if (cfg.bash_timestamp)         m_proxy->set_bash_timestamp(true);
-        if (cfg.max_connections > 0)    m_proxy->set_max_connections(cfg.max_connections);
-        if (cfg.rate_limit > 0.0)       m_proxy->set_rate_limit(cfg.rate_limit);
-        if (cfg.global_rate_limit > 0.0)m_proxy->set_global_rate_limit(cfg.global_rate_limit);
-        if (cfg.idle_timeout > 0)       m_proxy->set_idle_timeout(cfg.idle_timeout);
-        if (cfg.drain)                  m_proxy->set_drain(true);
-        if (cfg.tls)                    m_proxy->set_tls(true);
-        if (!cfg.cert_path.empty())     m_proxy->set_cert_path(cfg.cert_path);
-        if (!cfg.key_path.empty())      m_proxy->set_key_path(cfg.key_path);
-        if (!cfg.ca_path.empty())       m_proxy->set_ca_path(cfg.ca_path);
-        if (!cfg.target.empty())        m_proxy->set_target(cfg.target);
+        m_rt->set_event_loop(&m_loop);
+        m_rt->set_id(cfg.id);
+        if (cfg.port > 0)               m_rt->set_port(cfg.port);
+        if (!cfg.group.empty())         m_rt->set_group(cfg.group);
+        if (!cfg.log_file.empty())      m_rt->set_log_file(cfg.log_file);
+        if (!cfg.write_file.empty())    m_rt->set_write_file(cfg.write_file);
+        if (cfg.bash_output)            m_rt->set_bash_output(true);
+        if (cfg.bash_prefix)            m_rt->set_bash_prefix(true);
+        if (cfg.bash_timestamp)         m_rt->set_bash_timestamp(true);
+        if (cfg.max_connections > 0)    m_rt->set_max_connections(cfg.max_connections);
+        if (cfg.rate_limit > 0.0)       m_rt->set_rate_limit(cfg.rate_limit);
+        if (cfg.global_rate_limit > 0.0)m_rt->set_global_rate_limit(cfg.global_rate_limit);
+        if (cfg.idle_timeout > 0)       m_rt->set_idle_timeout(cfg.idle_timeout);
+        if (cfg.drain)                  m_rt->set_drain(true);
+        if (cfg.tls)                    m_rt->set_tls(true);
+        if (!cfg.cert_path.empty())     m_rt->set_cert_path(cfg.cert_path);
+        if (!cfg.key_path.empty())      m_rt->set_key_path(cfg.key_path);
+        if (!cfg.ca_path.empty())       m_rt->set_ca_path(cfg.ca_path);
+        if (!cfg.target.empty())        m_rt->set_target(cfg.target);
 
         // A script that does not load is a configuration this worker cannot
         // serve, not a warning to carry on past.
@@ -321,7 +326,7 @@ private:
         // Exiting is how a worker says so.  The supervisor already treats a dead
         // child as the runtime's problem; exit_config_refused tells it not to
         // fork a sixth copy of the same refusal.
-        if (!cfg.lua_script.empty() && !m_proxy->load_lua_script(cfg.lua_script))
+        if (!cfg.lua_script.empty() && !m_rt->load_lua_script(cfg.lua_script))
         {
             LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
                       "without it (the script's own error is above)");
@@ -330,14 +335,16 @@ private:
             return;
         }
 
-        apply_proxy_config(*m_proxy, cfg);
+        if (m_proxy)
+            apply_proxy_config(*m_proxy, cfg);
 
         // A table that arrived before the config is not lost: it is held and
         // applied here.  The daemon publishes on every membership change, and
         // nothing orders those against the config frame.
         if (m_pending_endpoints)
         {
-            m_proxy->set_endpoints(std::move(m_pending_endpoints));
+            // Only a proxy routes by name, so only a proxy is handed the table.
+            if (m_proxy) m_proxy->set_endpoints(std::move(m_pending_endpoints));
             m_pending_endpoints.reset();
         }
 
@@ -361,8 +368,8 @@ private:
 
         // Immutable from here, exactly as on the daemon side: a request that is
         // already resolving keeps the table it started with.
-        if (m_proxy)
-            m_proxy->set_endpoints(std::move(tbl));
+        if (m_rt)
+            if (m_proxy) m_proxy->set_endpoints(std::move(tbl));
         else
             m_pending_endpoints = std::move(tbl);
     }
@@ -378,7 +385,7 @@ private:
     // not exist when it happened.
     void on_publish(const std::string& payload)
     {
-        if (!m_proxy)
+        if (!m_rt)
             return;
 
         worker_proto::publish_wire p;
@@ -388,7 +395,7 @@ private:
             return;
         }
 
-        m_proxy->on_publish_dispatch(p.cache_name, p.channel, p.message);
+        m_rt->on_publish_dispatch(p.cache_name, p.channel, p.message);
     }
 
     void on_start()
@@ -399,24 +406,29 @@ private:
         // this in the same batch, and without the guard the worker took the port,
         // reported "proxy failed to start", and exited: a listener opened and
         // closed for a configuration it had already refused.
-        if (m_done || !m_proxy || m_proxy->get_state() == runtime_running)
+        if (m_done || !m_rt || m_rt->get_state() == runtime_running)
             return;
-        if (!m_proxy->start(m_loop))
+        if (!m_rt->start(m_loop))
             LOG_ERROR("proxy worker: proxy failed to start");
         send_state();
     }
 
     void on_stop()
     {
-        if (!m_proxy || m_proxy->get_state() != runtime_running)
+        if (!m_rt || m_rt->get_state() != runtime_running)
             return;
-        m_proxy->stop(m_loop);
+        m_rt->stop(m_loop);
         send_state();
     }
 
     int                                    m_fd;
     event_loop                             m_loop;
     std::unique_ptr<runtime_instance>       m_owned;
+    // The runtime this worker owns, and the same pointer narrowed when it
+    // happens to be a proxy.  Everything generic goes through m_rt; m_proxy is
+    // for the two things only a proxy has — its own config applier and the
+    // endpoint table it routes with.
+    runtime_instance*                      m_rt{nullptr};
     proxy_instance*                        m_proxy{nullptr};
     std::shared_ptr<const endpoint_table>  m_pending_endpoints;
     std::string                            m_in;

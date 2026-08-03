@@ -868,15 +868,15 @@ int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
     // Scanned rather than reordered: the flag takes no value, so finding it is
     // exact, and marking early is idempotent with the case below that marks it
     // again when the loop reaches it.
-    if (type == runtime_proxy)
+    // Any type, not only a proxy.  mark_out_of_process() has always been on
+    // runtime_instance; what kept this to proxies was the cast, and the worker
+    // no longer needs one — it builds whatever the config frame's type says.
+    for (size_t i = 3; i < pa.count; ++i)
     {
-        for (size_t i = 3; i < pa.count; ++i)
+        if (std::string_view(pa.args[i]) == "--out-of-process")
         {
-            if (std::string_view(pa.args[i]) == "--out-of-process")
-            {
-                static_cast<proxy_instance*>(instance)->mark_out_of_process();
-                break;
-            }
+            instance->mark_out_of_process();
+            break;
         }
     }
 
@@ -3174,7 +3174,11 @@ void daemon_handler::reconcile_proxy_workers()
         std::shared_lock lock(m_manager.mutex);
         for (const auto& [name, inst] : m_manager.list())
         {
-            if (inst->get_type() != runtime_proxy || !inst->is_out_of_process())
+            // The supervisor does not care what kind of runtime it is
+            // supervising — it forks, hands over a config frame, restarts and
+            // reads stats back, and none of that reads the type.  It held a
+            // proxy_instance* it never dereferenced until ba86f38.
+            if (!inst->is_out_of_process())
                 continue;
             if (inst->get_state() == runtime_running)
                 wanted.push_back(name);

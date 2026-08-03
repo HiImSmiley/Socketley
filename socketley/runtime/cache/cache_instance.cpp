@@ -4899,6 +4899,16 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
 std::string cache_instance::get_stats() const
 {
+    // Out-of-process: the text was built by the worker, walking a store that
+    // only the worker's thread may walk.  Returning it verbatim is what makes
+    // `stats` answer identically on both paths — rebuilding it here from this
+    // placeholder's own empty store is the wrong answer, and a confident one:
+    // it printed keys:0 and commands_processed:0 for a cache that had just
+    // served five SETs.  Same reasoning, same two lines, as
+    // proxy_instance::get_stats().
+    if (worker_backed())
+        return stat_detail_snapshot();
+
     std::string base = runtime_instance::get_stats();
     std::ostringstream out;
     out << base

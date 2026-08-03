@@ -14,6 +14,22 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
+        // Run this runtime in a worker process the daemon supervises, instead
+        // of inside the daemon.  Off by default: the in-process path is what
+        // every existing deployment is running and what the load figures were
+        // taken against.
+        //
+        // Common rather than per-type since the worker stopped being a proxy
+        // worker: it builds whatever the config frame's type names, and
+        // mark_out_of_process() has always been on runtime_instance.  It used
+        // to sit in parse_proxy_flags, which is why `create cache ...
+        // --out-of-process` answered "unknown flag" rather than doing it.
+        //
+        // Create-time only — see parse_common_edit_flags.
+        case fnv1a("--out-of-process"):
+            instance->mark_out_of_process();
+            return 0;
+
         case fnv1a("-p"):
         {
             if (i + 1 >= pa.count)
@@ -682,14 +698,6 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         }
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
-            return 0;
-        // Run this proxy in a worker process the daemon supervises, instead of
-        // inside the daemon.  Off by default: the in-process path is what every
-        // existing deployment is running and what the load figures were taken
-        // against, and this is the first step of the move rather than the end
-        // of it.  Create-time only — see parse_proxy_edit_flags.
-        case fnv1a("--out-of-process"):
-            proxy->mark_out_of_process();
             return 0;
         // ── mTLS, both directions ──
         //
