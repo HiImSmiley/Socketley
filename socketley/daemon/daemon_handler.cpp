@@ -3218,9 +3218,19 @@ void daemon_handler::reconcile_proxy_workers()
             continue;   // nothing to describe the runtime with
 
         auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
+
+        // The supervisor answers for the runtime it supervises.  Set before the
+        // spawn so that a request arriving in the same turn as the start has
+        // somewhere to go, and pointed at the placeholder so that
+        // publish_sinks() below picks it up instead of the empty local object.
+        sup->set_channel(&m_manager.requests());
+        inst->set_request_sink_override(sup.get());
+
         if (!sup->spawn(cfg))
         {
             LOG_ERROR("could not start out-of-process proxy worker");
+            // The override must not outlive the supervisor it points at.
+            inst->set_request_sink_override(nullptr);
             inst->mark_failed();
             continue;
         }

@@ -114,5 +114,34 @@ if printf '%s\n' "$ST" | grep -qE "commands_processed:[1-9]"; then ok; else
         "$(printf '%s' "$ST" | tr '\n' '|')"
 fi
 
+# ── and a server in the daemon can ask it ───────────────────────────────────
+#
+# The point of the whole arrangement.  `server --cache` posted into
+# request_channel, which could only ever reach a target in this address space;
+# now the channel parks the request, the supervisor puts it on the control
+# socket it already holds, the worker hands the payload to its own runtime
+# untouched, and the reply comes back to the origin with the cookie it posted.
+# Neither the server nor the client can tell.
+if command -v nc >/dev/null 2>&1; then
+    "$BIN" create server srv -p $((PORT + 1)) --cache oopc -s >/dev/null 2>&1
+    sleep 1.5
+    SET=$(printf 'cache set foo bar\n' | timeout 5 nc -q1 127.0.0.1 $((PORT + 1)) 2>/dev/null | head -1)
+    sleep 0.3
+    GOT=$(printf 'cache get foo\n'     | timeout 5 nc -q1 127.0.0.1 $((PORT + 1)) 2>/dev/null | head -1)
+    if [ "$GOT" = "bar" ]; then ok; else
+        bad "a server in the daemon reaches a cache in another process" \
+            "set said '$SET', get said '$GOT'"
+    fi
+
+    # And it really landed in the worker's store, not somewhere in the daemon.
+    DIRECT=$(redis-cli -p "$PORT" GET foo 2>/dev/null)
+    if [ "$DIRECT" = "bar" ]; then ok; else
+        bad "the value is in the worker's own store" "redis-cli read '$DIRECT'"
+    fi
+    "$BIN" stop srv >/dev/null 2>&1; "$BIN" remove srv >/dev/null 2>&1
+else
+    echo "  (nc absent — the cross-process cache assertions did not run)"
+fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

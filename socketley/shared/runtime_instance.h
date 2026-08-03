@@ -380,7 +380,19 @@ public:
     // manager — not the asking runtime — that puts the answer in the request
     // channel's table, on the same membership changes that republish the
     // endpoints.  See shared/request_channel.h.
-    virtual request_sink* as_request_sink() { return nullptr; }
+    // What answers requests addressed to this runtime's name.  A cache returns
+    // itself; everything else has nothing to answer with.
+    //
+    // The override is for a runtime that is not in this process.  Its
+    // placeholder here has the name and the port but an empty store, so
+    // answering from it would be confidently wrong — the same failure
+    // get_stats() had until 338341f.  The daemon sets this to the supervisor
+    // that holds the control socket to the worker, and the channel then reaches
+    // the real runtime without anything on the asking side changing.
+    virtual request_sink* as_request_sink()
+    { return m_sink_override; }
+
+    void set_request_sink_override(request_sink* s) { m_sink_override = s; }
 
     // The mesh client-certificate paths, for the one role that has them.
     //
@@ -582,6 +594,7 @@ private:
 
     // Runtime manager / event loop (base class)
     runtime_manager* m_runtime_manager = nullptr;
+    request_sink*    m_sink_override = nullptr;
     event_loop* m_event_loop = nullptr;
 
     // Tick timer

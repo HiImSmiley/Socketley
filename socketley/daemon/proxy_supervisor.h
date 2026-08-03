@@ -33,13 +33,28 @@
 #include <string>
 #include <sys/types.h>
 
+#include "../shared/request_channel.h"
+
 class proxy_instance;
 class runtime_instance;
 struct runtime_config;
 
-class proxy_supervisor
+// Also the request_sink for the runtime it supervises.  A placeholder in this
+// process has the name and the port but none of the state, so the channel is
+// pointed here instead: serve_deferred() puts the request on the control socket
+// the supervisor already holds, and the reply frame comes back to
+// complete_deferred().  Nothing on the asking side changes, which is what
+// request_channel.h promised before either half existed.
+class proxy_supervisor : public request_sink
 {
 public:
+    // Never inline: the answer is in another process and the only ways to
+    // pretend otherwise are to block this thread or to make it up.
+    bool serves_inline() const override { return false; }
+    void serve_request(std::string_view, std::string&) override {}
+    bool serve_deferred(uint64_t ticket, std::string_view payload) override;
+
+    void set_channel(request_channel* ch) { m_channel = ch; }
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -108,6 +123,7 @@ private:
     // not have to change for it.  What does is the worker's own side, where
     // create_runtime() is called with runtime_proxy hardcoded and the stats
     // frame is filled from proxy_instance members by hand.
+    request_channel*  m_channel{nullptr};
     runtime_instance* m_placeholder{nullptr};
     std::string       m_exec_path;
     std::string       m_config_json;      // kept so a restart can re-send it

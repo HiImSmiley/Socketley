@@ -12,6 +12,7 @@
 #include <signal.h>
 
 #include "proxy_instance.h"
+#include "../../shared/request_channel.h"
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
@@ -228,6 +229,7 @@ private:
             case worker_proto::frame_type::config:    on_config(payload);    break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
+            case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
@@ -388,6 +390,38 @@ private:
     // config frame has nowhere to go, and holding it the way a pending endpoint
     // table is held would be storing an event to replay at a subscriber that did
     // not exist when it happened.
+    // A request another runtime made of this one, arriving over the control
+    // socket instead of over this runtime's own port.
+    //
+    // The payload is whatever would have reached that port and is handed to the
+    // runtime untouched — nothing here parses a command, which is why this wire
+    // was chosen over the target's own protocol.  The ticket is the channel's,
+    // and it goes back with the answer so the daemon can pair them without
+    // understanding either.
+    void on_chan_req(const std::string& payload)
+    {
+        worker_proto::chan_request_wire q;
+        if (!worker_proto::decode_chan_request(payload, q))
+            return;   // a frame this build cannot read is skipped, not fatal
+
+        // request_status::no_target if there is nothing to ask.  The daemon
+        // cannot know that from its side: the placeholder exists whether or not
+        // this worker ever built its runtime.
+        uint8_t     st = 1;   // no_target
+        std::string reply;
+        if (m_rt)
+        {
+            if (auto* sink = m_rt->as_request_sink())
+            {
+                sink->serve_request(q.payload, reply);
+                st = 0;       // ok
+            }
+        }
+
+        if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::chan_rep,
+                          worker_proto::encode_chan_reply(q.ticket, st, reply)))) {}
+    }
+
     void on_publish(const std::string& payload)
     {
         if (!m_rt)

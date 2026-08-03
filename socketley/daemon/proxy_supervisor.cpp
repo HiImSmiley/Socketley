@@ -340,6 +340,18 @@ void proxy_supervisor::ingest(const std::string&)
             case worker_proto::frame_type::hello:
                 break;
 
+            case worker_proto::frame_type::chan_rep:
+            {
+                // The answer to a request this supervisor put on the wire.  The
+                // ticket is the channel's own, so nothing here has to know what
+                // was asked or what came back.
+                worker_proto::chan_reply_wire r;
+                if (m_channel && worker_proto::decode_chan_reply(payload, r))
+                    m_channel->complete_deferred(
+                        r.ticket, static_cast<request_status>(r.status), r.payload);
+                break;
+            }
+
             case worker_proto::frame_type::state:
                 // Reported for the log, not acted on: the daemon's own record
                 // of created/running/stopped is what the CLI is promised, and
@@ -460,4 +472,19 @@ bool proxy_supervisor::check_liveness()
     }
     send_start();
     return true;
+}
+
+// The request goes out on the control socket the child is already reading.  A
+// write that does not queue means the child is gone or wedged; saying so here
+// is what keeps a ticket from being parked for something that will never
+// answer — the channel then tells the origin `no_target` instead.
+bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view payload)
+{
+    if (!m_channel)
+        return false;
+    const std::string name = m_placeholder ? std::string(m_placeholder->get_name())
+                                           : std::string();
+    return write_frame(worker_proto::frame(
+        worker_proto::frame_type::chan_req,
+        worker_proto::encode_chan_request(ticket, name, payload)));
 }
