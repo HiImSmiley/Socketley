@@ -55,7 +55,22 @@ if ! command -v taskset >/dev/null 2>&1 || [ "$NPROC" -lt 4 ]; then
     echo "and the result is a statement about the scheduler." >&2
     exit 2
 fi
-DCPU=0,1; LCPU=2,3
+
+# The split follows the machine instead of being written down for one of them.
+# It used to be a hardcoded 0,1 / 2,3, which on a ten-core box would have
+# measured four cores and called it a result — the two aggregate tests are
+# exactly the ones that were unmeasurable (spread over 100%) because the load
+# generator was fighting the daemon for two cores.
+#
+# A third to the daemon, the rest to the load generator.  The daemon's event
+# loop is one thread and cannot use more than one core for itself, but it also
+# carries the SQPOLL poller when that is on and the state writer thread, and
+# leaving it room is cheaper than discovering it was boxed in.  The generator is
+# the side that scales with client count and gets the majority.
+DCORES=$(( NPROC / 3 )); [ "$DCORES" -lt 2 ] && DCORES=2
+DCPU=$(seq -s, 0 $((DCORES - 1)))
+LCPU=$(seq -s, "$DCORES" $((NPROC - 1)))
+echo "pinning: daemon on CPU $DCPU, load on CPU $LCPU (${NPROC} cores)" >&2
 
 sweep() { pkill -x socketley 2>/dev/null; sleep 0.5; }
 trap 'sweep; [ -n "${W:-}" ] && rm -rf "$W"' EXIT

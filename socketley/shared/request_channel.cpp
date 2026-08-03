@@ -166,8 +166,34 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
     return true;
 }
 
+void request_channel::complete_deferred(uint64_t ticket, request_status st,
+                                        std::string_view reply)
+{
+    auto it = m_parked.find(ticket);
+    if (it == m_parked.end())
+        return;   // answered twice, or withdrawn by drop_origin(); either is fine
+
+    const parked_request p = it->second;
+    m_parked.erase(it);
+
+    if (st == request_status::ok)
+        m_stat_served++;
+
+    // The same check the inline path makes after the sink has run, for the same
+    // reason and with more time for it to have become true: the runtime that
+    // asked may have been stopped or removed while the answer was in flight.
+    if (p.origin && origin_live(p.origin))
+        p.origin->on_request_reply(p.cookie, st, reply);
+}
+
 void request_channel::drop_origin(const request_origin* origin)
 {
+    // Parked requests first.  A ticket whose origin is gone can never be
+    // delivered, and leaving it in the table is the one way this map grows
+    // without bound.
+    for (auto it = m_parked.begin(); it != m_parked.end(); )
+        it = (it->second.origin == origin) ? m_parked.erase(it) : std::next(it);
+
     for (auto it = m_queue.begin(); it != m_queue.end(); )
     {
         if (it->origin == origin)
@@ -231,7 +257,34 @@ void request_channel::drain()
         // republishes the whole sink table underneath this iterator.
         auto  sit  = m_sinks.find(e.target);
         auto* sink = (sit == m_sinks.end()) ? nullptr : sit->second;
-        if (sink)
+        if (sink && !sink->serves_inline())
+        {
+            // The sink is on the other side of something — a socket, another
+            // process — and cannot fill `reply` before returning.  Park the
+            // request against a ticket and let it answer on its own turn.
+            // Nothing here waits, which is the entire reason this path exists.
+            if (m_parked.size() >= MAX_PARKED)
+            {
+                m_stat_deferred_refused++;
+                st = request_status::overloaded;
+            }
+            else
+            {
+                const uint64_t ticket = m_next_ticket++;
+                m_parked.emplace(ticket, parked_request{e.origin, e.cookie});
+                if (sink->serve_deferred(ticket, e.payload))
+                {
+                    m_stat_deferred++;
+                    continue;      // the reply comes from complete_deferred()
+                }
+                // It would not even take it.  Nothing is going to complete this
+                // ticket, so it must not stay parked.
+                m_parked.erase(ticket);
+                m_stat_no_target++;
+                st = request_status::no_target;
+            }
+        }
+        else if (sink)
         {
             sink->serve_request(e.payload, reply);
             st = request_status::ok;

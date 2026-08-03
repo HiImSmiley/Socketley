@@ -120,6 +120,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -168,6 +169,31 @@ class request_sink
 public:
     virtual ~request_sink() = default;
     virtual void serve_request(std::string_view payload, std::string& out) = 0;
+
+    // ─── A SINK THAT CANNOT ANSWER ON THIS THREAD ───────────────────────────
+    //
+    // serve_request() fills `out` before it returns, which a runtime in this
+    // process can always do: it reads its own memory.  One on the other side of
+    // a process boundary cannot, and the only ways to pretend otherwise are to
+    // block the event loop or to lie about the answer.  This project has
+    // already paid for the first once — an fsync on this thread stalled every
+    // runtime the daemon held for up to 9.6 ms — and will not pay for it again.
+    //
+    // So a sink may say it cannot answer inline.  The channel then parks the
+    // request against a ticket and hands it over; the sink completes it later
+    // through request_channel::complete_deferred(), on whatever turn of the
+    // loop its own transport reports.  Nothing on the ASKING side changes: the
+    // origin still gets on_request_reply() with the cookie it posted, and it
+    // cannot tell the two paths apart, which is the whole point.
+    //
+    // Default: inline, so every sink that exists today is untouched.
+    virtual bool serves_inline() const { return true; }
+
+    // Take a request this sink promised to complete later.  Returning false
+    // means it could not even accept it — the channel then answers the origin
+    // `no_target` rather than parking something nobody will ever complete.
+    virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*payload*/)
+    { return false; }
 };
 
 // What asks.  The reply lands here on a later turn of the loop, carrying the
@@ -225,6 +251,20 @@ public:
     // delivered to it again.  Must be called before the origin is destroyed.
     void drop_origin(const request_origin* origin);
 
+    // Finish a request a sink took through serve_deferred().  Delivers the
+    // reply to the origin that asked, if it is still alive — the same liveness
+    // check the inline path makes, for the same reason: the runtime that asked
+    // may have been removed in between, and a ticket is the only thing that
+    // survives being stale.
+    //
+    // An unknown ticket is ignored rather than treated as an error: a sink that
+    // answers twice, or answers after drop_origin() has withdrawn the request,
+    // is not doing anything the channel cannot absorb.
+    void complete_deferred(uint64_t ticket, request_status st,
+                           std::string_view reply);
+
+    size_t parked_count() const { return m_parked.size(); }
+
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     // Diagnostics.  Counters rather than gauges where a gauge would only ever
@@ -262,6 +302,26 @@ private:
     std::deque<entry> m_queue;
     endpoint_table::transparent_map<request_sink*> m_sinks;
 
+    // Requests handed to a sink that could not answer inline, waiting for it to
+    // call complete_deferred().
+    //
+    // Bounded, because a remote that never answers must not grow this without
+    // limit — beyond the cap a deferral is refused and the origin is told
+    // `overloaded`, which is a true statement about the channel.  What is still
+    // owed here is a DEADLINE: a sink whose peer disappears silently leaves its
+    // ticket parked until the origin goes away and drop_origin() sweeps it.
+    // That is the common case and it is covered; the uncommon one — an origin
+    // that outlives an unanswered request for ever — is not, and the channel
+    // has a loop to arm a timer on when somebody needs it.
+    static constexpr size_t MAX_PARKED = 4096;
+    struct parked_request
+    {
+        request_origin* origin{nullptr};
+        uint64_t        cookie{0};
+    };
+    std::unordered_map<uint64_t, parked_request> m_parked;
+    uint64_t m_next_ticket{1};
+
     // Origins allowed to receive a reply.  A flat vector because there is one
     // entry per runtime that asks anything of another — a handful — and the
     // check runs once per reply, not per byte.
@@ -283,4 +343,6 @@ private:
     uint64_t m_stat_served{0};
     uint64_t m_stat_no_target{0};
     uint64_t m_stat_wakeups{0};
+    uint64_t m_stat_deferred{0};
+    uint64_t m_stat_deferred_refused{0};
 };

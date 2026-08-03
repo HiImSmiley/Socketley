@@ -439,6 +439,43 @@ project "test_name_resolver"
 
 -- ─── Test: managed runtime ───
 
+project "test_request_channel"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_request_channel.cpp",
+            "socketley/shared/request_channel.cpp",
+            "socketley/shared/event_loop.cpp" }
+
+    links { "uring" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: managed runtime ───
+
 project "test_managed_runtime"
     kind "ConsoleApp"
     language "C++"
