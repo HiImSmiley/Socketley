@@ -1150,12 +1150,6 @@ bool server_instance::setup(event_loop& loop)
     m_tls.reset();
     if (get_tls())
     {
-        if (m_udp)
-        {
-            LOG_ERROR("server: --tls on a UDP listener would need DTLS, which is not "
-                      "implemented -- refusing to bind in cleartext");
-            return false;
-        }
         if (!m_upstream_targets.empty())
         {
             LOG_ERROR("server: --tls encrypts this server's own listener, and nothing "
@@ -1244,8 +1238,8 @@ bool server_instance::setup(event_loop& loop)
     // TCP mode
     //
     // SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
-    // daemon forks a proxy worker for every runtime created with
-    // --out-of-process.  Without the flag every such worker inherits this port
+    // daemon forks a worker for every runtime that does not ask for
+    // --daemon-process.  Without the flag every such worker inherits this port
     // — measured, as fd 6 of a worker whose own port was a different one — and
     // holds it after this runtime is stopped and after the daemon exits.  The
     // shutdown() in teardown() unhashes the socket for every dup at once and so

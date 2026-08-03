@@ -182,7 +182,8 @@ sleep 0.2
 # that script writes — so a refusal used to be reported as "the callback never
 # fired", which is the defect this file exists to catch.
 create_ok "server on nodeA created with the cluster script" \
-    nodeA create server "$RT_A" -p "$PORT_A" -g api --lua "$LUA_SCRIPT" -s
+    nodeA create server "$RT_A" -p "$PORT_A" -g api --lua "$LUA_SCRIPT" \
+        --daemon-process -s
 sleep 1
 
 # ─── Test 1: on_start sees at least the local daemon ────────────────────────

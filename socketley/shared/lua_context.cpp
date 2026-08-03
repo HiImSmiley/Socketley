@@ -1261,12 +1261,11 @@ namespace
 std::string worker_refusal(const char* call)
 {
     return std::string("socketley.") + call +
-           "() is refused in an out-of-process proxy worker: the worker is a "
-           "separate process and holds no runtime manager, so there is no "
-           "inventory here for this call to act on — it would answer nothing "
-           "and look exactly like a daemon with nothing in it. Run this proxy "
-           "without --out-of-process, or move the call to a runtime that lives "
-           "in the daemon.";
+           "() is refused in a worker process: this call reaches for the "
+           "runtime map, which lives in the daemon, and answering from here "
+           "would return nothing — indistinguishable from a successful call on "
+           "a daemon with nothing in it. Create this runtime with "
+           "--daemon-process, or move the call to one that has it.";
 }
 
 }  // namespace

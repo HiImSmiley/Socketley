@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
-# A proxy created with --out-of-process runs in its own process.  That process
+# A proxy created with runs in its own process.  That process
 # holds one runtime and no map of runtimes, so socketley.create, .start, .stop,
 # .remove, .send, .list, .get, .pipe and the whole socketley.cluster table have
 # nothing to act on.  They used to return a false, a nil or an empty table —
@@ -131,10 +131,11 @@ state() {
 
 create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "in-process callback proxy created" "$BIN" create proxy cb_in \
-    -p "$CB_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$CB_LUA" -s
+    -p "$CB_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$CB_LUA" \
+    --daemon-process -s
 create_ok "out-of-process callback proxy created" "$BIN" create proxy cb_oop \
     -p "$CB_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$CB_LUA" \
-    --out-of-process -s
+    -s
 
 for _ in $(seq 1 60); do
     [ "$(body cb_oop "$CB_OOP_PORT" /ok)" = "alive" ] && break
@@ -172,30 +173,31 @@ if [ "$MGMT_OOP_CODE" = "500" ]; then pass; else
 fi
 
 # ── Assertion 2: and the refusal says what and why ──────────────────────────
-if grep -q 'socketley\.list() is refused in an out-of-process proxy worker' \
+if grep -q 'socketley\.list() is refused in a worker process' \
         "$SOCKETLEY_DLOG" 2>/dev/null; then
     pass
 else
     fail "the refusal names the call and the reason" \
          "no such line in the daemon log" \
-         "wanted: socketley.list() is refused in an out-of-process proxy worker: ..." \
+         "wanted: socketley.list() is refused in a worker process: ..." \
          "last lines: $(tail -3 "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"
 fi
-if grep -q 'refused in an out-of-process proxy worker.*--out-of-process' \
+if grep -q 'refused in a worker process.*--daemon-process' \
         "$SOCKETLEY_DLOG" 2>/dev/null; then
     pass
 else
     fail "the refusal names the way out" \
-         "the message does not mention --out-of-process, so an operator reading it" \
-         "is not told which flag produced the restriction"
+         "the message does not mention --daemon-process, so an operator" \
+         "reading it is not told how to get the call back"
 fi
 
 # ── Assertion 3: a top-level refusal fails the runtime ──────────────────────
 create_ok "in-process top-level proxy created" "$BIN" create proxy top_in \
-    -p "$TOP_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" -s
+    -p "$TOP_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
+    --daemon-process -s
 create_ok "out-of-process top-level proxy created" "$BIN" create proxy top_oop \
     -p "$TOP_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
-    --out-of-process -s
+    -s
 
 # The supervisor reaps the child on the health timer, so this takes a few
 # seconds; poll for the verdict rather than sleeping a guess at it.

@@ -7,7 +7,7 @@
 # answer this question at all, and it is worth saying why before the file goes
 # on to do something more awkward.
 #
-# A proxy created with --out-of-process exists twice: as the worker process that
+# A proxy created with exists twice: as the worker process that
 # owns the listening socket, and as a placeholder inside the daemon that holds
 # its name, port and state.  The placeholder loads the same Lua script.  So the
 # script's `socketley.subscribe` call is registered in BOTH interpreters, and
@@ -128,9 +128,9 @@ probe() {
 create_ok "backend created"  "$BIN" create server backend  -p "$BE_PORT" -s
 create_ok "cache created"    "$BIN" create cache  cachepub -p "$CACHE_PORT" -s
 create_ok "in-process proxy created" "$BIN" create proxy px_in -p "$PX_IN_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA_IN" -s
+    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA_IN" --daemon-process -s
 create_ok "out-of-process proxy created" "$BIN" create proxy px_oop -p "$PX_OOP_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA_OOP" --out-of-process -s
+    --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA_OOP" -s
 
 # The worker is forked by `create --start`; wait for it to bind rather than
 # guessing at how long that takes.

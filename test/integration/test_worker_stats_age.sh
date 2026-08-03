@@ -88,24 +88,33 @@ field() {
 # satisfy; the parent test pins it to this test's own daemon, so a worker
 # belonging to another run on this machine cannot be picked up — or signalled.
 worker_pid() {
-    local dpids d p ppid
+    local dpids p ppid
+    # The runtime's own worker, named by the runtime.
+    #
+    # This used to walk /proc for the first child of this daemon whose exe is
+    # $BIN, which was exact while a worker was the unusual case.  It stopped
+    # being exact when a worker became the ordinary one: `backend` is created
+    # first and is a worker too, so the walk found it, the test suspended the
+    # backend, and px_oop went on publishing — its age stayed at 228 ms for a
+    # 1500 ms stop, which reads as "the age does not grow" and is really "the
+    # wrong process was stopped".
+    #
+    # `stats` prints pid: for a runtime with a process of its own, so the answer
+    # is available by name.  Still checked against this daemon's children, which
+    # is what keeps a stale pid from another test's daemon out.
+    p=$(field "$1" pid)
+    [ -n "$p" ] || return 0
+    [ "/proc/$p/exe" -ef "$BIN" ] || return 0
     dpids=$(daemon_pids "$SOCKETLEY_SOCKET")
-    [ -n "$dpids" ] || return 0
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
-        [ "/proc/$p/exe" -ef "$BIN" ] || continue
-        ppid=$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null) || continue
-        case " $dpids " in *" $ppid "*) ;; *) continue ;; esac
-        printf '%s' "$p"
-        return 0
-    done
+    ppid=$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null) || return 0
+    case " $dpids " in *" $ppid "*) printf '%s' "$p" ;; esac
 }
 
 create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "in-process proxy created" "$BIN" create proxy px_in -p "$PX_IN_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http -s
+    --backend "127.0.0.1:$BE_PORT" --protocol http --daemon-process -s
 create_ok "out-of-process proxy created" "$BIN" create proxy px_oop -p "$PX_OOP_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http --out-of-process -s
+    --backend "127.0.0.1:$BE_PORT" --protocol http -s
 
 # Wait for the first push: before one has arrived the placeholder has nothing to
 # be the age of, and that is a different thing from a stale one.
@@ -141,7 +150,7 @@ if [ -z "$IN_KIND" ] && [ -z "$IN_AGE" ]; then pass; else
 fi
 
 # ── The number is a measurement, not a constant ─────────────────────────────
-WORKER_PID=$(worker_pid)
+WORKER_PID=$(worker_pid px_oop)
 if [ -n "$WORKER_PID" ]; then pass; else
     fail "setup: the worker process was found" \
          "no child of this daemon has $BIN as its exe" \

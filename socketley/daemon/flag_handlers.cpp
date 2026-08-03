@@ -14,20 +14,26 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
-        // Run this runtime in a worker process the daemon supervises, instead
-        // of inside the daemon.  Off by default: the in-process path is what
-        // every existing deployment is running and what the load figures were
-        // taken against.
+        // Run this runtime inside the daemon rather than in a process of its
+        // own.  The only flag for where a runtime runs, and it names the
+        // non-default state — a runtime with no such flag gets its own worker
+        // process.
         //
-        // Common rather than per-type since the worker stopped being a proxy
-        // worker: it builds whatever the config frame's type names, and
-        // mark_out_of_process() has always been on runtime_instance.  It used
-        // to sit in parse_proxy_flags, which is why `create cache ...
-        // --out-of-process` answered "unknown flag" rather than doing it.
+        // There were two for a while, `--out-of-process` and `--in-daemon`, one
+        // per side of a boolean.  Two names for one bit means the pair has to be
+        // kept level in the create parser, the edit parser, the precedence rule
+        // and the documentation, and this file has already shown what happens
+        // when it is not: `--out-of-process` reached the common create parser
+        // while its edit refusal stayed behind in parse_proxy_flags, so
+        // `edit proxy x` answered a refusal and `edit server x` answered
+        // "unknown flag" for the same request against the same field.
         //
         // Create-time only — see parse_common_edit_flags.
-        case fnv1a("--out-of-process"):
-            instance->mark_out_of_process();
+        //
+        // Taken here so it is not an unknown flag, and acted on nowhere but the
+        // pre-scan in daemon_handler, which is the only place that sees the
+        // whole command line before --lua is executed.
+        case fnv1a("--daemon-process"):
             return 0;
 
         case fnv1a("-p"):
@@ -847,8 +853,12 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         // was a proxy-only flag: `edit server x --out-of-process` answered
         // "unknown flag" and `edit proxy x --out-of-process` answered the
         // refusal, for the same request against the same field.
-        case fnv1a("--out-of-process"):
-            std::cout << "--out-of-process can only be set when the runtime is created\n";
+        // Refused rather than ignored.  Honouring it would mean moving a
+        // configured runtime from one address space to another underneath
+        // whatever is already pointing at it, and quietly dropping it would
+        // leave the operator believing a runtime is isolated when it is not.
+        case fnv1a("--daemon-process"):
+            std::cout << "where a runtime runs can only be set when it is created\n";
             return 1;
 
         case fnv1a("-p"):

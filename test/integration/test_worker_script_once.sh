@@ -3,7 +3,7 @@
 #
 # ─── WHAT A "PLACEHOLDER" IS FOR, AND WHAT IT IS NOT FOR ────────────────────
 #
-# A proxy created with --out-of-process exists twice: as the worker process that
+# A proxy created with exists twice: as the worker process that
 # owns the listening socket and serves every byte, and as a placeholder inside
 # the daemon that holds its name, port, group and state so that `ls`, `stats`
 # and the endpoint table have something to answer with.
@@ -83,7 +83,7 @@ sleep 0.3
 : > "$MARK"
 create_ok "out-of-process proxy created" \
     "$BIN" create proxy oop -p $((PROXY_PORT+1)) --backend "127.0.0.1:$BE_PORT" \
-    --lua "$SOCKETLEY_TMPD/s.lua" --out-of-process -s
+    --lua "$SOCKETLEY_TMPD/s.lua" -s
 sleep 2
 
 OOP_RUNS=$(wc -l < "$MARK")
@@ -118,7 +118,7 @@ cat > "$SOCKETLEY_TMPD/broken.lua" <<'EOF'
 this is not lua (
 EOF
 OUT=$("$BIN" create proxy broken -p $((PROXY_PORT+2)) --backend "127.0.0.1:$BE_PORT" \
-      --lua "$SOCKETLEY_TMPD/broken.lua" --out-of-process -s 2>&1) || true
+      --lua "$SOCKETLEY_TMPD/broken.lua" -s 2>&1) || true
 case "$OUT" in
     *"Lua"*|*"lua"*) ok ;;
     *) bad "a script that cannot compile is refused at create" "said: '$OUT'" ;;

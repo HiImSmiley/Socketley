@@ -80,6 +80,7 @@ enum tls_conn_state : uint8_t {
 // anywhere else is a rule the restore path can walk around.
 std::string tls_config_refusal(runtime_type type,
                                bool tls,
+                               bool udp,
                                std::string_view cert_path,
                                std::string_view key_path,
                                std::string_view ca_path,

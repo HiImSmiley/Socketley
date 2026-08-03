@@ -178,7 +178,7 @@ private:
     void check_managed_health();
 
     // ── Out-of-process proxies ──────────────────────────────────────────────
-    // One supervisor per proxy created with --out-of-process, keyed by runtime
+    // One supervisor per runtime that runs in a worker, keyed by runtime
     // name.  Owned here rather than by the instance because the supervisor
     // outlives a stop: `stop` takes the child down but the runtime stays in the
     // map, and `start` must bring a new one up against the same record.
@@ -222,4 +222,13 @@ private:
     // subscribe callbacks fire in the process that is serving its traffic.
     void publish_to_workers(std::string_view cache_name, std::string_view channel,
                             std::string_view message);
+
+    // A publish that came UP from a worker's cache, fanned out to everything
+    // this daemon can reach — its own runtimes and every OTHER worker.  The
+    // sender is excluded: it has already delivered to its own runtime.
+    void on_worker_publish(proxy_supervisor* from, std::string_view cache_name,
+                           std::string_view channel, std::string_view message);
+
+    // Set only while a worker's publish is being fanned out; see above.
+    proxy_supervisor* m_publish_origin{nullptr};
 };

@@ -9,7 +9,7 @@
 # nothing was logged: the client sent `cache get k` and waited until its socket
 # timed out.
 #
-# What runs here is the arrangement the daemon becomes once --out-of-process is
+# What runs here is the arrangement the daemon becomes once is
 # the default, where *every* runtime is on the far side of a socket from every
 # other one and the daemon is the only process holding the map.
 set -uo pipefail
@@ -56,8 +56,8 @@ ask() {            # port, command -> the first line of the answer
 #
 # Both in the daemon.  If this stops working the rest of the file is measuring
 # something other than the process boundary.
-"$BIN" create cache  cdaemon -p 29901 --resp -s          >/dev/null 2>&1
-"$BIN" create server sin     -p 29902 --cache cdaemon -s >/dev/null 2>&1
+"$BIN" create cache  cdaemon -p 29901 --resp --daemon-process -s          >/dev/null 2>&1
+"$BIN" create server sin     -p 29902 --cache cdaemon --daemon-process -s >/dev/null 2>&1
 sleep 1.5
 
 if [ "$(ask 29902 'cache set ctl 1')" = "ok" ] && [ "$(ask 29902 'cache get ctl')" = "1" ]; then
@@ -68,7 +68,7 @@ else
 fi
 
 # ── out of the daemon, asking into it ───────────────────────────────────────
-"$BIN" create server swrk -p 29903 --cache cdaemon --out-of-process -s >/dev/null 2>&1
+"$BIN" create server swrk -p 29903 --cache cdaemon -s >/dev/null 2>&1
 sleep 2.5
 
 SPID=$(ss -ltnp 2>/dev/null | awk '$4 ~ /:29903/' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
@@ -98,9 +98,9 @@ fi
 # Neither runtime is in the daemon now.  The request crosses the boundary twice
 # in each direction: worker -> daemon -> worker for the question, and back for
 # the answer, paired by two ticket namespaces that never meet.
-"$BIN" create cache  cwrk -p 29904 --resp      --out-of-process -s >/dev/null 2>&1
+"$BIN" create cache  cwrk -p 29904 --resp      -s >/dev/null 2>&1
 sleep 1.5
-"$BIN" create server snone -p 29905 --cache cwrk --out-of-process -s >/dev/null 2>&1
+"$BIN" create server snone -p 29905 --cache cwrk -s >/dev/null 2>&1
 sleep 2.5
 
 CPID=$(ss -ltnp 2>/dev/null | awk '$4 ~ /:29904/' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
@@ -131,8 +131,8 @@ fi
 # it — `nc -q1` quits a second after its stdin ends whether or not an answer
 # arrived, so a hung request and a refused one take the same wall time.  The
 # content is what tells them apart: silence was the old behaviour.
-"$BIN" create server sbadin  -p 29906 --cache nosuchcache                  -s >/dev/null 2>&1
-"$BIN" create server sbadout -p 29907 --cache nosuchcache --out-of-process -s >/dev/null 2>&1
+"$BIN" create server sbadin  -p 29906 --cache nosuchcache --daemon-process      -s >/dev/null 2>&1
+"$BIN" create server sbadout -p 29907 --cache nosuchcache -s >/dev/null 2>&1
 sleep 2.5
 
 MISS_IN=$(ask 29906 'cache get k')

@@ -9,19 +9,13 @@
 # against forty-six case branches across four parsers, so a flag could be moved,
 # renamed or forgotten in the edit half and no test would notice.
 #
-# It did happen. --out-of-process moved to the common CREATE parser so a cache
-# or a server could take it; its refusal stayed behind in parse_proxy_edit_flags.
-# For a whole release `edit proxy x --out-of-process` answered
-#
-#     --out-of-process can only be set when the proxy is created
-#
-# and `edit server x --out-of-process` answered
-#
-#     unknown flag: --out-of-process
-#
-# for the same request against the same field. Nothing was wrong with either
-# message. What was wrong was that they differed, and no fixture in this
-# directory was ever going to say so.
+# It did happen. The flag that decides where a runtime runs moved to the common
+# CREATE parser so a cache or a server could take it, and its refusal stayed
+# behind in parse_proxy_edit_flags. For a whole release, editing that field on a
+# proxy answered a refusal naming it, and editing the same field on a server
+# answered "unknown flag". Nothing was wrong with either message. What was wrong
+# was that they differed, and no fixture in this directory was ever going to say
+# so.
 #
 # ─── WHAT IT ASSERTS, AND WHAT IT DELIBERATELY DOES NOT ─────────────────────
 #

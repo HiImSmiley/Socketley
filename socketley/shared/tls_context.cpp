@@ -35,6 +35,7 @@ std::string tls_not_implemented_error(std::string_view option)
 
 std::string tls_config_refusal(runtime_type type,
                                bool tls,
+                               bool udp,
                                std::string_view cert_path,
                                std::string_view key_path,
                                std::string_view ca_path,
@@ -48,6 +49,24 @@ std::string tls_config_refusal(runtime_type type,
                                 !mesh_client_cert.empty() || !mesh_client_key.empty();
     if (!anything_asked)
         return {};   // no TLS asked for, nothing to refuse
+
+    // A datagram socket has no handshake to put TLS on; that would be DTLS, and
+    // there is none here.
+    //
+    // The rule lived in server_instance::setup() and client_instance::setup(),
+    // written out twice, and a placeholder for a runtime in a worker never runs
+    // either — start() returns as soon as the child is forked, because binding
+    // and dialling happen over there.  So `create client x --udp --tls -s` was
+    // refused and unwound in the daemon and accepted out of process, where the
+    // worker discovered it a moment later and the runtime was left `failed`
+    // instead of never existing.  Two answers to one impossible configuration,
+    // decided by where it was going to run.
+    //
+    // It is a question about two flags. It needs no socket, so it belongs with
+    // the other questions about flags, and it is asked once.
+    if (tls && udp)
+        return "--tls on a UDP socket would need DTLS, which is not implemented\n"
+               "  drop --udp to dial over TLS, or drop --tls to send datagrams\n";
 
     if (!tls_role_has_handshake(type))
     {

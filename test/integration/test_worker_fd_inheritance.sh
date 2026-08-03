@@ -3,7 +3,7 @@
 # no others.
 #
 # The daemon forks and execs itself for every proxy created with
-# --out-of-process.  Four descriptors are meant to cross that exec — /dev/null
+#.  Four descriptors are meant to cross that exec — /dev/null
 # on stdin, the daemon's stdout and stderr so a worker's log lines land where
 # the operator is already looking, and the control socket on fd 3.  Everything
 # else the daemon holds was inheritable as well, because SOCK_CLOEXEC was set at
@@ -140,7 +140,7 @@ ready_tcp 127.0.0.1 "$SRV_PORT" 15 || fail "setup" "the unrelated server never l
 
 create_ok "out-of-process proxy created" \
     "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" --backend "127.0.0.1:$BE_PORT" \
-    --protocol http --out-of-process -s
+    --protocol http -s
 
 # The worker, found by executable identity rather than by name: agents copy the
 # binary into their worktrees under other names, and lib_daemon.sh documents at

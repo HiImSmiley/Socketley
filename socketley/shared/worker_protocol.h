@@ -79,10 +79,24 @@ enum class frame_type : uint16_t
     shutdown  = 20,  // payload: empty
     publish   = 21,  // payload: see encode_publish
     chan_req  = 22,  // payload: see encode_chan_request
+    deliver   = 23,  // payload: raw message bytes; see below
 
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply
 };
+
+// ── deliver: `socketley send <name> <message>` for a runtime in a worker ────
+//
+// The message a server broadcasts to its connections, or a client writes to its
+// peer.  It needs no encoder: the payload IS the message, and the frame header
+// already carries the length, so nothing has to be escaped, quoted or parsed.
+//
+// It exists because `send` acts on connections, and the connections are in the
+// worker.  cmd_send() reached the placeholder — which has the name, the port and
+// the state but not one connection — called lua_broadcast() on it and returned
+// 0.  The CLI said nothing, the exit status said success, and the message went
+// nowhere.  A `send` that reports success and delivers nothing is the shape of
+// wrong this tree is least willing to ship.
 
 // ── What a worker's exit status means ───────────────────────────────────────
 //

@@ -495,12 +495,6 @@ bool client_instance::setup(event_loop& loop)
     m_tls.reset();
     if (get_tls())
     {
-        if (m_udp)
-        {
-            LOG_ERROR("client: --tls on a UDP socket would need DTLS, which is not "
-                      "implemented -- refusing to dial in cleartext");
-            return false;
-        }
         auto ctx = std::make_unique<tls_context>();
         // --ca is this client's trust store; without one the system store is
         // used.  Either way the chain is verified and the peer's name is

@@ -39,6 +39,7 @@
 // So the fd is armed for readability and the loop wakes on the answer.  The
 // timer still drains, as the backstop for a poll that could not be submitted.
 #include <chrono>
+#include <functional>
 #include <string>
 #include <sys/types.h>
 
@@ -97,6 +98,18 @@ public:
                           std::string_view reply) override;
 
     void set_channel(request_channel* ch) { m_channel = ch; }
+
+    // What to do with a publish coming UP from the child.  A cache in a worker
+    // reaches its subscribers only through here: the daemon holds every other
+    // runtime and every other worker's socket, so it is the only process that
+    // can fan one out.  The supervisor passes itself so the daemon can leave
+    // this child out of that fan-out — it has already delivered to its own
+    // runtime, and a second copy would run every subscriber in it twice.
+    using publish_handler = std::function<void(proxy_supervisor* from,
+                                               std::string_view cache_name,
+                                               std::string_view channel,
+                                               std::string_view message)>;
+    void set_publish_handler(publish_handler h) { m_on_publish = std::move(h); }
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -124,6 +137,12 @@ public:
     // removed or renamed, or when the cluster's view moves.
     void send_endpoints(const std::string& encoded_payload);
 
+    // `socketley send <name> <message>`, on its way to the runtime that has the
+    // connections.  Best-effort like every other frame going down: a false is a
+    // child that is not reading, and cmd_send reports it rather than returning
+    // the 0 it used to return for a message nobody received.
+    bool send_deliver(std::string_view message);
+
     // One published message, on its way to the child's subscribe callbacks.
     //
     // Not kept the way the endpoint table is: a table is a state a new child has
@@ -140,6 +159,12 @@ public:
     // found dead — the caller uses that to decide whether to persist a state
     // change.
     bool check_liveness();
+
+    // True once for each time the child reported a state this side had to
+    // adopt.  Same shape as check_liveness(): the supervisor decides, the
+    // caller persists, so the state file and the runtime map cannot disagree
+    // about a runtime that failed in another process.
+    bool take_state_change() { const bool c = m_state_changed; m_state_changed = false; return c; }
 
     bool  is_alive() const { return m_pid > 0; }
     pid_t pid()      const { return m_pid; }
@@ -213,6 +238,10 @@ private:
     io_request   m_poll_req{};
     unsigned     m_poll_mask{0};
     bool         m_poll_armed{false};
+
+    publish_handler m_on_publish;
+
+    bool         m_state_changed{false};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

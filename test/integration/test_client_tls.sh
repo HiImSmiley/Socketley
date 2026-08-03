@@ -384,19 +384,28 @@ if [ $CREATE_RC -ne 0 ] && ! printf '%s\n' "$LISTED" | grep -q "tudp"; then ok; 
         "a UDP client came up under a TLS configuration and is sending datagrams in the clear"
 fi
 
-# Started in two steps the runtime survives the refusal, and `failed` is where
-# it has to stay: created is a runtime nobody has tried to start yet, and
-# running is the outcome this whole section exists to prevent.  This is the arm
-# the old assertion was written for and never reached.
+# And without -s the create itself is refused, so nothing is left behind at all.
+#
+# This assertion used to be the other way round: create, then start, then look
+# for the runtime sitting in `failed`.  That was the behaviour while the pair
+# was caught in client_instance::setup(), which a placeholder for a runtime in
+# a worker never runs — so the same command was refused in the daemon and
+# accepted out of it.  The rule is a question about two flags and needs no
+# socket to answer, so it moved to tls_config_refusal, where every other
+# impossible TLS combination is answered, and it is now refused at create like
+# its siblings above.
+#
+# The property that assertion also covered — a runtime whose start fails stays
+# visible and `failed` — is not lost: test_ps_failed_visible.sh holds it down,
+# with a port conflict, which is a trigger nothing can decide in advance.
 "$BIN" create client tudp2 -t "127.0.0.1:$PEER" --udp --tls >/dev/null 2>&1
-"$BIN" start tudp2 >/dev/null 2>&1
-START_RC=$?
-sleep 0.5
-if [ $START_RC -ne 0 ] \
-   && "$BIN" ps -a 2>/dev/null | awk '$2 == "tudp2" && /Failed/ { f=1 } END { exit !f }'; then
+CREATE2_RC=$?
+sleep 0.3
+if [ $CREATE2_RC -ne 0 ] \
+   && ! "$BIN" ps -a 2>/dev/null | grep -q "tudp2"; then
     ok
 else
-    bad "a UDP client that was refused TLS stays visible and failed" \
+    bad "--tls on a UDP client is refused at create, leaving nothing behind" \
         "$("$BIN" ps -a 2>/dev/null | tr '\n' '|')"
 fi
 

@@ -385,6 +385,12 @@ bool proxy_supervisor::write_frame(const std::string& framed)
     return true;
 }
 
+bool proxy_supervisor::send_deliver(std::string_view message)
+{
+    return write_frame(worker_proto::frame(worker_proto::frame_type::deliver,
+                                           std::string(message)));
+}
+
 void proxy_supervisor::send_start()
 {
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::start, {}))) {}
@@ -496,6 +502,18 @@ void proxy_supervisor::ingest(const std::string&)
             case worker_proto::frame_type::hello:
                 break;
 
+            case worker_proto::frame_type::publish:
+            {
+                // The same frame this supervisor writes downward, arriving from
+                // the other end.  A cache serving PUBLISH in a worker has no
+                // other way to reach a subscriber: every other runtime and every
+                // other worker's socket is held by the daemon.
+                worker_proto::publish_wire p;
+                if (m_on_publish && worker_proto::decode_publish(payload, p))
+                    m_on_publish(this, p.cache_name, p.channel, p.message);
+                break;
+            }
+
             case worker_proto::frame_type::chan_rep:
             {
                 // The answer to a request this supervisor put on the wire.  The
@@ -514,10 +532,39 @@ void proxy_supervisor::ingest(const std::string&)
                 break;
 
             case worker_proto::frame_type::state:
-                // Reported for the log, not acted on: the daemon's own record
-                // of created/running/stopped is what the CLI is promised, and
-                // it is set by the command that caused the transition.  Letting
-                // the child move it would mean two writers for one value.
+                // created / running / stopped are still not acted on, and for
+                // the reason that was always given: the daemon's own record is
+                // what the CLI is promised, it is set by the command that
+                // caused the transition, and letting the child move it too
+                // would mean two writers for one value.
+                //
+                // `failed` is not one of those.  No command causes it and the
+                // daemon cannot observe it: start() on an out-of-process
+                // runtime stores `running` the moment the child is forked,
+                // because that is all this side knows — the port is bound in
+                // the worker, the TLS pair is checked in the worker, the script
+                // runs in the worker.  When any of that refuses, the child
+                // stays alive holding a runtime that will never serve, so
+                // check_liveness() never fires either.
+                //
+                // What that looked like, with a client whose TLS configuration
+                // cannot work:
+                //
+                //     in the daemon    ls: Failed   json: "status":"failed"
+                //     in a worker      ls: Up       json: "status":"running"
+                //
+                // A wrong answer rather than a missing one, to `ls`, to `ps -a`
+                // and to every script reading the JSON.
+                if (!payload.empty() &&
+                    static_cast<runtime_state>(static_cast<uint8_t>(payload[0]))
+                        == runtime_failed &&
+                    m_placeholder &&
+                    m_placeholder->get_state() != runtime_failed)
+                {
+                    LOG_ERROR("worker reported its runtime failed to start");
+                    m_placeholder->mark_failed();
+                    m_state_changed = true;   // collected by check_managed_health
+                }
                 break;
 
             default:

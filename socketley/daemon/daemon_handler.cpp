@@ -59,7 +59,7 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
     inst->get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
 
     return tls_config_refusal(inst->get_type(),
-                              inst->get_tls(), inst->get_cert_path(),
+                              inst->get_tls(), inst->is_udp(), inst->get_cert_path(),
                               inst->get_key_path(), inst->get_ca_path(),
                               mesh_ca, mesh_cert, mesh_key,
                               inst->get_replication_target());
@@ -219,8 +219,8 @@ bool daemon_handler::setup()
     unlink(socket_path.c_str());
 
     // SOCK_CLOEXEC: this is the socket every CLI command arrives on, and the
-    // daemon forks and execs a proxy worker for every runtime created with
-    // --out-of-process.  Without the flag the worker inherits it — measured, as
+    // daemon forks and execs a worker for every runtime that does not ask for
+    // --daemon-process.  Without the flag the worker inherits it — measured, as
     // fd 5 of a live worker, an SO_ACCEPTCON row on the daemon's own path — and
     // then answers the question "is a daemon serving this socket" in the
     // affirmative for as long as it lives.  The test suite asks exactly that
@@ -870,9 +870,9 @@ int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
     // whether this runtime will live in a worker: an out-of-process placeholder
     // compiles the script and discards it, an in-process runtime loads and runs
     // it (see runtime_instance::load_lua_script).  Flags arrive in whatever
-    // order the operator typed them, so `--lua x --out-of-process` would
-    // otherwise have executed the script in the daemon before anyone knew it
-    // belonged to a worker -- and `--out-of-process --lua x` would not.  A
+    // order the operator typed them, so `--lua x --daemon-process` would
+    // otherwise have compiled-and-discarded the script before anyone knew it
+    // was staying in the daemon -- and `--daemon-process --lua x` would not.  A
     // create whose behaviour depends on argument order is a bug waiting for
     // someone to reorder a command line.
     //
@@ -882,14 +882,27 @@ int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
     // Any type, not only a proxy.  mark_out_of_process() has always been on
     // runtime_instance; what kept this to proxies was the cast, and the worker
     // no longer needs one — it builds whatever the config frame's type says.
+    // Where this runtime runs.  A process of its own unless it says otherwise.
+    //
+    // One flag, naming the one state that is not the default.  A boolean needs
+    // one name, not two: `--out-of-process` and `--in-daemon` were one bit under
+    // two spellings, and the pair had to be kept level in four places.
+    //
+    // A runtime in a process of its own cannot take the daemon down with it,
+    // cannot stall another runtime's event loop, and is scheduled by the kernel
+    // rather than by whatever else that loop was doing. What --daemon-process
+    // buys back is what only shared memory can give: the cross-runtime Lua
+    // management API, a routes declaration the placeholder can publish, and
+    // about 50 µs per cross-runtime request.
+    //
+    // What this default costs where it is not yet free is written down in
+    // test/out_of_process_gaps.md, measured rather than guessed.
+    bool want_worker = true;
     for (size_t i = 3; i < pa.count; ++i)
-    {
-        if (std::string_view(pa.args[i]) == "--out-of-process")
-        {
-            instance->mark_out_of_process();
-            break;
-        }
-    }
+        if (std::string_view(pa.args[i]) == "--daemon-process")
+            want_worker = false;
+    if (want_worker)
+        instance->mark_out_of_process();
 
     for (size_t i = 3; i < pa.count; ++i)
     {
@@ -1023,7 +1036,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     // for neither — so there is nothing for typed input to mean.  Offering it
     // would mean inventing a semantics rather than exposing one.  This is the
     // same on both paths: a worker's proxy has no more of a stream than the
-    // daemon's does, so nothing here is about --out-of-process.
+    // daemon's does, so nothing here is about where the runtime runs.
     if (want_interactive)
     {
         if (auto* first = m_manager.get(names.front());
@@ -1077,7 +1090,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Any proxy just moved into `running` with --out-of-process now needs its
+    // Any runtime just moved into `running` in a worker now needs its
     // child.  Doing it here rather than waiting for the health timer is what
     // makes `start` followed immediately by a request work.
     reconcile_proxy_workers();
@@ -1630,6 +1643,30 @@ int daemon_handler::cmd_send(const parsed_args& pa)
         return 1;
     }
 
+    if (instance->get_type() != runtime_server && instance->get_type() != runtime_client)
+    {
+        std::cout << "send is only supported for server and client runtimes\n";
+        return 1;
+    }
+
+    // The connections are wherever the runtime is.
+    //
+    // This used to switch on the type and call lua_broadcast() straight away,
+    // which for a runtime in a worker reached the placeholder: it has the name,
+    // the port and the state, and not one connection.  The call succeeded, the
+    // command returned 0, and the message went nowhere.  A `send` that reports
+    // success and delivers nothing is worse than one that fails.
+    if (instance->is_out_of_process())
+    {
+        auto it = m_proxy_workers.find(std::string(name));
+        if (it == m_proxy_workers.end() || !it->second->send_deliver(message))
+        {
+            std::cout << "could not reach the worker holding " << name << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
     switch (instance->get_type())
     {
         case runtime_server:
@@ -1647,8 +1684,7 @@ int daemon_handler::cmd_send(const parsed_args& pa)
             break;
         }
         default:
-            std::cout << "send is only supported for server and client runtimes\n";
-            return 1;
+            break;
     }
 
     return 0;
@@ -2573,7 +2609,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // below is called unconditionally), so the pair being judged here is the
     // pair that will exist afterwards.
     if (const std::string msg = tls_config_refusal(type,
-                                                   cfg.tls, cfg.cert_path, cfg.key_path,
+                                                   cfg.tls, cfg.udp, cfg.cert_path, cfg.key_path,
                                                    cfg.ca_path, cfg.mesh_client_ca,
                                                    cfg.mesh_client_cert, cfg.mesh_client_key,
                                                    cfg.replicate_target);
@@ -3168,7 +3204,29 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
     // which worker it is going to.
     const std::string payload = worker_proto::encode_publish(cache_name, channel, message);
     for (auto& [_, sup] : m_proxy_workers)
+    {
+        // Everyone but whoever sent it up.  A worker that published has already
+        // run its own subscribers — it cannot wait for a round trip to do that,
+        // and it should not have to — so echoing the frame back would run every
+        // subscriber in that process a second time for one PUBLISH.
+        if (sup.get() == m_publish_origin)
+            continue;
         sup->send_publish(payload);
+    }
+}
+
+void daemon_handler::on_worker_publish(proxy_supervisor* from,
+                                       std::string_view cache_name,
+                                       std::string_view channel,
+                                       std::string_view message)
+{
+    // Saved and restored rather than cleared: dispatch_publish() runs Lua, a
+    // subscriber may PUBLISH again, and the inner fan-out must not lose the
+    // outer one's origin on its way back out.
+    proxy_supervisor* const prev = m_publish_origin;
+    m_publish_origin = from;
+    m_manager.dispatch_publish(cache_name, channel, message);
+    m_publish_origin = prev;
 }
 
 void daemon_handler::poll_proxy_workers()
@@ -3242,6 +3300,10 @@ void daemon_handler::reconcile_proxy_workers()
         // publish_sinks() below picks it up instead of the empty local object.
         sup->set_channel(&m_manager.requests());
         sup->set_event_loop(&m_loop);
+        sup->set_publish_handler([this](proxy_supervisor* from,
+                                        std::string_view c, std::string_view ch,
+                                        std::string_view m)
+                                 { on_worker_publish(from, c, ch, m); });
         inst->set_request_sink_override(sup.get());
 
         if (!sup->spawn(cfg))
@@ -3304,6 +3366,16 @@ void daemon_handler::check_managed_health()
     // before the managed-runtime sweep below, which can return early.
     for (auto& [worker_name, sup] : m_proxy_workers)
     {
+        // The child's own report, drained before liveness so a runtime that
+        // failed to start reaches the state file on the same tick it was heard
+        // about.  poll_proxy_workers() below is where the frame is read; this
+        // collects what the previous drain decided.
+        if (sup->take_state_change() && m_persistence)
+        {
+            if (auto* inst = m_manager.get(worker_name))
+                m_persistence->save_runtime(inst);
+        }
+
         if (sup->check_liveness() && m_persistence)
         {
             // A child that died and was not restarted has moved the runtime to

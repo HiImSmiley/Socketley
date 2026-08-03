@@ -38,6 +38,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 daemon_isolate psfailed
 
+BROKEN_PORT=19891
 SRV_PORT=19890
 
 PASS=0; FAIL=0; TOTAL=0
@@ -67,6 +68,7 @@ bad() {
 has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 cleanup() {
+    rm -f "${BROKEN_LUA:-}"
     "$BIN" stop   upsrv brokencli 2>/dev/null || true
     sleep 0.2
     "$BIN" remove upsrv brokencli 2>/dev/null || true
@@ -82,14 +84,26 @@ daemon_start "$BIN"
 # the failed runtime and not absence of output.
 "$BIN" create server upsrv -p "$SRV_PORT" -s >/dev/null 2>&1 || true
 
-# The failure, by ordinary configuration mistake: --tls on a UDP client would
-# need DTLS, so the runtime is created and then refuses to start.  Created
-# without -s on purpose — `create -s` unwinds a runtime whose start fails and
-# leaves nothing behind, and a runtime that does not exist is not the case
-# under test.
-"$BIN" create client brokencli -t 127.0.0.1:19999 --udp --tls >/dev/null 2>&1 || true
+# The failure: a script whose top level reaches for the cross-runtime management
+# API.  In a worker that API is refused by name, the script does not load, and
+# the worker exits saying so — which is a failure NOTHING on the daemon side can
+# decide in advance, because the daemon only compiles and discards a worker's
+# script.  Created without -s on purpose: `create -s` unwinds a runtime whose
+# start fails and leaves nothing behind, and a runtime that does not exist is
+# not the case under test.
+#
+# Two earlier triggers stopped working, and why is worth keeping.  `--tls` on a
+# UDP client was a question about two flags, so it moved to where every other
+# impossible TLS combination is answered and is now refused at create.  A port
+# conflict is not a failure at all here: the listener sets SO_REUSEPORT, so a
+# second runtime binds the same port and both come up.  What is left is a
+# failure that genuinely cannot be known until the process that will serve the
+# runtime tries, which is the only honest kind for this file.
+BROKEN_LUA="$(mktemp "${TMPDIR:-/tmp}/psfailed-XXXXXX.lua")"
+printf 'local names = socketley.list()\n' > "$BROKEN_LUA"
+"$BIN" create server brokencli -p "$BROKEN_PORT" --lua "$BROKEN_LUA" >/dev/null 2>&1 || true
 "$BIN" start brokencli >/dev/null 2>&1 || true
-sleep 0.3
+sleep 3
 
 # The premise.  Without this, every assertion below is being made about a
 # runtime that is in some other state and the file proves nothing.
@@ -125,7 +139,7 @@ fi
 # because every row it could print was running.  A row for a failed runtime that
 # still claims "running" is worse than no row.
 PSAJ=$("$BIN" ps -a --json 2>&1 || true)
-if has "$PSAJ" '"name":"brokencli","type":"client","port":0,"status":"failed"'; then
+if has "$PSAJ" '"name":"brokencli","type":"server","port":19891,"status":"failed"'; then
     ok
 else
     bad "ps -a --json reports the real state" \

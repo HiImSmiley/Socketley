@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Integration test: a cache runs in a worker process of its own.
 #
-# `--out-of-process` existed only for proxies, for two reasons that were both
-# incidental.  The worker called create_runtime(runtime_proxy, ...) with the
-# type written into the source rather than read from the config frame the daemon
-# had just sent it; and the flag itself sat in parse_proxy_flags, so
-# `create cache ... --out-of-process` answered "unknown flag" rather than doing
-# anything.  The supervisor never needed either: it forks, hands over a config
-# frame, restarts and reads stats back, and it held a proxy_instance* it never
-# dereferenced.
+# Running in a worker was once a proxy-only arrangement, for two reasons that
+# were both incidental.  The worker called create_runtime(runtime_proxy, ...)
+# with the type written into the source rather than read from the config frame
+# the daemon had just sent it; and the flag that asked for it sat in
+# parse_proxy_flags, so a cache was answered "unknown flag" rather than given
+# one.  The supervisor never needed either: it forks, hands over a config frame,
+# restarts and reads stats back, and it held a proxy_instance* it never
+# dereferenced.  A worker is now what every runtime gets unless it asks for
+# --daemon-process.
 #
 # What this file holds down is that the CLI cannot tell the difference — the
 # same assertions would pass against an in-process cache, which is the point —
@@ -53,10 +54,10 @@ fi
 daemon_start "$BIN"
 DAEMON_PID="${SOCKETLEY_DPID:-}"
 
-if "$BIN" create cache oopc -p "$PORT" --resp --out-of-process -s >/dev/null 2>&1; then
+if "$BIN" create cache oopc -p "$PORT" --resp -s >/dev/null 2>&1; then
     ok
 else
-    bad "a cache accepts --out-of-process" \
+    bad "a cache accepts" \
         "the flag was refused; it used to live in the proxy parser only"
 fi
 
@@ -123,7 +124,7 @@ fi
 # untouched, and the reply comes back to the origin with the cookie it posted.
 # Neither the server nor the client can tell.
 if command -v nc >/dev/null 2>&1; then
-    "$BIN" create server srv -p $((PORT + 1)) --cache oopc -s >/dev/null 2>&1
+    "$BIN" create server srv -p $((PORT + 1)) --cache oopc --daemon-process -s >/dev/null 2>&1
     sleep 1.5
     SET=$(printf 'cache set foo bar\n' | timeout 5 nc -q1 127.0.0.1 $((PORT + 1)) 2>/dev/null | head -1)
     sleep 0.3
@@ -154,7 +155,7 @@ fi
 # was fixed leave ten of them.
 if [ -n "$DAEMON_PID" ]; then
     for i in 1 2 3; do
-        "$BIN" create cache "zz$i" -p $((PORT + 50 + i)) --resp --out-of-process -s >/dev/null 2>&1
+        "$BIN" create cache "zz$i" -p $((PORT + 50 + i)) --resp -s >/dev/null 2>&1
         sleep 0.5
         "$BIN" stop "zz$i"   >/dev/null 2>&1
         "$BIN" remove "zz$i" >/dev/null 2>&1

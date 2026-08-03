@@ -12,6 +12,8 @@
 #include <signal.h>
 
 #include "proxy_instance.h"
+#include "../server/server_instance.h"
+#include "../client/client_instance.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
@@ -32,6 +34,24 @@ namespace
 // proxy is not spending its event loop building strings: the detail text is
 // produced by get_stats(), which walks the connection tables.
 constexpr auto stats_interval = std::chrono::milliseconds(250);
+
+// SIGTERM asked for, and not yet acted on.
+//
+// The supervisor's shutdown() writes a shutdown frame, closes the socket and
+// signals, in that order and without waiting — the daemon's event-loop thread
+// does not block on a child.  With the default disposition the signal won this
+// race: the worker died where it stood, mid-unwind, and everything stop() does
+// on the way out was skipped.  What that cost was visible from outside as a Lua
+// `on_stop` callback that never ran for a runtime in a worker and always ran
+// for one in the daemon, for the same `socketley stop`.
+//
+// Caught rather than ignored: the flag ends the loop on its next turn, which is
+// the same path the shutdown frame takes, so there is one way out and not two.
+// A worker that will not unwind is not left running — the supervisor escalates
+// to SIGKILL five seconds after the SIGTERM.
+volatile sig_atomic_t g_term_requested = 0;
+
+extern "C" void worker_on_term(int) { g_term_requested = 1; }
 
 // Frames on their way to the daemon, and what happens when it is not reading.
 //
@@ -176,6 +196,17 @@ public:
         // instead of raising SIGPIPE.
         signal(SIGPIPE, SIG_IGN);
 
+        // Before anything is bound, so the window between the fork and the
+        // first frame is covered too.
+        {
+            struct sigaction sa{};
+            sa.sa_handler = worker_on_term;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;              // no SA_RESTART: a slow poll should
+                                          // return so the loop can see the flag
+            if (::sigaction(SIGTERM, &sa, nullptr) < 0) {}
+        }
+
         // No ring yet.  io_uring fixes a ring's flags when the ring is created
         // and offers no way to change them afterwards, so whatever is going to
         // decide this worker's ring — SQPOLL, a CPU set — has to have arrived
@@ -190,7 +221,7 @@ public:
 
         auto last_stats = std::chrono::steady_clock::now();
 
-        while (!m_done)
+        while (!m_done && !g_term_requested)
         {
             // One drain pass of the ring, with a short wait so an idle worker
             // is not spinning.  run() is not usable here: it owns the thread
@@ -381,6 +412,7 @@ private:
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
+            case worker_proto::frame_type::deliver:   on_deliver(payload);   break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
@@ -418,8 +450,30 @@ private:
         // between the parse above and the init below — that gap is the whole
         // point of building the ring here instead of in run().
         //
-        // Nothing is passed today, so the ring lands on the same environment
-        // the daemon was launched with, exactly as before.
+        // This is where a worker's --cpus and --sqpoll are finally honoured.
+        // They were parsed, stored, persisted and reported, and then applied to
+        // nothing: the ring was built from whatever environment the daemon was
+        // launched with, so `create proxy p --cpus 0-1` pinned
+        // no thread anywhere while `stats` reported cpus:0-1.  Nothing said so
+        // — this is the shape of confidently-wrong the rest of this file is
+        // written against.
+        //
+        // It has to happen here and nowhere else: io_uring fixes a ring's flags
+        // when the ring is created, so set_sqpoll()/set_cpus() on an open ring
+        // are no-ops by contract.  Between the parse above and the init below is
+        // the only window that exists.
+        //
+        if (!cfg.cpus.empty())
+        {
+            cpu_set_spec spec;
+            std::string  err;
+            if (parse_cpu_set(cfg.cpus, spec, err))
+                m_loop.set_cpus(spec);
+            else
+                LOG_WARN("proxy worker: unusable --cpus in its config, ignored");
+        }
+        if (cfg.sqpoll_set)
+            m_loop.set_sqpoll(cfg.sqpoll);
         //
         // Guarded on ring_open() rather than on reaching here once: a config
         // that got as far as the ring and then failed to build a proxy leaves
@@ -448,24 +502,14 @@ private:
 
         m_rt->set_event_loop(&m_loop);
         m_rt->set_id(cfg.id);
-        if (cfg.port > 0)               m_rt->set_port(cfg.port);
-        if (!cfg.group.empty())         m_rt->set_group(cfg.group);
-        if (!cfg.log_file.empty())      m_rt->set_log_file(cfg.log_file);
-        if (!cfg.write_file.empty())    m_rt->set_write_file(cfg.write_file);
-        if (cfg.bash_output)            m_rt->set_bash_output(true);
-        if (cfg.bash_prefix)            m_rt->set_bash_prefix(true);
-        if (cfg.bash_timestamp)         m_rt->set_bash_timestamp(true);
-        if (cfg.max_connections > 0)    m_rt->set_max_connections(cfg.max_connections);
-        if (cfg.rate_limit > 0.0)       m_rt->set_rate_limit(cfg.rate_limit);
-        if (cfg.global_rate_limit > 0.0)m_rt->set_global_rate_limit(cfg.global_rate_limit);
-        if (cfg.idle_timeout > 0)       m_rt->set_idle_timeout(cfg.idle_timeout);
-        if (cfg.drain)                  m_rt->set_drain(true);
-        if (cfg.tls)                    m_rt->set_tls(true);
-        if (!cfg.cert_path.empty())     m_rt->set_cert_path(cfg.cert_path);
-        if (!cfg.key_path.empty())      m_rt->set_key_path(cfg.key_path);
-        if (!cfg.ca_path.empty())       m_rt->set_ca_path(cfg.ca_path);
-        if (!cfg.target.empty())        m_rt->set_target(cfg.target);
-        if (!cfg.cache_name.empty())    m_rt->set_cache_name(cfg.cache_name);
+
+        // Both halves, from the same file the daemon's restore path uses.
+        // This was a hand-written list here, and it was missing seventeen
+        // fields: a worker built a runtime the operator had not asked for and
+        // reported nothing, because there is nothing to report — every setter
+        // it did call succeeded.  See runtime_config_apply.h.
+        apply_common_config(*m_rt, cfg);
+        apply_typed_config(*m_rt, cfg);
 
         // ── the channel, both directions ────────────────────────────────────
         //
@@ -489,6 +533,35 @@ private:
         m_manager.requests().set_default_sink(&m_remote);
         m_rt->set_runtime_manager(&m_manager);
 
+        // ── and a publish on its way out ────────────────────────────────────
+        //
+        // The mirror of the frame this worker already receives.  A cache calls
+        // mgr->dispatch_publish(), which in the daemon writes the message to
+        // every worker and then runs every in-process subscriber.  In a worker
+        // that same call found a manager with an empty map and no sink, so a
+        // PUBLISH served by a cache out here reached nobody at all — not the
+        // subscribers in the daemon, not the ones in other workers, and not the
+        // one in this process either, because this runtime is not in this map.
+        //
+        // Out of the process first and the local runtime second, in that order
+        // and for the reason the daemon's copy gives: a subscriber may call
+        // straight back into the manager, and a frame already written to a
+        // socket cannot be affected by what it does.
+        m_manager.set_publish_sink(
+            [this](std::string_view cache_name, std::string_view channel,
+                   std::string_view message)
+            {
+                if (!m_writer.write(worker_proto::frame(
+                        worker_proto::frame_type::publish,
+                        worker_proto::encode_publish(cache_name, channel, message)))) {}
+
+                // The daemon fans this back out to every worker EXCEPT this
+                // one, so delivering here is not a duplicate — it is the only
+                // delivery this process gets.
+                if (m_rt)
+                    m_rt->on_publish_dispatch(cache_name, channel, message);
+            });
+
         // A script that does not load is a configuration this worker cannot
         // serve, not a warning to carry on past.
         //
@@ -510,9 +583,6 @@ private:
             m_done      = true;
             return;
         }
-
-        if (m_proxy)
-            apply_proxy_config(*m_proxy, cfg);
 
         // A table that arrived before the config is not lost: it is held and
         // applied here.  The daemon publishes on every membership change, and
@@ -609,6 +679,37 @@ private:
 
         m_manager.requests().complete_deferred(
             p.ticket, static_cast<request_status>(p.status), p.payload);
+    }
+
+    // `socketley send` reaching the process that holds the connections.
+    //
+    // The same two calls cmd_send() makes on an in-process runtime, and the same
+    // mode test: a server in `in` mode and a client in `in` mode both read only,
+    // so a broadcast to one is a message with nowhere to go.
+    void on_deliver(const std::string& message)
+    {
+        if (!m_rt || m_rt->get_state() != runtime_running)
+            return;
+
+        switch (m_rt->get_type())
+        {
+            case runtime_server:
+            {
+                auto* srv = static_cast<server_instance*>(m_rt);
+                if (srv->get_mode() != mode_in)
+                    srv->lua_broadcast(message);
+                break;
+            }
+            case runtime_client:
+            {
+                auto* cli = static_cast<client_instance*>(m_rt);
+                if (cli->get_mode() != client_mode_in)
+                    cli->lua_send(message);
+                break;
+            }
+            default:
+                break;   // send is a server/client verb; cmd_send says so
+        }
     }
 
     void on_publish(const std::string& payload)

@@ -1538,13 +1538,47 @@ Such a connection is closed, and the backend that produced an unfinished
 response is charged to its breaker so the next client is routed elsewhere.
 .SS Process Isolation
 .TP
-.B \-\-out\-of\-process
-Run this runtime in a worker process supervised by the daemon, instead of
-inside the daemon itself. Off by default.
+.B \-\-daemon\-process
+Run this runtime inside the daemon rather than in a process of its own.
 .IP
-Not a proxy flag, though it was one for a while: a server, a client and a
-cache take it as well, and the worker builds whatever type its configuration
-frame names.
+A runtime gets its own supervised worker process unless this is given. This is
+the only flag for where a runtime runs: a boolean needs one name, and it is the
+non\-default state that is named.
+.IP
+There was a
+.B \-\-daemon\-process
+flag, which is what this replaces. It is gone rather than kept as a synonym for
+the default: a flag that no longer changes anything is a flag whose meaning has
+to be looked up to discover that it has none.
+.IP
+What this buys back is what only shared memory can give. The cross\-runtime Lua
+management API \(em
+.BR socketley.create ,
+.BR .start ,
+.BR .stop ,
+.BR .remove ,
+.BR .send ,
+.BR .list ,
+.BR .get ,
+.B .pipe
+and all of
+.B socketley.cluster
+\(em is refused inside a worker, and at a script's top level that leaves the
+runtime
+.BR failed .
+A script's
+.B routes
+declaration is read from the placeholder, so a runtime in a worker publishes
+none. And a cross\-runtime request costs about 50 microseconds more, measured,
+which a server doing
+.B \-\-cache
+pays on every command.
+.IP
+Settable only at
+.BR create .
+.B edit
+rejects it, because honouring it would mean moving a configured runtime between
+address spaces underneath whatever already points at it.
 .IP
 The daemon forks and execs itself, hands the worker its configuration and
 its routing table over a control socket, and keeps a placeholder for it in
@@ -4624,7 +4658,7 @@ A proxy in
 mode is unaffected by any of this: it was already a byte relay and never looked
 at a status line.
 .SS Out\-of\-process proxies
-.B \-\-out\-of\-process
+.B \-\-daemon\-process
 moves the proxy out of the daemon. What it refuses, and what it costs, is worth
 stating plainly.
 .PP
@@ -4650,7 +4684,7 @@ was refused.
 .IP
 One thing is given up with it. A script's
 .B routes
-declaration is read from the placeholder, so an out\-of\-process runtime
+declaration is read from the placeholder, so a runtime in a worker
 publishes none \(em a gateway in front of one forwards to it without the 405 it
 could otherwise refuse at the edge. The declaration is a handler's feature
 rather than a proxy's, so a server moved out of process gives it up too.

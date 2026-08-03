@@ -183,7 +183,7 @@ bool runtime_instance::start(event_loop& loop)
     std::string_view mesh_ca, mesh_cert, mesh_key;
     get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
     if (const std::string msg = tls_config_refusal(get_type(),
-                                                   get_tls(), get_cert_path(),
+                                                   get_tls(), is_udp(), get_cert_path(),
                                                    get_key_path(), get_ca_path(),
                                                    mesh_ca, mesh_cert, mesh_key,
                                                    get_replication_target());

@@ -1,7 +1,11 @@
 #include "runtime_config_apply.h"
 
 #include "state_persistence.h"
+#include "runtime_instance.h"
+#include "../runtime/server/server_instance.h"
+#include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
+#include "../runtime/cache/cache_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg)
 {
@@ -38,4 +42,93 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg)
         prx.set_mesh_client_cert(cfg.mesh_client_cert);
     if (!cfg.mesh_client_key.empty())
         prx.set_mesh_client_key(cfg.mesh_client_key);
+}
+
+void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
+{
+    // Guarded the way the worker's own list was: a setter called with an empty
+    // or zero value would overwrite a default that means something, and this
+    // function is used on a runtime that is already configured as well as on a
+    // fresh one.
+    if (cfg.port > 0)                rt.set_port(cfg.port);
+    if (!cfg.group.empty())          rt.set_group(cfg.group);
+    if (!cfg.log_file.empty())       rt.set_log_file(cfg.log_file);
+    if (!cfg.write_file.empty())     rt.set_write_file(cfg.write_file);
+    if (cfg.bash_output)             rt.set_bash_output(true);
+    if (cfg.bash_prefix)             rt.set_bash_prefix(true);
+    if (cfg.bash_timestamp)          rt.set_bash_timestamp(true);
+    if (cfg.max_connections > 0)     rt.set_max_connections(cfg.max_connections);
+    if (cfg.rate_limit > 0.0)        rt.set_rate_limit(cfg.rate_limit);
+    if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
+    if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
+    if (cfg.drain)                   rt.set_drain(true);
+    if (cfg.tls)                     rt.set_tls(true);
+    if (!cfg.cert_path.empty())      rt.set_cert_path(cfg.cert_path);
+    if (!cfg.key_path.empty())       rt.set_key_path(cfg.key_path);
+    if (!cfg.ca_path.empty())        rt.set_ca_path(cfg.ca_path);
+    if (!cfg.target.empty())         rt.set_target(cfg.target);
+    if (!cfg.cache_name.empty())     rt.set_cache_name(cfg.cache_name);
+
+    // The ring request, recorded on the runtime so `stats` answers about what
+    // was asked for and not only about what the ring happens to be.  Applying
+    // it to an actual ring is the caller's: in the daemon every runtime shares
+    // one, built before any config was read, and in a worker there is one ring
+    // per runtime and it is built from exactly this — see proxy_worker's
+    // on_config, which has to do it before init() because io_uring fixes a
+    // ring's flags at creation.
+    if (!cfg.cpus.empty())
+    {
+        cpu_set_spec spec;
+        std::string  err;
+        if (parse_cpu_set(cfg.cpus, spec, err))
+            rt.set_cpus(spec);
+    }
+    if (cfg.sqpoll_set)
+        rt.set_sqpoll(cfg.sqpoll);
+}
+
+void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
+{
+    switch (rt.get_type())
+    {
+        case runtime_server:
+        {
+            auto& srv = static_cast<server_instance&>(rt);
+            srv.set_mode(static_cast<server_mode>(cfg.mode));
+            srv.set_udp(cfg.udp);
+            if (!cfg.master_pw.empty())  srv.set_master_pw(cfg.master_pw);
+            if (cfg.master_forward)      srv.set_master_forward(true);
+            if (!cfg.http_dir.empty())   srv.set_http_dir(cfg.http_dir);
+            if (cfg.http_cache)          srv.set_http_cache(true);
+            srv.clear_upstream_targets();
+            for (const auto& u : cfg.upstreams)
+                srv.add_upstream_target(u);
+            break;
+        }
+        case runtime_client:
+        {
+            auto& cli = static_cast<client_instance&>(rt);
+            cli.set_mode(static_cast<client_mode>(cfg.mode));
+            cli.set_udp(cfg.udp);
+            if (cfg.reconnect != 0) cli.set_reconnect(cfg.reconnect);
+            break;
+        }
+        case runtime_proxy:
+            apply_proxy_config(static_cast<proxy_instance&>(rt), cfg);
+            break;
+
+        case runtime_cache:
+        {
+            auto& cache = static_cast<cache_instance&>(rt);
+            if (!cfg.persistent_path.empty())
+                cache.set_persistent(cfg.persistent_path);
+            cache.set_mode(static_cast<cache_mode>(cfg.cache_mode));
+            cache.set_resp_forced(cfg.resp_forced);
+            if (!cfg.replicate_target.empty())
+                cache.set_replicate_target(cfg.replicate_target);
+            if (cfg.max_memory > 0) cache.set_max_memory(cfg.max_memory);
+            cache.set_eviction(static_cast<eviction_policy>(cfg.eviction));
+            break;
+        }
+    }
 }

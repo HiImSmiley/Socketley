@@ -76,7 +76,7 @@ create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "proxy created (not started)" "$BIN" create proxy px -p "$PX_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http
 create_ok "out-of-process proxy created (not started)" "$BIN" create proxy px_oop \
-    -p "$PX_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --out-of-process
+    -p "$PX_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http
 create_ok "server created (not started)" "$BIN" create server plainsrv -p "$SRV_PORT"
 
 BEFORE=$(state px)
