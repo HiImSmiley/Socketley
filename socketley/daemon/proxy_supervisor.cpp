@@ -49,8 +49,6 @@ proxy_supervisor::proxy_supervisor(runtime_instance* placeholder, std::string ex
     : m_placeholder(placeholder)
     , m_exec_path(std::move(exec_path))
 {
-    if (m_placeholder && m_placeholder->get_type() == runtime_proxy)
-        m_proxy = static_cast<proxy_instance*>(m_placeholder);
     if (m_exec_path.empty())
         m_exec_path = self_exe();
 }

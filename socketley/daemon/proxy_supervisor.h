@@ -96,8 +96,19 @@ private:
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
 
+    // Deliberately a runtime_instance and nothing narrower.  Everything this
+    // class does — fork and exec the child, hand it a config frame, re-send the
+    // endpoint table, restart it, read its stats back — is the same work
+    // whatever kind of runtime is on the other side.  It held a
+    // proxy_instance* beside this one for a while; that pointer was assigned in
+    // the constructor and never read again, which is the clearest evidence
+    // available that nothing here needs the type.
+    //
+    // Which is what makes a cache or a server in a worker cheap: this file does
+    // not have to change for it.  What does is the worker's own side, where
+    // create_runtime() is called with runtime_proxy hardcoded and the stats
+    // frame is filled from proxy_instance members by hand.
     runtime_instance* m_placeholder{nullptr};
-    proxy_instance*   m_proxy{nullptr};
     std::string       m_exec_path;
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
