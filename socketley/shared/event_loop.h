@@ -553,6 +553,14 @@ private:
     uint16_t m_fixed_armed[MAX_FIXED_FILES]{};
     uint64_t m_fixed_free_deferred[BITMAP_WORDS]{};
 
+    // Slots whose unregister is owed as well as their index.  Set when
+    // free_fixed_file_slot() had to cancel something first: the cancel names
+    // the index and the kernel resolves it when it consumes the SQE, so
+    // unregistering before then makes the cancel answer EBADF and withdraw
+    // nothing.  Cleared in settle_deferred(), once the operations have
+    // reported and the file has done its last work.
+    uint64_t m_fixed_unreg_deferred[BITMAP_WORDS]{};
+
     // The descriptor(s) named by the completion currently being dispatched, and
     // only while it is the last completion that submission will produce.  A
     // handler closing the descriptor it was just called about is the ordinary

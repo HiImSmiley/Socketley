@@ -457,6 +457,24 @@ void event_loop::settle_deferred(uint32_t target)
         if (!((m_fixed_free_deferred[w] >> bit) & 1u))
             return;
         m_fixed_free_deferred[w] &= ~(1ULL << bit);
+
+        // And the unregister, which free_fixed_file_slot() left to here when it
+        // had something to cancel first.  The two cannot both happen at the
+        // moment of the release: a cancel naming a fixed index is matched when
+        // the kernel CONSUMES the SQE, and register_files_update() is a syscall
+        // that takes effect at once — so unregistering on the way out left the
+        // cancel resolving an index that pointed at nothing.  Measured, on the
+        // seed this was found with: "fixed cancel idx=0 -> res=-9 (Bad file
+        // descriptor)", with the recv it was meant to withdraw still armed
+        // afterwards.  Here the operations have reported, so the file has done
+        // its last work and dropping the reference is safe and final.
+        if (m_files_registered && ((m_fixed_unreg_deferred[w] >> bit) & 1u))
+        {
+            m_fixed_unreg_deferred[w] &= ~(1ULL << bit);
+            int neg = -1;
+            if (io_uring_register_files_update(&m_ring, idx, &neg, 1) < 0) {}
+        }
+
         m_file_bitmap[w] &= ~(1ULL << bit);
         m_file_bitmap_hint = w;
         return;
@@ -2095,15 +2113,11 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     uint32_t w = idx / 64;
     uint32_t bit = idx % 64;
 
-    // Anything still armed on this index is withdrawn first, while the index
-    // still resolves to a file — the fixed-file twin of the rule close_fd()
-    // states for descriptor numbers, and for the same reason: after the
-    // unregister below the kernel looks the index up and finds nothing, so the
-    // cancel matches nothing and answers -ENOENT.
+    // WITH SOMETHING STILL ARMED, THE CANCEL GOES FIRST AND THE UNREGISTER LAST.
     //
-    // Without this an operation armed on a fixed index had no way to be
+    // Until this existed, an operation armed on a fixed index had no way to be
     // withdrawn at all.  close_fd() cancels by descriptor number and a fixed
-    // operation is not counted against one — arm(req, fixed_target(idx)) puts
+    // submission is not counted against one — arm(req, fixed_target(idx)) puts
     // it in a different table — so a multishot recv on a direct connection
     // could only ever end by itself, and a multishot recv holds its own
     // reference to the file, so "by itself" means the peer or the socket.  On
@@ -2111,19 +2125,37 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     // wait queue every time.  On the nightly runner's kernel it does not, and
     // the harness reported the result there for months in the only words it
     // had: "1 operation(s) still owed at end of input: recv-multishot=1", after
-    // 1970 rounds of polling in 2010 ms — a ring that was being serviced and an
+    // 1970 rounds of polling in 2010 ms — a ring being serviced and an
     // operation that was never going to report.
-    // idx is already known to be in range — the guard at the top of this
-    // function returned for anything else — and m_fixed_armed is an array
-    // member, so the count is the whole test.
+    //
+    // The ORDER is the whole of it, and getting it wrong looks exactly like not
+    // cancelling.  A cancel naming a fixed index is matched when the kernel
+    // consumes the SQE; register_files_update() is a syscall that takes effect
+    // immediately.  Submitting the cancel and unregistering on the next line
+    // therefore hands the kernel an index pointing at nothing by the time it
+    // looks — measured, on the seed this was found with:
+    //
+    //     [trace] fixed cancel idx=0 -> res=-9 (Bad file descriptor)
+    //
+    // with the recv it was meant to withdraw still armed afterwards.  Same
+    // shape as the flush-then-close hazard this file documents for descriptor
+    // numbers, one level up.
+    //
+    // So the unregister is deferred to settle_deferred(), where it runs once
+    // the operations have reported.  Nothing is lost by waiting: the point of
+    // unregistering is to drop the kernel's last reference to the socket, and
+    // an operation still in flight is that reference.
     if (m_fixed_armed[idx] > 0)
+    {
         submit_cancel_fixed(idx);
+        m_fixed_free_deferred[w]  |= (1ULL << bit);
+        m_fixed_unreg_deferred[w] |= (1ULL << bit);
+        return;
+    }
 
-    // Unregister, and unconditionally.  This is what drops the kernel's
-    // reference to the socket; until it runs the descriptor's own close() has
-    // not really closed anything.  It is safe to do with submissions still
-    // queued against the index — they resolve to nothing and fail -EBADF, which
-    // is a completion the owner already handles.
+    // Nothing armed: unregister now, as this always did.  This is what drops
+    // the kernel's reference to the socket; until it runs the descriptor's own
+    // close() has not really closed anything.
     int neg = -1;
     if (m_files_registered)
     {
@@ -2143,12 +2175,6 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     // reads still armed by design, and every one of them had reasoned that the
     // request "took its own reference when it was issued" — true of a submission
     // the kernel has consumed, and the entire question is the ones it has not.
-    if (m_fixed_armed[idx] > 0)
-    {
-        m_fixed_free_deferred[w] |= (1ULL << bit);
-        return;
-    }
-
     m_file_bitmap[w] &= ~(1ULL << bit);
     // Update hint to this word since it now has a free slot
     m_file_bitmap_hint = w;
