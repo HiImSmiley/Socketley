@@ -3,6 +3,7 @@
 
 #include "../../socketley/shared/request_channel.h"
 #include "../../socketley/shared/event_loop.h"
+#include "../../socketley/shared/worker_protocol.h"
 
 #include <string>
 #include <vector>
@@ -232,4 +233,53 @@ TEST_CASE("an origin that goes away takes its parked requests with it")
 
     ch.detach();
     loop.shutdown_ring();
+}
+
+// ─── the wire a socket-backed sink would use ────────────────────────────────
+//
+// Deliberately not the target's own client protocol.  The cache's text replies
+// are not self-delimiting — ten commands answer over several lines ending in
+// `end\n` — so a client could only find the end of one by knowing which command
+// produced it.  RESP would be self-delimiting but cannot be produced faithfully:
+// process_command() splits positionally and `SET k hello world` stores
+// "hello world", so building arrays needs an arity table per command.  A
+// length-prefixed frame needs neither: the payload passes through untouched and
+// the ticket pairs answer with question.
+
+TEST_CASE("a channel request survives the frame")
+{
+    using namespace worker_proto;
+    const std::string payload = "GET k\nSET a hello world\n";
+    auto f = encode_chan_request(4242, "cachename", payload);
+
+    chan_request_wire q;
+    REQUIRE(decode_chan_request(f, q));
+    CHECK(q.ticket == 4242);
+    CHECK(q.target == "cachename");
+    // Verbatim, spaces and newlines intact: nothing on this wire parses cache
+    // commands, which is the entire reason it was chosen.
+    CHECK(q.payload == payload);
+}
+
+TEST_CASE("a channel reply survives the frame")
+{
+    using namespace worker_proto;
+    auto g = encode_chan_reply(4242, static_cast<uint8_t>(request_status::ok),
+                               "$5\r\nhello\r\n");
+    chan_reply_wire p;
+    REQUIRE(decode_chan_reply(g, p));
+    CHECK(p.ticket == 4242);
+    CHECK(p.status == static_cast<uint8_t>(request_status::ok));
+    CHECK(p.payload == "$5\r\nhello\r\n");
+}
+
+TEST_CASE("a truncated frame is refused rather than read past")
+{
+    using namespace worker_proto;
+    auto f = encode_chan_request(1, "cache", "GET k");
+    for (size_t cut : {size_t(0), size_t(3), size_t(7), f.size() - 1})
+    {
+        chan_request_wire q;
+        CHECK_FALSE(decode_chan_request(std::string_view(f).substr(0, cut), q));
+    }
 }

@@ -78,6 +78,10 @@ enum class frame_type : uint16_t
     stop      = 19,  // payload: empty
     shutdown  = 20,  // payload: empty
     publish   = 21,  // payload: see encode_publish
+    chan_req  = 22,  // payload: see encode_chan_request
+
+    // worker → daemon, again
+    chan_rep  = 4,   // payload: see encode_chan_reply
 };
 
 // ── What a worker's exit status means ───────────────────────────────────────
@@ -420,6 +424,82 @@ inline bool decode_publish(std::string_view payload, publish_wire& p)
     p.cache_name = std::string(r.str());
     p.channel    = std::string(r.str());
     p.message    = std::string(r.str());
+    return r.ok;
+}
+
+// ── A request one runtime makes of another, across the process boundary ─────
+//
+// request_channel has always promised that a target on the other side of a
+// process boundary would be reached by a socket-backed sink "and nothing on the
+// asking side changes".  This is the wire that carries it, and it is
+// deliberately this one rather than the target's own client protocol.
+//
+// NOT the cache's text protocol: its replies are not self-delimiting — ten
+// commands answer over several lines ending in `end\n` — so a client could only
+// find the end of a reply by knowing which command produced it, which puts the
+// cache's command table in a second place.
+//
+// NOT RESP either, though RESP is self-delimiting: producing it is the problem.
+// process_command() splits a line positionally, command to the first space, key
+// to the second, and the rest is the value with its spaces intact, so
+// `SET k hello world` stores "hello world".  Turning that into arrays needs an
+// arity table per command — the same duplication by another road.
+//
+// A length-prefixed frame has neither difficulty.  The payload is whatever
+// would have arrived on the target's own port and is passed through untouched;
+// the ticket is what pairs an answer with its question, and it is the channel's
+// own, so nothing here has to understand a single command.
+struct chan_request_wire
+{
+    uint64_t    ticket{0};
+    std::string target;    // runtime name the request is addressed to
+    std::string payload;
+};
+
+struct chan_reply_wire
+{
+    uint64_t    ticket{0};
+    uint8_t     status{0};  // request_status, as a number
+    std::string payload;
+};
+
+inline std::string encode_chan_request(uint64_t ticket, std::string_view target,
+                                       std::string_view payload)
+{
+    std::string out;
+    out.reserve(16 + target.size() + payload.size());
+    put_u64(out, ticket);
+    put_str(out, target);
+    put_str(out, payload);
+    return out;
+}
+
+inline bool decode_chan_request(std::string_view payload, chan_request_wire& q)
+{
+    reader r(payload.data(), payload.size());
+    q.ticket  = r.u64();
+    q.target  = std::string(r.str());
+    q.payload = std::string(r.str());
+    return r.ok;
+}
+
+inline std::string encode_chan_reply(uint64_t ticket, uint8_t status,
+                                     std::string_view payload)
+{
+    std::string out;
+    out.reserve(13 + payload.size());
+    put_u64(out, ticket);
+    out.push_back(static_cast<char>(status));
+    put_str(out, payload);
+    return out;
+}
+
+inline bool decode_chan_reply(std::string_view payload, chan_reply_wire& p)
+{
+    reader r(payload.data(), payload.size());
+    p.ticket  = r.u64();
+    p.status  = static_cast<uint8_t>(r.u8());
+    p.payload = std::string(r.str());
     return r.ok;
 }
 
