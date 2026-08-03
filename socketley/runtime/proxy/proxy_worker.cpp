@@ -368,10 +368,15 @@ private:
 
         // Immutable from here, exactly as on the daemon side: a request that is
         // already resolving keeps the table it started with.
-        if (m_rt)
-            if (m_proxy) m_proxy->set_endpoints(std::move(tbl));
-        else
-            m_pending_endpoints = std::move(tbl);
+        // Three cases, and the braces are load-bearing.  Written without them
+        // the `else` bound to the inner `if` and a table arriving before the
+        // config frame was dropped instead of stashed — -Wdangling-else caught
+        // it, which is the whole reason that warning is not tolerated here.
+        if (!m_rt)
+            m_pending_endpoints = std::move(tbl);   // no runtime yet; keep it
+        else if (m_proxy)
+            m_proxy->set_endpoints(std::move(tbl)); // only a proxy routes by name
+        // else: a runtime that does not route.  Nothing to hand it.
     }
 
     // A cache somewhere in the daemon published, and this proxy's script asked to
