@@ -33,26 +33,71 @@ namespace
 // produced by get_stats(), which walks the connection tables.
 constexpr auto stats_interval = std::chrono::milliseconds(250);
 
-bool write_all(int fd, std::string_view buf)
+// Frames on their way to the daemon, and what happens when it is not reading.
+//
+// This was a straight write that dropped the frame on EAGAIN, which was right
+// while the socket carried stats: the next push supersedes the one that did not
+// fit. It is wrong for a request or a reply. A dropped chan_req is answered
+// `no such runtime` by the asking side — for a target that exists — and a
+// dropped chan_rep is an answer that never comes, so the origin waits until its
+// client gives up.
+//
+// Queued and flushed as the socket takes them, with a cap so a daemon that has
+// stopped reading cannot grow this process without limit.
+class control_writer
 {
-    size_t off = 0;
-    while (off < buf.size())
+public:
+    static constexpr size_t MAX_BACKLOG = 4u << 20;
+
+    explicit control_writer(int fd) : m_fd(fd) {}
+
+    bool write(std::string_view framed)
     {
-        const ssize_t n = ::write(fd, buf.data() + off, buf.size() - off);
-        if (n > 0) { off += static_cast<size_t>(n); continue; }
-        if (n < 0 && (errno == EINTR))
-            continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        if (pending() + framed.size() > MAX_BACKLOG)
         {
-            // The daemon is not draining us.  Dropping the frame is right for
-            // stats — the next one supersedes it anyway — and the caller treats
-            // a false return as "not sent", never as "connection lost".
+            if (!m_full)
+            {
+                LOG_WARN("proxy worker: control backlog full; the daemon is not reading");
+                m_full = true;
+            }
             return false;
         }
-        return false;
+        m_full = false;
+        m_out.append(framed);
+        flush();
+        return true;
     }
-    return true;
-}
+
+    void flush()
+    {
+        while (m_off < m_out.size())
+        {
+            const ssize_t n = ::write(m_fd, m_out.data() + m_off, m_out.size() - m_off);
+            if (n > 0) { m_off += static_cast<size_t>(n); continue; }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
+            m_dead = true;          // the daemon is gone; run() ends on the read side
+            return;
+        }
+
+        // Compacted in one move: erasing the written prefix on every pass is
+        // quadratic in exactly the backlog this exists to hold.
+        if (m_off >= m_out.size())      { m_out.clear(); m_off = 0; }
+        else if (m_off >= 64 * 1024)    { m_out.erase(0, m_off); m_off = 0; }
+    }
+
+    size_t pending() const { return m_out.size() - m_off; }
+    bool   dead()    const { return m_dead; }
+
+private:
+    int         m_fd;
+    std::string m_out;
+    size_t      m_off{0};
+    bool        m_full{false};
+    bool        m_dead{false};
+};
 
 // Every runtime this process does not hold.
 //
@@ -70,7 +115,7 @@ bool write_all(int fd, std::string_view buf)
 class remote_sink : public request_sink
 {
 public:
-    explicit remote_sink(int fd) : m_fd(fd) {}
+    explicit remote_sink(control_writer* w) : m_w(w) {}
 
     void serve_request(std::string_view, std::string& out) override
     {
@@ -85,22 +130,43 @@ public:
                         std::string_view payload) override
     {
         // The name travels with the request rather than being resolved here,
-        // because this process cannot resolve it. Refusing on a failed write is
-        // what keeps a ticket from being parked against a daemon that is not
-        // reading: the channel answers the origin no_target instead.
-        return write_all(m_fd,
+        // because this process cannot resolve it. A false return means the
+        // backlog is full — the daemon has stopped reading entirely — and the
+        // channel then answers the origin rather than parking a ticket nothing
+        // will complete.
+        return m_w->write(
             worker_proto::frame(worker_proto::frame_type::chan_req,
                 worker_proto::encode_chan_request(ticket, target, payload)));
     }
 
 private:
-    int m_fd;
+    control_writer* m_w;
 };
 
-class worker
+// The worker's half of the same problem the supervisor has.
+//
+// Its loop waits on the ring for 20 ms and then drains the control socket, so a
+// request arriving from the daemon waited up to a full timeout before anything
+// looked at it.  With the daemon side armed that was the whole remaining cost:
+// a cross-process `cache set` measured 20.00 ms — the timeout, to the
+// hundredth — against 0.09 ms for the same command in the daemon.
+//
+// Arming the fd on this worker's own ring makes the wait end when the frame
+// arrives.  Everything else about the loop is unchanged: pump_control() still
+// runs every turn, so a missed arm costs latency, never a frame.
+class worker : public io_handler
 {
 public:
-    explicit worker(int control_fd) : m_fd(control_fd), m_remote(control_fd) {}
+    explicit worker(int control_fd)
+        : m_fd(control_fd), m_writer(control_fd), m_remote(&m_writer) {}
+
+    void on_cqe(struct io_uring_cqe* /*cqe*/) override
+    {
+        // Nothing to do but stop waiting.  The frame is drained by the
+        // pump_control() the main loop already runs on every turn, and re-armed
+        // there too — doing either here would give this socket two readers.
+        m_ctl_armed = false;
+    }
 
     int run()
     {
@@ -145,6 +211,20 @@ public:
             if (!pump_control())
                 break;
 
+            // Whatever the socket would not take last turn.  A reply sitting
+            // here is somebody's answer, so it goes before anything else this
+            // turn does.
+            m_writer.flush();
+            if (m_writer.dead())
+                break;
+
+            // After the drain, not before: an arm placed while a frame is
+            // already buffered fires at once and the turn is wasted.  Skipped
+            // once the worker has decided to exit, so nothing is outstanding
+            // against the fd on the way down.
+            if (!m_done)
+                arm_control();
+
             const auto now = std::chrono::steady_clock::now();
             if (now - last_stats >= stats_interval)
             {
@@ -163,6 +243,12 @@ public:
         // Before the ring, like every other owner registration: detach answers
         // whatever is still queued `dropped` and gives the owner token back.
         m_manager.requests().detach();
+        if (m_ctl_armed)
+        {
+            if (!m_loop.submit_poll_remove(&m_ctl_req)) {}
+            m_ctl_armed = false;
+        }
+        m_loop.deregister_owner(this);
         m_loop.shutdown_ring();
 
         return m_exit_code;
@@ -185,11 +271,27 @@ private:
         if (::poll(&pfd, 1, timeout_ms) < 0) {}
     }
 
+    // Make the ring's wait end when a frame arrives instead of when the timeout
+    // does.  One-shot: the fd outlives every arm here, but a multishot poll on
+    // it would still be reporting after shutdown_ring() and there is nothing to
+    // gain from it — one SQE per exchange against a socket that carries one
+    // frame at a time.
+    void arm_control()
+    {
+        if (!m_loop.ring_open() || m_ctl_armed)
+            return;
+        // POLLOUT only while something is waiting to go out, so an idle worker
+        // is not woken by a socket that is merely writable.
+        const unsigned mask = POLLIN | (m_writer.pending() ? POLLOUT : 0u);
+        m_ctl_req   = { this, nullptr, m_fd, 0, op_poll };
+        m_ctl_armed = m_loop.submit_poll_add(m_fd, mask, &m_ctl_req);
+    }
+
     void send_hello()
     {
         std::string payload;
         worker_proto::put_u32(payload, static_cast<uint32_t>(::getpid()));
-        if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::hello, payload))) {}
+        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::hello, payload))) {}
     }
 
     void send_state()
@@ -198,7 +300,7 @@ private:
         payload.push_back(static_cast<char>(
             m_rt ? static_cast<uint8_t>(m_rt->get_state())
                     : static_cast<uint8_t>(runtime_created)));
-        if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::state, payload))) {}
+        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
     void push_stats()
@@ -227,7 +329,7 @@ private:
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
 
-        if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::stats,
+        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::stats,
                                                  worker_proto::encode_stats(s)))) {}
     }
 
@@ -378,6 +480,9 @@ private:
         // Its own name is registered so a request for it is served here rather
         // than making a round trip through the daemon, which would route it
         // back to this very worker.
+        // The ring exists from here, so the control socket can be armed on it.
+        m_loop.register_owner(this);
+
         m_manager.requests().attach(m_loop);
         if (auto* sink = m_rt->as_request_sink())
             m_manager.requests().register_sink(cfg.name, sink);
@@ -487,7 +592,7 @@ private:
             }
         }
 
-        if (!write_all(m_fd, worker_proto::frame(worker_proto::frame_type::chan_rep,
+        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::chan_rep,
                           worker_proto::encode_chan_reply(q.ticket, st, reply)))) {}
     }
 
@@ -546,6 +651,8 @@ private:
 
     int                                    m_fd;
     event_loop                             m_loop;
+    // Before m_remote, which holds a pointer to it.
+    control_writer                         m_writer;
     remote_sink                            m_remote;
     // Empty map, live channel.  See the wiring in on_config().  Declared before
     // the runtime so it outlives it: a runtime revokes its origin as it is
@@ -562,6 +669,8 @@ private:
     proxy_instance*                        m_proxy{nullptr};
     std::shared_ptr<const endpoint_table>  m_pending_endpoints;
     std::string                            m_in;
+    io_request                             m_ctl_req{};
+    bool                                   m_ctl_armed{false};
     bool                                   m_done{false};
     int                                    m_exit_code{0};
 };

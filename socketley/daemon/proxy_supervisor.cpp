@@ -11,7 +11,10 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
+#include <poll.h>
+
 #include "../runtime/proxy/proxy_instance.h"
+#include "../shared/event_loop.h"
 #include "../shared/logging.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/state_persistence.h"
@@ -73,12 +76,80 @@ proxy_supervisor::~proxy_supervisor()
         m_channel->drop_origin(this);
     }
     shutdown();
+
+    // After shutdown(), which closes the socket and cancels the arm with it.
+    // The registration is what makes the loop drop a completion that is still
+    // on its way for this handler, so it is given back last.
+    if (m_loop)
+        m_loop->deregister_owner(this);
+}
+
+void proxy_supervisor::set_event_loop(event_loop* loop)
+{
+    m_loop = loop;
+    if (m_loop)
+        m_loop->register_owner(this);
+}
+
+void proxy_supervisor::arm_control_poll()
+{
+    if (!m_loop || m_control_fd < 0 || m_poll_armed)
+        return;
+
+    m_poll_mask  = POLLIN | (pending_out() ? POLLOUT : 0u);
+    m_poll_req   = { this, nullptr, m_control_fd, 0, op_poll };
+    m_poll_armed = m_loop->submit_poll_add(m_control_fd, m_poll_mask, &m_poll_req);
+
+    // Not an error worth failing the runtime over: the health tick still drains
+    // this socket, so a refused arm costs latency and nothing else.  Said out
+    // loud because that latency is two seconds and somebody will measure it.
+    if (!m_poll_armed)
+        LOG_WARN("proxy supervisor: could not arm the control socket; its "
+                 "replies now wait for the health tick");
+}
+
+void proxy_supervisor::disarm_control_poll()
+{
+    if (!m_loop)
+        return;
+
+    // Cancel first, then let the loop drop whatever still reports: an armed
+    // poll names a descriptor this class is about to close, and a completion
+    // that arrives after the close would carry a token for an fd that may
+    // already belong to somebody else.
+    if (m_poll_armed)
+    {
+        if (!m_loop->submit_poll_remove(&m_poll_req)) {}
+        m_poll_armed = false;
+    }
+}
+
+void proxy_supervisor::on_cqe(struct io_uring_cqe* /*cqe*/)
+{
+    // Whatever the result, this arm is spent.  Cleared before the drain so a
+    // frame that causes a write back into this socket can re-arm rather than
+    // queue behind an arm that has already reported.
+    m_poll_armed = false;
+    m_poll_mask  = 0;
+
+    // The backlog first: whatever the poll reported, the socket may have room
+    // now, and a request waiting in m_out is somebody's answer not yet asked
+    // for.  flush_control() re-arms with the mask the backlog calls for.
+    flush_control();
+
+    // Errors included: a poll that reports POLLHUP or an error is exactly the
+    // case where the read below returns 0 and close_control() runs, which is
+    // the death path this class already has.
+    poll();
+
+    arm_control_poll();
 }
 
 void proxy_supervisor::close_control()
 {
     if (m_control_fd >= 0)
     {
+        disarm_control_poll();
         ::close(m_control_fd);
         m_control_fd = -1;
     }
@@ -216,7 +287,78 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (!m_endpoints.empty())
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
 
+    // Last, and only on the path that keeps the socket: an arm on a descriptor
+    // a failed spawn is about to close is the completion-outliving-its-fd case
+    // this file goes to some length to avoid.
+    arm_control_poll();
     return true;
+}
+
+// ─── writing to the child ───────────────────────────────────────────────────
+//
+// This used to write straight at the descriptor and drop the frame on EAGAIN,
+// which was defensible while the socket carried stats: the next push supersedes
+// the one that did not fit, and blocking the daemon's event-loop thread on a
+// process it does not control is not on the table.
+//
+// It stopped being defensible when requests went on the same socket.  A dropped
+// request frame is a false return, the channel reads a false return as "this
+// sink cannot take it", and the origin is answered `no such runtime` — for a
+// runtime that exists, is healthy, and is answering everything else.  Measured
+// before this buffer, with 10,000 pipelined `cache set` through one worker:
+// 298 of them answered no such runtime.  The socket held about 270 frames and
+// everything past that was a confident lie.
+//
+// So the frames are queued and flushed as the socket takes them.  The cap is
+// what makes it bounded, and reaching it is a real refusal rather than an
+// invented one — see serve_deferred, which turns it into `overloaded`.
+void proxy_supervisor::flush_control()
+{
+    while (m_out_off < m_out.size() && m_control_fd >= 0)
+    {
+        const ssize_t n = ::write(m_control_fd, m_out.data() + m_out_off,
+                                  m_out.size() - m_out_off);
+        if (n > 0)
+        {
+            m_out_off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;                       // the arm below waits for writability
+
+        // Anything else is the child going away, which is close_control()'s
+        // business and not a per-frame failure.
+        close_control();
+        return;
+    }
+
+    // Consumed prefix, dropped in one move rather than per write: erase(0, n) in
+    // the loop is quadratic in the backlog, and the backlog is exactly the case
+    // this exists for.
+    if (m_out_off > 0)
+    {
+        if (m_out_off >= m_out.size())
+        {
+            m_out.clear();
+            m_out_off = 0;
+        }
+        else if (m_out_off >= 64 * 1024)
+        {
+            m_out.erase(0, m_out_off);
+            m_out_off = 0;
+        }
+    }
+
+    // A backlog means the next thing worth waking for is writability, not just
+    // readability.  Re-armed rather than adjusted: the arm is one-shot.
+    const unsigned want = POLLIN | (pending_out() ? POLLOUT : 0u);
+    if (want != m_poll_mask)
+    {
+        disarm_control_poll();
+        arm_control_poll();
+    }
 }
 
 bool proxy_supervisor::write_frame(const std::string& framed)
@@ -224,25 +366,22 @@ bool proxy_supervisor::write_frame(const std::string& framed)
     if (m_control_fd < 0)
         return false;
 
-    size_t off = 0;
-    while (off < framed.size())
+    if (pending_out() + framed.size() > MAX_CONTROL_BACKLOG)
     {
-        const ssize_t n = ::write(m_control_fd, framed.data() + off, framed.size() - off);
-        if (n > 0) { off += static_cast<size_t>(n); continue; }
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        // Said once per crossing rather than per frame: a wedged child produces
+        // one of these per request otherwise.
+        if (!m_out_full)
         {
-            // The child is not reading.  Blocking here would stall the daemon's
-            // event-loop thread on a process it does not control, so the frame
-            // is dropped and said out loud.  Config is the one frame that
-            // cannot be dropped safely, and spawn() treats a false here as a
-            // failed spawn for exactly that reason.
-            LOG_WARN("proxy supervisor: control socket full, frame dropped");
-            return false;
+            LOG_WARN("proxy supervisor: control socket backlog full; the child "
+                     "is not reading");
+            m_out_full = true;
         }
         return false;
     }
+    m_out_full = false;
+
+    m_out += framed;
+    flush_control();
     return true;
 }
 

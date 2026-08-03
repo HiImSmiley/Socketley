@@ -20,15 +20,24 @@
 // the Prometheus endpoint then read the placeholder and cannot tell the
 // difference — which is the property this whole first step exists to prove.
 //
-// ─── WHY THERE IS NO io_uring HERE ──────────────────────────────────────────
+// ─── WHY THERE IS io_uring HERE NOW ─────────────────────────────────────────
 //
-// The control socket is drained with ordinary non-blocking reads, from the
-// daemon's existing 2-second health timer and from any command that is about
-// to read the figures.  It is deliberately not armed on the ring.  Adding a
-// descriptor to the ring means an owner token, a balanced arm/disarm, and a
-// completion that can outlive what it names — the exact shape of this
-// project's worst defects — and it would buy nothing: the child pushes on its
-// own schedule and the daemon only has to pick the newest one up.
+// There was not, and the reason given was sound for what the socket carried:
+// a stats push, an endpoint table, a publish.  For all three, a drain on the
+// 2-second health timer and before any command that reads figures is enough —
+// the child pushes on its own schedule, `stats` prints the age of what it
+// found, and nobody is waiting on a particular byte.  Arming a descriptor costs
+// an owner token, a balanced arm/disarm and a completion that can outlive what
+// it names, which is the shape of this project's worst defects.
+//
+// Then a request went on the same socket, and the reasoning did not survive it.
+// A request has somebody waiting on it by definition.  Measured: an in-daemon
+// `cache set` answers in 0.15 ms, and the same command against a cache in a
+// worker answered in 2000.02 ms — one health tick, to the hundredth of a
+// millisecond, because that is the only thing that was going to read the reply.
+//
+// So the fd is armed for readability and the loop wakes on the answer.  The
+// timer still drains, as the backstop for a poll that could not be submitted.
 #include <chrono>
 #include <string>
 #include <sys/types.h>
@@ -51,9 +60,29 @@ struct runtime_config;
 // back as a chan_rep.  The daemon is the only process holding the whole map, so
 // it is the only one that can route; the supervisor is where a worker's request
 // enters that map and where its answer leaves it.
-class proxy_supervisor : public request_sink, public request_origin
+// And an io_handler, because the control socket carries requests now.
+//
+// It used to carry three things — a stats push, an endpoint table, a publish —
+// and for all three a drain every two seconds on the health tick was right:
+// `stats` prints figures with their age attached, and nobody is waiting.  A
+// request is not that.  Putting one on this socket without changing how it is
+// serviced made a cross-process `cache get` cost one whole tick: measured
+// against an in-daemon cache at 0.15 ms, a cache in a worker answered in
+// 2000.02 ms, which is the timer and nothing else.
+//
+// So the fd is armed in the ring for readability and the loop wakes on the
+// reply.  The health tick still drains as a backstop, for the case where a poll
+// submission is refused.
+class proxy_supervisor : public request_sink, public request_origin,
+                         public io_handler
 {
 public:
+    // Where the control socket is armed.  Without one the supervisor still
+    // works and still answers, on the health tick, which is what it did before.
+    void set_event_loop(event_loop* loop);
+
+    void on_cqe(struct io_uring_cqe* cqe) override;
+
     // Never inline: the answer is in another process and the only ways to
     // pretend otherwise are to block this thread or to make it up.
     bool serves_inline() const override { return false; }
@@ -133,6 +162,19 @@ private:
     void   close_control();
     bool   write_frame(const std::string& framed);
     void   on_chan_req(std::string_view payload);
+
+    // Arm the control socket for readability, if there is a loop and a socket
+    // and nothing armed already.  Re-armed from on_cqe(): one-shot, because a
+    // multishot poll on a descriptor this class closes on several paths is a
+    // completion outliving its fd, and the arm costs one SQE per exchange.
+    void   flush_control();
+    size_t pending_out() const { return m_out.size() - m_out_off; }
+
+    void   arm_control_poll();
+    // Give the arm back before the descriptor goes.  A completion for a closed
+    // fd is dropped by the loop for a deregistered owner, and this is what makes
+    // sure the owner is deregistered.
+    void   disarm_control_poll();
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
 
@@ -154,6 +196,23 @@ private:
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
     std::string       m_in;               // partial frames from the child
+
+    // Frames written but not yet taken by the socket.  Bounded, because the
+    // alternative to a bound is the daemon growing without limit on behalf of a
+    // child that has stopped reading.  Generous next to what a control socket
+    // holds — about 270 request frames — so a burst is absorbed rather than
+    // refused, and small next to the channel's own 16 MB queue, which is the
+    // thing actually meant to bound a client that pipelines.
+    static constexpr size_t MAX_CONTROL_BACKLOG = 4u << 20;
+
+    std::string  m_out;
+    size_t       m_out_off{0};
+    bool         m_out_full{false};
+
+    event_loop*  m_loop{nullptr};
+    io_request   m_poll_req{};
+    unsigned     m_poll_mask{0};
+    bool         m_poll_armed{false};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

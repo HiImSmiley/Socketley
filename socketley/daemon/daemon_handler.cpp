@@ -3241,6 +3241,7 @@ void daemon_handler::reconcile_proxy_workers()
         // somewhere to go, and pointed at the placeholder so that
         // publish_sinks() below picks it up instead of the empty local object.
         sup->set_channel(&m_manager.requests());
+        sup->set_event_loop(&m_loop);
         inst->set_request_sink_override(sup.get());
 
         if (!sup->spawn(cfg))
