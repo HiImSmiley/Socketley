@@ -152,6 +152,30 @@ const char* request_status_text(request_status st);
 // daemon would register a socket-backed sink instead and nothing on the asking
 // side would change.
 //
+// ─── WHAT SUCH A SINK WOULD SPEAK, AND WHAT IT MUST NOT ─────────────────────
+//
+// Settled on 2026-08-03, because the obvious two answers are both wrong and
+// each looks right until it is tried.
+//
+// NOT the cache's text protocol.  Its replies are not self-delimiting: ten
+// commands answer over several lines and end with `end\n`, so a client can
+// only tell where one reply stops if it knows, per command, which kind it is.
+// That puts the cache's command table in a second place, where it will rot.
+//
+// NOT RESP either, which would be self-delimiting.  Translating the payload
+// into it is the problem: cache_instance::process_command() splits a line
+// positionally — command to the first space, key to the second, and everything
+// after that is the value, spaces included, so `SET k hello world` stores
+// "hello world".  Producing RESP arrays from that needs an arity table per
+// command, which is the same duplication by another route.
+//
+// The transport with neither difficulty is the one already carrying the
+// endpoint table into workers: shared/worker_protocol.h, length-prefixed
+// frames with a message kind.  The request is a frame, the reply is a frame,
+// and nothing on either side has to know what a cache command means.  What is
+// missing is the other end — a cache that runs in a worker at all — so the
+// sink is written after that exists and not before.
+//
 // A payload is what would arrive on the target's own port — for the cache, a
 // newline-delimited command stream, answered line by line with the replies
 // concatenated in order.  One line in and one line out is the ordinary case and
