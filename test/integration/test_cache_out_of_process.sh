@@ -143,5 +143,29 @@ else
     echo "  (nc absent — the cross-process cache assertions did not run)"
 fi
 
+# ── and stopping one does not leave a corpse behind ─────────────────────────
+#
+# shutdown() signals the child and tries once to reap it, which all but never
+# succeeds — the worker is unwinding its ring at that instant.  Everything after
+# that relied on the health timer's waitpid, and the health timer walks the
+# supervisor map, and the stop path erases the supervisor in the same statement
+# that calls shutdown().  So nothing ever waited on the child again: one zombie
+# per stop, held for the life of the daemon.  Ten cycles on the build before this
+# was fixed leave ten of them.
+if [ -n "$DAEMON_PID" ]; then
+    for i in 1 2 3; do
+        "$BIN" create cache "zz$i" -p $((PORT + 50 + i)) --resp --out-of-process -s >/dev/null 2>&1
+        sleep 0.5
+        "$BIN" stop "zz$i"   >/dev/null 2>&1
+        "$BIN" remove "zz$i" >/dev/null 2>&1
+    done
+    sleep 4          # at least one health tick, which is what sweeps them
+    ZOMB=$(ps -o stat= --ppid "$DAEMON_PID" 2>/dev/null | grep -c Z)
+    if [ "$ZOMB" -eq 0 ]; then ok; else
+        bad "a stopped worker is reaped, not left as a zombie" \
+            "$ZOMB unreaped children after 3 create/stop cycles"
+    fi
+fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

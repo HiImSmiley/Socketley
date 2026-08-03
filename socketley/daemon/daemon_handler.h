@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include <chrono>
 #include <sys/un.h>
 
 #include "../shared/event_loop_definitions.h"
@@ -196,6 +197,23 @@ private:
     // Drain every worker's control socket so the figures are current.  Called
     // before the commands that print them.
     void poll_proxy_workers();
+
+    // ── Children whose supervisor is gone ───────────────────────────────────
+    // A worker that has been signalled but not yet exited, taken over from the
+    // supervisor being destroyed.  Nobody else can reap it: the daemon also
+    // waitpid()s its managed runtimes by pid, so a catch-all SIGCHLD reaper
+    // would swallow their exit status.
+    struct orphan_worker
+    {
+        pid_t                                 pid;
+        std::chrono::steady_clock::time_point signalled_at;
+        bool                                  killed{false};
+    };
+    std::vector<orphan_worker> m_orphan_workers;
+
+    // waitpid(WNOHANG) over the list, and SIGKILL for anything still there a few
+    // seconds after its SIGTERM.  Called from the health timer.
+    void reap_orphan_workers();
 
     // Encode the manager's endpoint table and push it to every worker.
     void publish_endpoints_to_workers(const endpoint_table& tbl);

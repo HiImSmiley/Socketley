@@ -102,6 +102,17 @@ public:
     bool  is_alive() const { return m_pid > 0; }
     pid_t pid()      const { return m_pid; }
 
+    // Hand the child over to somebody who will outlive this object.
+    //
+    // shutdown() signals and tries once to reap, which nearly always fails: the
+    // child is unwinding its ring at that instant.  Everything after that
+    // depended on this supervisor still being in the map for the health timer to
+    // find — and on the stop path it is erased in the same statement, so nothing
+    // ever waited on the child again and it stayed a zombie for the life of the
+    // daemon.  Returning the pid and forgetting it here makes the handover
+    // explicit and keeps the destructor from signalling a second time.
+    pid_t release_pid() { const pid_t p = m_pid; m_pid = 0; return p; }
+
     void set_death_policy(death_policy p) { m_policy = p; }
     death_policy get_death_policy() const { return m_policy; }
 

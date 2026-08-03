@@ -30,6 +30,7 @@
 #include <iostream>
 #include <filesystem>
 #include <sys/wait.h>
+#include <csignal>
 #include "../shared/logging.h"
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
@@ -301,8 +302,18 @@ void daemon_handler::teardown()
     // reparented to init, still bound to their ports, and the next daemon would
     // fail to bind.
     for (auto& [_, sup] : m_proxy_workers)
+    {
         sup->shutdown();
+        if (const pid_t p = sup->release_pid(); p > 0)
+            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
+    }
     m_proxy_workers.clear();
+
+    // The children are on their way out and this process is too, so init would
+    // adopt whatever is left.  Reaped here anyway for the case teardown() does
+    // not end in exit(): a daemon that is torn down and set up again would
+    // otherwise carry the previous generation's zombies for the rest of its life.
+    reap_orphan_workers();
 
     // Nothing may call the sink once the workers are gone: it would encode a
     // table for an empty map, which is harmless, but the manager outlives this
@@ -3198,6 +3209,12 @@ void daemon_handler::reconcile_proxy_workers()
             continue;
         }
         it->second->shutdown();
+        // shutdown() reaps only a child that was already gone, and one that has
+        // just been asked to unwind its ring never is.  The supervisor is
+        // destroyed on the next line, so this is the last moment anything knows
+        // the pid.
+        if (const pid_t p = it->second->release_pid(); p > 0)
+            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
         it = m_proxy_workers.erase(it);
     }
 
@@ -3242,8 +3259,46 @@ void daemon_handler::reconcile_proxy_workers()
     }
 }
 
+void daemon_handler::reap_orphan_workers()
+{
+    if (m_orphan_workers.empty())
+        return;
+
+    // Long enough for a worker to cancel its ring and close its connections,
+    // short enough that a daemon stopping runtimes in a loop does not accumulate
+    // them.  A child that is still here after this has not answered SIGTERM and
+    // is not going to.
+    constexpr auto kill_after = std::chrono::seconds(5);
+    const auto     now        = std::chrono::steady_clock::now();
+
+    for (auto it = m_orphan_workers.begin(); it != m_orphan_workers.end();)
+    {
+        // ECHILD as well as a positive pid: if it is not ours any more there is
+        // nothing left to wait for, and keeping the entry would mean signalling
+        // a number the kernel is free to hand to somebody else.
+        const pid_t r = ::waitpid(it->pid, nullptr, WNOHANG);
+        if (r > 0 || (r < 0 && errno == ECHILD))
+        {
+            it = m_orphan_workers.erase(it);
+            continue;
+        }
+
+        if (!it->killed && now - it->signalled_at > kill_after)
+        {
+            const std::string note = "worker " + std::to_string(it->pid) +
+                                     " did not exit on SIGTERM; killing it";
+            LOG_WARN(note.c_str());
+            ::kill(it->pid, SIGKILL);
+            it->killed = true;
+        }
+        ++it;
+    }
+}
+
 void daemon_handler::check_managed_health()
 {
+    reap_orphan_workers();
+
     // The children first: liveness, then whatever they have reported.  Both
     // before the managed-runtime sweep below, which can return early.
     for (auto& [worker_name, sup] : m_proxy_workers)
