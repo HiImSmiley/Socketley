@@ -216,7 +216,15 @@ public:
     // Take a request this sink promised to complete later.  Returning false
     // means it could not even accept it — the channel then answers the origin
     // `no_target` rather than parking something nobody will ever complete.
-    virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*payload*/)
+    //
+    // The name is passed as well as the payload, and it is not redundant.  A
+    // sink registered under one name knows what it is; the default sink is
+    // registered under none and forwards for every name in the daemon, so
+    // without this it would have to be told out of band which request it is
+    // being handed — a second channel of information between two calls that are
+    // one operation.
+    virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*target*/,
+                                std::string_view /*payload*/)
     { return false; }
 };
 
@@ -262,6 +270,25 @@ public:
     void clear_sinks();
     void register_sink(std::string_view name, request_sink* sink);
     void drop_sink(const request_sink* sink);
+
+    // Where a request goes when the name is in nobody's table here.
+    //
+    // The daemon never sets one: it holds the whole map, so a name it does not
+    // know is a name that does not exist, and `no such runtime` is the truth.
+    //
+    // A worker is the opposite case. It holds exactly one runtime and knows
+    // nothing about the rest, so an unknown name is not evidence of anything —
+    // it is the ordinary case, and `server --cache c` in a worker hit it for
+    // every single request. Pointing the default at the control socket makes
+    // the daemon the router, which is the only process in a position to be one.
+    //
+    // The worker registers its own runtime by name as well, and that is not
+    // decoration: without it a request for the worker's own name would go out
+    // to the daemon, whose sink for that name is the supervisor of this very
+    // worker, and come straight back. The table entry is what stops the cycle;
+    // proxy_supervisor refuses the same loop from its own side as well.
+    void set_default_sink(request_sink* sink) { m_default_sink = sink; }
+    request_sink* default_sink() const { return m_default_sink; }
 
     // Ask `target` to answer `payload`.  False means the request was not taken
     // — no ring, or the queue is full — and no reply will ever be delivered for
@@ -325,6 +352,10 @@ private:
 
     std::deque<entry> m_queue;
     endpoint_table::transparent_map<request_sink*> m_sinks;
+
+    // Not cleared by clear_sinks(): the table is rebuilt on every membership
+    // change and the fallback is a property of the process, not of the map.
+    request_sink* m_default_sink{nullptr};
 
     // Requests handed to a sink that could not answer inline, waiting for it to
     // call complete_deferred().

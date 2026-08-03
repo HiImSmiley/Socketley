@@ -92,6 +92,11 @@ void request_channel::drop_sink(const request_sink* sink)
         else
             ++it;
     }
+
+    // The fallback too, or dropping a sink would leave every unknown name
+    // pointing at it.
+    if (m_default_sink == sink)
+        m_default_sink = nullptr;
 }
 
 bool request_channel::origin_live(const request_origin* o) const
@@ -256,7 +261,7 @@ void request_channel::drain()
         // request can reach Lua, Lua can create or remove a runtime, and that
         // republishes the whole sink table underneath this iterator.
         auto  sit  = m_sinks.find(e.target);
-        auto* sink = (sit == m_sinks.end()) ? nullptr : sit->second;
+        auto* sink = (sit == m_sinks.end()) ? m_default_sink : sit->second;
         if (sink && !sink->serves_inline())
         {
             // The sink is on the other side of something — a socket, another
@@ -272,7 +277,7 @@ void request_channel::drain()
             {
                 const uint64_t ticket = m_next_ticket++;
                 m_parked.emplace(ticket, parked_request{e.origin, e.cookie});
-                if (sink->serve_deferred(ticket, e.payload))
+                if (sink->serve_deferred(ticket, e.target, e.payload))
                 {
                     m_stat_deferred++;
                     continue;      // the reply comes from complete_deferred()

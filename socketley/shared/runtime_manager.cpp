@@ -689,10 +689,11 @@ void runtime_manager::publish_endpoints()
     // a request that arrives for it is better answered "no such target" than
     // served out of an empty one.
     //
-    // A worker's placeholder answers null here like every non-cache runtime, so
-    // nothing registers for a runtime that lives in another process — which is
-    // right: the request channel delivers by calling a sink on this thread, and
-    // there is no object on this side to call.
+    // A worker's placeholder answers with its supervisor, which is a sink that
+    // cannot serve inline: the request is parked and put on the control socket
+    // instead of being computed on this thread.  Before that existed the
+    // placeholder answered null and a runtime in another process was simply
+    // unreachable by name.
     {
         std::shared_lock lock(mutex);
         m_requests.clear_sinks();

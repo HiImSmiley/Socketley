@@ -55,6 +55,23 @@ proxy_supervisor::proxy_supervisor(runtime_instance* placeholder, std::string ex
 
 proxy_supervisor::~proxy_supervisor()
 {
+    // Three things outlive a supervisor and all three can be holding it: the
+    // placeholder keeps it as its sink override, and the channel keeps it as a
+    // sink and — since a worker can ask as well as answer — as an origin.  A
+    // supervisor dies whenever its runtime is stopped while the runtime itself
+    // stays in the map, so this is an ordinary event, not a shutdown-only one.
+    //
+    // The sink table only holds running runtimes, which is what has kept the
+    // override from being dereferenced after the fact so far.  That is a
+    // property of another file's filter, not of this one, and it is not worth
+    // depending on.
+    if (m_placeholder)
+        m_placeholder->set_request_sink_override(nullptr);
+    if (m_channel)
+    {
+        m_channel->drop_sink(this);
+        m_channel->drop_origin(this);
+    }
     shutdown();
 }
 
@@ -352,6 +369,11 @@ void proxy_supervisor::ingest(const std::string&)
                 break;
             }
 
+            case worker_proto::frame_type::chan_req:
+                // A request from the worker's runtime for one it cannot see.
+                on_chan_req(payload);
+                break;
+
             case worker_proto::frame_type::state:
                 // Reported for the log, not acted on: the daemon's own record
                 // of created/running/stopped is what the CLI is promised, and
@@ -478,13 +500,65 @@ bool proxy_supervisor::check_liveness()
 // write that does not queue means the child is gone or wedged; saying so here
 // is what keeps a ticket from being parked for something that will never
 // answer — the channel then tells the origin `no_target` instead.
-bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view payload)
+bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
+                                      std::string_view payload)
 {
     if (!m_channel)
         return false;
-    const std::string name = m_placeholder ? std::string(m_placeholder->get_name())
-                                           : std::string();
+    // `target` is this supervisor's own runtime by construction — the channel
+    // only reaches here through the name this sink is registered under — but it
+    // is sent rather than re-derived, so the two sides read the same field.
     return write_frame(worker_proto::frame(
         worker_proto::frame_type::chan_req,
-        worker_proto::encode_chan_request(ticket, name, payload)));
+        worker_proto::encode_chan_request(ticket, target, payload)));
+}
+
+// ─── the other direction ────────────────────────────────────────────────────
+
+void proxy_supervisor::on_chan_req(std::string_view payload)
+{
+    worker_proto::chan_request_wire q;
+    if (!worker_proto::decode_chan_request(payload, q))
+        return;
+
+    const auto refuse = [&](request_status st)
+    {
+        if (!write_frame(worker_proto::frame(
+                worker_proto::frame_type::chan_rep,
+                worker_proto::encode_chan_reply(q.ticket,
+                    static_cast<uint8_t>(st), {})))) {}
+    };
+
+    // The one cycle this arrangement can produce, cut here.
+    //
+    // A worker asking for its own name would be posted into the daemon's
+    // channel, whose sink for that name is this supervisor, which would put it
+    // straight back on the wire to the worker that asked.  The worker registers
+    // its own runtime precisely so this does not arise, and this is the second
+    // lock on the same door: a worker built by an older binary, or one whose
+    // runtime failed to build at all, must not be able to start the two
+    // processes handing one request back and forth for ever.
+    if (m_placeholder && q.target == m_placeholder->get_name())
+    {
+        refuse(request_status::no_target);
+        return;
+    }
+
+    if (!m_channel ||
+        !m_channel->post(this, q.ticket, q.target, q.payload, request_class::client))
+    {
+        // Nothing was taken, so no on_request_reply() is coming and the worker
+        // would wait for ever.  Answering here is the whole difference between
+        // a refusal and a hang.
+        refuse(request_status::no_target);
+    }
+}
+
+void proxy_supervisor::on_request_reply(uint64_t cookie, request_status st,
+                                        std::string_view reply)
+{
+    if (!write_frame(worker_proto::frame(
+            worker_proto::frame_type::chan_rep,
+            worker_proto::encode_chan_reply(cookie, static_cast<uint8_t>(st),
+                                            reply)))) {}
 }

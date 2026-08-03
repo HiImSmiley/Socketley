@@ -20,6 +20,7 @@
 #include "../../shared/runtime_config_apply.h"
 #include "../../shared/runtime_factory.h"
 #include "../../shared/runtime_instance.h"
+#include "../../shared/runtime_manager.h"
 #include "../../shared/state_persistence.h"
 #include "../../shared/worker_protocol.h"
 
@@ -53,10 +54,53 @@ bool write_all(int fd, std::string_view buf)
     return true;
 }
 
+// Every runtime this process does not hold.
+//
+// The worker's own channel can serve exactly one name — the runtime in this
+// process — and until now that was the whole of its world: `server --cache c`
+// in a worker found no manager at all, so post_cache_request() returned before
+// posting anything and the client waited for an answer nobody was ever going to
+// write. Not an error, not a refusal. Silence, until the socket timed out.
+//
+// This is the mirror of proxy_supervisor's sink. Same wire, same ticket
+// discipline, opposite direction: the request goes out on the control socket,
+// the daemon looks the name up in the map only it holds, and the answer comes
+// back as a chan_rep. The asking runtime cannot tell — which is the property
+// the whole channel exists to provide, now finally true in both directions.
+class remote_sink : public request_sink
+{
+public:
+    explicit remote_sink(int fd) : m_fd(fd) {}
+
+    void serve_request(std::string_view, std::string& out) override
+    {
+        // Unreachable: serves_inline() is false. If the channel ever calls it,
+        // an answer invented here would be worse than none.
+        out.clear();
+    }
+
+    bool serves_inline() const override { return false; }
+
+    bool serve_deferred(uint64_t ticket, std::string_view target,
+                        std::string_view payload) override
+    {
+        // The name travels with the request rather than being resolved here,
+        // because this process cannot resolve it. Refusing on a failed write is
+        // what keeps a ticket from being parked against a daemon that is not
+        // reading: the channel answers the origin no_target instead.
+        return write_all(m_fd,
+            worker_proto::frame(worker_proto::frame_type::chan_req,
+                worker_proto::encode_chan_request(ticket, target, payload)));
+    }
+
+private:
+    int m_fd;
+};
+
 class worker
 {
 public:
-    explicit worker(int control_fd) : m_fd(control_fd) {}
+    explicit worker(int control_fd) : m_fd(control_fd), m_remote(control_fd) {}
 
     int run()
     {
@@ -115,6 +159,10 @@ public:
         // into a segfault the last time it was got wrong.
         if (m_rt && m_rt->get_state() == runtime_running)
             m_rt->stop(m_loop);
+
+        // Before the ring, like every other owner registration: detach answers
+        // whatever is still queued `dropped` and gives the owner token back.
+        m_manager.requests().detach();
         m_loop.shutdown_ring();
 
         return m_exit_code;
@@ -230,6 +278,7 @@ private:
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
+            case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
@@ -314,6 +363,26 @@ private:
         if (!cfg.key_path.empty())      m_rt->set_key_path(cfg.key_path);
         if (!cfg.ca_path.empty())       m_rt->set_ca_path(cfg.ca_path);
         if (!cfg.target.empty())        m_rt->set_target(cfg.target);
+        if (!cfg.cache_name.empty())    m_rt->set_cache_name(cfg.cache_name);
+
+        // ── the channel, both directions ────────────────────────────────────
+        //
+        // A runtime asks through its manager, and a worker had none: every
+        // `cache` command a server in a worker was given died at the
+        // `if (!mgr) return;` in post_cache_request(), unanswered.  The map
+        // stays empty on purpose — this process holds one runtime and the
+        // manager is here for the channel — and every call site that looks a
+        // name up in it already handles not finding one, which in a worker is
+        // the truth rather than a failure.
+        //
+        // Its own name is registered so a request for it is served here rather
+        // than making a round trip through the daemon, which would route it
+        // back to this very worker.
+        m_manager.requests().attach(m_loop);
+        if (auto* sink = m_rt->as_request_sink())
+            m_manager.requests().register_sink(cfg.name, sink);
+        m_manager.requests().set_default_sink(&m_remote);
+        m_rt->set_runtime_manager(&m_manager);
 
         // A script that does not load is a configuration this worker cannot
         // serve, not a warning to carry on past.
@@ -422,6 +491,21 @@ private:
                           worker_proto::encode_chan_reply(q.ticket, st, reply)))) {}
     }
 
+    // The answer to something this worker's runtime asked of a runtime it
+    // cannot see.  The ticket is one this process issued, so it can only ever
+    // match a request parked here — a chan_rep the other way carries the
+    // daemon's ticket and is read by the daemon, never by this.  The two
+    // namespaces never meet, which is why neither needs a tag.
+    void on_chan_rep(const std::string& payload)
+    {
+        worker_proto::chan_reply_wire p;
+        if (!worker_proto::decode_chan_reply(payload, p))
+            return;
+
+        m_manager.requests().complete_deferred(
+            p.ticket, static_cast<request_status>(p.status), p.payload);
+    }
+
     void on_publish(const std::string& payload)
     {
         if (!m_rt)
@@ -462,6 +546,13 @@ private:
 
     int                                    m_fd;
     event_loop                             m_loop;
+    remote_sink                            m_remote;
+    // Empty map, live channel.  See the wiring in on_config().  Declared before
+    // the runtime so it outlives it: a runtime revokes its origin as it is
+    // destroyed, and that call needs a channel that is still there — the same
+    // ordering runtime_manager itself documents, and the same UBSan report if
+    // it is got wrong.
+    runtime_manager                        m_manager;
     std::unique_ptr<runtime_instance>       m_owned;
     // The runtime this worker owns, and the same pointer narrowed when it
     // happens to be a proxy.  Everything generic goes through m_rt; m_proxy is

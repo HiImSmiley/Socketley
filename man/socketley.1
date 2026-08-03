@@ -1534,8 +1534,12 @@ response is charged to its breaker so the next client is routed elsewhere.
 .SS Process Isolation
 .TP
 .B \-\-out\-of\-process
-Run this proxy in a worker process supervised by the daemon, instead of
+Run this runtime in a worker process supervised by the daemon, instead of
 inside the daemon itself. Off by default.
+.IP
+Not a proxy flag, though it was one for a while: a server, a client and a
+cache take it as well, and the worker builds whatever type its configuration
+frame names.
 .IP
 The daemon forks and execs itself, hands the worker its configuration and
 its routing table over a control socket, and keeps a placeholder for it in
@@ -4644,8 +4648,19 @@ One thing is given up with it. A script's
 declaration is read from the placeholder, so an out\-of\-process runtime
 publishes none \(em a gateway in front of one forwards to it without the 405 it
 could otherwise refuse at the edge. The declaration is a handler's feature
-rather than a proxy's, and only a proxy can be moved out of process today, so
-nothing that can currently be split declares routes at all.
+rather than a proxy's, so a server moved out of process gives it up too.
+.PP
+.B "A runtime in a worker can still ask another runtime by name."
+.B \-\-cache
+works across the boundary in both directions. A request for a name the asking
+process does not hold goes out on the control socket; the daemon holds the
+whole map and is the only process that can route, so it looks the name up,
+posts the request to whatever answers for it \(em in the daemon or in another
+worker \(em and writes the answer back. Neither the asking runtime nor the
+client on the other end of the socket can tell which arrangement served it.
+A name nobody answers to is refused, with the same
+.B "error: no such runtime"
+an in\-process runtime gives, rather than being dropped in silence.
 .PP
 .B "The cross\-runtime management API is refused inside a worker."
 A worker is a separate process holding one runtime and no runtime manager, so

@@ -838,6 +838,19 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
+        // Refused rather than ignored.  Honouring it would mean moving a
+        // configured runtime from one address space to another underneath
+        // whatever is already pointing at it, and quietly dropping it would
+        // leave the operator believing a runtime is isolated when it is not.
+        //
+        // Here rather than in parse_proxy_edit_flags, where it lived while this
+        // was a proxy-only flag: `edit server x --out-of-process` answered
+        // "unknown flag" and `edit proxy x --out-of-process` answered the
+        // refusal, for the same request against the same field.
+        case fnv1a("--out-of-process"):
+            std::cout << "--out-of-process can only be set when the runtime is created\n";
+            return 1;
+
         case fnv1a("-p"):
         {
             if (is_running)
@@ -1372,13 +1385,6 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
-        // Refused rather than ignored.  Honouring it would mean moving a
-        // configured runtime from one address space to another underneath
-        // whatever is already pointing at it, and quietly dropping it would
-        // leave the operator believing a proxy is isolated when it is not.
-        case fnv1a("--out-of-process"):
-            std::cout << "--out-of-process can only be set when the proxy is created\n";
-            return 1;
         // The mesh client-certificate flags, taken here as they are on the
         // create path.  They live with the proxy rather than in the common
         // edit handler because that is where they exist at all: a server or

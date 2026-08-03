@@ -54,6 +54,7 @@ struct deferred_sink : request_sink
     bool accept{true};
     std::vector<uint64_t>    tickets;
     std::vector<std::string> payloads;
+    std::vector<std::string> targets;
 
     void serve_request(std::string_view, std::string& out) override
     {
@@ -62,11 +63,13 @@ struct deferred_sink : request_sink
         out += "INLINE-WAS-CALLED";
     }
     bool serves_inline() const override { return false; }
-    bool serve_deferred(uint64_t ticket, std::string_view payload) override
+    bool serve_deferred(uint64_t ticket, std::string_view target,
+                        std::string_view payload) override
     {
         if (!accept)
             return false;
         tickets.push_back(ticket);
+        targets.emplace_back(target);
         payloads.emplace_back(payload);
         return true;
     }
@@ -127,6 +130,7 @@ TEST_CASE("a deferred sink answers nothing until it says so")
     // an answer the sink never gave or a stalled loop.
     REQUIRE(sink.tickets.size() == 1);
     CHECK(sink.payloads[0] == "GET k");
+    CHECK(sink.targets[0] == "remote");   // the name reaches the sink, not just the bytes
     CHECK(origin.replies.empty());
     CHECK(ch.parked_count() == 1);
 
@@ -230,6 +234,102 @@ TEST_CASE("an origin that goes away takes its parked requests with it")
 
     ch.complete_deferred(sink.tickets[0], request_status::ok, "too late");
     CHECK(origin.replies.empty());
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+// ─── the fallback, and why a worker needs one ───────────────────────────────
+//
+// The daemon holds every runtime, so a name it does not know does not exist.
+// A worker holds one, so a name it does not know is the ordinary case: the
+// whole rest of the daemon.  Without a fallback `server --cache c` inside a
+// worker resolved to nothing on every request — and not to an error, because
+// the runtime never even reached the channel.  The client simply waited.
+
+TEST_CASE("an unknown name goes to the default sink, with the name")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    deferred_sink fallback;
+    recording_origin origin;
+    ch.set_default_sink(&fallback);          // and nothing registered by name
+
+    REQUIRE(ch.post(&origin, 3, "somewhere-else", "GET k", request_class::client));
+    pump(loop);
+
+    // The name has to survive: the fallback is registered under no name at all
+    // and forwards for every one of them, so it cannot infer which it is
+    // holding.  This is what the sink signature carries the target for.
+    REQUIRE(fallback.tickets.size() == 1);
+    CHECK(fallback.targets[0] == "somewhere-else");
+    CHECK(fallback.payloads[0] == "GET k");
+    CHECK(origin.replies.empty());
+
+    ch.complete_deferred(fallback.tickets[0], request_status::ok, "v");
+    REQUIRE(origin.replies.size() == 1);
+    CHECK(origin.replies[0].cookie == 3);
+    CHECK(origin.replies[0].payload == "v");
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+TEST_CASE("a registered name is served here rather than sent to the fallback")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    inline_sink      mine;
+    deferred_sink    fallback;
+    recording_origin origin;
+    ch.register_sink("mine", &mine);
+    ch.set_default_sink(&fallback);
+
+    REQUIRE(ch.post(&origin, 1, "mine", "PING", request_class::client));
+    pump(loop);
+
+    // Not a preference — a termination condition.  In a worker the fallback is
+    // the control socket to the daemon, and the daemon's sink for this worker's
+    // own name is the supervisor that would put the request straight back on
+    // that socket.  The table entry is what stops the two processes handing one
+    // request to each other for ever.
+    CHECK(mine.calls == 1);
+    CHECK(fallback.tickets.empty());
+    REQUIRE(origin.replies.size() == 1);
+    CHECK(origin.replies[0].payload == "+PONG\r\n");
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
+TEST_CASE("dropping a sink drops it as the fallback too")
+{
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    deferred_sink    fallback;
+    recording_origin origin;
+    ch.set_default_sink(&fallback);
+    REQUIRE(ch.default_sink() == &fallback);
+
+    // Otherwise every unknown name would keep pointing at storage the caller
+    // has just withdrawn, which is worse than the no_target it replaces.
+    ch.drop_sink(&fallback);
+    CHECK(ch.default_sink() == nullptr);
+
+    REQUIRE(ch.post(&origin, 1, "gone", "GET k", request_class::client));
+    pump(loop);
+    REQUIRE(origin.replies.size() == 1);
+    CHECK(origin.replies[0].st == request_status::no_target);
+    CHECK(fallback.tickets.empty());
 
     ch.detach();
     loop.shutdown_ring();

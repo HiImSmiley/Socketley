@@ -45,14 +45,27 @@ struct runtime_config;
 // the supervisor already holds, and the reply frame comes back to
 // complete_deferred().  Nothing on the asking side changes, which is what
 // request_channel.h promised before either half existed.
-class proxy_supervisor : public request_sink
+// And the request_origin for requests coming the other way.  A runtime in a
+// worker knows one name — its own — so everything else it asks for arrives here
+// as a chan_req, is posted into the daemon's channel, and the reply is written
+// back as a chan_rep.  The daemon is the only process holding the whole map, so
+// it is the only one that can route; the supervisor is where a worker's request
+// enters that map and where its answer leaves it.
+class proxy_supervisor : public request_sink, public request_origin
 {
 public:
     // Never inline: the answer is in another process and the only ways to
     // pretend otherwise are to block this thread or to make it up.
     bool serves_inline() const override { return false; }
     void serve_request(std::string_view, std::string&) override {}
-    bool serve_deferred(uint64_t ticket, std::string_view payload) override;
+    bool serve_deferred(uint64_t ticket, std::string_view target,
+                        std::string_view payload) override;
+
+    // A reply to something the worker asked.  The cookie is the worker's own
+    // ticket, handed back unchanged so it can pair the two without this side
+    // keeping a table.
+    void on_request_reply(uint64_t cookie, request_status st,
+                          std::string_view reply) override;
 
     void set_channel(request_channel* ch) { m_channel = ch; }
     // What to do when the child dies without being asked to.
@@ -119,6 +132,7 @@ public:
 private:
     void   close_control();
     bool   write_frame(const std::string& framed);
+    void   on_chan_req(std::string_view payload);
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
 
