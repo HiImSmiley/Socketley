@@ -102,82 +102,102 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 
 ## Performance
 
-All benchmarks: single-threaded, loopback TCP, Release build. Measured inside a Lima VM (4 vCPU / 3.8 GiB) on an Intel Core Ultra 5 125H, Linux 6.8. Bare-metal performance will be higher.
+**How these were measured.** Development box, 4 cores, Linux 7.0, Release
+build, loopback TCP. The daemon is pinned to CPU 0,1 and the load generator to
+CPU 2,3, so the two are not competing for the same cores. Every measurement
+waits until fewer than 1000 sockets are in `TIME_WAIT` before it starts — a
+2000-connection run leaves ~10000 behind for a full 2×MSL, and a benchmark
+started on top of that measures port pressure rather than this daemon. Each
+figure is the median of three runs, and the spread across those runs is given
+beside it, because several of these numbers move by more than a fifth between
+runs on a machine this size.
 
-### Cache vs Redis 7.0 (RESP2, `redis-benchmark`)
+Numbers from a different machine are not comparable with these. That is what
+the spread column is for: treat anything inside it as unchanged.
 
-> Both servers use the same Redis wire protocol (RESP2) and the same benchmark tool.
-> Socketley is **single-threaded**. Redis 7.x is also single-threaded (event loop).
+### Cache vs Redis 7.0.15 (RESP2, `redis-benchmark`)
 
-**Pipeline depth = 1** (one outstanding request per client, 50 clients, 200K ops each):
+> Both servers speak RESP2 and are driven by the same tool, `redis-benchmark`,
+> 50 clients. Socketley is single-threaded; Redis 7.x is also single-threaded.
 
-| Operation    | Socketley     | Redis 7.0     | Ratio  |
-|-------------|---------------|---------------|--------|
-| SET         | 188K ops/s    | 156K ops/s    | **1.2x** |
-| GET         | 198K ops/s    | 172K ops/s    | **1.1x** |
-| LPUSH       | 203K ops/s    | 157K ops/s    | **1.3x** |
-| LPOP        | 197K ops/s    | 165K ops/s    | **1.2x** |
-| SADD        | 194K ops/s    | 153K ops/s    | **1.3x** |
-| HSET        | 188K ops/s    | 146K ops/s    | **1.3x** |
+**Pipeline depth 1** — 200K operations per test:
 
-At P=1, throughput is dominated by loopback round-trip latency (~0.13 ms), both servers are essentially equivalent.
+| Operation | Socketley    | Redis 7.0.15 | Ratio |
+|-----------|--------------|--------------|-------|
+| SET       | 186K ±6%     | 192K ±7%     | 0.97× |
+| GET       | 180K ±7%     | 178K ±7%     | 1.01× |
+| LPUSH     | 173K ±12%    | 180K ±6%     | 0.96× |
+| LPOP      | 167K ±19%    | 170K ±26%    | 0.98× |
+| SADD      | 177K ±27%    | 164K ±28%    | 1.08× |
+| HSET      | 170K ±27%    | 165K ±27%    | 1.03× |
 
-**Pipeline depth = 100** (100 pipelined requests, 50 clients, 2M ops each):
+At depth 1 the two are **indistinguishable**: every ratio is inside the spread
+of the measurement. Throughput here is dominated by the loopback round trip,
+and neither server is doing enough work per operation for the difference to
+show. Any claim of an advantage in either direction at this depth is noise.
 
-| Operation    | Socketley      | Redis 7.0     | Speedup   |
-|-------------|----------------|---------------|-----------|
-| SET         | **8.51M ops/s** | 3.12M ops/s  | **2.7x**  |
-| GET         | **9.71M ops/s** | 3.78M ops/s  | **2.6x**  |
-| LPUSH       | **8.58M ops/s** | 2.78M ops/s  | **3.1x**  |
-| LPOP        | **10.4M ops/s** | 2.44M ops/s  | **4.3x**  |
-| SADD        | **7.72M ops/s** | 3.29M ops/s  | **2.3x**  |
-| HSET        | **9.09M ops/s** | 2.84M ops/s  | **3.2x**  |
+**Pipeline depth 100** — 2M operations per test:
 
-Socketley is **2-4x faster than Redis 7** at sustained pipelined throughput.
+| Operation | Socketley     | Redis 7.0.15 | Speedup |
+|-----------|---------------|--------------|---------|
+| SET       | 9.05M ±26%    | 2.79M ±29%   | 3.2×    |
+| GET       | 9.85M ±21%    | 3.36M ±18%   | 2.9×    |
+| LPUSH     | 9.48M ±14%    | 2.51M ±6%    | 3.8×    |
+| LPOP      | 10.36M ±31%   | 2.26M ±3%    | 4.6×    |
+| SADD      | 7.19M ±42%    | 3.03M ±15%   | 2.4×    |
+| HSET      | 8.97M ±30%    | 2.44M ±9%    | 3.7×    |
 
-The advantage comes from:
-- **io_uring SQPOLL** eliminates all `epoll_wait`/`sendmsg` syscalls, zero syscalls per op in the hot path
-- **Zero-allocation RESP2 codec**: parse and encode directly into/from the connection buffer using `to_chars` and `string_view`; no heap allocations per command
-- **Batch CQE drain**: all completions from a submit round are processed in one pass; single `io_uring_cq_advance`
-- **writev coalescing**: up to 16 responses batched into a single `writev` SQE
+Pipelined, socketley is **2.4× to 4.6× faster than Redis 7**, and the margin is
+far larger than the spread. The advantage comes from:
 
-**Latency comparison** (P=100):
+- **io_uring SQPOLL** — no `epoll_wait`/`sendmsg` syscalls in the hot path
+- **Zero-allocation RESP2 codec** — parse and encode directly into and out of
+  the connection buffer with `to_chars` and `string_view`
+- **Batch CQE drain** — every completion from a submit round in one pass, one
+  `io_uring_cq_advance`
+- **writev coalescing** — up to 16 responses in a single `writev` SQE
 
-| Metric   | Socketley | Redis 7.0 |
-|----------|-----------|-----------|
-| p50 SET  | 0.29 ms   | 1.50 ms   |
-| p50 GET  | 0.26 ms   | 1.14 ms   |
-| p99 SET  | 0.58 ms   | 1.78 ms   |
-| p99 GET  | 0.34 ms   | 1.42 ms   |
+The shape of these two tables is the interesting part: the advantage exists
+only when there is enough work per connection to amortise the per-operation
+cost. That is also where the weakness is — see below.
 
-### Server: Connection Rate & Message Throughput
+### Server, proxy and WebSocket
 
-| Test                               | Result             |
-|------------------------------------|--------------------|
-| Connection rate (2000 conns)       | **87.8K conn/s**   |
-| Burst (5000 simultaneous)          | **117.6K conn/s**  |
-| Single client 64B msg throughput   | **393K msg/s** (24.4 MB/s) |
-| Single client 1KB msg throughput   | **427K msg/s** (417 MB/s)  |
-| 100 clients × 500 msgs (aggregate) | **4.22M msg/s**    |
+Median of three runs, `socketley_bench`, same pinning and `TIME_WAIT`
+discipline.
 
-5-run median, 10% warm-up, `clock_gettime(CLOCK_MONOTONIC)`. All on a single-threaded io_uring event loop with `IORING_SETUP_SQPOLL`.
+| Test                               | Result             | Spread |
+|------------------------------------|--------------------|--------|
+| Connection rate (2000 conns)       | **81K conn/s**     | ±16%   |
+| Burst (5000 simultaneous)          | **113K conn/s**    | ±2%    |
+| Single client, 64B messages        | **424K msg/s**     | ±7%    |
+| Single client, 1KB messages        | **364K msg/s**     | ±11%   |
+| 100 clients × 500 msgs (aggregate) | ~2.3M msg/s        | ±52%   |
+| Proxy, TCP forwarding (128B)       | **648K msg/s**     | ±5%    |
+| Proxy, 20 concurrent clients       | ~2.1M msg/s        | ±88%   |
+| WebSocket handshakes (200)         | **30K/s**          | ±7%    |
+| WebSocket frames (64B)             | **407K frame/s**   | ±1%    |
+| WebSocket, 20 concurrent clients   | **80K/s**          | ±6%    |
 
-### Proxy: TCP Forwarding
+Two rows are given without emphasis on purpose. The proxy's concurrent figure
+moves by 88% between runs on this machine and the server's by 52% across four
+observations — too much to publish as a number, and worth saying so rather than
+quoting a median that looks precise. They are the two aggregate tests, which is
+not a coincidence; see the weakness below.
 
-| Test                              | Result             |
-|-----------------------------------|--------------------|
-| TCP message throughput (128B)     | **471K msg/s** (58 MB/s) |
-| 20 concurrent clients             | **4.20M msg/s**    |
-| Named-runtime backend resolution  | **2.29M msg/s**    |
-| Proxy overhead vs direct          | **1.3%**           |
+**Known weakness, stated rather than omitted.** Single connections are fast and
+pipelined depth is fast; many *simultaneous* connections are not proportionally
+fast. The aggregate figures above are roughly half of what the same tests
+produced against a build from February 2026 measured on the same day — while
+single-connection and pipelined figures are the same or better. The cost per
+connection has grown, and it disappears at one connection and dominates at a
+hundred.
 
-### WebSocket
-
-| Test                              | Result             |
-|-----------------------------------|--------------------|
-| Handshake throughput (200 ops)    | **27.7K handshake/s** |
-| Frame send throughput (64B)       | **417K frame/s** (27.8 MB/s) |
-| 20 concurrent clients             | **67.6K handshake/s** |
+Part of that is the price of correctness: the February build did not release
+registered file slots on teardown, did not cancel operations armed on them,
+leaked descriptors across `exec`, and closed clients without an answer. Some of
+it is probably not. Where it might be, and the experiment that would settle
+each candidate, is written down in `test/benchmark/hotspots.md`.
 
 ## Quick Start
 
