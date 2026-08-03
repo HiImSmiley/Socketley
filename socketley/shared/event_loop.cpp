@@ -38,6 +38,21 @@ event_loop::~event_loop()
 
 void event_loop::shutdown_ring()
 {
+    // The frame times, if this build was asked to keep them.  Here because it is
+    // the one point every process passes through with the numbers complete:
+    // run() has returned, the runtimes have stopped, nothing more will be
+    // submitted.
+    //
+    // Guarded, because this function is documented idempotent and the
+    // destructor calls it after the explicit call — which printed the whole
+    // table twice, and a histogram that appears twice is one a reader has to
+    // check is not two different measurements.
+    if (!m_timing_dumped)
+    {
+        m_timing_dumped = true;
+        SKL_TIMING_DUMP(m_op_timing, "event loop");
+    }
+
     if (!m_ring_open)
         return;
 
@@ -610,6 +625,10 @@ uint32_t event_loop::fd_inflight(int fd) const
 // so the count only ever includes submissions that were really queued.
 inline void event_loop::arm(io_request* req, uint32_t target, uint32_t target2)
 {
+    // The submission side of the frame.  Everything below this point is the
+    // kernel's time until the completion comes back.
+    SKL_TIMING_STAMP(req);
+
     uint32_t tok = 0;
     if (__builtin_expect(req->owner != nullptr, 1))
     {
@@ -1186,6 +1205,10 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
             m_cqe_target  = rt1;
             m_cqe_target2 = rt2;
         }
+
+        // Before the dispatch, not after: on_cqe may free the storage this
+        // request lives in, and may re-arm it — either way the stamp is gone.
+        SKL_TIMING_COMPLETE(m_op_timing, req);
 
         if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
                              && req->owner != nullptr, 1))

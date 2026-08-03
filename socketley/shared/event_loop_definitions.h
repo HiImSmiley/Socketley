@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include "op_timing_fwd.h"
 
 // Branch prediction hints for hot-path optimization
 #ifndef SOCKETLEY_LIKELY
@@ -376,6 +377,11 @@ struct io_request
     // narrow band, so two unrelated connections agreeing is common rather than
     // rare.  One monotonic source makes agreement mean identity again.
     uint32_t generation{0};
+
+    // Submit-to-complete timing, -DSOCKETLEY_TIMING only; the field is absent
+    // otherwise so a shipping build carries no cost for it.
+    SKL_TIMING_FIELD
+
 
     // Which handler this submission belonged to, copied from the owner's
     // io_handler::m_loop_token by the submit_* helpers.  run() compares it

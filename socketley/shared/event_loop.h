@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 
 #include "event_loop_definitions.h"
+#include "op_timing.h"
 
 struct buf_ring_pool
 {
@@ -551,6 +552,10 @@ private:
     // naming each slot, and whether the slot is waiting to go back to the
     // allocator.
     uint16_t m_fixed_armed[MAX_FIXED_FILES]{};
+    // Submit-to-complete histogram, -DSOCKETLEY_TIMING only.
+    SKL_TIMING_MEMBER
+    bool m_timing_dumped{false};
+
     uint64_t m_fixed_free_deferred[BITMAP_WORDS]{};
 
     // Slots whose unregister is owed as well as their index.  Set when
