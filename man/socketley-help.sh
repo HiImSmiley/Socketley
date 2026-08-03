@@ -433,7 +433,7 @@ flags_options() {
     echo "│ -b               │ Output messages to stdout               │"
     echo "│ -bp              │ Output with [name] prefix               │"
     echo "│ -bt              │ Output with [HH:MM:SS] timestamp        │"
-    echo "│ -bpt             │ Output with timestamp and prefix        │"
+    echo "│ -bpt, -btp       │ Output with timestamp and prefix        │"
     echo "│ --max-connections│ Limit concurrent connections            │"
     echo "│ --rate-limit <n> │ Messages/sec per connection (token bkt) │"
     echo "│ --global-rate-limit│ Messages/sec across all connections   │"

@@ -883,8 +883,13 @@ Output messages with runtime name prefix: [name] message
 .B \-bt
 Output messages with timestamp: [HH:MM:SS] message
 .TP
+.B \-bpt ", " \-btp
+Output messages with both timestamp and prefix: [HH:MM:SS] [name] message.
+Both spellings are accepted and mean the same thing; only
 .B \-bpt
-Output messages with both timestamp and prefix: [HH:MM:SS] [name] message
+was documented, so
+.B \-btp
+worked and could not be looked up.
 .TP
 .BI "\-\-max\-connections " "n"
 Limit maximum concurrent connections. New connections beyond this limit
@@ -1546,7 +1551,7 @@ its routing table over a control socket, and keeps a placeholder for it in
 the runtime map. What the CLI shows is unchanged:
 .BR ps ,
 .BR ls ,
-.BR inspect ,
+.BR show ,
 .B stats
 and the Prometheus endpoint report the same figures they do for an
 in-process proxy, because the worker publishes them and the daemon stores
@@ -1595,7 +1600,7 @@ requires
 .BR \-\-tls " " \-\-cert " " \-\-key ;
 without them it is refused, because on a cleartext port it would authenticate
 nobody while
-.B inspect
+.B show
 reported mutual TLS.
 .TP
 .BI "\-\-client\-cert " "path"
@@ -4916,7 +4921,7 @@ itself serves or forwards.
 .PP
 Earlier releases accepted the TLS flags on every runtime type, stored them,
 persisted them, showed them in
-.BR "socketley inspect" ,
+.BR "socketley show" ,
 and then encrypted nothing. A proxy created with
 .B "\-\-tls \-\-cert \-\-key"
 answered a plaintext HTTP request with 200 on the port it claimed to encrypt,
