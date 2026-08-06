@@ -2947,6 +2947,34 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
     return refused > 0 ? 1 : 0;
 }
 
+// ─── How long a command will wait for a worker to answer ────────────────────
+//
+// Measured on this machine: a worker that has to compile a script, build its
+// ring and bind its listener reports back 17-22 ms after `create` has forked it,
+// over ten runs.  A refusal comes back sooner, because the child stops at the
+// script and exits rather than going on to bind anything.
+//
+// Two seconds is therefore about a hundred times the cost of the case it is
+// timing, which is the point: it is not a budget the normal path spends, it is
+// the backstop for a worker that has wedged and will never answer.  The wait
+// ends on the answer, so what a create actually costs is the 20 ms, and the
+// bound is only ever reached when something is already wrong.
+//
+// Two seconds rather than a new number of its own because it is the interval
+// this daemon already uses for the health tick -- the longest anything here
+// waits to notice a worker. One timescale in the file is easier to reason about
+// than two, and a wait that outlived the tick meant to supersede it would be the
+// confusing combination.
+//
+// Two commands wait on this: `create`, for the verdict on a configuration, and
+// `reload-lua`, for the declaration a re-read script produces.  Both are the
+// control path, and both would otherwise report success for something the
+// worker had not done yet.
+namespace
+{
+constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
+}
+
 int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
@@ -2959,9 +2987,30 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
+    // A runtime whose script runs in a worker has to be asked, and the answer
+    // waited for.  Every reload is sent before any of them is waited on, so
+    // reloading N runtimes costs one round trip rather than N of them.
+    std::vector<std::pair<proxy_supervisor*, const void*>> pending;
+
     for (const auto& n : names)
     {
         auto* inst = m_manager.get(n);
+
+        // The script lives in the worker, and the daemon's copy of this runtime
+        // is a placeholder that compiled the file once and discarded it.  So
+        // reloading here would re-read the file into an interpreter that does
+        // not serve anything, and would still leave the process that does
+        // serving running the old one.
+        if (auto it = m_proxy_workers.find(n); it != m_proxy_workers.end())
+        {
+            // Read before the ask, so the answer cannot be missed for having
+            // arrived between the two.
+            const void* prev = inst ? inst->worker_routes().get() : nullptr;
+            pending.emplace_back(it->second.get(), prev);
+            it->second->send_reload();
+            continue;
+        }
+
         if (inst && !inst->get_lua_script_path().empty())
             inst->reload_lua_script();
         // Rebuild HTTP file cache on reload-lua (picks up new/changed files)
@@ -2972,6 +3021,29 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
                 srv->rebuild_http_cache();
         }
     }
+
+    // ─── The publish waits for the declarations it is meant to carry ────────
+    //
+    // `reload-lua` is the command that makes "the declaration is published, not
+    // configured" true: an operator edits a handler's script, runs this, and
+    // expects the gateway in front of it to enforce the new declaration on the
+    // very next request.  Returning as soon as the frames were written would
+    // publish whatever the daemon happened to be holding -- which is the
+    // previous version of exactly the thing being changed -- and the new one
+    // would land on the health tick up to two seconds later.  The command would
+    // report success for a change that had not taken effect yet, which is the
+    // same shape of false success `create` was fixed for.
+    //
+    // This is the control path.  It waits on the IPC socket already, and the
+    // rule against synchronous cross-runtime calls is about the data path,
+    // where a request would have to suspend across a round trip.  The bound is
+    // the one `create` uses, for the reason given there: one timescale in this
+    // file rather than two.  A worker that never answers leaves the declaration
+    // it had in force, and the publish below carries that.
+    for (auto& [sup, prev] : pending)
+        if (!sup->await_routes(prev, worker_startup_bound))
+            LOG_WARN("reload-lua: a worker did not report its declaration in "
+                     "time; the gateway keeps enforcing the previous one");
 
     // A script is where a runtime's route declaration lives, so reloading one
     // can change what it says it will answer.  Without this the proxies in
@@ -3398,29 +3470,6 @@ void daemon_handler::reconcile_proxy_workers()
         m_manager.publish_endpoints();
         started->send_start();
     }
-}
-
-// ─── How long `create` will wait for a worker to answer ─────────────────────
-//
-// Measured on this machine: a worker that has to compile a script, build its
-// ring and bind its listener reports back 17-22 ms after `create` has forked it,
-// over ten runs.  A refusal comes back sooner, because the child stops at the
-// script and exits rather than going on to bind anything.
-//
-// Two seconds is therefore about a hundred times the cost of the case it is
-// timing, which is the point: it is not a budget the normal path spends, it is
-// the backstop for a worker that has wedged and will never answer.  The wait
-// ends on the answer, so what a create actually costs is the 20 ms, and the
-// bound is only ever reached when something is already wrong.
-//
-// Two seconds rather than a new number of its own because it is the interval
-// this daemon already uses for the health tick -- the longest anything here
-// waits to notice a worker. One timescale in the file is easier to reason about
-// than two, and a wait that outlived the tick meant to supersede it would be the
-// confusing combination.
-namespace
-{
-constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
 }
 
 int daemon_handler::await_worker_startup(std::string_view name)

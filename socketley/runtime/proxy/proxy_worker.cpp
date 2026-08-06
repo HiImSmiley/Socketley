@@ -415,6 +415,7 @@ private:
             case worker_proto::frame_type::deliver:   on_deliver(payload);   break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
+            case worker_proto::frame_type::reload:    on_reload();           break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
 
             // Anything else is either a frame this build predates or one that
@@ -769,6 +770,44 @@ private:
             return;
         m_rt->stop(m_loop);
         send_state();
+    }
+
+    // `reload-lua` reached this runtime.  The script runs here and nowhere else,
+    // so the daemon cannot re-read it on this runtime's behalf; it can only ask,
+    // which is what this frame is.
+    //
+    // The answer goes back unconditionally, which is where this differs from
+    // on_config() above.  A fresh child has no predecessor and the daemon holds
+    // nothing to clear, so sending nothing there means "no declaration".  After a
+    // reload the daemon may be holding the *previous* version of this script's
+    // declaration, and a script that has deleted a route -- or its whole `routes`
+    // table -- has to be able to withdraw it.  An empty frame is what withdraws
+    // it: publish_endpoints() drops a declaration with nothing in it, so the
+    // gateway goes back to forwarding rather than being left enforcing a rule the
+    // handler has removed.  Silently, in that case, because nothing but `stats`
+    // reports what the gate holds.
+    void on_reload()
+    {
+        if (!m_rt || m_rt->get_lua_script_path().empty())
+            return;
+        // A script that will not compile leaves the previous one in force --
+        // reload_lua_script()'s own contract -- so the declaration read below is
+        // still the one being enforced either way, and still the right answer.
+        if (!m_rt->reload_lua_script())
+            LOG_WARN("proxy worker: reload-lua could not load the script; the "
+                     "previous one is still in force");
+        send_routes();
+    }
+
+    void send_routes()
+    {
+        const auto* lctx = m_rt ? m_rt->lua() : nullptr;
+        route_table decl;
+        if (lctx && lctx->has_routes())
+            decl = lctx->declared_routes();
+        if (!m_writer.write(worker_proto::frame(
+                worker_proto::frame_type::routes,
+                worker_proto::encode_routes(decl)))) {}
     }
 
     int                                    m_fd;

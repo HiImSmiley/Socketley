@@ -410,6 +410,11 @@ void proxy_supervisor::send_stop()
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::stop, {}))) {}
 }
 
+void proxy_supervisor::send_reload()
+{
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::reload, {}))) {}
+}
+
 void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
 {
     m_endpoints = encoded_payload;
@@ -570,6 +575,58 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
             struct timespec ts{0, static_cast<long>(slice) * 1000000L};
             if (::nanosleep(&ts, nullptr) < 0) {}
         }
+    }
+}
+
+// The reload half of the same idea, and deliberately the same shape: drain what
+// is there, decide, then sleep on the descriptor rather than on the clock.
+//
+// It watches the declaration object the child's frame installs, rather than the
+// m_routes_changed flag beside it: that flag belongs to the health tick, which
+// consumes it, so a wait resting on it would end or not end depending on
+// whether a timer happened to fire first.  A fresh table is allocated for every
+// frame, so the pointer changing means "a declaration arrived" even when the
+// script's answer turned out identical to the one before it.
+//
+// Like await_startup() it does not reap.  check_liveness() is called for the
+// same reason -- a child that dies mid-reload must end the wait rather than run
+// it to the bound -- and it is still the only place that reaps and the only
+// place that writes the state.  A false here is not an error the caller has to
+// report: the declaration the daemon already holds is still the one in force,
+// and cmd_reload_lua publishes that.
+bool proxy_supervisor::await_routes(const void* previous,
+                                    std::chrono::milliseconds bound)
+{
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+
+    for (;;)
+    {
+        poll();
+
+        if (m_placeholder && m_placeholder->worker_routes().get() != previous)
+            return true;
+
+        // A child that has gone is one that will never answer.  Checked after
+        // the drain above, so a declaration sitting in the socket of a child
+        // that has since exited is still taken.
+        if (check_liveness())
+            continue;
+        if (m_control_fd < 0 || m_pid <= 0)
+            return false;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return false;
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        int slice = static_cast<int>(std::min<std::chrono::milliseconds::rep>(
+            remaining.count(), 20));
+        if (slice < 0)
+            slice = 0;
+
+        struct pollfd pfd{m_control_fd, POLLIN, 0};
+        if (::poll(&pfd, 1, slice) < 0) {}
     }
 }
 

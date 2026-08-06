@@ -136,6 +136,21 @@ public:
     void send_stop();
     void shutdown();
 
+    // Ask the child to re-run its script.  The script lives in the worker, so
+    // this is the only way `reload-lua` can reach a runtime that is out of
+    // process; the child answers with a `routes` frame, which is what
+    // await_routes() below waits for.
+    void send_reload();
+
+    // Block until this child has installed a declaration other than
+    // `previous` — the placeholder's worker_routes() pointer read before
+    // send_reload(), so a frame arriving between the two cannot be mistaken for
+    // the one still being waited on.  Same shape and the same rules as
+    // await_startup(): ::poll on the control descriptor, no SQE, and no waitpid
+    // of its own — see the note above its definition.  False means the child
+    // never answered, and the caller publishes what it already had.
+    bool await_routes(const void* previous, std::chrono::milliseconds bound);
+
     // A new membership snapshot.  Cheap enough to send unconditionally: the
     // daemon publishes only when a runtime is created, started, stopped,
     // removed or renamed, or when the cluster's view moves.

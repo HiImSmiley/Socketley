@@ -405,6 +405,19 @@ Accepts multiple names, glob patterns, or a mix. Runtimes without
 Lua scripts are skipped. With
 .BR * ,
 reloads Lua on all runtimes that have scripts loaded.
+.IP
+A runtime that runs in a worker is asked rather than reloaded here: its script
+lives in that process and only that process can re-run it. The command waits
+for the worker to report the declaration the new script makes \(em bounded the
+way
+.B create
+bounds its own wait \(em so that when it returns, a gateway in front of that
+runtime is already enforcing what the edited script says, including when the
+edit removed the
+.B routes
+table altogether. A worker that does not answer in time leaves the previous
+declaration in force and says so in the log; a script that does not compile
+leaves the previous one running, as it does in the daemon.
 .TP
 .BI "show " "name|pattern" "..."
 Print runtime JSON configuration to stdout. Accepts multiple names,

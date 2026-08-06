@@ -83,6 +83,7 @@ enum class frame_type : uint16_t
     publish   = 21,  // payload: see encode_publish
     chan_req  = 22,  // payload: see encode_chan_request
     deliver   = 23,  // payload: raw message bytes; see below
+    reload    = 24,  // payload: empty; re-run the script, then answer `routes`
 
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply

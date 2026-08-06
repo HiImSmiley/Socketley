@@ -269,7 +269,7 @@ fi
 python3 - "$PX_PORT" "$PX_NAME" "$BIN" "$BE_NAME" "$GP_PORT" "$GP_NAME" \
            "$GA_NAME" "$GB_NAME" "$BE_LUA" "$MX_PORT" "$MX_NAME" \
            >"$OUT" 2>&1 <<'PYEOF' || true
-import socket, subprocess, sys
+import socket, subprocess, sys, time
 
 px_port  = int(sys.argv[1])
 px_name  = sys.argv[2]
@@ -302,6 +302,79 @@ def counters(*names):
             elif line.startswith("bytes_in:"):
                 nbytes += int(line.split(":", 1)[1])
     return conns, nbytes
+
+
+# ── Reading a counter that lives in another process ────────────────────────
+#
+# Every runtime here runs in its own process, and a runtime in a worker does not
+# have its counters read at the moment of the question: it publishes them every
+# 250 ms and `stats` drains whatever has arrived.  That is deliberate and
+# documented -- see LIMITATIONS, "A worker's figures are pushed, and stats says
+# how old they are" -- and making them live would mean the daemon blocking its
+# event loop on a child, which is the one thing that design refuses.  `stats`
+# says so per runtime, in figures:pushed and figures_age_ms.
+#
+# Measured on this machine: a served request becomes visible in `stats` between
+# 36 ms and 251 ms afterwards, against 8-10 ms for a runtime inside the daemon.
+# So a read taken immediately after a request legitimately predates it, and this
+# oracle has to account for that in BOTH of its directions -- in opposite ways,
+# because the trap is opposite:
+#
+#   must GROW      poll until it does.  Racing the push reports "the request
+#                  never reached the backend" for one that did.
+#   must NOT move  wait past a full publish interval FIRST, so a byte that had
+#                  been forwarded would already be visible.  Reading immediately
+#                  would pass against a proxy that forwarded every one of the
+#                  forty refusals, which is the single thing these assertions
+#                  exist to catch.
+#
+# Neither is a sleep standing in for a tick.  The first ends on the counter
+# itself; the second waits out an interval the worker's own publisher is
+# specified in, and the baselines are quiesced so that a phase can never be
+# credited with the previous phase's bytes in either direction.
+
+PUBLISH_INTERVAL = 0.25      # proxy_worker.cpp: stats_interval
+SETTLE           = 1.0       # four publish intervals: margin for a loaded machine
+BOUND            = 5.0       # give-up, so a counter that never moves still fails
+
+
+def counters_quiet(*names):
+    """A baseline that has stopped moving.
+
+    The phase before this one may not have been published yet, and a baseline
+    read too early is low -- which would credit this phase with the previous
+    one's bytes, passing a `grew` that should have failed and failing an
+    `unchanged` that should have passed.  Waits for two readings a publish
+    interval apart to agree."""
+    prev = counters(*names)
+    end = time.time() + BOUND
+    while time.time() < end:
+        time.sleep(PUBLISH_INTERVAL * 1.5)
+        cur = counters(*names)
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
+def counters_grown(baseline, *names):
+    """Poll until bytes_in passes `baseline`, then return the reading.
+
+    Returns the last reading either way -- a counter that genuinely never moves
+    is returned unchanged and fails its assertion, rather than hanging here or
+    being waved through."""
+    end = time.time() + BOUND
+    cur = counters(*names)
+    while cur[1] <= baseline[1] and time.time() < end:
+        time.sleep(0.05)
+        cur = counters(*names)
+    return cur
+
+
+def counters_settled(*names):
+    """Read only once a change would certainly have been published."""
+    time.sleep(SETTLE)
+    return counters(*names)
 
 
 def read_response(s):
@@ -398,7 +471,7 @@ print("P0 %s %s" % (st, body))
 # would have to open them, and they would be counted.  One request would not
 # show it — a pooled socket from the readiness probe absorbs the first rejection
 # without a new accept.
-before_c, before_b = counters(be_name)
+before_c, before_b = counters_quiet(be_name)
 first = None
 bad = 0
 for _ in range(40):
@@ -407,7 +480,7 @@ for _ in range(40):
         first = (st, hdrs, body)
     if not st.startswith("HTTP/1.1 405"):
         bad += 1
-after_c, after_b = counters(be_name)
+after_c, after_b = counters_settled(be_name)
 print("P1 ACCEPTS %d %d" % (before_c, after_c))
 print("P1 BYTES %d %d" % (before_b, after_b))
 print("P1 BADSTATUS %d" % bad)
@@ -419,9 +492,9 @@ print("P1 CLEN %s" % hdrs.get("content-length", "<absent>"))
 print("P1 BODY %s" % body.strip())
 
 # ── phase 2: the vacuity guard — the counters CAN move ─────────────────────
-b2c, b2b = counters(be_name)
+b2c, b2b = counters_quiet(be_name)
 st, _, body = request("/endpoint/login", method="POST", body="user=x")
-a2c, a2b = counters(be_name)
+a2c, a2b = counters_grown((b2c, b2b), be_name)
 print("P2 %s %s" % (st, body))
 print("P2 BYTES %d %d" % (b2b, a2b))
 
@@ -431,9 +504,9 @@ print("P2 BYTES %d %d" % (b2b, a2b))
 # it listed it, and a gate that refuses HEAD breaks every cache validator and
 # link checker there is.  Measured on the backend, not on the status: a 200 the
 # proxy invented would look the same from here.
-b3c, b3b = counters(be_name)
+b3c, b3b = counters_quiet(be_name)
 st, _, _ = request("/endpoint/login", method="HEAD")
-a3c, a3b = counters(be_name)
+a3c, a3b = counters_grown((b3c, b3b), be_name)
 print("P3 STATUS %s" % st)
 print("P3 BYTES %d %d" % (b3b, a3b))
 
@@ -442,11 +515,11 @@ print("P3 BYTES %d %d" % (b3b, a3b))
 # RFC 9110 Section 9.3.7 — "what may I do here" — and the declaration is
 # precisely that answer, so no backend is involved.  Five of them, so a pooled
 # socket cannot explain a still counter.
-b4c, b4b = counters(be_name)
+b4c, b4b = counters_quiet(be_name)
 st4, h4, _ = request("/endpoint/login", method="OPTIONS")
 for _ in range(4):
     request("/endpoint/login", method="OPTIONS")
-a4c, a4b = counters(be_name)
+a4c, a4b = counters_settled(be_name)
 print("P4 STATUS %s" % st4)
 print("P4 ALLOW %s" % h4.get("allow", "<absent>"))
 print("P4 BYTES %d %d" % (b4b, a4b))
@@ -460,19 +533,19 @@ print("P4 BYTES %d %d" % (b4b, a4b))
 # never sent at all.  What the operator sees is a CORS error on a request their
 # code never made.  Origin policy lives with the handler, so the preflight goes
 # to the handler: the backend's counters must move.
-b5c, b5b = counters(be_name)
+b5c, b5b = counters_quiet(be_name)
 st5, _, body5 = request("/endpoint/login", method="OPTIONS",
                         extra="Origin: http://app.example\r\n"
                               "Access-Control-Request-Method: DELETE\r\n")
-a5c, a5b = counters(be_name)
+a5c, a5b = counters_grown((b5c, b5b), be_name)
 print("P5 STATUS %s" % st5)
 print("P5 BODY %s" % body5.strip())
 print("P5 BYTES %d %d" % (b5b, a5b))
 
 # ── phase 6: a handler that declares OPTIONS keeps it ──────────────────────
-b6c, b6b = counters(be_name)
+b6c, b6b = counters_quiet(be_name)
 st6, _, body6 = request("/cors", method="OPTIONS")
-a6c, a6b = counters(be_name)
+a6c, a6b = counters_grown((b6c, b6b), be_name)
 print("P6 STATUS %s" % st6)
 print("P6 BODY %s" % body6.strip())
 print("P6 BYTES %d %d" % (b6b, a6b))
@@ -483,9 +556,9 @@ print("P6 BYTES %d %d" % (b6b, a6b))
 # it: a handler is free to answer paths it never declared, and a gate that
 # turned silence into a refusal would make declaring one route the act of hiding
 # every other.
-b7c, b7b = counters(be_name)
+b7c, b7b = counters_quiet(be_name)
 st7, _, body7 = request("/elsewhere", method="DELETE")
-a7c, a7b = counters(be_name)
+a7c, a7b = counters_grown((b7c, b7b), be_name)
 print("P7 STATUS %s" % st7)
 print("P7 BODY %s" % body7.strip())
 print("P7 BYTES %d %d" % (b7b, a7b))
@@ -494,9 +567,9 @@ print("P7 BYTES %d %d" % (b7b, a7b))
 st8, h8, _ = request("/static/app.js", method="DELETE")
 print("P8 STATUS %s" % st8)
 print("P8 ALLOW %s" % h8.get("allow", "<absent>"))
-b8c, b8b = counters(be_name)
+b8c, b8b = counters_quiet(be_name)
 st8b, _, body8b = request("/static/app.js")
-a8c, a8b = counters(be_name)
+a8c, a8b = counters_grown((b8c, b8b), be_name)
 print("P8 GET %s %s" % (st8b, body8b.strip()))
 print("P8 BYTES %d %d" % (b8b, a8b))
 
@@ -514,9 +587,9 @@ print("P9 ALLOW %s" % h9.get("allow", "<absent>"))
 # connection and cannot know which one this request will reach, so it may only
 # refuse a method NO member declared — refusing PUT would refuse at the edge
 # what the second member was going to serve.
-b10c, b10b = counters(ga_name, gb_name)
+b10c, b10b = counters_quiet(ga_name, gb_name)
 st10, _, body10 = request("/endpoint/login", method="PUT", port=gp_port, name=gp_name)
-a10c, a10b = counters(ga_name, gb_name)
+a10c, a10b = counters_grown((b10c, b10b), ga_name, gb_name)
 print("P10 PUT %s %s" % (st10, body10.strip()))
 print("P10 BYTES %d %d" % (b10b, a10b))
 
@@ -533,9 +606,9 @@ print("P10 GET %s" % st10b)
 st10c, _, _ = request("/static/app.js", method="DELETE", port=gp_port, name=gp_name)
 print("P10 PARTIAL %s" % st10c)
 
-b11c, b11b = counters(ga_name, gb_name)
+b11c, b11b = counters_quiet(ga_name, gb_name)
 st11, h11, _ = request("/endpoint/login", method="DELETE", port=gp_port, name=gp_name)
-a11c, a11b = counters(ga_name, gb_name)
+a11c, a11b = counters_settled(ga_name, gb_name)
 print("P11 STATUS %s" % st11)
 print("P11 ALLOW %s" % h11.get("allow", "<absent>"))
 print("P11 BYTES %d %d" % (b11b, a11b))
@@ -547,10 +620,10 @@ print("P11 BYTES %d %d" % (b11b, a11b))
 # proxy has no basis on which to claim it knows what it answers — so refusing a
 # method here would be refusing on behalf of a backend that never spoke.  The
 # safe half of the fork is to forward, and this is the assertion that pins it.
-b11bc, b11bb = counters(be_name)
+b11bc, b11bb = counters_quiet(be_name)
 st11b, _, body11b = request("/endpoint/login", method="DELETE",
                             port=mx_port, name=mx_name)
-a11bc, a11bb = counters(be_name)
+a11bc, a11bb = counters_grown((b11bc, b11bb), be_name)
 print("P11B STATUS %s" % st11b)
 print("P11B BODY %s" % body11b.strip())
 print("P11B BYTES %d %d" % (b11bb, a11bb))
@@ -806,11 +879,29 @@ else
     echo "  FAIL [runtime alive]: the proxy did not survive the run"
 fi
 
+# await_field <runtime> <field> <expected> — echoes the last reading seen.
+#
+# These proxies are themselves out of process, so declared_routes is a figure
+# their worker pushed rather than one read here (see LIMITATIONS), and a read
+# taken the instant the harness stops can be one publish behind.  Waits for the
+# expected reading rather than sleeping a fixed amount, and echoes whatever it
+# settled on if that never arrives — so a wrong value still fails the assertion
+# below, it simply is not failed for having been asked too early.
+await_field() {
+    local rt=$1 field=$2 want=$3 seen="" i
+    for i in $(seq 1 50); do
+        seen=$("$BIN" stats "$rt" 2>/dev/null | grep "^$field:" || true)
+        [ "$seen" = "$want" ] && break
+        sleep 0.1
+    done
+    printf '%s' "$seen"
+}
+
 # What the proxy says it is enforcing, which is the only way to tell the four
 # ways of enforcing nothing apart from outside.  One route now, not three: the
 # reload in phase 12 replaced the declaration with a single entry.
 TOTAL=$((TOTAL+1))
-DR=$("$BIN" stats "$PX_NAME" 2>/dev/null | grep '^declared_routes:' || true)
+DR=$(await_field "$PX_NAME" declared_routes "declared_routes:1")
 if [ "$DR" = "declared_routes:1" ]; then
     PASS=$((PASS+1))
 else
@@ -820,7 +911,7 @@ else
 fi
 
 TOTAL=$((TOTAL+1))
-DR=$("$BIN" stats "$MX_NAME" 2>/dev/null | grep '^declared_routes:' || true)
+DR=$(await_field "$MX_NAME" declared_routes "declared_routes:0")
 if [ "$DR" = "declared_routes:0" ]; then
     PASS=$((PASS+1))
 else
