@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <algorithm>
+#include <type_traits>
 #include <liburing.h>
 #ifdef SOCKETLEY_TRACE
 #include <dirent.h>
@@ -2738,6 +2739,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // as their continuation.  client_answerable declines that one on
     // response_started, exactly as it declines it for a gateway failure, and the
     // truncated response is left truncated: the client can see that it is.
+    // This is the CLEARTEXT half of the ceiling.  A connection with a session
+    // never reaches this line — the TLS branch above returns as soon as it sees
+    // `closing`, and the ceiling is hit inside tls_feed while it is decrypting —
+    // so tls_feed answers its own, and the two must stay in step.  See the note
+    // there for why the refusal is produced at the limit rather than here.
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE))
     {
         answer_request_too_large(conn);
@@ -8963,6 +8969,7 @@ void proxy_instance::tls_feed(Conn* conn, const char* data, size_t len)
     }
 
     char plain[16384];
+    bool over_ceiling = false;
     for (;;)
     {
         const int n = tls_context::ssl_read(conn->ssl, plain, sizeof(plain));
@@ -8975,7 +8982,7 @@ void proxy_instance::tls_feed(Conn* conn, const char* data, size_t len)
             // produce more than one buffer's worth" is not true here.
             if (SOCKETLEY_UNLIKELY(conn->partial.size() > Conn::MAX_PARTIAL_SIZE))
             {
-                conn->closing = true;
+                over_ceiling = true;
                 break;
             }
             continue;
@@ -8990,6 +8997,41 @@ void proxy_instance::tls_feed(Conn* conn, const char* data, size_t len)
             conn->tls_peer_closed = true;
         }
         break;
+    }
+
+    // The ceiling has an answer, and this is the only place a TLS connection can
+    // give it.
+    //
+    // handle_client_read has the sibling check and writes the 413 — but it is
+    // below the branch that runs for a connection with a session, and that
+    // branch returns as soon as it sees `closing`.  So on a --tls listener the
+    // only thing that ever happened here was the flag: the client was closed on
+    // in silence, which is precisely the state the 413 was added to end, and the
+    // man page promised the status with exactly one exception that this was not.
+    //
+    // Answering here rather than teaching the TLS branch to fall through into
+    // the cleartext path is the difference between one refusal being produced
+    // where its limit is found and two paths having to agree forever about
+    // which of them owns it.  Nothing about how the bytes reach the wire is
+    // special: send_error queues a response like any other, and
+    // flush_client_write_queue routes a session's bytes through tls_flush,
+    // which is the only thing allowed to put them on the wire.  The caller's
+    // own tls_flush, one line after this returns, is what carries the records
+    // out — the same way it already carries a handshake alert.
+    //
+    // Before `closing`, not after: client_answerable() refuses a connection
+    // that is already on its way out, so setting the flag first would silence
+    // the very answer this exists to produce.  It also still refuses when a
+    // backend's response has already started, which is the one exception the
+    // page names and the one case where a status line would land mid-message.
+    //
+    // Only the client half.  A backend connection has no client to answer and
+    // no status to send it; the ceiling there is a teardown and nothing else.
+    if (SOCKETLEY_UNLIKELY(over_ceiling))
+    {
+        if constexpr (std::is_same_v<Conn, proxy_client_connection>)
+            answer_request_too_large(conn);
+        conn->closing = true;
     }
 }
 
