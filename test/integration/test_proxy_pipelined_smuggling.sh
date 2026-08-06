@@ -64,7 +64,17 @@ cleanup() {
     # Kill by socket, not only by pid.  A CLI command run against a daemon that
     # is not up yet starts one of its own, detached from this shell; killing
     # $DPID would leave that one running for good, holding this test's ports.
-    for p in $(pgrep -f 'socketley daemon' 2>/dev/null || true); do
+    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
+    # 'socketley daemon'` also matches a shell whose own command line merely
+    # carries that string — a test runner, or this file — and the environ check
+    # below cannot rule it out, because such a shell exports the very
+    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
+    # this reach daemons of this run and nothing else.
+    for p in $(pgrep -x socketley 2>/dev/null || true); do
+        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+            *" daemon "*|*" daemon") ;;
+            *) continue ;;
+        esac
         if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
                 < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
             kill -9 "$p" 2>/dev/null || true

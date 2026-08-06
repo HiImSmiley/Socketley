@@ -52,6 +52,14 @@ ready_http() {
 import socket, sys, time
 host, port, path, timeout = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
 deadline = time.time() + timeout
+# Why the last attempt failed.  Every probe in this file used to discard it, so
+# a listener that refused every connection, one whose backend answered 502 for
+# fifteen seconds and one that never came up at all produced the same message:
+# none.  The caller then reports "not ready", and diagnosing which of the three
+# it was costs a rerun with the probe pasted into a shell — the rerun that no
+# longer reproduces.  Kept as text rather than raised, because a probe that
+# fails is answering its question, not erroring.
+last = ""
 while time.time() < deadline:
     try:
         s = socket.create_connection((host, port), 0.5)
@@ -71,9 +79,17 @@ while time.time() < deadline:
             code = data.split(b" ")[1] if len(data.split(b" ")) > 1 else b""
             if code[:1] in (b"2", b"3"):
                 sys.exit(0)
-    except Exception:
-        pass
+            # A served-but-wrong status raises nothing, so without this the one
+            # failure this probe exists to catch is the one it stays silent
+            # about: a proxy answering 502 because no backend is in rotation.
+            last = "answered " + code.decode("latin-1", "replace") + " every time"
+        else:
+            last = "no status line, got " + repr(data[:60])
+    except Exception as e:
+        last = "%s: %s" % (type(e).__name__, e)
     time.sleep(0.05)
+if last:
+    print(last, file=sys.stderr)
 sys.exit(1)
 PY
 }
@@ -90,6 +106,7 @@ ready_answers() {
 import socket, sys, time
 host, port, path, timeout = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
 deadline = time.time() + timeout
+last = ""
 while time.time() < deadline:
     try:
         s = socket.create_connection((host, port), 0.5)
@@ -99,9 +116,15 @@ while time.time() < deadline:
         s.close()
         if data.startswith(b"HTTP/1."):
             sys.exit(0)
-    except Exception:
-        pass
+        # Reported for the reason ready_http gives above.  Here it is the whole
+        # of the check: this probe accepts any status, so the only way it fails
+        # with bytes in hand is a listener answering something that is not HTTP.
+        last = "no status line, got " + repr(data[:60])
+    except Exception as e:
+        last = "%s: %s" % (type(e).__name__, e)
     time.sleep(0.05)
+if last:
+    print(last, file=sys.stderr)
 sys.exit(1)
 PY
 }
@@ -127,15 +150,23 @@ host, port, cafile, servername, timeout = (
 ctx = ssl.create_default_context(cafile=cafile)
 ctx.check_hostname = True
 deadline = time.time() + timeout
+# Reported for the reason ready_http gives above, and this is the probe where
+# discarding it cost the most: verification is part of the check, so a listener
+# serving the wrong certificate, one whose chain does not reach CAFILE and one
+# that is simply not up yet all failed here identically and silently.
+last = ""
 while time.time() < deadline:
     try:
         with socket.create_connection((host, port), 0.5) as raw:
             with ctx.wrap_socket(raw, server_hostname=servername) as tls:
                 if tls.version():
                     sys.exit(0)
-    except Exception:
-        pass
+                last = "handshake completed but reported no version"
+    except Exception as e:
+        last = "%s: %s" % (type(e).__name__, e)
     time.sleep(0.05)
+if last:
+    print(last, file=sys.stderr)
 sys.exit(1)
 PY
 }
@@ -151,18 +182,26 @@ ready_resp() {
 import socket, sys, time
 host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 deadline = time.time() + timeout
+last = ""
 while time.time() < deadline:
     try:
         s = socket.create_connection((host, port), 0.5)
         s.settimeout(0.5)
         s.sendall(b"*1\r\n$4\r\nPING\r\n")
-        if s.recv(64).startswith(b"+PONG"):
+        reply = s.recv(64)
+        if reply.startswith(b"+PONG"):
             s.close()
             sys.exit(0)
         s.close()
-    except Exception:
-        pass
+        # Reported for the reason ready_http gives above.  A cache still loading
+        # its state file accepts and answers -- with an error, or with nothing --
+        # so the reply is the difference between "not up" and "up and refusing".
+        last = "PING answered " + repr(reply[:60])
+    except Exception as e:
+        last = "%s: %s" % (type(e).__name__, e)
     time.sleep(0.05)
+if last:
+    print(last, file=sys.stderr)
 sys.exit(1)
 PY
 }
