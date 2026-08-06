@@ -67,6 +67,15 @@ fi
 # carries the SQPOLL poller when that is on and the state writer thread, and
 # leaving it room is cheaper than discovering it was boxed in.  The generator is
 # the side that scales with client count and gets the majority.
+#
+# The workers count against the daemon's share, and that is meant.  taskset
+# sets an affinity mask, and a forked child inherits it, so since a runtime
+# gets a process of its own unless it asks not to, every worker this daemon
+# spawns is confined to DCPU along with it.  That is the honest reading of
+# "the server side gets a third": what is being budgeted is the whole server,
+# not one process of it.  It does mean these numbers cannot be compared with
+# ones recorded before runtimes moved out of the daemon — the same mask now
+# holds more processes.
 DCORES=$(( NPROC / 3 )); [ "$DCORES" -lt 2 ] && DCORES=2
 DCPU=$(seq -s, 0 $((DCORES - 1)))
 LCPU=$(seq -s, "$DCORES" $((NPROC - 1)))

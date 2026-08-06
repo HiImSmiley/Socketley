@@ -39,22 +39,63 @@ daemon_pid() {
             return 0
         fi
     fi
-    pgrep -f "${SOCKETLEY_BIN} daemon" | head -1
+    # Identity is the executable behind the pid, never a command-line pattern:
+    # `pgrep -f "$SOCKETLEY_BIN daemon"` also matches a shell whose arguments
+    # merely carry that string, this script among them.
+    local p exe want
+    want=$(readlink -f "$SOCKETLEY_BIN" 2>/dev/null)
+    for p in $(pgrep -x socketley 2>/dev/null || true); do
+        exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+        [[ "$exe" == "$want" ]] || continue
+        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+            *" daemon "*|*" daemon") echo "$p"; return 0 ;;
+        esac
+    done
 }
 
-# Sum utime+stime (clock ticks) over every thread of a process.
+# The daemon and the worker processes it forked.
+#
+# This benchmark measures idle cost, and since a runtime gets a process of its
+# own unless it asks not to, most of what it exists to measure is no longer in
+# the daemon.  Summing one process reports a daemon supervising four spinning
+# workers as idle -- which is the exact shape of the defect this file is meant
+# to catch, so getting it wrong here is worse than not measuring at all.
+#
+# Children are found by ppid out of /proc and confirmed by their executable.
+# Not by name: a worker's command line says `proxy-worker`, not `daemon`, so
+# the pattern that used to find the daemon could never have found them.
+daemon_tree_pids() {
+    local root=$1 p ppid exe want
+    want=$(readlink -f "/proc/$root/exe" 2>/dev/null) || return 0
+    echo "$root"
+    for p in /proc/[0-9]*; do
+        p=${p#/proc/}
+        [[ "$p" == "$root" ]] && continue
+        exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+        [[ "$exe" == "$want" ]] || continue
+        # /proc/<pid>/stat: everything up to the last ')' is pid and comm, so
+        # after stripping it $1 is state and $2 is ppid.
+        ppid=$(awk '{ sub(/^.*\) /, ""); print $2 }' "/proc/$p/stat" 2>/dev/null) || continue
+        [[ "$ppid" == "$root" ]] && echo "$p"
+    done
+}
+
+# Sum utime+stime (clock ticks) over every thread of the daemon and of every
+# worker it forked.
 # /proc/<pid>/stat field 2 is the comm in parens and may itself contain spaces
 # or parens, so everything up to the LAST ')' is discarded before splitting.
 # After that, utime is field 12 and stime field 13.
 total_ticks() {
-    local pid=$1 sum=0 t line rest
-    for t in /proc/"$pid"/task/*/stat; do
-        [[ -r "$t" ]] || continue
-        line=$(cat "$t" 2>/dev/null) || continue
-        rest=${line##*\) }
-        # shellcheck disable=SC2086
-        set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
+    local root=$1 sum=0 pid t line rest
+    for pid in $(daemon_tree_pids "$root"); do
+        for t in /proc/"$pid"/task/*/stat; do
+            [[ -r "$t" ]] || continue
+            line=$(cat "$t" 2>/dev/null) || continue
+            rest=${line##*\) }
+            # shellcheck disable=SC2086
+            set -- $rest
+            sum=$(( sum + ${12:-0} + ${13:-0} ))
+        done
     done
     echo "$sum"
 }

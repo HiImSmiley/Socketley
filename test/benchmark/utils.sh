@@ -197,14 +197,50 @@ stop_daemon() {
         rm -f "$DAEMON_PID_FILE"
     fi
 
-    # Fallback: kill any daemon processes matching our exact binary path.
-    # Do NOT use pkill -x "socketley" — that kills the systemd-managed daemon too.
-    pkill -9 -f "${SOCKETLEY_BIN} daemon" 2>/dev/null || true
+    # Fallback: every process running our exact binary — the daemon and the
+    # worker processes it forked.
+    #
+    # This was `pkill -9 -f "$SOCKETLEY_BIN daemon"`, which names one process of
+    # however many are running: a worker is exec'd with `proxy-worker` on its
+    # command line, not `daemon`, so with two runtimes started it finds one of
+    # three.  Measured, it still left nothing behind — a worker whose control
+    # socket has closed ends itself, which proxy_worker.cpp's run() does on
+    # purpose so that a worker cannot go on serving a proxy nobody supervises.
+    # So the old sweep was correct by someone else's care rather than its own,
+    # and it is replaced for what it says, not for damage it did.
+    #
+    # Identity by command-line pattern is the part that is wrong here for the
+    # usual reason: `-f` matches any process whose arguments merely carry the
+    # string, and record_throughput.sh starts the daemon as
+    # `taskset -c "$DCPU" "$BIN" daemon`, whose command line carries it exactly.
+    # The executable behind the pid cannot be spoofed by an argument, reaches
+    # the workers by identity rather than by inheritance, and still keeps a
+    # systemd-managed daemon out of it — that one runs the installed binary,
+    # not this build, which is the protection the old comment was reaching for
+    # with "do not use pkill -x socketley".
+    local own_exe p exe
+    own_exe=$(readlink -f "$SOCKETLEY_BIN" 2>/dev/null)
+    if [ -n "$own_exe" ]; then
+        for p in $(pgrep -x socketley 2>/dev/null || true); do
+            exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+            if [ "$exe" = "$own_exe" ]; then
+                kill -9 "$p" 2>/dev/null || true
+            fi
+        done
+    fi
     sleep 0.3
 
-    # Verify no daemon is running (our binary only)
-    if pgrep -f "${SOCKETLEY_BIN} daemon" >/dev/null 2>&1; then
-        log_warn "Daemon process still exists after cleanup"
+    # Verify nothing of ours survived — the same identity test, so it answers
+    # for the workers as well as for the daemon rather than for the daemon
+    # alone.
+    if [ -n "$own_exe" ]; then
+        for p in $(pgrep -x socketley 2>/dev/null || true); do
+            exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+            if [ "$exe" = "$own_exe" ]; then
+                log_warn "A daemon or worker process still exists after cleanup"
+                break
+            fi
+        done
     fi
 
     # Remove socket and stale state
