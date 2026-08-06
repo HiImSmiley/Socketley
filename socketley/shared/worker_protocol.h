@@ -46,6 +46,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <memory>
+#include <utility>
+#include "route_table.h"
 #include <string_view>
 #include <vector>
 
@@ -83,7 +86,23 @@ enum class frame_type : uint16_t
 
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply
+    routes    = 5,   // payload: see encode_routes
 };
+
+// ── routes: what a runtime in a worker says it will answer ──────────────────
+//
+// A script's `routes` declaration is produced by running the script, and a
+// worker's script runs in the worker.  The placeholder only checks that the
+// file parses — it builds no interpreter, so it has no declaration and
+// publish_endpoints() published none.  A gateway in front of such a runtime
+// then forwarded every method to it instead of refusing the undeclared ones at
+// the edge with a 405: the enforcement quietly stopped existing, which is the
+// worst way for a gate to fail.
+//
+// So the worker sends its declaration up once, after the script has loaded, and
+// the daemon puts it where publish_endpoints() looks.  The alternative — having
+// the placeholder run the script too — is the one thing --daemon-process exists
+// to avoid: every top-level side effect would happen twice, in two processes.
 
 // ── deliver: `socketley send <name> <message>` for a runtime in a worker ────
 //
@@ -157,6 +176,11 @@ struct reader
     bool ok{true};
 
     reader(const char* data, size_t len) : p(data), end(data + len) {}
+
+    // Nothing left to read.  Used to make a field optional: a frame from a
+    // build that did not write it ends here, and the reader stops rather than
+    // failing.
+    bool done() const { return p >= end; }
 
     uint16_t u16()
     {
@@ -259,8 +283,19 @@ struct endpoint_wire
     uint16_t    port{0};
 };
 
+using route_decl_wire = std::vector<
+    std::pair<std::string, std::shared_ptr<const route_table>>>;
+
+// Declared here, defined below the frame that uses it.  encode_endpoints
+// appends the route declarations after the two endpoint blocks, so it calls
+// this before the file has read it; the definition stays where it is because
+// it belongs beside decode_routes, which is the half that has to agree with it.
+inline std::string encode_routes(const route_table& rt);
+
 inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
-                                    const std::vector<endpoint_wire>& groups)
+                                    const std::vector<endpoint_wire>& groups,
+                                    const route_decl_wire& name_routes  = {},
+                                    const route_decl_wire& group_routes = {})
 {
     std::string out;
     put_u32(out, static_cast<uint32_t>(names.size()));
@@ -277,16 +312,95 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
         put_str(out, e.host);
         put_u16(out, e.port);
     }
+
+    // The declarations, by name and by group.
+    //
+    // Left out for a long time, and the gap was invisible because it only shows
+    // where the PROXY is in a worker: the daemon builds an endpoint_table with
+    // set_name_routes() and a proxy in this process reads the same object.  One
+    // in a worker gets this frame instead, and this frame carried a host and a
+    // port and nothing else — so its gate had nothing to enforce and forwarded
+    // every method, while `stats` reported declared_routes:0.
+    //
+    // Appended after the two blocks above rather than folded into them, so a
+    // worker built before this field reads the endpoints it understands and
+    // stops at the end of them.
+    put_u32(out, static_cast<uint32_t>(name_routes.size()));
+    for (const auto& [n, rt] : name_routes)
+    {
+        put_str(out, n);
+        put_str(out, encode_routes(*rt));
+    }
+    put_u32(out, static_cast<uint32_t>(group_routes.size()));
+    for (const auto& [g, rt] : group_routes)
+    {
+        put_str(out, g);
+        put_str(out, encode_routes(*rt));
+    }
     return out;
+}
+
+// A route declaration on the wire.  Flat and self-describing: a count, then
+// per route a path, a prefix flag and its methods.  Nothing here validates —
+// the table's own add() does that on the way in, and it is the same code on
+// both sides.
+inline std::string encode_routes(const route_table& rt)
+{
+    std::string out;
+    put_u32(out, static_cast<uint32_t>(rt.all().size()));
+    for (const auto& d : rt.all())
+    {
+        put_str(out, d.path);
+        out.push_back(d.prefix ? 1 : 0);
+        put_u32(out, static_cast<uint32_t>(d.methods.size()));
+        for (const auto& m : d.methods)
+            put_str(out, m);
+    }
+    return out;
+}
+
+inline bool decode_routes(std::string_view payload, route_table& out)
+{
+    reader r(payload.data(), payload.size());
+    out.clear();
+
+    const uint32_t n = r.u32();
+    if (!r.ok) return false;
+
+    // Rebuilt through add(), not assigned: every bound and every rejection the
+    // declaration was subject to when the script made it applies again here,
+    // so a frame cannot install a table the local build would have refused.
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        const std::string path(r.str());
+        if (!r.ok) return false;
+        const bool prefix = r.u8() != 0;
+        (void)prefix;   // carried by the path's trailing '*', see route_table::add
+
+        const uint32_t nm = r.u32();
+        if (!r.ok) return false;
+        std::vector<std::string> methods;
+        for (uint32_t j = 0; j < nm && r.ok; ++j)
+            methods.emplace_back(r.str());
+        if (!r.ok) return false;
+
+        if (out.add(prefix ? path + "*" : path, methods) != route_table::add_result::ok)
+            return false;
+    }
+    return r.ok;
 }
 
 inline bool decode_endpoints(std::string_view payload,
                              std::vector<endpoint_wire>& names,
-                             std::vector<endpoint_wire>& groups)
+                             std::vector<endpoint_wire>& groups,
+                             route_decl_wire& name_routes,
+                             route_decl_wire& group_routes)
 {
     reader r(payload.data(), payload.size());
     names.clear();
     groups.clear();
+    name_routes.clear();
+    group_routes.clear();
 
     const uint32_t n_names = r.u32();
     if (!r.ok) return false;
@@ -313,6 +427,40 @@ inline bool decode_endpoints(std::string_view payload,
         e.port = r.u16();
         if (!r.ok) return false;
         groups.push_back(std::move(e));
+    }
+
+    // The declarations, if this frame carries them.  A frame from a build that
+    // predates the field simply ends here, and the two maps stay empty — which
+    // is the behaviour that build had.
+    if (!r.done())
+    {
+        const uint32_t n_nr = r.u32();
+        if (!r.ok) return false;
+        for (uint32_t i = 0; i < n_nr && r.ok; ++i)
+        {
+            std::string nm(r.str());
+            std::string blob(r.str());
+            if (!r.ok) return false;
+            auto rt = std::make_shared<route_table>();
+            if (!decode_routes(blob, *rt))
+                return false;
+            name_routes.emplace_back(std::move(nm),
+                                     std::shared_ptr<const route_table>(std::move(rt)));
+        }
+
+        const uint32_t n_gr = r.u32();
+        if (!r.ok) return false;
+        for (uint32_t i = 0; i < n_gr && r.ok; ++i)
+        {
+            std::string g(r.str());
+            std::string blob(r.str());
+            if (!r.ok) return false;
+            auto rt = std::make_shared<route_table>();
+            if (!decode_routes(blob, *rt))
+                return false;
+            group_routes.emplace_back(std::move(g),
+                                      std::shared_ptr<const route_table>(std::move(rt)));
+        }
     }
 
     return r.ok;

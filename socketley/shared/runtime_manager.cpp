@@ -410,10 +410,14 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
         m_publish_sink(cache_name, channel, message);
 
     // A runtime that lives in a worker process is skipped here on purpose; see
-    // set_publish_sink().  Its placeholder holds a fully loaded copy of the same
-    // script, so it answers lua() and has the script's subscribers registered —
-    // it would run them in the daemon, against an instance with no connections,
-    // while the process actually serving the traffic saw nothing.
+    // set_publish_sink().  The frame goes to the process that is serving the
+    // traffic, and its subscribers run there.
+    //
+    // This used to say the placeholder "holds a fully loaded copy of the same
+    // script, so it answers lua()".  It does not: load_lua_script() only asks
+    // whether the file parses when the runtime is out of process, and builds no
+    // interpreter at all.  The skip is still right; the reason given for it was
+    // not.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
@@ -613,13 +617,18 @@ void runtime_manager::publish_endpoints()
             // to whoever routes to it — see shared/route_table.h.  A runtime
             // that declares nothing gets no entry, and a proxy in front of it
             // forwards exactly as it did before this existed.
-            const auto* lctx = inst->lua();
-            std::shared_ptr<const route_table> decl;
-            if (lctx && lctx->has_routes())
+            // The worker's copy first: a runtime in another process has no
+            // interpreter here, so lua() is null and the declaration can only
+            // have come up the control socket.
+            std::shared_ptr<const route_table> decl = inst->worker_routes();
+            if (!decl)
             {
-                decl = std::make_shared<const route_table>(lctx->declared_routes());
-                tbl->set_name_routes(name, decl);
+                const auto* lctx = inst->lua();
+                if (lctx && lctx->has_routes())
+                    decl = std::make_shared<const route_table>(lctx->declared_routes());
             }
+            if (decl && !decl->empty())
+                tbl->set_name_routes(name, decl);
             if (!group.empty() && running)
                 group_members[std::string(group)][name] = std::move(decl);
         }

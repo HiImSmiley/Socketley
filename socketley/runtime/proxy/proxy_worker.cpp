@@ -575,6 +575,8 @@ private:
         // Exiting is how a worker says so.  The supervisor already treats a dead
         // child as the runtime's problem; exit_config_refused tells it not to
         // fork a sixth copy of the same refusal.
+        // Sent after the load below, not before: there is no declaration until
+        // the script's top level has run.
         if (!cfg.lua_script.empty() && !m_rt->load_lua_script(cfg.lua_script))
         {
             LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
@@ -587,6 +589,19 @@ private:
         // A table that arrived before the config is not lost: it is held and
         // applied here.  The daemon publishes on every membership change, and
         // nothing orders those against the config frame.
+        // What this runtime says it will answer, up to the daemon, which is the
+        // only process that can publish it to whoever routes here.  Sent once
+        // and only when there is something to send: a runtime that declares
+        // nothing leaves the gateway forwarding exactly as it did before route
+        // declarations existed, and an empty frame would say the same thing at
+        // the cost of a round of publishing.
+        if (const auto* lctx = m_rt->lua(); lctx && lctx->has_routes())
+        {
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::routes,
+                    worker_proto::encode_routes(lctx->declared_routes())))) {}
+        }
+
         if (m_pending_endpoints)
         {
             // Only a proxy routes by name, so only a proxy is handed the table.
@@ -600,7 +615,9 @@ private:
     void on_endpoints(const std::string& payload)
     {
         std::vector<worker_proto::endpoint_wire> names, groups;
-        if (!worker_proto::decode_endpoints(payload, names, groups))
+        worker_proto::route_decl_wire name_routes, group_routes;
+        if (!worker_proto::decode_endpoints(payload, names, groups,
+                                            name_routes, group_routes))
         {
             LOG_WARN("proxy worker: malformed endpoint table, keeping the previous one");
             return;
@@ -611,6 +628,10 @@ private:
             tbl->set_name(e.name, runtime_endpoint{e.host, e.port});
         for (const auto& e : groups)
             tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port});
+        for (auto& [n, rt] : name_routes)
+            tbl->set_name_routes(n, std::move(rt));
+        for (auto& [g, rt] : group_routes)
+            tbl->set_group_routes(g, std::move(rt));
 
         // Immutable from here, exactly as on the daemon side: a request that is
         // already resolving keeps the table it started with.

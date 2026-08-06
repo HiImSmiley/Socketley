@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include "route_table.h"
 #include <chrono>
 #include <sstream>
 #include <vector>
@@ -392,6 +393,18 @@ public:
     virtual request_sink* as_request_sink()
     { return m_sink_override; }
 
+    // What a runtime in a worker says it will answer.
+    //
+    // The declaration is produced by running the script, and a worker's script
+    // runs in the worker — the placeholder only checks that the file parses, so
+    // it has no interpreter and lua() is null.  publish_endpoints() reads the
+    // declaration from lua(), found nothing, and published none: a gateway in
+    // front of such a runtime forwarded every method instead of refusing the
+    // undeclared ones with a 405.  The worker sends its table up and it is kept
+    // here, where publish_endpoints() looks first.
+    void set_worker_routes(std::shared_ptr<const route_table> rt);
+    const std::shared_ptr<const route_table>& worker_routes() const;
+
     void set_request_sink_override(request_sink* s) { m_sink_override = s; }
 
     // The mesh client-certificate paths, for the one role that has them.
@@ -581,6 +594,7 @@ private:
     bool m_external = false;
     bool m_managed = false;
     bool m_out_of_process = false;
+    std::shared_ptr<const route_table> m_worker_routes;
     std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;

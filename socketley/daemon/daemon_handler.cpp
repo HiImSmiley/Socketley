@@ -3187,7 +3187,17 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
         for (const auto& ep : eps)
             groups.push_back({group, ep.host, ep.port});
 
-    const std::string payload = worker_proto::encode_endpoints(names, groups);
+    // The declarations travel with the table.  A proxy in a worker enforces
+    // what this frame says and nothing else — it cannot read the daemon's
+    // endpoint_table object, which is where these used to stay.
+    worker_proto::route_decl_wire name_routes, group_routes;
+    for (const auto& [n, rt] : tbl.name_routes())
+        if (rt) name_routes.emplace_back(n, rt);
+    for (const auto& [g, rt] : tbl.group_routes())
+        if (rt) group_routes.emplace_back(g, rt);
+
+    const std::string payload =
+        worker_proto::encode_endpoints(names, groups, name_routes, group_routes);
     for (auto& [_, sup] : m_proxy_workers)
         sup->send_endpoints(payload);
 }
@@ -3364,6 +3374,7 @@ void daemon_handler::check_managed_health()
 
     // The children first: liveness, then whatever they have reported.  Both
     // before the managed-runtime sweep below, which can return early.
+    bool routes_moved = false;
     for (auto& [worker_name, sup] : m_proxy_workers)
     {
         // The child's own report, drained before liveness so a runtime that
@@ -3376,6 +3387,11 @@ void daemon_handler::check_managed_health()
                 m_persistence->save_runtime(inst);
         }
 
+        // A declaration that arrived since the last tick.  publish_endpoints()
+        // rebuilds the whole table, so one call covers however many sent one.
+        if (sup->take_routes_change())
+            routes_moved = true;
+
         if (sup->check_liveness() && m_persistence)
         {
             // A child that died and was not restarted has moved the runtime to
@@ -3387,6 +3403,9 @@ void daemon_handler::check_managed_health()
     }
     poll_proxy_workers();
     reconcile_proxy_workers();
+
+    if (routes_moved)
+        m_manager.publish_endpoints();
 
 
     std::shared_lock lock(m_manager.mutex);

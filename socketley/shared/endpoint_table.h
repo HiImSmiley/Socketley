@@ -163,6 +163,14 @@ public:
     const transparent_map<runtime_endpoint>& names() const { return m_by_name; }
     const transparent_map<std::vector<runtime_endpoint>>& groups() const { return m_by_group; }
 
+    // The declarations too, for the same reader and the same reason.  Without
+    // these the encoder could only carry hosts and ports, and a proxy in a
+    // worker enforced nothing while `stats` reported declared_routes:0.
+    const transparent_map<std::shared_ptr<const route_table>>& name_routes() const
+    { return m_routes_by_name; }
+    const transparent_map<std::shared_ptr<const route_table>>& group_routes() const
+    { return m_routes_by_group; }
+
 private:
     transparent_map<runtime_endpoint>              m_by_name;
     transparent_map<std::vector<runtime_endpoint>> m_by_group;

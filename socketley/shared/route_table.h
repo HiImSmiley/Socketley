@@ -201,6 +201,11 @@ public:
         m_prefixes.clear();
     }
 
+    // Every declaration, in the order they were added.  Needed because a
+    // declaration made in a worker has to reach the daemon, which publishes it
+    // to whoever routes to that runtime — see worker_protocol's encode_routes.
+    const std::vector<route_decl>& all() const { return m_routes; }
+
     bool   empty() const { return m_routes.empty(); }
     // Reported by a proxy's `stats` as declared_routes; see there for why a
     // number nobody can see is a feature nobody can debug.

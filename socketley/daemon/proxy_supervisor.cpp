@@ -502,6 +502,27 @@ void proxy_supervisor::ingest(const std::string&)
             case worker_proto::frame_type::hello:
                 break;
 
+            case worker_proto::frame_type::routes:
+            {
+                // The declaration this child's script made.  Kept on the
+                // placeholder, which is where publish_endpoints() looks, and a
+                // republish is asked for because membership has not changed —
+                // nothing else would carry it out to the proxies in front.
+                auto rt = std::make_shared<route_table>();
+                if (worker_proto::decode_routes(payload, *rt) && m_placeholder)
+                {
+                    m_placeholder->set_worker_routes(
+                        std::shared_ptr<const route_table>(std::move(rt)));
+                    m_routes_changed = true;
+                }
+                else
+                {
+                    LOG_WARN("worker sent a route declaration this build could "
+                             "not read; the gateway in front keeps forwarding");
+                }
+                break;
+            }
+
             case worker_proto::frame_type::publish:
             {
                 // The same frame this supervisor writes downward, arriving from

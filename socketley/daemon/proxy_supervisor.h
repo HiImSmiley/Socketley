@@ -164,6 +164,10 @@ public:
     // adopt.  Same shape as check_liveness(): the supervisor decides, the
     // caller persists, so the state file and the runtime map cannot disagree
     // about a runtime that failed in another process.
+    // True once after the child has sent a route declaration.  Same shape as
+    // take_state_change(): the supervisor decides, the caller republishes.
+    bool take_routes_change() { const bool c = m_routes_changed; m_routes_changed = false; return c; }
+
     bool take_state_change() { const bool c = m_state_changed; m_state_changed = false; return c; }
 
     bool  is_alive() const { return m_pid > 0; }
@@ -242,6 +246,7 @@ private:
     publish_handler m_on_publish;
 
     bool         m_state_changed{false};
+    bool         m_routes_changed{false};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

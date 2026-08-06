@@ -733,6 +733,16 @@ std::string runtime_instance::ring_policy_refusal(const event_loop& loop) const
     return msg;
 }
 
+void runtime_instance::set_worker_routes(std::shared_ptr<const route_table> rt)
+{
+    m_worker_routes = std::move(rt);
+}
+
+const std::shared_ptr<const route_table>& runtime_instance::worker_routes() const
+{
+    return m_worker_routes;
+}
+
 void runtime_instance::set_runtime_manager(runtime_manager* mgr) { m_runtime_manager = mgr; }
 void runtime_instance::set_event_loop(event_loop* loop) { m_event_loop = loop; }
 runtime_manager* runtime_instance::get_runtime_manager() const { return m_runtime_manager; }
