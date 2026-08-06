@@ -132,7 +132,25 @@ if ! "$BIN" ls >/dev/null 2>&1; then
     exit 1
 fi
 
-"$BIN" create server rid_par -p "$PARENT_PORT" --lua "$WORK/parent.lua" -s >/dev/null 2>&1
+# --daemon-process is load-bearing, not decoration.
+#
+# This parent's script calls socketley.create() and socketley.start() to bring
+# the sub-server up, and that is the cross-runtime management API: it reaches
+# for the runtime map, which exists only in the daemon.  A runtime in a worker
+# is refused it by name — deliberately, and with an error that prescribes this
+# exact flag — so a parent left out of process never creates rid_sub, nothing
+# ever listens on SUB_PORT, and the harness dies on its first connect there
+# with every assertion below unrun.
+#
+# It was not always needed.  This file was written when a server ran inside the
+# daemon, and it says so by not asking; `--daemon-process` became the thing you
+# have to ask for when out-of-process became the default.  So the flag restores
+# the arrangement these fourteen assertions were written against rather than
+# changing what any of them claims — the parent and its sub-server in one
+# address space, which is what makes "the id is not a descriptor" a statement
+# about naming rather than about which process happened to be asked.
+"$BIN" create server rid_par -p "$PARENT_PORT" --lua "$WORK/parent.lua" \
+       --daemon-process -s >/dev/null 2>&1
 sleep 0.5
 
 OUT=$(python3 - "$PARENT_PORT" "$SUB_PORT" <<'PY'
@@ -333,8 +351,26 @@ function on_client_message(client_id, msg)
 end
 EOLUA
 
-"$BIN" create server rid_lone -p 19773 --lua "$WORK/lone.lua" -s >/dev/null 2>&1
-"$BIN" create server rid_par2 -p 19774 --lua "$WORK/parent2.lua" -s >/dev/null 2>&1
+# Both in the daemon, for the same reason the parent above is, and one more.
+#
+# self.route() looks its target up in the runtime map — a worker holds no such
+# map, only its own runtime — so routing from a worker to a runtime in another
+# process does not happen.  Measured on this build: with both of these left at
+# today's out-of-process default, self.route() answers `false`, rid_lone counts
+# 0 connections and its on_connect never fires; with both in the daemon it
+# answers true, counts 1, and fires once.
+#
+# That `false` is indistinguishable from "no such target", so a script cannot
+# tell a target that is absent from one that is merely elsewhere.  It is a real
+# gap and it is recorded here rather than asserted, because these two checks
+# are about a stopped origin leaving stale entries in its target's books — a
+# question about bookkeeping between two runtimes that share one, which is what
+# the flag restores.  Routing a connection between processes is a separate
+# feature and is not what this file measures.
+"$BIN" create server rid_lone -p 19773 --lua "$WORK/lone.lua" \
+       --daemon-process -s >/dev/null 2>&1
+"$BIN" create server rid_par2 -p 19774 --lua "$WORK/parent2.lua" \
+       --daemon-process -s >/dev/null 2>&1
 sleep 0.6
 
 lone_conns() { "$BIN" stats rid_lone 2>/dev/null | grep -E "^connections:" | head -1 | cut -d: -f2; }
