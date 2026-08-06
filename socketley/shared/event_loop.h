@@ -129,6 +129,27 @@ public:
     // A count alone says an owner cannot be released; the kind says why.
     void owner_inflight_breakdown(const io_handler* owner, uint32_t* out) const;
 
+    // The same question asked of a token instead of a handler, for a caller
+    // that is holding storage it may not free yet.
+    //
+    // Both of the above take an io_handler*, and neither can be asked once the
+    // handler is on its way out.  deregister_owner() clears the handler's copy
+    // of its token as its first act, and it is deregistered precisely when its
+    // storage is about to go — so the moment the question matters is the moment
+    // the handler can no longer be named.  Matching on the pointer instead is
+    // worse, not better: the address is exactly what a later allocation may
+    // reuse, so a fresh object at the old address would answer for the dead
+    // one.  A token cannot be confused that way — the slot's epoch changes on
+    // every re-registration, so a token names one registration for good.
+    //
+    // A caller that means to defer a free therefore captures the token BEFORE
+    // deregistering, and asks here afterwards.  Zero means nothing in the ring
+    // will name that registration again, which is the only licence to free the
+    // storage its io_requests live in.  Note that this is a stronger condition
+    // than "deregistered": a dropped completion is still a completion, and
+    // dropping one reads the owner token out of the request to decide.
+    uint32_t token_inflight(uint32_t token) const;
+
     // True once the owner table has run out and handlers began sharing one
     // identity.  From that point owner_inflight() cannot answer for any single
     // one of them — it reports zero for a handler that never got a slot, which

@@ -70,6 +70,13 @@ proxy_supervisor::~proxy_supervisor()
     // override from being dereferenced after the fact so far.  That is a
     // property of another file's filter, not of this one, and it is not worth
     // depending on.
+    //
+    // A backstop now rather than the real severance: retire() does this while
+    // the placeholder is still known to be alive, and nulls both pointers, so
+    // on every path that goes through it these two blocks are skipped.  They
+    // stay for a supervisor destroyed without ever being retired — one that
+    // failed to spawn and is dropped on the spot — which has nothing in the
+    // ring and nothing to wait for.
     if (m_placeholder)
         m_placeholder->set_request_sink_override(nullptr);
     if (m_channel)
@@ -82,6 +89,15 @@ proxy_supervisor::~proxy_supervisor()
     // After shutdown(), which closes the socket and cancels the arm with it.
     // The registration is what makes the loop drop a completion that is still
     // on its way for this handler, so it is given back last.
+    //
+    // Giving it back is NOT what makes this safe, and it never was.  A dropped
+    // completion is still a completion: the loop reads the owner token out of
+    // the io_request to decide whether to drop it, and m_poll_req is a member
+    // of this object, so that read lands in the storage the delete below is
+    // about to release.  retire() is the call that makes the wait possible, and
+    // reaching it first is what leaves nothing here to be found.
+    // Destroying a supervisor without it — through m_loop still being set at
+    // this point — is the path that used to abort the daemon.
     if (m_loop)
         m_loop->deregister_owner(this);
 }
@@ -90,7 +106,63 @@ void proxy_supervisor::set_event_loop(event_loop* loop)
 {
     m_loop = loop;
     if (m_loop)
-        m_loop->register_owner(this);
+        m_owner_token = m_loop->register_owner(this);
+}
+
+uint32_t proxy_supervisor::retire()
+{
+    // The three holders the destructor lists, given up at the moment they are
+    // all still known to exist.  The destructor is no longer that moment: it
+    // runs whenever the ring finishes, and cmd_remove frees the placeholder a
+    // few statements after retiring the supervisor for it — so a destructor
+    // clearing the override then reads a runtime_instance that is gone.
+    //
+    // Dropping the channel registrations here is the same argument in the other
+    // direction.  Between retirement and the free this object still answers to
+    // its name in the sink table, with a control socket that is closed and a
+    // child that has been signalled; a request routed to it in that window
+    // could only fail, and a caller would be told the write failed rather than
+    // that the runtime is gone.
+    if (m_placeholder)
+    {
+        m_placeholder->set_request_sink_override(nullptr);
+        m_placeholder = nullptr;
+    }
+    if (m_channel)
+    {
+        m_channel->drop_sink(this);
+        m_channel->drop_origin(this);
+        m_channel = nullptr;
+    }
+
+    // Nothing may be delivered to this object once it is retired, and the
+    // publish handler is the one holder that is not a pointer somebody else
+    // keeps — it is a std::function this object owns, capturing the handler
+    // that is about to put it in the quarantine.
+    m_on_publish = nullptr;
+
+    if (!m_loop)
+        return 0;
+
+    // Cancel the arm and let the descriptor go.  The whole point of the token
+    // below is to wait out what is still in the ring, so submitting the
+    // withdrawal before asking is what makes the count able to reach zero at
+    // all — an arm nobody asked back never reports.
+    close_control();
+
+    event_loop* const loop = m_loop;
+    const uint32_t    tok  = m_owner_token;
+
+    // Cleared before the deregistration and never set again.  m_loop is what
+    // arm_control_poll() tests, so this is what stops a late poll() or
+    // flush_control() from putting this object back in the ring behind the
+    // quarantine's back — which would restart the wait the caller has already
+    // begun, on a count it has already read.
+    m_loop        = nullptr;
+    m_owner_token = 0;
+
+    loop->deregister_owner(this);
+    return tok;
 }
 
 void proxy_supervisor::arm_control_poll()

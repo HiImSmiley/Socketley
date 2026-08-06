@@ -306,6 +306,15 @@ bool cluster_discovery::start(event_loop& loop)
     publish();
     scan();
 
+    // Here and not at the top: every refusal above returns without having
+    // submitted anything, and a slot claimed by a handler that then goes away
+    // without deregistering is a slot register_owner() will never hand out
+    // again.  Explicit rather than left to the implicit registration inside
+    // schedule_timer(), because retire() has to hand this value on after
+    // deregistering — which is the moment it can no longer be read back off
+    // the handler.
+    m_owner_token = loop.register_owner(this);
+
     // Start the timer cycle
     schedule_timer();
     return true;
@@ -317,8 +326,39 @@ void cluster_discovery::stop()
     unpublish();
 }
 
+uint32_t cluster_discovery::retire()
+{
+    event_loop* const loop = m_loop;
+
+    // Before stop(), which clears m_loop.  Withdrawing does not make the
+    // timeout stop being owed a completion — it still reports, with -ECANCELED
+    // — it only stops that report being up to two seconds away, which is two
+    // seconds this object would otherwise sit in the quarantine.  Exactly the
+    // argument server_instance makes for withdrawing its own two timers.
+    if (loop && m_timer_armed)
+        if (!loop->submit_timeout_remove(&m_timer_req)) {}
+
+    stop();
+
+    if (!loop)
+        return 0;
+
+    const uint32_t tok = m_owner_token;
+    m_owner_token      = 0;
+
+    // Last, and only after m_loop is null: from here every completion still on
+    // its way for this handler is dropped rather than dispatched.  Dropping one
+    // still reads the request it names, which is why the caller must wait for
+    // token_inflight() before freeing and may not treat this call as licence.
+    loop->deregister_owner(this);
+    return tok;
+}
+
 void cluster_discovery::on_cqe(struct io_uring_cqe* /*cqe*/)
 {
+    // Spent, whatever it reported and whether or not the cycle continues below.
+    m_timer_armed = false;
+
     if (!m_loop)
         return;
 
@@ -335,8 +375,15 @@ void cluster_discovery::schedule_timer()
 
     m_timer_ts.tv_sec = PUBLISH_INTERVAL_SEC;
     m_timer_ts.tv_nsec = 0;
-    m_timer_req = { this, nullptr, -1, 0, op_timeout };
-    m_loop->submit_timeout(&m_timer_ts, &m_timer_req);
+    m_timer_req   = { this, nullptr, -1, 0, op_timeout };
+    m_timer_armed = m_loop->submit_timeout(&m_timer_ts, &m_timer_req);
+
+    // A refused submission is the end of the publish cycle: nothing else
+    // reschedules it, so this daemon would stop heartbeating into the cluster
+    // directory and its peers would age it out without one line saying so.
+    if (SOCKETLEY_UNLIKELY(!m_timer_armed))
+        LOG_WARN("cluster: the publish timer could not be armed; this daemon "
+                 "stops heartbeating and its peers will treat it as stale");
 }
 
 std::string cluster_discovery::build_publish_json() const

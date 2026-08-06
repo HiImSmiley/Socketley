@@ -86,6 +86,43 @@ public:
     // works and still answers, on the health tick, which is what it did before.
     void set_event_loop(event_loop* loop);
 
+    // Stop supervising: give up everything that could still reach this object,
+    // give the ring back, and return the identity it was submitting under so
+    // that whoever holds it can ask the loop when its storage is free.  See the
+    // quarantine in daemon_handler.
+    //
+    // This exists because the destructor cannot do the job.  An io_request
+    // lives INSIDE this class — m_poll_req — so a completion still in the ring
+    // names storage that ~proxy_supervisor is about to release, and the loop's
+    // own staleness check has to read the owner token out of that request to
+    // find out whether to drop it.  When the request lives inside the owner,
+    // the check IS the use-after-free; deregistering harder cannot help.
+    //
+    // Nor can the destructor wait for the ring.  A supervisor is destroyed from
+    // inside a command handler, which is itself inside a completion being
+    // dispatched, so waiting would mean re-entering the loop from there and
+    // dispatching completions — possibly the one for the object mid-destruction
+    // — while the loop's own per-turn accounting is half-updated.
+    //
+    // So it is two calls, for the reason conn_transfer.h gives for its own pair
+    // and in almost the same words: the answer to "is the ring finished with
+    // this" arrives on a later turn of the loop than the question, and a
+    // destructor is a one-call interface by construction.  This is the first
+    // call.  The second is event_loop::token_inflight() reaching zero, and only
+    // then may the object be destroyed.
+    //
+    // The severance has to happen HERE and not in the destructor, and that is
+    // not tidiness.  The destructor used to run at the moment of retirement, so
+    // reaching for the placeholder there was reaching for a live runtime; once
+    // the free is deferred it is not, because cmd_remove retires the supervisor
+    // and then has runtime_manager::remove() free the very instance
+    // m_placeholder points at.  Everything this object is holding a pointer to
+    // is known to be alive at retirement and not one moment longer.
+    //
+    // Returns 0 for a supervisor that never had a loop, which is a supervisor
+    // that never submitted and can be destroyed on the spot.
+    uint32_t retire();
+
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     // Never inline: the answer is in another process and the only ways to
@@ -290,6 +327,14 @@ private:
     bool         m_out_full{false};
 
     event_loop*  m_loop{nullptr};
+
+    // The token register_owner() handed back, kept because the loop clears the
+    // handler's own copy the instant it is deregistered — and deregistering is
+    // exactly what retire() has to do before it can hand the token on.
+    // io_handler::m_loop_token is private to the loop, and reading it after the
+    // fact would read a zero anyway.
+    uint32_t     m_owner_token{0};
+
     io_request   m_poll_req{};
     unsigned     m_poll_mask{0};
     bool         m_poll_armed{false};

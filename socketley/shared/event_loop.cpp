@@ -381,6 +381,41 @@ uint32_t event_loop::owner_inflight(const io_handler* owner) const
     return total;
 }
 
+uint32_t event_loop::token_inflight(uint32_t token) const
+{
+    // Registration is implicit on the first submission, so a handler still
+    // holding a token of zero has never put anything in the ring under an
+    // identity of its own and nothing is owed to one.
+    if (token == 0)
+        return 0;
+
+    // The unverifiable identity shares slot 0 with every other handler that
+    // could not be given one, so the slot cannot answer for any single one of
+    // them.  What it can answer is the whole slot: while nothing at all is owed
+    // there, nothing is owed to this handler either.  That is the honest
+    // conservative reading, and it is the same slot the masked lookup below
+    // would reach anyway — spelled out because the reasoning is different.
+    if (token == OWNER_UNVERIFIED)
+        return m_owners[0].inflight;
+
+    const auto& slot = m_owners[token & OWNER_SLOT_MASK];
+
+    // Still the current registration: what the slot counts is what it owes.
+    if (slot.token == token)
+        return slot.inflight;
+
+    // Revoked, and the slot not handed out since.  deregister_owner() clears
+    // the token and deliberately leaves the count standing, so the count is
+    // still this registration's and disarm() is what will bring it down.
+    if (slot.token == 0)
+        return slot.inflight;
+
+    // Handed out again — which register_owner() will only do once the slot's
+    // inflight has reached zero, so everything this token named has already
+    // reported.  The count now standing belongs to the new occupant.
+    return 0;
+}
+
 // The two encodings IO_TARGET_* describes, in the form the submit_* helpers
 // already have the number in.  A negative one means the caller had no
 // descriptor to name, which is not an error here — submit_timeout has none at

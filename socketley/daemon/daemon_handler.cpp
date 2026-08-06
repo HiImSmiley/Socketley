@@ -307,6 +307,17 @@ void daemon_handler::teardown()
         sup->shutdown();
         if (const pid_t p = sup->release_pid(); p > 0)
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
+
+        // Retired here too, so that "a supervisor is never destroyed while
+        // something still holds it" holds on both paths that destroy one rather
+        // than on the one that happened to be reported.  The clear() below is
+        // safe in the daemon for a different reason — daemon_start() shuts the
+        // ring down before this runs, so no completion can be dispatched
+        // afterwards — but this is also the destructor's path, and that reason
+        // belongs to the caller, not to this function.  There is nothing to
+        // wait for afterwards and nothing left to wait with, so the token is
+        // dropped.
+        if (sup->retire() != 0) {}
     }
     m_proxy_workers.clear();
 
@@ -374,6 +385,13 @@ void daemon_handler::teardown()
     // man page's stale-detection table calls "file deleted, peers drop it at
     // once", so it has to reach unpublish().
     stop_cluster();
+
+    // After stop_cluster(), because that is the last thing that can add to it.
+    // Everything here was retired — detached from the loop and dropped by
+    // whatever held it — on a path where waiting longer is not on offer, and
+    // the same reasoning covers it as the clears above: daemon.cpp ends the
+    // ring before this runs, so no completion can be dispatched afterwards.
+    m_retired_handlers.clear();
 
     // Through the loop, not close(): every one of these numbers has been named
     // by an SQE — a read on each client, an accept on the listener — and a
@@ -3390,11 +3408,26 @@ void daemon_handler::reconcile_proxy_workers()
         }
         it->second->shutdown();
         // shutdown() reaps only a child that was already gone, and one that has
-        // just been asked to unwind its ring never is.  The supervisor is
-        // destroyed on the next line, so this is the last moment anything knows
+        // just been asked to unwind its ring never is.  The supervisor leaves
+        // the map on the next line, so this is the last moment anything knows
         // the pid.
         if (const pid_t p = it->second->release_pid(); p > 0)
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
+
+        // Erased from the map but NOT destroyed.  The erase used to run the
+        // destructor here, and the supervisor's control-socket poll had just
+        // been cancelled rather than completed — so its completion arrived on a
+        // later turn, and the loop read the owner token out of an io_request
+        // living inside the object this statement had freed.  Removing or
+        // stopping an out-of-process runtime was enough; no traffic was needed.
+        //
+        // retire() gives the ring back, drops every pointer to this supervisor
+        // while the things holding them are still alive, and hands over the
+        // identity to wait on.  drain_retired_handlers() destroys it once the
+        // loop says nothing more will name it.
+        auto           sup = std::move(it->second);
+        const uint32_t tok = sup->retire();
+        m_retired_handlers.push_back({std::move(sup), tok});
         it = m_proxy_workers.erase(it);
     }
 
@@ -3556,9 +3589,38 @@ void daemon_handler::reap_orphan_workers()
     }
 }
 
+void daemon_handler::drain_retired_handlers()
+{
+    if (m_retired_handlers.empty())
+        return;
+
+    for (auto it = m_retired_handlers.begin(); it != m_retired_handlers.end();)
+    {
+        // The one question worth asking, and the loop is the only thing that
+        // can answer it: is any completion still going to name the storage
+        // inside this object.  Not "has it been deregistered" — a deregistered
+        // owner's completion is dropped, and dropping one reads the request to
+        // decide.
+        if (m_loop.token_inflight(it->token) != 0)
+        {
+            ++it;
+            continue;
+        }
+
+        // Zero, so nothing in the ring can reach it any more and the erase
+        // below is what finally runs the destructor.
+        it = m_retired_handlers.erase(it);
+    }
+}
+
 void daemon_handler::check_managed_health()
 {
     reap_orphan_workers();
+
+    // Beside the pid graveyard, and drained the same way for the same reason:
+    // both hold something a removal could not finish with, and the tick is a
+    // later turn of the loop than the removal was.
+    drain_retired_handlers();
 
     // The children first: liveness, then whatever they have reported.  Both
     // before the managed-runtime sweep below, which can return early.
@@ -3667,10 +3729,22 @@ void daemon_handler::stop_cluster()
     if (!m_owned_cluster)
         return;
 
-    m_owned_cluster->stop();
-    m_owned_cluster.reset();
+    // Not reset() — quarantined.  cluster_discovery's publish timer is an
+    // io_request inside the object, so a timeout still counting down names
+    // storage the reset would free, and the loop reads the owner token out of
+    // that request when the completion lands.  stop() did not deregister at
+    // all, so the token still matched and the completion was dispatched: a
+    // virtual call on a freed cluster_discovery, about two seconds after this
+    // line.  Pointing `daemon --cluster` at a second directory was enough, and
+    // so was renaming a clustered daemon, which restarts discovery through
+    // here.
+    //
+    // The pointers first, so that nothing can reach the object while it waits.
     m_cluster = nullptr;
     m_manager.set_cluster_discovery(nullptr);
+
+    const uint32_t tok = m_owned_cluster->retire();
+    m_retired_handlers.push_back({std::move(m_owned_cluster), tok});
 }
 
 bool daemon_handler::start_cluster(const std::string& name, const std::string& dir)

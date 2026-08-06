@@ -80,6 +80,24 @@ public:
     // Stop and unpublish (graceful shutdown)
     void stop();
 
+    // Stop, and hand back the identity the loop knew this object by, so that
+    // whoever is about to free it can ask when the ring is finished with its
+    // storage — event_loop::token_inflight(), and the quarantine in
+    // daemon_handler that this is the first half of.
+    //
+    // stop() cannot answer that and never could.  The publish timer is an
+    // io_request living INSIDE this object, so a timeout still counting down
+    // names storage the delete is about to release, and the loop reads the
+    // owner token out of that request to decide whether the completion is
+    // stale.  stop() did not even reach the deciding: it cleared m_loop and
+    // returned without deregistering, so the token still matched and the
+    // completion was DISPATCHED — a virtual call on a freed cluster_discovery,
+    // two seconds after `daemon --cluster` was pointed somewhere new.
+    //
+    // Returns 0 for an object that was never started, which has nothing in the
+    // ring and can be freed on the spot.
+    uint32_t retire();
+
     // Get remote runtimes matching a group (thread-safe, returns snapshot)
     struct remote_endpoint { std::string host; uint16_t port; };
     std::vector<remote_endpoint> get_remote_group(std::string_view group) const;
@@ -151,6 +169,17 @@ private:
     // Timer
     io_request m_timer_req{};
     struct __kernel_timespec m_timer_ts{};
+
+    // "The ring owes us this timeout."  Raised only when the submission was
+    // really queued and lowered only by its completion, so retire() withdraws a
+    // timer that is actually there rather than spending an SQE on -ENOENT.
+    // Same rule and the same wording as request_channel::m_wake_armed.
+    bool m_timer_armed{false};
+
+    // What register_owner() handed back.  Kept because deregister_owner()
+    // clears the handler's own copy as its first act, and retire() has to
+    // deregister before it can hand the token on.
+    uint32_t m_owner_token{0};
 
     // Cached remote daemons (protected by mutex)
     mutable std::mutex m_remote_mutex;

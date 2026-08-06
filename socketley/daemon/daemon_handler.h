@@ -223,6 +223,50 @@ private:
     // seconds after its SIGTERM.  Called from the health timer.
     void reap_orphan_workers();
 
+    // ── Handlers the ring has not finished with ─────────────────────────────
+    // The same shape one level up, and for a reason that rhymes: above, a pid
+    // that cannot be reaped yet; here, storage that cannot be freed yet.
+    //
+    // Two of this daemon's handlers embed an io_request in their own storage —
+    // proxy_supervisor's control-socket poll, cluster_discovery's publish timer
+    // — and both are freed while the daemon is running.  A completion still in
+    // the ring therefore names memory inside the object, and the loop reads the
+    // owner token out of that request to decide whether the completion is
+    // stale.  Freeing one with a completion outstanding does not merely risk a
+    // stale dispatch: it makes the staleness check itself a read of freed
+    // memory.  Stopping or removing an out-of-process runtime did exactly that,
+    // and so did pointing --cluster at a second directory.
+    //
+    // The wait cannot go in either destructor.  Both frees happen inside a
+    // command handler, which is itself inside a completion the loop is
+    // dispatching, so a destructor that waited would have to re-enter the loop
+    // and dispatch completions from there — including, possibly, the one for
+    // the object it is in the middle of destroying.  Deferring instead is what
+    // conn_transfer.h already does for a descriptor and for the same stated
+    // reason: the answer arrives on a later turn than the question.  It is also
+    // what runtime_manager already does for a stopped runtime_instance, whose
+    // requests live in its storage for exactly the same reason.
+    //
+    // Held as io_handler because that is the whole of what this needs — it has
+    // a virtual destructor, and every object that can land here is one.
+    struct retired_handler
+    {
+        std::unique_ptr<io_handler> obj;
+        // The identity it submitted under, captured before deregistration
+        // because that is what clears the handler's own copy.  The loop is
+        // asked about this, not about the pointer: an address can be reused by
+        // the next object, a token cannot.
+        uint32_t                    token;
+    };
+    std::vector<retired_handler> m_retired_handlers;
+
+    // Free whichever of them the ring owes nothing.  Called from the health
+    // timer, beside reap_orphan_workers(), because that is already the place
+    // this daemon revisits what it could not finish earlier — and because the
+    // tick is by construction a later turn of the loop than the command that
+    // put them here, which is the whole property being waited on.
+    void drain_retired_handlers();
+
     // Encode the manager's endpoint table and push it to every worker.
     void publish_endpoints_to_workers(const endpoint_table& tbl);
 
