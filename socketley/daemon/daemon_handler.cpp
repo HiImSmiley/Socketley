@@ -3364,11 +3364,39 @@ void daemon_handler::reconcile_proxy_workers()
             inst->mark_failed();
             continue;
         }
-        sup->send_start();
-
-        // The child forked after the last publish, so it has no table yet.
+        // Three frames have to reach this child, in this order: config, the
+        // endpoint table, then start.  The comment that used to sit here named
+        // the reason but sat one line too late to act on it.
+        //
+        // A backend written as a bare runtime name is turned into host:port by
+        // resolve_backend(), and that runs inside start() -- before the listener
+        // is bound, and it fails the start outright when there is no table to
+        // look the name up in.  A supervisor forked in this loop has an empty
+        // endpoint cache, so the send inside spawn() had nothing to send yet;
+        // the table's only other way to a worker is publish_endpoints(), which
+        // reaches one only by walking m_proxy_workers.  So the emplace has to
+        // come before the publish, and the start after it.
+        //
+        // With start sent first, an out-of-process proxy whose backend was a
+        // name never came up at all: the worker resolved nothing, refused to
+        // bind, and every client got a connection refused on a port `ls` showed
+        // as running.  A literal address was unaffected -- it needs no table --
+        // which is what made this look like a proxy bug rather than an ordering
+        // one.  A restart already worked, because by then spawn() had a cached
+        // table to re-send; only the first child was ever broken.
+        //
+        // The table travels as its own frame rather than riding on `start`,
+        // because that is the frame spawn() already re-sends to a restarted
+        // child from its cache: one path into the worker, not two.
+        //
+        // sup is moved into the map, so the start goes through the supervisor
+        // itself.  A pointer rather than the emplace iterator: unordered_map
+        // never invalidates a pointer to an element, so this does not rest on
+        // publish_endpoints() leaving the map alone.
+        proxy_supervisor* const started = sup.get();
         m_proxy_workers.emplace(name, std::move(sup));
         m_manager.publish_endpoints();
+        started->send_start();
     }
 }
 
