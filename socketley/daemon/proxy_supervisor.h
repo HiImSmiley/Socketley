@@ -44,6 +44,10 @@
 #include <sys/types.h>
 
 #include "../shared/request_channel.h"
+// For runtime_state: await_startup() remembers the state the child reported
+// without adopting it, so the enum is part of this class's own storage now
+// rather than something only the .cpp had to know about.
+#include "../shared/runtime_definitions.h"
 
 class proxy_instance;
 class runtime_instance;
@@ -155,6 +159,38 @@ public:
     // Called from the health timer and before any command that reads figures.
     void poll();
 
+    // ─── What the child made of the configuration it was handed ─────────────
+    //
+    // `create` reports on a runtime whose configuration is applied in another
+    // process, and it used to report before that process had looked at it: a
+    // script the worker would refuse got rc=0 and an `ls` line saying Up, and
+    // the reason arrived in the log afterwards, addressed to nobody.  A
+    // declaration is the case that made this visible — a path without a leading
+    // slash is perfectly good Lua, so the placeholder's compile-only check
+    // passes it — but the shape is older than routes and is not specific to
+    // them: anything the worker alone can judge was judged after the answer.
+    enum class startup
+    {
+        pending,   // nothing conclusive yet
+        serving,   // the child applied the configuration and bound its socket
+        refused,   // the child would not, or could not, serve this configuration
+    };
+
+    // Block this thread — NOT the event loop — until the child has reached one
+    // of those, or `bound` runs out.
+    //
+    // The distinction matters and is the whole reason this is safe to call from
+    // a command handler.  Waiting here does not pump the ring: it is ::poll(2)
+    // on one descriptor, ::read(2) to drain it, and the existing waitpid inside
+    // check_liveness().  No SQE is submitted and no completion is reaped, so
+    // nothing re-enters the dispatch that called us.  What it does cost is the
+    // loop standing still for as long as the wait lasts, which is why the
+    // routine case has to be short and is: a worker reports in about 20 ms, and
+    // a refusal comes back sooner still because the child exits on the spot.
+    // The bound is the backstop for a worker that has wedged, not a budget the
+    // normal path spends.
+    startup await_startup(std::chrono::milliseconds bound);
+
     // waitpid(WNOHANG) plus the death policy.  Returns true if the child was
     // found dead — the caller uses that to decide whether to persist a state
     // change.
@@ -247,6 +283,18 @@ private:
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};
+
+    // The last state the child reported about itself, observed and not adopted.
+    //
+    // ingest() is explicit that created/running are not written through to the
+    // placeholder, because the daemon's own record is what the CLI is promised
+    // and a second writer for one value is how those two come to disagree.
+    // That rule is about who OWNS the value; it does not stop this side from
+    // remembering what it was told.  await_startup() reads this to tell "the
+    // child has bound its socket" from "the child has not answered yet", and
+    // writes nothing anywhere on the strength of it.
+    runtime_state m_worker_state{runtime_created};
+    bool          m_worker_state_seen{false};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

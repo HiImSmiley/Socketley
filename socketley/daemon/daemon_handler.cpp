@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <charconv>
+#include <chrono>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include "../shared/name_resolver.h"
@@ -983,7 +984,46 @@ int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
     // After the save, because the supervisor describes the child with the same
     // runtime_config the state file holds and reads it back off the instance.
     if (autostart && !instance->get_test_mode())
+    {
         reconcile_proxy_workers();
+
+        // ─── The answer waits for the process that decides it ───────────────
+        //
+        // Everything above this line was judged in the daemon, and for a runtime
+        // that lives in the daemon that was the whole configuration.  For one
+        // that lives in a worker it is not: the script runs there, the port is
+        // bound there, the TLS pair is checked there.  `create` returned on the
+        // strength of having forked a process, which is not the same as that
+        // process having accepted anything -- and the gap was a report of
+        // success for a configuration that was about to be refused, with the
+        // reason arriving in the log afterwards.
+        //
+        // A declaration is where that finally bit, because `--daemon-process`
+        // made servers out-of-process by default and servers are the role that
+        // declares routes.  `path = "no-slash"` is faultless Lua, so the
+        // placeholder's compile-only check passes it and only the worker ever
+        // discovers it is not a path.
+        //
+        // Waiting is what this tree does everywhere else a setting might not be
+        // honoured -- --sqpoll a ring cannot give, --tls on a role with no
+        // handshake, a restored runtime whose ring requirement cannot be met --
+        // and all three refuse the create rather than reporting one. The rule
+        // against synchronous cross-runtime calls is not this: that is the data
+        // path, where a request would have to suspend across a round trip.  This
+        // is the control path, which already waits -- on the IPC socket, and on
+        // the fork above.
+        // The runtime is deliberately left where the refusal put it, which is
+        // `failed`, rather than being removed as the in-daemon path removes a
+        // runtime whose script will not load.  Two things in the tree already
+        // say so and outrank the symmetry argument: proxy_supervisor keeps a
+        // refused configuration `failed` "where the operator can see it", and
+        // a restored runtime whose ring requirement cannot be met lands there
+        // too.  A create that refuses and leaves nothing to look at would make
+        // the worker's reason the only record, in a log, of a runtime the
+        // operator can no longer ask about.
+        if (const int wrc = await_worker_startup(name); wrc != 0)
+            return wrc;
+    }
 
     return 0;
 }
@@ -3330,6 +3370,77 @@ void daemon_handler::reconcile_proxy_workers()
         m_proxy_workers.emplace(name, std::move(sup));
         m_manager.publish_endpoints();
     }
+}
+
+// ─── How long `create` will wait for a worker to answer ─────────────────────
+//
+// Measured on this machine: a worker that has to compile a script, build its
+// ring and bind its listener reports back 17-22 ms after `create` has forked it,
+// over ten runs.  A refusal comes back sooner, because the child stops at the
+// script and exits rather than going on to bind anything.
+//
+// Two seconds is therefore about a hundred times the cost of the case it is
+// timing, which is the point: it is not a budget the normal path spends, it is
+// the backstop for a worker that has wedged and will never answer.  The wait
+// ends on the answer, so what a create actually costs is the 20 ms, and the
+// bound is only ever reached when something is already wrong.
+//
+// Two seconds rather than a new number of its own because it is the interval
+// this daemon already uses for the health tick -- the longest anything here
+// waits to notice a worker. One timescale in the file is easier to reason about
+// than two, and a wait that outlived the tick meant to supersede it would be the
+// confusing combination.
+namespace
+{
+constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
+}
+
+int daemon_handler::await_worker_startup(std::string_view name)
+{
+    auto it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end())
+        return 0;   // in-daemon, or never spawned: nothing in another process
+
+    switch (it->second->await_startup(worker_startup_bound))
+    {
+        case proxy_supervisor::startup::serving:
+            return 0;
+
+        case proxy_supervisor::startup::refused:
+            // Deliberately "did not accept" rather than "refused its script".
+            // Two different things reach this verdict -- a worker that exits
+            // rather than serve without its script, and one that started and
+            // could not bind, resolve its backend or load its TLS pair -- and
+            // only the first is a refusal in the narrow sense.  The message has
+            // to be true of both, and the child has already written the specific
+            // reason: "'path' must start with '/'" names the entry and the rule,
+            // which is more than this side knows.  What is added here is the
+            // consequence, on the CLI's own stream, because a log line the
+            // operator has not gone looking for is not an answer to a command.
+            //
+            // Exit 1 for both, because both are the configuration that was
+            // handed in: a script that will not load, a backend that cannot be
+            // resolved, a port already taken.  That is bad input, not a fatal.
+            std::cout << "runtime " << name
+                      << " could not start: the worker did not accept its "
+                         "configuration (the reason is in the daemon log)\n";
+            return 1;
+
+        case proxy_supervisor::startup::pending:
+            break;
+    }
+
+    // Neither answer inside the bound.  Deliberately NOT reported as a refusal
+    // and deliberately not marked failed here: this side does not know which it
+    // is, and the two wrong answers available -- "it failed" about a runtime
+    // that comes up a moment later, "it worked" about one that never does --
+    // are both worse than saying what is actually known.  The supervisor still
+    // owns the child, the health tick still settles the state, and `ls` will
+    // show whichever it turns out to be.
+    std::cout << "runtime " << name
+              << " did not report back within 2s of starting; it is still being "
+                 "supervised -- check `socketley ls` for what it settled on\n";
+    return 2;
 }
 
 void daemon_handler::reap_orphan_workers()

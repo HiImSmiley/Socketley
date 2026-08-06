@@ -4689,6 +4689,38 @@ publishes none \(em a gateway in front of one forwards to it without the 405 it
 could otherwise refuse at the edge. The declaration is a handler's feature
 rather than a proxy's, so a server moved out of process gives it up too.
 .PP
+.B "create waits for the worker's verdict."
+Compiling the script in the placeholder catches a file that does not parse, and
+nothing else: the rest of the configuration is judged in the worker, where the
+script actually runs, the port is actually bound and the TLS pair is actually
+read. So
+.B create
+does not answer when it has forked a process \(em it waits until that process
+says whether it can serve what it was handed.
+.IP
+Three things end the wait. The worker reports that it is serving, and
+.B create
+exits 0. The worker refuses, or starts and cannot bind, resolve its backend or
+load its certificates, and
+.B create
+exits 1 with the reason in the daemon's log \(em the runtime is left
+.B failed
+where
+.B ls
+shows it, rather than being removed, so there is still something to ask about.
+Or neither answer arrives within two seconds, and
+.B create
+exits 2 saying so; the runtime stays under supervision and
+.B ls
+reports whatever it settles on.
+.IP
+The bound is a backstop, not a budget. A worker that has to compile a script,
+build its ring and bind a listener reports back in about 20 ms, and a refusal
+comes back sooner because the child stops at the script; two seconds is only
+reached by a worker that has wedged.
+.B create
+never blocks indefinitely on a child.
+.PP
 .B "A runtime in a worker can still ask another runtime by name."
 .B \-\-cache
 works across the boundary in both directions. A request for a name the asking

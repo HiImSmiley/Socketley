@@ -195,12 +195,32 @@ fi
 create_ok "in-process top-level proxy created" "$BIN" create proxy top_in \
     -p "$TOP_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
     --daemon-process -s
-create_ok "out-of-process top-level proxy created" "$BIN" create proxy top_oop \
+# Deliberately not create_ok.  This create is expected to be refused, and that
+# is now an assertion in its own right: `create` waits for the worker's verdict
+# before answering, so a script the worker will not load is refused by the
+# command that asked for it instead of being reported as success and corrected
+# in the log a moment later.  It used to exit 0 here, which is the defect that
+# wait exists to close.
+#
+# Exit 1 specifically, not merely non-zero: "unknown flag" and "unknown runtime"
+# are refusals too, and 2 is the timeout — an oracle that accepted any failure
+# would pass against a build that simply never answered.
+TOP_OOP_RC=0
+TOP_OOP_OUT=$("$BIN" create proxy top_oop \
     -p "$TOP_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
-    -s
+    -s 2>&1) || TOP_OOP_RC=$?
+if [ "$TOP_OOP_RC" = "1" ]; then pass; else
+    fail "create refuses a script the worker will not load" \
+         "create exited $TOP_OOP_RC, wanted 1" \
+         "the script's top-level socketley.list() cannot work in a worker, so the" \
+         "worker refuses the configuration — and create is what has to say so," \
+         "because by the time the log says it the operator has been told 0" \
+         "create said: ${TOP_OOP_OUT:-<nothing>}"
+fi
 
-# The supervisor reaps the child on the health timer, so this takes a few
-# seconds; poll for the verdict rather than sleeping a guess at it.
+# Already true by the time create returned, since create waited for it.  The
+# poll is kept because it costs nothing when the answer is already there and
+# still covers the runtime being failed by the health tick instead.
 for _ in $(seq 1 100); do
     [ "$(state top_oop)" = "failed" ] && break
     sleep 0.2

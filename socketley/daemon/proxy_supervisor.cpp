@@ -1,8 +1,10 @@
 #include "proxy_supervisor.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <string>
 #include <unistd.h>
@@ -267,6 +269,13 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     m_pid        = child;
     m_control_fd = sv[0];
 
+    // A new child has said nothing yet.  Without this a restart would inherit
+    // the previous one's report, and await_startup() would answer for a process
+    // that no longer exists — most sharply on the restart path, where the child
+    // being replaced is one that had reached `running` before it died.
+    m_worker_state      = runtime_created;
+    m_worker_state_seen = false;
+
     const int fl = ::fcntl(m_control_fd, F_GETFL, 0);
     if (fl >= 0)
         if (::fcntl(m_control_fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
@@ -484,6 +493,86 @@ void proxy_supervisor::poll()
     ingest(m_in);
 }
 
+// ─── Waiting for the child's verdict without pumping the ring ───────────────
+//
+// Three things can end this wait, and all three are read with plain syscalls:
+//
+//   serving   the child sent `state` carrying running, which on_start() writes
+//             only after m_rt->start() has bound the socket.
+//   refused   the placeholder is `failed`.  Two paths reach that and both are
+//             somebody else's already: ingest() adopts a `state` frame carrying
+//             failed, and check_liveness() adopts the exit status of a child
+//             that died -- including exit_config_refused, whose whole purpose is
+//             to say "not a crash, a configuration I will never accept".
+//   timeout   neither, before the bound.
+//
+// What is deliberately NOT here is a waitpid of its own.  check_liveness() is
+// the one place that reaps and the one place that applies the death policy;
+// a second reaper would take the child out from under it, and the pid
+// bookkeeping and the restart-burst counter would both be reading a corpse
+// somebody else buried.  So this calls check_liveness() and reads the result
+// off the placeholder, which keeps one writer for the state and one reaper for
+// the child.
+//
+// A restart during the wait is not an ending.  check_liveness() may fork a
+// replacement, which leaves the placeholder `running` and m_worker_state_seen
+// false; the loop simply goes round again against the new child, still inside
+// the same bound.
+proxy_supervisor::startup
+proxy_supervisor::await_startup(std::chrono::milliseconds bound)
+{
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+
+    for (;;)
+    {
+        // Whatever is already buffered, before deciding anything.  On the
+        // refusal path the child has usually exited before this is first
+        // called, so the frames and the EOF are both sitting in the socket.
+        poll();
+
+        if (m_placeholder && m_placeholder->get_state() == runtime_failed)
+            return startup::refused;
+
+        if (m_worker_state_seen && m_worker_state == runtime_running)
+            return startup::serving;
+
+        // Reaps, applies the policy, and may mark the placeholder failed or
+        // fork a replacement.  Checked again at the top of the next turn.
+        if (check_liveness())
+            continue;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return startup::pending;
+
+        // Sleep on the descriptor, not on the clock: the answer arrives as a
+        // frame, and a poll that ends on it costs the wait nothing it does not
+        // have to spend.  Capped so a child that dies without closing its end
+        // -- SIGKILL leaves nothing to read -- is still noticed by the
+        // check_liveness() above within a tick of the cap rather than at the
+        // deadline.
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        int slice = static_cast<int>(std::min<std::chrono::milliseconds::rep>(
+            remaining.count(), 20));
+        if (slice < 0)
+            slice = 0;
+
+        if (m_control_fd >= 0)
+        {
+            struct pollfd pfd{m_control_fd, POLLIN, 0};
+            if (::poll(&pfd, 1, slice) < 0) {}
+        }
+        else
+        {
+            // No socket left to wait on: the child is gone or never had one,
+            // and the only thing that can still change is the reap above.
+            struct timespec ts{0, static_cast<long>(slice) * 1000000L};
+            if (::nanosleep(&ts, nullptr) < 0) {}
+        }
+    }
+}
+
 void proxy_supervisor::ingest(const std::string&)
 {
     worker_proto::frame_type type{};
@@ -576,6 +665,20 @@ void proxy_supervisor::ingest(const std::string&)
                 //
                 // A wrong answer rather than a missing one, to `ls`, to `ps -a`
                 // and to every script reading the JSON.
+                //
+                // Remembered either way, which is not the same as adopted.  The
+                // paragraph above is about who owns the placeholder's state; it
+                // does not say this side has to forget what the child said.
+                // await_startup() needs exactly that memory to tell a child that
+                // has bound its socket from one that has not answered yet, and
+                // it writes nothing on the strength of it.
+                if (!payload.empty())
+                {
+                    m_worker_state =
+                        static_cast<runtime_state>(static_cast<uint8_t>(payload[0]));
+                    m_worker_state_seen = true;
+                }
+
                 if (!payload.empty() &&
                     static_cast<runtime_state>(static_cast<uint8_t>(payload[0]))
                         == runtime_failed &&

@@ -194,6 +194,14 @@ private:
     // forgotten at the seventh call site.
     void reconcile_proxy_workers();
 
+    // Wait for a just-started out-of-process runtime to say whether it can serve
+    // the configuration it was handed, and turn that into an exit status.
+    //
+    // Returns 0 if the child is serving, non-zero with the reason already
+    // printed otherwise.  A runtime that is not out-of-process, or that has no
+    // supervisor, is 0: there is nothing in another process to wait for.
+    int await_worker_startup(std::string_view name);
+
     // Drain every worker's control socket so the figures are current.  Called
     // before the commands that print them.
     void poll_proxy_workers();
