@@ -1258,14 +1258,39 @@ namespace
 // Raised rather than returned, because the return value is the thing that
 // cannot carry it: `if socketley.create(...) then` is how these are written and
 // a false is what it already handles.
-std::string worker_refusal(const char* call)
+//
+// `call` is the fully-qualified name as a script writes it, so the message
+// names what was typed.  `mistaken_for` completes the sentence, because the lie
+// differs by call: an empty list reads as a daemon with nothing in it, while a
+// false from self.route() reads as a target that is not there.
+std::string worker_refusal(const std::string& call,
+                           const char* mistaken_for =
+                               "a successful call on a daemon with nothing in it")
 {
-    return std::string("socketley.") + call +
+    return call +
            "() is refused in a worker process: this call reaches for the "
            "runtime map, which lives in the daemon, and answering from here "
-           "would return nothing — indistinguishable from a successful call on "
-           "a daemon with nothing in it. Create this runtime with "
-           "--daemon-process, or move the call to one that has it.";
+           "would return nothing — indistinguishable from " + mistaken_for +
+           ". Create this runtime with --daemon-process, or move the call to "
+           "one that has it.";
+}
+
+// The raise itself.  Built by a Lua factory so that what a script sees is Lua's
+// own error() at the call site rather than a C++ exception thrown through
+// LuaJIT's frames — which is what lets every callback in this tree catch it and
+// print it with the callback's name attached.
+//
+// Shared by the two tables that have something to refuse, so both fail the same
+// way.  Comes back invalid if the interpreter could not build it; callers say so
+// rather than quietly leaving a working binding in place.
+sol::function refusal_factory(sol::state& lua)
+{
+    auto factory = lua.safe_script(
+        "return function(msg) return function() error(msg, 2) end end",
+        sol::script_pass_on_error);
+    if (!factory.valid())
+        return sol::function();
+    return factory;
 }
 
 }  // namespace
@@ -1291,10 +1316,8 @@ bool lua_context::s_worker_process = false;
 // as a configuration it cannot serve.
 void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl)
 {
-    auto factory = m_lua.safe_script(
-        "return function(msg) return function() error(msg, 2) end end",
-        sol::script_pass_on_error);
-    if (!factory.valid())
+    sol::function make = refusal_factory(m_lua);
+    if (!make.valid())
     {
         // Cannot happen with a working interpreter, and if it does the honest
         // thing is to say so rather than leave the old bindings in place while
@@ -1304,7 +1327,6 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
                      "answer nothing" << std::endl;
         return;
     }
-    sol::function make = factory;
 
     // Everything that reaches for the runtime map, and nothing that does not.
     // socketley.log, .http, .json_*, the timers and .subscribe all work in a
@@ -1313,7 +1335,7 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     for (const char* call : {"create", "start", "stop", "remove", "send", "list",
                              "get", "pipe"})
     {
-        sol::function f = make(worker_refusal(call));
+        sol::function f = make(worker_refusal(std::string("socketley.") + call));
         sk[call] = f;
     }
 
@@ -1321,7 +1343,7 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // worker has neither.
     for (const char* call : {"daemons", "runtimes", "group", "stats"})
     {
-        sol::function f = make(worker_refusal((std::string("cluster.") + call).c_str()));
+        sol::function f = make(worker_refusal(std::string("socketley.cluster.") + call));
         cluster_tbl[call] = f;
     }
 }
@@ -1912,6 +1934,46 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     self["unpipe"] = [owner](int fd) {
         static_cast<server_instance*>(owner)->lua_unpipe(fd);
     };
+
+    // ── Last, and over the top of the binding above ─────────────────────────
+    //
+    // self.route() names another runtime, so it looks that name up in the
+    // runtime map exactly as the socketley.* calls do — and a worker holds no
+    // such map, only its own runtime.  It escaped their refusal for one reason:
+    // it is spelled self. rather than socketley., and the refusal was installed
+    // per table rather than per what a call reaches for.
+    //
+    // Left alone it answered a bare false, which is also what it answers for a
+    // target that does not exist.  A script could not tell a runtime that is
+    // absent from one that is merely in another process, and the accepted-but-
+    // not-applied call is the shape this tree refuses everywhere else.
+    //
+    // What this does NOT say is how routing a connection between processes
+    // should eventually work.  It says only that it cannot happen in a worker
+    // today, which is true and is all that is known: when a connection can be
+    // handed to another process, this is the binding that stops being refused,
+    // and nothing here decides what that mechanism looks like.
+    //
+    // Only route().  unroute(), get_route() and owner_send() answer from this
+    // runtime's own tables, and in a worker those are empty because nothing was
+    // ever routed — so their false is the truth rather than a substitute for
+    // it, and refusing them would replace a correct answer with an error.
+    if (in_worker_process())
+    {
+        sol::function make = refusal_factory(m_lua);
+        if (make.valid())
+        {
+            sol::function f = make(
+                worker_refusal("self.route", "a target that does not exist"));
+            self["route"] = f;
+        }
+        else
+        {
+            std::cerr << "[lua] could not install the out-of-process refusal for "
+                         "self.route; it is left bound and will answer false"
+                      << std::endl;
+        }
+    }
 }
 
 void lua_context::register_client_table(runtime_instance* owner, sol::table& self)

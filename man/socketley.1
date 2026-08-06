@@ -4788,28 +4788,47 @@ the
 .B self
 table, and the connection and request callbacks.
 .IP
-.B "self.route() is the exception in that list, and it does not say so."
-It names another runtime, so it reaches for the map like the calls above \(em
-but it is a
-.B self
-call rather than a
-.B socketley
-one and was not given their refusal. In a worker it finds nothing and returns
+.B "self.route() is the exception in that list, and it is refused like the rest."
+It names another runtime, so it reaches for the map exactly as the calls above
+do; it is only spelled
+.B self.
+rather than
+.B socketley.
+and so was bound while they were replaced. It raises the same refusal they do,
+naming itself and
+.BR \-\-daemon\-process ,
+and it is caught wherever theirs are \(em in a callback the request fails and
+the reason is logged against the callback's name, at the top level the script
+does not load.
+.IP
+It used to answer
 .BR false ,
-which is also what it answers for a target that does not exist: a script cannot
-tell a runtime that is absent from one that is merely in another process.
-Measured with two servers left at the out-of-process default,
-.B self.route()
-answers
+which is also what it answers for a target that does not exist, so a script
+could not tell a runtime that is absent from one that is merely in another
+process. Measured with two servers left at the out-of-process default it
+answered
 .BR false ,
-the target counts no connection and its
+the target counted no connection and its
 .B on_connect
-never fires; with both created
+never fired; with both created
 .B \-\-daemon\-process
-it routes. Moving a live connection between processes is a separate mechanism
-from naming one, and nothing here does it yet \(em so a script that routes
-should keep the runtimes it routes between in the daemon, and should check the
-return rather than assuming it worked.
+it routes, and still does.
+.IP
+The refusal says that a connection cannot be routed out of a worker
+.IR today ,
+and nothing more \(em it is not a statement about how moving a live connection
+between processes will eventually work. Naming a runtime and handing it an open
+connection are separate mechanisms, and only the first exists here. A script
+that routes should keep the runtimes it routes between in the daemon.
+.IP
+.BR unroute() ,
+.B get_route()
+and
+.B owner_send()
+are not refused. They answer from this runtime's own tables, which in a worker
+are empty because nothing was ever routed there \(em so their
+.B false
+is the truth rather than a stand-in for it.
 .PP
 .B "Cross\-runtime pub/sub reaches a worker."
 A cache's

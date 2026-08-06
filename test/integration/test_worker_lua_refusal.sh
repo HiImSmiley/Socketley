@@ -67,9 +67,9 @@ fail() {
 }
 
 cleanup() {
-    "$BIN" stop  cb_oop cb_in top_oop top_in backend 2>/dev/null || true
+    "$BIN" stop  cb_oop cb_in top_oop top_in backend rt_target rt_in rt_oop 2>/dev/null || true
     sleep 0.3
-    "$BIN" remove cb_oop cb_in top_oop top_in backend 2>/dev/null || true
+    "$BIN" remove cb_oop cb_in top_oop top_in backend rt_target rt_in rt_oop 2>/dev/null || true
     daemon_stop
 }
 trap cleanup EXIT
@@ -257,6 +257,75 @@ if [ "$REFUSALS" -eq 1 ]; then pass; else
          "the worker refused $REFUSALS times, wanted exactly 1" \
          "restarting a child that cannot accept its configuration produces one" \
          "more copy of the same refusal per attempt, up to the burst limit"
+fi
+
+# ── Assertion 5: self.route() is refused too, and says so ───────────────────
+#
+# It reaches for the same runtime map as the calls above and is refused for the
+# same reason; it is only spelled self. rather than socketley., which is the
+# whole reason it was missed.  It answered a bare false — which is also what it
+# answers for a target that does not exist — so a script could not tell a
+# runtime that is absent from one that is merely in another process.
+#
+# A server rather than a proxy, because self.route() is a server's call.
+ROUTE_LUA="$SOCKETLEY_TMPD/route.lua"
+# "route" and not something shorter: a client message under three bytes is not
+# delivered to on_client_message at all on this build — protocol detection wants
+# that many before it will decide — so a two-letter word would make this file
+# fail for a reason that has nothing to do with what it is asserting.
+cat > "$ROUTE_LUA" <<'LUAEOF'
+function on_connect(client_id) self.send(client_id, "ready") end
+function on_client_message(client_id, msg)
+    if msg == "route" then
+        local ok, err = pcall(function() return self.route(client_id, "rt_target") end)
+        socketley.log("ROUTE ok=" .. tostring(ok) .. " res=" .. tostring(err))
+    end
+end
+LUAEOF
+TARGET_LUA="$SOCKETLEY_TMPD/target.lua"
+cat > "$TARGET_LUA" <<'LUAEOF'
+function on_connect(client_id) socketley.log("RT_TARGET_GOT_ONE") end
+LUAEOF
+
+create_ok "route target created" "$BIN" create server rt_target -p 19455 \
+          --lua "$TARGET_LUA" --daemon-process -s
+create_ok "routing server in the daemon created" "$BIN" create server rt_in -p 19456 \
+          --lua "$ROUTE_LUA" --daemon-process -s
+create_ok "routing server in a worker created" "$BIN" create server rt_oop -p 19457 \
+          --lua "$ROUTE_LUA" -s
+
+# poke PORT — open a connection, read the greeting so the server has finished
+# with it, ask to be routed, and hold the connection open long enough for the
+# route to be acted on.
+poke() { python3 -c "
+import socket,time,sys
+s=socket.create_connection(('127.0.0.1',int(sys.argv[1])));s.settimeout(2)
+try: s.recv(4096)
+except Exception: pass
+s.sendall(b'route\n');time.sleep(1.0);s.close()" "$1" 2>/dev/null || true; }
+
+poke 19456      # the control: in the daemon, this must actually route
+poke 19457      # the worker: this must be refused by name
+sleep 0.8
+
+if grep -q 'self\.route() is refused in a worker process' "$SOCKETLEY_DLOG" 2>/dev/null
+then pass; else
+    fail "self.route() is refused in a worker, by name" \
+         "the log carries no such refusal" \
+         "a bare false here is indistinguishable from 'no such target', which is" \
+         "the accepted-but-not-applied shape this whole file is about:" \
+         "$(grep -a -o 'ROUTE ok=[a-z]* res=[^ ]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)"
+fi
+
+# ── Control 4: the same call, in the daemon, still routes ───────────────────
+#
+# Without this, "the worker refused" also passes on a build where self.route()
+# refuses everywhere — which would be a broken feature, not a boundary.
+if grep -q 'RT_TARGET_GOT_ONE' "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    fail "control: the same self.route() works in the daemon" \
+         "the target never reported a routed connection" \
+         "if this fails the assertion above is about routing being broken," \
+         "not about the process boundary, and proves nothing"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
