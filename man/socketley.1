@@ -2589,9 +2589,10 @@ table with no entry at index 1 is refused too \(em it is an array, and
 .B routes = {["/a"] = {"GET"}}
 would otherwise load and declare nothing.
 .PP
-A proxy runtime running in a worker process of its own does not receive route
-declarations yet and forwards every method; the declaration is enforced by
-proxies running inside the daemon.
+A proxy runtime running in a worker process of its own enforces declarations
+the same way. The table reaches it in the endpoint frame that already carries
+the addresses, so where the gateway runs makes no difference to which methods
+it refuses.
 .IP
 See
 .B examples/proxy/declared\-routes.lua
