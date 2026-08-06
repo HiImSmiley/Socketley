@@ -353,7 +353,21 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         if (::fcntl(m_control_fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
 
     if (m_placeholder)
+    {
         m_placeholder->set_pid(child);
+
+        // Forked, not listening.  Everything below this line is a frame on its
+        // way to a child that has not run a line of its own yet, and the port
+        // is bound at the far end of it — so from here until the child says
+        // otherwise this runtime is not a group member anybody may be routed
+        // to.  See runtime_instance::endpoint_live().
+        //
+        // Lowered on every spawn and not only the first, which is what covers
+        // the restart path: a child that died and is being replaced re-enters
+        // exactly this window, and the endpoint table said it was serving
+        // throughout the old one.
+        m_placeholder->set_endpoint_live(false);
+    }
 
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, m_config_json)))
     {
@@ -806,6 +820,24 @@ void proxy_supervisor::ingest(const std::string&)
                     m_worker_state =
                         static_cast<runtime_state>(static_cast<uint8_t>(payload[0]));
                     m_worker_state_seen = true;
+
+                    // The one thing only the child can tell us, and the reason
+                    // this frame is worth more than a state the daemon already
+                    // owns: the listener is up.  Written through to the
+                    // placeholder because the endpoint table is built from it
+                    // and this is the fact the group filter needs — which is
+                    // not the same as adopting the child's state, the value
+                    // the paragraph above says has one owner.
+                    //
+                    // Raised once per transition so the caller republishes: an
+                    // address that has become answerable is only useful to the
+                    // gateways once they are told.
+                    if (m_placeholder && m_worker_state == runtime_running &&
+                        !m_placeholder->endpoint_live())
+                    {
+                        m_placeholder->set_endpoint_live(true);
+                        m_reachability_changed = true;
+                    }
                 }
 
                 if (!payload.empty() &&

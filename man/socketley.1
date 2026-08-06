@@ -1114,6 +1114,15 @@ discovery: a proxy using
 as a backend will route to all running members of that group at connection
 time. New group members are discovered automatically without restarting
 the proxy.
+.IP
+A member joins its group when it is actually listening, not when it is created.
+For a runtime that runs in its own process this is a few milliseconds after
+.B create
+returns, because the port is bound in that process and the daemon publishes the
+member once the worker reports it. Until then the member is absent from the
+group rather than present and refusing connections \(em being routed to an
+address that is not accepting yet would trip the routing proxy's circuit breaker
+against a member that is merely young.
 .SH SERVER FLAGS
 .TP
 .BI "\-\-mode " "mode"

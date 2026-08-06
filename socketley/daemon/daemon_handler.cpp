@@ -3514,6 +3514,15 @@ int daemon_handler::await_worker_startup(std::string_view name)
     switch (it->second->await_startup(worker_startup_bound))
     {
         case proxy_supervisor::startup::serving:
+            // The child is listening, so it is a group member others may be
+            // routed to now — and until this runs, deliberately, they have not
+            // been told about it.  This is what turns the wait into the
+            // announcement rather than leaving it to the health tick two
+            // seconds later; a create that returns has already published.
+            // take_reachability_change() is consumed here so the tick does not
+            // publish a second time for the same transition.
+            if (it->second->take_reachability_change())
+                m_manager.publish_endpoints();
             return 0;
 
         case proxy_supervisor::startup::refused:
@@ -3640,6 +3649,16 @@ void daemon_handler::check_managed_health()
         // A declaration that arrived since the last tick.  publish_endpoints()
         // rebuilds the whole table, so one call covers however many sent one.
         if (sup->take_routes_change())
+            routes_moved = true;
+
+        // A child that has started listening since the last tick.  Folded into
+        // the same republish for the same reason, and it is the backstop rather
+        // than the fast path: a `create` announces its own worker as soon as
+        // await_worker_startup() sees it serving.  What reaches here is every
+        // other way a worker can come up — a restart after a crash above all,
+        // where nothing is waiting on the child and the member has been out of
+        // its group since the fork.
+        if (sup->take_reachability_change())
             routes_moved = true;
 
         if (sup->check_liveness() && m_persistence)

@@ -258,6 +258,14 @@ public:
 
     bool take_state_change() { const bool c = m_state_changed; m_state_changed = false; return c; }
 
+    // True once each time the child has become answerable at its port — the
+    // transition, not the condition.  Same shape as the two above: the
+    // supervisor observes, the caller republishes the endpoint table, because a
+    // member that has just started listening is only reachable once the
+    // gateways have been told it is.  See runtime_instance::endpoint_live().
+    bool take_reachability_change()
+    { const bool c = m_reachability_changed; m_reachability_changed = false; return c; }
+
     bool  is_alive() const { return m_pid > 0; }
     pid_t pid()      const { return m_pid; }
 
@@ -343,6 +351,7 @@ private:
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};
+    bool         m_reachability_changed{false};
 
     // The last state the child reported about itself, observed and not adopted.
     //

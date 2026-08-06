@@ -112,6 +112,19 @@ bool runtime_instance::start(event_loop& loop)
     // is no completion the kernel could still deliver into this object.
     if (m_out_of_process)
     {
+        // "Binds nothing" is the whole sentence above, and it is what this flag
+        // has to say out loud.  The line below stores `running` because that is
+        // the daemon's record of what was asked for — but nothing is listening
+        // on this port yet and, at this point, no child has even been forked to
+        // do it.  publish_endpoints() adds a member to its group on `running`,
+        // so without this the address is announced to every gateway here, in
+        // runtime_manager::start()'s publish, before the supervisor exists.
+        //
+        // Set before the state and not after: the two are read by another call
+        // in the same statement sequence, and a reader that saw `running` with
+        // the old flag would be reading exactly the state this prevents.
+        m_endpoint_live = false;
+
         m_state.store(runtime_running, std::memory_order_release);
         m_start_time = std::chrono::system_clock::now();
         return true;

@@ -405,6 +405,39 @@ public:
     void set_worker_routes(std::shared_ptr<const route_table> rt);
     const std::shared_ptr<const route_table>& worker_routes() const;
 
+    // ── Is there something listening on this runtime's port yet? ────────────
+    //
+    // `running` answers that for a runtime that binds in this process, because
+    // start() binds the listener before it returns and the state is set after.
+    // It does not answer it for one that binds in a worker: start() there
+    // stores `running` the moment the child is FORKED, since that is all this
+    // side knows — the port is bound in the worker, and the daemon hears about
+    // it in a `state` frame some milliseconds later.
+    //
+    // publish_endpoints() adds a runtime to its group on `running`, meaning "a
+    // member that is merely configured has nothing listening".  For an
+    // out-of-process member that reading was wrong, and the gap was not
+    // academic: the address went into every other gateway's table while nothing
+    // was accepting on it, a saturated gateway spent its next few thousand
+    // requests being refused there, and five refusals opened the group circuit
+    // breaker — which then excluded the new member for the whole circuit
+    // timeout, thirty seconds by default.  Measured at 28k req/s: a member that
+    // joined served nothing for the entire window.
+    //
+    // So the group filter asks this instead, and the supervisor is what answers
+    // it: false from the fork, true when the child reports that it is serving.
+    // True by default and never lowered for a runtime that binds here, which is
+    // what keeps in-daemon behaviour exactly as it was.
+    //
+    // Deliberately NOT applied to the by-name entry above it.  That one is
+    // unfiltered on purpose — a backend written as a bare runtime name is
+    // resolved inside the target's own start(), before anything has bound — and
+    // filtering it is what broke out-of-process proxies with a named backend
+    // once already.  This is about group membership, which is a promise made to
+    // somebody else.
+    bool endpoint_live() const { return m_endpoint_live; }
+    void set_endpoint_live(bool live) { m_endpoint_live = live; }
+
     void set_request_sink_override(request_sink* s) { m_sink_override = s; }
 
     // The mesh client-certificate paths, for the one role that has them.
@@ -595,6 +628,10 @@ private:
     bool m_managed = false;
     bool m_out_of_process = false;
     std::shared_ptr<const route_table> m_worker_routes;
+
+    // See endpoint_live().  True by default: a runtime that binds in this
+    // process is listening by the time anything can ask.
+    bool m_endpoint_live{true};
     std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
     child_policy m_child_policy = child_policy::stop;

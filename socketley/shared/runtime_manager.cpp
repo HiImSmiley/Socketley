@@ -607,8 +607,18 @@ void runtime_manager::publish_endpoints()
 
             // By group: running only, which is what get_by_group() filtered on.
             // A member that is merely configured has nothing listening.
+            //
+            // And `running` is not the whole of that question.  For a runtime
+            // that binds in a worker, this side sets `running` when the child is
+            // forked, not when it binds — so `running` alone put an address into
+            // every gateway's group while nothing was accepting on it.  See
+            // runtime_instance::endpoint_live(), which is the rest of the
+            // question and is answered by whoever owns the child.  Always true
+            // for a runtime that binds here, so nothing about the in-process
+            // case changes.
             const std::string_view group = inst->get_group();
-            const bool running = (inst->get_state() == runtime_running);
+            const bool running = (inst->get_state() == runtime_running) &&
+                                 inst->endpoint_live();
             if (!group.empty() && running)
                 tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
 
