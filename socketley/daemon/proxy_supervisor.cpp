@@ -219,12 +219,54 @@ void proxy_supervisor::on_cqe(struct io_uring_cqe* /*cqe*/)
     arm_control_poll();
 }
 
+// Through the loop, not ::close(), and the tension in that is worth writing
+// down because it looks like a reason not to.
+//
+// The rule first: a descriptor the ring may still name is not the caller's to
+// close.  An SQE carries a descriptor NUMBER that the kernel resolves when it
+// consumes the SQE — under SQPOLL on another thread, at a moment nothing here
+// observes — so closing between submission and consumption does not withdraw
+// the operation, it redirects it onto whatever inherits the number.  This class
+// arms exactly one thing on this descriptor, the readability poll above, and
+// disarm_control_poll() asks for it back — but a cancel is itself an SQE naming
+// the same number, and the poll it cancels is still owed one completion when
+// this line runs.  So there was a window here, and the number it hands away is
+// the one the NEXT worker's socketpair is most likely to be given.
+//
+// What it cost is smaller than the proxy's version of the same bug: a poll
+// watches, it does not read, so a redirected arm reports somebody else's
+// readability rather than putting bytes in the wrong stream, and the completion
+// is dropped for a deregistered owner.  Small is not none, and it is the same
+// mistake — the one this project has paid for more than once.
+//
+// The argument against was that shutdown() needs this close to be immediate: it
+// is the backstop that makes a worker which never reads its `shutdown` frame
+// see EOF and exit.  close_fd() holds the number while the ring still owes
+// something for it, so the peer does not see EOF until it lets go.
+//
+// That argument does not survive being measured against what close_fd()
+// actually holds for.  The wait is one turn of the loop, not an open-ended one:
+// the poll has just been cancelled, its -ECANCELED lands on the next drain, and
+// disarm() closes the descriptor from there.  In the commonest case — this
+// being called from inside the poll's own completion, on the read of zero bytes
+// that says the child is gone — it is not even a turn, because the loop disarms
+// as soon as this handler returns.  And EOF is not the only thing on that path:
+// shutdown() sends SIGTERM on the next line, and reap_orphan_workers() escalates
+// to SIGKILL five seconds later.  A worker wedged badly enough to need the EOF
+// is not going to notice a delay measured in microseconds.
+//
+// So the ownership rule wins on its own terms, and the immediacy requirement is
+// still met.  m_loop may be null for a supervisor that never had one, and there
+// is nothing to protect against then.
 void proxy_supervisor::close_control()
 {
     if (m_control_fd >= 0)
     {
         disarm_control_poll();
-        ::close(m_control_fd);
+        if (m_loop)
+            m_loop->close_fd(m_control_fd);
+        else
+            ::close(m_control_fd);
         m_control_fd = -1;
     }
 }
