@@ -1248,6 +1248,25 @@ Detected when the first byte is
 .BR * .
 Useful for cache-linked servers or custom RESP-based protocols.
 .PP
+.B "How much it waits for before deciding."
+The tests above read four bytes \(em every HTTP method is matched on four
+characters, the RESP markers on two \(em so a connection that has sent fewer
+than that is normally left to send more.
+.PP
+A completed line is the exception, and it has to be: a client that writes
+.B "hi\\en"
+and waits to be answered will not send a fourth byte until it is, so waiting for
+one would be waiting for something that only arrives after the answer. A line
+that ended inside four bytes cannot be an HTTP method \(em each is four
+characters and none contains a newline \(em so the protocol is decided there and
+then, as RESP if the first two bytes say so and as TCP otherwise. Short lines
+are ordinary input on a line protocol and are delivered like any other.
+.PP
+This is about the
+.I first
+line only. Once a connection's protocol is known, lines of any length are
+delivered as they arrive.
+.PP
 Browser example:
 .nf
 const ws = new WebSocket("ws://localhost:9000");

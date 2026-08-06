@@ -13,9 +13,11 @@ LUA_SCRIPT="/tmp/test_http_worker.lua"
 cleanup() {
     "$BIN" stop http_svr 2>/dev/null || true
     "$BIN" stop proto_svr 2>/dev/null || true
+    "$BIN" stop short_svr 2>/dev/null || true
     sleep 0.5
     "$BIN" remove http_svr 2>/dev/null || true
     "$BIN" remove proto_svr 2>/dev/null || true
+    "$BIN" remove short_svr 2>/dev/null || true
     rm -f "$LUA_SCRIPT"
     daemon_stop
 }
@@ -189,6 +191,89 @@ else
     fail "tcp connect: the payload arrived" \
          "proto_svr's bytes_in went $PB0 -> $PB1, wanted exactly $PROTO_N more." \
          "The connection was accepted but the newline-delimited payload did not land."
+fi
+
+# --- Test 2b: a short first line is answered, not held ------------------------
+#
+# Detection reads four bytes before it will name a protocol, and used to wait
+# for them unconditionally.  A line-protocol client writes "hi\n" and then waits
+# to be answered, so the fourth byte is one it will not send until the answer
+# comes: the connection deadlocked with three bytes in the buffer, no callback
+# ran, and nothing was logged.  From the client's side that is indistinguishable
+# from a server that received nothing.
+#
+# The oracle is the echo, not a connection counter or a byte counter: both of
+# those move for data the server has merely *received*, which is exactly the
+# state this defect leaves a connection in.  Only a reply proves the bytes
+# reached the script.  And the reply has to carry the payload back, so a server
+# answering some canned greeting cannot pass.
+#
+# Paired with a longer line through the same code on the same server: without
+# it, "the short line was answered" would also fail on a build that answers
+# nothing, and the failure would be read as this defect returning.
+ECHO_LUA="$SOCKETLEY_TMPD/echo.lua"
+cat > "$ECHO_LUA" <<'LUAEOF'
+function on_client_message(client_id, msg)
+    self.send(client_id, "echo:" .. msg)
+end
+LUAEOF
+SHORT_PORT=19393
+create_ok "line-echo server created" "$BIN" create server short_svr -p "$SHORT_PORT" \
+          --lua "$ECHO_LUA" -s
+sleep 0.3
+
+# say PORT PAYLOAD -> whatever came back within the timeout, or the empty string
+say() {
+    python3 -c "
+import socket,sys
+try:
+    s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=3)
+    s.settimeout(3)
+    s.sendall(sys.argv[2].encode())
+    try: sys.stdout.write(s.recv(4096).decode('latin1','replace'))
+    except Exception: pass
+    s.close()
+except Exception: pass" "$1" "$2" 2>/dev/null || printf ''
+}
+
+SHORT_REPLY=$(say "$SHORT_PORT" 'hi
+')
+LONG_REPLY=$(say "$SHORT_PORT" 'hello
+')
+
+# The control first: if this fails, the claim below proves nothing.
+TOTAL=$((TOTAL+1))
+if [ "$LONG_REPLY" = "echo:hello" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [control: a normal line is echoed]: got '$LONG_REPLY', wanted 'echo:hello'"
+    echo "        the short-line assertion below is not measuring anything while this fails"
+fi
+
+TOTAL=$((TOTAL+1))
+if [ "$SHORT_REPLY" = "echo:hi" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a two-byte line is answered]: got '$SHORT_REPLY', wanted 'echo:hi'"
+    echo "        'hi\\n' is three bytes on the wire, one short of what protocol"
+    echo "        detection wants; an empty answer here is the connection deadlocking"
+    echo "        with the line sitting unread, which is what this asserts is over"
+fi
+
+# And the detection it must not have broken: the same server still has to see
+# an HTTP request as HTTP rather than as a line of text.
+TOTAL=$((TOTAL+1))
+SHORT_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+             "http://127.0.0.1:$SHORT_PORT/" 2>/dev/null) || SHORT_HTTP="000"
+if [ "$SHORT_HTTP" != "000" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [detection still recognises HTTP]: curl got '$SHORT_HTTP'"
+    echo "        deciding early on a completed short line must not change what a"
+    echo "        four-byte method prefix is classified as"
 fi
 
 # HTTP connection should get a response (no Lua = 404 or static)

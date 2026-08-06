@@ -2445,9 +2445,40 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // Multi-protocol auto-detection
     if (conn->proto == proto_unknown)
     {
+        // Four bytes is what the tests below need: every HTTP method here is
+        // matched on four characters, and the RESP markers on two.
+        //
+        // Waiting for a fourth byte is right while the client is still mid-line
+        // and wrong the moment a whole line has arrived.  A line-protocol client
+        // writes "hi\n" and then waits to be answered, so the bytes that would
+        // end this wait are the ones it will not send until the wait ends.  That
+        // is a deadlock, and it was a silent one: three bytes sat in `partial`,
+        // no callback ran, nothing was logged, and the connection was
+        // indistinguishable from a client that had sent nothing at all.  It has
+        // been here since the first implementation — see the test.
+        //
+        // A completed short line is not ambiguous, so this decides rather than
+        // guesses or refuses.  Every HTTP method prefix above is four characters
+        // and none contains a newline, so a line that ended inside four bytes
+        // cannot be one; the RESP markers are read out of the first two bytes
+        // and are still applied when they are there.  What remains is TCP, which
+        // is what such a line was always eventually classified as once some
+        // later byte happened to unblock it.
         if (conn->partial.size() < 4)
-            goto submit_next_read;
+        {
+            if (conn->partial.find('\n') == std::string::npos)
+                goto submit_next_read;   // still mid-line: more may yet come
 
+            const char s0 = conn->partial[0];
+            const char s1 = conn->partial.size() > 1 ? conn->partial[1] : '\0';
+            const bool resp =
+                (s0 == '*' && s1 >= '0' && s1 <= '9') ||
+                (s0 == '$' && s1 >= '0' && s1 <= '9') ||
+                (s0 == '+' && ((s1 >= 'A' && s1 <= 'Z') || (s1 >= 'a' && s1 <= 'z')));
+            conn->proto = resp ? proto_resp : proto_tcp;
+        }
+        else
+        {
         char c0 = conn->partial[0], c1 = conn->partial[1];
         char c2 = conn->partial[2], c3 = conn->partial[3];
 
@@ -2476,6 +2507,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         else
         {
             conn->proto = proto_tcp;
+        }
         }
     }
 
