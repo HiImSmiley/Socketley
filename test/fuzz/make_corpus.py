@@ -515,6 +515,69 @@ E_NONE, E_LRU, E_RANDOM = 0, 1, 2
 T_LONG, T_ELAPSED = 0, 1
 
 
+# ───────────────────────────── proxy tunnel ─────────────────────────────────
+#
+# Seeds for fuzz_proxy_tunnel.  These pin the case rather than hoping a mutator
+# reaches it: the target's directed half builds a 101 on every input, and what
+# these vary is the byte stream that arrives BEHIND the switch — which is where
+# the property lives.  A seed here that merely spelled a valid 101 would be
+# teaching the mutator the one thing the target already guarantees.
+#
+# The first byte is read by the target as a style selector (contradictory
+# framing headers on the 101, and whether the 101 itself straddles a chunk
+# boundary), so each seed leads with the shape it means to pin.
+def proxytunnel_seeds():
+    s = {}
+
+    STYLE_PLAIN, STYLE_CLEN, STYLE_TE = 0, 1, 2
+    STYLE_SPLIT = 8
+
+    # The coincidence the scanner's comment names: tunnel payload that spells a
+    # complete, well-formed response.  Without the early return this is read as
+    # a finished message and the socket is filed in the pool.
+    s["payload_is_a_response"] = bytes([STYLE_PLAIN]) + \
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    # The same, with a length that would make the "response" look pooled-ready
+    # at a boundary the peer chose.
+    s["payload_response_with_body"] = bytes([STYLE_PLAIN]) + \
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+
+    # A 101 that contradicts itself, then payload.  The switch must win over the
+    # framing headers, not be reconciled with them.
+    s["clen_on_the_101"] = bytes([STYLE_CLEN]) + b"\x81\x05hello"
+    s["chunked_on_the_101"] = bytes([STYLE_TE]) + b"0\r\n\r\n"
+
+    # The 101 split across a read boundary, which is the shape that leaves an
+    # ordinary response `unknown`.
+    s["split_101"] = bytes([STYLE_SPLIT]) + b"\x81\x03abc"
+
+    # Real WebSocket traffic behind the switch: a masked client frame and a
+    # server close frame.  The frame header is the "two bytes of coincidence"
+    # that normally hide the defect, so a seed that has one is the realistic
+    # negative case.
+    s["masked_text_frame"] = bytes([STYLE_PLAIN]) + \
+        b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
+    s["close_frame"] = bytes([STYLE_PLAIN]) + b"\x88\x02\x03\xe8"
+
+    # Payload that is a status line and nothing else, and payload that is only a
+    # blank line — the two halves of a header block, each arriving alone.
+    s["payload_status_line_only"] = bytes([STYLE_PLAIN]) + b"HTTP/1.1 204 No Content\r\n"
+    s["payload_blank_line_only"] = bytes([STYLE_PLAIN]) + b"\r\n\r\n"
+
+    # Payload spelling a SECOND 101, and one spelling a 100-continue: both are
+    # states the scanner treats specially when it is still reading HTTP.
+    s["payload_another_101"] = bytes([STYLE_PLAIN]) + \
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n"
+    s["payload_continue"] = bytes([STYLE_PLAIN]) + b"HTTP/1.1 100 Continue\r\n\r\n"
+
+    # Empty, and one byte: the target must hold with nothing behind the switch.
+    s["nothing_behind_it"] = bytes([STYLE_PLAIN])
+    s["one_byte"] = bytes([STYLE_PLAIN]) + b"\x00"
+
+    return s
+
+
 def op(name, key=0, a=0, b=0):
     return bytes([_OP[name], key & 0xFF, a & 0xFF, b & 0xFF])
 
@@ -2140,6 +2203,7 @@ KEPT_BUDGET = {
     "server": 8,       # 0 kept
     "client": 8,       # 0 kept
     "proxy": 8,        # 0 kept
+    "proxytunnel": 8,  # 0 kept
 }
 
 
@@ -2172,6 +2236,7 @@ def main(argv):
                         ("http", http_seeds()), ("httpresp", httpresp_seeds()),
                         ("cache", cache_seeds()), ("server", server_seeds()),
                         ("client", client_seeds()), ("proxy", proxy_seeds()),
+                        ("proxytunnel", proxytunnel_seeds()),
                         ("eventloop", eventloop_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count

@@ -694,7 +694,7 @@ project "test_sdk_ws_client"
 -- bugs.  The TSan exclusion is not optional: ASan and TSan cannot coexist in one
 -- process, and these targets have no threads for TSan to look at anyway.
 --
--- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request
+-- Recommended: make config=sanitize_x64 fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_proxy_tunnel fuzz_event_loop fuzz_http_request
 
 local function fuzz_target_settings()
     targetdir ("bin/%{cfg.buildcfg}")
@@ -804,6 +804,32 @@ project "fuzz_http_response"
 
     files {
         "test/fuzz/fuzz_http_response.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/proxy/http_response_framing.h"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: the tunnel half of that same scanner ───────────────────────────
+--
+-- Same header, different question, and a separate target because the question
+-- has to be *directed*.  fuzz_http_response explores response framing; nothing
+-- in it or its corpus pins a 101, so the state a connection enters when it
+-- stops carrying HTTP is reached only by coincidence.  This target builds the
+-- switch itself on every input and then attacks what follows it, asserting the
+-- one predicate both of the proxy's pooling paths ask — a live tunnel socket
+-- must never become poolable.  See the header of test/fuzz/fuzz_proxy_tunnel.cpp.
+
+project "fuzz_proxy_tunnel"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_proxy_tunnel.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
         "socketley/runtime/proxy/http_response_framing.h"

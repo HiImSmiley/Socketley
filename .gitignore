@@ -62,6 +62,13 @@ bin/fuzz-artifacts/
 bin/fuzz-corpus/
 bin/fuzz-libfuzzer/
 
+# The same directory, unanchored, because the replay driver writes its crash
+# artifact relative to the working directory rather than to bin/.  Running a
+# target by hand from the repository root — which is how anyone reproduces a
+# failure — therefore drops fuzz-artifacts/ here instead, where the anchored
+# rule above does not reach it.  Found by doing exactly that.
+fuzz-artifacts/
+
 # Load harness and suite logs
 suite-*.log
 load-*.log
