@@ -100,19 +100,31 @@ total_ticks() {
     echo "$sum"
 }
 
-# Per-thread "tid comm ticks", one line each.
+# Per-thread "tid comm ticks", one line each — over the same tree total_ticks
+# sums, so the breakdown accounts for the number printed above it.  Listing only
+# the daemon's threads beside a total that includes the workers would be worse
+# than either alone: the reader would go looking for the missing percent among
+# threads that never had it.  The pid is carried in the label because two
+# processes can and do have a thread with the same name.
 thread_ticks() {
-    local pid=$1 t line rest tid comm
-    for t in /proc/"$pid"/task/*; do
-        [[ -r "$t/stat" ]] || continue
-        tid=$(basename "$t")
-        comm=$(cat "$t/comm" 2>/dev/null)
-        line=$(cat "$t/stat" 2>/dev/null) || continue
-        rest=${line##*\) }
-        # shellcheck disable=SC2086
-        set -- $rest
-        echo "$tid ${comm:-?} $(( ${12:-0} + ${13:-0} ))"
-    done
+    local root=$1 pid t line rest tid comm
+    {
+        for pid in $(daemon_tree_pids "$root"); do
+            for t in /proc/"$pid"/task/*; do
+                [[ -r "$t/stat" ]] || continue
+                tid=$(basename "$t")
+                comm=$(cat "$t/comm" 2>/dev/null)
+                line=$(cat "$t/stat" 2>/dev/null) || continue
+                rest=${line##*\) }
+                # shellcheck disable=SC2086
+                set -- $rest
+                echo "$tid ${comm:-?}[$pid] $(( ${12:-0} + ${13:-0} ))"
+            done
+        done
+    # join(1) drops what it does not see in order, silently.  The glob sorts
+    # within one process; across the several this now walks it does not, and an
+    # unsorted pair would lose threads from the breakdown rather than error.
+    } | sort -k1,1
 }
 
 # Measure one scenario: sample total ticks across DURATION, report CPU percent
@@ -226,10 +238,28 @@ setup_cache_with_ttl() {
         done
     } | bench_nc "$CACHE_PORT" >/dev/null 2>&1
 
-    local keys
-    keys=$(socketley_cmd stats idle-cache 2>/dev/null | grep -oP '^keys:\K[0-9]+' | head -1)
+    # Wait for the count instead of reading it once.
+    #
+    # A cache in a worker process publishes its figures every quarter-second and
+    # the daemon reports what it last received, so a `stats` issued right after
+    # the final write answers for the moment before it: measured, 0 of 200
+    # immediately and 200 after 0.3s, with `get` returning the values over the
+    # cache port the whole time.  Nothing is lost and nothing is slow -- the
+    # figure is simply not read at the instant of the question the way an
+    # in-process runtime's was, which the page says under "A worker's figures
+    # are pushed".
+    #
+    # The check was written when this scenario ran inside the daemon and the
+    # number was live.  It is the assertion that is stale, not the cache: it had
+    # started reporting a seeding failure for a cache that had every key.
+    local keys=0 i
+    for i in $(seq 1 40); do
+        keys=$(socketley_cmd stats idle-cache 2>/dev/null | grep -oP '^keys:\K[0-9]+' | head -1)
+        [[ "${keys:-0}" -ge 200 ]] && break
+        sleep 0.1
+    done
     if [[ "${keys:-0}" -lt 200 ]]; then
-        log_error "TTL seeding failed: stats reports ${keys:-0} keys, expected 200"
+        log_error "TTL seeding failed: stats reports ${keys:-0} keys after 4s, expected 200"
         return 1
     fi
     log_success "seeded ${keys} keys with a TTL"
