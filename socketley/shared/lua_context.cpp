@@ -314,6 +314,10 @@ struct lua_timer : io_handler
     io_request            req{};
     bool                  repeat{false};
     bool                  cancelled{false};
+    // True for exactly as long as `fn` is on the stack below.  Read by
+    // sever_timer(), which must not replace a callable that is executing; see
+    // the note there.
+    bool                  dispatching{false};
     int                   timer_id{0};
 
     void on_cqe(struct io_uring_cqe* cqe) override
@@ -341,7 +345,13 @@ struct lua_timer : io_handler
         {
             lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
                                       ctx ? ctx->callback_timeout_ms() : 0u);
+            // The flag brackets the call and nothing else.  A callback may
+            // cancel its own timer — clear_interval(id) from inside the
+            // interval is the one-shot shape — and sever_timer() has to be able
+            // to tell that this is the timer it is being asked to sever.
+            dispatching = true;
             sol::protected_function_result tr = fn();
+            dispatching = false;
             if (SOCKETLEY_UNLIKELY(!tr.valid()))
             {
                 sol::error e = tr;
@@ -361,6 +371,66 @@ struct lua_timer : io_handler
         }
     }
 };
+
+// ─── Severing one timer from its context ───────────────────────────────────
+//
+// c1f45ba built this in ~lua_context and 1928eb4/ebb6897 generalised it to
+// cancel_timers(); it is one function now because clear_timeout and
+// clear_interval need exactly it and used to perform a weaker thing instead.
+//
+// The order is the reasoning, and it is written out at cancel_timers():
+//
+//   * the sol::function goes first, so a completion already in flight cannot
+//     call into Lua.  It is also what releases the closure's registry
+//     reference — until it does, the callback and everything it captured are
+//     reachable from C++ and no collectgarbage() can free them.  The one
+//     exception is a timer severed from inside its own callback; see below.
+//   * `ctx` goes second, so lua_timer::on_cqe takes its terminal `delete this`
+//     path rather than calling two methods on a context that has either
+//     already given this timer away or is about to be destroyed.
+//   * deregister_owner is deliberately NOT called here.  event_loop.h: a
+//     handler that frees itself from inside its own on_cqe must deregister
+//     THERE, because deregistering while its last completion is in flight has
+//     that completion dropped and the callback that would have freed it never
+//     runs.  on_cqe already does it in the right place.
+//
+// The withdrawal at the end is the part clear_timeout/clear_interval were
+// missing.  They set `cancelled` and `repeat` and stopped, which is enough to
+// keep the callback from running — the existing tests pin that — but the
+// timeout stayed armed, so the lua_timer, its closure and its owner
+// registration all stayed alive until it expired on its own.  Cancelling a
+// one-hour interval kept every one of them for the hour.
+//
+// Guarded on ring_open() rather than merely on a non-null loop: ~lua_context
+// reaches this at process teardown, by which time shutdown_ring() has been
+// called, and a submission then is a submission into a ring that is gone.
+static void sever_timer(lua_timer* t)
+{
+    // ─── Unless it is the callback doing the severing ───────────────────────
+    //
+    // `clear_interval(id)` from inside that interval's own callback is how a
+    // one-shot subscriber to time is written, and `socketley.stop(self.name)`
+    // from a timer reaches cancel_timers() the same way.  In both, `fn` is the
+    // function currently executing, and sol's call reads members of the object
+    // it was invoked through after lua_pcall returns — so replacing it here
+    // took the daemon down with a SIGSEGV on that very tick.  Measured on this
+    // branch before the flag existed: three ticks, "IV cleared", then nothing.
+    //
+    // Skipping the assignment costs nothing.  `ctx` and the two flags below are
+    // still cleared, so lua_timer::on_cqe takes its terminal branch the moment
+    // the callback returns and deletes the timer there — and ~lua_timer
+    // releases the reference at that point, a few instructions later than this
+    // line would have.
+    if (!t->dispatching)
+        t->fn = sol::nil;
+
+    t->ctx       = nullptr;
+    t->cancelled = true;
+    t->repeat    = false;
+
+    if (t->loop && t->loop->ring_open())
+        if (!t->loop->submit_timeout_remove(&t->req)) {}
+}
 
 lua_context::~lua_context()
 {
@@ -429,11 +499,41 @@ void* lua_context::timer_pool_acquire()
     return new lua_timer{};
 }
 
+// How many spent lua_timers this context keeps to hand back out.
+//
+// The pool exists so that a script arming a timer per message does not allocate
+// one per message, and a handful of slots buys all of that.  It had no bound,
+// and a pool without one is not a pool: a script that arms two thousand
+// timeouts at once — a fan-out, a retry sweep, a batch of deadlines — leaves
+// two thousand lua_timers in this vector after they fire, and they stay for the
+// life of the context because nothing ever shrinks it.  Retention at the
+// high-water mark is a strange thing to pay for a cache of empty objects.
+//
+// 64 because the concurrency this is worth optimising for is a script's steady
+// state, not its worst burst, and past that the allocator is the right thing to
+// be using.  A lua_timer is small, so the cap is about the shape rather than
+// the bytes: a bound that exists is what makes the memory a script can hold
+// this way a function of its steady state instead of its peak.
+static constexpr size_t timer_pool_max = 64;
+
 void lua_context::timer_pool_release(void* t)
 {
     auto* timer = static_cast<lua_timer*>(t);
+
+    // Freed rather than pooled once the pool is full.  Safe in exactly the way
+    // the pooling is: this is only ever reached from inside the timer's own
+    // on_cqe, after that completion has been reported and after
+    // deregister_owner, so the ring owes this object nothing — which is why the
+    // branch beside this call site can already write `delete this`.
+    if (m_timer_pool.size() >= timer_pool_max)
+    {
+        delete timer;
+        return;
+    }
+
     timer->fn = sol::nil;
     timer->cancelled = false;
+    timer->dispatching = false;
     timer->timer_id = 0;
     m_timer_pool.push_back(t);
 }
@@ -912,34 +1012,14 @@ void lua_context::settle_subscriptions()
 // is wrong in a way a script can act on: self.send from such a timer reaches
 // clients of a runtime the operator has taken down.
 //
-// The severance is exactly what the destructor performed, and the reasoning
-// there applies here unchanged — the sol::function goes first so a completion
-// cannot call into Lua, `ctx` goes second so on_cqe takes its terminal path
-// instead of calling two methods on this object, and deregister_owner is
-// deliberately left to on_cqe.  The only difference is that this object
+// The severance is exactly what the destructor performed, and the reasoning is
+// written out at sever_timer() above.  The only difference is that this object
 // survives, which is why both containers are cleared: what is left in them
 // would name timers this context has already given away.
 void lua_context::cancel_timers()
 {
     for (auto* p : m_active_timers)
-    {
-        auto* t = static_cast<lua_timer*>(p);
-        t->fn  = sol::nil;
-        t->ctx = nullptr;
-
-        // Bring the completion forward instead of waiting out the interval.  Not
-        // required for correctness — the timeout reports on its own schedule and
-        // the timer frees itself then, by the same path — but an interval can be
-        // an hour long, and until it reports, the timer holds its storage and
-        // one owner registration.  A reload every hour would accumulate both.
-        //
-        // Guarded on ring_open() and not merely on a non-null loop: the
-        // destructor reaches this through here at process teardown, and by then
-        // shutdown_ring() has already been called.  A submission then is a
-        // submission into a ring that is gone.
-        if (t->loop && t->loop->ring_open())
-            if (!t->loop->submit_timeout_remove(&t->req)) {}
-    }
+        sever_timer(static_cast<lua_timer*>(p));
     m_active_timers.clear();
 
     // The timer ids too.  They name timers this context no longer owns — every
@@ -2112,9 +2192,36 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.set_timeout(ms, fn) → timer_id
+    //
+    // ─── What 0 means, and why it stays 0 ───────────────────────────────────
+    //
+    // A refusal, and only a refusal.  The ids come from `++m_next_timer_id` on
+    // a counter that starts at 0, so a timer that was armed always has an id of
+    // 1 or more and there is no value a script has to disambiguate — `if
+    // socketley.set_timeout(ms, f) == 0 then` is a complete test.
+    //
+    // What it does not say is WHICH refusal, and both are worth a line in the
+    // log rather than a silent nothing: a runtime with no event loop is not a
+    // runtime that can schedule anything, and `ms <= 0` is a script asking for
+    // a timer that would never be armed.  Neither can happen in a working
+    // script, so the cost of saying so is nothing and the cost of not saying so
+    // is a callback that never runs with no record of why.
+    //
+    // Not changed to a nil return, which was the alternative.  0 is already
+    // unambiguous, and a nil would break `local id = set_timeout(...)` followed
+    // by `clear_timeout(id)` — clear_timeout takes an int, so the failure would
+    // move from a callback that never fires to a type error at a line that has
+    // nothing wrong with it.
     sk["set_timeout"] = [this, owner](int ms, sol::protected_function fn) -> int {
         auto* loop = owner->get_event_loop();
-        if (!loop || ms <= 0) return 0;
+        if (!loop || ms <= 0)
+        {
+            std::cerr << "[lua] set_timeout(" << ms << ") armed nothing: "
+                      << (loop ? "the delay must be greater than 0"
+                               : "this runtime has no event loop")
+                      << std::endl;
+            return 0;
+        }
         auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
         t->alive  = m_alive;
         t->fn     = std::move(fn);
@@ -2133,9 +2240,18 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.set_interval(ms, fn) → timer_id
+    //
+    // 0 on refusal, said out loud; see set_timeout above for the whole of it.
     sk["set_interval"] = [this, owner](int ms, sol::protected_function fn) -> int {
         auto* loop = owner->get_event_loop();
-        if (!loop || ms <= 0) return 0;
+        if (!loop || ms <= 0)
+        {
+            std::cerr << "[lua] set_interval(" << ms << ") armed nothing: "
+                      << (loop ? "the period must be greater than 0"
+                               : "this runtime has no event loop")
+                      << std::endl;
+            return 0;
+        }
         auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
         t->alive  = m_alive;
         t->fn     = std::move(fn);
@@ -2153,23 +2269,40 @@ void lua_context::register_bindings(runtime_instance* owner)
         return id;
     };
 
-    // socketley.clear_timeout(id) — cancel a pending timeout
-    sk["clear_timeout"] = [this](int id) {
+    // ─── Cancelling a timer withdraws it ────────────────────────────────────
+    //
+    // Both of these were two assignments — `cancelled = true; repeat = false;`
+    // — and nothing else.  That stops the callback, which is all the existing
+    // tests ask for, and it leaves everything else exactly where it was: the
+    // timeout stays armed in the ring, the lua_timer keeps its storage and its
+    // owner registration, and the sol::protected_function keeps a registry
+    // reference to the closure and to every upvalue it captured.  Cancelling a
+    // one-hour interval held all of that for the hour.  Measured on the parent,
+    // 100 cleared timeouts each capturing a 32 KB string, collectgarbage()
+    // called after the clear: the Lua heap did not move.
+    //
+    // sever_timer() is what cancel_timers() already does to every timer at stop
+    // and at teardown, so this is that mechanism reused rather than a second
+    // one — which matters, because the order it performs those four steps in is
+    // load-bearing and there should be exactly one place that knows it.
+    //
+    // unregister_timer() first, and not after: it finds the map entry by
+    // t->timer_id, and it is what takes this timer out of m_timer_map and
+    // m_active_timers so that neither goes on naming a timer this context has
+    // handed to its own completion.
+    auto cancel_timer_by_id = [this](int id) {
         auto it = m_timer_map.find(id);
-        if (it == m_timer_map.end()) return;
+        if (it == m_timer_map.end()) return;   // already fired, or never issued
         auto* t = static_cast<lua_timer*>(it->second);
-        t->cancelled = true;
-        t->repeat = false;
+        unregister_timer(t);
+        sever_timer(t);
     };
 
+    // socketley.clear_timeout(id) — cancel a pending timeout
+    sk["clear_timeout"] = cancel_timer_by_id;
+
     // socketley.clear_interval(id) — cancel a repeating interval
-    sk["clear_interval"] = [this](int id) {
-        auto it = m_timer_map.find(id);
-        if (it == m_timer_map.end()) return;
-        auto* t = static_cast<lua_timer*>(it->second);
-        t->cancelled = true;
-        t->repeat = false;
-    };
+    sk["clear_interval"] = cancel_timer_by_id;
 
     // socketley.json_encode(value) → JSON string
     sk["json_encode"] = [](sol::object val) -> std::string {

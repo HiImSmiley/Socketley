@@ -3378,6 +3378,16 @@ to replay; use
 to arm them again \(em it re-runs
 .BR on_start ,
 so timers armed there do come back.
+.IP
+Both return
+.B 0
+and arm nothing when
+.I ms
+is not greater than zero, or when the runtime has no event loop. Real ids
+start at 1, so
+.B 0
+is unambiguous; the reason is written to the daemon's log, because a timer that
+will never fire is otherwise silent.
 .TP
 .B socketley.clear_timeout(timer_id)
 Cancel a pending timeout. The timer will not fire. Safe to call with
@@ -3386,6 +3396,15 @@ an already-expired or invalid ID (no-op).
 .B socketley.clear_interval(timer_id)
 Cancel a repeating interval. The timer stops after the current cycle
 completes. Safe to call with an already-expired or invalid ID (no-op).
+.IP
+Both withdraw the timer rather than merely muting it: the io_uring timeout is
+removed, the timer's storage is released, and the reference to the callback
+goes with it \(em so the closure and everything it captured become collectable
+at the call rather than when the timer would have expired. Cancelling a
+one-hour interval used to hold all of that for the hour.
+.IP
+Both are safe to call from inside the timer's own callback, which is how a
+one-shot repeating timer is written.
 .TP
 .B socketley.json_encode(value) \(-> string
 Encode a Lua value (table, string, number, boolean, nil) as a JSON string.
