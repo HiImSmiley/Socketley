@@ -447,8 +447,12 @@ std::string cluster_discovery::build_publish_json() const
             json += "\",\"connections\":";
 
             char conn_buf[16];
+            // The reported figure, not the local tables: this runtime's
+            // connections may be in a worker process, and publishing 0 to the
+            // rest of the cluster is worse than publishing nothing — a peer
+            // choosing by load would read an idle member.
             auto [cend, cec] = std::to_chars(conn_buf, conn_buf + sizeof(conn_buf),
-                                              inst->get_connection_count());
+                                              inst->reported_connection_count());
             json.append(conn_buf, static_cast<size_t>(cend - conn_buf));
 
             json += '}';

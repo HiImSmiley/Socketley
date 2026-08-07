@@ -159,6 +159,16 @@ TEST_CASE("managed runtime persistence")
         inst->set_pid(54321);
 
         sp.save_runtime(inst.get());
+        // save_runtime() queues the write and returns; the writer thread
+        // publishes the file.  Reading the directory without waiting is a race
+        // this test lost about one run in twelve, reporting load_all() as empty
+        // -- a persistence bug that was not there.
+        //
+        // drain() did not fix it on its own: it used to wait for the queue to be
+        // empty, which the writer satisfies when it PICKS UP a job rather than
+        // when it finishes one.  Both halves are needed, and the other half is
+        // in state_persistence::drain().
+        sp.drain();
 
         auto configs = sp.load_all();
         REQUIRE(configs.size() == 1);

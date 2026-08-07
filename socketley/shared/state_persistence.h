@@ -195,6 +195,7 @@ private:
     std::condition_variable m_cv;
     std::deque<job>         m_queue;
     bool                    m_stop{false};
+    uint64_t                m_queued{0}; // jobs accepted, for drain()
     uint64_t                m_done{0};   // jobs completed, for drain()
 
     std::filesystem::path config_path(std::string_view name) const;

@@ -279,12 +279,48 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
+    // The daemon's ring policy, wherever this runtime asked for none of its own.
+    //
+    // Before runtimes moved out of the daemon they ran on its event loop, so
+    // `daemon --cpus 0-1` and `daemon --no-sqpoll` were theirs by construction.
+    // A worker has a loop of its own and learns nothing it is not told, and both
+    // settings then go wrong in a way that leaves no trace:
+    //
+    //   cpus   — the worker inherits the daemon's affinity mask through fork, so
+    //            it is pinned in fact while its loop believes every core is
+    //            available.  `stats` reported cpus:max for a runtime that could
+    //            only ever run on two, and the SQPOLL thread was placed against
+    //            a set that was not the real one.
+    //   sqpoll — the worker re-reads SOCKETLEY_SQPOLL out of the environment it
+    //            inherited, so a daemon started with --no-sqpoll in a shell that
+    //            exports it spawned workers with SQPOLL on, against the only
+    //            instruction anybody gave.
+    //
+    // Only where the runtime is silent.  `create --cpus` is a statement about
+    // that runtime and outranks the daemon's default, which is the order that
+    // already applied when the two shared a loop.
+    runtime_config effective = cfg;
+    if (m_loop)
+    {
+        if (effective.cpus.empty() && !m_loop->cpus().all)
+            effective.cpus = m_loop->cpus().to_string();
+
+        // Forwarded even when the answer is "off": off is a decision here, and
+        // leaving it unsaid lets an inherited environment variable answer in
+        // place of the operator.
+        if (!effective.sqpoll_set)
+        {
+            effective.sqpoll_set = true;
+            effective.sqpoll     = m_loop->sqpoll_requested();
+        }
+    }
+
     // Keep the config so a restart can replay it without going back to disk.
     // The state file is the daemon's record for the operator; this is the
     // daemon's record for the child, and they are written at different moments.
     {
         state_persistence sp{std::filesystem::path{}};
-        m_config_json = sp.format_json_pretty(cfg);
+        m_config_json = sp.format_json_pretty(effective);
     }
 
     int sv[2] = {-1, -1};

@@ -88,7 +88,29 @@ public:
     bool get_bash_timestamp() const;
 
     // Connection count (virtual, implemented per runtime type)
+    //
+    // EVENT-LOOP THREAD ONLY, and only meaningful for a runtime whose
+    // connections are in this process: it walks this object's tables.  Anything
+    // reporting a figure to a user wants reported_connection_count() instead.
     virtual size_t get_connection_count() const { return 0; }
+
+    // What to print.  The same question asked in a way that survives the
+    // runtime living in a worker process, where this object is a placeholder
+    // whose tables are empty and whose figures arrive in a pushed frame.
+    //
+    // Every other counter on a `stats` line is an atomic that frame stores
+    // into, so they stayed right while this one did not -- `stats` and `ls`
+    // reported 0 connections for a server with clients, beside a
+    // total_connections that was counting them.  Reading the live tables is
+    // correct exactly when there is no worker, which is what this decides once
+    // instead of at each call site.
+    size_t reported_connection_count() const
+    {
+        return worker_backed()
+                   ? static_cast<size_t>(
+                         m_stat_active_connections.load(std::memory_order_relaxed))
+                   : get_connection_count();
+    }
 
     // Max connections
     void set_max_connections(uint32_t max);

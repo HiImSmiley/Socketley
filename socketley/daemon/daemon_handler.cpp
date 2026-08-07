@@ -1312,7 +1312,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"status\":\"" << state_str
-                << "\",\"connections\":" << instance->get_connection_count()
+                << "\",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
                 << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
                 << "\"}";
@@ -1359,7 +1359,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(16) << name
                 << std::setw(8)  << type_to_string(instance->get_type())
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
-                << std::setw(6)  << instance->get_connection_count()
+                << std::setw(6)  << instance->reported_connection_count()
                 << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
                 << std::setw(20) << status_str
                 << format_time_ago(instance->get_created_time()) << "\n";
@@ -1404,7 +1404,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             if (col_name)    col(std::string(name));
             if (col_type)    col(std::string(type_to_string(instance->get_type())));
             if (col_port)    col(port > 0 ? std::to_string(port) : "-");
-            if (col_conn)    col(std::to_string(instance->get_connection_count()));
+            if (col_conn)    col(std::to_string(instance->reported_connection_count()));
             if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
             if (col_group)   col(group.empty() ? "-" : std::string(group));
             if (col_status)  col(status);
@@ -1518,7 +1518,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << ",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
-                << "\",\"connections\":" << instance->get_connection_count()
+                << "\",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
                 << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
                 << "\"}";
@@ -1553,7 +1553,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(16) << name
                 << std::setw(8)  << type_to_string(instance->get_type())
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
-                << std::setw(6)  << instance->get_connection_count()
+                << std::setw(6)  << instance->reported_connection_count()
                 << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
                 << std::setw(20) << state_column(instance.get())
                 << format_time_ago(instance->get_created_time()) << "\n";
@@ -1588,7 +1588,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             if (col_name)    col(std::string(name));
             if (col_type)    col(std::string(type_to_string(instance->get_type())));
             if (col_port)    col(port > 0 ? std::to_string(port) : "-");
-            if (col_conn)    col(std::to_string(instance->get_connection_count()));
+            if (col_conn)    col(std::to_string(instance->reported_connection_count()));
             if (col_owner)   col(owner.empty() ? "-" : std::string(owner));
             if (col_uptime)  col(state_column(instance.get()));
             if (col_created) col(format_time_ago(instance->get_created_time()));

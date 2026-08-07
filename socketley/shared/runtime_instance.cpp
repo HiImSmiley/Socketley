@@ -842,7 +842,12 @@ std::string runtime_instance::get_stats() const
     out += "\nport:";
     append_u64(m_port);
     out += "\nconnections:";
-    append_u64(get_connection_count());
+    // Not get_connection_count(): see reported_connection_count(), which is the
+    // same question asked in a way that survives the runtime living in a worker.
+    // A type that overrides get_stats() hands back the worker's whole text
+    // before reaching here; this covers the ones that do not, and any added
+    // later.
+    append_u64(reported_connection_count());
     out += "\ntotal_connections:";
     append_u64(m_stat_total_connections.load(std::memory_order_relaxed));
     out += "\ntotal_messages:";

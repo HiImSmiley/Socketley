@@ -889,6 +889,7 @@ void state_persistence::enqueue(job j)
     {
         std::lock_guard<std::mutex> lk(m_mx);
         m_queue.push_back(std::move(j));
+        ++m_queued;                 // what drain() waits to see completed
     }
     m_cv.notify_one();
 }
@@ -925,8 +926,22 @@ void state_persistence::writer_loop()
 
 void state_persistence::drain()
 {
+    // Waits for the work to be DONE, not for it to have been picked up.
+    //
+    // This waited on m_queue.empty(), which the writer satisfies the moment it
+    // pops a job — before write, before fsync, before the rename that publishes
+    // the file.  So drain() returned while the state directory still did not
+    // contain what had been saved, which is the one thing a caller can want from
+    // it: `save_runtime(x); drain(); load_all()` came back without x about one
+    // time in ten, and read as a persistence bug rather than as a wait that did
+    // not wait.  m_done has been sitting here for this, with a comment saying so.
+    //
+    // The target is read under the lock and fixed: jobs enqueued after this call
+    // are somebody else's to wait for, and including them would let a busy
+    // daemon hold a caller here indefinitely.
     std::unique_lock<std::mutex> lk(m_mx);
-    m_cv.wait(lk, [&]{ return m_queue.empty(); });
+    const uint64_t target = m_queued;
+    m_cv.wait(lk, [&]{ return m_done >= target; });
 }
 
 state_persistence::~state_persistence()

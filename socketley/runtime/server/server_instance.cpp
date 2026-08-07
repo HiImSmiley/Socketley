@@ -4239,6 +4239,20 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
 
 std::string server_instance::get_stats() const
 {
+    // The worker's own text when there is a worker, as proxy_instance and
+    // cache_instance already do: peak_connections below is computed from a
+    // connection table that lives in the other process, so rebuilding it here
+    // reads the placeholder's empty one and prints 0 for a server with clients.
+    //
+    // This depends on the worker being told the daemon's ring policy — see
+    // proxy_supervisor::spawn().  Without that, handing back the worker's text
+    // also handed back its idea of `cpus` and `sqpoll`, which was its loop's
+    // configuration rather than the daemon's: pinned by an inherited affinity
+    // mask while reporting cpus:max.  Forwarding the policy is what makes the
+    // worker's answer the true one for every line, not just for the counters.
+    if (worker_backed())
+        return stat_detail_snapshot();
+
     std::string base = runtime_instance::get_stats();
     std::ostringstream out;
     out << base
