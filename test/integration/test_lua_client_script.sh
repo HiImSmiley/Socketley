@@ -108,7 +108,8 @@ function on_start()
     socketley.log(TAG .. " order=" .. table.concat(order, ","))
     socketley.log(TAG .. " ident name=" .. self.name ..
                   " type=" .. self.type ..
-                  " proto=" .. self.protocol)
+                  " proto=" .. self.protocol ..
+                  " alias=" .. tostring(rawequal(client, self)))
     self.send("$3")
 end
 
@@ -186,13 +187,17 @@ assert_eq "on_start fires second" \
     "in on_connect is broken today and would be silently fixed by a swap"
 
 # ── 2. self.name, self.type, self.protocol ─────────────────────────────────
-assert_eq "self.name, self.type and self.protocol on a TCP client" \
-          "CLI ident name=lc_cli type=client proto=tcp" \
-          "$(line 'CLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+')"
+# alias=true is rawequal: the global `client` is the same table as self, not a
+# copy — register_bindings does m_lua[type_to_string(type)] = self.  A copy
+# would pass a "calling through it works" check and give a script two places to
+# keep state.
+assert_eq "self.name, self.type, self.protocol, and the 'client' alias" \
+          "CLI ident name=lc_cli type=client proto=tcp alias=true" \
+          "$(line 'CLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+ alias=[a-z]+')"
 said 'UDPCLI ident' 10 || true
 assert_eq "self.protocol says udp on a --udp client" \
-          "UDPCLI ident name=lc_udpcli type=client proto=udp" \
-          "$(line 'UDPCLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+')" \
+          "UDPCLI ident name=lc_udpcli type=client proto=udp alias=true" \
+          "$(line 'UDPCLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+ alias=[a-z]+')" \
     "the tcp assertion above passes on a build that hard-codes the string;" \
     "the pair does not"
 

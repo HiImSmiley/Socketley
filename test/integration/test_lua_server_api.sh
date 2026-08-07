@@ -197,6 +197,22 @@ function on_client_message(id, msg)
         for _, c in ipairs(ids) do if c == id then mine = true end end
         reply(id, "clients=" .. tostring(#ids) .. " mine=" .. tostring(mine))
 
+    elseif cmd == "ident" then
+        -- self.connections() and self.protocol on a SERVER.  Both names are
+        -- bound on four different tables and only the other three were ever
+        -- asked; a binding wired to the wrong instance answers plausibly here
+        -- and is never noticed.
+        reply(id, "conns=" .. tostring(self.connections()) ..
+                  " proto=" .. tostring(self.protocol) ..
+                  " alias_same=" .. tostring(rawequal(server, self)) ..
+                  " alias_conns=" .. tostring(server.connections()))
+
+    elseif cmd == "sendone" then
+        -- self.send() to one client.  Named separately from every other reply
+        -- in this script so the on_send assertion below can be about THIS
+        -- payload and not about the RPC traffic.
+        self.send(id, "DIRECT-SEND-PAYLOAD")
+
     elseif cmd == "peerip" then
         reply(id, "peerip=" .. tostring(self.peer_ip(id)))
 
@@ -414,6 +430,40 @@ assert_eq "...and the runtime no longer counts it" \
           "R1:clients=1 mine=true" "$(grep -o 'R1:clients=[0-9]* mine=[a-z]*' <<<"$T" | head -1)" \
     "the caller is still there, so this also says disconnect took the client" \
     "it was told to and not simply everything"
+
+# ── 3b. self.connections, self.protocol, and the `server` alias ────────────
+T=$(tx "$API_PORT" c1 c2 s1:whoami r1 s2:whoami r2 s1:ident r1 x1 x2)
+assert_eq "self.connections() on a server counts both connections" \
+          "R1:conns=2 proto=tcp alias_same=true alias_conns=2" \
+          "$(grep -o 'R1:conns=.*' <<<"$T" | head -1)" \
+    "four tables bind a method called connections and only the other three" \
+    "were ever asked.  alias_same is rawequal: register_bindings does" \
+    "m_lua[type_to_string(type)] = self, so the global 'server' is not a copy" \
+    "of the table, it IS the table — a build that made a second table with the" \
+    "same methods would satisfy 'a call through it works' and would silently" \
+    "give a script two places to keep state" \
+    "transcript: $(tr '\n' '|' <<<"$T")"
+
+# ── 3c. on_send fires for what the runtime broadcasts, and not for a reply ──
+#
+# invoke_on_send has two call sites — server lua_broadcast and the client's
+# send — and self.send(id, msg) is not one of them.  That asymmetry is not
+# written down anywhere, and a script that logs outbound traffic in on_send
+# sees broadcasts and silently misses every targeted reply.  Pinned as it is so
+# that changing it is a decision; the assertion is a count of ZERO for a payload
+# that was definitely sent, which is the only shape that can catch it.
+BEFORE_SEND=$(hits 'API on_send=' "$SOCKETLEY_DLOG")
+T=$(tx "$API_PORT" c1 s1:whoami r1 s1:sendone w:0.4 r1 x1)
+assert_eq "control: the targeted send did arrive at the client" \
+          "1" "$(got "$T" 'R1:DIRECT-SEND-PAYLOAD')" \
+    "if it never arrived, the zero below is about a send that did not happen"
+assert_eq "on_send does NOT fire for self.send(id, msg)" \
+          "0" "$(hits 'API on_send=\[DIRECT-SEND-PAYLOAD\]' "$SOCKETLEY_DLOG")" \
+    "current behaviour: invoke_on_send is reached from lua_broadcast and from" \
+    "the client's send, and from nowhere else"
+assert_eq "...and no on_send line was produced at all by that reply" \
+          "$BEFORE_SEND" "$(hits 'API on_send=' "$SOCKETLEY_DLOG")" \
+    "the stronger form of the same claim: not merely 'not with that payload'"
 
 # ── 4. groups ──────────────────────────────────────────────────────────────
 T=$(tx "$API_PORT" c1 c2 s1:whoami r1 s2:whoami r2 \

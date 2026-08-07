@@ -235,7 +235,9 @@ ops["publish"] = function()
 end
 
 ops["identity"] = function()
-    return "conns=" .. tostring(self.connections()) ..
+    return "alias=" .. tostring(rawequal(cache, self)) ..
+           " aliasget=" .. tostring(cache.get("from_resp")) ..
+           " conns=" .. tostring(self.connections()) ..
            " name=" .. self.name ..
            " type=" .. self.type ..
            " state=" .. tostring(self.state) ..
@@ -419,7 +421,7 @@ done
 # it is a field that can go stale rather than a constant — asked here while the
 # runtime is up, which is the only value it should ever have on this path.
 assert_eq "self.connections(), self.name, self.type, self.state, self.port" \
-          "conns=1 name=lc_cache type=cache state=running port=$PORT" \
+          "alias=true aliasget=written-in-resp conns=1 name=lc_cache type=cache state=running port=$PORT" \
           "$(reply 1 "GET ops:identity")"
 
 # ── 8. publish, counted and delivered ──────────────────────────────────────

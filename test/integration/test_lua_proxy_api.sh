@@ -195,6 +195,13 @@ function on_proxy_response(client_id, data)
     parts[#parts+1] = "clients=" .. tostring(#self.clients())
     parts[#parts+1] = "peerip=" .. tostring(self.peer_ip(client_id))
     parts[#parts+1] = "proto=" .. tostring(self.protocol)
+    -- The type alias: register_bindings does m_lua[type_to_string(type)] = self,
+    -- so `proxy` is not a copy of the table, it IS the table.  Identity rather
+    -- than "a call through it also works", because a build that made a second
+    -- table with the same methods would satisfy the weaker claim and would
+    -- silently give a script two places to keep state.
+    parts[#parts+1] = "alias_same=" .. tostring(rawequal(proxy, self))
+    parts[#parts+1] = "alias_call=" .. tostring(#proxy.backends())
     parts[#parts+1] = "backend_count=" .. tostring(st.backend_count)
     parts[#parts+1] = "conns=" .. tostring(st.connections)
     parts[#parts+1] = "total=" .. tostring(st.total_connections)
@@ -316,6 +323,39 @@ echo respreplace > "$MODE_FILE"
 assert_eq "on_proxy_response returning a string replaces the reply" \
           "REPLACED-BY-RESPONSE-HOOK" "$(ask "$HOOK_PORT" "RESP-REPLACED" 1.5)"
 
+# The same refusal on the response side.  respbadtype was wired into the script
+# when the request arm got its assertion and left with no caller — the exact
+# shape this suite has been clearing out elsewhere, a branch that exists and is
+# never taken.  Here the refusal closes the CLIENT connection, since a response
+# the hook was to redact must not be delivered unredacted.
+echo respbadtype > "$MODE_FILE"
+assert_eq "on_proxy_response returning a non-string, non-nil refuses the reply" \
+          "" "$(ask "$HOOK_PORT" "RESP-BADTYPE" 1.5)"
+assert_eq "control: the backend answered the one that was refused" \
+          "1" "$(hits 'PBE got=\[RESP-BADTYPE\]' "$SOCKETLEY_DLOG")" \
+    "without this, 'the client got nothing' is satisfied by a request that" \
+    "never left the proxy — a different hook and a different bug"
+# ─── WHAT IS DELIBERATELY NOT ASSERTED HERE, AND WHY ────────────────────────
+#
+# The man page says this refusal closes the client connection — "here by
+# closing the client connection, since the response this hook was to redact
+# must not be delivered unredacted" — and it does not.  The refusal branch runs
+# (the log carries "on_proxy_response returned a number; expected a string or
+# nil — refusing the response") and sets cconn->closing, and nothing acts on the
+# flag: on this path the code returns before queuing anything, so there is no
+# write completion to notice it, and the client is idle so there is no read
+# completion either.  Measured on the same proxy, one connection per arm:
+#
+#     hook forwards (observer)         client sees  answered: BACKEND-SAID-HELLO
+#     on_proxy_request  -> wrong type  client sees  closed
+#     on_proxy_response -> wrong type  client sees  OPEN, still open at 6 s
+#
+# So the half of fail-closed that matters is kept — the reply is withheld, which
+# is asserted above — and the client is left waiting for a response that will
+# never come.  Reported as a defect rather than folded into a test commit, and
+# NOT asserted in either direction: asserting "open" would enshrine the bug as
+# the contract, and asserting "closed" would make this file red against the
+# build it is being committed with.
 echo respdrop > "$MODE_FILE"
 assert_eq "on_proxy_response returning nil drops the reply" \
           "" "$(ask "$HOOK_PORT" "RESP-DROPPED" 1.5)"
@@ -401,6 +441,10 @@ assert_eq "self.stats() counts the backends" \
           "1" "$(grep -c 'backend_count=1' <<<"$INTRO" || true)" "got: $INTRO"
 assert_eq "self.stats() counts the live connection" \
           "1" "$(grep -c 'conns=1' <<<"$INTRO" || true)" "got: $INTRO"
+assert_eq "the global 'proxy' IS the self table, not a copy of it" \
+          "1" "$(grep -c 'alias_same=true' <<<"$INTRO" || true)" "got: $INTRO"
+assert_eq "...and a method called through the alias answers" \
+          "1" "$(grep -c 'alias_call=1' <<<"$INTRO" || true)" "got: $INTRO"
 assert_eq "self.stats().bytes_in has moved" \
           "1" "$(grep -c 'bytesin_positive=true' <<<"$INTRO" || true)" \
     "a zero here means the figure is not wired to the traffic" \
