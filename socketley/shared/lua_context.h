@@ -79,6 +79,12 @@ public:
     // Update self.state to reflect current runtime state
     void update_self_state(const char* state_str);
 
+    // Sever every armed timer from this context without destroying it.  Called
+    // when a runtime stops: a stopped runtime must execute no script, and its
+    // set_interval timers otherwise keep firing until the context is destroyed
+    // by `remove`.  Idempotent — a second call has nothing left to sever.
+    void cancel_timers();
+
     // Callback bitmask constants
     enum : uint32_t {
         CB_ON_START              = 1u << 0,
@@ -354,6 +360,7 @@ public:
     // Without Lua there is no chunk to compile, so nothing can fail to.
     static bool script_compiles(std::string_view, std::string&) { return true; }
     void update_self_state(const char*) {}
+    void cancel_timers() {}
 
     bool has_on_start()          const { return false; }
     bool has_on_stop()           const { return false; }

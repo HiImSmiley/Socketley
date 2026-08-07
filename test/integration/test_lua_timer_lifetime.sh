@@ -12,7 +12,9 @@
 #
 #   reload-lua   builds a replacement context and swaps.  The old one is freed
 #                with the timer's sol::function still referring to it.
-#   stop         tears the runtime down entirely.
+#   stop         tears the runtime down, and must sever the script's timers
+#                with it — it severed only the on_tick timer, so a stopped
+#                runtime went on executing script until it was removed.
 #
 # Both are ordinary operator actions and both are reachable with one line of
 # script.  The failure is a use-after-free, so on a Release build it is a crash
@@ -151,28 +153,28 @@ assert_eq "the replaced script's interval stops firing" "$V1_A" "$V1_B" \
     "file exists for, and it is invisible on a Release build until the memory" \
     "is reused — the Sanitize run is where it is loud"
 
-# ── 3. stop and remove, with an interval and a long timeout pending ────────
+# ── 3. stop cancels the script's timers ────────────────────────────────────
 #
-# ─── WHAT stop DOES NOT DO, MEASURED RATHER THAN ASSERTED ──────────────────
-#
-# `stop` does not cancel a runtime's Lua timers.  The interval goes on firing on
-# the daemon's event loop at its full rate, for a runtime the operator has
-# stopped and `ls` shows as stopped.  Measured on this build, a 60 ms interval,
-# counting the callback's own lines:
+# This used to be a measurement with no assertion, because the build it was
+# written against left the interval running: `stop` severed the on_tick timer
+# and nothing at all touched the ones a script arms with set_timeout and
+# set_interval, so they kept firing at full rate until `remove` destroyed the
+# context.  Measured then, a 60 ms interval, counting the callback's own lines:
 #
 #     while running                 25
-#     after stop   +0s / +2s / +4s  25 / 58 / 92     (+33, +34)
-#     after remove +0s / +2s        92 / 92          (+0)
+#     after stop   +0 / +2 / +4 s   25 / 58 / 92     (+33, +34)
+#     after remove +0 / +2 s        92 / 92          (+0)
 #
-# So it is `remove` that cancels them — the lua_context destructor — and `stop`
-# leaves them running indefinitely.  Reported as a defect and NOT asserted in
-# either direction: asserting the ticks would enshrine it, and asserting their
-# absence would make this file red against the build it ships with.  What IS
-# asserted is the safety property that has to hold either way (the daemon
-# survives) and the guarantee that does hold (remove stops them).
+# A stopped runtime that goes on executing script is not untidy: self.send from
+# such a timer delivers to clients of a runtime the operator has taken down.
+# runtime_instance::stop() severs them now, after on_stop, the same way it
+# already severed m_tick.
 V2_A=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
 "$BIN" stop tmr >/dev/null 2>&1 || true
-sleep 1.2
+sleep 0.8
+S_A=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
+sleep 1.5
+S_B=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
 
 TOTAL=$((TOTAL+1))
 if alive; then PASS=$((PASS+1)); else
@@ -180,17 +182,32 @@ if alive; then PASS=$((PASS+1)); else
     echo "  FAIL: the daemon did not survive a stop with timers pending"
 fi
 
-# ── remove cancels what stop did not ───────────────────────────────────────
+# The sample is taken after the stop has settled, so a tick already dispatched
+# when the command arrived is not counted against the fix.  A second and a half
+# of a 60 ms interval is about twenty-five, so this is not a narrow margin.
+assert_eq "stop cancels the script's interval" "$S_A" "$S_B" \
+    "counted a second and a half apart, both samples after the stop: an" \
+    "interval still armed adds roughly twenty-five between them"
+
+# ...and it was genuinely running right up to the stop, so the flatness above
+# is the stop doing something rather than a timer that had already finished.
+if [ "$(( S_A - V2_A ))" -ge 0 ] && [ "$V2_A" -ge 3 ]; then pass; else
+    fail "control: the interval was running when the stop arrived" \
+         "only $V2_A ticks before it" \
+         "a timer that had already stopped makes every reading above flat for" \
+         "a reason that has nothing to do with the fix"
+fi
+
+# ── remove, after a stop that has already severed them ─────────────────────
 "$BIN" remove tmr >/dev/null 2>&1 || true
 sleep 0.8
 R_A=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
-sleep 1.5
-R_B=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
-assert_eq "remove cancels a pending interval" "$R_A" "$R_B" \
-    "sampled a second and a half apart, so a 60 ms interval still armed would" \
-    "add about twenty-five.  The pair with the measurement above is the point:" \
-    "the count was still climbing after stop and is flat after remove, so this" \
-    "is the destructor doing it and not the timer having run out on its own"
+sleep 1.2
+assert_eq "remove leaves nothing further to cancel" \
+          "$R_A" "$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")" \
+    "the destructor severs them too, and it must not matter that stop got" \
+    "there first — a double severance is what a stopped-then-removed runtime" \
+    "asks for every time"
 
 TOTAL=$((TOTAL+1))
 if alive; then PASS=$((PASS+1)); else

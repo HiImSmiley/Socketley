@@ -139,32 +139,7 @@ lua_context::~lua_context()
     // terminal path a null ctx selects — which is what this severance is handing
     // the timer to.  runtime_instance does the identical thing to its tick timer
     // (`m_tick->rt = nullptr` in reload_lua_script), for the identical reason.
-    for (auto* p : m_active_timers)
-    {
-        auto* t = static_cast<lua_timer*>(p);
-        t->fn  = sol::nil;
-        t->ctx = nullptr;
-
-        // Bring the completion forward instead of waiting out the interval.  Not
-        // required for correctness — the timeout reports on its own schedule and
-        // the timer frees itself then, by the same path — but an interval can be
-        // an hour long, and until it reports, the timer holds its storage and
-        // one owner registration.  A reload every hour would accumulate both.
-        //
-        // Guarded on ring_open() and not merely on a non-null loop: this
-        // destructor also runs at process teardown, and by then shutdown_ring()
-        // has already been called.  A submission then is a submission into a
-        // ring that is gone.
-        if (t->loop && t->loop->ring_open())
-            if (!t->loop->submit_timeout_remove(&t->req)) {}
-    }
-    m_active_timers.clear();
-
-    // The timer ids too.  They name timers this context no longer owns — every
-    // one of them has just been handed to its own completion — so a lookup that
-    // survived into the destructor's remaining work would find a pointer with
-    // nothing left to say.
-    m_timer_map.clear();
+    cancel_timers();
 
     // Free all pooled timers.  These are safe to delete outright: a timer only
     // reaches the pool from inside its own on_cqe, after that completion has
@@ -539,6 +514,53 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
             fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
         }
     }
+}
+
+
+// Sever every armed timer from this context, leaving the context itself alive.
+//
+// Split out of ~lua_context so that stopping a runtime can reach it.  A stopped
+// runtime must execute no script, and its intervals used to go on firing at
+// full rate for as long as the daemon lived — the context is only destroyed by
+// `remove`, so `stop` left every set_interval running.  That is not untidy, it
+// is wrong in a way a script can act on: self.send from such a timer reaches
+// clients of a runtime the operator has taken down.
+//
+// The severance is exactly what the destructor performed, and the reasoning
+// there applies here unchanged — the sol::function goes first so a completion
+// cannot call into Lua, `ctx` goes second so on_cqe takes its terminal path
+// instead of calling two methods on this object, and deregister_owner is
+// deliberately left to on_cqe.  The only difference is that this object
+// survives, which is why both containers are cleared: what is left in them
+// would name timers this context has already given away.
+void lua_context::cancel_timers()
+{
+    for (auto* p : m_active_timers)
+    {
+        auto* t = static_cast<lua_timer*>(p);
+        t->fn  = sol::nil;
+        t->ctx = nullptr;
+
+        // Bring the completion forward instead of waiting out the interval.  Not
+        // required for correctness — the timeout reports on its own schedule and
+        // the timer frees itself then, by the same path — but an interval can be
+        // an hour long, and until it reports, the timer holds its storage and
+        // one owner registration.  A reload every hour would accumulate both.
+        //
+        // Guarded on ring_open() and not merely on a non-null loop: the
+        // destructor reaches this through here at process teardown, and by then
+        // shutdown_ring() has already been called.  A submission then is a
+        // submission into a ring that is gone.
+        if (t->loop && t->loop->ring_open())
+            if (!t->loop->submit_timeout_remove(&t->req)) {}
+    }
+    m_active_timers.clear();
+
+    // The timer ids too.  They name timers this context no longer owns — every
+    // one of them has just been handed to its own completion — so a lookup that
+    // survived into the destructor's remaining work would find a pointer with
+    // nothing left to say.
+    m_timer_map.clear();
 }
 
 void lua_context::update_self_state(const char* state_str)

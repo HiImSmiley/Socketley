@@ -2836,6 +2836,19 @@ every
 .I ms
 milliseconds. Returns an integer timer ID that can be passed to
 .BR socketley.clear_interval() .
+.IP
+Both kinds are cancelled when the runtime stops, and are
+.B not
+restored if it is started again. A stopped runtime executes no script, so a
+timer armed by one does not survive it \(em including a timer armed inside
+.BR on_stop ,
+which is severed with the rest. The registrations are made at the script's top
+level, which runs when the script is loaded rather than when the runtime starts,
+so there is nothing for a later
+.B start
+to replay; use
+.B reload\-lua
+to arm them again.
 .TP
 .B socketley.clear_timeout(timer_id)
 Cancel a pending timeout. The timer will not fire. Safe to call with

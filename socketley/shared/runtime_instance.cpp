@@ -260,6 +260,30 @@ bool runtime_instance::stop(event_loop& loop)
 
     if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
     invoke_on_stop();
+
+    // The script's own timers, after on_stop and not before it.
+    //
+    // m_tick above is the on_tick machinery and was already severed here; the
+    // timers a script arms with set_timeout and set_interval were not, and
+    // nothing else does it until the context is destroyed — which only `remove`
+    // does.  So a stopped runtime went on running its script: measured, a 60 ms
+    // interval still firing at full rate minutes after `stop`, flat only after
+    // `remove`.  A script that calls self.send from such a timer is delivering
+    // to clients of a runtime the operator has taken down.
+    //
+    // After on_stop so that a timer armed inside on_stop is severed too: on_stop
+    // is the last thing this runtime is entitled to execute, and scheduling work
+    // to run after it is scheduling work for a runtime that is not there.
+    //
+    // Not restored by a later start().  The registrations are made at the
+    // script's top level, which runs when the script is loaded and not when the
+    // runtime starts, so there is nothing for start() to replay — stated in the
+    // man page beside set_interval rather than left for someone to discover.
+#ifndef SOCKETLEY_NO_LUA
+    if (m_lua)
+        m_lua->cancel_timers();
+#endif
+
     teardown(loop);
     loop.deregister_owner(this);
     m_state.store(runtime_stopped, std::memory_order_release);
