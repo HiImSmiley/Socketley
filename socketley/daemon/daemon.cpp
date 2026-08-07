@@ -8,6 +8,7 @@
 #include "../shared/daemon_client.h"
 #include "../shared/state_persistence.h"
 #include "../shared/runtime_config_apply.h"
+#include "../shared/lua_context.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -68,7 +69,23 @@ static uint16_t load_daemon_config(const std::string& config_path)
     sol::state lua;
     lua.open_libraries(sol::lib::base, sol::lib::string);
 
-    auto result = lua.safe_script_file(path, sol::script_pass_on_error);
+    // Bounded like every other chunk in this process — see lua_deadline in
+    // lua_context.h.  This one runs before the socket is bound and before a
+    // single runtime exists, so a config file that does not return does not
+    // freeze a serving daemon; it stops one from ever starting, and under a
+    // service manager that is a start timeout and a restart loop with the log
+    // line missing.  With the bound it is a named error and a daemon that comes
+    // up on its defaults.
+    //
+    // The process default rather than a `callback_timeout_ms` of the config's
+    // own: this file configures the daemon, not a runtime, and the variable
+    // that would set it is read out of the same environment this is.
+    auto result = [&] {
+        lua_deadline::install(lua.lua_state(), lua_deadline::default_ms());
+        lua_deadline::scope guard("the daemon configuration file",
+                                  lua_deadline::default_ms());
+        return lua.safe_script_file(path, sol::script_pass_on_error);
+    }();
     if (!result.valid())
     {
         sol::error err = result;

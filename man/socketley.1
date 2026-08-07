@@ -2472,6 +2472,111 @@ Cluster only. Called when a remote daemon becomes stale or disappears.
 .TP
 .B on_group_change(group, members)
 Cluster only. Called when the member count of a group changes.
+.SS Callback Deadline
+Every Lua callback invocation is given a wall\-clock budget. A callback that has
+not returned when its budget runs out is stopped with an error, exactly as if
+the script had called
+.BR error() :
+the daemon logs the reason, the callback's usual failure path runs, and the
+runtime carries on serving. The default budget is
+.B 10000
+milliseconds.
+.PP
+The bound exists because the event loop is a single thread serving every runtime
+in the daemon. Before it,
+.B "while true do end"
+in any callback froze all of them \(em traffic, the metrics endpoint and the IPC
+socket \(em with no recovery short of
+.BR "kill \-9" .
+.PP
+What is bounded:
+.RS
+.IP \(bu 2
+each invocation of any
+.BI on_ *
+callback, separately \(em a periodic
+.B on_tick
+gets a fresh budget on every tick
+.IP \(bu 2
+each invocation of a
+.B socketley.set_timeout
+or
+.B socketley.set_interval
+callback, and of a
+.B socketley.subscribe
+handler
+.IP \(bu 2
+the whole
+.B filters
+chain for one request, as a single budget rather than one per filter
+.IP \(bu 2
+the script's top level, which runs inside
+.BR create .
+A top level that never returns refuses the create with a reason instead of
+blocking the terminal on a command that never answers
+.RE
+.PP
+A stopped callback is a callback that raised, so wherever a raise already has a
+defined answer, the deadline gets that answer.
+.B on_auth
+denies and says why;
+.B on_route
+falls back to the usual backend pick; a
+.B filters
+entry refuses the request with a 500. In
+.B on_proxy_request
+and
+.B on_proxy_response
+it is the refusal case and not the "returned nothing" case \(em the connection
+closes, and the bytes of a request whose hook never finished deciding are not
+forwarded as though the hook had waved them through.
+.PP
+.B socketley.http
+lives inside the same budget: its
+.B timeout_ms
+is clamped to what is left of the callback's, so a callback that spends its
+budget waiting on a host gets an ordinary
+.B "ok = false"
+result rather than being stopped. A script that needs a long fetch raises the
+callback budget to suit. Nothing can interrupt a request mid\-socket \(em the
+mechanism is a VM instruction hook and a blocking call executes no instructions.
+.PP
+.B Setting it.
+A script sets its own with a top\-level
+.B callback_timeout_ms
+global, next to
+.BR tick_ms :
+.nf
+
+callback_timeout_ms = 30000   \-\- this script does slow work on purpose
+callback_timeout_ms = 0       \-\- no bound at all for this script
+
+.fi
+An operator moves the default for every script that says nothing with
+.B SOCKETLEY_LUA_TIMEOUT_MS
+in the daemon's environment; see
+.BR ENVIRONMENT .
+.PP
+.B What it costs.
+LuaJIT runs a state in the interpreter while an instruction hook is installed,
+so a callback whose cost is its own arithmetic loses the JIT. Measured on the
+dev VM at 20000 round trips: an ordinary callback that answers a message showed
+no difference above the run\-to\-run noise, while a callback doing 2000
+arithmetic operations per message ran at 80% of its unhooked rate. Setting the
+bound to
+.B 0
+installs no hook and restores the JIT exactly.
+.PP
+.B What it does not bound.
+A callback stopped at its deadline has still held the loop for that long, so a
+CLI command issued during the stall can hit its own five second receive timeout
+and report the daemon unreachable; it succeeds on the retry. A runaway
+.B on_tick
+is stopped on every tick rather than once. And
+.BR getaddrinfo (3),
+inside
+.BR socketley.http ,
+executes no VM instructions and is not interrupted.
 .SS Proxy Filter Chain
 Proxy only, HTTP mode only.
 .B filters
@@ -4067,6 +4172,22 @@ Number of buffers in that ring. Default
 Together with the size this bounds how much concurrent traffic the runtime can
 absorb before the pool runs dry and reads fall back to a slower per-read path;
 the pool costs count times size of memory per cache runtime.
+.TP
+.B SOCKETLEY_LUA_TIMEOUT_MS
+How long one Lua callback invocation may hold the event\-loop thread, in
+milliseconds. Default
+.BR 10000 ;
+.B 0
+switches the bound off entirely. See
+.BR "Callback Deadline" .
+.IP
+This is the default for every script that does not declare its own
+.B callback_timeout_ms
+global; a script that does declare one overrides it. A value that is not a
+whole number of milliseconds in 0\(en3600000 is refused with a warning and the
+default is used.
+.IP
+Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by

@@ -41,12 +41,218 @@ namespace lua_diag
 #include <charconv>
 #include <chrono>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #ifndef SOCKETLEY_NO_HTTPS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 #endif
+
+// ─── The callback deadline ──────────────────────────────────────────────────
+//
+// See lua_context.h for what this is and why it has this shape.  What lives
+// here is the state it is enforced through.
+namespace lua_deadline
+{
+// How many VM instructions between hook calls.
+//
+// The hook's whole body on the ordinary path is one clock read and one
+// comparison — steady_clock::now() is a vDSO read on this platform, about 20ns
+// — so at this count it costs on the order of 20ns per 10,000 instructions,
+// which is noise beside the interpreter itself.  It is also 100,000 times finer
+// than the smallest deadline anyone would set, so the granularity of the check
+// is never what decides when a runaway is caught.
+//
+// The real cost of having a hook at all is elsewhere and is not tunable by this
+// number: LuaJIT drops the state to the interpreter while a count or line hook
+// is installed, because a compiled trace does not call back out.  That is the
+// price of being able to interrupt a `while true do end` at all — a trace with
+// no hook in it cannot be stopped from inside — and it is why installing
+// nothing when the deadline is off is worth the branch.
+static constexpr int hook_count = 10000;
+
+// ── The armed invocation ────────────────────────────────────────────────────
+//
+// Thread-local, not per-interpreter.  The daemon serves every runtime from one
+// thread and each worker has one of its own, so this is per event loop, which
+// is the resource the deadline exists to protect.  Nesting across interpreters
+// then works out to the right thing on its own: a publish that runs another
+// runtime's subscriber spends the budget of the callback that published.
+static thread_local unsigned                              t_depth{0};
+static thread_local std::chrono::steady_clock::time_point t_deadline{};
+static thread_local const char*                           t_what{nullptr};
+static thread_local uint32_t                              t_limit_ms{0};
+// Whether this invocation has already been reported.  The hook raises every
+// time it fires past the deadline, but says so once: a script that wraps its
+// own runaway in pcall() swallows the first error and is raised in again a few
+// thousand instructions later, and that must stop the script without also
+// filling the log with one line per raise.
+static thread_local bool                                  t_reported{false};
+
+uint32_t default_ms()
+{
+    // Read once.  A getenv per lua_context would be a syscall-free but still
+    // pointless string parse on a path that runs at every create.
+    static const uint32_t value = [] () -> uint32_t {
+        const char* e = std::getenv("SOCKETLEY_LUA_TIMEOUT_MS");
+        if (!e || !*e)
+            return builtin_default_ms;
+
+        // Anything that is not a number is a typo in an operator's unit file,
+        // and silently falling back to the default would hide it.  Anything
+        // negative is the same.  0 is meaningful: it turns the deadline off.
+        char*     end = nullptr;
+        long long v   = std::strtoll(e, &end, 10);
+        if (end == e || *end != '\0' || v < 0 || v > 3600000)
+        {
+            std::cerr << "[lua] SOCKETLEY_LUA_TIMEOUT_MS=\"" << e
+                      << "\" is not a millisecond count in 0..3600000; using "
+                      << builtin_default_ms << std::endl;
+            return builtin_default_ms;
+        }
+        return static_cast<uint32_t>(v);
+    }();
+    return value;
+}
+
+scope::scope(const char* what, uint32_t limit_ms) noexcept
+    : m_outermost(t_depth == 0 && limit_ms != 0)
+{
+    if (m_outermost)
+    {
+        t_deadline = std::chrono::steady_clock::now()
+                   + std::chrono::milliseconds(limit_ms);
+        t_what     = what;
+        t_limit_ms = limit_ms;
+        t_reported = false;
+    }
+    // Counted even when this scope did not arm, so that the matching destructor
+    // does not have to decide anything and an inner scope can never disarm the
+    // outer one's deadline.  A scope constructed while the deadline is off does
+    // not arm and does not count: t_depth stays 0, remaining_ms() stays -1, and
+    // socketley.http keeps the timeout the script asked for.
+    if (t_depth != 0 || m_outermost)
+        ++t_depth;
+}
+
+scope::~scope() noexcept
+{
+    // The outermost scope resets rather than decrements, and that is the one
+    // thing in here that has to be true no matter what happened inside it.  A
+    // leaked depth would leave the deadline armed and already expired after the
+    // callback that armed it had returned — so the NEXT callback, an innocent
+    // one, would be stopped on its first hook fire, and so would every callback
+    // after that.  Decrementing makes that outcome reachable from any path that
+    // skips an inner destructor; resetting at the boundary does not.
+    if (m_outermost)
+    {
+        t_depth    = 0;
+        t_what     = nullptr;
+        t_limit_ms = 0;
+    }
+    else if (t_depth != 0)
+    {
+        --t_depth;
+    }
+}
+
+long remaining_ms() noexcept
+{
+    if (t_depth == 0)
+        return -1;
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_deadline - std::chrono::steady_clock::now()).count();
+    if (left < 0)          return 0;
+    if (left > INT_MAX)    return INT_MAX;
+    return static_cast<long>(left);
+}
+
+// The hook.  Runs on the hot path of every script, so the ordinary return is
+// two loads and a compare.
+//
+// ─── It reports before it raises, and that is still worth a line ────────────
+//
+// This used to be the only report there was.  Every callback was invoked inside
+// a `catch (const sol::error&)`, and that catch only ever fired because sol2's
+// panic handler happens to throw and the throw happens to unwind out of the
+// interpreter — which it does not in the Sanitize build, so the diagnostic was
+// dead in exactly the configuration the nightly job uses.
+//
+// 07baee7..b868bb5 removed every one of those catches and made the calls
+// protected, so a deadline now arrives at the call site as an invalid result
+// and IS reported there, in both builds, with the script and line attached —
+// which this line cannot know.  That is the primary report now, and it is the
+// one to read.
+//
+// This line stays because two paths still have nothing else.  A script that
+// wraps its own slow work in pcall() — `local ok = pcall(fetch_all)` is an
+// ordinary thing to write — catches the deadline error itself, and the call
+// site never sees a failure to report; without this the runtime would simply
+// stop making progress with nothing in the log to say why.  And
+// on_http_request is the one callback the sweep did not reach: it is still a
+// sol::function and its call site checks nothing at all, so a deadline there
+// is invisible unless it is written here.
+//
+// So it is deliberately short, and deliberately not a copy of the error text:
+// this line is the event, the call site's line is the diagnosis.
+//
+// No C++ object with a destructor is alive at the raise: lua_error unwinds by
+// whatever means LuaJIT was built for, and a std::string here would be the one
+// allocation that leaks when that turns out to be longjmp.
+//
+// The deadline is NOT pushed forward after it fires, and that is deliberate.
+// Leaving it expired means the hook raises again on the next few thousand
+// instructions, which is what closes the obvious way around this: a script that
+// writes `while true do pcall(spin) end` swallows the raise inside pcall, and
+// the only thing that ends it is the next raise landing on the outer loop
+// instead.  The hook count is a global countdown rather than a per-frame one,
+// so it lands there within a few thousand fires — a fraction of a second — and
+// the invocation ends.  A grace period after each fire would give the protected
+// frame all of it and the outer loop none, and never end.
+static void hook(lua_State* L, lua_Debug*)
+{
+    if (t_depth == 0)
+        return;
+    if (std::chrono::steady_clock::now() < t_deadline)
+        return;
+
+    const char*    what = t_what ? t_what : "a callback";
+    const unsigned ms   = t_limit_ms;
+
+    if (!t_reported)
+    {
+        t_reported = true;
+        std::fprintf(stderr, "[lua] %s hit its %ums deadline and was stopped\n",
+                     what, ms);
+        std::fflush(stderr);
+    }
+
+    // `what` carries the noun, so this reads as a sentence for a callback, for
+    // the script's top level and for the daemon's configuration file alike.
+    luaL_error(L, "%s exceeded the %ums deadline", what, ms);
+}
+
+void install(lua_State* L, uint32_t limit_ms)
+{
+    if (limit_ms == 0)
+    {
+        // Off means off, down to not paying for it: with no count hook LuaJIT
+        // compiles again.  An operator who has measured the hook and decided
+        // against it gets the interpreter they had before this existed.
+        lua_sethook(L, nullptr, 0, 0);
+        return;
+    }
+    lua_sethook(L, hook, LUA_MASKCOUNT, hook_count);
+}
+
+}  // namespace lua_deadline
+
+void lua_context::install_deadline_hook()
+{
+    lua_deadline::install(m_lua.lua_state(), m_deadline_ms);
+}
 
 lua_context::lua_context()
 {
@@ -60,6 +266,8 @@ lua_context::lua_context()
     m_lua["os"]["rename"]  = sol::nil;
     m_lua["os"]["tmpname"] = sol::nil;
     m_lua["os"]["exit"]    = sol::nil;
+
+    install_deadline_hook();
 }
 
 // ─── lua_timer: heap-allocated one-shot / repeating timer via op_timeout ───
@@ -87,7 +295,19 @@ struct lua_timer : io_handler
             else delete this;
             return;
         }
+        // A timer body is a callback invocation like any other — it runs on the
+        // event-loop thread, from a completion, and holds it for as long as it
+        // runs.  The budget comes from the context that registered it, so a
+        // script that set callback_timeout_ms gets the same answer here as in
+        // on_message.  A timer whose context has already been severed (ctx null:
+        // see the destructor) has nothing left to run, and fn is nil by then.
+        //
+        // The scope brackets the call and nothing else: a deadline that expires
+        // in here comes back as an invalid result, and b62d58d's branch below
+        // is already the right place for it to be reported.
         {
+            lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
+                                      ctx ? ctx->callback_timeout_ms() : 0u);
             sol::protected_function_result tr = fn();
             if (SOCKETLEY_UNLIKELY(!tr.valid()))
             {
@@ -250,12 +470,78 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         m_lua["package"]["path"] = new_path;
     }
 
-    auto result = m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
+    // The top-level chunk is bounded too, and it is the one place the bound
+    // changes what a *command* does rather than what a connection sees.  This
+    // runs synchronously inside `create`: a script whose top level does not
+    // return used to freeze the daemon before the runtime existed, with the
+    // operator's terminal blocked on a create that would never answer.  It is
+    // safe_script_file, so an expiry comes back as an invalid result and lands
+    // in load_diag — the create is refused, with a reason, and nothing is
+    // half-built.
+    //
+    // The process default and not the script's own `callback_timeout_ms`: the
+    // global is set BY this chunk, so at this point there is nothing to read.
+    auto result = [&] {
+        lua_deadline::scope guard("the script's top level", lua_deadline::default_ms());
+        return m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
+    }();
     if (!result.valid())
     {
         sol::error err = result;
         load_diag(std::string("script error: ") + err.what());
         return false;
+    }
+
+    // What this script asked for, now that its top level has run.  Same shape
+    // as tick_ms directly below: a global, read once, clamped.
+    //
+    // 0 is meaningful and means "no deadline on my callbacks" — a script that
+    // genuinely blocks for minutes has to be able to say so, and saying so in
+    // the file is the visible way to do it.  A negative or non-integer value is
+    // a mistake in a file somebody is editing right now, so it is named rather
+    // than rounded into something plausible.
+    //
+    // TWO READS, AND BOTH FORMS ARE DELIBERATE.
+    //
+    // `.get<sol::optional<int>>()` is the checked read 091e6d9 replaced every
+    // bare `sol::optional<T> x = tbl[k]` in this tree with.  The bare form runs
+    // an unconditional conversion, and sol2's safety checks follow NDEBUG — on
+    // in every Debug and Sanitize build, off in Release — so what it does with
+    // a value it cannot convert is a property of the build rather than of the
+    // code.  091e6d9 has the case that cost a daemon: an ABSENT key read as
+    // sol::optional<std::string> inside socketley.create's binding, throwing
+    // across the Lua C boundary into std::terminate.
+    //
+    // Honestly: the bare form was tried here and did NOT misbehave.  Measured,
+    // Sanitize, `callback_timeout_ms = "soon"` through `create --lua`: it
+    // answered nullopt and the diagnostic below fired, the same as the checked
+    // form.  The guard above is why — sol::object first, so the key is known to
+    // be present, which is the case 091e6d9 was about.  So this is not a crash
+    // being fixed; it is the one read in this file that would otherwise be
+    // spelled differently from every other read in the file, resting on a
+    // measurement of which type pairs sol2 happens to throw on.  That is not a
+    // thing to rest on, and the checked form costs nothing.
+    //
+    // The sol::object probe stays because the checked read cannot tell the two
+    // failures apart — absent and present-but-wrong both answer nullopt, and
+    // they need different answers.  Absent means "no opinion, use the daemon's
+    // default"; present and unreadable is a typo somebody wants told about.
+    {
+        sol::object cto = m_lua["callback_timeout_ms"];
+        if (cto.valid() && cto != sol::nil)
+        {
+            sol::optional<int> ms =
+                m_lua["callback_timeout_ms"].get<sol::optional<int>>();
+            if (!ms || *ms < 0)
+            {
+                load_diag("`callback_timeout_ms` must be a millisecond count of "
+                          "0 or more (0 disables the callback deadline for this "
+                          "script)");
+                return false;
+            }
+            m_deadline_ms = static_cast<uint32_t>(*ms);
+            install_deadline_hook();
+        }
     }
 
     m_on_start = m_lua["on_start"];
@@ -505,6 +791,15 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     key_buf.append(channel);
     auto it = m_subscriptions.find(key_buf);
     if (it == m_subscriptions.end()) return;
+
+    // One scope for the whole fan-out, not one per subscriber.  A publish is
+    // usually made from inside another callback, and lua_deadline::scope nests
+    // outermost-wins, so in that case this arms nothing and the subscribers
+    // spend the publisher's budget — which is right, because the publisher's
+    // callback does not return until the last subscriber has run.  When the
+    // publish comes from somewhere with no callback armed, this is the outermost
+    // scope and the whole fan-out shares one budget.
+    lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms);
     for (auto& fn : it->second)
     {
         sol::protected_function_result r = fn(channel, message);
@@ -597,6 +892,20 @@ void lua_context::update_self_state(const char* state_str)
 // Residual: getaddrinfo() is still unbounded and is not counted against the
 // deadline until it returns — the resolver has no per-call timeout, and giving
 // it one means resolving off-thread, which is the same asynchronous rework.
+// It is also the one part of this call the callback deadline cannot reach: a
+// count hook counts VM instructions and the resolver executes none.
+//
+// AND IT LIVES INSIDE THE CALLBACK'S BUDGET. There are now two bounds on how
+// long the event loop may be held, and two bounds that merely happen to be
+// compatible is a bug waiting for the day somebody changes one of them. So
+// timeout_ms is clamped to what is left of the invocation deadline (see
+// lua_deadline in lua_context.h) and there is one budget: whatever a callback
+// spends here, it spends out of the ten seconds it has in total, and a script
+// that wants a thirty-second fetch says `callback_timeout_ms = 31000` and gets
+// it. Nothing here can be interrupted mid-socket by the hook — no bytecode runs
+// between these poll() calls — so the clamp is the only way the two interact,
+// and it interacts by returning an ordinary `ok = false, error = "..."` result
+// that a script can see and handle.
 //
 // Keep to on_start/on_stop or low-frequency on_tick callbacks regardless.
 // ---------------------------------------------------------------------------
@@ -682,6 +991,25 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     int timeout_ms      = sol::optional<int>(opts["timeout_ms"]).value_or(5000);
     if (timeout_ms <= 0)
         timeout_ms = 5000;
+
+    // Inside the callback's budget, not beside it.  remaining_ms() is -1 when
+    // no deadline is armed — a call from somewhere that is not a callback, or a
+    // script that set callback_timeout_ms = 0 — and then timeout_ms stands as
+    // the script wrote it, which is exactly the behaviour that existed before.
+    {
+        const long budget = lua_deadline::remaining_ms();
+        if (budget == 0)
+        {
+            // Named rather than reported as a connect timeout: the request has
+            // not been attempted, and "timed out" would send whoever reads it
+            // to look at the wrong host.
+            result["error"] = "no time left in this callback's deadline "
+                              "(callback_timeout_ms) to make the request";
+            return result;
+        }
+        if (budget > 0 && budget < timeout_ms)
+            timeout_ms = static_cast<int>(budget);
+    }
 
     // One deadline for the whole exchange, taken before anything can block.
     // Every wait below measures against this, so the total time this call can

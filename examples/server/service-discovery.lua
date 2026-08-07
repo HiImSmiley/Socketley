@@ -6,6 +6,17 @@
 -- is why this only runs in on_start/on_stop. timeout_ms (default 5000) is one
 -- deadline for the whole exchange, so the stall is bounded, not absent.
 --
+-- It is bounded twice, in fact, and the tighter of the two wins. Every callback
+-- invocation has a wall-clock budget of its own -- 10000ms by default -- and
+-- socketley.http's timeout_ms is clamped to whatever is left of it. The two
+-- calls below ask for the default 5000 inside a budget of 10000, so neither is
+-- clipped and nothing here needs changing. A callback that made three of these
+-- in a row would be: the third would find little of the budget left and come
+-- back with ok = false. Declare what the script actually needs when that is the
+-- case, at the top level, next to tick_ms:
+--
+--     callback_timeout_ms = 20000
+--
 -- An https:// URL is fully verified: the chain against the system CA store and
 -- the certificate against the host in the URL, TLS 1.2 minimum. There is no way
 -- to switch that off, so a Consul agent behind a private CA needs that CA in the

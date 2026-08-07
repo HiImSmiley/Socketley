@@ -4413,6 +4413,16 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     conn->filter_headers.clear();
     conn->filter_removed_headers.clear();
 
+    // One budget for the whole chain, armed here rather than handed out per
+    // filter by the accessor the way every other callback gets it.  A request
+    // costs what its chain costs: ten filters that each take a second are ten
+    // seconds of the event-loop thread for one request, and measuring them one
+    // at a time would call that fine.  A filter that outruns it raises, and the
+    // loop below already has the right answer for a filter that raises —
+    // refuse the request and say so.
+    lua_deadline::scope deadline_guard("a filter in the `filters` chain",
+                                       lctx->callback_timeout_ms());
+
     for (const auto& filter : lctx->filters())
     {
         auto result = filter(req);

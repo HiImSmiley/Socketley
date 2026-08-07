@@ -27,6 +27,14 @@ int cli_config(int argc, char** argv)
         return 1;
     }
 
+    // Deliberately NOT bounded by lua_deadline, unlike every other chunk this
+    // tree runs.  That bound exists because the daemon's event loop is one
+    // thread serving every runtime, and a script that does not return takes all
+    // of them down with it.  This chunk runs in the CLI process: it holds
+    // nothing anybody else is waiting on, the operator started it in the
+    // foreground and can end it with a keystroke, and a configuration file that
+    // spends thirty seconds working out what to create is doing something
+    // legitimate that a ten second bound would break for no gain.
     sol::protected_function_result result = script();
 
     if (!result.valid())

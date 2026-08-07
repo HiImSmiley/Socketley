@@ -37,15 +37,161 @@ namespace lua_diag
 #ifndef SOCKETLEY_NO_LUA
 
 #include <sol/sol.hpp>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "route_table.h"
 
 class runtime_instance;
+
+// ─── How long one Lua callback may hold the event-loop thread ───────────────
+//
+// Nothing used to bound a script at all.  `while true do end` in any callback —
+// or at a script's top level, which runs synchronously inside the `create`
+// command — freezes the single thread that serves every runtime in this daemon:
+// all traffic, the metrics endpoint, the IPC socket.  Measured on the parent
+// commit, one server spinning and a second server doing nothing:
+//
+//     stats <the other runtime>   -> no answer, exit 2 after 5s
+//     traffic to the other runtime -> not served
+//     daemon                       -> 80% of a core, recoverable only by SIGKILL
+//
+// The mechanism is a count hook.  lua_sethook(L, h, LUA_MASKCOUNT, N) fires h
+// every N VM instructions; h reads a clock and, if this invocation has outrun
+// its deadline, raises a Lua error, which unwinds the callback exactly the way
+// any other script error does — the tree already knows how to report those.
+//
+// The trigger is an instruction count because that is the only thing LuaJIT will
+// call back on.  The *test* is wall-clock time, because instructions do not map
+// to time: a callback blocked in socketley.http executes almost no bytecode and
+// still holds the loop for as long as it likes.  An instruction budget on its
+// own would punish a tight numeric loop and wave the sleeping one through.
+//
+// Not a supervisor thread (nothing can safely interrupt LuaJIT from outside),
+// and not a runtime kill (heavier than failing the one callback, and the
+// callback failure path already exists and already reports).
+namespace lua_deadline
+{
+    // ─── The number ─────────────────────────────────────────────────────────
+    //
+    // Ten seconds, which is not a new scale: it is PROXY_HEADER_TIMEOUT_SEC,
+    // and it was chosen there for the same shape of question — "far outside
+    // anything a working participant does, and far inside how long something
+    // broken would like to hold the connection".  A callback is the same
+    // trade: no legitimate handler in this tree spends a second, and the
+    // cost of being wrong in the other direction is a working script that
+    // starts failing, which is worse than no bound at all.
+    //
+    // It is also the number socketley.http forces.  That call blocks the event
+    // loop by design and defaults to a 5000ms timeout, and it is sanctioned for
+    // on_start / on_stop / low-frequency on_tick — so a callback that makes one
+    // ordinary HTTP request must fit inside the deadline with room to spare, or
+    // the deadline breaks the documented use of the one blocking primitive this
+    // tree ships.  10000 leaves that request its full 5000 and a second one
+    // after it.  Anything at or under 5000 would silently clip the default.
+    //
+    // The two are not merely numerically compatible: socketley.http asks
+    // remaining_ms() and clamps its own wait to what is left of the callback's
+    // budget, so there is one budget rather than two that happen to agree.  The
+    // hook cannot fire *inside* http in any case — a count hook counts VM
+    // instructions and a blocking C call executes none — so there is no way for
+    // this to interrupt a half-read socket.
+    inline constexpr uint32_t builtin_default_ms = 10000;
+
+    // The process-wide default, in milliseconds; 0 means the mechanism is off
+    // and no hook is installed at all.  Read once from SOCKETLEY_LUA_TIMEOUT_MS.
+    //
+    // ─── Where it is configurable, and why there ────────────────────────────
+    //
+    // Two knobs, for the two people who have a reason to touch it.
+    //
+    // The script says `callback_timeout_ms = N` at its top level, next to
+    // `tick_ms`, which is the same shape of declaration for the same reason:
+    // how long a callback legitimately needs is a property of the code in that
+    // file, and the person who knows it is the person editing it.  It travels
+    // with the script through reload-lua, export and import without a new
+    // persisted field on every runtime.
+    //
+    // The operator sets SOCKETLEY_LUA_TIMEOUT_MS in the daemon's environment,
+    // alongside SOCKETLEY_CACHE_TTL_SWEEP_MS and SOCKETLEY_SQPOLL_IDLE_MS,
+    // which are the tuning knobs of exactly this kind.  It moves the default
+    // for every script that never mentioned the subject, and 0 switches the
+    // mechanism off outright — which is what a new safety mechanism owes
+    // whoever is running it in production when it turns out to misfire.
+    //
+    // Not a CLI flag.  A flag would have to be parsed, persisted, exported,
+    // imported, shown by `inspect` and accepted by `edit`, and it would let
+    // somebody who has not read the script overrule a bound its author set
+    // deliberately.  The two knobs above already cover both people.
+    uint32_t default_ms();
+
+    // Put the count hook on a state, or take it off when limit_ms is 0.
+    //
+    // Public because lua_context is not the only interpreter in the daemon: it
+    // reads its own configuration file with a bare sol::state before any runtime
+    // exists (see daemon.cpp), and a config file is a script like any other.
+    //
+    // Every interpreter in the DAEMON is bounded.  The one in the CLI process is
+    // not, deliberately — see cli_config.cpp.
+    void install(lua_State* L, uint32_t limit_ms);
+
+    // Arm the deadline for one callback invocation.
+    //
+    // Nesting is deliberate and only the outermost scope arms.  A callback that
+    // reaches a second interpreter — socketley.publish running a subscriber that
+    // belongs to another runtime — is one stretch of time the event loop is held
+    // for, and that is the thing being bounded, so the inner call spends the
+    // outer call's budget rather than being handed a fresh one.
+    class scope
+    {
+    public:
+        // `what` names the callback for the diagnostic; it must outlive the
+        // scope, which every call site satisfies by passing a literal.
+        // `limit_ms` of 0 leaves the deadline unarmed.
+        scope(const char* what, uint32_t limit_ms) noexcept;
+        ~scope() noexcept;
+        scope(const scope&)            = delete;
+        scope& operator=(const scope&) = delete;
+
+    private:
+        bool m_outermost;
+    };
+
+    // Milliseconds left in the armed invocation; -1 when nothing is armed or
+    // the mechanism is off.  socketley.http asks, so that its own wait lives
+    // inside the callback's budget instead of beside it.
+    long remaining_ms() noexcept;
+}
+
+// One callback, with the deadline armed for exactly the length of the call.
+//
+// Returned by every on_*() accessor below instead of the bare sol::function, so
+// that arming is not something 40 call sites in five files each have to
+// remember — and so that the next callback added to this class gets the bound
+// by writing its accessor the same way the others are written.
+template <class F>
+class lua_guarded_call
+{
+public:
+    lua_guarded_call(F& fn, const char* what, uint32_t limit_ms) noexcept
+        : m_fn(fn), m_scope(what, limit_ms) {}
+
+    // decltype(auto) rather than auto: sol's call operator returns a result
+    // object that owns a slice of the Lua stack and pops it when it dies.  The
+    // returned expression is a prvalue of that type, so C++17 constructs it
+    // straight into the caller's object — no move, no second pop.
+    template <class... A>
+    decltype(auto) operator()(A&&... a) const { return m_fn(std::forward<A>(a)...); }
+
+private:
+    F&                   m_fn;
+    lua_deadline::scope  m_scope;
+};
 
 // Lua context for a runtime - manages state and bindings
 class lua_context
@@ -150,37 +296,71 @@ public:
     // daemon when it publishes the endpoint snapshot, not on any request path.
     bool has_routes()                const { return m_callback_mask & CB_ROUTES; }
 
-    // Get callbacks
-    sol::protected_function& on_start() { return m_on_start; }
-    sol::protected_function& on_stop() { return m_on_stop; }
-    sol::protected_function& on_message() { return m_on_message; }
-    sol::protected_function& on_send() { return m_on_send; }
-    sol::protected_function& on_connect() { return m_on_connect; }
-    sol::protected_function& on_disconnect() { return m_on_disconnect; }
-    // protected_function, like filters() and unlike every other callback here.
-    // See m_on_route below for why.
-    sol::protected_function& on_route() { return m_on_route; }
-    sol::protected_function& on_master_auth() { return m_on_master_auth; }
-    sol::protected_function& on_client_message() { return m_on_client_message; }
-    sol::protected_function& on_tick() { return m_on_tick; }
-    sol::protected_function& on_miss()      { return m_on_miss; }
-    sol::protected_function& on_write()     { return m_on_write; }
-    sol::protected_function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
-    sol::protected_function& on_expire()    { return m_on_expire; }
-    sol::protected_function& on_auth()        { return m_on_auth; }
-    sol::protected_function& on_websocket()   { return m_on_websocket; }
-    sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
-    sol::protected_function& on_proxy_response() { return m_on_proxy_response; }
-    sol::protected_function& on_cluster_join()   { return m_on_cluster_join; }
-    sol::protected_function& on_cluster_leave()  { return m_on_cluster_leave; }
-    sol::protected_function& on_group_change()   { return m_on_group_change; }
-    sol::protected_function& on_upstream()           { return m_on_upstream; }
-    sol::protected_function& on_upstream_connect()   { return m_on_upstream_connect; }
-    sol::protected_function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
-    sol::function& on_http_request()       { return m_on_http_request; }
+    // Get callbacks.
+    //
+    // Each returns a handle that arms the invocation deadline for the length of
+    // the call and disarms it afterwards, then forwards to the function.  Call
+    // sites are unchanged — `lua->on_message()(msg)` still reads the same — and
+    // no call site can forget the bound, which is the point of putting it here
+    // rather than at each of the forty places that invoke one of these.
+    //
+    // The handle forwards and nothing else.  It does not look at the result and
+    // must not start: 07baee7..b868bb5 made every one of these a protected call
+    // whose caller checks valid() before reading anything, and a failed call
+    // still has a value at index 0 — the error object.  b868bb5 records what
+    // that costs when the order is wrong: on_miss reads index 0 and writes it
+    // into the cache, so a read-before-check would have stored a Lua error
+    // message as the fetched value and served it as a hit for ever.
+    //
+    // guarded_protected almost everywhere, because after that sweep almost
+    // every callback here is a sol::protected_function.  on_http_request is the
+    // one still declared sol::function, so it is the one still `guarded`.
+    using guarded           = lua_guarded_call<sol::function>;
+    using guarded_protected = lua_guarded_call<sol::protected_function>;
+
+    guarded_protected on_start()      { return {m_on_start,      "on_start",      m_deadline_ms}; }
+    guarded_protected on_stop()       { return {m_on_stop,       "on_stop",       m_deadline_ms}; }
+    guarded_protected on_message()    { return {m_on_message,    "on_message",    m_deadline_ms}; }
+    guarded_protected on_send()       { return {m_on_send,       "on_send",       m_deadline_ms}; }
+    guarded_protected on_connect()    { return {m_on_connect,    "on_connect",    m_deadline_ms}; }
+    guarded_protected on_disconnect() { return {m_on_disconnect, "on_disconnect", m_deadline_ms}; }
+    // on_route and on_master_auth were protected before the sweep — see
+    // m_on_route below for the reasoning that the sweep then generalised.
+    guarded_protected on_route()       { return {m_on_route,       "on_route",       m_deadline_ms}; }
+    guarded_protected on_master_auth() { return {m_on_master_auth, "on_master_auth", m_deadline_ms}; }
+    guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms}; }
+    guarded_protected on_tick()       { return {m_on_tick,       "on_tick",       m_deadline_ms}; }
+    guarded_protected on_miss()       { return {m_on_miss,       "on_miss",       m_deadline_ms}; }
+    guarded_protected on_write()      { return {m_on_write,      "on_write",      m_deadline_ms}; }
+    guarded_protected on_delete_cb()  { return {m_on_delete,     "on_delete",     m_deadline_ms}; }  // avoid clash with std::delete
+    guarded_protected on_expire()     { return {m_on_expire,     "on_expire",     m_deadline_ms}; }
+    // The callback that decides whether a client is served at all.  A deadline
+    // raised in here IS such a failure, and it reaches invoke_on_auth's
+    // !valid() branch — reported, and fail-closed — rather than vanishing.
+    guarded_protected on_auth()       { return {m_on_auth,       "on_auth",       m_deadline_ms}; }
+    guarded_protected on_websocket()  { return {m_on_websocket,  "on_websocket",  m_deadline_ms}; }
+    guarded_protected on_proxy_request()  { return {m_on_proxy_request,  "on_proxy_request",  m_deadline_ms}; }
+    guarded_protected on_proxy_response() { return {m_on_proxy_response, "on_proxy_response", m_deadline_ms}; }
+    guarded_protected on_cluster_join()  { return {m_on_cluster_join,  "on_cluster_join",  m_deadline_ms}; }
+    guarded_protected on_cluster_leave() { return {m_on_cluster_leave, "on_cluster_leave", m_deadline_ms}; }
+    guarded_protected on_group_change()  { return {m_on_group_change,  "on_group_change",  m_deadline_ms}; }
+    guarded_protected on_upstream()            { return {m_on_upstream,            "on_upstream",            m_deadline_ms}; }
+    guarded_protected on_upstream_connect()    { return {m_on_upstream_connect,    "on_upstream_connect",    m_deadline_ms}; }
+    guarded_protected on_upstream_disconnect() { return {m_on_upstream_disconnect, "on_upstream_disconnect", m_deadline_ms}; }
+    guarded on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms}; }
     // The chain, in the order the script listed it.  Only valid to read when
     // has_filters() is true; empty otherwise.
+    //
+    // The one accessor that hands back the functions themselves rather than a
+    // guarded handle, because the chain is walked and the whole walk is what a
+    // request costs: the caller arms one lua_deadline::scope around the loop
+    // (see proxy_instance) so ten filters share one request's budget instead of
+    // being handed ten.
     const std::vector<sol::protected_function>& filters() const { return m_filters; }
+
+    // What one invocation of a callback on this script may spend, in ms; 0 when
+    // the deadline is off.  Read by the filter chain, which arms its own scope.
+    uint32_t callback_timeout_ms() const { return m_deadline_ms; }
 
     // What this script says it will answer.  Read by runtime_manager when it
     // builds the snapshot every proxy is handed, and by nothing else — a route
@@ -210,6 +390,11 @@ public:
     static bool in_worker_process();
 
 private:
+    // Put the count hook on this state, or take it off when m_deadline_ms is 0.
+    // Called once at construction and again after the script's top level has
+    // run, because that is when a `callback_timeout_ms` global becomes readable.
+    void install_deadline_hook();
+
     void register_bindings(runtime_instance* owner);
     // Overwrite the cross-runtime calls with a refusal that names them.  Only
     // called when in_worker_process().
@@ -308,6 +493,16 @@ private:
 
     uint32_t m_tick_ms{0};
     uint32_t m_callback_mask{0};
+
+    // What one callback invocation on this script may spend, in milliseconds;
+    // 0 = unbounded, and then no hook is installed and LuaJIT keeps its JIT.
+    //
+    // Starts at the process default so that the top-level chunk — which runs
+    // inside `create`, before the script has had a chance to say anything — is
+    // bounded too; a top level that never returns must refuse the create rather
+    // than half-build a runtime.  Replaced by the script's own
+    // `callback_timeout_ms` global, if it declared one, once the chunk has run.
+    uint32_t m_deadline_ms{lua_deadline::default_ms()};
 
     // See set_worker_process().  Written once at process start, before any
     // interpreter exists, and read-only afterwards — so it needs no atomic and
