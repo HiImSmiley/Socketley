@@ -3484,15 +3484,17 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
         if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
-        // This client speaks HTTP, and no relayed line is well formed on an
-        // HTTP connection at any point in its life.  Skipped rather than held:
-        // a hold implies there is a later moment at which these bytes would be
-        // correct, and for HTTP there is not.  See relay_targetable().
+        // This client speaks a request/response protocol — HTTP or RESP — and
+        // no relayed line is well formed on one at any point in its life.
+        // Skipped rather than held: a hold implies there is a later moment at
+        // which these bytes would be correct, and for a connection whose
+        // replies are matched to its requests by their order on the stream
+        // there is not.  See relay_targetable().
         //
-        // Ahead of the hold below, because a connection between two keep-alive
-        // requests reads as unclassified and would otherwise accumulate a hold
-        // that the next request's first read then flushes — in front of the
-        // response to that very request.
+        // Ahead of the hold below, because an HTTP connection between two
+        // keep-alive requests reads as unclassified and would otherwise
+        // accumulate a hold that the next request's first read then flushes —
+        // in front of the response to that very request.
         if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
             continue;
 
@@ -3596,13 +3598,17 @@ void server_instance::relay_hold_flush(server_connection* conn)
     if (SOCKETLEY_LIKELY(conn->relay_hold.empty()))
         return;
 
-    // What was held before the classification turned out to be HTTP is dropped
-    // rather than delivered.  These bytes were held on the guess that the
-    // connection would turn out to be a relay target; it did not, and there is
-    // no framing on an HTTP connection that could carry them.  The window is
-    // real and not theoretical: a GET is classified proto_ws_upgrading, which
-    // holds, and only the header parse says whether it was an upgrade or a
-    // plain request.
+    // What was held before the classification turned out to be a
+    // request/response protocol is dropped rather than delivered.  These bytes
+    // were held on the guess that the connection would turn out to be a relay
+    // target; it did not, and there is no framing on an HTTP or RESP
+    // connection that could carry them.  Both windows are real and not
+    // theoretical: a GET is classified proto_ws_upgrading, which holds, and
+    // only the header parse says whether it was an upgrade or a plain request;
+    // and a RESP client whose first write stops short of four bytes and of a
+    // newline — "*1\r" — is unclassified until the rest of the command
+    // arrives, so a broadcast in that gap is held and then flushed onto a
+    // connection that turned out to speak RESP.
     if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
     {
         conn->relay_hold.clear();

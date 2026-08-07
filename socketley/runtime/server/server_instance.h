@@ -661,9 +661,34 @@ private:
     // WebSocket is not covered: it arrives over the same HTTP, and once upgraded
     // it has framing for server-initiated messages, which is the whole point of
     // it and the supported way for a browser to receive relay traffic.
+    //
+    // RESP is the same protocol shape and therefore the same answer.  A RESP
+    // client sends a command and reads the next value on the stream as its
+    // reply — RESP2 correlates replies to commands by their order and by
+    // nothing else, exactly as HTTP does — so an unsolicited value is consumed
+    // as the answer to whatever that client asked next.  Two further reasons it
+    // cannot be made well formed by delaying it:
+    //
+    //   * What broadcast() writes is not a RESP value at all.  It is the
+    //     message text with a newline, so the client reads a plain letter where
+    //     a type byte belongs; a real RESP client answers that with a protocol
+    //     error and drops the connection.
+    //
+    //   * Encoding it as one would not rescue it.  The only channel RESP2 has
+    //     for a server-initiated value is pub/sub, which the client must enter
+    //     with SUBSCRIBE and which this runtime does not implement — the RESP
+    //     branch of handle_read joins argv with spaces and hands the result to
+    //     process_message like any other line.
+    //
+    // No sticky companion to http_seen is needed for it.  http_seen exists
+    // because `proto` does not survive a keep-alive gap; every one of those
+    // resets is on an HTTP response path, and proto_resp is never reset — a
+    // connection that speaks RESP speaks it until it closes.  If that ever
+    // stops being true, this needs a resp_seen for the same reason HTTP needed
+    // http_seen.
     static bool relay_targetable(const server_connection* conn)
     {
-        return !conn->http_seen;
+        return !conn->http_seen && conn->proto != proto_resp;
     }
 
     // May the deadline release this connection's hold?

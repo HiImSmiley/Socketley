@@ -1171,6 +1171,19 @@ no point at which it would be well formed, so it is not sent rather than delayed
 A WebSocket connection is unaffected \(em it arrives over the same HTTP, but once
 upgraded it has framing for server\-initiated messages and receives everything.
 That is the supported way for a browser client to receive relay traffic.
+.IP
+A connection that speaks RESP is excluded on the same grounds and from the
+command that identifies it as RESP onward. RESP2 matches replies to commands by
+their order on the stream and by nothing else, so a relayed message is read as
+the reply to whatever that client asks next; and what the relay writes is the
+message text, not a RESP value, so a Redis client reads a plain letter where a
+type byte belongs and answers with a protocol error. Encoding it as a value
+would not help, because the only channel RESP2 has for a server\-initiated value
+is pub/sub, which the client enters with SUBSCRIBE and which a server runtime
+does not implement. A RESP client on a relaying server still receives its own
+replies, anything a script addresses to it by client id, and the answers to
+.B "cache <command>"
+messages; what it no longer receives is other clients' traffic.
 .TP
 .B \-\-udp
 Use UDP instead of TCP. The server binds a single SOCK_DGRAM socket.
@@ -1291,7 +1304,12 @@ callback fires after the upgrade.
 .B RESP (Redis protocol)
 Detected when the first byte is
 .BR * .
-Useful for cache-linked servers or custom RESP-based protocols.
+Useful for cache-linked servers or custom RESP-based protocols. Like an HTTP
+connection and for the same reason, a RESP connection is not in the relay set:
+it is answered, but it is not sent other clients' messages. See
+.B \-\-mode
+under
+.BR "SERVER FLAGS" .
 .PP
 .B "How much it waits for before deciding."
 The tests above read four bytes \(em every HTTP method is matched on four
