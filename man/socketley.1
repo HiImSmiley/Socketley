@@ -2301,10 +2301,20 @@ Same semantics as
 .BR on_proxy_request :
 return a replacement string or nil to drop.
 .TP
-.B on_master_auth(client_id, password)
-Server only (master mode). Custom authentication. Return true to grant
-master role, false to deny. If defined, overrides
-.BR \-\-master\-pw .
+.B on_master_auth(client_id, password) \(-> bool
+Server only (master mode). Custom authentication. Return
+.B true
+to grant the master role. If defined, overrides
+.BR \-\-master\-pw ,
+so this callback is the entire gate on that server.
+Read strictly, and fail\-closed: only the boolean
+.B true
+grants. Anything else denies \(em
+.BR false ,
+.BR nil ,
+no return at all, and every truthy non\-boolean such as a string, the number 0
+or a table. If the callback throws a Lua error the attempt is denied and the
+error is logged.
 A denial from this callback is counted against the source address exactly as a
 wrong
 .B \-\-master\-pw

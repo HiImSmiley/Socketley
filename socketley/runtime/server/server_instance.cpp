@@ -20,6 +20,7 @@
 #include <netinet/tcp.h>
 #include <netdb.h>
 #include <liburing.h>
+#include <iostream>
 #include <sstream>
 #include <algorithm>
 #include <fstream>
@@ -3339,17 +3340,46 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 std::string_view pw = msg.substr(7);
                 bool auth_ok = false;
 
-                // Try Lua on_master_auth callback first
+                // ─── An auth hook is read strictly, and a failure is a denial ───
+                //
+                // The Lua hook comes first and the `else if` below is the whole
+                // point: a script that defines on_master_auth has REPLACED
+                // --master-pw, not supplemented it, so whatever this block
+                // decides is the entire gate on the master role.
+                //
+                // It used to be `result.get<bool>()`, which is lua_toboolean —
+                // and in Lua the only false values are `false` and `nil`.  So
+                // `return "denied"`, `return 0` and `return {}` all granted
+                // master: every spelling of "no" that a script might reach for
+                // except the two nobody writes by mistake.  Read as an optional
+                // <bool>, which is a type check rather than a truth test, so a
+                // hook that did not answer `true` has not authenticated anybody.
+                //
+                // The `result.valid()` guard it replaces could not fire.  The
+                // callback is an unprotected sol::function, and converting its
+                // unsafe_function_result to a protected_function_result stamps
+                // call_status::ok on the way — so `valid()` was constant true
+                // and the only thing standing between a raising hook and a
+                // granted master role was the catch below.
+                //
+                // Which said nothing.  `catch (...) {}` meant an auth callback
+                // with a typo in it denied in complete silence, indistinguishable
+                // from one that had considered the request and refused it — so
+                // the operator saw a gate that worked and had no way to learn
+                // their gate was not running.  Fail closed and say why: this is
+                // the convention invoke_on_auth has used all along, one file
+                // away, for the same reason.
                 auto* lctx = lua();
                 if (lctx && lctx->has_on_master_auth())
                 {
 #ifndef SOCKETLEY_NO_LUA
                     try {
-                        sol::protected_function_result result =
-                            lctx->on_master_auth()(sender->fd, pw);
-                        if (result.valid())
-                            auth_ok = result.get<bool>();
-                    } catch (...) {}
+                        sol::optional<bool> res = lctx->on_master_auth()(sender->fd, pw);
+                        auth_ok = res.value_or(false);
+                    } catch (const sol::error& e) {
+                        std::cerr << "[lua] on_master_auth error: " << e.what() << std::endl;
+                        auth_ok = false;
+                    }
 #endif
                 }
                 else if (!m_master_pw.empty())
