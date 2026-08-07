@@ -61,8 +61,12 @@ void runtime_instance::fire_tick(int res)
         m_cb_on_tick(dt);
     } else if (m_lua && m_lua->has_on_tick()) {
 #ifndef SOCKETLEY_NO_LUA
-        try { m_lua->on_tick()(dt); }
-        catch (const sol::error& e) { std::cerr << "[lua] on_tick error: " << e.what() << "\n"; }
+        sol::protected_function_result r = m_lua->on_tick()(dt);
+        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        {
+            sol::error e = r;
+            std::cerr << "[lua] on_tick error: " << e.what() << "\n";
+        }
 #endif
     }
     if (!m_tick || !m_event_loop) return;
@@ -564,9 +568,10 @@ void runtime_instance::invoke_on_start()
 #ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("running");
 
-    try {
-        m_lua->on_start()();
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_start()();
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_start error: " << e.what() << std::endl;
     }
 #endif
@@ -581,9 +586,10 @@ void runtime_instance::invoke_on_stop()
 #ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("stopped");
 
-    try {
-        m_lua->on_stop()();
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_stop()();
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_stop error: " << e.what() << std::endl;
     }
 #endif
@@ -596,9 +602,10 @@ void runtime_instance::invoke_on_message(std::string_view msg)
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    try {
-        m_lua->on_message()(msg);
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_message()(msg);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_message error: " << e.what() << std::endl;
     }
 #endif
@@ -611,9 +618,10 @@ void runtime_instance::invoke_on_connect(int client_id)
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    try {
-        m_lua->on_connect()(client_id);
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_connect()(client_id);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_connect error: " << e.what() << std::endl;
     }
 #endif
@@ -626,9 +634,10 @@ void runtime_instance::invoke_on_disconnect(int client_id)
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    try {
-        m_lua->on_disconnect()(client_id);
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_disconnect()(client_id);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_disconnect error: " << e.what() << std::endl;
     }
 #endif
@@ -675,9 +684,10 @@ void runtime_instance::invoke_on_send([[maybe_unused]] std::string_view msg)
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    try {
-        m_lua->on_send()(msg);
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_send()(msg);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_send error: " << e.what() << std::endl;
     }
 #endif
@@ -802,9 +812,10 @@ void runtime_instance::invoke_on_client_message(int client_id, std::string_view 
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    try {
-        m_lua->on_client_message()(client_id, msg);
-    } catch (const sol::error& e) {
+    sol::protected_function_result r = m_lua->on_client_message()(client_id, msg);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
         std::cerr << "[lua] on_client_message error: " << e.what() << std::endl;
     }
 #endif

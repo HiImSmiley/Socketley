@@ -145,18 +145,18 @@ public:
     bool has_routes()                const { return m_callback_mask & CB_ROUTES; }
 
     // Get callbacks
-    sol::function& on_start() { return m_on_start; }
-    sol::function& on_stop() { return m_on_stop; }
-    sol::function& on_message() { return m_on_message; }
-    sol::function& on_send() { return m_on_send; }
-    sol::function& on_connect() { return m_on_connect; }
-    sol::function& on_disconnect() { return m_on_disconnect; }
+    sol::protected_function& on_start() { return m_on_start; }
+    sol::protected_function& on_stop() { return m_on_stop; }
+    sol::protected_function& on_message() { return m_on_message; }
+    sol::protected_function& on_send() { return m_on_send; }
+    sol::protected_function& on_connect() { return m_on_connect; }
+    sol::protected_function& on_disconnect() { return m_on_disconnect; }
     // protected_function, like filters() and unlike every other callback here.
     // See m_on_route below for why.
     sol::protected_function& on_route() { return m_on_route; }
     sol::protected_function& on_master_auth() { return m_on_master_auth; }
-    sol::function& on_client_message() { return m_on_client_message; }
-    sol::function& on_tick() { return m_on_tick; }
+    sol::protected_function& on_client_message() { return m_on_client_message; }
+    sol::protected_function& on_tick() { return m_on_tick; }
     sol::function& on_miss()      { return m_on_miss; }
     sol::function& on_write()     { return m_on_write; }
     sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
@@ -214,12 +214,12 @@ private:
     void register_proxy_table(runtime_instance* owner, sol::table& self);
 
     sol::state m_lua;
-    sol::function m_on_start;
-    sol::function m_on_stop;
-    sol::function m_on_message;
-    sol::function m_on_send;
-    sol::function m_on_connect;
-    sol::function m_on_disconnect;
+    sol::protected_function m_on_start;
+    sol::protected_function m_on_stop;
+    sol::protected_function m_on_message;
+    sol::protected_function m_on_send;
+    sol::protected_function m_on_connect;
+    sol::protected_function m_on_disconnect;
 
     // protected_function, for the same reason m_filters below is one.  Every
     // callback still declared sol::function is invoked inside a try/catch that
@@ -259,8 +259,8 @@ private:
     // swallowed is indistinguishable from one that considered the request and
     // refused it, which is the whole defect this callback was just fixed for.
     sol::protected_function m_on_master_auth;
-    sol::function m_on_client_message;
-    sol::function m_on_tick;
+    sol::protected_function m_on_client_message;
+    sol::protected_function m_on_tick;
     sol::function m_on_miss;
     sol::function m_on_write;
     sol::function m_on_delete;
