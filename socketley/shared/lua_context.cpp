@@ -260,7 +260,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         else
             script_dir = ".";
 
-        sol::optional<std::string> current_path = m_lua["package"]["path"];
+        sol::optional<std::string> current_path = m_lua["package"]["path"].get<sol::optional<std::string>>();
         std::string new_path = script_dir + "/?.lua;" + script_dir + "/?/init.lua";
         if (current_path && !current_path->empty())
         {
@@ -289,7 +289,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_client_message = m_lua["on_client_message"];
     m_on_tick = m_lua["on_tick"];
     if (m_on_tick.valid()) {
-        sol::optional<int> tms = m_lua["tick_ms"];
+        sol::optional<int> tms = m_lua["tick_ms"].get<sol::optional<int>>();
         m_tick_ms = (tms && *tms >= 10) ? static_cast<uint32_t>(*tms) : 100;
     }
     m_on_miss   = m_lua["on_miss"];
@@ -427,7 +427,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 }
                 sol::table e = entry.as<sol::table>();
 
-                sol::optional<std::string> path = e["path"];
+                sol::optional<std::string> path = e["path"].get<sol::optional<std::string>>();
                 if (!path)
                 {
                     load_diag("routes[" + std::to_string(i) + "] has no `path`");
@@ -537,7 +537,7 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
 
 void lua_context::update_self_state(const char* state_str)
 {
-    sol::optional<sol::table> self = m_lua["self"];
+    sol::optional<sol::table> self = m_lua["self"].get<sol::optional<sol::table>>();
     if (self)
         (*self)["state"] = state_str;
 }
@@ -645,7 +645,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     result["body"]   = std::string{};
     result["error"]  = std::string{};
 
-    sol::optional<std::string> url_opt = opts["url"];
+    sol::optional<std::string> url_opt = opts["url"].get<sol::optional<std::string>>();
     if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
 
     std::string method  = sol::optional<std::string>(opts["method"]).value_or("GET");
@@ -822,7 +822,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         req.append(cl_buf, static_cast<size_t>(cl_res.ptr - cl_buf));
         req.append("\r\n");
     }
-    sol::optional<sol::table> hdrs = opts["headers"];
+    sol::optional<sol::table> hdrs = opts["headers"].get<sol::optional<sol::table>>();
     if (hdrs) {
         (*hdrs).for_each([&](sol::object k, sol::object v) {
             if (k.is<std::string>() && v.is<std::string>())
@@ -1154,7 +1154,47 @@ static void json_encode_value(std::string& out, const sol::object& val)
                 {
                     if (!first) out += ',';
                     first = false;
-                    json_encode_string(out, kv.first.as<std::string>());
+
+                    // ─── The key is not necessarily a string ────────────────
+                    //
+                    // This branch takes every table that is not a dense array,
+                    // and the commonest of those is a SPARSE one — {[1]=1,
+                    // [3]=3} — whose keys are numbers.  `as<std::string>()` on
+                    // a number was two bugs at once.
+                    //
+                    // sol2's safety checks follow NDEBUG, so they are off in
+                    // Release and on in every Debug and Sanitize build.  With
+                    // them on, this does not convert: it throws, the throw
+                    // leaves through sol2's handler as "[sol2] An exception
+                    // occurred: caught (...) exception", and the callback that
+                    // called json_encode never returns.  Measured, one script
+                    // encoding {[1]=1,[3]=3} and replying with the result:
+                    //
+                    //     Release   ->  j={"3":3,"1":1}
+                    //     Sanitize  ->  (no reply at all; connection times out)
+                    //
+                    // With them off it is worse than an error.  as<std::string>
+                    // on a number is lua_tolstring, which does not read the
+                    // value — it REPLACES it, in the table, in the middle of a
+                    // lua_next traversal.  The Lua manual forbids exactly that:
+                    // modifying a key during traversal is undefined, and the
+                    // Release build has been doing it on every sparse table.
+                    //
+                    // So the key is formatted here and the table is not
+                    // touched.  A JSON object's keys are strings, so a
+                    // non-string key is rendered and then quoted, which is the
+                    // same text Release produced by coercion.
+                    if (kv.first.get_type() == sol::type::string)
+                    {
+                        json_encode_string(out, kv.first.as<std::string>());
+                    }
+                    else
+                    {
+                        std::string key_text;
+                        json_encode_value(key_text, kv.first);
+                        json_encode_string(out, key_text);
+                    }
+
                     out += ':';
                     json_encode_value(out, kv.second);
                 }
@@ -1458,18 +1498,40 @@ void lua_context::register_bindings(runtime_instance* owner)
         inst->set_lua_created(true);
 
         if (config) {
-            sol::optional<int> port = (*config)["port"];
+            sol::optional<int> port = (*config)["port"].get<sol::optional<int>>();
             if (port) inst->set_port(static_cast<uint16_t>(*port));
 
-            sol::optional<std::string> lua_script = (*config)["config"];
-            if (!lua_script) lua_script = (*config)["lua"];
+            // ─── A key that is not there must read as absent, not throw ─────
+            //
+            // `sol::optional<T> x = tbl[k]` looks like it says "if present",
+            // and it does not.  The optional's converting constructor runs an
+            // unconditional conversion, and with sol2's safety checks on — they
+            // follow NDEBUG, so they are ON in every Debug and Sanitize build
+            // and off in Release — a key that is absent or of another type
+            // throws.  The throw is raised inside a lambda that sol2 called
+            // across the Lua C boundary, so it unwinds into std::terminate:
+            //
+            //     socketley.create("server","made",{port=P,start=true})
+            //     Release   -> the runtime is created and started
+            //     Sanitize  -> terminate called without an active exception
+            //                  (the whole daemon, and every runtime in it)
+            //
+            // gdb put it at this line: the config above has no `lua` key, and
+            // reading the one that is not there is what ended the process.
+            //
+            // `.get<sol::optional<T>>()` is the checked form — it asks whether
+            // the value is there and of the right type, and answers nullopt
+            // when it is not, which is what every one of these reads meant.
+            sol::optional<std::string> lua_script =
+                (*config)["config"].get<sol::optional<std::string>>();
+            if (!lua_script) lua_script = (*config)["lua"].get<sol::optional<std::string>>();
             if (lua_script && !lua_script->empty())
                 inst->load_lua_script(*lua_script);
 
-            sol::optional<std::string> target = (*config)["target"];
+            sol::optional<std::string> target = (*config)["target"].get<sol::optional<std::string>>();
             if (target) inst->set_target(*target);
 
-            sol::optional<std::string> mode_str = (*config)["mode"];
+            sol::optional<std::string> mode_str = (*config)["mode"].get<sol::optional<std::string>>();
             if (mode_str && type == runtime_server) {
                 auto* srv = static_cast<server_instance*>(inst);
                 switch (fnv1a(*mode_str)) {
@@ -1482,23 +1544,23 @@ void lua_context::register_bindings(runtime_instance* owner)
 
             if (type == runtime_server) {
                 auto* srv = static_cast<server_instance*>(inst);
-                sol::optional<std::string> http_dir = (*config)["http"];
+                sol::optional<std::string> http_dir = (*config)["http"].get<sol::optional<std::string>>();
                 if (http_dir && !http_dir->empty())
                     srv->set_http_dir(*http_dir);
-                sol::optional<bool> http_cache = (*config)["http_cache"];
+                sol::optional<bool> http_cache = (*config)["http_cache"].get<sol::optional<bool>>();
                 if (http_cache && *http_cache)
                     srv->set_http_cache(true);
             }
 
-            sol::optional<std::string> group = (*config)["group"];
+            sol::optional<std::string> group = (*config)["group"].get<sol::optional<std::string>>();
             if (group && !group->empty())
                 inst->set_group(*group);
 
-            sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"];
+            sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"].get<sol::optional<std::string>>();
             if (on_stop_str && fnv1a(*on_stop_str) == fnv1a("remove"))
                 inst->set_child_policy(runtime_instance::child_policy::remove);
 
-            sol::optional<bool> start = (*config)["start"];
+            sol::optional<bool> start = (*config)["start"].get<sol::optional<bool>>();
             if (start && *start)
                 mgr->start(name, *loop);
         }
