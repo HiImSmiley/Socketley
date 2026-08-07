@@ -161,7 +161,7 @@ public:
     sol::function& on_write()     { return m_on_write; }
     sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
     sol::function& on_expire()    { return m_on_expire; }
-    sol::function& on_auth()        { return m_on_auth; }
+    sol::protected_function& on_auth()        { return m_on_auth; }
     sol::function& on_websocket()   { return m_on_websocket; }
     sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
     sol::protected_function& on_proxy_response() { return m_on_proxy_response; }
@@ -265,7 +265,11 @@ private:
     sol::function m_on_write;
     sol::function m_on_delete;
     sol::function m_on_expire;
-    sol::function m_on_auth;
+    // The callback that decides whether a client is served at all, so a
+    // failure has to arrive as a value for the same reason on_master_auth's
+    // does — and a test now pins that its error is reported, which under the
+    // try/catch it was not in the Sanitize build.
+    sol::protected_function m_on_auth;
     sol::function m_on_websocket;
     // Both refuse on error, so the error has to arrive as a value: a refusal
     // nobody can explain is barely better than the admission it replaced.

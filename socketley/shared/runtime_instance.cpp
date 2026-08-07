@@ -639,13 +639,31 @@ bool runtime_instance::invoke_on_auth(int client_id)
     if (m_cb_on_auth) return m_cb_on_auth(client_id);
 #ifndef SOCKETLEY_NO_LUA
     if (!m_lua || !m_lua->has_on_auth()) return true;  // no hook = allow
-    try {
-        sol::optional<bool> res = m_lua->on_auth()(client_id);
-        return res.value_or(false);  // nil/non-bool → reject (fail-closed)
-    } catch (const sol::error& e) {
+
+    // A PROTECTED call.  Written as a try/catch on sol::error — which is what
+    // stood here, and what every other callback in this file still does — the
+    // rejection happened and the message did not: the catch depends on sol2's
+    // panic handler throwing and on that throw unwinding out of the
+    // interpreter, and in this repository's Sanitize build it does neither.
+    // Measured with a script that logs a marker and then raises: the marker
+    // reached the daemon log, the client was rejected, and no `on_auth error`
+    // line was ever written.
+    //
+    // This is the callback that decides whether a client is served at all, so
+    // "it rejected everyone and would not say why" is the shape of outage an
+    // operator has to be able to diagnose from the log.  The error comes back
+    // as a value now, the way on_master_auth's and the filter chain's do.
+    sol::protected_function_result r = m_lua->on_auth()(client_id);
+
+    if (!r.valid()) {
+        sol::error e = r;
         std::cerr << "[lua] on_auth error: " << e.what() << "\n";
         return false;  // Lua error → reject (fail-closed)
     }
+    // nil, a non-bool, or no return at all → reject (fail-closed)
+    sol::optional<bool> res = r.return_count() > 0 ? r.get<sol::optional<bool>>()
+                                                   : sol::optional<bool>{};
+    return res.value_or(false);
 #else
     return true;
 #endif
