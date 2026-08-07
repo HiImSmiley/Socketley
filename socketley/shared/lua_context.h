@@ -117,7 +117,9 @@ public:
     sol::function& on_send() { return m_on_send; }
     sol::function& on_connect() { return m_on_connect; }
     sol::function& on_disconnect() { return m_on_disconnect; }
-    sol::function& on_route() { return m_on_route; }
+    // protected_function, like filters() and unlike every other callback here.
+    // See m_on_route below for why.
+    sol::protected_function& on_route() { return m_on_route; }
     sol::function& on_master_auth() { return m_on_master_auth; }
     sol::function& on_client_message() { return m_on_client_message; }
     sol::function& on_tick() { return m_on_tick; }
@@ -184,7 +186,23 @@ private:
     sol::function m_on_send;
     sol::function m_on_connect;
     sol::function m_on_disconnect;
-    sol::function m_on_route;
+
+    // protected_function, for the same reason m_filters below is one, and it is
+    // the only other callback that needs to be.  Every callback above is invoked
+    // inside a try/catch that catches sol::error; that only works because sol2's
+    // panic handler happens to throw one, and whether the throw can unwind out
+    // of the interpreter at all depends on how LuaJIT was built — so the catch
+    // is a bet, not a guarantee.  A protected call does not make the bet: the
+    // error comes back as a value.
+    //
+    // on_route is the callback that decides where a request goes, and the
+    // routing path already has a defined answer for "no usable index came back"
+    // — round-robin.  An error is that same non-answer, so it has to arrive in a
+    // form the C++ side can act on rather than as an unwind through the accept
+    // path.  It is also the callback most likely to raise: on a TCP proxy it is
+    // called with no arguments, so the ordinary `hash(path) % n` errors on the
+    // very first request.
+    sol::protected_function m_on_route;
     sol::function m_on_master_auth;
     sol::function m_on_client_message;
     sol::function m_on_tick;

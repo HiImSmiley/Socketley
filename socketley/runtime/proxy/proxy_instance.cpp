@@ -4741,21 +4741,43 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
         {
 #ifndef SOCKETLEY_NO_LUA
-            sol::object result;
-            if (m_protocol == protocol_http)
-                result = lua()->on_route()(conn->method, conn->path);
-            else
-                result = lua()->on_route()();
+            // A protected call, and the only reason it can be written on one
+            // line: an error inside on_route used to leave here as an unwind out
+            // of the accept path, where nothing between this and main() catches
+            // anything, and the process ended in the Lua panic handler.  The
+            // whole of that outage was a script that raised.
+            sol::protected_function_result r =
+                m_protocol == protocol_http ? lua()->on_route()(conn->method, conn->path)
+                                            : lua()->on_route()();
 
-            if (result.is<int>())
+            // A raising on_route is routed round-robin, not refused, and that is
+            // the deliberate difference from the filter chain.  A filter that
+            // raised has not said "carry on", and the opinion it was there to
+            // express is usually "no" — so refusing is the safe reading of its
+            // silence.  on_route expresses no opinion about whether a request
+            // may proceed, only about where it goes, and this path already has
+            // an answer for a callback that produced no usable index: the
+            // fallback immediately below.  An error is that same non-answer.
+            // Refusing instead would turn one typo in a routing script into the
+            // same total outage the unwind used to cause, only politer.
+            if (SOCKETLEY_UNLIKELY(!r.valid()))
             {
-                int idx = result.as<int>();
-                if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
+                sol::error err = r;
+                fprintf(stderr, "[lua] on_route error: %s\n", err.what());
+            }
+            else if (r.return_count() > 0)
+            {
+                sol::object result = r;
+                if (result.is<int>())
                 {
-                    conn->backend_idx = static_cast<size_t>(idx);
-                    conn->retries_remaining = m_mesh.retry_count;
-                    note_backend_selected(static_cast<size_t>(idx));
-                    return &m_backends[static_cast<size_t>(idx)];
+                    int idx = result.as<int>();
+                    if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
+                    {
+                        conn->backend_idx = static_cast<size_t>(idx);
+                        conn->retries_remaining = m_mesh.retry_count;
+                        note_backend_selected(static_cast<size_t>(idx));
+                        return &m_backends[static_cast<size_t>(idx)];
+                    }
                 }
             }
 #endif
@@ -4910,17 +4932,34 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         if (m_strategy == strategy_lua && lua() && lua()->has_on_route())
         {
 #ifndef SOCKETLEY_NO_LUA
-            sol::object result;
-            if (m_protocol == protocol_http)
-                result = lua()->on_route()(conn->method, conn->path);
-            else
-                result = lua()->on_route()();
+            // The group half of the same call, protected for the same reason —
+            // see the indexed path above.  Reached by an @group backend with
+            // more than one member, so `--strategy lua` could take the process
+            // down through either path and this one needed no traffic the other
+            // did not.
+            sol::protected_function_result r =
+                m_protocol == protocol_http ? lua()->on_route()(conn->method, conn->path)
+                                            : lua()->on_route()();
 
-            if (result.is<int>())
+            // Report and leave `selected` where it is — pool[0], which is
+            // already what an out-of-range index gets here.  Same decision as
+            // the indexed path, spelled with this path's own fallback: the
+            // callback failed to name a member, and this path's answer to that
+            // is the first one.
+            if (SOCKETLEY_UNLIKELY(!r.valid()))
             {
-                int idx = result.as<int>();
-                if (idx >= 0 && static_cast<size_t>(idx) < pool.size())
-                    selected = &pool[static_cast<size_t>(idx)];
+                sol::error err = r;
+                fprintf(stderr, "[lua] on_route error: %s\n", err.what());
+            }
+            else if (r.return_count() > 0)
+            {
+                sol::object result = r;
+                if (result.is<int>())
+                {
+                    int idx = result.as<int>();
+                    if (idx >= 0 && static_cast<size_t>(idx) < pool.size())
+                        selected = &pool[static_cast<size_t>(idx)];
+                }
             }
 #endif
         }

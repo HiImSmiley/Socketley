@@ -46,8 +46,15 @@ runtimes = {
 | `on_stop()` | Runtime stopped | none |
 | `on_message(msg)` | Message received (claims handling; no default broadcast) | message string |
 | `on_send(msg)` | Message sent | message string |
-| `on_route(method, path)` | HTTP request (proxy), *after* a backend is needed | method, path |
+| `on_route(method, path)` | HTTP request (proxy), *after* a backend is needed | method, path (see below) |
 | `filters = {fn, ...}` | HTTP request (proxy), *before* backend selection | req table |
+
+`on_route` receives its two arguments on `--protocol http` only. A TCP proxy
+has no request line to read them from and calls it with none, so a body written
+for HTTP — `return hash(path) % n` — raises on the first request once it is
+moved to a TCP proxy. A call that raises is reported on stderr and the proxy
+falls back to the selection it would have made without the callback; the
+request is still forwarded.
 
 `filters` is an array, not a single callback: each function runs in order and
 either says nothing (carry on) or returns the answer, ending the request before

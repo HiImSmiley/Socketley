@@ -2270,6 +2270,20 @@ Proxy only. Custom backend selection. Returns backend index (0-based).
 Answers only "where does this go"; to accept or refuse a request before any
 backend is chosen, see
 .BR "Proxy Filter Chain" .
+.IP
+The two arguments are passed on
+.B "\-\-protocol http"
+only. A TCP proxy has no request line to read them from and calls
+.B on_route
+with none, so a body written for HTTP \(em
+.RB ` "return hash(path) % n" `
+\(em raises on the first request when it is moved to a TCP proxy.
+.IP
+A call that raises, or that returns anything other than an index inside the
+backend list, selects nothing: the proxy reports the error on stderr and falls
+back to the selection it would have made without the callback. The request is
+forwarded either way. Refusing a request is the filter chain's job, not this
+one's.
 .TP
 .B filters
 Proxy only. Not a callback but an array of them: see
