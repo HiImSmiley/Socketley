@@ -285,9 +285,25 @@ bool runtime_instance::stop(event_loop& loop)
     // script's top level, which runs when the script is loaded and not when the
     // runtime starts, so there is nothing for start() to replay — stated in the
     // man page beside set_interval rather than left for someone to discover.
+    //
+    // And the script's subscriptions, for the same sentence and at the same
+    // point.  A socketley.subscribe registration lives in the lua_context too,
+    // and nothing between `stop` and `remove` touched it: a PUBLISH on the
+    // linked cache was delivered to a runtime `ls` reported as Stopped, whose
+    // handler read self.state as "stopped" and ran anyway.  self.send from
+    // there reaches clients of a runtime the operator has taken down — the
+    // timers' bill, one API along.
+    //
+    // Unlike the timers, these DO come back on a later start(), and the
+    // difference is not an inconsistency: a subscription is registered from
+    // on_start, which start() runs, where a timer is armed at the script's top
+    // level, which only a load runs.  Both are stated in the man page.
 #ifndef SOCKETLEY_NO_LUA
     if (m_lua)
+    {
         m_lua->cancel_timers();
+        m_lua->cancel_subscriptions();
+    }
 #endif
 
     teardown(loop);

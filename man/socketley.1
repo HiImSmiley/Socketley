@@ -316,6 +316,16 @@ Stop one or more running runtimes. Accepts multiple names, glob patterns
 or a mix. With
 .BR * ,
 stops all running runtimes.
+.IP
+A stopped runtime executes no script. Its
+.B on_stop
+runs, and then every
+.B set_timeout
+and
+.B set_interval
+timer and every
+.B socketley.subscribe
+registration it holds is severed, so nothing it armed can fire afterwards.
 .TP
 .BI "remove " "name|pattern" "..."
 Remove one or more runtimes from the registry. Cannot be undone.
@@ -3518,6 +3528,22 @@ Multiple subscriptions to the same channel are all fired in registration order.
 Returns an integer id for
 .BR socketley.unsubscribe() .
 Ids start at 1 and are never reused.
+.IP
+Every registration this runtime holds is ended when it stops, and a stopped
+runtime therefore receives nothing \(em a stopped runtime executes no script,
+the same rule the timers are severed under. They
+.B do
+come back if it is started again, which is where they differ from
+.B set_interval
+and
+.BR set_timeout :
+a subscription is registered from
+.BR on_start ,
+and
+.B start
+runs
+.BR on_start ,
+where a timer is armed at the script's top level and only a load runs that.
 .TP
 .B socketley.unsubscribe(subscription_id) \(-> bool
 End one registration. Returns
@@ -3531,10 +3557,14 @@ channel can be ended independently. Safe to call from inside a subscriber's own
 callback, which is how a one-shot subscriber is written; the removal takes
 effect for the next message rather than in the middle of delivering this one.
 .IP
-A subscription lives as long as the Lua context, which is destroyed by
+Ending one explicitly matters while the runtime is up:
+.B stop
+ends them all, and
 .B remove
-and by
-.BR reload\-lua .
+and
+.B reload\-lua
+destroy the context they live in, but nothing does either of those on a
+runtime that is simply serving.
 Without ending them, a script that subscribes from a callback that runs more
 than once \(em
 .B on_tick

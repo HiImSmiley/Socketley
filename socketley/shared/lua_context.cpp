@@ -1037,6 +1037,58 @@ void lua_context::settle_subscriptions()
     m_subscriptions_dirty = false;
 }
 
+// End every subscription this context holds, leaving the context itself alive.
+//
+// The other half of cancel_timers(), and it exists for the sentence that one is
+// written under: a stopped runtime must execute no script.  ebb6897 severed the
+// timers at `stop` and left this standing, so a registration went on living as
+// long as the interpreter did — and only `remove` destroys that — which meant a
+// PUBLISH on the linked cache was delivered to a runtime `ls` reported as
+// Stopped.  Measured on the parent commit, the handler even read self.state as
+// "stopped" and ran anyway.  The bill is the same one: socketley.subscribe
+// callbacks call self.send, and self.send from a stopped runtime delivers to
+// clients of a runtime the operator has taken down.
+//
+// ─── Deferred while a dispatch is walking, exactly as unsubscribe() is ──────
+//
+// This is not a theoretical ordering.  `socketley.stop(self.name)` from inside a
+// subscriber reaches here through runtime_instance::stop(), and the frame it
+// reaches here from is holding `auto& subs = it->second` — a reference into the
+// very map below.  Clearing it there would free the vector being walked, which
+// is the same shape sever_timer() has to dodge one call along when a timer
+// cancels itself.  So the marking path is the one unsubscribe() already built:
+// entries are marked dead, m_subscriptions_dirty is set, and the outermost
+// dispatch frame calls settle_subscriptions() on its way out.  Marking dead is
+// enough for the delivery in progress too — dispatch_publish skips a dead entry
+// on every iteration, so the handlers after this one in the same fan-out do not
+// run either.
+//
+// The ids go in both paths.  They name registrations this context no longer
+// has, so a later socketley.unsubscribe(id) answering true for one of them
+// would be answering for something that is already gone; false is the truth,
+// and it is what the id's contract says.
+void lua_context::cancel_subscriptions()
+{
+    // Nothing is walking the pending queue — dispatch_publish reads the map —
+    // so these go outright whether or not a dispatch is in flight.  They are
+    // registrations made during this dispatch, which is to say made by a script
+    // that is being stopped, and settling them afterwards would install
+    // subscribers on a runtime that has gone.
+    m_pending_subscriptions.clear();
+    m_subscription_keys.clear();
+
+    if (m_dispatch_depth != 0)
+    {
+        for (auto& [key, v] : m_subscriptions)
+            for (auto& s : v)
+                s.dead = true;
+        m_subscriptions_dirty = true;
+        return;
+    }
+
+    m_subscriptions.clear();
+    m_subscriptions_dirty = false;
+}
 
 // Sever every armed timer from this context, leaving the context itself alive.
 //

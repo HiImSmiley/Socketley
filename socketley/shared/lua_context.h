@@ -231,6 +231,13 @@ public:
     // by `remove`.  Idempotent — a second call has nothing left to sever.
     void cancel_timers();
 
+    // End every subscription this context holds, without destroying it.  The
+    // other half of cancel_timers() and called from the same place, for the same
+    // sentence: a stopped runtime must execute no script, and a registration
+    // otherwise outlives the stop by the whole life of the interpreter.  Safe
+    // from inside a delivery — see the definition — and idempotent.
+    void cancel_subscriptions();
+
     // Callback bitmask constants
     enum : uint32_t {
         CB_ON_START              = 1u << 0,
@@ -618,6 +625,7 @@ public:
     static bool script_compiles(std::string_view, std::string&) { return true; }
     void update_self_state(const char*) {}
     void cancel_timers() {}
+    void cancel_subscriptions() {}
 
     bool has_on_start()          const { return false; }
     bool has_on_stop()           const { return false; }
