@@ -8,8 +8,19 @@
 -- - Service-to-service communication
 -- - Shared state via cache
 --
--- USAGE:
---   socketley --lua microservices.lua
+-- USAGE (from the repository root):
+--   socketley --lua examples/advanced/microservices.lua
+--
+-- WHY on_route IS IN microservices-handler.lua
+--
+-- This file runs in the CLI process: socketley reads `daemon` and `runtimes`,
+-- emits `create` commands, and exits.  A callback written here would never be
+-- loaded and never called.  The gateway asks for its handler with the `config`
+-- key, which becomes `--lua <path>` on the create; the DAEMON opens that path
+-- against its own working directory, hence the repository-root spelling.
+--
+-- strategy = "lua" is required for on_route to be consulted at all.  Without
+-- it the gateway keeps round-robin and the handler silently does nothing.
 --
 -- =============================================================================
 
@@ -82,71 +93,32 @@ runtimes = {
         name = "api-gateway",
         port = services.gateway.port,
         protocol = "http",
-        strategy = "lua",
+        strategy = "lua",   -- REQUIRED: on_route is consulted under this only
         backends = {
             "user-service",       -- 0
             "product-service",    -- 1
             "order-service",      -- 2
             "inventory-service"   -- 3
         },
+        config = "examples/advanced/microservices-handler.lua",
         start = true
     }
 }
 
--- Route requests to appropriate service
-function on_route(method, path)
-    local routes = {
-        { pattern = "^/users",      backend = 0, name = "user-service" },
-        { pattern = "^/auth",       backend = 0, name = "user-service" },
-        { pattern = "^/products",   backend = 1, name = "product-service" },
-        { pattern = "^/catalog",    backend = 1, name = "product-service" },
-        { pattern = "^/orders",     backend = 2, name = "order-service" },
-        { pattern = "^/checkout",   backend = 2, name = "order-service" },
-        { pattern = "^/inventory",  backend = 3, name = "inventory-service" },
-        { pattern = "^/stock",      backend = 3, name = "inventory-service" }
-    }
-
-    for _, route in ipairs(routes) do
-        if path:match(route.pattern) then
-            socketley.log(method .. " " .. path .. " → " .. route.name)
-            return route.backend
-        end
-    end
-
-    -- Default to user service
-    return 0
-end
-
-function on_start()
-    if self.name == "api-gateway" then
-        socketley.log("╔════════════════════════════════════════╗")
-        socketley.log("║     Microservices Architecture         ║")
-        socketley.log("╠════════════════════════════════════════╣")
-        socketley.log("║  Gateway: http://localhost:8080        ║")
-        socketley.log("╠════════════════════════════════════════╣")
-        socketley.log("║  Routes:                               ║")
-        socketley.log("║    /users, /auth     → user-service    ║")
-        socketley.log("║    /products, /catalog → product-svc   ║")
-        socketley.log("║    /orders, /checkout → order-service  ║")
-        socketley.log("║    /inventory, /stock → inventory-svc  ║")
-        socketley.log("╚════════════════════════════════════════╝")
-    end
-end
-
 --[[
 Architecture:
 
-                        ┌──────────────────┐
-                        │  api-gateway     │
-                        │  :8080           │
-                        └────────┬─────────┘
-                                 │
-        ┌────────────┬───────────┼───────────┬────────────┐
-        ▼            ▼           ▼           ▼            ▼
-┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-│  users   │  │ products │  │  orders  │  │inventory │  │  cache   │
-│  :9001   │  │  :9002   │  │  :9003   │  │  :9004   │  │  :9005   │
-└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+                        +------------------+
+                        |  api-gateway     |
+                        |  :8080           |
+                        +--------+---------+
+                                 |
+        +------------+-----------+-----------+------------+
+        v            v           v           v            v
++----------+  +----------+  +----------+  +----------+  +----------+
+|  users   |  | products |  |  orders  |  |inventory |  |  cache   |
+|  :9001   |  |  :9002   |  |  :9003   |  |  :9004   |  |  :9005   |
++----------+  +----------+  +----------+  +----------+  +----------+
 
 Test:
   curl localhost:8080/api-gateway/users

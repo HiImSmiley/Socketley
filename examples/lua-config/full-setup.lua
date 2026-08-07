@@ -9,8 +9,31 @@
 -- - Persistent cache for shared state
 -- - Comprehensive logging and callbacks
 --
--- USAGE:
---   socketley --lua full-setup.lua
+-- USAGE (from the repository root):
+--   mkdir -p /tmp/socketley-logs
+--   socketley --lua examples/lua-config/full-setup.lua
+--
+-- WHY THE mkdir IS A SHELL COMMAND AND NOT A LINE IN THIS FILE
+--
+-- This file is read by the CLI's own interpreter, which opens base, package
+-- and table -- and nothing else.  There is no `os` here at all, so
+--
+--     os.execute("mkdir -p " .. CONFIG.log_dir)
+--
+-- is not a sandbox refusal but `attempt to index global 'os' (a nil value)`:
+-- the whole file fails on that line, exit 1, and not one runtime is created.
+-- There is no `string` either, so `string.format` and `path:match()` are out.
+-- Concatenation with `..` and tostring() are core and still work, which is all
+-- the arithmetic below needs.
+--
+-- WHY THE CALLBACKS ARE IN full-setup-handler.lua
+--
+-- socketley reads `daemon` and `runtimes` out of this file, turns them into
+-- `create` commands, and exits.  Callbacks written here would never be loaded
+-- and never called.  The `config` key attaches the handler: it becomes
+-- `--lua <path>` on the create, and the DAEMON opens that path against its own
+-- working directory -- hence the repository-root spelling.  An absolute path
+-- always works.
 --
 -- =============================================================================
 
@@ -18,11 +41,9 @@
 local CONFIG = {
     log_dir = "/tmp/socketley-logs",
     cache_file = "/tmp/socketley-state.bin",
-    base_port = 9000
+    base_port = 9000,
+    handler = "examples/lua-config/full-setup-handler.lua"
 }
-
--- Ensure log directory exists (via shell)
-os.execute("mkdir -p " .. CONFIG.log_dir)
 
 -- =============================================================================
 -- RUNTIME DEFINITIONS
@@ -37,6 +58,7 @@ runtimes = {
         port = CONFIG.base_port,
         persistent = CONFIG.cache_file,
         log = CONFIG.log_dir .. "/state-store.log",
+        config = CONFIG.handler,
         start = true
     },
 
@@ -50,6 +72,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/auth-service.log",
         write = CONFIG.log_dir .. "/auth-messages.log",
+        config = CONFIG.handler,
         start = true
     },
     {
@@ -59,6 +82,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/user-service.log",
         write = CONFIG.log_dir .. "/user-messages.log",
+        config = CONFIG.handler,
         start = true
     },
     {
@@ -68,6 +92,7 @@ runtimes = {
         mode = "inout",
         log = CONFIG.log_dir .. "/order-service.log",
         write = CONFIG.log_dir .. "/order-messages.log",
+        config = CONFIG.handler,
         start = true
     },
 
@@ -79,13 +104,14 @@ runtimes = {
         name = "api-gateway",
         port = 8080,
         protocol = "http",
-        strategy = "lua",
+        strategy = "lua",   -- REQUIRED: on_route is consulted under this only
         backends = {
             "auth-service",   -- 0
             "user-service",   -- 1
             "order-service"   -- 2
         },
         log = CONFIG.log_dir .. "/api-gateway.log",
+        config = CONFIG.handler,
         start = true
     },
 
@@ -108,105 +134,33 @@ runtimes = {
     }
 }
 
--- =============================================================================
--- ROUTING LOGIC
--- =============================================================================
-function on_route(method, path)
-    -- Authentication endpoints
-    if path:match("^/auth") or
-       path:match("^/login") or
-       path:match("^/logout") or
-       path:match("^/token") then
-        return 0  -- auth-service
-    end
-
-    -- User management endpoints
-    if path:match("^/users") or
-       path:match("^/profile") or
-       path:match("^/account") then
-        return 1  -- user-service
-    end
-
-    -- Order/transaction endpoints
-    if path:match("^/orders") or
-       path:match("^/cart") or
-       path:match("^/checkout") or
-       path:match("^/payment") then
-        return 2  -- order-service
-    end
-
-    -- Default to user-service
-    return 1
-end
-
--- =============================================================================
--- LIFECYCLE CALLBACKS
--- =============================================================================
-local startup_time = os.time()
-local request_count = 0
-
-function on_start()
-    socketley.log("[" .. self.name .. "] Started")
-
-    if self.name == "api-gateway" then
-        socketley.log("=== API Gateway Ready ===")
-        socketley.log("Listening on http://localhost:8080")
-        socketley.log("")
-        socketley.log("Routes:")
-        socketley.log("  /api-gateway/auth/*    → auth-service:9001")
-        socketley.log("  /api-gateway/users/*   → user-service:9002")
-        socketley.log("  /api-gateway/orders/*  → order-service:9003")
-    end
-
-    if self.name == "state-store" then
-        -- Initialize counters
-        self.set("stats:startup_time", tostring(startup_time))
-        self.set("stats:request_count", "0")
-    end
-end
-
-function on_stop()
-    socketley.log("[" .. self.name .. "] Stopped")
-
-    if self.name == "state-store" then
-        local uptime = os.time() - startup_time
-        socketley.log("Uptime: " .. uptime .. " seconds")
-        socketley.log("Total requests: " .. request_count)
-    end
-end
-
-function on_message(msg)
-    request_count = request_count + 1
-    socketley.log("[" .. self.name .. "] Message #" .. request_count .. ": " .. msg:sub(1, 50))
-end
-
 --[[
 === FULL SETUP ARCHITECTURE ===
 
-                    ┌─────────────────────────────────────────┐
-                    │           Internet / Clients            │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────────────┐
-                    │         api-gateway:8080                │
-                    │         (HTTP Proxy, Lua routing)       │
-                    └────┬──────────┬──────────────┬──────────┘
-                         │          │              │
-           ┌─────────────┘          │              └─────────────┐
-           ▼                        ▼                            ▼
-┌──────────────────┐    ┌──────────────────┐        ┌──────────────────┐
-│ auth-service     │    │ user-service     │        │ order-service    │
-│ :9001            │    │ :9002            │        │ :9003            │
-└────────┬─────────┘    └────────┬─────────┘        └────────┬─────────┘
-         │                       │                           │
-         └───────────────┬───────┴───────────────────────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │ state-store:9000    │
-              │ (Persistent Cache)  │
-              └─────────────────────┘
+                    +-----------------------------------------+
+                    |           Internet / Clients            |
+                    +-----------------+-----------------------+
+                                      |
+                                      v
+                    +-----------------------------------------+
+                    |         api-gateway:8080                |
+                    |         (HTTP Proxy, Lua routing)       |
+                    +----+----------+--------------+----------+
+                         |          |              |
+           +-------------+          |              +-------------+
+           v                        v                            v
++------------------+    +------------------+        +------------------+
+| auth-service     |    | user-service     |        | order-service    |
+| :9001            |    | :9002            |        | :9003            |
++--------+---------+    +--------+---------+        +--------+---------+
+         |                       |                           |
+         +---------------+-------+---------------------------+
+                         |
+                         v
+              +---------------------+
+              | state-store:9000    |
+              | (Persistent Cache)  |
+              +---------------------+
 
 === TEST COMMANDS ===
 

@@ -2,10 +2,23 @@
 -- callbacks.lua - Event Callbacks
 -- =============================================================================
 --
--- Demonstrates all available Lua callbacks and when they fire.
+-- Creates the runtime whose callbacks callbacks-handler.lua defines.
 --
--- USAGE:
---   socketley --lua callbacks.lua
+-- USAGE (from the repository root):
+--   socketley --lua examples/lua-config/callbacks.lua
+--
+-- WHY THE CALLBACKS ARE IN THE OTHER FILE
+--
+-- This file runs in the CLI process: socketley reads `daemon` and `runtimes`,
+-- emits `create` commands, and exits.  A `function on_start()` written here
+-- would never be loaded by anything and never called -- and nothing would say
+-- so, which is the worst way for an example to be wrong.  The `config` key is
+-- what attaches a handler: it becomes `--lua <path>` on the create, and the
+-- daemon loads that file into the runtime's own interpreter.
+--
+-- The daemon opens that path relative to ITS working directory, not this
+-- file's, so it is spelled from the repository root below.  An absolute path
+-- always works.
 --
 -- =============================================================================
 
@@ -14,73 +27,18 @@ runtimes = {
         type = "server",
         name = "callback-demo",
         port = 9000,
+        config = "examples/lua-config/callbacks-handler.lua",
         start = true
     }
 }
 
--- =============================================================================
--- CALLBACK: on_start
--- Triggered when runtime transitions to 'running' state
--- =============================================================================
-function on_start()
-    socketley.log("=== on_start() called ===")
-    socketley.log("Runtime '" .. self.name .. "' is now running")
-    socketley.log("Listening on port " .. self.port)
-
-    -- Access runtime properties
-    socketley.log("Properties:")
-    socketley.log("  self.name  = " .. self.name)
-    socketley.log("  self.port  = " .. tostring(self.port))
-    socketley.log("  self.type  = " .. self.type)
-    socketley.log("  self.state = " .. self.state)
-end
-
--- =============================================================================
--- CALLBACK: on_stop
--- Triggered when runtime transitions to 'stopped' state
--- =============================================================================
-function on_stop()
-    socketley.log("=== on_stop() called ===")
-    socketley.log("Runtime '" .. self.name .. "' is shutting down")
-
-    -- Cleanup code can go here
-    socketley.log("Performing cleanup...")
-end
-
--- =============================================================================
--- CALLBACK: on_message
--- Triggered when a message is received
--- Parameter: msg - the received message string
--- NOTE: Defining on_message claims message handling — the default broadcast
---       (inout/master modes) is suppressed. Use self.broadcast() to relay.
--- =============================================================================
-function on_message(msg)
-    socketley.log("=== on_message() called ===")
-    socketley.log("Received: '" .. msg .. "'")
-    socketley.log("Length: " .. #msg .. " bytes")
-
-    -- Example: Echo back with modification
-    -- Since on_message claims handling, we must broadcast explicitly
-    local response = "[ECHO] " .. msg
-    self.broadcast(response)
-    socketley.log("Broadcasted: '" .. response .. "'")
-end
-
--- =============================================================================
--- CALLBACK: on_send
--- Triggered when a message is sent
--- Parameter: msg - the sent message string
--- =============================================================================
-function on_send(msg)
-    socketley.log("=== on_send() called ===")
-    socketley.log("Sent: '" .. msg .. "'")
-end
-
 --[[
 Test:
-  1. Run: socketley --lua callbacks.lua
+  1. Run: socketley --lua examples/lua-config/callbacks.lua
   2. Connect: nc localhost 9000
-  3. Type messages and observe callback logs
+  3. Type messages and watch the daemon's log for the callback lines
+     (journalctl -u socketley -f when installed, or the terminal the daemon
+     was started in when run by hand)
   4. Stop: socketley stop callback-demo
 
 Cleanup:

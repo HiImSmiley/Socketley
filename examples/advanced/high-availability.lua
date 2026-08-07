@@ -7,10 +7,22 @@
 -- - Load balancing across replicas
 -- - Health tracking in cache
 --
--- USAGE:
---   socketley --lua high-availability.lua
+-- USAGE (from the repository root):
+--   socketley --lua examples/advanced/high-availability.lua
+--
+-- WHY THE CALLBACKS ARE IN high-availability-handler.lua
+--
+-- This file runs in the CLI process.  socketley reads `daemon` and `runtimes`
+-- out of it, emits `create` commands, and exits -- it never reaches the
+-- daemon.  A callback written here would never be loaded and never called.
+-- The `config` key is what attaches a handler: it becomes `--lua <path>` on
+-- the create, and the DAEMON opens that path against its own working
+-- directory, which is why it is spelled from the repository root.  An
+-- absolute path always works.
 --
 -- =============================================================================
+
+local HANDLER = "examples/advanced/high-availability-handler.lua"
 
 runtimes = {
     -- Health tracking cache
@@ -28,6 +40,7 @@ runtimes = {
         port = 9001,
         mode = "inout",
         group = "api",
+        config = HANDLER,
         start = true
     },
     {
@@ -36,6 +49,7 @@ runtimes = {
         port = 9002,
         mode = "inout",
         group = "api",
+        config = HANDLER,
         start = true
     },
     {
@@ -44,6 +58,7 @@ runtimes = {
         port = 9003,
         mode = "inout",
         group = "api",
+        config = HANDLER,
         start = true
     },
 
@@ -55,6 +70,7 @@ runtimes = {
         protocol = "http",
         strategy = "round-robin",
         backends = { "@api" },
+        config = HANDLER,
         start = true
     },
 
@@ -65,6 +81,7 @@ runtimes = {
         port = 9011,
         mode = "inout",
         group = "workers",
+        config = HANDLER,
         start = true
     },
     {
@@ -73,6 +90,7 @@ runtimes = {
         port = 9012,
         mode = "inout",
         group = "workers",
+        config = HANDLER,
         start = true
     },
 
@@ -88,65 +106,30 @@ runtimes = {
     }
 }
 
--- Track replica health
-local replica_starts = {}
-
-function on_start()
-    local name = self.name
-
-    -- Track start time for health monitoring
-    replica_starts[name] = os.time()
-
-    if name:match("^api%-lb") then
-        socketley.log("╔════════════════════════════════════════════╗")
-        socketley.log("║        High Availability Setup             ║")
-        socketley.log("╠════════════════════════════════════════════╣")
-        socketley.log("║  API LB:    http://localhost:8080 (@api)   ║")
-        socketley.log("║  Worker LB: tcp://localhost:8081 (@workers)║")
-        socketley.log("╠════════════════════════════════════════════╣")
-        socketley.log("║  API Replicas: 3 (round-robin, @api)       ║")
-        socketley.log("║  Worker Replicas: 2 (random, @workers)     ║")
-        socketley.log("║  Groups enable dynamic scaling!             ║")
-        socketley.log("╚════════════════════════════════════════════╝")
-    end
-
-    if name:match("replica") then
-        socketley.log("[HA] " .. name .. " started (healthy)")
-    end
-end
-
-function on_stop()
-    local name = self.name
-    if name:match("replica") then
-        local uptime = os.time() - (replica_starts[name] or os.time())
-        socketley.log("[HA] " .. name .. " stopped (uptime: " .. uptime .. "s)")
-    end
-end
-
 --[[
 Architecture:
 
                    API Requests                    Worker Tasks
-                        │                               │
-                        ▼                               ▼
-              ┌─────────────────┐             ┌─────────────────┐
-              │    api-lb       │             │   worker-lb     │
-              │    :8080        │             │   :8081         │
-              │  round-robin    │             │   random        │
-              └────────┬────────┘             └────────┬────────┘
-                       │                               │
-        ┌──────────────┼──────────────┐         ┌──────┴──────┐
-        ▼              ▼              ▼         ▼             ▼
-┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌──────────┐ ┌──────────┐
-│ api-replica │ │ api-replica │ │ api-replica │ │ worker-1 │ │ worker-2 │
-│      1      │ │      2      │ │      3      │ │  :9011   │ │  :9012   │
-│   :9001     │ │   :9002     │ │   :9003     │ └──────────┘ └──────────┘
-└─────────────┘ └─────────────┘ └─────────────┘
+                        |                               |
+                        v                               v
+              +-----------------+             +-----------------+
+              |    api-lb       |             |   worker-lb     |
+              |    :8080        |             |   :8081         |
+              |  round-robin    |             |   random        |
+              +--------+--------+             +--------+--------+
+                       |                               |
+        +--------------+--------------+         +------+------+
+        v              v              v         v             v
++-------------+ +-------------+ +-------------+ +----------+ +----------+
+| api-replica | | api-replica | | api-replica | | worker-1 | | worker-2 |
+|      1      | |      2      | |      3      | |  :9011   | |  :9012   |
+|   :9001     | |   :9002     | |   :9003     | +----------+ +----------+
++-------------+ +-------------+ +-------------+
 
-                                ┌─────────────┐
-                                │health-store │
-                                │   :9000     │
-                                └─────────────┘
+                                +-------------+
+                                |health-store |
+                                |   :9000     |
+                                +-------------+
 
 Test Load Balancing:
   # Watch requests distribute across replicas
@@ -163,7 +146,8 @@ Simulate Failover:
   socketley start api-replica-2
 
 Scale Up (no proxy restart needed):
-  socketley create server api-replica-4 -p 9004 -g api -s
+  socketley create server api-replica-4 -p 9004 -g api -s \
+    --lua examples/advanced/high-availability-handler.lua
   # api-lb automatically includes api-replica-4 via @api group
 
 Cleanup:

@@ -2,11 +2,23 @@
 -- custom-routing.lua - Lua-Based Proxy Routing
 -- =============================================================================
 --
--- Demonstrates the on_route() callback for custom proxy routing logic.
--- This allows dynamic backend selection based on HTTP method and path.
+-- Creates three backends and a proxy that picks between them from Lua.
 --
--- USAGE:
---   socketley --lua custom-routing.lua
+-- USAGE (from the repository root):
+--   socketley --lua examples/lua-config/custom-routing.lua
+--
+-- TWO THINGS THIS FILE CANNOT DO ITSELF
+--
+-- 1. It cannot hold on_route.  This file runs in the CLI process, which reads
+--    `daemon` and `runtimes` and exits; a callback written here is never
+--    loaded and never called.  on_route lives in custom-routing-handler.lua,
+--    which the proxy asks for with the `config` key below.  The daemon opens
+--    that path relative to ITS working directory, so it is written from the
+--    repository root; an absolute path always works.
+--
+-- 2. strategy = "lua" is not decoration.  on_route is consulted only under
+--    --strategy lua.  Leave it out and the proxy keeps round-robin, never
+--    looks the callback up, and the handler silently does nothing.
 --
 -- =============================================================================
 
@@ -38,75 +50,16 @@ runtimes = {
         name = "smart-router",
         port = 8080,
         protocol = "http",
-        strategy = "lua",  -- Enable Lua routing
+        strategy = "lua",  -- REQUIRED: without it on_route is never consulted
         backends = {
             "127.0.0.1:9001",  -- 0: static
             "127.0.0.1:9002",  -- 1: api
             "127.0.0.1:9003"   -- 2: compute
         },
+        config = "examples/lua-config/custom-routing-handler.lua",
         start = true
     }
 }
-
--- =============================================================================
--- CALLBACK: on_route
--- Triggered for each HTTP request in 'lua' strategy mode
--- Parameters:
---   method - HTTP method (GET, POST, PUT, DELETE, etc.)
---   path   - Request path (e.g., /api/users)
--- Returns:
---   Backend index (0-based) or nil for round-robin default
--- =============================================================================
-function on_route(method, path)
-    socketley.log("Routing: " .. method .. " " .. path)
-
-    -- Static content: images, CSS, JS, fonts
-    if path:match("%.css$") or
-       path:match("%.js$") or
-       path:match("%.png$") or
-       path:match("%.jpg$") or
-       path:match("%.woff") or
-       path:match("^/static/") then
-        socketley.log(" → static-backend")
-        return 0
-    end
-
-    -- Compute-heavy operations
-    if path:match("^/compute/") or
-       path:match("^/ml/") or
-       path:match("^/analytics/") then
-        socketley.log(" → compute-backend")
-        return 2
-    end
-
-    -- API requests
-    if path:match("^/api/") or
-       path:match("^/v1/") or
-       path:match("^/v2/") then
-        socketley.log(" → api-backend")
-        return 1
-    end
-
-    -- Health checks to API
-    if path == "/health" or path == "/status" then
-        socketley.log(" → api-backend (health)")
-        return 1
-    end
-
-    -- Default: static backend for everything else
-    socketley.log(" → static-backend (default)")
-    return 0
-end
-
-function on_start()
-    if self.type == "proxy" then
-        socketley.log("Smart router started")
-        socketley.log("Routing rules:")
-        socketley.log("  /static/*, *.css, *.js, images → static-backend:9001")
-        socketley.log("  /api/*, /v1/*, /v2/*          → api-backend:9002")
-        socketley.log("  /compute/*, /ml/*, /analytics → compute-backend:9003")
-    end
-end
 
 --[[
 Test:
@@ -121,6 +74,9 @@ Test:
   # Compute tasks → compute-backend
   curl localhost:8080/smart-router/compute/process
   curl localhost:8080/smart-router/ml/predict
+
+  # What the proxy is actually enforcing and relaying
+  socketley stats smart-router
 
 Cleanup:
   socketley stop smart-router static-backend api-backend compute-backend

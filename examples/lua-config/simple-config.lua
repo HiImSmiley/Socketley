@@ -4,8 +4,21 @@
 --
 -- Shows the basic structure of a Lua configuration file.
 --
--- USAGE:
---   socketley --lua simple-config.lua
+-- USAGE (from the repository root):
+--   socketley --lua examples/lua-config/simple-config.lua
+--
+-- A CONFIGURATION IS NOT A HANDLER
+--
+-- This file runs in the CLI process.  socketley reads `daemon` and `runtimes`
+-- out of it, turns them into `create` commands, and exits -- it never reaches
+-- the daemon.  Callbacks written HERE are dead code: nothing loads them and
+-- nothing calls them.
+--
+-- The callbacks live in simple-config-handler.lua, and each runtime asks for
+-- that file by name with the `config` key below.  That path is opened by the
+-- DAEMON, so it is resolved against the daemon's working directory, not
+-- against this file's -- which is why it is written out from the repository
+-- root here.  An absolute path always works.
 --
 -- =============================================================================
 
@@ -17,7 +30,8 @@ runtimes = {
         name = "my-server",     -- Unique name (required)
         port = 9000,            -- Listening port
         mode = "inout",         -- Message mode: inout|in|out
-        start = true,       -- Start immediately
+        config = "examples/lua-config/simple-config-handler.lua",
+        start = true,           -- Start immediately
         log = "/tmp/server.log" -- Log file
     },
 
@@ -27,22 +41,11 @@ runtimes = {
         name = "my-client",
         target = "127.0.0.1:9000",  -- Target server
         mode = "inout",
+        config = "examples/lua-config/simple-config-handler.lua",
         start = true,
         log = "/tmp/client.log"
     }
 }
-
--- Optional: Callback when any runtime starts
-function on_start()
-    socketley.log("Runtime started: " .. self.name)
-    socketley.log("  Type: " .. self.type)
-    socketley.log("  Port: " .. self.port)
-end
-
--- Optional: Callback when any runtime stops
-function on_stop()
-    socketley.log("Runtime stopped: " .. self.name)
-end
 
 --[[
 After running:
@@ -51,6 +54,10 @@ After running:
 Output:
   my-server    server    running
   my-client    client    running
+
+The handler's on_start lines appear in the daemon's log, one per runtime:
+  [lua] Runtime started: my-server
+  [lua] Runtime started: my-client
 
 Cleanup:
   socketley stop my-server my-client
