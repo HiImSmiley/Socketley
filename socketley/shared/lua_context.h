@@ -165,9 +165,9 @@ public:
     sol::protected_function& on_websocket()   { return m_on_websocket; }
     sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
     sol::protected_function& on_proxy_response() { return m_on_proxy_response; }
-    sol::function& on_cluster_join()   { return m_on_cluster_join; }
-    sol::function& on_cluster_leave()  { return m_on_cluster_leave; }
-    sol::function& on_group_change()   { return m_on_group_change; }
+    sol::protected_function& on_cluster_join()   { return m_on_cluster_join; }
+    sol::protected_function& on_cluster_leave()  { return m_on_cluster_leave; }
+    sol::protected_function& on_group_change()   { return m_on_group_change; }
     sol::protected_function& on_upstream()           { return m_on_upstream; }
     sol::protected_function& on_upstream_connect()   { return m_on_upstream_connect; }
     sol::protected_function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
@@ -275,9 +275,9 @@ private:
     // nobody can explain is barely better than the admission it replaced.
     sol::protected_function m_on_proxy_request;
     sol::protected_function m_on_proxy_response;
-    sol::function m_on_cluster_join;
-    sol::function m_on_cluster_leave;
-    sol::function m_on_group_change;
+    sol::protected_function m_on_cluster_join;
+    sol::protected_function m_on_cluster_leave;
+    sol::protected_function m_on_group_change;
     sol::protected_function m_on_upstream;
     sol::protected_function m_on_upstream_connect;
     sol::protected_function m_on_upstream_disconnect;
@@ -319,7 +319,7 @@ public:
 private:
 
     // Cross-runtime pub/sub: key = cache_name + '\0' + channel
-    std::unordered_map<std::string, std::vector<sol::function>> m_subscriptions;
+    std::unordered_map<std::string, std::vector<sol::protected_function>> m_subscriptions;
 
     // Timer cancellation: ID → timer* mapping
     int m_next_timer_id{0};

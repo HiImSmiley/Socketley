@@ -489,89 +489,100 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                 if (runtimes.find(n) == runtimes.end()) break;
             }
 
-            try {
-                switch (ev.kind)
-                {
-                    case cluster_event::daemon_join:
-                        if (lua->has_on_cluster_join())
+            switch (ev.kind)
+            {
+                case cluster_event::daemon_join:
+                    if (lua->has_on_cluster_join())
+                    {
+                        sol::table dt = lua->state().create_table();
+                        dt["name"] = ev.daemon_name;
+                        // Look up host from remote daemons
+                        if (m_cluster)
                         {
-                            sol::table dt = lua->state().create_table();
-                            dt["name"] = ev.daemon_name;
-                            // Look up host from remote daemons
-                            if (m_cluster)
+                            auto daemons = m_cluster->get_all_daemons();
+                            for (const auto& rd : daemons)
                             {
-                                auto daemons = m_cluster->get_all_daemons();
-                                for (const auto& rd : daemons)
+                                if (rd.name == ev.daemon_name)
                                 {
-                                    if (rd.name == ev.daemon_name)
+                                    dt["host"] = rd.host;
+                                    break;
+                                }
+                            }
+                        }
+                        sol::protected_function_result r = lua->on_cluster_join()(dt);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            fprintf(stderr, "[lua] on_cluster_join error: %s\n", e.what());
+                        }
+                    }
+                    break;
+
+                case cluster_event::daemon_leave:
+                    if (lua->has_on_cluster_leave())
+                    {
+                        sol::table dt = lua->state().create_table();
+                        dt["name"] = ev.daemon_name;
+                        sol::protected_function_result r = lua->on_cluster_leave()(dt);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            fprintf(stderr, "[lua] on_cluster_leave error: %s\n", e.what());
+                        }
+                    }
+                    break;
+
+                case cluster_event::group_change:
+                    if (lua->has_on_group_change())
+                    {
+                        // Build members table
+                        sol::table members = lua->state().create_table();
+                        int mi = 1;
+                        if (m_cluster)
+                        {
+                            // Local group members
+                            {
+                                std::shared_lock lock(mutex);
+                                for (const auto& [_, rinst] : runtimes)
+                                {
+                                    if (rinst->get_group() == ev.group_name &&
+                                        rinst->get_state() == runtime_running &&
+                                        rinst->get_port() > 0)
                                     {
-                                        dt["host"] = rd.host;
-                                        break;
+                                        sol::table m = lua->state().create_table();
+                                        m["daemon"] = std::string(m_cluster->get_daemon_name());
+                                        m["host"] = std::string(m_cluster->get_cluster_addr());
+                                        m["port"] = rinst->get_port();
+                                        members[mi++] = m;
                                     }
                                 }
                             }
-                            lua->on_cluster_join()(dt);
-                        }
-                        break;
-
-                    case cluster_event::daemon_leave:
-                        if (lua->has_on_cluster_leave())
-                        {
-                            sol::table dt = lua->state().create_table();
-                            dt["name"] = ev.daemon_name;
-                            lua->on_cluster_leave()(dt);
-                        }
-                        break;
-
-                    case cluster_event::group_change:
-                        if (lua->has_on_group_change())
-                        {
-                            // Build members table
-                            sol::table members = lua->state().create_table();
-                            int mi = 1;
-                            if (m_cluster)
+                            // Remote group members
+                            auto daemons = m_cluster->get_all_daemons();
+                            for (const auto& rd : daemons)
                             {
-                                // Local group members
+                                for (const auto& rt : rd.runtimes)
                                 {
-                                    std::shared_lock lock(mutex);
-                                    for (const auto& [_, rinst] : runtimes)
+                                    if (rt.group == ev.group_name &&
+                                        rt.state == "running" && rt.port > 0)
                                     {
-                                        if (rinst->get_group() == ev.group_name &&
-                                            rinst->get_state() == runtime_running &&
-                                            rinst->get_port() > 0)
-                                        {
-                                            sol::table m = lua->state().create_table();
-                                            m["daemon"] = std::string(m_cluster->get_daemon_name());
-                                            m["host"] = std::string(m_cluster->get_cluster_addr());
-                                            m["port"] = rinst->get_port();
-                                            members[mi++] = m;
-                                        }
-                                    }
-                                }
-                                // Remote group members
-                                auto daemons = m_cluster->get_all_daemons();
-                                for (const auto& rd : daemons)
-                                {
-                                    for (const auto& rt : rd.runtimes)
-                                    {
-                                        if (rt.group == ev.group_name &&
-                                            rt.state == "running" && rt.port > 0)
-                                        {
-                                            sol::table m = lua->state().create_table();
-                                            m["daemon"] = rt.daemon_name;
-                                            m["host"] = rt.host;
-                                            m["port"] = rt.port;
-                                            members[mi++] = m;
-                                        }
+                                        sol::table m = lua->state().create_table();
+                                        m["daemon"] = rt.daemon_name;
+                                        m["host"] = rt.host;
+                                        m["port"] = rt.port;
+                                        members[mi++] = m;
                                     }
                                 }
                             }
-                            lua->on_group_change()(ev.group_name, members);
                         }
-                        break;
-                }
-            } catch (const sol::error& e) {
-                fprintf(stderr, "[lua] cluster event callback error: %s\n", e.what());
+                        sol::protected_function_result r = lua->on_group_change()(ev.group_name, members);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            fprintf(stderr, "[lua] on_group_change error: %s\n", e.what());
+                        }
+                    }
+                    break;
             }
         }
     }

@@ -66,7 +66,7 @@ lua_context::lua_context()
 struct lua_timer : io_handler
 {
     std::shared_ptr<bool> alive;
-    sol::function         fn;
+    sol::protected_function fn;
     event_loop*           loop{};
     lua_context*          ctx{};
     struct __kernel_timespec ts{};
@@ -87,8 +87,13 @@ struct lua_timer : io_handler
             else delete this;
             return;
         }
-        try { fn(); } catch (const sol::error& e) {
-            fprintf(stderr, "[lua] timer error: %s\n", e.what());
+        {
+            sol::protected_function_result tr = fn();
+            if (SOCKETLEY_UNLIKELY(!tr.valid()))
+            {
+                sol::error e = tr;
+                fprintf(stderr, "[lua] timer error: %s\n", e.what());
+            }
         }
         if (repeat && *alive && !cancelled)
             loop->submit_timeout(&ts, &req);
@@ -527,9 +532,10 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     if (it == m_subscriptions.end()) return;
     for (auto& fn : it->second)
     {
-        try { fn(channel, message); }
-        catch (const sol::error& e)
+        sol::protected_function_result r = fn(channel, message);
+        if (SOCKETLEY_UNLIKELY(!r.valid()))
         {
+            sol::error e = r;
             fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
         }
     }
@@ -1665,7 +1671,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.set_timeout(ms, fn) → timer_id
-    sk["set_timeout"] = [this, owner](int ms, sol::function fn) -> int {
+    sk["set_timeout"] = [this, owner](int ms, sol::protected_function fn) -> int {
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0) return 0;
         auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
@@ -1686,7 +1692,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.set_interval(ms, fn) → timer_id
-    sk["set_interval"] = [this, owner](int ms, sol::function fn) -> int {
+    sk["set_interval"] = [this, owner](int ms, sol::protected_function fn) -> int {
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0) return 0;
         auto* t  = static_cast<lua_timer*>(timer_pool_acquire());
@@ -1740,7 +1746,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.subscribe(cache_name, channel, fn) — receive published messages
-    sk["subscribe"] = [this](std::string cache_name, std::string channel, sol::function fn) {
+    sk["subscribe"] = [this](std::string cache_name, std::string channel, sol::protected_function fn) {
         m_subscriptions[cache_name + '\0' + channel].push_back(std::move(fn));
     };
 
