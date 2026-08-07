@@ -236,7 +236,7 @@ is a unique identifier for the runtime.
 .BI "attach " "type name port " "[\-\-owner " "name" "]"
 Register an external process as a runtime visible in
 .BR ls / ps .
-The daemon does NOT bind the port or forward any I/O — the external process
+The daemon does NOT bind the port or forward any I/O \(em the external process
 manages its own network connections. The runtime appears as running and can
 be inspected or removed like any other runtime.
 .RS
@@ -1361,8 +1361,8 @@ Normal messages are still processed according to the server's mode.
 .nf
 socketley create cache store -p 9001 -s
 socketley create server api -p 9000 --cache store -s
-# Client sends: "cache set foo bar" → receives "ok"
-# Client sends: "cache get foo" → receives "bar"
+# Client sends: "cache set foo bar" \(-> receives "ok"
+# Client sends: "cache get foo" \(-> receives "bar"
 .fi
 .PP
 The request is asynchronous. The server does not run the cache's command
@@ -1655,11 +1655,18 @@ A runtime gets its own supervised worker process unless this is given. This is
 the only flag for where a runtime runs: a boolean needs one name, and it is the
 non\-default state that is named.
 .IP
-There was a
-.B \-\-daemon\-process
-flag, which is what this replaces. It is gone rather than kept as a synonym for
-the default: a flag that no longer changes anything is a flag whose meaning has
-to be looked up to discover that it has none.
+It is described here because a proxy is where the split was built first, but it
+is not a proxy flag: a server, a client and a cache each get their own process
+by default too, and each takes this flag to stay in the daemon.
+.IP
+There were two flags,
+.B \-\-out\-of\-process
+and
+.BR \-\-in\-daemon ,
+and this replaces both. They were one bit under two spellings that had to be
+kept level in four places; neither is kept as a synonym, because a flag that no
+longer changes anything is a flag whose meaning has to be looked up to discover
+that it has none.
 .IP
 What this buys back is what only shared memory can give. The cross\-runtime Lua
 management API \(em
@@ -1673,22 +1680,25 @@ management API \(em
 .B .pipe
 and all of
 .B socketley.cluster
-\(em is refused inside a worker, and at a script's top level that leaves the
-runtime
+\(em is refused inside a worker, and so is
+.BR self.route() ,
+which names another runtime and so reaches for the same map. At a script's top
+level that refusal leaves the runtime
 .BR failed .
-A script's
-.B routes
-declaration is read from the placeholder, so a runtime in a worker publishes
-none. And a cross\-runtime request costs about 50 microseconds more, measured,
-which a server doing
+And a cross\-runtime request costs about 50 microseconds more, measured, which a
+server doing
 .B \-\-cache
 pays on every command.
 .IP
-Settable only at
-.BR create .
-.B edit
-rejects it, because honouring it would mean moving a configured runtime between
-address spaces underneath whatever already points at it.
+A script's
+.B routes
+declaration is
+.I not
+one of the things given up. It is produced by running the script, which happens
+in the worker, and travels back to the daemon on the control socket the worker
+already holds; the placeholder publishes it to the proxies in front of the
+runtime exactly as it would for an in\-process one. See
+.B "Declared Routes" .
 .IP
 The daemon forks and execs itself, hands the worker its configuration and
 its routing table over a control socket, and keeps a placeholder for it in
@@ -1698,7 +1708,7 @@ the runtime map. What the CLI shows is unchanged:
 .BR show ,
 .B stats
 and the Prometheus endpoint report the same figures they do for an
-in-process proxy, because the worker publishes them and the daemon stores
+in-process runtime, because the worker publishes them and the daemon stores
 them where an in-process runtime would have written them.
 .IP
 The port is bound in the worker; no descriptor is passed across the
@@ -1728,7 +1738,7 @@ read live, and
 .B stats
 says how old they are \(em measured from when the worker read them, so an age in
 the seconds means a child that has stopped publishing. See
-.B "Out-of-process proxies"
+.B "Out-of-process runtimes"
 under
 .BR LIMITATIONS .
 .SS mTLS Flags
@@ -2130,10 +2140,10 @@ tab(|);
 l l l.
 Callback|Signature|When called
 _
-on_miss(key)|→ value [, ttl_seconds]|GET returns nil — fetch from DB
-on_write(key, value, ttl)|→ nothing|After successful SET/SETEX/SETNX/MSET
-on_delete(key)|→ nothing|After DEL — delete from DB
-on_expire(key)|→ nothing|After TTL sweep removes key
+on_miss(key)|\(-> value [, ttl_seconds]|GET returns nil \(em fetch from DB
+on_write(key, value, ttl)|\(-> nothing|After successful SET/SETEX/SETNX/MSET
+on_delete(key)|\(-> nothing|After DEL \(em delete from DB
+on_expire(key)|\(-> nothing|After TTL sweep removes key
 .TE
 .PP
 \fBon_miss\fR may return two values (Lua multi-return): the fetched string and an
@@ -2211,7 +2221,58 @@ echo "expire user:1 300" | nc localhost 9000
 echo "subscribe news" | nc localhost 9000
 .fi
 .SH LUA CONFIGURATION
-Lua scripts can define multiple runtimes and attach callbacks.
+.B "Two different files are both called \(lqa Lua script\(rq, and they do not mix."
+.RS
+.IP \(bu 2
+A
+.I daemon configuration
+\(em
+.BR "socketley \-\-lua config.lua" .
+This runs in the CLI process, is read for its
+.B daemon
+and
+.B runtimes
+tables, is turned into
+.B create
+commands and then exits. It never reaches the daemon and never becomes part of
+any runtime. A callback defined in such a file is dead code: nothing loads it,
+nothing calls it, and nothing says so.
+.IP \(bu 2
+A
+.I runtime handler
+\(em
+.BR "socketley create server api \-p 9000 \-\-lua handler.lua" ,
+or the same path given as a runtime's
+.B config
+key inside a configuration. This one is loaded by the daemon into that runtime's
+own interpreter, and it is the only file whose
+.BI on_ *
+callbacks,
+.B filters
+and
+.B routes
+mean anything.
+.RE
+.PP
+A configuration attaches a handler by naming its path, never by defining the
+callbacks itself:
+.nf
+
+runtimes = {
+    { type = "server", name = "api", port = 9000,
+      config = "handler.lua",     \-\- the file whose callbacks run
+      start = true },
+}
+.fi
+.PP
+.B config
+and
+.B lua
+are accepted as spellings of the same key. Everything below this point in this
+chapter, except
+.B "Configuration File Format"
+itself, describes a
+.IR "runtime handler" .
 .PP
 .B Module loading:
 The Lua
@@ -2232,7 +2293,8 @@ daemon = {
 }
 
 runtimes = {
-    { type = "server", name = "api", port = 9000, group = "api", start = true },
+    { type = "server", name = "api", port = 9000, group = "api",
+      config = "handler.lua", start = true },
     { type = "client", name = "cli", port = 9000, target = "127.0.0.1:9000" },
     { type = "proxy",  name = "gw", port = 8080,
       backends = {"@api", "127.0.0.1:9000"}, strategy = "round-robin" },
@@ -2245,6 +2307,128 @@ The
 .B daemon
 table is processed first (name, then cluster). If omitted, the daemon
 runs without cluster mode.
+.PP
+Recognised
+.B runtimes
+keys, and the flag each becomes:
+.nf
+type, name                 (required)
+port                       \-p
+target                     \-t
+mode                       \-\-mode
+log                        \-\-log
+write                      \-w
+persistent                 \-\-persistent
+protocol                   \-\-protocol
+strategy                   \-\-strategy
+backends (array)           \-\-backend a,b,c
+config / lua               \-\-lua           the runtime's handler script
+bash                       \-b / \-bp / \-bt / \-bpt
+cache                      \-\-cache
+group                      \-g
+master_pw                  \-\-master\-pw
+master_forward (bool)      \-\-master\-forward
+http                       \-\-http
+http_cache (bool)          \-\-http\-cache
+udp (bool)                 \-\-udp
+test (bool)                \-\-test
+start (bool)               \-s
+.fi
+.PP
+A key this list does not name is ignored in silence, and a flag this list does
+not reach \(em
+.B \-\-daemon\-process
+and the whole health\-check, circuit\-breaker, retry and TLS families among them
+\(em cannot be set from a configuration at all. Create those runtimes with
+.B create
+directly, or
+.B edit
+them afterwards.
+.PP
+The interpreter that reads this file is not the daemon's, and it is much
+smaller. It opens
+.BR base ,
+.B package
+and
+.B table
+only \(em there is no
+.BR os ,
+.BR io ,
+.B string
+or
+.BR math .
+.RB ` "os.execute(\(dqmkdir -p /tmp/logs\(dq)" `
+at the top of a configuration is not a sandbox refusal but
+.BR "attempt to index global 'os' (a nil value)" :
+the whole file is refused, exit 1, and no runtime is created. Without
+.B string
+the method form goes too, so
+.B "path:match(...)"
+and
+.B string.format
+are unavailable here; concatenation with
+.B ..
+and
+.BR tostring ()
+are core and still work. Create the directories a configuration needs from the
+shell that invokes it, and do the string work in the handler, whose interpreter
+has all of these.
+.SS Handler Sandbox
+A handler's interpreter opens
+.BR base ,
+.BR string ,
+.BR table ,
+.BR math ,
+.BR os ,
+.B io
+and
+.BR package .
+Five
+.B os
+functions are then removed, and calling one is
+.B "attempt to call field '...' (a nil value)"
+rather than a refusal with a reason:
+.PP
+.nf
+os.execute    os.remove    os.rename    os.tmpname    os.exit
+.fi
+.PP
+.BR os.time (),
+.BR os.clock (),
+.BR os.date ()
+and
+.BR os.difftime ()
+remain \(em the handler needs to tell the time, not to run programs, unlink
+files or end the process it shares with every other runtime in the daemon.
+.B os.exit()
+in particular would take the daemon down from inside a callback.
+.PP
+To run a command or create a directory, do it from the shell that creates the
+runtime, before
+.BR create .
+To write a file, use
+.B io.open
+in append or write mode, which is not removed \(em bearing in mind that it
+blocks the event loop for as long as the write takes.
+.PP
+.B require()
+resolves against the script's directory and then the default
+.BR package.path ,
+but
+.B package.cpath
+is left at its default and no binary module ships with socketley. A
+.B require
+of a C module \(em
+.BR cjson ,
+.BR lsqlite3 ,
+a
+.B luasql
+driver \(em therefore fails unless that module is installed where the system Lua
+would find it. For JSON, use the built\-in
+.B socketley.json_encode
+and
+.B socketley.json_decode
+instead; they need nothing installed.
 .SS Available Callbacks
 .TP
 .B on_start()
@@ -2281,10 +2465,23 @@ Called when a client disconnects (server/client).
 Called when message sent.
 .TP
 .B on_route(method, path)
-Proxy only. Custom backend selection. Returns backend index (0-based).
+Proxy only, and
+.B "\-\-strategy lua"
+only. Custom backend selection. Returns backend index (0-based).
 Answers only "where does this go"; to accept or refuse a request before any
 backend is chosen, see
 .BR "Proxy Filter Chain" .
+.IP
+The strategy is what consults it. A proxy created without
+.B "\-\-strategy lua"
+keeps round\-robin (or
+.BR random ,
+if that was asked for) and never looks the callback up, so a script defining
+.B on_route
+on such a proxy is loaded, is reported by nothing, and routes exactly as if the
+function were not there. That is the usual reason a
+.B on_route
+that was tested and works appears to do nothing.
 .IP
 The two arguments are passed on
 .B "\-\-protocol http"
@@ -2303,6 +2500,11 @@ one's.
 .B filters
 Proxy only. Not a callback but an array of them: see
 .BR "Proxy Filter Chain" .
+.TP
+.B routes
+Not a callback either, but a table this runtime declares about what it answers,
+which the daemon publishes to the proxies in front of it: see
+.BR "Declared Routes" .
 .TP
 .B on_proxy_request(client_id, data) \(-> string | nil
 Proxy only. Called for every chunk forwarded from a client to a backend.
@@ -2452,6 +2654,27 @@ function on_tick(dt)
     self.broadcast("ping")
 end
 .fi
+.TP
+.B on_miss(key) \(-> value [, ttl_seconds]
+Cache only. Called when
+.B GET
+finds nothing, so the script can fetch the value from somewhere else; what it
+returns is stored and answered as a hit. See
+.B "Database Backend"
+for the four cache callbacks in full, with their ordering and their failure
+behaviour.
+.TP
+.B on_write(key, value, ttl)
+Cache only. Called after a successful
+.BR SET / SETEX / SETNX / MSET .
+.TP
+.B on_delete(key)
+Cache only. Called after a
+.B DEL
+that removed something.
+.TP
+.B on_expire(key)
+Cache only. Called after the TTL sweep removes a key.
 .TP
 .B on_upstream(conn_id, data)
 Server only. Called for each newline-delimited message received from an
@@ -2816,21 +3039,33 @@ table with no entry at index 1 is refused too \(em it is an array, and
 .B routes = {["/a"] = {"GET"}}
 would otherwise load and declare nothing.
 .PP
-A proxy runtime running in a worker process of its own enforces declarations
-the same way. The table reaches it in the endpoint frame that already carries
-the addresses, so where the gateway runs makes no difference to which methods
-it refuses.
+Neither end of this has to be in the daemon. A proxy in a worker process of its
+own enforces declarations the same way: the table reaches it in the endpoint
+frame that already carries the addresses. And a
+.I handler
+in a worker declares them the same way, which is less obvious \(em the
+declaration is produced by running the script, and only the worker runs it, so
+it travels back to the daemon in a
+.B routes
+frame on the control socket and the placeholder publishes the worker's copy.
+Where either runtime runs makes no difference to which methods are refused, and
+neither needs
+.BR \-\-daemon\-process .
 .IP
 See
 .B examples/proxy/declared\-routes.lua
 for a handler that declares an AJAX endpoint and the gateway in front of it.
 .SS Runtime Methods (in Lua)
 .nf
+-- Every type
 self.name      -- Runtime name (read-only)
 self.port      -- Port number (read-only)
 self.state     -- Current state (read-only)
 self.type      -- Runtime type (read-only)
-self.protocol  -- "tcp" or "udp" (server/client only)
+self.connections()         -- Current connection count (all four types)
+
+self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
+               -- (not set on a cache)
 self.send(msg)             -- Send message (client)
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server)
@@ -2875,10 +3110,12 @@ self.publish(channel, msg)  -- Publish to channel
 -- Server: connection control
 self.disconnect(client_id)         -- Terminate a connection from Lua
 self.peer_ip(client_id)            -- Get client IP (IPv4 or IPv6 string)
+                                   -- also on a proxy, same meaning
 self.ws_headers(client_id)         -- Get WS upgrade headers table (nil for TCP)
 
 -- Server: client enumeration and multicast
 self.clients()                     -- Return table of all connected client_ids
+                                   -- also on a proxy, same meaning
 self.multicast(ids, msg)           -- Send msg to a subset of clients (ids = table of client_ids)
 
 -- Server: named groups
@@ -2890,13 +3127,16 @@ self.group_send(group, msg)        -- Send msg to all clients in a group
 self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly between them
 self.unpipe(id)                    -- Remove pipe pairing for a client
 socketley.pipe(src, src_fd, dst, dst_fd) -- Cross-runtime pipe (both must be servers)
+                                   -- names other runtimes: needs --daemon-process
 
 -- Server: per-connection metadata
 self.set_data(id, key, val)        -- Set string metadata on a connection (nil val deletes key)
 self.get_data(id, key)             -- Get metadata string or nil
 
 -- Server: client routing
-self.route(client_id, target)      -- Forward client to sub-server
+self.route(client_id, target)      -- Forward client to sub-server. Names another
+                                   -- runtime, so it is REFUSED in a worker:
+                                   -- both runtimes need --daemon-process.
 self.unroute(client_id)            -- Stop forwarding
 self.get_route(client_id)          -- Get current route (string or nil)
 
@@ -2905,7 +3145,44 @@ self.owner_send(client_id, msg)    -- Send to a connection routed here, through
                                    -- the runtime that owns it. Returns false if
                                    -- that connection has gone.
 self.owner_broadcast(msg)          -- Broadcast to all owner's clients
+
+-- Proxy
+self.clients()                     -- Table of connected client_ids
+self.peer_ip(client_id)            -- Client IP (IPv4 or IPv6 string)
+self.close_client(client_id)       -- Close one client connection
+self.backends()                    -- Array of backend addresses, in the
+                                   -- order on_route indexes them (1-based
+                                   -- in Lua; on_route returns 0-based)
+self.backend_health()              -- Circuit-breaker state per backend,
+                                   -- same 1-based order:
+                                   -- "closed" | "open" | "half_open"
+self.stats()                       -- {connections, bytes_in, bytes_out,
+                                   --  total_connections, total_messages,
+                                   --  backend_count}
 .fi
+.PP
+.B "The proxy table is smaller than the server's on purpose."
+A proxy relays between a client and a backend and speaks for neither, so there
+is no
+.BR broadcast() ,
+no
+.B send()
+and no per\-connection metadata: it has no message of its own to put on the
+wire. To change what crosses it, use
+.B on_proxy_request
+and
+.BR on_proxy_response ,
+and to refuse a request, the filter chain.
+.PP
+.B self.backends()
+is indexed from 1, like every Lua array, while
+.B on_route
+returns an index from 0 \(em so the address
+.B on_route
+selects with
+.B n
+is
+.BR "self.backends()[n + 1]" .
 .PP
 .B self.owner_send()
 takes only a client_id this runtime was actually given \(em one that arrived
@@ -3041,15 +3318,91 @@ socketley.remove(name)                -- Stop + remove runtime
 socketley.send(name, msg)             -- Send/broadcast to runtime
 socketley.list()                      -- List all runtime names (table)
 socketley.get(name)                   -- Get info table or nil
+socketley.pipe(src, src_fd, dst, dst_fd)  -- Cross-runtime pipe (servers)
 .fi
 .P
 Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), start (bool).
 Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
+.PP
+.B "Every call above requires \-\-daemon\-process, and raises without it."
+.RS
+.PP
+These calls act on the runtime map, and the runtime map lives in the daemon. A
+runtime gets its own worker process unless it was created with
+.BR \-\-daemon\-process ,
+and a worker holds one runtime and no map \(em so each of them, and
+.B self.route()
+with them, is replaced there by a function that raises a Lua error naming the
+call, the reason and the way out:
+.PP
+.nf
+[lua] on_start error: lobby.lua:13: socketley.create() is refused in a
+worker process: this call reaches for the runtime map, which lives in the
+daemon ... Create this runtime with \-\-daemon\-process, or move the call to
+one that has it.
+.fi
+.PP
+They are not offered and they do not quietly answer nothing. Returning
+.BR false ,
+.B nil
+or an empty table is what a
+.I successful
+call returns on a daemon with nothing in it, so neither the script nor the
+operator could tell the two apart.
+.PP
+Where the raise lands is the thing to plan for. At a script's top level it fails
+the load, and a worker whose script did not load does not serve: the
+.B create
+is refused with a reason and the runtime is left
+.BR failed .
+Inside a callback it is caught and logged like any other callback error, and the
+runtime carries on \(em so a script that builds its world in
+.B on_start
+comes up looking entirely healthy,
+.B ls
+green and connections accepted, while none of what
+.B on_start
+was for has happened. Add
+.B \-\-daemon\-process
+at
+.BR create ;
+it cannot be added later, since
+.B edit
+rejects it.
+.PP
+Everything that does not reach for the map works in a worker exactly as it does
+in the daemon:
+.BR socketley.log ,
+.BR .http ,
+.BR .json_encode / .json_decode ,
+the timers,
+.BR .subscribe ,
+the whole
+.B self
+table apart from
+.BR self.route() ,
+and every connection and request callback. See
+.B "Out-of-process runtimes"
+under
+.B LIMITATIONS
+for the full account.
+.RE
 .SS Cluster Introspection API
 When the daemon runs in cluster mode (\fB\-\-cluster\fR), the
 .B socketley.cluster
 table provides read-only introspection into the full cluster topology.
-All functions return empty tables when not in cluster mode, so scripts work in both standalone and cluster setups without modification.
+All functions return empty tables when not in cluster mode, so scripts work in
+both standalone and cluster setups without modification.
+.PP
+That last sentence holds for cluster mode being off. It does not hold for a
+runtime in a worker process, which is the default: the cluster view is the
+runtime map plus what discovery has heard, and a worker has neither, so all four
+of these are replaced there by the same raise the management API gets. See
+.B "Runtime Management API"
+above. A script that must run
+.B socketley.cluster
+needs
+.BR \-\-daemon\-process .
 .TP
 .B socketley.cluster.daemons() \(-> table
 Returns an array of daemon info tables. Each entry has:
@@ -3754,9 +4107,9 @@ Master mode server (one controller, many viewers):
 .nf
 socketley create server broadcast -p 9000 \\
     --mode master --master-pw secret -s
-# Client A: sends "master secret" → "master: ok"
-# Client A: sends "hello" → broadcast to all others
-# Client B: sends "hello" → silently dropped
+# Client A: sends "master secret" \(-> "master: ok"
+# Client A: sends "hello" \(-> broadcast to all others
+# Client B: sends "hello" \(-> silently dropped
 .fi
 .PP
 Master mode with forwarding:
@@ -3780,9 +4133,9 @@ Cache access through server:
 .nf
 socketley create cache db -p 9001 -s
 socketley create server api -p 9000 --cache db -s
-# Client sends: "cache set user:1 alice" → "ok"
-# Client sends: "cache get user:1" → "alice"
-# Client sends: "hello" → broadcast as usual
+# Client sends: "cache set user:1 alice" \(-> "ok"
+# Client sends: "cache get user:1" \(-> "alice"
+# Client sends: "hello" \(-> broadcast as usual
 .fi
 .PP
 Dynamic proxy with group-based backend discovery:
@@ -4066,7 +4419,7 @@ lookup
 when installed and privileged, otherwise
 .BR /tmp/socketley.sock ).
 .IP
-No workload calls for setting it. A deployed node — a container or a host — has
+No workload calls for setting it. A deployed node \(em a container or a host \(em has
 a filesystem namespace to itself, so one daemon on the default path is the whole
 arrangement, and that is what the systemd unit ships. Clustering does not use
 this variable either: members publish themselves into a shared directory and
@@ -4163,7 +4516,7 @@ Default
 Larger buffers let one read completion carry more commands, but a read that
 returns less than a full buffer still consumes the whole one, so the waste per
 partial read grows with the size. Measured on the dev VM, raising this to 16384
-cost 31% at 1 KB values and 8% at 4 KB values — the default is where it belongs
+cost 31% at 1 KB values and 8% at 4 KB values \(em the default is where it belongs
 unless a specific workload shows otherwise.
 .TP
 .B SOCKETLEY_CACHE_BUF_COUNT
@@ -4955,15 +5308,16 @@ A proxy in
 .B \-\-protocol tcp
 mode is unaffected by any of this: it was already a byte relay and never looked
 at a status line.
-.SS Out\-of\-process proxies
+.SS Out\-of\-process runtimes
+A runtime of any type gets its own supervised worker process unless
 .B \-\-daemon\-process
-moves the proxy out of the daemon. What it refuses, and what it costs, is worth
-stating plainly.
+is given, which keeps it inside the daemon. What a worker refuses, and what it
+costs, is worth stating plainly.
 .PP
 .B "The script runs in the worker and nowhere else."
-An out\-of\-process proxy exists twice: the worker that owns the listening socket
-and serves every byte, and a placeholder in the daemon that carries its name,
-port, group and state so
+An out\-of\-process runtime exists twice: the worker that owns the listening
+socket and serves every byte, and a placeholder in the daemon that carries its
+name, port, group and state so
 .BR ls ,
 .B stats
 and the endpoint table have something to answer with. The script belongs to the
@@ -4980,12 +5334,25 @@ manager and the worker does not, so a top\-level
 created a runtime from inside the daemon while the identical line in the worker
 was refused.
 .IP
-One thing is given up with it. A script's
+A script's
 .B routes
-declaration is read from the placeholder, so a runtime in a worker
-publishes none \(em a gateway in front of one forwards to it without the 405 it
-could otherwise refuse at the edge. The declaration is a handler's feature
-rather than a proxy's, so a server moved out of process gives it up too.
+declaration is not given up with it, though it was until the worker learned to
+send it. The declaration is produced by running the script, and only the worker
+runs it; the placeholder had none, so
+.B publish_endpoints
+published none and a gateway in front of such a runtime forwarded every method
+to it instead of refusing the undeclared ones at the edge with a 405 \(em
+enforcement that quietly stopped existing, which is the worst way for a gate to
+fail. The worker now encodes the declaration into a
+.B routes
+frame on the control socket it already holds, the supervisor decodes it onto the
+placeholder, and the daemon publishes the worker's copy in preference to a local
+one. A
+.B reload\-lua
+on such a runtime waits for the new declaration before republishing, so the
+gateway is never enforcing the old script's methods against the new script's
+handler. The declaration is a handler's feature rather than a proxy's, which is
+what made this matter the moment every type got its own process by default.
 .PP
 .B "create waits for the worker's verdict."
 Compiling the script in the placeholder catches a file that does not parse, and
@@ -5193,9 +5560,12 @@ answers a different question: a worker that is
 and has an age in the seconds is one the daemon still believes in and that has
 stopped speaking.
 .PP
-Only the proxy can be split. The other runtimes still reach across
-runtime boundaries through pointers and cannot be moved until they route
-from pushed data the way the proxy now does.
+Every type can be split, and every type is split unless it asks not to be. The
+proxy was first, and the rest followed once they too routed from pushed data
+rather than from a pointer into another runtime. What is left is written down in
+this section: the cross\-runtime management API,
+.BR self.route() ,
+and figures that are pushed rather than read.
 .SS TLS
 .B "Every runtime type speaks TLS: a server's and a cache's own listener, a proxy \(em on both of its legs \(em and a client runtime's dial."
 Created with
