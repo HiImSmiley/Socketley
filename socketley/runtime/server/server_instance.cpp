@@ -216,6 +216,8 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->meta.clear();
     conn->write_queue.clear();
     conn->relay_hold.clear();
+    conn->relay_hold_since = {};
+    conn->spoke = false;
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
@@ -1108,6 +1110,7 @@ bool server_instance::setup(event_loop& loop)
     {
         m_accept_armed         = false;
         m_idle_sweep_armed     = false;
+        m_relay_deadline_armed = false;
         m_accept_backoff_armed = false;
         m_udp_recv_armed       = false;
         // Nothing in the ring names any of them any more.
@@ -1664,6 +1667,12 @@ void server_instance::teardown(event_loop& loop)
     // request the ring is not carrying, which answers -ENOENT and wastes an SQE.
     if (m_idle_sweep_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_idle_sweep_req);
+    // 250 ms rather than thirty seconds, so this one would end the retirement
+    // on its own soon enough — but "soon enough" is not the contract, and a
+    // timer left in the ring is a completion this owner is still owed however
+    // short its fuse.
+    if (m_relay_deadline_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_relay_deadline_req);
     if (m_accept_backoff_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_accept_backoff_req);
     loop.flush();
@@ -1780,6 +1789,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         // no longer armed, which is what the next start() needs to know.
         return_provided_buf(cqe);
         if (req == &m_idle_sweep_req)          m_idle_sweep_armed = false;
+        else if (req == &m_relay_deadline_req) m_relay_deadline_armed = false;
         else if (req == &m_accept_backoff_req) m_accept_backoff_armed = false;
         else if (req == &m_udp_recv->req)       m_udp_recv_armed = false;
         else if (req == m_accept_req.get()) m_accept_armed = false;
@@ -1897,6 +1907,16 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 }
                 if (m_idle_timeout_cached > 0)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+            }
+            // Relay-hold deadline.  Lowered before the sweep and not after it,
+            // because the sweep re-arms this very request for whatever is still
+            // waiting; clearing the flag afterwards would clear the arming the
+            // sweep had just done, and the timer would stop for good the first
+            // time two listeners were holding at once.
+            else if (req == &m_relay_deadline_req)
+            {
+                m_relay_deadline_armed = false;
+                relay_deadline_sweep();
             }
             // Accept backoff expired — resubmit accept
             else if (req == &m_accept_backoff_req)
@@ -2436,6 +2456,18 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     {
         conn->partial.append(conn->read_buf, cqe->res);
     }
+
+    // This client has said something, and from here on it is one that is owed
+    // an answer rather than one that is only listening.  Here rather than in
+    // each of the three branches above because this is where they meet, and on
+    // `partial` rather than on cqe->res because on a TLS connection the bytes
+    // that just arrived may be a handshake record the session answers by
+    // itself: a client is not waiting on the relay for that.  Sticky — a
+    // connection does not become a listener again by falling silent, and the
+    // sticky part is what keeps a keep-alive HTTP client, whose protocol is
+    // reset to unknown between requests, out of the deadline's reach.
+    if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
+        conn->spoke = true;
 
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
     {
@@ -3515,6 +3547,18 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
 void server_instance::relay_hold_push(server_connection* conn,
                                       const std::shared_ptr<const std::string>& msg)
 {
+    // The deadline runs from the first message held, not from every one.  A
+    // listener on a busy relay would otherwise have its clock reset by each new
+    // broadcast and never reach the deadline at all — which is the "never
+    // classified, never served" behaviour this exists to end, restored exactly
+    // where it hurts most.
+    if (conn->relay_hold.empty())
+    {
+        conn->relay_hold_since = std::chrono::steady_clock::now();
+        if (relay_deadline_applies(conn))
+            relay_deadline_arm(RELAY_HOLD_DEADLINE_MS);
+    }
+
     conn->relay_hold.push(msg);
 
     // A loop and not a single pop: one relayed message can be larger than the
@@ -3542,6 +3586,87 @@ void server_instance::relay_hold_flush(server_connection* conn)
     // broadcast() takes for a connection that was classified in time.
     while (!conn->relay_hold.empty())
         send_to(conn, conn->relay_hold.take_front());
+
+    conn->relay_hold_since = {};
+}
+
+void server_instance::relay_deadline_arm(uint32_t after_ms)
+{
+    // Not if it is already counting.  A timeout is attached to no descriptor,
+    // so a second submission on this request would leave the first one in the
+    // ring with nothing able to name it — the same defect the idle sweep's
+    // armed flag exists to prevent, and the reason that one is commented at
+    // such length in setup().
+    if (m_relay_deadline_armed || SOCKETLEY_UNLIKELY(!m_loop))
+        return;
+
+    m_relay_deadline_ts.tv_sec  = after_ms / 1000;
+    m_relay_deadline_ts.tv_nsec = static_cast<long long>(after_ms % 1000) * 1000000LL;
+    m_relay_deadline_req = { this, nullptr, -1, 0, op_timeout };
+    m_relay_deadline_armed = m_loop->submit_timeout(&m_relay_deadline_ts, &m_relay_deadline_req);
+}
+
+void server_instance::relay_deadline_sweep()
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = std::chrono::milliseconds(RELAY_HOLD_DEADLINE_MS);
+
+    // The shortest wait any connection that is still holding has left.  Starts
+    // at the full deadline because nothing can be owed longer than that.
+    auto next = deadline;
+    bool still_waiting = false;
+
+    // The same shape broadcast() iterates m_active_fds with, for the same
+    // reason: the flush below writes, a write that never reaches the ring marks
+    // the connection closing, and re-reading size() each turn is what makes
+    // that safe.  Nothing here removes an fd from the vector — only a
+    // completion does that — so no entry is skipped.
+    for (size_t i = 0; i < m_active_fds.size(); i++)
+    {
+        const int fd = m_active_fds[i];
+        auto* conn = m_conn_idx[fd];
+        if (SOCKETLEY_LIKELY(!conn || conn->closing || conn->relay_hold.empty()))
+            continue;
+
+        // Classified, spoken, or still handshaking: this hold is not the
+        // deadline's to release, and its connection is not what the timer
+        // should be re-armed for either.  A client mid-request is waiting for
+        // an answer, and flushing in front of that answer is the defect the
+        // hold exists to prevent.
+        if (!relay_deadline_applies(conn))
+            continue;
+
+        const auto waited = now - conn->relay_hold_since;
+        if (waited < deadline)
+        {
+            still_waiting = true;
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - waited);
+            if (left < next)
+                next = left;
+            continue;
+        }
+
+        // Out of time.  This client has sent nothing since it was accepted, so
+        // there is no response of its own for these bytes to arrive in front
+        // of, and raw line-delimited text is what a connection that has never
+        // announced anything else gets.  Settling the protocol rather than just
+        // emptying the queue is the point: everything relayed after this goes
+        // straight out, so the 250 ms is paid once per connection and not once
+        // per message.
+        conn->proto = proto_tcp;
+        relay_hold_flush(conn);
+    }
+
+    if (still_waiting)
+    {
+        // A floor under the re-arm.  Without it a hold that is one microsecond
+        // short of its deadline arms a one-microsecond timeout, and a busy
+        // relay would spend more time in the timer wheel than in the sweep.
+        static constexpr uint32_t MIN_REARM_MS = 5;
+        auto ms = static_cast<uint32_t>(next.count());
+        relay_deadline_arm(ms < MIN_REARM_MS ? MIN_REARM_MS : ms);
+    }
 }
 
 bool server_instance::conn_has_output(const server_connection* conn) const

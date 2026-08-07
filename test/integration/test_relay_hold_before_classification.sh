@@ -34,12 +34,38 @@
 #     invisible to any check that only looks for one message.  So the assertion
 #     is on the whole sequence, in order.
 #
-# The last section covers the bound.  A connection that never sends is never
-# classified, so its hold is not a transient and has to be capped; the policy is
-# to drop the OLDEST, which is checked directly by asserting that the first
-# message is gone and the last one survived.  A test that only asserted "some
-# messages arrived" would pass equally well against a cap that dropped the
-# newest, which is the choice that would strand a listener on stale traffic.
+# Scenario 3 covers the bound.  A hold can outlive a single read — a connection
+# that has sent a partial request and paused holds until the rest of it arrives
+# — so it is not a transient and has to be capped; the policy is to drop the
+# OLDEST, which is checked directly by asserting that the first message is gone
+# and the last one survived.  A test that only asserted "some messages arrived"
+# would pass equally well against a cap that dropped the newest, which is the
+# choice that would strand a listener on stale traffic.
+#
+# ─── AND WHY THE HOLD HAS A DEADLINE (SCENARIO 4) ────────────────────────────
+#
+# Holding until classification, and only until classification, has a side effect
+# that is worse than the defect for one kind of client: a connection that never
+# sends is never classified, so it would receive no relay traffic at all, ever.
+# A pure listener — connect, stay quiet, read what everybody else broadcasts —
+# is a legitimate client of an inout server, whose documented job is to relay
+# every client's messages to every other client, and it worked before the hold
+# existed.
+#
+# So the hold has a deadline.  Scenario 4 is a client that sends nothing at any
+# point and still receives the relay traffic, within a bounded time rather than
+# never.  It is the assertion that fails on the commit that introduced the hold,
+# and it is deliberately not satisfied by "eventually": the delay is measured
+# from the moment the relayed lines were sent, so a fix that released the hold
+# on some unrelated thirty-second sweep would fail it just as the hold does.
+#
+# Scenario 1 is the reason the deadline cannot simply be "N ms after the first
+# held message, whoever you are".  The client there has sent a partial upgrade
+# and is waiting to be answered, and the test keeps it waiting for as long as a
+# stats poll takes — seconds.  Releasing its hold on a timer would put relay
+# bytes in front of the 101 all over again, on a slow client rather than a fast
+# one.  Scenario 1 passing and Scenario 4 passing in the same run is what says
+# the deadline is conditioned on having said nothing rather than on time alone.
 #
 # ─── WHY THE SEQUENCING IS NOT A SLEEP ───────────────────────────────────────
 #
@@ -100,6 +126,17 @@ which shows as a missing key rather than as a hang.
 import socket, subprocess, sys, time
 
 BIN, PORT = sys.argv[1], int(sys.argv[2])
+
+# What the server's RELAY_HOLD_DEADLINE_MS is, and what this file will allow for
+# it.  The two are far apart on purpose: the constant is a promise about the
+# event loop, this budget is a promise about a shared machine that may be
+# running a whole suite alongside this test, and asserting the former to the
+# millisecond would make the file fail for reasons that have nothing to do with
+# the deadline.  It is still a real bound — six times the constant is nowhere
+# near "eventually", and a release driven by the 30s idle sweep, or no release
+# at all, misses it by an order of magnitude.
+RELAY_DEADLINE_MS = 250
+DEADLINE_BUDGET_S = 1.5
 
 def stat(key):
     out = subprocess.run([BIN, "stats", "relayhold"], capture_output=True, text=True).stdout
@@ -245,6 +282,53 @@ print("overflow_has_first=%s" % ("yes" if b"seq0000-" in hbuf else "no"))
 print("overflow_has_last=%s"  % ("yes" if (b"seq%04d-" % (N-1)) in hbuf else "no"))
 print("overflow_bytes=%d" % len(hbuf))
 h.close(); s3.close()
+
+# ── Scenario 4: a listener that never speaks still gets the traffic ─────────
+# The one client in this file that sends nothing at any point.  Everything above
+# eventually says something, which is what releases its hold; this one does not,
+# so only the deadline can release it.
+time.sleep(0.3)
+base_conns = stat("total_connections") or 0
+l = conn()                      # never sends a byte, from accept to close
+wait_until("total_connections", base_conns + 1, "pure listener accepted")
+
+s4 = conn()
+# The clock starts here and not before.  Nothing is held for this connection
+# until there is relay traffic to hold, so the deadline cannot have started
+# counting during the accept wait above -- which takes a stats interval and
+# would otherwise be charged to it.
+t0 = time.time()
+s4.sendall(b"listen-one\nlisten-two\n")
+
+l.settimeout(DEADLINE_BUDGET_S)
+try:
+    first = l.recv(65536)
+    delay = time.time() - t0
+except socket.timeout:
+    first, delay = b"", -1.0
+print("listener_delay_ms=%d" % (delay * 1000 if delay >= 0 else -1))
+print("listener_within_deadline=%s" % ("yes" if 0 <= delay <= DEADLINE_BUDGET_S else "no"))
+
+# The rest of whatever was held, if the two lines arrived in separate segments.
+first += read_for(l, 0.5)
+print("listener_payload=%s" % first.decode("latin-1").replace("\n", "|").strip("|"))
+
+# And it is settled now, not holding again.  A deadline that released the bytes
+# but left the connection unclassified would pass everything above and then hold
+# the very next relayed message for another full deadline -- or, if the release
+# were a one-off, for ever.  This second round is what tells those apart, and it
+# is given a fifth of the budget because there is nothing left to wait for.
+t1 = time.time()
+s4.sendall(b"listen-three\n")
+l.settimeout(DEADLINE_BUDGET_S / 5)
+try:
+    more = l.recv(65536)
+    delay2 = time.time() - t1
+except socket.timeout:
+    more, delay2 = b"", -1.0
+print("listener_after_flush=%s" % more.decode("latin-1").strip())
+print("listener_after_flush_ms=%d" % (delay2 * 1000 if delay2 >= 0 else -1))
+l.close(); s4.close()
 PYEOF
 
 OUT=$(python3 "$TMPD_T/drive.py" "$BIN" "$PORT" 2>&1) || {
@@ -273,6 +357,16 @@ assert_eq "$(val tcp_payload)" "tcp-one|tcp-two" "plain TCP client gets held tra
 # asserting only that the oldest is gone would pass one that dropped everything.
 assert_eq "$(val overflow_has_first)" "no"  "hold over its bound drops the oldest"
 assert_eq "$(val overflow_has_last)" "yes"  "hold over its bound keeps the newest"
+
+# ── Scenario 4 ──────────────────────────────────────────────────────────────
+# The listener never sent anything, so classification can never release its
+# hold.  These two fail on the commit that introduced the hold: the traffic does
+# not arrive late there, it does not arrive.
+assert_eq "$(val listener_within_deadline)" "yes" "silent listener served within the deadline"
+assert_eq "$(val listener_payload)" "listen-one|listen-two" "silent listener gets all of it, in order"
+# ...and the deadline classified it rather than merely emptying the hold once.
+assert_eq "$(val listener_after_flush)" "listen-three" "listener is settled, not holding again"
+echo "  (listener served after ${DELAY_MS:=$(val listener_delay_ms)} ms, next message after $(val listener_after_flush_ms) ms)"
 
 # The server is still serving after all of it.
 OUT2=$("$BIN" ps 2>&1) || true

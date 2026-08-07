@@ -111,7 +111,33 @@ struct alignas(64) server_connection
     // because the client is entitled to them: an inout server relays every
     // client's messages to every other client, and this connection goes on
     // receiving exactly this traffic for the rest of its life.
+    //
+    // Or by the deadline, for a connection that has said nothing at all.  See
+    // RELAY_HOLD_DEADLINE_MS and `spoke` below for why those two are the same
+    // release and not two policies.
     socketley::byte_counted_queue<std::shared_ptr<const std::string>> relay_hold;
+
+    // When this hold started — set as it goes from empty to non-empty, and
+    // meaningless while it is empty.  The deadline is measured from the first
+    // message held rather than from the accept, because until there is traffic
+    // to hold there is nothing for a deadline to be late for.
+    std::chrono::steady_clock::time_point relay_hold_since{};
+
+    // Has this client ever sent a byte of application data?
+    //
+    // Sticky, and it is the whole of what separates a listener from a client
+    // mid-request.  Both are unclassified, and the relay owes them opposite
+    // things: a connection that has sent something is waiting for an answer to
+    // it, so relay bytes released early land in front of that answer and this
+    // is the defect all over again; a connection that has sent nothing has no
+    // answer outstanding for anything to land in front of, so releasing its
+    // hold cannot reorder anything.  Only the second kind has a deadline.
+    //
+    // Set where inbound bytes reach `partial`, so a TLS connection counts as
+    // having spoken when its plaintext arrives and not when its handshake
+    // records do — a client is not "waiting for an answer" to a ClientHello
+    // that OpenSSL answers by itself.
+    bool spoke{false};
 
     // writev batch: holds refs alive until CQE completes
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
@@ -246,6 +272,13 @@ struct alignas(64) server_connection
         // handed to this one.  pool_release() already did it; repeated here for
         // the same reason the TLS session above is.
         relay_hold.clear();
+        relay_hold_since = {};
+        // A struct that carried a client which had spoken would otherwise hand
+        // the next one a permanent exemption from the deadline: it would be a
+        // listener the relay believed was mid-request, and it would be held for
+        // as long as it stayed connected — which is the behaviour the deadline
+        // exists to end, reintroduced through the pool.
+        spoke = false;
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
         write_batch_count = 0;
         read_pending = false;
@@ -517,15 +550,16 @@ private:
     // What one connection may accumulate while it is still unclassified,
     // before the oldest held message is dropped to make room.
     //
-    // This is not a transient.  A connection that never sends anything is
-    // never classified, so a pure listener holds up to this bound for as long
-    // as it stays connected, and a server with many of them pays it per
-    // connection.  The figure is therefore sized for the window it exists to
-    // cover — accept to first read, normally a single turn of the event loop —
-    // and deliberately not for a backlog: 64 KB is four full 16 KB reads'
-    // worth of relayed lines, far more than that window can produce, and
-    // 1/128th of the 8 MB a connection's own write queue may hold, so an idle
-    // listener cannot cost more than an active client already may.
+    // This is not a transient.  A client that has sent half a request and
+    // paused holds until the rest of it arrives, which is its own decision and
+    // may be a long one, and a server with many such connections pays this per
+    // connection.  The figure is sized for the window it exists to cover —
+    // accept to the read that classifies, normally a single turn of the event
+    // loop — and deliberately not for a backlog: 64 KB is four full 16 KB
+    // reads' worth of relayed lines, far more than that window can produce, and
+    // 1/128th of the 8 MB a connection's own write queue may hold, so a
+    // connection waiting to be classified cannot cost more than an active
+    // client already may.
     //
     // Overflow drops the oldest.  The three alternatives are all worse:
     // growing is the memory-exhaustion path this bound exists to close;
@@ -534,6 +568,44 @@ private:
     // talking, which is a far worse failure than a listener missing the start
     // of a conversation it has not joined yet.
     static constexpr size_t RELAY_HOLD_MAX_BYTES = 64 * 1024;
+
+    // How long relay traffic is held for a connection that has said nothing.
+    //
+    // Holding until classification and only until classification has one
+    // consequence that is worse than the defect it fixes: a connection that
+    // never sends is never classified, so a pure listener — connect, stay
+    // quiet, read what everybody else broadcasts — would receive no relay
+    // traffic at all, ever.  That is a legitimate client of an inout server,
+    // whose whole job is to relay every client's messages to every other
+    // client, and it worked before the hold existed.  So the hold has a
+    // deadline, and on it the connection is treated as raw and flushed through
+    // the ordinary path.
+    //
+    // Only for a connection that has not spoken.  See `spoke`: a client
+    // mid-request is waiting for an answer, and releasing its hold on a timer
+    // would put relay bytes in front of that answer — the original defect,
+    // moved from fast clients to slow ones.  Such a connection holds until it
+    // is classified however long that takes, exactly as before.
+    //
+    // 250 ms, bounded from both sides:
+    //
+    //   * It must not expire before a client that intends to speak has been
+    //     heard, because a listener is what this classifies it as, permanently.
+    //     The gap it has to clear is connect-to-first-byte for a client that
+    //     writes its request immediately — under a millisecond on loopback or a
+    //     LAN, and 250 ms still covers a full round trip on an intercontinental
+    //     link.  The clock also starts at the first held message rather than at
+    //     the accept, so an idle server never runs it at all: a slow client is
+    //     only ever at risk while other clients are actively broadcasting.
+    //
+    //   * It must not be long enough to read as a stall.  A listener's added
+    //     latency is 250 ms once, on its first relayed message; every message
+    //     after that goes straight out, because the deadline classifies the
+    //     connection rather than merely emptying its queue.  That is under the
+    //     ~300 ms at which a delay becomes visible in interactive traffic, and
+    //     two orders of magnitude below the 30 s idle sweep, which is the only
+    //     other timer that would otherwise have touched such a connection.
+    static constexpr uint32_t RELAY_HOLD_DEADLINE_MS = 250;
 
     // Is this connection still waiting to be classified?  Both states mean the
     // same thing to the relay — nothing has been decided about what the client
@@ -545,6 +617,21 @@ private:
         return conn->proto == proto_unknown || conn->proto == proto_ws_upgrading;
     }
 
+    // May the deadline release this connection's hold?
+    //
+    // Three conditions, and each one is a different way of asking whether
+    // anything is owed to this client that relay bytes could arrive in front
+    // of.  It must still be unclassified (a classified one has no hold left to
+    // release); it must never have spoken (see `spoke`); and its TLS handshake,
+    // if it has one, must be finished — a session still exchanging records has
+    // no keys to encrypt with, so flushing into it would queue plaintext behind
+    // a handshake and then deliver it in front of the first real response.
+    static bool relay_deadline_applies(const server_connection* conn)
+    {
+        return proto_unsettled(conn) && !conn->spoke
+               && conn->tls_state != tls_conn_handshake;
+    }
+
     // Hold one relayed message for a connection that has no protocol yet.
     void relay_hold_push(server_connection* conn,
                          const std::shared_ptr<const std::string>& msg);
@@ -554,6 +641,20 @@ private:
     // classified without its held traffic going out behind the response to the
     // very read that classified it.
     void relay_hold_flush(server_connection* conn);
+
+    // Arm the deadline timer if it is not already counting.  One timer for the
+    // whole instance rather than one per connection: a per-connection timeout
+    // would need an io_request, an armed flag and a withdrawal on every close
+    // path, for a deadline that is the same length for every connection and is
+    // only ever waited on by connections that are doing nothing.
+    void relay_deadline_arm(uint32_t after_ms);
+
+    // Everything whose deadline has passed, and re-arm for the oldest that is
+    // left.  Arming for the full deadline each time would make the worst-case
+    // wait twice the constant, for a connection whose hold began just after the
+    // previous arming; re-arming for the remainder is what keeps the bound the
+    // number that is written down.
+    void relay_deadline_sweep();
 
     // ── the --cache auto-store ──────────────────────────────────────────────
     // Every message a linked server receives is written to the cache under an
@@ -739,6 +840,13 @@ private:
     io_request m_idle_sweep_req{};
     struct __kernel_timespec m_idle_sweep_ts{};
 
+    // Relay-hold deadline timer.  Armed on demand — by the first message held
+    // for a connection that qualifies — and re-armed by its own completion for
+    // as long as anything is still waiting, so a server with no listeners never
+    // puts it in the ring at all.
+    io_request m_relay_deadline_req{};
+    struct __kernel_timespec m_relay_deadline_ts{};
+
     // An armed request stays armed across a stop: a timeout is attached to no
     // fd, so neither shutdown() nor a cancel reaches it, and it completes when
     // it completes.  Arming a second one at the next start() is what gave a
@@ -747,6 +855,7 @@ private:
     bool m_accept_armed{false};
     bool m_accept_backoff_armed{false};
     bool m_idle_sweep_armed{false};
+    bool m_relay_deadline_armed{false};
     bool m_udp_recv_armed{false};
 
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;

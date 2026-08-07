@@ -1139,18 +1139,26 @@ Message flow direction:
 Relayed messages are held for a connection until the server knows what protocol
 it speaks, and delivered once it does \(em through that protocol's framing, so a
 WebSocket client receives them as frames rather than as raw text. A connection is
-classified by its first message, so a client that connects and never sends
-anything receives no relay traffic until it does. This matters because the
-alternative is a corrupted handshake: a client whose opening move is an HTTP
-request or a WebSocket upgrade would otherwise be sent relay bytes in front of
-the response it is waiting for.
+classified by its first message. This matters because the alternative is a
+corrupted handshake: a client whose opening move is an HTTP request or a
+WebSocket upgrade would otherwise be sent relay bytes in front of the response it
+is waiting for.
+.IP
+A client that connects and sends nothing is served anyway, after a delay of at
+most 250 ms, and is treated as a plain line\-delimited TCP client from then on.
+Such a client has nothing outstanding for the relayed bytes to arrive in front
+of, so there is no handshake to protect. The delay is paid once per connection,
+not once per message: everything relayed after the first delivery goes out
+immediately. A client that has sent part of a request and not finished it is not
+covered by this and is held until its request completes, however long that takes
+\(em that one is waiting for an answer, and the answer must come first.
 .IP
 The hold is capped at 64 KB per connection. Past that the oldest held messages
 are dropped to make room, so a client that stays silent through more than 64 KB
-of relay traffic and then speaks receives the most recent messages and not the
-whole backlog. The cap is per connection and applies only before the first
-message; once a connection is classified, relay traffic goes straight to its
-write queue and the ordinary
+of relay traffic in under 250 ms receives the most recent messages and not the
+whole backlog. The cap is per connection and applies only before classification;
+once a connection is classified, relay traffic goes straight to its write queue
+and the ordinary
 .B \-\-max\-conns
 and write\-queue limits govern instead.
 .TP
