@@ -1220,6 +1220,55 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             return wrc;
     }
 
+    // ─── A script whose on_start raised is not a silent success ─────────────
+    //
+    // Last, after the save and after the worker's verdict, because the runtime
+    // IS created and IS running and nothing above this line is being undone.
+    // start() will not fail on a raise — the listener is already up by the time
+    // on_start runs, and taking it down over a callback is not something this
+    // tree does anywhere else — so the runtime stays exactly where it is, with
+    // whatever on_start managed before it gave up.
+    //
+    // But `create -s` reported that with exit 0 and not one character of output,
+    // and the only record was a line in the daemon's log.  `reload-lua` has
+    // answered 1 with the reason since it began re-running on_start, on the
+    // rule that a command does not report success for something that did not
+    // happen; the same script, the same callback and the same raise answered 0
+    // here.  An operator cannot be expected to know that the exit code for a
+    // broken on_start depends on which command they used to reach it.
+    //
+    // 1 rather than 2, per this tree's codes: the fault is in the file the
+    // operator named, which is bad input.  It is also the code `create` already
+    // gives when that same file will not PARSE — "could not load Lua script",
+    // one step earlier in the same script's life — and answering the two
+    // differently would be the arbitrary part.
+    if (autostart && !instance->get_test_mode())
+    {
+        // Two places to ask, because on_start runs wherever the script runs.
+        // In the daemon the instance itself kept the reason; in a worker the
+        // script never came near this process, and the child sent it up as a
+        // `start_err` frame before the `state` frame the wait above ended on.
+        // Asking only the first would have covered the flag nobody passes:
+        // since 2313c26 a runtime is out of process unless it says otherwise,
+        // so the worker leg IS the ordinary `create -s`.
+        std::string why(instance->last_on_start_error());
+        if (why.empty())
+        {
+            if (auto it = m_proxy_workers.find(std::string(name));
+                it != m_proxy_workers.end())
+                why = it->second->take_start_error();
+        }
+
+        if (!why.empty())
+        {
+            std::cout << "create " << name << ": " << why << "\n"
+                      << "the runtime is created and running, with whatever "
+                         "on_start established before it raised; fix the script "
+                         "and run `reload-lua " << name << "` to re-run it.\n";
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -1314,6 +1363,26 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             if (m_persistence)
                 m_persistence->set_was_running(n, true);
             inst = m_manager.get(n);
+
+            // The runtime is up; its script's set-up is not.  Counted as a
+            // failure and reported with the reason, for the reasoning written
+            // out at the end of cmd_create — and counted rather than returned,
+            // because `start a b c` has to start b and c whatever a's script
+            // did, exactly as it does for a TLS refusal above.
+            //
+            // was_running is set anyway, deliberately: it records that the
+            // operator asked for this runtime to be up, and it is up.  Clearing
+            // it would mean a daemon restart silently leaving down a listener
+            // that is serving traffic right now.
+            if (inst && !inst->last_on_start_error().empty())
+            {
+                conn->write_buf += "start " + std::string(n) + ": "
+                                 + inst->last_on_start_error() + "\n"
+                                 + "the runtime is running, with whatever on_start "
+                                   "established before it raised; fix the script and "
+                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
+                ++failed;
+            }
         }
 
         if (want_interactive && inst)
@@ -3141,6 +3210,21 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         m_manager.stop(n, m_loop);
         if (m_manager.start(n, m_loop) && m_persistence)
             m_persistence->set_was_running(n, true);
+
+        // "reload is a stop followed by a start, so it is a start" — the
+        // sentence above, applied to the other thing a start now answers for.
+        // Leaving this one out would put back exactly the inconsistency the
+        // rest of this commit removes: the same script and the same raise
+        // reported by `start` and not by the command that is a start.
+        if (inst = m_manager.get(n); inst && !inst->last_on_start_error().empty())
+        {
+            conn->write_buf += "reload " + std::string(n) + ": "
+                             + inst->last_on_start_error() + "\n"
+                             + "the runtime is running, with whatever on_start "
+                               "established before it raised; fix the script and "
+                               "run `reload-lua " + std::string(n) + "` to re-run it.\n";
+            ++refused;
+        }
     }
     return refused > 0 ? 1 : 0;
 }

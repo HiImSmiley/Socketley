@@ -53,6 +53,24 @@ public:
     // left the map has to be retired or can be destroyed on the spot.
     bool has_armed_io() const;
 
+    // What the last invoke_on_start() raised, empty when it did not raise.
+    //
+    // start() does not fail on a raise and must not: the runtime is listening by
+    // the time on_start runs, and turning a script's error into `failed` would
+    // take a live listener down over a callback the rest of this tree reports
+    // and carries on from.  But "the command may not fail" and "the command may
+    // not say" are different sentences, and only the first one is true — so the
+    // reason is kept here for whoever asked for the start to read.
+    //
+    // Not lua_diag: that buffer belongs to whoever is about to read it, and a
+    // nested socketley.create from inside on_start clears it and writes its own
+    // load diagnostics into it.  This is attached to the runtime whose on_start
+    // it was, which is the thing the caller has to name in the message.
+    //
+    // Cleared at the top of every invoke_on_start(), so it always describes the
+    // most recent attempt and a runtime that starts cleanly reports nothing.
+    const std::string& last_on_start_error() const;
+
     std::string_view get_name() const;
     void set_name(std::string_view name);
     std::string_view get_id() const;
@@ -593,6 +611,8 @@ private:
     runtime_type m_type;
     std::atomic<runtime_state> m_state;
     bool m_armed_io = false;
+    // See last_on_start_error().  Empty unless the most recent on_start raised.
+    std::string m_on_start_error;
     uint16_t m_port = 0;
     bool m_test_mode = false;
     std::string m_log_file;

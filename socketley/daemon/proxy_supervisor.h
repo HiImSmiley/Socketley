@@ -196,6 +196,14 @@ public:
     // other.  Taken rather than peeked: one reload, one report.
     std::string take_reload_error();
 
+    // Why this child's on_start raised when it was started, or empty if it did
+    // not.  The child sends a `start_err` frame before the `state` frame that
+    // ends await_startup(), so reading it straight after that wait is reading
+    // the answer for that start.  Taken rather than peeked, for the same reason:
+    // one start, one report — and a second read must not attribute the first
+    // start's failure to a later one.
+    std::string take_start_error();
+
     // A new membership snapshot.  Cheap enough to send unconditionally: the
     // daemon publishes only when a runtime is created, started, stopped,
     // removed or renamed, or when the cluster's view moves.
@@ -364,6 +372,13 @@ private:
     // Why the last `reload` this child was sent did not load.  Empty when it
     // did, because a worker that reloaded cleanly sends no frame at all.
     std::string  m_reload_error;
+
+    // Why this child's on_start raised when it was started.  Empty when it did
+    // not, for the same reason: the frame is only sent on a raise.  Held apart
+    // from m_reload_error because the two are cleared on different asks — a
+    // reload clears its own before sending — and one member for both would hand
+    // a startup failure to the first reload that asked.
+    std::string  m_start_error;
 
     // The last state the child reported about itself, observed and not adopted.
     //

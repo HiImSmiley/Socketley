@@ -89,6 +89,7 @@ enum class frame_type : uint16_t
     chan_rep  = 4,   // payload: see encode_chan_reply
     routes    = 5,   // payload: see encode_routes
     reload_err = 6,  // payload: why a `reload` failed; see below
+    start_err  = 7,  // payload: why `start`'s on_start raised; see below
 };
 
 // ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
@@ -105,6 +106,28 @@ enum class frame_type : uint16_t
 // no frame and the daemon's "did anything go wrong" is "did one arrive".  It is
 // written before the `routes` frame that ends the daemon's wait, so by the time
 // cmd_reload_lua stops waiting it has already been read.
+
+// ── start_err: the same answer, for the command that started the runtime ────
+//
+// on_start runs inside `create -s` as well as inside `reload-lua`, and for a
+// runtime in a worker it runs out here.  The child's start() does not fail on a
+// raise — see runtime_instance::start(), the listener is up and the state is
+// `running` several lines before on_start is called — so the `state` frame that
+// follows says `running`, await_startup() answers `serving`, and until this
+// frame existed the daemon had no way to learn that the script's set-up had not
+// happened.  `create -s` therefore exited 0 in silence for a runtime with none
+// of its subscriptions, timers or connections established.
+//
+// A separate frame from reload_err rather than a reuse of it.  The two are read
+// by different commands at different moments and cleared on different asks —
+// reload_err is cleared by send_reload() so that "nothing since the ask" is what
+// success looks like — and one member serving both would report a startup
+// failure as the answer to the first reload that came along.
+//
+// Same three rules as reload_err: the payload is the diagnostic verbatim, it is
+// sent only when on_start raised, and it is written before the `state` frame
+// that ends await_startup(), so it has been read by the time the daemon stops
+// waiting.
 
 // ── routes: what a runtime in a worker says it will answer ──────────────────
 //

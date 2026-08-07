@@ -761,6 +761,21 @@ private:
             return;
         if (!m_rt->start(m_loop))
             LOG_ERROR("proxy worker: proxy failed to start");
+
+        // A raise in on_start does not stop this runtime serving and is not
+        // meant to — start() says why — but `create -s` is still holding the
+        // operator's terminal, and out here its script's set-up is the one
+        // thing that side cannot observe.  Written before send_state(), which
+        // is what ends the daemon's wait, for the reason the reload path gives
+        // at the same point: an answer that arrives after the wait has ended is
+        // an answer nobody reads.
+        if (const std::string& why = m_rt->last_on_start_error(); !why.empty())
+        {
+            LOG_WARN(("proxy worker: " + why).c_str());
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::start_err, why))) {}
+        }
+
         send_state();
     }
 

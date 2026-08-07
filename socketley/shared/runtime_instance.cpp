@@ -333,6 +333,11 @@ bool runtime_instance::has_armed_io() const
     return m_armed_io;
 }
 
+const std::string& runtime_instance::last_on_start_error() const
+{
+    return m_on_start_error;
+}
+
 std::string_view runtime_instance::get_name() const
 {
     return m_name;
@@ -649,6 +654,12 @@ std::string_view runtime_instance::get_lua_script_path() const
 
 bool runtime_instance::invoke_on_start()
 {
+    // Every attempt starts with nothing to report, including the ones that
+    // return early: a runtime whose script no longer declares on_start, or that
+    // was handed a C++ callback instead, must not still be carrying the reason
+    // an earlier attempt raised.
+    m_on_start_error.clear();
+
     if (m_cb_on_start) { m_cb_on_start(); return true; }
     if (!m_lua || !m_lua->has_on_start())
         return true;
@@ -671,7 +682,18 @@ bool runtime_instance::invoke_on_start()
         // carry it to, and reload_lua_script() is the one that does.  The
         // buffer is per-thread and cleared by whoever is about to read it, so
         // writing here costs the callers that do not nothing at all.
-        lua_diag::record(std::string("on_start error: ") + e.what());
+        //
+        // And on the instance as well, which is what `start` and `create -s`
+        // read.  Those two go through runtime_manager::start(), whose answer is
+        // start()'s — and start() ignores this one deliberately, so by the time
+        // either command can look, the only thing that would have told it is a
+        // bool that was thrown away three frames down.  A thread-local is no
+        // good to them either: `start srv1 srv2 srv3` runs three on_starts
+        // before it reports anything, and each script may create runtimes of its
+        // own, whose loads clear that buffer.  The reason belongs to the runtime
+        // it happened in.
+        m_on_start_error = std::string("on_start error: ") + e.what();
+        lua_diag::record(m_on_start_error);
         return false;
     }
 #endif

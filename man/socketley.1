@@ -232,6 +232,20 @@ Create a new runtime instance.
 can be: server, client, proxy, cache.
 .I name
 is a unique identifier for the runtime.
+.IP
+With
+.B \-s
+and a
+.BR \-\-lua " script,"
+.B on_start
+runs inside this command. A raise there does not take the runtime down \(em it
+is created and running, with whatever
+.B on_start
+established before it failed \(em but the command exits 1 and names the callback
+and the reason, so a start whose set-up did not run is not reported as a clean
+one. Fix the script and
+.B reload\-lua
+to re-run it.
 .TP
 .BI "attach " "type name port " "[\-\-owner " "name" "]"
 Register an external process as a runtime visible in
@@ -3670,13 +3684,15 @@ the load, and a worker whose script did not load does not serve: the
 is refused with a reason and the runtime is left
 .BR failed .
 Inside a callback it is caught and logged like any other callback error, and the
-runtime carries on \(em so a script that builds its world in
+runtime carries on. In
 .B on_start
-comes up looking entirely healthy,
+that means a runtime that is up and serving with none of what
+.B on_start
+was for having happened \(em
 .B ls
-green and connections accepted, while none of what
-.B on_start
-was for has happened. Add
+green, connections accepted \(em so the command that started it exits 1 and
+names the callback and the reason. The runtime is left running either way; the
+exit code and the message are how the two are told apart. Add
 .B \-\-daemon\-process
 at
 .BR create ;

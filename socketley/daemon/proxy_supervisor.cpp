@@ -595,6 +595,16 @@ std::string proxy_supervisor::take_reload_error()
     return out;
 }
 
+std::string proxy_supervisor::take_start_error()
+{
+    // Cleared explicitly for the reason take_reload_error() gives: a moved-from
+    // string is valid but unspecified, and this member's whole meaning is
+    // "empty means on_start ran".
+    std::string out = std::move(m_start_error);
+    m_start_error.clear();
+    return out;
+}
+
 void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
 {
     m_endpoints = encoded_payload;
@@ -856,6 +866,16 @@ void proxy_supervisor::ingest(const std::string&)
                 // read back there rather than logged: the worker has already
                 // logged it, and the point of the frame is the other terminal.
                 m_reload_error = payload;
+                break;
+
+            case worker_proto::frame_type::start_err:
+                // The same shape one command along: only sent when on_start
+                // raised, and only between the `start` frame and the `state`
+                // frame that ends await_startup(), so this is the answer to the
+                // start cmd_create is holding.  Read back there rather than
+                // logged, because the worker has already logged it and the
+                // point of the frame is the operator's terminal.
+                m_start_error = payload;
                 break;
 
             case worker_proto::frame_type::publish:
