@@ -7,6 +7,10 @@ source "$(dirname "$0")/utils.sh"
 
 PROXY_PORT=19080
 BACKEND_PORT_1=19081
+# Connections in flight for the two HTTP tests.  40 because that is what the
+# bash version ran per batch, so the load the proxy sees is unchanged and only
+# the client measuring it is different.
+HTTP_CONCURRENCY=${HTTP_CONCURRENCY:-40}
 BACKEND_PORT_2=19082
 RESULTS_FILE="${RESULTS_DIR}/proxy_${TIMESTAMP}.json"
 
@@ -76,61 +80,26 @@ test_http_single_backend() {
     wait_for_port $PROXY_PORT || { log_error "Proxy failed to start"; kill "$backend_pid" 2>/dev/null; ensure_clean; return 1; }
     sleep 0.5
 
-    local latencies_file=$(mktemp)
-    local results_dir=$(mktemp -d)
-    local success=0
-    local batch=40
-
-    local start_time=$(get_time_ms)
-
-    timeout "$BENCH_TIMEOUT_CMD" bash -c '
-        source "'"$(dirname "$0")"'/utils.sh"
-        PROXY_PORT='"$PROXY_PORT"'
-        results_dir="'"$results_dir"'"
-        num_requests='"$num_requests"'
-        batch='"$batch"'
-        for i in $(seq 1 $num_requests); do
-            (
-                t0=$(get_time_ms)
-                exec 99<>/dev/tcp/localhost/$PROXY_PORT 2>/dev/null || exit 1
-                printf "GET /bench_proxy/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&99
-                IFS= read -r -t 2 resp <&99
-                exec 99<&-
-                t1=$(get_time_ms)
-                if [[ -n "$resp" ]]; then
-                    echo "$((t1 - t0))" > "$results_dir/r_$i"
-                fi
-            ) &
-            if [[ $((i % batch)) -eq 0 ]]; then
-                wait
-                echo -ne "\r  Progress: $i / $num_requests"
-            fi
-        done
-        wait
-    '
+    # See http_load.py for why this is not a bash loop any more.
+    local out
+    out=$(timeout "$BENCH_TIMEOUT_CMD" python3 "$(dirname "$0")/http_load.py" \
+              localhost "$PROXY_PORT" /bench_proxy/test "$num_requests" "$HTTP_CONCURRENCY")
     if [[ $? -eq 124 ]]; then
         log_bench "TIMEOUT" "proxy_http_single_backend request loop"
     fi
-    echo ""
 
-    for f in "$results_dir"/r_*; do
-        [[ -f "$f" ]] && { cat "$f" >> "$latencies_file"; ((success++)); }
-    done
-    rm -rf "$results_dir"
-
-    local end_time=$(get_time_ms)
-    local total_time=$((end_time - start_time))
-    local rps=$(echo "scale=2; $success * 1000 / $total_time" | bc)
-
-    local stats=$(calc_stats "$latencies_file")
-    rm -f "$latencies_file"
-
-    local avg_lat=$(echo "$stats" | grep -oP 'avg=\K[0-9.]+')
-    local p99_lat=$(echo "$stats" | grep -oP 'p99=\K[0-9.]+')
+    local success total_time rps avg_lat p99_lat
+    success=$(echo "$out" | grep -oP 'success=\K[0-9]+')
+    total_time=$(echo "$out" | grep -oP 'elapsed_ms=\K[0-9]+')
+    avg_lat=$(echo "$out" | grep -oP 'avg_ms=\K[0-9.]+')
+    p99_lat=$(echo "$out" | grep -oP 'p99_ms=\K[0-9.]+')
+    success=${success:-0}; total_time=${total_time:-0}
+    rps=0
+    [[ "$total_time" -gt 0 ]] && rps=$(echo "scale=2; $success * 1000 / $total_time" | bc)
 
     log_success "Successful requests: $success / $num_requests"
     log_success "Throughput: $rps req/sec"
-    log_info "Latency: $stats"
+    log_info "Latency: avg=${avg_lat}ms p99=${p99_lat}ms (${HTTP_CONCURRENCY} concurrent)"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
@@ -138,6 +107,7 @@ test_http_single_backend() {
         "success" "$success" \
         "total_time_ms" "$total_time" \
         "requests_per_sec" "$rps" \
+        "concurrency" "$HTTP_CONCURRENCY" \
         "avg_latency_ms" "$avg_lat" \
         "p99_latency_ms" "$p99_lat"
 
@@ -170,45 +140,30 @@ test_http_load_balancing() {
     sleep 0.5
 
     local success=0
-    local results_dir=$(mktemp -d)
-    local batch=40
 
-    local start_time=$(get_time_ms)
-
-    timeout "$BENCH_TIMEOUT_CMD" bash -c '
-        PROXY_PORT='"$PROXY_PORT"'
-        results_dir="'"$results_dir"'"
-        num_requests='"$num_requests"'
-        batch='"$batch"'
-        for i in $(seq 1 $num_requests); do
-            (
-                exec 99<>/dev/tcp/localhost/$PROXY_PORT 2>/dev/null || exit 1
-                printf "GET /bench_proxy/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&99
-                IFS= read -r -t 2 resp <&99
-                exec 99<&-
-                [[ -n "$resp" ]] && touch "$results_dir/ok_$i"
-            ) &
-            if [[ $((i % batch)) -eq 0 ]]; then
-                wait
-                echo -ne "\r  Progress: $i / $num_requests"
-            fi
-        done
-        wait
-    '
+    # The same client as the single-backend test, and that is the point: these
+    # two numbers are read against each other.  While one forked `date` twice
+    # per request and the other did not, the comparison said a second backend
+    # made the proxy five times faster, which was a statement about bash.
+    local out
+    out=$(timeout "$BENCH_TIMEOUT_CMD" python3 "$(dirname "$0")/http_load.py" \
+              localhost "$PROXY_PORT" /bench_proxy/test "$num_requests" "$HTTP_CONCURRENCY")
     if [[ $? -eq 124 ]]; then
         log_bench "TIMEOUT" "proxy_http_load_balancing request loop"
     fi
-    echo ""
 
-    success=$(ls "$results_dir" | wc -l)
-    rm -rf "$results_dir"
-
-    local end_time=$(get_time_ms)
-    local total_time=$((end_time - start_time))
-    local rps=$(echo "scale=2; $success * 1000 / $total_time" | bc)
+    local total_time rps avg_lat p99_lat
+    success=$(echo "$out" | grep -oP 'success=\K[0-9]+')
+    total_time=$(echo "$out" | grep -oP 'elapsed_ms=\K[0-9]+')
+    avg_lat=$(echo "$out" | grep -oP 'avg_ms=\K[0-9.]+')
+    p99_lat=$(echo "$out" | grep -oP 'p99_ms=\K[0-9.]+')
+    success=${success:-0}; total_time=${total_time:-0}
+    rps=0
+    [[ "$total_time" -gt 0 ]] && rps=$(echo "scale=2; $success * 1000 / $total_time" | bc)
 
     log_success "Successful requests: $success / $num_requests"
     log_success "Throughput: $rps req/sec"
+    log_info "Latency: avg=${avg_lat}ms p99=${p99_lat}ms (${HTTP_CONCURRENCY} concurrent)"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
@@ -217,7 +172,10 @@ test_http_load_balancing() {
         "strategy" "round-robin" \
         "success" "$success" \
         "total_time_ms" "$total_time" \
-        "requests_per_sec" "$rps"
+        "requests_per_sec" "$rps" \
+        "concurrency" "$HTTP_CONCURRENCY" \
+        "avg_latency_ms" "$avg_lat" \
+        "p99_latency_ms" "$p99_lat"
 
     socketley_cmd stop bench_proxy
     sleep 0.5
