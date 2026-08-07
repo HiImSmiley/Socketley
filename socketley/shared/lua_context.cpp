@@ -87,13 +87,64 @@ struct lua_timer : io_handler
 
 lua_context::~lua_context()
 {
-    // Clear all timer sol::function refs BEFORE the Lua state is destroyed.
-    // This prevents luaL_unref on a closed state when the timer CQE fires.
-    for (auto* t : m_active_timers)
-        static_cast<lua_timer*>(t)->fn = sol::nil;
+    // An active timer outlives this context, and has to.  Its io_request lives
+    // inside the lua_timer, which is its own heap allocation and its own
+    // io_handler — so the storage the ring is still reading is NOT the storage
+    // being freed here, and there is nothing to defer or quarantine the way
+    // daemon_handler defers a retired proxy_supervisor.  What this destructor
+    // owes the timer is severance, and it used to perform only half of it.
+    //
+    // It nilled the sol::function, which is why a completion could not call into
+    // a closed Lua state.  It left `ctx` pointing here — and lua_timer::on_cqe
+    // reaches through that pointer on every path it has, to unregister_timer()
+    // and timer_pool_release(), both of them methods on this object.  So a
+    // `reload-lua`, or a second load_lua_script(), on any script that called
+    // set_interval left a live registration naming a timer that would call two
+    // methods on freed memory the next time it fired.  Under ASan that is an
+    // abort one tick after the reload; without it, the replacement context is
+    // allocated at exactly this size immediately afterwards, so the stale
+    // completion edits the new context's timer tables about as often as it
+    // touches an unmapped page.
+    //
+    // deregister_owner() is deliberately NOT called here, and that is not an
+    // omission.  event_loop.h: a handler that frees itself from inside its own
+    // on_cqe must deregister THERE and not earlier, because deregistering while
+    // its last completion is in flight has that completion dropped, and the
+    // callback that would have freed the handler never runs.  on_cqe already
+    // does it in the right place, and the `else delete this` beside it is the
+    // terminal path a null ctx selects — which is what this severance is handing
+    // the timer to.  runtime_instance does the identical thing to its tick timer
+    // (`m_tick->rt = nullptr` in reload_lua_script), for the identical reason.
+    for (auto* p : m_active_timers)
+    {
+        auto* t = static_cast<lua_timer*>(p);
+        t->fn  = sol::nil;
+        t->ctx = nullptr;
+
+        // Bring the completion forward instead of waiting out the interval.  Not
+        // required for correctness — the timeout reports on its own schedule and
+        // the timer frees itself then, by the same path — but an interval can be
+        // an hour long, and until it reports, the timer holds its storage and
+        // one owner registration.  A reload every hour would accumulate both.
+        //
+        // Guarded on ring_open() and not merely on a non-null loop: this
+        // destructor also runs at process teardown, and by then shutdown_ring()
+        // has already been called.  A submission then is a submission into a
+        // ring that is gone.
+        if (t->loop && t->loop->ring_open())
+            if (!t->loop->submit_timeout_remove(&t->req)) {}
+    }
     m_active_timers.clear();
 
-    // Free all pooled timers
+    // The timer ids too.  They name timers this context no longer owns — every
+    // one of them has just been handed to its own completion — so a lookup that
+    // survived into the destructor's remaining work would find a pointer with
+    // nothing left to say.
+    m_timer_map.clear();
+
+    // Free all pooled timers.  These are safe to delete outright: a timer only
+    // reaches the pool from inside its own on_cqe, after that completion has
+    // reported, so the ring owes them nothing.
     for (auto* t : m_timer_pool)
         delete static_cast<lua_timer*>(t);
     m_timer_pool.clear();
