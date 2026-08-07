@@ -2883,7 +2883,7 @@ A callback that
 is not a callback that declined. The request is answered
 .BR "500 Internal Server Error" ,
 and the error is written to the daemon's log as
-.BR "[lua] on_http_request error: ..." .
+.BR "[lua <runtime>] on_http_request error: ..." .
 Falling through to the 404 would make a handler that broke indistinguishable,
 at the client, from one that had no answer.
 .IP
@@ -2907,7 +2907,13 @@ Called at a configurable interval while the runtime is running.
 is the actual elapsed time in milliseconds since the last tick (double).
 Requires a top-level
 .B tick_ms
-global (integer, minimum 10, default 100 if omitted) to be set in the Lua script.
+global to be set in the Lua script: a whole number of milliseconds, 10 or more,
+defaulting to 100 when the global is omitted. A value below 10, or one that is
+not a whole number, refuses the script at load with a reason rather than being
+rounded into something else \(em 10 is the shortest interval
+.B on_tick
+can be armed at, and a script that asks for less is asking for something the
+daemon will not do.
 Example:
 .nf
 tick_ms = 50
@@ -3387,7 +3393,8 @@ self.group_send(group, msg)        -- Send msg to all clients in a group
 -- Server: zero-copy pipe pairing (bypasses Lua callbacks)
 self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly between them
 self.unpipe(id)                    -- Remove pipe pairing for a client
-socketley.pipe(src, src_fd, dst, dst_fd) -- Cross-runtime pipe (both must be servers)
+socketley.pipe(src, fd_a, src, fd_b)   -- Pair two connections of one server
+socketley.pipe(src, fd, dst)           -- Route a connection to another server
                                    -- names other runtimes: needs --daemon-process
 
 -- Server: per-connection metadata
@@ -3460,7 +3467,19 @@ into whichever client had inherited that descriptor.
 .SS Global Functions
 .TP
 .B socketley.log(msg)
-Output log message with [lua] prefix.
+Write one line to the daemon's log at
+.B INFO
+level, prefixed with the name of the runtime that wrote it:
+.BR "[12:04:31] [INFO] [lua my\-server] ..." .
+It goes through the daemon's logger, so
+.B log_level
+in the configuration file turns it down like anything else; at the default
+level nothing that used to appear stops appearing. Every Lua diagnostic carries
+the same
+.B [lua <runtime>]
+prefix, which is what separates two scripts sharing one stderr \(em and two
+runtimes commonly share one script file, so the file name in an error is not an
+identity.
 .TP
 .B socketley.set_timeout(ms, fn) \(-> timer_id
 Fire
@@ -3603,8 +3622,16 @@ url         string   Request URL (http:// or https://)
 method      string   HTTP method (default "GET")
 body        string   Request body (optional)
 headers     table    Extra headers e.g. {["Content-Type"]="application/json"}
-timeout_ms  number   Timeout in milliseconds (default 5000)
+timeout_ms  number   Timeout in milliseconds, 1..3600000 (default 5000)
 .fi
+.PP
+A key that is present and of the wrong type or out of range comes back as
+.B "ok = false"
+with the reason in
+.BR error ,
+rather than being replaced by the default: `timeout_ms = "soon"` used to become
+5000 and make the request anyway, on a number nobody chose. A key that is
+absent keeps its default, which is not a mistake and is not reported.
 .PP
 Returns a table:
 .nf
@@ -3646,11 +3673,46 @@ socketley.remove(name)                -- Stop + remove runtime
 socketley.send(name, msg)             -- Send/broadcast to runtime
 socketley.list()                      -- List all runtime names (table)
 socketley.get(name)                   -- Get info table or nil
-socketley.pipe(src, src_fd, dst, dst_fd)  -- Cross-runtime pipe (servers)
+socketley.pipe(src, fd_a, src, fd_b)  -- Pair two connections of one server
+socketley.pipe(src, fd, dst)          -- Route a connection to another server
 .fi
 .P
-Config table keys: port, config (lua script path), target, mode, group, on_parent_stop ("remove"/"stop"), start (bool).
-Lua-created runtimes have parent-child ownership; port=0 creates internal-only servers that receive forwarded messages only.
+.B socketley.pipe
+is two calls and the argument count says which. With four arguments it pairs
+two connections of ONE server, both descriptors named and both used. With three
+it hands the connection to another
+.IR runtime ,
+which decides what answers it \(em there is no destination descriptor in that,
+so a fourth argument across two runtimes is refused rather than accepted and
+discarded.
+.P
+.B Config table keys:
+.BR port ,
+.B config
+(or
+.BR lua ,
+a script path),
+.BR target ,
+.B mode
+(server only),
+.B http
+and
+.B http_cache
+(server only),
+.BR group ,
+.B on_parent_stop
+("remove" or "stop"), and
+.B start
+(bool).
+.B The table is validated and a refusal is a refusal:
+a port outside 0..65535, a mode or policy that is not one of the listed values,
+a key that is not on this list, a script that will not load, or a
+.B start
+that cannot bind, each returns
+.B false
+with the reason in the log and leaves no runtime behind. Lua-created runtimes
+have parent-child ownership; port=0 creates internal-only servers that receive
+forwarded messages only.
 .PP
 .B "Every call above requires \-\-daemon\-process, and raises without it."
 .RS
@@ -3664,7 +3726,7 @@ with them, is replaced there by a function that raises a Lua error naming the
 call, the reason and the way out:
 .PP
 .nf
-[lua] on_start error: lobby.lua:13: socketley.create() is refused in a
+[lua lobby] on_start error: lobby.lua:13: socketley.create() is refused in a
 worker process: this call reaches for the runtime map, which lives in the
 daemon ... Create this runtime with \-\-daemon\-process, or move the call to
 one that has it.

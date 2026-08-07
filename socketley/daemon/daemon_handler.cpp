@@ -1060,21 +1060,33 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     bool autostart = false;
 
+    // What --lua asked for, loaded once every flag has been seen; see the --lua
+    // case in parse_common_flags for why it cannot be loaded where it is
+    // parsed, and the block below the TLS and ring refusals for where it is.
+    std::string lua_script;
+
     // ─── One flag has to be known before the others are read ────────────────
     //
-    // --lua is acted on the moment it is parsed, and what it does depends on
-    // whether this runtime will live in a worker: an out-of-process placeholder
-    // compiles the script and discards it, an in-process runtime loads and runs
-    // it (see runtime_instance::load_lua_script).  Flags arrive in whatever
-    // order the operator typed them, so `--lua x --daemon-process` would
-    // otherwise have compiled-and-discarded the script before anyone knew it
-    // was staying in the daemon -- and `--daemon-process --lua x` would not.  A
-    // create whose behaviour depends on argument order is a bug waiting for
-    // someone to reorder a command line.
+    // What --lua does depends on whether this runtime will live in a worker: an
+    // out-of-process placeholder compiles the script and discards it, an
+    // in-process runtime loads and runs it (see
+    // runtime_instance::load_lua_script).  Flags arrive in whatever order the
+    // operator typed them, so when --lua was acted on where it was parsed,
+    // `--lua x --daemon-process` compiled-and-discarded the script before
+    // anyone knew it was staying in the daemon -- and `--daemon-process --lua x`
+    // did not.  A create whose behaviour depends on argument order is a bug
+    // waiting for someone to reorder a command line.
+    //
+    // --lua is deferred to after the loop now, for the other half of the same
+    // sentence, and this pre-scan still has to happen: it settles the bit the
+    // deferred load reads.
     //
     // Scanned rather than reordered: the flag takes no value, so finding it is
     // exact, and marking early is idempotent with the case below that marks it
-    // again when the loop reaches it.
+    // again when the loop reaches it.  It stays a pre-scan now that --lua is
+    // deferred to after the loop, and for the same reason it was one: this bit
+    // decides what load_lua_script DOES, so it has to be settled before the
+    // load, and the load is still inside this command.
     // Any type, not only a proxy.  mark_out_of_process() has always been on
     // runtime_instance; what kept this to proxies was the cast, and the worker
     // no longer needs one — it builds whatever the config frame's type says.
@@ -1102,7 +1114,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     for (size_t i = 3; i < pa.count; ++i)
     {
-        int result = parse_common_flags(instance, pa, i, autostart);
+        int result = parse_common_flags(instance, pa, i, autostart, lua_script);
         if (result == -1)
         {
             switch (type)
@@ -1159,6 +1171,33 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     if (const std::string msg = instance_ring_refusal(instance, m_loop); !msg.empty())
     {
         std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
+    // ─── The script, last, because it reads everything else back ────────────
+    //
+    // Loading builds the interpreter, runs the file's top level and snapshots
+    // `self` from the instance — so it has to happen after every flag has been
+    // applied, or `self` describes a half-configured runtime.  See the --lua
+    // case in parse_common_flags for what that cost.
+    //
+    // After the two refusals above and not before them, for the reason they
+    // give for being where they are: a runtime that is about to be refused must
+    // not have run a line of anybody's script first.  A top level is allowed to
+    // create children, open sockets and send messages, and undoing that is not
+    // something `m_manager.remove(name)` can do.
+    if (!lua_script.empty() && !instance->load_lua_script(lua_script))
+    {
+        // The reason, not just the fact.  This used to print exactly the four
+        // words below while the parse error, or the sentence one of the
+        // `filters`/`routes` validators wrote for the person editing the file,
+        // went to stderr — and stderr is the daemon's log, one process away
+        // from the terminal that ran the command.  An operator was told their
+        // script would not load and never told why.
+        std::cout << "could not load Lua script: " << lua_script << "\n";
+        if (!lua_diag::text().empty())
+            std::cout << lua_diag::text() << "\n";
         m_manager.remove(name);
         return 1;
     }

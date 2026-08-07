@@ -230,7 +230,7 @@ self.stats()                -- {connections, bytes_in, bytes_out, ...}
 
 ### Global Functions
 ```lua
-socketley.log(msg)                 -- Log with [lua] prefix
+socketley.log(msg)                 -- One INFO line, prefixed [lua <runtime>]
 socketley.json_encode(v)           -- Lua value -> JSON string
 socketley.json_decode(s)           -- JSON string -> Lua value
 socketley.set_timeout(ms, fn)      -- one-shot timer, returns an id

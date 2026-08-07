@@ -55,9 +55,11 @@ Output:
   my-server    server    running
   my-client    client    running
 
-The handler's on_start lines appear in the daemon's log, one per runtime:
-  [lua] Runtime started: my-server
-  [lua] Runtime started: my-client
+The handler's on_start lines appear in the daemon's log, one per runtime,
+each naming the runtime it came from -- which is the point, since both lines
+come from the same handler file:
+  [12:04:31] [INFO] [lua my-server] Runtime started: my-server
+  [12:04:31] [INFO] [lua my-client] Runtime started: my-client
 
 Cleanup:
   socketley stop my-server my-client

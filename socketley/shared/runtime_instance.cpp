@@ -39,8 +39,8 @@ void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 void runtime_instance::start_tick_timer()
 {
     uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
-                : (m_lua ? m_lua->get_tick_ms() : 100);
-    if (ms < 10) ms = 10;
+                : (m_lua ? m_lua->get_tick_ms() : lua_tick::default_ms);
+    if (ms < lua_tick::floor_ms) ms = lua_tick::floor_ms;
     m_tick = new tick_handler();
     m_tick->rt = this;
     m_tick->loop = m_event_loop;
@@ -65,14 +65,14 @@ void runtime_instance::fire_tick(int res)
         if (SOCKETLEY_UNLIKELY(!r.valid()))
         {
             sol::error e = r;
-            std::cerr << "[lua] on_tick error: " << e.what() << "\n";
+            std::cerr << lua_diag::tag(get_name()) << " on_tick error: " << e.what() << "\n";
         }
 #endif
     }
     if (!m_tick || !m_event_loop) return;
     uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
-                : (m_lua ? m_lua->get_tick_ms() : 100);
-    if (ms < 10) ms = 10;
+                : (m_lua ? m_lua->get_tick_ms() : lua_tick::default_ms);
+    if (ms < lua_tick::floor_ms) ms = lua_tick::floor_ms;
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
     m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req);
@@ -522,7 +522,8 @@ bool runtime_instance::load_lua_script(std::string_view path)
         std::string err;
         if (!lua_context::script_compiles(path, err))
         {
-            std::cerr << "[lua] script error: " << err << std::endl;
+            std::cerr << lua_diag::tag(get_name()) << " script error: "
+                      << err << std::endl;
             return false;
         }
         m_lua_script_path = path;
@@ -559,7 +560,8 @@ bool runtime_instance::reload_lua_script()
         std::string err;
         if (!lua_context::script_compiles(m_lua_script_path, err))
         {
-            std::cerr << "[lua] script error: " << err << std::endl;
+            std::cerr << lua_diag::tag(get_name()) << " script error: "
+                      << err << std::endl;
             return false;
         }
         return true;
@@ -671,7 +673,7 @@ bool runtime_instance::invoke_on_start()
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_start error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_start error: " << e.what() << std::endl;
 
         // Recorded as well as printed, for the reason lua_context.h gives for
         // the load-time diagnostics: this is a tee, not a redirect.  The
@@ -713,7 +715,7 @@ void runtime_instance::invoke_on_stop()
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_stop error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_stop error: " << e.what() << std::endl;
     }
 #endif
 }
@@ -729,7 +731,7 @@ void runtime_instance::invoke_on_message(std::string_view msg)
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_message error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_message error: " << e.what() << std::endl;
     }
 #endif
 }
@@ -745,7 +747,7 @@ void runtime_instance::invoke_on_connect(int client_id)
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_connect error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_connect error: " << e.what() << std::endl;
     }
 #endif
 }
@@ -761,7 +763,7 @@ void runtime_instance::invoke_on_disconnect(int client_id)
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_disconnect error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_disconnect error: " << e.what() << std::endl;
     }
 #endif
 }
@@ -789,7 +791,7 @@ bool runtime_instance::invoke_on_auth(int client_id)
 
     if (!r.valid()) {
         sol::error e = r;
-        std::cerr << "[lua] on_auth error: " << e.what() << "\n";
+        std::cerr << lua_diag::tag(get_name()) << " on_auth error: " << e.what() << "\n";
         return false;  // Lua error → reject (fail-closed)
     }
     // nil, a non-bool, or no return at all → reject (fail-closed)
@@ -811,7 +813,7 @@ void runtime_instance::invoke_on_send([[maybe_unused]] std::string_view msg)
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_send error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_send error: " << e.what() << std::endl;
     }
 #endif
 }
@@ -939,7 +941,7 @@ void runtime_instance::invoke_on_client_message(int client_id, std::string_view 
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
         sol::error e = r;
-        std::cerr << "[lua] on_client_message error: " << e.what() << std::endl;
+        std::cerr << lua_diag::tag(get_name()) << " on_client_message error: " << e.what() << std::endl;
     }
 #endif
 }

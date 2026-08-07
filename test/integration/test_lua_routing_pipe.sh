@@ -22,14 +22,23 @@
 # (nil again).  The third is the one that cannot pass on a no-op — a build that
 # answered from a table it never cleared would still say rt_sub.
 #
-# ─── WHAT socketley.pipe ACTUALLY DOES, WHICH IS NOT WHAT IT LOOKS LIKE ────
+# ─── socketley.pipe IS TWO CALLS, AND THE ARGUMENT COUNT SAYS WHICH ────────
 #
-# The four-argument form reads as though it joins two descriptors across two
-# runtimes.  It does not: for src ~= dst it calls route_client(src_fd, dst_name)
-# and the fourth argument is discarded entirely.  That is worth a test because
-# it is worth knowing — a script passing a carefully obtained destination
-# descriptor is passing a value nothing reads.  Asserted by the destination
-# receiving traffic that was addressed to no descriptor of its own.
+# The four-argument form used to read as though it joined two descriptors
+# across two runtimes.  It never did: for src ~= dst it calls
+# route_client(src_fd, dst_name) and the fourth argument was discarded
+# entirely, so a script that went to the trouble of obtaining a descriptor from
+# the destination was told it had been used.
+#
+# The arity is the request now.  Four is the pipe — two connections of ONE
+# server, paired through pipe_peer_fd, which is an index into that server's own
+# table and cannot name anything outside it.  Three is the route — the
+# connection is handed to the destination RUNTIME, which decides what answers
+# it.  Asking for four across two runtimes is asking for the thing that does
+# not exist, and is refused by name rather than served as the other one.
+#
+# Both sides are asserted below: the refusal, and the three-argument form
+# delivering the destination traffic that was addressed to no descriptor.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -191,13 +200,16 @@ local first = nil
 
 function on_client_message(id, msg)
     if msg == "cross" then
-        -- The four-argument form.  The fourth argument is a descriptor number
-        -- that this call does not read; 0 is passed to say so.
-        self.send(id, "cross=" .. tostring(socketley.pipe("pipe_a", id, "pipe_b", 0)))
+        -- Three arguments: route this connection to the runtime named.
+        self.send(id, "cross=" .. tostring(socketley.pipe("pipe_a", id, "pipe_b")))
+
+    elseif msg == "cross4" then
+        -- Four, across two runtimes: the combination that does not exist.
+        self.send(id, "cross4=" .. tostring(socketley.pipe("pipe_a", id, "pipe_b", 0)))
 
     elseif msg == "crossmissing" then
         self.send(id, "crossmissing=" ..
-                  tostring(socketley.pipe("pipe_a", id, "nosuchruntime", 0)))
+                  tostring(socketley.pipe("pipe_a", id, "nosuchruntime")))
 
     elseif msg == "hold" then
         first = id
@@ -297,16 +309,16 @@ assert_eq "...and the payload reaches a client of the owner" \
     "that client is connected to the parent and has never spoken to the" \
     "sub-server; reaching it is the whole point of the call"
 
-# ── 3. socketley.pipe, four-argument cross-runtime form ────────────────────
+# ── 3. socketley.pipe, three-argument cross-runtime form ───────────────────
 T=$(tx "$A_PORT" c1 s1:cross r1 w:0.4 "s1:CROSSED-PAYLOAD" w:0.6 x1)
 assert_eq "socketley.pipe() across two runtimes reports success" \
           "R1:cross=true" "$(grep -o 'R1:cross=[a-z]*' <<<"$T" | head -1)"
 said 'PIPEB got=' 8 || true
 assert_eq "...and the source's traffic arrives at the destination runtime" \
           "1" "$(hits 'PIPEB got=\[CROSSED-PAYLOAD\]' "$SOCKETLEY_DLOG")" \
-    "the fourth argument was 0, a descriptor the destination has never had —" \
-    "this form routes the connection by NAME and discards it, which is not" \
-    "what four arguments look like"
+    "the connection is routed by NAME and the destination decides what" \
+    "answers it; there is no destination descriptor in this, which is why" \
+    "the form that offers one is refused below"
 assert_eq "...and the traffic no longer reaches the source runtime" \
           "0" "$(hits 'PIPEA got=\[CROSSED-PAYLOAD\]' "$SOCKETLEY_DLOG")" \
     "a build that copied rather than moved the connection satisfies the line" \
@@ -316,6 +328,16 @@ T=$(tx "$A_PORT" c1 s1:crossmissing r1 x1)
 assert_eq "socketley.pipe() to a runtime that does not exist returns false" \
           "R1:crossmissing=false" \
           "$(grep -o 'R1:crossmissing=[a-z]*' <<<"$T" | head -1)"
+
+# The fourth argument across two runtimes is the request that does not exist.
+# It used to be accepted, discarded, and reported as success — and this file
+# asserted that, because it was the behaviour.
+T=$(tx "$A_PORT" c1 s1:cross4 r1 x1)
+assert_eq "...and a destination descriptor across two runtimes is refused" \
+          "R1:cross4=false" "$(grep -o 'R1:cross4=[a-z]*' <<<"$T" | head -1)" \
+    "pipe_peer_fd is an index into ONE server's connection table, so there is" \
+    "no cross-runtime pairing to make; the call routed by name and threw the" \
+    "descriptor away while answering true"
 
 # ── 4. socketley.pipe, same-runtime form ───────────────────────────────────
 #

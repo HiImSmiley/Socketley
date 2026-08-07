@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -32,6 +33,57 @@ namespace lua_diag
     // Record one line.  Called from lua_context and runtime_instance's
     // compile-only paths; nothing else should need it.
     void record(std::string_view line);
+
+    // ─── Which runtime's script said it ─────────────────────────────────────
+    //
+    // The prefix every Lua diagnostic in this tree carries: "[lua <name>]", or
+    // "[lua]" for the handful of lines that belong to no runtime — the
+    // SOCKETLEY_LUA_TIMEOUT_MS parse, and the daemon's own configuration file.
+    //
+    // It used to be "[lua]" everywhere, and with one script running that is
+    // enough.  It stops being enough at two.  The text after the prefix names
+    // the callback and, when Lua has a location for it, the script and line:
+    //
+    //     [lua] on_message error: handler.lua:12: attempt to index a nil value
+    //
+    // Which is a file, and a file is not a runtime.  Sharing one handler across
+    // a set of servers is the ordinary way to write them — examples/ does it —
+    // so that line is consistent with any of them, and with all of them at
+    // once.  There is nothing else in the line to narrow it down: no port, no
+    // pid, one stderr for the whole daemon.
+    //
+    // A std::string per line, on paths that are already reporting a failure.
+    // The one caller on an ordinary path is socketley.log, which is a write to
+    // a log either way.
+    std::string tag(std::string_view runtime_name);
+}
+
+// ─── The tick floor, in one place ───────────────────────────────────────────
+//
+// `tick_ms` is a script global, and it used to be read against two different
+// rules.  lua_context mapped anything below 10 to 100; runtime_instance, which
+// is what actually arms the timer, clamped anything below 10 to 10.  So
+// `tick_ms = 5` ran at 100ms — ten times slower than the other rule allows —
+// and which number a reader predicted depended on which file they opened.
+//
+// runtime_instance's is the one that survives, because it is the one that
+// decides: it also clamps m_cb_tick_ms, the interval a C++ SDK runtime sets
+// through set_tick_interval, and that path has no load step to refuse at.  So
+// the floor stays there as the last word, and the Lua path REFUSES a value
+// below it rather than raising it — a script asking for 5 is asking for
+// something this daemon will not do, and being told so at load is the whole
+// difference between a mistake found while editing the file and a mistake
+// found by wondering why a tick is late.
+//
+// Outside the SOCKETLEY_NO_LUA guard: runtime_instance clamps in both builds.
+namespace lua_tick
+{
+    // The shortest interval on_tick may be armed at.
+    inline constexpr uint32_t floor_ms = 10;
+
+    // What a script that declares on_tick and no tick_ms gets, and what a
+    // runtime with no script at all ticks at.
+    inline constexpr uint32_t default_ms = 100;
 }
 
 #ifndef SOCKETLEY_NO_LUA
@@ -164,7 +216,17 @@ namespace lua_deadline
         // `limit_ms` of 0 leaves the deadline unarmed.  It does not stop the
         // scope counting: a callback is on the stack whether or not anyone is
         // timing it.
-        scope(const char* what, uint32_t limit_ms) noexcept;
+        //
+        // `runtime` names the runtime whose script this is, for the same reason
+        // every other Lua diagnostic now carries one — see lua_diag::tag.  A
+        // const char* rather than a string_view because the hook must format it
+        // with fprintf at a point where no C++ destructor may run; it outlives
+        // the scope for the same reason `what` does, the one caller that passes
+        // a non-literal handing it lua_context::m_owner_name, which outlives
+        // every callback made through that context.  Null for the two scopes
+        // that belong to no runtime: the daemon's configuration file, and a
+        // script's top level, which runs before there is a runtime to name.
+        scope(const char* what, uint32_t limit_ms, const char* runtime = nullptr) noexcept;
         ~scope() noexcept;
         scope(const scope&)            = delete;
         scope& operator=(const scope&) = delete;
@@ -207,8 +269,9 @@ template <class F>
 class lua_guarded_call
 {
 public:
-    lua_guarded_call(F& fn, const char* what, uint32_t limit_ms) noexcept
-        : m_fn(fn), m_scope(what, limit_ms) {}
+    lua_guarded_call(F& fn, const char* what, uint32_t limit_ms,
+                     const char* runtime = nullptr) noexcept
+        : m_fn(fn), m_scope(what, limit_ms, runtime) {}
 
     // decltype(auto) rather than auto: sol's call operator returns a result
     // object that owns a slice of the Lua stack and pops it when it dies.  The
@@ -250,6 +313,11 @@ public:
 
     // Get the Lua state (for callback invocation)
     sol::state& state() { return m_lua; }
+
+    // The runtime this interpreter belongs to, for a diagnostic's prefix.
+    // Empty before load_script has run, and for a context that was built
+    // without one.  See lua_diag::tag.
+    const std::string& owner_name() const { return m_owner_name; }
 
     // Update self.state to reflect current runtime state
     void update_self_state(const char* state_str);
@@ -356,37 +424,37 @@ public:
     // down, and what let it was that `guarded` still existed to spell it.
     using guarded_protected = lua_guarded_call<sol::protected_function>;
 
-    guarded_protected on_start()      { return {m_on_start,      "on_start",      m_deadline_ms}; }
-    guarded_protected on_stop()       { return {m_on_stop,       "on_stop",       m_deadline_ms}; }
-    guarded_protected on_message()    { return {m_on_message,    "on_message",    m_deadline_ms}; }
-    guarded_protected on_send()       { return {m_on_send,       "on_send",       m_deadline_ms}; }
-    guarded_protected on_connect()    { return {m_on_connect,    "on_connect",    m_deadline_ms}; }
-    guarded_protected on_disconnect() { return {m_on_disconnect, "on_disconnect", m_deadline_ms}; }
+    guarded_protected on_start()      { return {m_on_start,      "on_start",      m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_stop()       { return {m_on_stop,       "on_stop",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_message()    { return {m_on_message,    "on_message",    m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_send()       { return {m_on_send,       "on_send",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_connect()    { return {m_on_connect,    "on_connect",    m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_disconnect() { return {m_on_disconnect, "on_disconnect", m_deadline_ms, m_owner_name.c_str()}; }
     // on_route and on_master_auth were protected before the sweep — see
     // m_on_route below for the reasoning that the sweep then generalised.
-    guarded_protected on_route()       { return {m_on_route,       "on_route",       m_deadline_ms}; }
-    guarded_protected on_master_auth() { return {m_on_master_auth, "on_master_auth", m_deadline_ms}; }
-    guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms}; }
-    guarded_protected on_tick()       { return {m_on_tick,       "on_tick",       m_deadline_ms}; }
-    guarded_protected on_miss()       { return {m_on_miss,       "on_miss",       m_deadline_ms}; }
-    guarded_protected on_write()      { return {m_on_write,      "on_write",      m_deadline_ms}; }
-    guarded_protected on_delete_cb()  { return {m_on_delete,     "on_delete",     m_deadline_ms}; }  // avoid clash with std::delete
-    guarded_protected on_expire()     { return {m_on_expire,     "on_expire",     m_deadline_ms}; }
+    guarded_protected on_route()       { return {m_on_route,       "on_route",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_master_auth() { return {m_on_master_auth, "on_master_auth", m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_tick()       { return {m_on_tick,       "on_tick",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_miss()       { return {m_on_miss,       "on_miss",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_write()      { return {m_on_write,      "on_write",      m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_delete_cb()  { return {m_on_delete,     "on_delete",     m_deadline_ms, m_owner_name.c_str()}; }  // avoid clash with std::delete
+    guarded_protected on_expire()     { return {m_on_expire,     "on_expire",     m_deadline_ms, m_owner_name.c_str()}; }
     // The callback that decides whether a client is served at all.  A deadline
     // raised in here IS such a failure, and it reaches invoke_on_auth's
     // !valid() branch — reported, and fail-closed — rather than vanishing.
-    guarded_protected on_auth()       { return {m_on_auth,       "on_auth",       m_deadline_ms}; }
-    guarded_protected on_websocket()  { return {m_on_websocket,  "on_websocket",  m_deadline_ms}; }
-    guarded_protected on_proxy_request()  { return {m_on_proxy_request,  "on_proxy_request",  m_deadline_ms}; }
-    guarded_protected on_proxy_response() { return {m_on_proxy_response, "on_proxy_response", m_deadline_ms}; }
-    guarded_protected on_cluster_join()  { return {m_on_cluster_join,  "on_cluster_join",  m_deadline_ms}; }
-    guarded_protected on_cluster_leave() { return {m_on_cluster_leave, "on_cluster_leave", m_deadline_ms}; }
-    guarded_protected on_group_change()  { return {m_on_group_change,  "on_group_change",  m_deadline_ms}; }
-    guarded_protected on_upstream()            { return {m_on_upstream,            "on_upstream",            m_deadline_ms}; }
-    guarded_protected on_upstream_connect()    { return {m_on_upstream_connect,    "on_upstream_connect",    m_deadline_ms}; }
-    guarded_protected on_upstream_disconnect() { return {m_on_upstream_disconnect, "on_upstream_disconnect", m_deadline_ms}; }
+    guarded_protected on_auth()       { return {m_on_auth,       "on_auth",       m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_websocket()  { return {m_on_websocket,  "on_websocket",  m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_proxy_request()  { return {m_on_proxy_request,  "on_proxy_request",  m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_proxy_response() { return {m_on_proxy_response, "on_proxy_response", m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_cluster_join()  { return {m_on_cluster_join,  "on_cluster_join",  m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_cluster_leave() { return {m_on_cluster_leave, "on_cluster_leave", m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_group_change()  { return {m_on_group_change,  "on_group_change",  m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_upstream()            { return {m_on_upstream,            "on_upstream",            m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_upstream_connect()    { return {m_on_upstream_connect,    "on_upstream_connect",    m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_upstream_disconnect() { return {m_on_upstream_disconnect, "on_upstream_disconnect", m_deadline_ms, m_owner_name.c_str()}; }
     // A handler that raises has not declined; see m_on_http_request below.
-    guarded_protected on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms}; }
+    guarded_protected on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms, m_owner_name.c_str()}; }
     // The chain, in the order the script listed it.  Only valid to read when
     // has_filters() is true; empty otherwise.
     //
@@ -435,6 +503,16 @@ private:
     void install_deadline_hook();
 
     void register_bindings(runtime_instance* owner);
+
+    // One load-time refusal: into the daemon's log, naming this runtime, and
+    // into the buffer the command that asked for this load reads back.
+    //
+    // The two halves say different things on purpose.  The log line carries the
+    // runtime name because the log is shared by every runtime in the daemon;
+    // the recorded line does not, because whoever is about to read it typed the
+    // name themselves one command ago and would be told it twice.
+    void load_diag(const std::string& msg) const;
+
     // Overwrite the cross-runtime calls with a refusal that names them.  Only
     // called when in_worker_process().
     void refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl);
@@ -442,6 +520,14 @@ private:
     void register_client_table(runtime_instance* owner, sol::table& self);
     void register_cache_table(runtime_instance* owner, sol::table& self);
     void register_proxy_table(runtime_instance* owner, sol::table& self);
+
+    // The runtime this interpreter belongs to, by name, for the diagnostics.
+    //
+    // A copy and not a pointer to the owner: the timer completions and the
+    // subscription fan-out both report from places where the context has
+    // already been severed from its runtime, and a name that reads as freed
+    // memory is worse than no name at all.  Written once, in register_bindings.
+    std::string m_owner_name;
 
     sol::state m_lua;
     sol::protected_function m_on_start;

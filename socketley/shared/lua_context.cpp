@@ -17,6 +17,21 @@ namespace lua_diag
         if (!s_text.empty()) s_text += '\n';
         s_text += line;
     }
+
+    // See the declaration.  The empty name is not an error case — the daemon's
+    // own configuration file and the SOCKETLEY_LUA_TIMEOUT_MS parse are Lua
+    // diagnostics belonging to no runtime, and "[lua]" is what they mean.
+    std::string tag(std::string_view runtime_name)
+    {
+        std::string out("[lua");
+        if (!runtime_name.empty())
+        {
+            out += ' ';
+            out += runtime_name;
+        }
+        out += ']';
+        return out;
+    }
 }
 
 #ifndef SOCKETLEY_NO_LUA
@@ -24,6 +39,7 @@ namespace lua_diag
 #include "runtime_instance.h"
 #include "runtime_definitions.h"
 #include "runtime_manager.h"
+#include "logging.h"
 #include "cluster_discovery.h"
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
@@ -41,6 +57,7 @@ namespace lua_diag
 #include <charconv>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +100,10 @@ static constexpr int hook_count = 10000;
 static thread_local unsigned                              t_depth{0};
 static thread_local std::chrono::steady_clock::time_point t_deadline{};
 static thread_local const char*                           t_what{nullptr};
+// Which runtime's script the armed invocation belongs to; null for the two
+// that belong to none.  Set and cleared beside t_what, which makes the pairing
+// impossible to get half right.
+static thread_local const char*                           t_runtime{nullptr};
 static thread_local uint32_t                              t_limit_ms{0};
 // Whether this invocation has already been reported.  The hook raises every
 // time it fires past the deadline, but says so once: a script that wraps its
@@ -123,7 +144,7 @@ uint32_t default_ms()
     return value;
 }
 
-scope::scope(const char* what, uint32_t limit_ms) noexcept
+scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
     : m_outermost(t_depth == 0 && limit_ms != 0)
     , m_first_frame(t_frames == 0)
 {
@@ -140,6 +161,7 @@ scope::scope(const char* what, uint32_t limit_ms) noexcept
         t_deadline = std::chrono::steady_clock::now()
                    + std::chrono::milliseconds(limit_ms);
         t_what     = what;
+        t_runtime  = runtime;
         t_limit_ms = limit_ms;
         t_reported = false;
     }
@@ -165,6 +187,7 @@ scope::~scope() noexcept
     {
         t_depth    = 0;
         t_what     = nullptr;
+        t_runtime  = nullptr;
         t_limit_ms = 0;
     }
     else if (t_depth != 0)
@@ -252,8 +275,17 @@ static void hook(lua_State* L, lua_Debug*)
     if (!t_reported)
     {
         t_reported = true;
-        std::fprintf(stderr, "[lua] %s hit its %ums deadline and was stopped\n",
-                     what, ms);
+        // Two formats rather than one built with lua_diag::tag(): that returns
+        // a std::string, and the paragraph above is about what may be alive
+        // when luaL_error unwinds by whatever means LuaJIT was built for.
+        // Nothing here allocates.
+        if (t_runtime && *t_runtime)
+            std::fprintf(stderr,
+                         "[lua %s] %s hit its %ums deadline and was stopped\n",
+                         t_runtime, what, ms);
+        else
+            std::fprintf(stderr, "[lua] %s hit its %ums deadline and was stopped\n",
+                         what, ms);
         std::fflush(stderr);
     }
 
@@ -405,7 +437,8 @@ struct lua_timer : io_handler
         // is already the right place for it to be reported.
         {
             lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
-                                      ctx ? ctx->callback_timeout_ms() : 0u);
+                                      ctx ? ctx->callback_timeout_ms() : 0u,
+                                      ctx ? ctx->owner_name().c_str() : nullptr);
             // The flag brackets the call and nothing else.  A callback may
             // cancel its own timer — clear_interval(id) from inside the
             // interval is the one-shot shape — and sever_timer() has to be able
@@ -416,7 +449,9 @@ struct lua_timer : io_handler
             if (SOCKETLEY_UNLIKELY(!tr.valid()))
             {
                 sol::error e = tr;
-                fprintf(stderr, "[lua] timer error: %s\n", e.what());
+                fprintf(stderr, "%s timer error: %s\n",
+                        lua_diag::tag(ctx ? std::string_view(ctx->owner_name())
+                                          : std::string_view{}).c_str(), e.what());
             }
         }
         if (repeat && *alive && !cancelled)
@@ -616,9 +651,26 @@ static const char* state_to_string(runtime_state s)
 // in the two declaration validators goes through here, because every one of
 // them is a sentence written for the person editing the script — and until now
 // not one of them could reach them.
-static void load_diag(const std::string& msg)
+//
+// See the declaration for why only one of the two halves carries the name.
+void lua_context::load_diag(const std::string& msg) const
 {
-    std::cerr << "[lua] " << msg << std::endl;
+    std::cerr << lua_diag::tag(m_owner_name) << ' ' << msg << std::endl;
+    lua_diag::record(msg);
+}
+
+// The same line, from the management API rather than from a load.
+//
+// It records as well as prints for a reason that is easy to miss: a script's
+// TOP LEVEL runs synchronously inside `create`, and a top-level
+// socketley.create() is the ordinary way an orchestration script builds its
+// children — so there genuinely is a command in flight to carry the reason to,
+// and cmd_create already reads the buffer back.  When there is no such command
+// the buffer costs a string nobody reads and is cleared by the next load.
+static void api_diag(runtime_instance* owner, const std::string& msg)
+{
+    std::cerr << lua_diag::tag(owner ? owner->get_name() : std::string_view{})
+              << ' ' << msg << std::endl;
     lua_diag::record(msg);
 }
 
@@ -676,7 +728,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     // The process default and not the script's own `callback_timeout_ms`: the
     // global is set BY this chunk, so at this point there is nothing to read.
     auto result = [&] {
-        lua_deadline::scope guard("the script's top level", lua_deadline::default_ms());
+        lua_deadline::scope guard("the script's top level", lua_deadline::default_ms(),
+                                  m_owner_name.c_str());
         return m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
     }();
     if (!result.valid())
@@ -748,9 +801,47 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
     m_on_tick = m_lua["on_tick"];
+    // ─── tick_ms, against one floor rather than two ─────────────────────────
+    //
+    // See lua_tick in the header for which of the two rules this file used to
+    // hold survived and why.  What changed here is that a value below the floor
+    // is now REFUSED instead of being turned into a different number: this line
+    // read `(tms && *tms >= 10) ? *tms : 100`, so `tick_ms = 5` was not a
+    // clamp, it was a substitution — the script asked for 5 and got 100, twenty
+    // times slower, with the same silence a script that asked for nothing gets.
+    //
+    // Absent still means 100.  A script that declares on_tick and no interval
+    // has expressed no opinion, and a default is the right answer to that;
+    // there is nothing for anybody to be surprised by later.  The refusal is
+    // only for a value that was written down and could not be honoured.
+    //
+    // The read is a double with an integrality test rather than
+    // `get<sol::optional<int>>()`, and that is not decoration.  Every Lua
+    // number is a double, so `tick_ms = 12.5` is an ordinary thing to type;
+    // asking sol for an int leaves what happens to the half up to a conversion
+    // this file does not own, and the two builds do not agree about conversions
+    // — that is the whole subject of the note at callback_timeout_ms above.
+    // Asking for the number and judging it here has one answer in every build.
     if (m_on_tick.valid()) {
-        sol::optional<int> tms = m_lua["tick_ms"].get<sol::optional<int>>();
-        m_tick_ms = (tms && *tms >= 10) ? static_cast<uint32_t>(*tms) : 100;
+        sol::object t = m_lua["tick_ms"];
+        if (!t.valid() || t == sol::nil)
+        {
+            m_tick_ms = lua_tick::default_ms;
+        }
+        else if (t.get_type() != sol::type::number ||
+                 t.as<double>() != std::floor(t.as<double>()) ||
+                 t.as<double>() < static_cast<double>(lua_tick::floor_ms) ||
+                 t.as<double>() > 86400000.0)
+        {
+            load_diag("`tick_ms` must be a whole number of milliseconds, "
+                      + std::to_string(lua_tick::floor_ms)
+                      + " or more — the shortest interval on_tick can be armed at");
+            return false;
+        }
+        else
+        {
+            m_tick_ms = static_cast<uint32_t>(t.as<double>());
+        }
     }
     m_on_miss   = m_lua["on_miss"];
     m_on_write  = m_lua["on_write"];
@@ -1019,7 +1110,8 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     // scope and the whole fan-out shares one budget.
     ++m_dispatch_depth;
     {
-        lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms);
+        lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms,
+                                  m_owner_name.c_str());
         for (size_t i = 0; i < n; ++i)
         {
             if (subs[i].dead) continue;
@@ -1027,7 +1119,8 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
             if (SOCKETLEY_UNLIKELY(!r.valid()))
             {
                 sol::error e = r;
-                fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
+                fprintf(stderr, "%s subscribe callback error: %s\n",
+                        lua_diag::tag(m_owner_name).c_str(), e.what());
             }
         }
     }
@@ -1269,12 +1362,63 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     sol::optional<std::string> url_opt = opts["url"].get<sol::optional<std::string>>();
     if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
 
-    std::string method  = sol::optional<std::string>(opts["method"]).value_or("GET");
-    std::string url     = *url_opt;
-    std::string body    = sol::optional<std::string>(opts["body"]).value_or("");
-    int timeout_ms      = sol::optional<int>(opts["timeout_ms"]).value_or(5000);
-    if (timeout_ms <= 0)
-        timeout_ms = 5000;
+    // ─── The three optional keys, checked ───────────────────────────────────
+    //
+    // These were the last `sol::optional<T> x = tbl[k]` reads in this file, the
+    // form 091e6d9 replaced everywhere else after one of them took the daemon
+    // down: the converting constructor runs an unconditional conversion, sol2's
+    // safety checks follow NDEBUG, and a key that is absent or of another type
+    // throws across the Lua C boundary into std::terminate.  Honestly: this
+    // pair does not throw today, measured — `socketley.http{url=...}` with no
+    // `method` is what every test in the tree calls and it answers "GET" in
+    // both builds.  It is replaced anyway for the reason written at
+    // callback_timeout_ms: whether a conversion throws is a property of the
+    // build, and that is not a thing to rest on when the checked form costs
+    // nothing.
+    //
+    // And the second half is this file's own subject.  `timeout_ms = "soon"`
+    // read as nullopt and became 5000 — a value written down, discarded, and
+    // the request made anyway on a number nobody chose.  A wrong value is
+    // reported through `result.error`, which is the channel this call already
+    // has and the one a script can act on; a *missing* value keeps its default,
+    // because saying nothing is not a mistake.
+    std::string url = *url_opt;
+
+    std::string method = "GET";
+    if (sol::object o = opts["method"]; o.valid() && o != sol::nil)
+    {
+        if (o.get_type() != sol::type::string)
+        {
+            result["error"] = "method must be a string";
+            return result;
+        }
+        method = o.as<std::string>();
+    }
+
+    std::string body;
+    if (sol::object o = opts["body"]; o.valid() && o != sol::nil)
+    {
+        if (o.get_type() != sol::type::string)
+        {
+            result["error"] = "body must be a string";
+            return result;
+        }
+        body = o.as<std::string>();
+    }
+
+    int timeout_ms = 5000;
+    if (sol::object o = opts["timeout_ms"]; o.valid() && o != sol::nil)
+    {
+        const double d = (o.get_type() == sol::type::number) ? o.as<double>() : -1.0;
+        if (o.get_type() != sol::type::number || d != std::floor(d) ||
+            d < 1.0 || d > 3600000.0)
+        {
+            result["error"] = "timeout_ms must be a whole number of "
+                              "milliseconds in 1..3600000";
+            return result;
+        }
+        timeout_ms = static_cast<int>(d);
+    }
 
     // Inside the callback's budget, not beside it.  remaining_ms() is -1 when
     // no deadline is armed — a call from somewhere that is not a callback, or a
@@ -2093,7 +2237,8 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
         // Cannot happen with a working interpreter, and if it does the honest
         // thing is to say so rather than leave the old bindings in place while
         // believing they are gone.
-        std::cerr << "[lua] could not install the out-of-process refusals; the "
+        std::cerr << lua_diag::tag(m_owner_name)
+                  << " could not install the out-of-process refusals; the "
                      "cross-runtime management API is left bound and will "
                      "answer nothing" << std::endl;
         return;
@@ -2121,34 +2266,143 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
 
 void lua_context::register_bindings(runtime_instance* owner)
 {
+    // Which runtime every diagnostic from this interpreter belongs to.  First,
+    // because load_diag is called from the validators below this point and from
+    // load_script, which calls this function before it does anything else.
+    m_owner_name = std::string(owner->get_name());
+
     // Register socketley.log() and management API
     sol::table sk = m_lua.create_table();
-    sk["log"] = [](std::string msg) {
-        std::cerr << "[lua] " << msg << std::endl;
+
+    // ─── socketley.log, through the daemon's own logger ─────────────────────
+    //
+    // It wrote straight to std::cerr, which made it the one stream in this
+    // process with no timestamp, no level and no way to turn it down.  A script
+    // logging per message is a script whose operator cannot ask for less
+    // without editing the script — and `log_level` in the daemon's
+    // configuration file exists precisely so that asking for less is a setting.
+    //
+    // At `info`, which is the default, nothing that used to appear stops
+    // appearing; it gains a clock and a level. At `warn`, script chatter goes
+    // quiet, which is what an operator who set `warn` asked for and could not
+    // previously get. That is the judgement: this is output, not diagnosis —
+    // the failures a script must never lose are the callback errors below,
+    // and those are ERROR and survive every level but silence.
+    sk["log"] = [owner](std::string msg) {
+        std::string line = lua_diag::tag(owner->get_name());
+        line += ' ';
+        line += msg;
+        LOG_INFO(line.c_str());
     };
 
     // socketley.create(type, name, config_table) → bool
-    sk["create"] = [owner](std::string type_str, std::string name, sol::optional<sol::table> config) -> bool {
+    //
+    // ─── THE TABLE IS JUDGED BEFORE ANYTHING IS BUILT ───────────────────────
+    //
+    // Every read below used to be "if it is there and I can convert it, apply
+    // it", with no branch for a value that was there and wrong.  That is one
+    // decision repeated eight times, and it is the wrong one every time:
+    //
+    //     port = 70000        cast to uint16_t -> a server on 4464
+    //     mode = "mater"      the switch's default: -> an inout server
+    //     on_parent_stop="keeep"  compared only against "remove" -> keep
+    //     prot = 8080         read by nothing -> a server on port 0
+    //
+    // and in all four the call answered `true`.  A script cannot see any of it:
+    // socketley.get(name).port answers 4464 as confidently as it would answer
+    // 8080, and the operator finds out from a client that cannot connect.
+    //
+    // The refusal policy is not invented here.  `filters` and `routes`, two
+    // hundred lines up this file, refuse the WHOLE script for exactly this
+    // class of mistake, and their validators say why: a hole in a chain is not
+    // visible, so the load fails rather than half-working.  A child runtime on
+    // a port nobody chose is the same shape — invisible from the script, from
+    // `ls`, and from the runtime itself, which is running perfectly well.
+    //
+    // UNKNOWN KEYS ARE REFUSED TOO, and that is the one line here worth
+    // arguing.  The case against is forward compatibility: a script written for
+    // a later socketley, naming a key this one has never heard of, stops
+    // loading instead of degrading.  The case for is that this table is not a
+    // wire format — it is read by the daemon the script is running inside, of
+    // the same build, on the same machine — so there is no version skew to
+    // absorb, and the failure it prevents is the commonest one there is.
+    // `prot = 8080` is a typo somebody will make; a server on port 0 is what
+    // they get for it, and nothing anywhere says the word `prot`. Refused, with
+    // the key named.
+    //
+    // The order matters as much as the checks: everything is judged BEFORE
+    // mgr->create, so a refusal leaves no runtime behind at all.  The two that
+    // cannot be — the script, which needs an instance to load into, and the
+    // start, which needs one to bind — remove what they built, which is what
+    // cmd_create does for the identical two failures on the CLI side.
+    // sol::object and not sol::optional<sol::table> for the third parameter:
+    // the optional answers nullopt for a value that is present and not a table,
+    // which is indistinguishable from no third argument at all — so
+    // socketley.create("server", "s", 8080) built a portless server and
+    // reported success.  An object says which of the two it was.
+    sk["create"] = [owner](std::string type_str, std::string name, sol::object config) -> bool {
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop) return false;
 
+        const std::string where = "socketley.create(\"" + type_str + "\", \"" + name + "\")";
+        auto refuse = [&](const std::string& why) {
+            api_diag(owner, where + ": " + why);
+            return false;
+        };
+
         runtime_type type;
-        if (!parse_runtime_type(type_str, type)) return false;
+        if (!parse_runtime_type(type_str, type))
+            return refuse("`" + type_str + "` is not a runtime type "
+                          "(server, client, proxy, cache)");
 
-        if (!mgr->create(type, name)) return false;
+        const bool has_config = config.valid() &&
+                                config.get_type() != sol::type::lua_nil &&
+                                config.get_type() != sol::type::none;
+        if (has_config && config.get_type() != sol::type::table)
+            return refuse("the third argument is a config table "
+                          "{ port = ..., config = ... }");
 
-        auto* inst = mgr->get(name);
-        if (!inst) return false;
+        // Everything the table asked for, read and judged here, applied below.
+        uint16_t    cfg_port       = 0;
+        bool        have_port      = false;
+        std::string cfg_script;
+        std::string cfg_target;    bool have_target = false;
+        server_mode cfg_mode       = mode_inout;
+        bool        have_mode      = false;
+        std::string cfg_http;
+        bool        cfg_http_cache = false;
+        std::string cfg_group;
+        bool        cfg_remove_with_parent = false;
+        bool        cfg_start      = false;
 
-        inst->set_runtime_manager(mgr);
-        inst->set_event_loop(loop);
-        inst->set_owner(owner->get_name());
-        inst->set_lua_created(true);
+        if (has_config)
+        {
+            sol::table t = config.as<sol::table>();
 
-        if (config) {
-            sol::optional<int> port = (*config)["port"].get<sol::optional<int>>();
-            if (port) inst->set_port(static_cast<uint16_t>(*port));
+            // The closed set, walked first so an unknown key is reported as
+            // itself rather than as whatever it failed to be.
+            static constexpr std::string_view known[] = {
+                "port", "config", "lua", "target", "mode", "http",
+                "http_cache", "group", "on_parent_stop", "start"
+            };
+            std::string bad_key;
+            t.for_each([&](sol::object k, sol::object) {
+                if (!bad_key.empty()) return;
+                if (k.get_type() != sol::type::string)
+                {
+                    bad_key = "<a key that is not a name>";
+                    return;
+                }
+                const std::string key = k.as<std::string>();
+                for (std::string_view ok : known)
+                    if (key == ok) return;
+                bad_key = key;
+            });
+            if (!bad_key.empty())
+                return refuse("`" + bad_key + "` is not a config key — one of "
+                              "port, config/lua, target, mode, http, http_cache, "
+                              "group, on_parent_stop, start");
 
             // ─── A key that is not there must read as absent, not throw ─────
             //
@@ -2168,50 +2422,193 @@ void lua_context::register_bindings(runtime_instance* owner)
             // gdb put it at this line: the config above has no `lua` key, and
             // reading the one that is not there is what ended the process.
             //
-            // `.get<sol::optional<T>>()` is the checked form — it asks whether
-            // the value is there and of the right type, and answers nullopt
-            // when it is not, which is what every one of these reads meant.
-            sol::optional<std::string> lua_script =
-                (*config)["config"].get<sol::optional<std::string>>();
-            if (!lua_script) lua_script = (*config)["lua"].get<sol::optional<std::string>>();
-            if (lua_script && !lua_script->empty())
-                inst->load_lua_script(*lua_script);
+            // Every read below is therefore taken as a sol::object first, which
+            // asks the Lua stack what is there without converting anything, and
+            // is then type-checked by this code rather than by a conversion
+            // whose behaviour is a property of the build.
+            sol::object o_port = t["port"];
+            if (o_port.valid() && o_port != sol::nil)
+            {
+                const double d = (o_port.get_type() == sol::type::number)
+                               ? o_port.as<double>() : -1.0;
+                if (o_port.get_type() != sol::type::number ||
+                    d != std::floor(d) || d < 0.0 || d > 65535.0)
+                    return refuse("`port` must be a whole number in 0..65535 "
+                                  "(0 means no port) — the CLI's own -p has "
+                                  "refused anything else since it was written");
+                cfg_port  = static_cast<uint16_t>(d);
+                have_port = true;
+            }
 
-            sol::optional<std::string> target = (*config)["target"].get<sol::optional<std::string>>();
-            if (target) inst->set_target(*target);
+            // `config` and `lua` are two spellings of one key; naming both is
+            // a script asking for two different scripts.
+            sol::object o_cfg = t["config"];
+            sol::object o_lua = t["lua"];
+            if (o_cfg.valid() && o_cfg != sol::nil && o_lua.valid() && o_lua != sol::nil)
+                return refuse("`config` and `lua` are the same key spelled two "
+                              "ways; name one");
+            sol::object o_script = (o_cfg.valid() && o_cfg != sol::nil) ? o_cfg : o_lua;
+            if (o_script.valid() && o_script != sol::nil)
+            {
+                if (o_script.get_type() != sol::type::string)
+                    return refuse("`config` must be the path to a Lua script");
+                cfg_script = o_script.as<std::string>();
+            }
 
-            sol::optional<std::string> mode_str = (*config)["mode"].get<sol::optional<std::string>>();
-            if (mode_str && type == runtime_server) {
-                auto* srv = static_cast<server_instance*>(inst);
-                switch (fnv1a(*mode_str)) {
-                    case fnv1a("in"):     srv->set_mode(mode_in);     break;
-                    case fnv1a("out"):    srv->set_mode(mode_out);    break;
-                    case fnv1a("master"): srv->set_mode(mode_master); break;
-                    default:              srv->set_mode(mode_inout);  break;
+            sol::object o_target = t["target"];
+            if (o_target.valid() && o_target != sol::nil)
+            {
+                if (o_target.get_type() != sol::type::string)
+                    return refuse("`target` must be a host:port string");
+                cfg_target  = o_target.as<std::string>();
+                have_target = true;
+            }
+
+            sol::object o_mode = t["mode"];
+            if (o_mode.valid() && o_mode != sol::nil)
+            {
+                if (o_mode.get_type() != sol::type::string)
+                    return refuse("`mode` must be one of in, out, inout, master");
+                // Only a server has modes, and `mode` on anything else used to
+                // be dropped without a word — a value accepted and ignored,
+                // which is the same defect as a value accepted and altered.
+                if (type != runtime_server)
+                    return refuse("`mode` applies to a server; a " + type_str
+                                  + " has none");
+                const std::string m = o_mode.as<std::string>();
+                switch (fnv1a(m))
+                {
+                    case fnv1a("in"):     cfg_mode = mode_in;     break;
+                    case fnv1a("out"):    cfg_mode = mode_out;    break;
+                    case fnv1a("inout"):  cfg_mode = mode_inout;  break;
+                    case fnv1a("master"): cfg_mode = mode_master; break;
+                    default:
+                        return refuse("`mode = \"" + m + "\"` is not a mode — "
+                                      "one of in, out, inout, master");
                 }
+                have_mode = true;
             }
 
-            if (type == runtime_server) {
-                auto* srv = static_cast<server_instance*>(inst);
-                sol::optional<std::string> http_dir = (*config)["http"].get<sol::optional<std::string>>();
-                if (http_dir && !http_dir->empty())
-                    srv->set_http_dir(*http_dir);
-                sol::optional<bool> http_cache = (*config)["http_cache"].get<sol::optional<bool>>();
-                if (http_cache && *http_cache)
-                    srv->set_http_cache(true);
+            sol::object o_http = t["http"];
+            if (o_http.valid() && o_http != sol::nil)
+            {
+                if (type != runtime_server)
+                    return refuse("`http` applies to a server; a " + type_str
+                                  + " serves no files");
+                if (o_http.get_type() != sol::type::string)
+                    return refuse("`http` must be a directory to serve");
+                cfg_http = o_http.as<std::string>();
             }
 
-            sol::optional<std::string> group = (*config)["group"].get<sol::optional<std::string>>();
-            if (group && !group->empty())
-                inst->set_group(*group);
+            sol::object o_hcache = t["http_cache"];
+            if (o_hcache.valid() && o_hcache != sol::nil)
+            {
+                if (type != runtime_server)
+                    return refuse("`http_cache` applies to a server; a "
+                                  + type_str + " serves no files");
+                if (o_hcache.get_type() != sol::type::boolean)
+                    return refuse("`http_cache` must be true or false");
+                cfg_http_cache = o_hcache.as<bool>();
+            }
 
-            sol::optional<std::string> on_stop_str = (*config)["on_parent_stop"].get<sol::optional<std::string>>();
-            if (on_stop_str && fnv1a(*on_stop_str) == fnv1a("remove"))
-                inst->set_child_policy(runtime_instance::child_policy::remove);
+            sol::object o_group = t["group"];
+            if (o_group.valid() && o_group != sol::nil)
+            {
+                if (o_group.get_type() != sol::type::string)
+                    return refuse("`group` must be a group name");
+                cfg_group = o_group.as<std::string>();
+            }
 
-            sol::optional<bool> start = (*config)["start"].get<sol::optional<bool>>();
-            if (start && *start)
-                mgr->start(name, *loop);
+            sol::object o_ops = t["on_parent_stop"];
+            if (o_ops.valid() && o_ops != sol::nil)
+            {
+                if (o_ops.get_type() != sol::type::string)
+                    return refuse("`on_parent_stop` must be \"remove\" or \"stop\"");
+                // "stop" and not "keep": child_policy::stop is what the enum
+                // calls it, what the `owner` command prints, and what the man
+                // page documents.  A second name for one bit is the thing the
+                // --out-of-process/--in-daemon note in flag_handlers warns
+                // about, and it costs the same here.
+                const std::string p = o_ops.as<std::string>();
+                if (fnv1a(p) == fnv1a("remove"))
+                    cfg_remove_with_parent = true;
+                else if (fnv1a(p) != fnv1a("stop"))
+                    return refuse("`on_parent_stop = \"" + p + "\"` is not a "
+                                  "policy — \"remove\" (goes with the parent) "
+                                  "or \"stop\" (outlives it, stopped)");
+            }
+
+            sol::object o_start = t["start"];
+            if (o_start.valid() && o_start != sol::nil)
+            {
+                if (o_start.get_type() != sol::type::boolean)
+                    return refuse("`start` must be true or false");
+                cfg_start = o_start.as<bool>();
+            }
+        }
+
+        // Nothing above this line built anything, so nothing above it has to
+        // undo anything.
+        if (!mgr->create(type, name))
+            return refuse("a runtime called \"" + name + "\" already exists");
+
+        auto* inst = mgr->get(name);
+        if (!inst) return refuse("the runtime could not be built");
+
+        inst->set_runtime_manager(mgr);
+        inst->set_event_loop(loop);
+        inst->set_owner(owner->get_name());
+        inst->set_lua_created(true);
+
+        if (have_port) inst->set_port(cfg_port);
+        if (have_target) inst->set_target(cfg_target);
+        if (!cfg_group.empty()) inst->set_group(cfg_group);
+        if (cfg_remove_with_parent)
+            inst->set_child_policy(runtime_instance::child_policy::remove);
+        if (type == runtime_server)
+        {
+            auto* srv = static_cast<server_instance*>(inst);
+            if (have_mode) srv->set_mode(cfg_mode);
+            if (!cfg_http.empty()) srv->set_http_dir(cfg_http);
+            if (cfg_http_cache) srv->set_http_cache(true);
+        }
+
+        // ─── The two that can only fail after the runtime exists ────────────
+        //
+        // Both returns were discarded.  A child whose script would not compile
+        // was created, registered and answered `true` with not one callback on
+        // it — a server that accepts connections and does nothing with them,
+        // which is indistinguishable from a working one until traffic arrives.
+        // A `start = true` that could not bind answered `true` for a runtime
+        // that never listened.
+        //
+        // Removed rather than left `failed`, because that is what cmd_create
+        // does for the same two failures: a script that will not load and a
+        // start that will not bind both take `m_manager.remove(name)` on the
+        // way out.  The one place this tree leaves a refusal standing is the
+        // out-of-process create, where the reason lives in another process and
+        // a `failed` row is the only record — not this path, where the reason
+        // is on the line above.  A Lua-created child is always in-daemon, so
+        // there is no supervisor holding a pointer to it and no release_workers
+        // to do first, which is why this is a plain remove.
+        //
+        // The reason is not repeated here on purpose: the child's own load has
+        // already written it, named for the CHILD, to both the log and the
+        // buffer a top-level create reads back.  Saying it again under the
+        // parent's name would put one failure on the operator's terminal twice
+        // under two different runtime names.
+        if (!cfg_script.empty() && !inst->load_lua_script(cfg_script))
+        {
+            mgr->remove(name);
+            return refuse("could not load " + cfg_script);
+        }
+
+        if (cfg_start && !mgr->start(name, *loop))
+        {
+            mgr->remove(name);
+            return refuse("start = true, and it could not be started"
+                          + (have_port ? " on port " + std::to_string(cfg_port)
+                                       : std::string{}));
         }
 
         return true;
@@ -2338,7 +2735,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0)
         {
-            std::cerr << "[lua] set_timeout(" << ms << ") armed nothing: "
+            std::cerr << lua_diag::tag(owner->get_name())
+                      << " set_timeout(" << ms << ") armed nothing: "
                       << (loop ? "the delay must be greater than 0"
                                : "this runtime has no event loop")
                       << std::endl;
@@ -2368,7 +2766,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0)
         {
-            std::cerr << "[lua] set_interval(" << ms << ") armed nothing: "
+            std::cerr << lua_diag::tag(owner->get_name())
+                      << " set_interval(" << ms << ") armed nothing: "
                       << (loop ? "the period must be greater than 0"
                                : "this runtime has no event loop")
                       << std::endl;
@@ -2510,23 +2909,80 @@ void lua_context::register_bindings(runtime_instance* owner)
         return true;
     };
 
-    // socketley.pipe(src_name, src_fd, dst_name, dst_fd) — cross-runtime zero-copy pipe
-    sk["pipe"] = [owner](std::string src_name, int src_fd, std::string dst_name, int dst_fd) -> bool {
+    // socketley.pipe(src_name, src_fd, dst_name[, dst_fd])
+    //
+    // ─── TWO OPERATIONS, AND THE ARGUMENT COUNT IS WHICH ────────────────────
+    //
+    // This was one four-argument call that did two unrelated things, and told
+    // you it had done the one you asked for either way.
+    //
+    // Inside one runtime it is a pipe: lua_pipe writes each connection's
+    // descriptor into the other's `pipe_peer_fd`, and bytes arriving on one go
+    // straight out of the other.  Both descriptors are needed and both are
+    // used.
+    //
+    // Across two runtimes it is not a pipe and cannot be.  `pipe_peer_fd` is an
+    // index into ONE server's connection table, so there is no pairing to make;
+    // what the branch actually does is route_client(src_fd, dst_name), which
+    // hands the connection to the destination RUNTIME and lets that runtime
+    // decide what to do with it.  There is no destination descriptor in that at
+    // all — and the fourth argument was read by nothing:
+    //
+    //     socketley.pipe("a", 3, "b", 7)  ->  true, and 7 was never looked at
+    //
+    // A script that went to the trouble of obtaining descriptor 7 from `b` was
+    // told it had joined 3 to 7.  It had not; it had given the connection to
+    // `b`, which delivered it wherever its own script says.
+    //
+    // So the fourth argument is optional now and the count states the request.
+    // Four is the pipe and requires one runtime; three is the route and
+    // requires two.  Asking for the combination that does not exist is refused
+    // by name rather than served as the other one.
+    sk["pipe"] = [owner](std::string src_name, int src_fd, std::string dst_name,
+                         sol::optional<int> dst_fd) -> bool {
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return false;
-        // Same-runtime fast path
-        if (src_name == dst_name && src_name == owner->get_name())
+
+        const std::string where = "socketley.pipe(\"" + src_name + "\", "
+                                + std::to_string(src_fd) + ", \"" + dst_name + "\""
+                                + (dst_fd ? ", " + std::to_string(*dst_fd) : "")
+                                + ")";
+        auto refuse = [&](const std::string& why) {
+            api_diag(owner, where + ": " + why);
+            return false;
+        };
+
+        if (src_name == dst_name)
         {
-            if (owner->get_type() != runtime_server) return false;
-            static_cast<server_instance*>(owner)->lua_pipe(src_fd, dst_fd);
+            // A pipe pairs two connections of one server, and only that
+            // server's own object holds them.  Naming a third runtime twice
+            // used to fall through to the cross-runtime branch and route a
+            // runtime to itself.
+            if (src_name != owner->get_name())
+                return refuse("a pipe joins two connections of one server, and "
+                              "only that server holds them — call it from \""
+                              + src_name + "\"'s own script");
+            if (!dst_fd)
+                return refuse("a pipe joins two connections: the fourth "
+                              "argument is the second one");
+            if (owner->get_type() != runtime_server)
+                return refuse("only a server has connections to pipe");
+            static_cast<server_instance*>(owner)->lua_pipe(src_fd, *dst_fd);
             return true;
         }
-        // Cross-runtime: both must be servers
+
+        if (dst_fd)
+            return refuse("a pipe across two runtimes routes the connection to "
+                          "\"" + dst_name + "\" and lets it decide which of its "
+                          "own connections answers — there is no destination "
+                          "descriptor to honour, so drop the fourth argument");
+
         auto* src_rt = mgr->get(src_name);
         auto* dst_rt = mgr->get(dst_name);
-        if (!src_rt || !dst_rt) return false;
-        if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server) return false;
-        // For cross-runtime, use route_client which already handles forwarding
+        if (!src_rt) return refuse("there is no runtime called \"" + src_name + "\"");
+        if (!dst_rt) return refuse("there is no runtime called \"" + dst_name + "\"");
+        if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server)
+            return refuse("both ends must be servers");
         auto* src_srv = static_cast<server_instance*>(src_rt);
         return src_srv->route_client(src_fd, dst_name);
     };
@@ -2905,7 +3361,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         }
         else
         {
-            std::cerr << "[lua] could not install the out-of-process refusal for "
+            std::cerr << lua_diag::tag(m_owner_name)
+                      << " could not install the out-of-process refusal for "
                          "self.route; it is left bound and will answer false"
                       << std::endl;
         }

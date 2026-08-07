@@ -27,6 +27,11 @@
 # The assertions read it now, and the gate is gone: a missing log is a failure,
 # not a reason to skip.
 #
+# The patterns name the runtime — `[lua luasvr]`, not `[lua]` — because the
+# prefix carries it now, and matching on it is worth more than tolerating it: a
+# daemon serving several scripts writes all of their lines to this one file, so
+# `CB:on_start` alone is satisfied by any of them.
+#
 # ─── WHAT THE ASSERTIONS ASSERT ─────────────────────────────────────────────
 #
 # Each one names a callback and a claim about its argument, because "the
@@ -140,16 +145,16 @@ create_ok "server with the callback script created" "$BIN" create server luasvr 
 ready_tcp 127.0.0.1 "$PORT" 8 || echo "  NOTE: listener never accepted a connection"
 
 # on_start runs as the runtime comes up, before anything connects.
-assert_log "on_start fired when the runtime started" '\[lua\] CB:on_start$'
+assert_log "on_start fired when the runtime started" '\[lua luasvr\] CB:on_start$'
 
 # One connection, one message, then a clean close — the three remaining
 # callbacks in the order the runtime must produce them.
 echo "hello-from-test" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
 
-assert_log "on_connect fired with a connection id" '\[lua\] CB:on_connect:[0-9]+$'
+assert_log "on_connect fired with a connection id" '\[lua luasvr\] CB:on_connect:[0-9]+$'
 assert_log "on_message fired with the payload the client sent" \
-           '\[lua\] CB:on_message:hello-from-test$'
-assert_log "on_disconnect fired with a connection id" '\[lua\] CB:on_disconnect:[0-9]+$'
+           '\[lua luasvr\] CB:on_message:hello-from-test$'
+assert_log "on_disconnect fired with a connection id" '\[lua luasvr\] CB:on_disconnect:[0-9]+$'
 
 # The argument, not just the arrival.  A handler invoked with the wrong id — or
 # with a fresh one — satisfies both patterns above and fails here.
@@ -180,7 +185,7 @@ fi
 assert_eq "on_disconnect names the connection that connected" "$CONN_ID" "$DISC_ID"
 
 "$BIN" stop luasvr 2>&1 || true
-assert_log "on_stop fired when the runtime stopped" '\[lua\] CB:on_stop$'
+assert_log "on_stop fired when the runtime stopped" '\[lua luasvr\] CB:on_stop$'
 
 # The claim the old single assertion was reaching for, made into one that can
 # fail: the daemon that ran all of that is still alive.  A Lua callback that

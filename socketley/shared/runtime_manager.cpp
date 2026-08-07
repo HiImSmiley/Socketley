@@ -615,7 +615,8 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            fprintf(stderr, "[lua] on_cluster_join error: %s\n", e.what());
+                            fprintf(stderr, "%s on_cluster_join error: %s\n",
+                                    lua_diag::tag(n).c_str(), e.what());
                         }
                     }
                     break;
@@ -629,7 +630,8 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            fprintf(stderr, "[lua] on_cluster_leave error: %s\n", e.what());
+                            fprintf(stderr, "%s on_cluster_leave error: %s\n",
+                                    lua_diag::tag(n).c_str(), e.what());
                         }
                     }
                     break;
@@ -681,7 +683,8 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            fprintf(stderr, "[lua] on_group_change error: %s\n", e.what());
+                            fprintf(stderr, "%s on_group_change error: %s\n",
+                                    lua_diag::tag(n).c_str(), e.what());
                         }
                     }
                     break;

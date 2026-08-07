@@ -4434,7 +4434,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         if (SOCKETLEY_UNLIKELY(!result.valid()))
         {
             sol::error err = result;
-            fprintf(stderr, "[lua] filter error: %s\n", err.what());
+            fprintf(stderr, "%s filter error: %s\n",
+                    lua_diag::tag(get_name()).c_str(), err.what());
             conn->partial.clear();
             send_error(conn, "500 Internal Server Error", "Filter Error\n");
             return true;
@@ -4455,7 +4456,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             // answer — and a third value is a script that means something this
             // side cannot read.  Guessing at it is how a `return false` meant as
             // a rejection becomes an admission.
-            fprintf(stderr, "[lua] filter returned a %s; expected nil or a table\n",
+            fprintf(stderr, "%s filter returned a %s; expected nil or a table\n",
+                    lua_diag::tag(get_name()).c_str(),
                     lua_typename(L.lua_state(), static_cast<int>(r.get_type())));
             conn->partial.clear();
             send_error(conn, "500 Internal Server Error", "Filter Error\n");
@@ -4474,8 +4476,9 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             sol::optional<sol::table> remove = t["remove_headers"].get<sol::optional<sol::table>>();
             if (!set && !remove)
             {
-                fprintf(stderr, "[lua] filter returned a table with none of "
-                                "`status`, `set_headers` or `remove_headers`\n");
+                fprintf(stderr, "%s filter returned a table with none of "
+                                "`status`, `set_headers` or `remove_headers`\n",
+                        lua_diag::tag(get_name()).c_str());
                 conn->partial.clear();
                 send_error(conn, "500 Internal Server Error", "Filter Error\n");
                 return true;
@@ -4504,8 +4507,9 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                         break;
                     if (!entry.is<std::string>())
                     {
-                        fprintf(stderr, "[lua] filter remove_headers: entry %zu is not a "
-                                        "string\n", i);
+                        fprintf(stderr, "%s filter remove_headers: entry %zu is not a "
+                                        "string\n",
+                                lua_diag::tag(get_name()).c_str(), i);
                         continue;
                     }
                     std::string name = entry.as<std::string>();
@@ -4513,14 +4517,16 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                         c = static_cast<char>(c | 0x20);
                     if (!filter_token_ok(name))
                     {
-                        fprintf(stderr, "[lua] filter remove_headers: `%s` is not a field "
-                                        "name\n", name.c_str());
+                        fprintf(stderr, "%s filter remove_headers: `%s` is not a field "
+                                        "name\n",
+                                lua_diag::tag(get_name()).c_str(), name.c_str());
                         continue;
                     }
                     if (filter_request_header_forbidden(name))
                     {
-                        fprintf(stderr, "[lua] filter remove_headers: `%s` is the proxy's "
-                                        "to decide, not a filter's\n", name.c_str());
+                        fprintf(stderr, "%s filter remove_headers: `%s` is the proxy's "
+                                        "to decide, not a filter's\n",
+                                lua_diag::tag(get_name()).c_str(), name.c_str());
                         continue;
                     }
                     // A name cannot be both set and removed: the last statement
@@ -4546,7 +4552,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             set->for_each([&](sol::object key, sol::object val) {
                 if (!key.is<std::string>() || !val.is<std::string>())
                 {
-                    fprintf(stderr, "[lua] filter set_headers: name and value must be strings\n");
+                    fprintf(stderr, "%s filter set_headers: name and value must be strings\n",
+                            lua_diag::tag(get_name()).c_str());
                     return;
                 }
                 std::string name = key.as<std::string>();
@@ -4555,14 +4562,16 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                     c = static_cast<char>(c | 0x20);
                 if (!filter_token_ok(name) || !filter_value_ok(value))
                 {
-                    fprintf(stderr, "[lua] filter set_headers: refused a header this "
-                                    "proxy will not put on the wire\n");
+                    fprintf(stderr, "%s filter set_headers: refused a header this "
+                                    "proxy will not put on the wire\n",
+                            lua_diag::tag(get_name()).c_str());
                     return;
                 }
                 if (filter_request_header_forbidden(name))
                 {
-                    fprintf(stderr, "[lua] filter set_headers: `%s` is the proxy's to "
-                                    "decide, not a filter's\n", name.c_str());
+                    fprintf(stderr, "%s filter set_headers: `%s` is the proxy's to "
+                                    "decide, not a filter's\n",
+                            lua_diag::tag(get_name()).c_str(), name.c_str());
                     return;
                 }
                 // The other half of the rule above: setting a name a filter
@@ -4593,7 +4602,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             status = status_obj->as<int>();
         if (status < 200 || status > 599)
         {
-            fprintf(stderr, "[lua] filter answer: status must be 200..599\n");
+            fprintf(stderr, "%s filter answer: status must be 200..599\n",
+                    lua_diag::tag(get_name()).c_str());
             conn->partial.clear();
             send_error(conn, "500 Internal Server Error", "Filter Error\n");
             return true;
@@ -4622,7 +4632,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
             rh->for_each([&](sol::object key, sol::object val) {
                 if (!key.is<std::string>() || !val.is<std::string>())
                 {
-                    fprintf(stderr, "[lua] filter answer headers: name and value must be strings\n");
+                    fprintf(stderr, "%s filter answer headers: name and value must be strings\n",
+                            lua_diag::tag(get_name()).c_str());
                     return;
                 }
                 const std::string name = key.as<std::string>();
@@ -4632,14 +4643,16 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                     c = static_cast<char>(c | 0x20);
                 if (!filter_token_ok(name) || !filter_value_ok(value))
                 {
-                    fprintf(stderr, "[lua] filter answer headers: refused a header this "
-                                    "proxy will not put on the wire\n");
+                    fprintf(stderr, "%s filter answer headers: refused a header this "
+                                    "proxy will not put on the wire\n",
+                            lua_diag::tag(get_name()).c_str());
                     return;
                 }
                 if (filter_response_header_forbidden(lower))
                 {
-                    fprintf(stderr, "[lua] filter answer headers: `%s` is framing, and "
-                                    "this proxy writes it\n", lower.c_str());
+                    fprintf(stderr, "%s filter answer headers: `%s` is framing, and "
+                                    "this proxy writes it\n",
+                            lua_diag::tag(get_name()).c_str(), lower.c_str());
                     return;
                 }
                 response += name;
@@ -4773,7 +4786,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
             if (SOCKETLEY_UNLIKELY(!r.valid()))
             {
                 sol::error err = r;
-                fprintf(stderr, "[lua] on_route error: %s\n", err.what());
+                fprintf(stderr, "%s on_route error: %s\n",
+                        lua_diag::tag(get_name()).c_str(), err.what());
             }
             else if (r.return_count() > 0)
             {
@@ -4959,7 +4973,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
             if (SOCKETLEY_UNLIKELY(!r.valid()))
             {
                 sol::error err = r;
-                fprintf(stderr, "[lua] on_route error: %s\n", err.what());
+                fprintf(stderr, "%s on_route error: %s\n",
+                        lua_diag::tag(get_name()).c_str(), err.what());
             }
             else if (r.return_count() > 0)
             {
@@ -8751,8 +8766,9 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         if (SOCKETLEY_UNLIKELY(!r.valid()))
         {
             sol::error err = r;
-            fprintf(stderr, "[lua] on_proxy_request error: %s — refusing the "
-                            "request\n", err.what());
+            fprintf(stderr, "%s on_proxy_request error: %s — refusing the "
+                            "request\n",
+                    lua_diag::tag(get_name()).c_str(), err.what());
             bconn->closing = true;
             conn->closing = true;
             return;
@@ -8790,8 +8806,9 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
                 // meant as a rejection is the case this exists for: forwarding
                 // it would admit exactly what the hook was written to refuse,
                 // and on_auth reaches the same conclusion with value_or(false).
-                fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
+                fprintf(stderr, "%s on_proxy_request returned a %s; expected "
                                 "a string or nil — refusing the request\n",
+                        lua_diag::tag(get_name()).c_str(),
                         lua_typename(lctx->state().lua_state(),
                                      static_cast<int>(obj.get_type())));
                 bconn->closing = true;
@@ -8937,8 +8954,9 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         if (SOCKETLEY_UNLIKELY(!r.valid()))
         {
             sol::error err = r;
-            fprintf(stderr, "[lua] on_proxy_response error: %s — refusing the "
-                            "response\n", err.what());
+            fprintf(stderr, "%s on_proxy_response error: %s — refusing the "
+                            "response\n",
+                    lua_diag::tag(get_name()).c_str(), err.what());
             refuse_response(conn, cconn);
             return;
         }
@@ -8960,8 +8978,9 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
             }
             else
             {
-                fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
+                fprintf(stderr, "%s on_proxy_response returned a %s; expected "
                                 "a string or nil — refusing the response\n",
+                        lua_diag::tag(get_name()).c_str(),
                         lua_typename(lctx->state().lua_state(),
                                      static_cast<int>(obj.get_type())));
                 refuse_response(conn, cconn);

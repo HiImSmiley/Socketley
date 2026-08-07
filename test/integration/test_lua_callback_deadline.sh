@@ -263,9 +263,13 @@ wait_log() {
     return 1
 }
 
-if wait_log '\[lua\] on_message hit its 1500ms deadline and was stopped'; then pass; else
-    fail "the callback that outran its budget said so" \
-         "no '[lua] on_message hit its 1500ms deadline and was stopped' in" \
+# The runtime's name is part of the claim now.  The hook's line used to say
+# "[lua] on_message ...", which does not tell an operator with forty servers
+# which one stopped — and a deadline is exactly the diagnostic somebody reads
+# in a hurry.
+if wait_log '\[lua dl_spin\] on_message hit its 1500ms deadline and was stopped'; then pass; else
+    fail "the callback that outran its budget said so, naming the runtime" \
+         "no '[lua dl_spin] on_message hit its 1500ms deadline and was stopped' in" \
          "$SOCKETLEY_DLOG" \
          "a bound nobody is told about is a support ticket"
 fi
@@ -281,9 +285,9 @@ fi
 # the one above stays green, the deadline is being reported by the mechanism
 # that raises it and by nothing that observes it, which is the arrangement the
 # sweep exists to have ended.
-if wait_log '\[lua\] on_message error: .*exceeded the 1500ms deadline'; then pass; else
+if wait_log '\[lua dl_spin\] on_message error: .*exceeded the 1500ms deadline'; then pass; else
     fail "the deadline reaches the call site's !valid() branch too" \
-         "no '[lua] on_message error: ... exceeded the 1500ms deadline' line" \
+         "no '[lua dl_spin] on_message error: ... exceeded the 1500ms deadline' line" \
          "the hook raises a Lua error; invoke_on_message checks valid() and" \
          "reports — if only the hook's line is here, that branch never saw it"
 fi
@@ -316,7 +320,7 @@ esac
 # was applied and not merely that something eventually stopped.
 printf 'spin\n' | timeout 10 nc -q 0 127.0.0.1 "$OWN_PORT" >/dev/null 2>&1 || true
 
-if wait_log '\[lua\] on_message hit its 300ms deadline and was stopped'; then pass; else
+if wait_log '\[lua dl_own\] on_message hit its 300ms deadline and was stopped'; then pass; else
     fail "a script's own callback_timeout_ms is what bounds its callbacks" \
          "dl_own declared callback_timeout_ms = 300 and no line in the log names it" \
          "the daemon's own default here is 1500 — if that is what fired, the" \
@@ -437,7 +441,7 @@ printf 'PAYLOAD-THROUGH-SPIN\n' | timeout 20 nc -q 1 127.0.0.1 "$PX_PORT"  >/dev
 printf 'PAYLOAD-THROUGH-WATCH\n' | timeout 20 nc -q 1 127.0.0.1 "$PX2_PORT" >/dev/null 2>&1 || true
 sleep 0.8
 
-if wait_log '\[lua\] on_proxy_request hit its 1500ms deadline and was stopped'; then pass; else
+if wait_log '\[lua dl_px\] on_proxy_request hit its 1500ms deadline and was stopped'; then pass; else
     fail "a byte hook that never returns is stopped too" \
          "no on_proxy_request stop line in $SOCKETLEY_DLOG" \
          "the deadline reaches this hook through the same guarded accessor as" \

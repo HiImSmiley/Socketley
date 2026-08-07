@@ -85,7 +85,14 @@ end)
 LUA
 
 # ticks — how many "tick" lines the daemon has logged so far.
-ticks() { grep -c "\[lua\] tick" "$SOCKETLEY_DLOG" 2>/dev/null || true; }
+#
+# The prefix is "[lua <runtime>]", not "[lua]": a Lua diagnostic names the
+# runtime it came from, and with several scripts writing to one stderr that is
+# the only thing in the line that separates them.  Matched loosely on purpose —
+# this file is about a timer surviving a reload, not about the shape of the
+# prefix, and pinning the name here would put a second claim in a function
+# whose whole job is to count.
+ticks() { grep -cE "\[lua[^]]*\] tick" "$SOCKETLEY_DLOG" 2>/dev/null || true; }
 
 # grew_by BASELINE TIMEOUT_S — wait until at least one more tick than BASELINE
 # has been logged.  Waiting on the count rather than sleeping a fixed span: the
@@ -114,7 +121,7 @@ ready_tcp 127.0.0.1 "$RT_PORT" 10 || true
 # never armed anything — which is the one way a use-after-free on a timer
 # completion can be "fixed" without fixing anything.
 if grew_by 0 8; then ok
-else bad "the interval is running" "no '[lua] tick' line within 8s of create" \
+else bad "the interval is running" "no '[lua <runtime>] tick' line within 8s of create" \
     "$(tail -3 "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"; fi
 
 # ─── THE RELOAD, WITH THE TIMER ARMED ───────────────────────────────────────

@@ -767,7 +767,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_expire error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_expire error: " << e.what() << "\n";
                     }
                 }
             }
@@ -1942,7 +1942,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -1974,7 +1974,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
                         sol::error e = res;
-                        std::cerr << "[lua] on_miss error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_miss error: " << e.what() << "\n";
                     }
                     else
                     {
@@ -2023,7 +2023,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            std::cerr << "[lua] on_delete error: " << e.what() << "\n";
+                            std::cerr << lua_diag::tag(get_name()) << " on_delete error: " << e.what() << "\n";
                         }
                     }
                 }
@@ -2187,7 +2187,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                         }
                     }
                 }
@@ -2631,7 +2631,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                         }
                     }
                 }
@@ -2664,7 +2664,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -2699,7 +2699,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -3492,7 +3492,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                         }
                     }
                 }
@@ -3548,7 +3548,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -3580,7 +3580,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
                         sol::error e = res;
-                        std::cerr << "[lua] on_miss error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_miss error: " << e.what() << "\n";
                     }
                     else
                     {
@@ -3625,7 +3625,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                             if (SOCKETLEY_UNLIKELY(!r.valid()))
                             {
                                 sol::error e = r;
-                                std::cerr << "[lua] on_delete error: " << e.what() << "\n";
+                                std::cerr << lua_diag::tag(get_name()) << " on_delete error: " << e.what() << "\n";
                             }
                         }
                     }
@@ -3760,7 +3760,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                         if (SOCKETLEY_UNLIKELY(!r.valid()))
                         {
                             sol::error e = r;
-                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                         }
                     }
                 }
@@ -4081,7 +4081,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -4112,7 +4112,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }
@@ -4143,7 +4143,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                     if (SOCKETLEY_UNLIKELY(!r.valid()))
                     {
                         sol::error e = r;
-                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
                     }
                 }
             }

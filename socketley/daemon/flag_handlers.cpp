@@ -11,7 +11,7 @@
 #include "../runtime/cache/cache_instance.h"
 
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
-                       size_t& i, bool& autostart)
+                       size_t& i, bool& autostart, std::string& lua_script)
 {
     switch (pa.hashes[i])
     {
@@ -80,26 +80,40 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             instance->set_write_file(pa.args[++i]);
             return 0;
 
+        // ─── RECORDED HERE, LOADED BY THE CALLER ────────────────────────────
+        //
+        // This used to call load_lua_script() on the spot, and that made a
+        // create mean different things depending on where on the command line
+        // it was written.  Loading a script builds the interpreter, runs the
+        // file's top level and snapshots the `self` table — name, port, type,
+        // state — out of the instance AS IT IS AT THAT MOMENT.  So:
+        //
+        //     create server s --lua x.lua -p 9000    self.port == 0, forever
+        //     create server s -p 9000 --lua x.lua    self.port == 9000
+        //
+        // for the same runtime, with `socketley.get("s").port` answering 9000
+        // in both — so a script could not even detect the case by comparing.
+        // A script that binds its behaviour to self.port, which is what the
+        // field is for, silently did the wrong thing for one of the two
+        // spellings and nothing anywhere said so.
+        //
+        // The file itself already states the rule, at the --daemon-process
+        // pre-scan in cmd_create: "A create whose behaviour depends on argument
+        // order is a bug waiting for someone to reorder a command line."  That
+        // pre-scan fixed it for one flag, by finding the flag that had to be
+        // known early.  This is the other half — the flag that has to be acted
+        // on late — and there is only one of those, because loading the script
+        // is the only step in a create that reads the configuration back.
+        //
+        // `edit` never had this: cmd_edit applies every field from its parsed
+        // config and only then reloads.
         case fnv1a("--lua"):
             if (i + 1 >= pa.count)
             {
                 std::cout << "--lua requires a Lua script path\n";
                 return 1;
             }
-            if (!instance->load_lua_script(pa.args[++i]))
-            {
-                // The reason, not just the fact.  This used to print exactly
-                // the four words below while the parse error, or the sentence
-                // one of the `filters`/`routes` validators wrote for the person
-                // editing the file, went to stderr — and stderr is the daemon's
-                // log, one process away from the terminal that ran the command.
-                // An operator was told their script would not load and never
-                // told why.
-                std::cout << "could not load Lua script: " << pa.args[i] << "\n";
-                if (!lua_diag::text().empty())
-                    std::cout << lua_diag::text() << "\n";
-                return 1;
-            }
+            lua_script = pa.args[++i];
             return 0;
 
         case fnv1a("-b"):

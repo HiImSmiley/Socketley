@@ -62,8 +62,13 @@ enum client_mode : uint8_t;
 enum cache_mode : uint8_t;
 
 // Result codes: 0 = handled, 1 = error, -1 = not handled (try type-specific)
+//
+// `lua_script` is an out-parameter and not something this function acts on, and
+// that is the whole point of it — see the --lua case for why loading a script
+// in the middle of a flag loop made `create` depend on the order the flags were
+// typed.  The caller loads it once every flag has been seen.
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
-                       size_t& i, bool& autostart);
+                       size_t& i, bool& autostart, std::string& lua_script);
 
 int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                        runtime_manager* mgr, std::string_view name);
