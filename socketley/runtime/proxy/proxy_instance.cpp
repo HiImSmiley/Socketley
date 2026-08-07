@@ -8748,11 +8748,6 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
             return;
         }
 
-        // "Said nothing" keeps meaning drop, in both its spellings — no return
-        // value at all, and an explicit nil — which is what this build already
-        // did and what the man page documents.  Checked explicitly because the
-        // branch below is a refusal, and a hook that only logs must not close
-        // every connection through it.
         // Saying nothing is not the same as saying nil, and this is the whole
         // difference between an observer and a refusal.
         //

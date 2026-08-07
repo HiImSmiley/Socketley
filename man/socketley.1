@@ -2310,6 +2310,17 @@ Return a modified string to replace the data, or
 .B nil
 to drop the chunk entirely (the backend never receives it).
 .IP
+Returning nothing at all forwards the chunk unchanged, and that is not the same
+as returning
+.BR nil .
+A hook written to watch traffic
+.RB ( "function on_proxy_request(id, data) log(data) end" )
+ends without a return, and reading that as
+.B nil
+made the most natural three lines in this API discard every byte through the
+proxy. The filter chain draws the same distinction \(em nothing returned means
+the filter has no opinion and the chain continues.
+.IP
 Fail\-closed, like the filter chain and for the same reason. A hook that throws
 a Lua error, or that returns anything other than a string or
 .BR nil ,
@@ -2330,8 +2341,8 @@ chain \(em see
 Proxy only. Called for every chunk forwarded from a backend to a client.
 Same semantics as
 .BR on_proxy_request :
-return a replacement string or nil to drop, and an error or a return of any
-other type refuses \(em here by closing the client connection, since the
+returning nothing forwards the chunk unchanged, a replacement string replaces
+it, nil drops it, and an error or a return of any other type refuses \(em here by closing the client connection, since the
 response this hook was to redact must not be delivered unredacted.
 .TP
 .B on_master_auth(client_id, password) \(-> bool
