@@ -139,6 +139,20 @@ struct alignas(64) server_connection
     // that OpenSSL answers by itself.
     bool spoke{false};
 
+    // Has this connection ever been an HTTP request/response connection?
+    //
+    // Sticky, because `proto` is not: it is reset to proto_unknown after every
+    // keep-alive response so the classifier can run again on the next request,
+    // and a connection that forgot it was HTTP would rejoin the relay set in
+    // every gap between two requests.  Set where proto_http is decided, and
+    // deliberately NOT set for a WebSocket, which arrives over the same HTTP
+    // and is a relay target for the rest of its life.
+    //
+    // What it excludes is exactly the relay — the unsolicited traffic this
+    // connection never asked for.  Its own responses, and anything a script
+    // addresses to it by client_id, are unaffected.
+    bool http_seen{false};
+
     // writev batch: holds refs alive until CQE completes
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
@@ -279,6 +293,11 @@ struct alignas(64) server_connection
         // as long as it stayed connected — which is the behaviour the deadline
         // exists to end, reintroduced through the pool.
         spoke = false;
+        // And a struct that carried an HTTP client would hand the next one a
+        // permanent exclusion from the relay — the more visible half of the same
+        // mistake: a client that never spoke HTTP, silently receiving nothing
+        // for as long as it stayed connected.
+        http_seen = false;
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
         write_batch_count = 0;
         read_pending = false;
@@ -615,6 +634,36 @@ private:
     static bool proto_unsettled(const server_connection* conn)
     {
         return conn->proto == proto_unknown || conn->proto == proto_ws_upgrading;
+    }
+
+    // May the relay write to this connection at all?
+    //
+    // The question the ordering defects on this connection kept being asked one
+    // window at a time, answered once instead.  An HTTP connection is never a
+    // relay target, at any point in its life:
+    //
+    //   * While a request is in flight — which it is from the four bytes that
+    //     settle the protocol until the last byte of the body — a relayed line
+    //     goes into the write queue ahead of the response, and the client, which
+    //     is parsing for a status line, reads that line instead.
+    //
+    //   * Between two keep-alive requests the client is not reading.  When it
+    //     next does, having sent another request, it parses whatever was left on
+    //     the connection as that response's status line.  The corruption is not
+    //     avoided by waiting, only deferred.
+    //
+    //   * HTTP frames bodies by Content-Length and responses by their order
+    //     against requests.  A server-initiated line has no place in either.
+    //     There is no delay, no hold and no ordering that makes one well formed.
+    //
+    // So this is a membership question rather than a timing one, and it is
+    // stated here rather than left implicit in a guard at one call site.  A
+    // WebSocket is not covered: it arrives over the same HTTP, and once upgraded
+    // it has framing for server-initiated messages, which is the whole point of
+    // it and the supported way for a browser to receive relay traffic.
+    static bool relay_targetable(const server_connection* conn)
+    {
+        return !conn->http_seen;
     }
 
     // May the deadline release this connection's hold?

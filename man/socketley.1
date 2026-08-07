@@ -1161,6 +1161,16 @@ once a connection is classified, relay traffic goes straight to its write queue
 and the ordinary
 .B \-\-max\-conns
 and write\-queue limits govern instead.
+.IP
+A connection that speaks HTTP is not in the relay set and receives no relayed
+messages at all, from the request that identifies it as HTTP onward. HTTP has no
+framing for a message the server sends on its own: before a response such a
+message replaces the status line the client is parsing for, and between two
+keep\-alive requests it is read as the status line of the next response. There is
+no point at which it would be well formed, so it is not sent rather than delayed.
+A WebSocket connection is unaffected \(em it arrives over the same HTTP, but once
+upgraded it has framing for server\-initiated messages and receives everything.
+That is the supported way for a browser client to receive relay traffic.
 .TP
 .B \-\-udp
 Use UDP instead of TCP. The server binds a single SOCK_DGRAM socket.

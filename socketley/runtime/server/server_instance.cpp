@@ -218,6 +218,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->relay_hold.clear();
     conn->relay_hold_since = {};
     conn->spoke = false;
+    conn->http_seen = false;
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
@@ -2535,7 +2536,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (c0 == 'G')
                 conn->proto = proto_ws_upgrading;
             else
+            {
                 conn->proto = proto_http;
+                // Out of the relay set from here on, and stickily: see
+                // relay_targetable().  Set at the same statement that decides
+                // the protocol so the two cannot drift apart.
+                conn->http_seen = true;
+            }
         }
         else
         {
@@ -2631,6 +2638,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             {
                 // Not a WebSocket upgrade — treat as HTTP request
                 conn->proto = proto_http;
+                conn->http_seen = true;   // see relay_targetable()
                 // Fall through to proto_http handler below
             }
             else
@@ -3476,6 +3484,18 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
         if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
+        // This client speaks HTTP, and no relayed line is well formed on an
+        // HTTP connection at any point in its life.  Skipped rather than held:
+        // a hold implies there is a later moment at which these bytes would be
+        // correct, and for HTTP there is not.  See relay_targetable().
+        //
+        // Ahead of the hold below, because a connection between two keep-alive
+        // requests reads as unclassified and would otherwise accumulate a hold
+        // that the next request's first read then flushes — in front of the
+        // response to that very request.
+        if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
+            continue;
+
         // Nothing is known yet about what this client speaks, and writing to it
         // now would put these bytes in front of the response to a request it
         // has already sent.  Hold them; handle_read releases them the moment
@@ -3575,6 +3595,20 @@ void server_instance::relay_hold_flush(server_connection* conn)
 {
     if (SOCKETLEY_LIKELY(conn->relay_hold.empty()))
         return;
+
+    // What was held before the classification turned out to be HTTP is dropped
+    // rather than delivered.  These bytes were held on the guess that the
+    // connection would turn out to be a relay target; it did not, and there is
+    // no framing on an HTTP connection that could carry them.  The window is
+    // real and not theoretical: a GET is classified proto_ws_upgrading, which
+    // holds, and only the header parse says whether it was an upgrade or a
+    // plain request.
+    if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
+    {
+        conn->relay_hold.clear();
+        conn->relay_hold_since = {};
+        return;
+    }
 
     // send_to() rather than a push straight into the write queue, and that is
     // the whole reason this is a function and not three lines at the call site:
