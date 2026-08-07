@@ -24,8 +24,11 @@ CLUSTER_DIR="$TMPD/cluster"
 mkdir -p "$CLUSTER_DIR"
 SOCK_A="$TMPD/nodeA.sock"
 SOCK_B="$TMPD/nodeB.sock"
-PORT_A=19401
-PORT_B=19402
+# One base, so this file can be driven on a private port block while it is being
+# changed.  The default is the pair it has always used.
+PB=${SOCKETLEY_PORT_BASE:-19401}
+PORT_A=$((PB + 0))
+PORT_B=$((PB + 1))
 DAEMON_PIDS=()
 
 # Unique runtime names
@@ -85,14 +88,37 @@ assert_contains() {
     fi
 }
 
+# assert_ge GOT WANT LABEL
+#
+# Defined since this file was written and called by none of it: every numeric
+# thing the script reported was checked with assert_contains, which asks whether
+# the KEY is present and never looks at the value.  "runtimes_count=" is
+# satisfied by runtimes_count=0, "api_group_count=" by a group of one — so the
+# two assertions that are supposed to prove this daemon can see across the
+# cluster passed on a view that contained only itself.  The counts below are the
+# ones a second daemon changes.
+#
+# `2>/dev/null` on the comparison because GOT is extracted from a file the Lua
+# script writes: an absent line yields the empty string, `[ "" -ge 2 ]` is an
+# error rather than a false, and under `set -e` that would end the run at the
+# assertion instead of reporting it.
 assert_ge() {
     TOTAL=$((TOTAL+1))
-    if [ "$1" -ge "$2" ] 2>/dev/null; then
+    if [ "${1:-}" -ge "$2" ] 2>/dev/null; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
-        echo "  FAIL: expected $1 >= $2"
+        echo "  FAIL: ${3:-value} is '${1:-<absent>}', wanted at least $2"
     fi
+}
+
+# num_max KEY — the largest value the script wrote for KEY, or empty if it never
+# wrote one.  The largest and not the last: on_tick reports repeatedly while the
+# cluster view is still filling in, so the last line can be a snapshot taken
+# before the remote daemon was visible.
+num_max() {
+    { grep -aoE "^$1=[0-9]+$" "$LUA_OUT" 2>/dev/null || true; } \
+        | cut -d= -f2 | sort -n | tail -1
 }
 
 echo "=== Integration: cluster Lua API ==="
@@ -189,9 +215,10 @@ sleep 1
 # ─── Test 1: on_start sees at least the local daemon ────────────────────────
 echo "  Test 1: on_start cluster.daemons() sees local daemon"
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
-assert_contains "$OUT" "daemons_count="
 assert_contains "$OUT" "daemon=nodeA"
 assert_contains "$OUT" "stats_daemons=1"
+assert_ge "$(num_max daemons_count)" 1 "cluster.daemons() count at on_start"
+assert_ge "$(num_max stats_runtimes)" 1 "cluster.stats().runtimes at on_start"
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 start_node "$SOCK_B" nodeB
@@ -217,11 +244,20 @@ echo "  Test 4: cluster.runtimes() sees cross-daemon runtimes"
 # Give tick a few cycles
 sleep 3
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
-assert_contains "$OUT" "runtimes_count="
+# Two, not "a number": one is what this daemon sees without leaving home, and
+# the whole claim is that cluster.runtimes() reaches the other daemon's.
+assert_ge "$(num_max runtimes_count)" 2 "cluster.runtimes() across both daemons"
 
 # ─── Test 5: cluster.group() returns api members ───────────────────────────
 echo "  Test 5: cluster.group() returns group members"
-assert_contains "$OUT" "api_group_count="
+# Two again: nodeA's own server is in group api, so a count of one proves only
+# that the local runtime is in the table it was put in.
+assert_ge "$(num_max api_group_count)" 2 "cluster.group(\"api\") members"
+
+# The argument on_group_change was handed, rather than only that it fired.  The
+# substring check in Test 3 is satisfied by members=0.
+assert_ge "$({ grep -aoE '^GROUP_CHANGE=api members=[0-9]+$' "$LUA_OUT" 2>/dev/null || true; } \
+           | cut -d= -f3 | sort -n | tail -1)" 2 "on_group_change member count"
 
 # ─── Test 6: on_cluster_leave fires when daemon B is killed ─────────────────
 echo "  Test 6: on_cluster_leave fires when daemon leaves"

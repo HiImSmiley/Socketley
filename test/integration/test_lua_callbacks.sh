@@ -51,7 +51,9 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
 daemon_isolate luacb
-PORT=19400
+# One base, so this file can be driven on a private port block while a change to
+# it is being verified.  The default is the port it has always used.
+PORT=${SOCKETLEY_PORT_BASE:-19400}
 PASS=0; FAIL=0; TOTAL=0
 LUA_SCRIPT="/tmp/test-callbacks-$$.lua"
 
@@ -158,6 +160,22 @@ assert_log "on_disconnect fired with a connection id" '\[lua\] CB:on_disconnect:
 # stop mid-run instead of reporting 5/7.
 CONN_ID=$(grep -oE 'CB:on_connect:[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null | head -1 | cut -d: -f3 || true)
 DISC_ID=$(grep -oE 'CB:on_disconnect:[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null | head -1 | cut -d: -f3 || true)
+# ...and NOT with assert_eq alone.  The `|| true` above that keeps the run
+# alive is exactly what makes both variables empty when neither callback fired,
+# and `assert_eq "" ""` is green — so the one assertion in this file that
+# compares two ids passed hardest against the build that produced no ids at all.
+# The emptiness has to be its own failure, named, before the comparison means
+# anything: an identity assertion is satisfied by a no-op unless something says
+# the operands exist.
+TOTAL=$((TOTAL+1))
+if [ -n "$CONN_ID" ] && [ -n "$DISC_ID" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: there are two ids to compare"
+    echo "        on_connect gave '${CONN_ID:-<none>}', on_disconnect '${DISC_ID:-<none>}'"
+    echo "        — with neither, the identity check below compares '' with ''"
+fi
 assert_eq "on_disconnect names the connection that connected" "$CONN_ID" "$DISC_ID"
 
 "$BIN" stop luasvr 2>&1 || true
