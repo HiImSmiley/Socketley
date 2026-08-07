@@ -284,6 +284,28 @@ ready_http 127.0.0.1 "$HTTP_PORT" /probe.txt 15 || echo "  NOTE: the HTTP target
 # ── 1. json_encode ─────────────────────────────────────────────────────────
 ENC=$(ask "$RPC_PORT" encode)
 assert_has "a table with keys 1..n encodes as a JSON array" "arr=[1,2,3]" "$ENC" "got: $ENC"
+# ─── THIS ASSERTION IS RED ON THE SANITIZE BUILD, AND THE BUILD IS WRONG ────
+#
+# The man page states the contract: "Tables with consecutive integer keys
+# starting at 1 are encoded as JSON arrays; all others as objects."  Release
+# honours it and answers {"3":3,"1":1}.  The Sanitize build THROWS:
+#
+#     [sol2] An exception occurred: caught (...) exception
+#
+# and the script gets a Lua error instead of a string.  The object branch of
+# json_encode_value does
+#
+#     json_encode_string(out, kv.first.as<std::string>());
+#
+# on a key that is a NUMBER here.  Release defines NDEBUG, so sol2's safety
+# checks are off and as<std::string>() takes LuaJIT's number-to-string
+# coercion; Sanitize defines DEBUG, the checks are on, and the same call
+# type-checks and throws.  Every other input this file encodes passes on both
+# builds — bisected one value at a time.
+#
+# Left asserting the documented behaviour on purpose.  Relaxing it to match the
+# Sanitize build would be writing the bug down as the contract, and the man page
+# already says otherwise.
 assert_has "a table with a hole encodes as a JSON object" "sparse={" "$ENC" \
     "one Lua type, two JSON types, decided by whether the integer keys run" \
     "1..n without a gap" "got: $ENC"

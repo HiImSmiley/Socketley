@@ -252,6 +252,15 @@ server_case error   no
 
 # The raised error is reported rather than swallowed — an operator whose script
 # throws in the gate has to be able to find out.
+#
+# RED ON THE SANITIZE BUILD, and the build is wrong.  Measured there: the gate
+# still REFUSES correctly (bytes_in stays 0, so fail-closed is intact) and
+# nothing is logged at all — no "on_auth error" line, no sol2 line, nothing.
+# 88e9ec0 fixed exactly this for Release; the DEBUG build, where sol2's safety
+# checks change how the error surfaces, still swallows it.  So an operator whose
+# gate throws gets a silent outage on one of the two configurations this project
+# ships tests for.  Left asserting the behaviour Release has, because that is
+# the one 88e9ec0 decided was right.
 if grep -qa "on_auth error" "$SOCKETLEY_DLOG"; then pass; else
     fail "a raised on_auth is logged" "no 'on_auth error' line in the daemon log" \
          "the connection is refused either way, which means a script that" \
