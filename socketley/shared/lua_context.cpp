@@ -825,6 +825,30 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     auto it = m_subscriptions.find(key_buf);
     if (it == m_subscriptions.end()) return;
 
+    // ─── Nothing may move under this loop ───────────────────────────────────
+    //
+    // A subscriber is a script, and a script may call straight back into this
+    // API: socketley.subscribe and socketley.unsubscribe are both bound in the
+    // very VM these run in.  This was a range-for over the vector, which holds
+    // an iterator into it — so one subscribe on this same channel from inside a
+    // handler reallocated the buffer and the loop went on walking the freed
+    // one.  Latent only because there was no unsubscribe to make the other half
+    // of it reachable.
+    //
+    // Both directions are therefore deferred rather than guarded against.
+    // subscribe() parks a new registration in m_pending_subscriptions and
+    // unsubscribe() marks its entry dead; settle_subscriptions() applies both
+    // when the last frame here unwinds.  The vector is then immutable for the
+    // whole dispatch, which is what makes the plain index below correct — and
+    // it costs nothing on the ordinary path, where no subscriber touches
+    // either call.
+    //
+    // Deferring the insertion also settles a question that would otherwise be
+    // decided by std::vector's growth policy: a subscription registered while a
+    // message is being delivered does not receive that message.
+    auto&        subs = it->second;
+    const size_t n    = subs.size();
+
     // One scope for the whole fan-out, not one per subscriber.  A publish is
     // usually made from inside another callback, and lua_deadline::scope nests
     // outermost-wins, so in that case this arms nothing and the subscribers
@@ -832,16 +856,50 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     // callback does not return until the last subscriber has run.  When the
     // publish comes from somewhere with no callback armed, this is the outermost
     // scope and the whole fan-out shares one budget.
-    lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms);
-    for (auto& fn : it->second)
+    ++m_dispatch_depth;
     {
-        sol::protected_function_result r = fn(channel, message);
-        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms);
+        for (size_t i = 0; i < n; ++i)
         {
-            sol::error e = r;
-            fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
+            if (subs[i].dead) continue;
+            sol::protected_function_result r = subs[i].fn(channel, message);
+            if (SOCKETLEY_UNLIKELY(!r.valid()))
+            {
+                sol::error e = r;
+                fprintf(stderr, "[lua] subscribe callback error: %s\n", e.what());
+            }
         }
     }
+    if (--m_dispatch_depth == 0)
+        settle_subscriptions();
+}
+
+// See the declaration.  Called at the moment it is safe to move the vectors
+// dispatch_publish walks — which is when the last of its frames has unwound, or
+// immediately when there were none.
+void lua_context::settle_subscriptions()
+{
+    for (auto& [key, sub] : m_pending_subscriptions)
+        m_subscriptions[key].push_back(std::move(sub));
+    m_pending_subscriptions.clear();
+
+    if (!m_subscriptions_dirty)
+        return;
+
+    for (auto it = m_subscriptions.begin(); it != m_subscriptions.end(); )
+    {
+        auto& v = it->second;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [](const subscription& s) { return s.dead; }),
+                v.end());
+        // A channel nobody listens to comes out of the map rather than staying
+        // as an empty vector: dispatch_publish finds by key, and a key that is
+        // present answers the lookup and then does nothing, on every publish,
+        // for the life of the context.
+        if (v.empty()) it = m_subscriptions.erase(it);
+        else           ++it;
+    }
+    m_subscriptions_dirty = false;
 }
 
 
@@ -1840,9 +1898,9 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     }
 
     // Everything that reaches for the runtime map, and nothing that does not.
-    // socketley.log, .http, .json_*, the timers and .subscribe all work in a
-    // worker exactly as they do in the daemon, and .subscribe in particular is
-    // delivered to now — see runtime_manager::set_publish_sink.
+    // socketley.log, .http, .json_*, the timers and .subscribe/.unsubscribe all
+    // work in a worker exactly as they do in the daemon, and .subscribe in
+    // particular is delivered to now — see runtime_manager::set_publish_sink.
     for (const char* call : {"create", "start", "stop", "remove", "send", "list",
                              "get", "pipe"})
     {
@@ -2128,9 +2186,73 @@ void lua_context::register_bindings(runtime_instance* owner)
         return json_decode_value(m_lua, p, end);
     };
 
-    // socketley.subscribe(cache_name, channel, fn) — receive published messages
-    sk["subscribe"] = [this](std::string cache_name, std::string channel, sol::protected_function fn) {
-        m_subscriptions[cache_name + '\0' + channel].push_back(std::move(fn));
+    // socketley.subscribe(cache_name, channel, fn) → subscription_id
+    //
+    // The id is new, and it is what socketley.unsubscribe takes.  Returning one
+    // rather than answering unsubscribe(cache_name, channel) follows the timers
+    // — set_timeout hands back an integer that clear_timeout takes — and is the
+    // only identity that can express the case the counterpart exists for: two
+    // handlers on one channel, of which the script wants to drop one.
+    sk["subscribe"] = [this](std::string cache_name, std::string channel,
+                             sol::protected_function fn) -> int {
+        const int   id  = ++m_next_subscription_id;
+        std::string key = cache_name + '\0' + channel;
+        m_subscription_keys.emplace(id, key);
+
+        subscription sub;
+        sub.id = id;
+        sub.fn = std::move(fn);
+
+        // Parked rather than appended when a dispatch is walking a vector; see
+        // dispatch_publish.  A handler that subscribes does not thereby receive
+        // the message it is handling.
+        if (m_dispatch_depth > 0)
+            m_pending_subscriptions.emplace_back(std::move(key), std::move(sub));
+        else
+            m_subscriptions[std::move(key)].push_back(std::move(sub));
+        return id;
+    };
+
+    // socketley.unsubscribe(subscription_id) → bool
+    //
+    // True when it removed a live registration, false when the id names none —
+    // an id that was never issued, or one already unsubscribed.  The timers
+    // return nothing from clear_timeout because cancelling a timeout that has
+    // already fired is an ordinary thing to do and says nothing about the
+    // script; a subscription has no such state.  It is live until this call, so
+    // false means the script asked about something that does not exist, and
+    // that is worth being able to see.
+    sk["unsubscribe"] = [this](int id) -> bool {
+        auto ki = m_subscription_keys.find(id);
+        if (ki == m_subscription_keys.end())
+            return false;
+
+        // One that has not reached the map yet — subscribed and unsubscribed
+        // inside the same dispatch — is simply dropped from the queue.
+        for (auto pit = m_pending_subscriptions.begin();
+             pit != m_pending_subscriptions.end(); ++pit)
+        {
+            if (pit->second.id != id) continue;
+            m_pending_subscriptions.erase(pit);
+            m_subscription_keys.erase(ki);
+            return true;
+        }
+
+        if (auto si = m_subscriptions.find(ki->second); si != m_subscriptions.end())
+        {
+            for (auto& s : si->second)
+                if (s.id == id) { s.dead = true; break; }
+        }
+        m_subscription_keys.erase(ki);
+        m_subscriptions_dirty = true;
+
+        // Marked now, taken out now — unless a dispatch is walking the vector
+        // this entry is in, in which case the walk finishes first.  A handler
+        // unsubscribing itself is the ordinary way to write a one-shot
+        // subscriber, so this is not an exotic path.
+        if (m_dispatch_depth == 0)
+            settle_subscriptions();
+        return true;
     };
 
     // socketley.pipe(src_name, src_fd, dst_name, dst_fd) — cross-runtime zero-copy pipe

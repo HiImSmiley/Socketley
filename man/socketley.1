@@ -3356,13 +3356,39 @@ arrays; all others as objects.
 Decode a JSON string into a Lua value. Objects become tables with string
 keys, arrays become tables with integer keys (1-based). Null becomes nil.
 .TP
-.B socketley.subscribe(cache_name, channel, fn)
+.B socketley.subscribe(cache_name, channel, fn) \(-> subscription_id
 Register
 .I fn(channel, message)
 to be called whenever the named cache runtime publishes to
 .IR channel .
 The function is called on the subscribing runtime's event loop turn (not from the cache itself).
 Multiple subscriptions to the same channel are all fired in registration order.
+.IP
+Returns an integer id for
+.BR socketley.unsubscribe() .
+Ids start at 1 and are never reused.
+.TP
+.B socketley.unsubscribe(subscription_id) \(-> bool
+End one registration. Returns
+.B true
+when it removed a live one and
+.B false
+when the id names none \(em never issued, or already unsubscribed.
+.IP
+The id names one registration, not a channel, so two handlers on the same
+channel can be ended independently. Safe to call from inside a subscriber's own
+callback, which is how a one-shot subscriber is written; the removal takes
+effect for the next message rather than in the middle of delivering this one.
+.IP
+A subscription lives as long as the Lua context, which is destroyed by
+.B remove
+and by
+.BR reload\-lua .
+Without ending them, a script that subscribes from a callback that runs more
+than once \(em
+.B on_tick
+is the ordinary one \(em registers the same handler again on every call, and
+each publish is delivered to every copy.
 .TP
 .B socketley.http(opts) \(-> table
 Synchronous HTTP/HTTPS client.

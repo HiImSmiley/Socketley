@@ -537,8 +537,52 @@ public:
     void unregister_timer(void* t);
 private:
 
+    // ─── One registration made by socketley.subscribe ───────────────────────
+    //
+    // This used to be a bare sol::protected_function in the vector, because
+    // nothing ever took one out again: socketley.subscribe appended and there
+    // was no counterpart, so a script that subscribed from on_tick grew the
+    // vector once per tick and every publish was delivered to every copy.
+    //
+    // The id is what unsubscribe names, following the timers — set_timeout and
+    // set_interval hand back an integer and clear_timeout/clear_interval take
+    // it, and that is the closest precedent this file has.  The alternative,
+    // unsubscribe(cache_name, channel), cannot express the case the id exists
+    // for: two subscriptions to one channel, of which the script wants to drop
+    // one.  Ids start at 1, so 0 is never one.
+    struct subscription
+    {
+        int                     id{0};
+        sol::protected_function fn;
+        // Marked by unsubscribe() while a dispatch is walking this channel, and
+        // compacted out when the outermost dispatch returns.  See
+        // dispatch_publish for why nothing may be erased under it.
+        bool                    dead{false};
+    };
+
     // Cross-runtime pub/sub: key = cache_name + '\0' + channel
-    std::unordered_map<std::string, std::vector<sol::protected_function>> m_subscriptions;
+    std::unordered_map<std::string, std::vector<subscription>> m_subscriptions;
+
+    // id → key, so unsubscribe() is one lookup rather than a walk of every
+    // channel.  Ids are never reused, so a stale one names nothing.
+    std::unordered_map<int, std::string> m_subscription_keys;
+    int m_next_subscription_id{0};
+
+    // Subscriptions made while a dispatch is in flight, applied when it ends.
+    // See dispatch_publish: the vector being walked may not move.
+    std::vector<std::pair<std::string, subscription>> m_pending_subscriptions;
+
+    // How many dispatch_publish frames this context has on the stack.  Not a
+    // bool: a subscriber may publish, and a publish may come back here.
+    unsigned m_dispatch_depth{0};
+
+    // Whether unsubscribe() marked anything while m_dispatch_depth was nonzero.
+    bool m_subscriptions_dirty{false};
+
+    // Apply the deferred insertions and remove the marked entries.  Called when
+    // the last dispatch frame unwinds, and directly by unsubscribe() when there
+    // is no dispatch to wait for.
+    void settle_subscriptions();
 
     // Timer cancellation: ID → timer* mapping
     int m_next_timer_id{0};
