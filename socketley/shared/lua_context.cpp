@@ -186,14 +186,16 @@ long remaining_ms() noexcept
 // which this line cannot know.  That is the primary report now, and it is the
 // one to read.
 //
-// This line stays because two paths still have nothing else.  A script that
+// This line stays because one path still has nothing else.  A script that
 // wraps its own slow work in pcall() — `local ok = pcall(fetch_all)` is an
 // ordinary thing to write — catches the deadline error itself, and the call
 // site never sees a failure to report; without this the runtime would simply
-// stop making progress with nothing in the log to say why.  And
-// on_http_request is the one callback the sweep did not reach: it is still a
-// sol::function and its call site checks nothing at all, so a deadline there
-// is invisible unless it is written here.
+// stop making progress with nothing in the log to say why.
+//
+// It used to be two.  on_http_request was the one callback the sweep did not
+// reach — still a sol::function, its call site checking nothing at all — so a
+// deadline there was invisible unless it was written here.  It is a protected
+// call now and its call site reports like the rest.
 //
 // So it is deliberately short, and deliberately not a copy of the error text:
 // this line is the event, the call site's line is the diagnosis.

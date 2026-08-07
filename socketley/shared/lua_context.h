@@ -312,10 +312,12 @@ public:
     // into the cache, so a read-before-check would have stored a Lua error
     // message as the fetched value and served it as a hit for ever.
     //
-    // guarded_protected almost everywhere, because after that sweep almost
-    // every callback here is a sol::protected_function.  on_http_request is the
-    // one still declared sol::function, so it is the one still `guarded`.
-    using guarded           = lua_guarded_call<sol::function>;
+    // One alias, because after the sweep finished with on_http_request there is
+    // no sol::function left in this class to guard.  A new callback added here
+    // is therefore a protected one by having nothing else to be, which is the
+    // property the second alias was quietly costing: on_http_request kept its
+    // unchecked call for two commits after the reasoning against it was written
+    // down, and what let it was that `guarded` still existed to spell it.
     using guarded_protected = lua_guarded_call<sol::protected_function>;
 
     guarded_protected on_start()      { return {m_on_start,      "on_start",      m_deadline_ms}; }
@@ -347,7 +349,8 @@ public:
     guarded_protected on_upstream()            { return {m_on_upstream,            "on_upstream",            m_deadline_ms}; }
     guarded_protected on_upstream_connect()    { return {m_on_upstream_connect,    "on_upstream_connect",    m_deadline_ms}; }
     guarded_protected on_upstream_disconnect() { return {m_on_upstream_disconnect, "on_upstream_disconnect", m_deadline_ms}; }
-    guarded on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms}; }
+    // A handler that raises has not declined; see m_on_http_request below.
+    guarded_protected on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms}; }
     // The chain, in the order the script listed it.  Only valid to read when
     // has_filters() is true; empty otherwise.
     //
@@ -472,7 +475,22 @@ private:
     sol::protected_function m_on_upstream;
     sol::protected_function m_on_upstream_connect;
     sol::protected_function m_on_upstream_disconnect;
-    sol::function m_on_http_request;
+    // The last one across.  It was still a sol::function two commits after the
+    // reasoning above was written, and its call site checked nothing at all —
+    // `sol::object result = on_http_request()(req)` reads index 0 of the result
+    // whatever the call did, which on a failure is the error object.  So a Lua
+    // error in an HTTP handler was reported by a catch in Release and by
+    // nothing in Sanitize, and in both builds the request fell through to the
+    // static-file/404 path.
+    //
+    // That fall-through is the part that makes this more than a missing log
+    // line.  Returning nil from this callback is DOCUMENTED as "I have no
+    // answer, serve the static file or 404", so answering a raise the same way
+    // makes a handler that broke indistinguishable — at the client — from one
+    // that declined.  The proxy hook one file over settled the identical
+    // question the identical way: a hook that raises has not said carry on.
+    // The call site now answers 500 and says why.
+    sol::protected_function m_on_http_request;
 
     // The `filters` chain.  A vector and not a single sol::function because the
     // whole point of it is order: each entry is asked in turn and the first one

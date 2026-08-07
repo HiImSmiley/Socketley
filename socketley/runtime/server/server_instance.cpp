@@ -966,27 +966,80 @@ static std::string_view http_reason(int status)
 void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
 {
 #ifndef SOCKETLEY_NO_LUA
-    // Try Lua on_http_request callback
+    // ─── The Lua handler ────────────────────────────────────────────────────
+    //
+    // Protected, like every other callback in this tree since 07baee7..b868bb5,
+    // and this was the last one to come across.  It used to be a sol::function
+    // called inside `try { ... } catch (const std::exception&)`, and the result
+    // was read with no check at all:
+    //
+    //     sol::object result = lua()->on_http_request()(lua_req);
+    //
+    // Two things were wrong with that.  The catch only fires when sol2's panic
+    // handler throws AND the throw unwinds out of the interpreter, which it does
+    // not in this repository's Sanitize configuration — so the one diagnostic
+    // this path had was dead in the build the nightly job uses.  And reading
+    // index 0 without asking valid() is the read b868bb5 records the cost of on
+    // the cache path: on a failed call index 0 is the error object.
+    //
+    // A raise is answered with 500, not with the fall-through below.  `return
+    // nil` from this callback is documented as "I have no answer, serve the
+    // static file or 404"; answering a raise the same way made a handler that
+    // broke indistinguishable at the client from one that declined, and left
+    // the operator nothing to read either.  The proxy hook settled the same
+    // question the same way — a hook that raises has not said carry on.
     if (lua() && lua()->has_on_http_request())
     {
-        try
+        // Build Lua request table
+        sol::table lua_req = lua()->state().create_table();
+        lua_req["method"] = req.method;
+        lua_req["path"] = req.path;
+        lua_req["query"] = req.query;
+        lua_req["body"] = req.body;
+        lua_req["client_id"] = req.client_id;
+        lua_req["version"] = req.version;
+
+        sol::table lua_headers = lua()->state().create_table();
+        for (const auto& [k, v] : req.headers)
+            lua_headers[std::string(k)] = std::string(v);
+        lua_req["headers"] = lua_headers;
+
+        // Determine keep-alive: HTTP/1.1 defaults to keep-alive
+        const bool keep_alive = (req.version.find("1.1") != std::string_view::npos);
+
+        sol::protected_function_result r = lua()->on_http_request()(lua_req);
+
+        if (SOCKETLEY_UNLIKELY(!r.valid()))
         {
-            // Build Lua request table
-            sol::table lua_req = lua()->state().create_table();
-            lua_req["method"] = req.method;
-            lua_req["path"] = req.path;
-            lua_req["query"] = req.query;
-            lua_req["body"] = req.body;
-            lua_req["client_id"] = req.client_id;
-            lua_req["version"] = req.version;
+            sol::error e = r;
+            std::cerr << "[lua] on_http_request error: " << e.what()
+                      << " — answering 500" << std::endl;
 
-            sol::table lua_headers = lua()->state().create_table();
-            for (const auto& [k, v] : req.headers)
-                lua_headers[std::string(k)] = std::string(v);
-            lua_req["headers"] = lua_headers;
+            auto response = build_http_response_full(500, http_reason(500), {},
+                                                     "500 Internal Server Error",
+                                                     keep_alive);
+            conn->write_queue.push(std::make_shared<const std::string>(std::move(response)));
+            if (!conn->write_pending)
+                flush_write_queue(conn);
 
-            sol::object result = lua()->on_http_request()(lua_req);
+            conn->partial.erase(0, total_consumed);
 
+            if (!keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;  // Reset for next request (pipelining)
+
+            return;
+        }
+
+        // return_count() before get(), for the same reason valid() came before
+        // both: a handler that ends without a `return` — which is how anyone
+        // writes one that only handles some paths — returns nothing, and index 0
+        // of nothing is not a value to ask about.  Falling through is the right
+        // answer for it and is what the documentation promises.
+        if (r.return_count() > 0)
+        {
+            sol::object result = r;
             if (result.is<sol::table>())
             {
                 sol::table resp_tbl = result.as<sol::table>();
@@ -1004,9 +1057,6 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                     });
                 }
 
-                // Determine keep-alive: HTTP/1.1 defaults to keep-alive
-                bool keep_alive = (req.version.find("1.1") != std::string_view::npos);
-
                 auto response = build_http_response_full(status, reason, resp_headers, body, keep_alive);
                 conn->write_queue.push(std::make_shared<const std::string>(std::move(response)));
                 if (!conn->write_pending)
@@ -1021,10 +1071,6 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
 
                 return;
             }
-        }
-        catch (const std::exception&)
-        {
-            // Lua error — fall through to static/404
         }
     }
 #endif

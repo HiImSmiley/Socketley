@@ -2677,8 +2677,19 @@ If no
 .B on_http_request
 callback is defined, the server falls back to static file serving
 .RB ( \-\-http )
-or returns 404. Supports HTTP/1.1 keep-alive \(em the connection is reused
+or returns 404. Returning nothing, or anything that is not a table, means the
+same thing: the request falls through to the static file or the 404.
+Supports HTTP/1.1 keep-alive \(em the connection is reused
 for subsequent requests.
+.IP
+A callback that
+.B raises
+is not a callback that declined. The request is answered
+.BR "500 Internal Server Error" ,
+and the error is written to the daemon's log as
+.BR "[lua] on_http_request error: ..." .
+Falling through to the 404 would make a handler that broke indistinguishable,
+at the client, from one that had no answer.
 .IP
 Example:
 .nf
