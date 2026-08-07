@@ -586,7 +586,13 @@ void proxy_supervisor::send_reload()
 
 std::string proxy_supervisor::take_reload_error()
 {
-    return std::move(m_reload_error);
+    // Cleared explicitly rather than left to the move.  A moved-from string is
+    // valid but unspecified, and this member's whole meaning is "empty means the
+    // reload loaded" — a second read finding something in it would report the
+    // previous reload's failure against a reload that worked.
+    std::string out = std::move(m_reload_error);
+    m_reload_error.clear();
+    return out;
 }
 
 void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
