@@ -8820,6 +8820,52 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         conn->closing = true;
 }
 
+// ─── Refusing a response has to mark the side whose handler is running ──────
+//
+// Both hook arms set a `closing` flag, and setting a flag is not closing a
+// connection: something has to act on it, and only one thing does — the
+// completion handler of whichever descriptor is running.
+//
+// The request arm works because the two line up.  forward_to_backend is called
+// from handle_client_read with the CLIENT connection in hand, its refusal sets
+// that client's flag, and handle_client_read tears the pair down on it.
+//
+// forward_to_client is the mirror image and the flags were not mirrored with
+// it.  Its caller is handle_backend_read, which ends on
+//
+//     if (!conn->closing) { ...re-arm the backend read... }
+//     else if (!conn->write_pending) { close_pair(conn->client_fd, fd); }
+//
+// where `conn` is the BACKEND.  The refusal set only the client's flag, so that
+// test read false, the backend read was re-armed, and the pair was left up.
+// Nothing else could ever have noticed: the refusal happens before anything is
+// queued to the client, so the client has no write in flight and no completion
+// of its own coming.  Measured against a backend that keeps its connection open
+// — one that hangs up after replying tears the pair down by itself and hides
+// this entirely:
+//
+//     request arm    closed_by_peer=True    0.0s   0 bytes
+//     response arm   closed_by_peer=False   6.0s   0 bytes
+//
+// No refused byte ever reached the client, so this was never a disclosure. It
+// was a client left connected to a proxy that had decided not to answer it —
+// and on a multi-chunk response, one holding a truncated answer whose declared
+// Content-Length will never be satisfied, which a conforming client waits on
+// for ever. The descriptor pair went with it.
+//
+// So the refusal marks both sides, exactly as the request arm does, and the
+// teardown that already exists is what acts. Deliberately not a close_pair()
+// from here: this function is called from the middle of a completion handler
+// that goes on using both connections after it returns, and close_pair releases
+// them. Marking is the whole of what a refusal may do; handle_backend_read owns
+// the timing, and it defers on anything still in flight.
+void proxy_instance::refuse_response(proxy_backend_connection* bconn,
+                                     proxy_client_connection* cconn)
+{
+    cconn->closing = true;
+    bconn->closing = true;
+}
+
 void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::string_view data)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
@@ -8883,7 +8929,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
             sol::error err = r;
             fprintf(stderr, "[lua] on_proxy_response error: %s — refusing the "
                             "response\n", err.what());
-            cconn->closing = true;
+            refuse_response(conn, cconn);
             return;
         }
 
@@ -8908,7 +8954,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
                                 "a string or nil — refusing the response\n",
                         lua_typename(lctx->state().lua_state(),
                                      static_cast<int>(obj.get_type())));
-                cconn->closing = true;
+                refuse_response(conn, cconn);
                 return;
             }
         }

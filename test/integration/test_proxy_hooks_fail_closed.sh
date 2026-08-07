@@ -59,7 +59,7 @@ fail() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
-NAMES="ph_raise ph_false ph_mod ph_rraise ph_rmod"
+NAMES="ph_raise ph_false ph_mod ph_rraise ph_rmod ph_qhold ph_rhold"
 BE_PIDS=()
 
 cleanup() {
@@ -87,8 +87,13 @@ daemon_start "$BIN"
 # the backend" has no other honest answer.
 BE_PY="$SOCKETLEY_TMPD/be.py"
 cat > "$BE_PY" <<'PY'
-import socket, sys, threading
+import socket, sys, threading, time
 port, log = int(sys.argv[1]), sys.argv[2]
+# "hold": answer and then keep the connection OPEN, like any keep-alive backend.
+# Without it this backend closes the moment it has replied, and that close tears
+# the pair down on its own -- which is precisely what hid the response arm's
+# missing close for as long as it was hidden.
+hold = len(sys.argv) > 3 and sys.argv[3] == "hold"
 lock = threading.Lock()
 
 def serve(c):
@@ -110,6 +115,8 @@ def serve(c):
                 f.write(data)
                 f.flush()
         c.sendall(b"BACKEND-REPLY")
+        if hold:
+            time.sleep(30)
     except Exception:
         pass
     finally:
@@ -151,12 +158,12 @@ except Exception:
     pass
 PY
 
-# stand NAME PROXY_PORT BE_PORT HOOK_BODY_FILE
+# stand NAME PROXY_PORT BE_PORT HOOK_BODY_FILE [hold]
 stand() {
-    local name=$1 pport=$2 beport=$3 lua=$4
+    local name=$1 pport=$2 beport=$3 lua=$4 hold=${5:-}
     local log="$SOCKETLEY_TMPD/$name.seen"
     : > "$log"
-    python3 "$BE_PY" "$beport" "$log" 2>"$SOCKETLEY_TMPD/$name.be.log" &
+    python3 "$BE_PY" "$beport" "$log" $hold 2>"$SOCKETLEY_TMPD/$name.be.log" &
     BE_PIDS+=("$!")
     local i
     for i in $(seq 1 50); do
@@ -275,6 +282,85 @@ then pass; else
     fail "the response hook's error is logged" \
          "no on_proxy_response error in the daemon log"
 fi
+
+
+# ─── THE CLOSE ITSELF, NOT A FLAG ───────────────────────────────────────────
+#
+# Both refusals set a `closing` flag, and setting a flag is not closing a
+# connection: something has to act on it.  The request arm's flag is read by
+# handle_client_read, which tears the pair down; the response arm set the
+# CLIENT's flag while its own caller, handle_backend_read, is gated on the
+# BACKEND's -- so nothing acted, and the client sat connected to a proxy that
+# had decided not to answer it.
+#
+# Measured before the fix, against a backend that keeps its connection open:
+#
+#     request arm    closed_by_peer=True   0.0s   0 bytes
+#     response arm   closed_by_peer=False  6.0s   0 bytes
+#
+# So the assertion below is the client's own socket: did the peer close it.
+# Asked of a HOLDING backend on purpose -- a backend that hangs up after
+# replying tears the pair down by itself, and every arm passes.
+HOLD_PY="$SOCKETLEY_TMPD/hold.py"
+cat > "$HOLD_PY" <<'PY_EOF'
+import socket, sys, time
+# Print "closed <bytes>" if the peer closed within the window, "open <bytes>"
+# if it did not.  The bytes matter too: a refusal that closes but has already
+# forwarded what it refused would be a different and worse defect.
+port, window = int(sys.argv[1]), float(sys.argv[2])
+out = b""
+verdict = "open"
+try:
+    s = socket.create_connection(("127.0.0.1", port), 5)
+    s.settimeout(0.5)
+    s.sendall(b"SECRET-PAYLOAD")
+    t0 = time.time()
+    while time.time() - t0 < window:
+        try:
+            b = s.recv(65536)
+        except socket.timeout:
+            continue
+        except Exception:
+            verdict = "closed"; break
+        if not b:
+            verdict = "closed"; break
+        out += b
+    s.close()
+except Exception as e:
+    verdict = "error:%s" % e
+sys.stdout.write("%s %d %s" % (verdict, len(out), out[:40].decode("latin1")))
+PY_EOF
+
+# hold_probe PORT -> "closed|open <nbytes> <data>"
+hold_probe() { python3 "$HOLD_PY" "$1" 4 2>/dev/null || printf 'error 0 '; }
+
+stand ph_qhold 21870 21871 "$L/raise.lua"  hold
+stand ph_rhold 21872 21873 "$L/rraise.lua" hold
+sleep 0.8
+
+Q_HOLD=$(hold_probe 21870)
+R_HOLD=$(hold_probe 21872)
+
+# ── Control 4: the harness can see a close at all ───────────────────────────
+#
+# The request arm against the same holding backend.  Without it, "the response
+# arm did not close" is equally explained by a probe that cannot detect a close.
+case "$Q_HOLD" in
+    closed\ *) pass ;;
+    *) fail "control: the request arm closes against a holding backend"             "ph_qhold answered '$Q_HOLD', wanted to start with 'closed'"             "if this is 'open' the probe cannot see a close and the assertion"             "below proves nothing about the response arm" ;;
+esac
+
+# ── The response arm must close too ─────────────────────────────────────────
+case "$R_HOLD" in
+    closed\ *) pass ;;
+    *) fail "an on_proxy_response refusal closes the client connection"             "ph_rhold answered '$R_HOLD', wanted to start with 'closed'"             "the man page says the client connection is closed, since the"             "response this hook was to redact must not be delivered"             "unredacted -- so a client that is still connected is waiting for"             "an answer the proxy has already decided never to send" ;;
+esac
+
+# ── ...and still without delivering what it refused ─────────────────────────
+case "$R_HOLD" in
+    *\ 0\ *) pass ;;
+    *) fail "the refused response is not delivered"             "ph_rhold received bytes: '$R_HOLD'"             "closing is not enough on its own; the bytes the hook refused"             "must not reach the client on the way out" ;;
+esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

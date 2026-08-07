@@ -852,6 +852,13 @@ private:
 
     void forward_to_backend(proxy_client_connection* conn, std::string_view data);
     void forward_to_client(proxy_backend_connection* conn, std::string_view data);
+
+    // Mark both sides of a pair whose response an on_proxy_response hook
+    // refused.  Both, because handle_backend_read — the caller that acts on
+    // this — is gated on the backend's flag, and the client has nothing of its
+    // own in flight to notice one.  See the note above the definition.
+    void refuse_response(proxy_backend_connection* bconn,
+                         proxy_client_connection* cconn);
     void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body);
     // The one answer for "this request will never reach a backend", and the one
     // place that decides which status says so.
