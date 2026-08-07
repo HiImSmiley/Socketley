@@ -762,9 +762,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         {
             for (const auto& key : expired_keys)
             {
-                try { lua()->on_expire()(key); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_expire error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_expire()(key);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_expire error: " << e.what() << "\n";
+                    }
+                }
             }
         }
 #endif
@@ -1932,9 +1937,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(key, value, 0); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(key, value, 0);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -1954,9 +1964,20 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_miss())
                 {
-                    try
+                    // Checked BEFORE the result is read, and that is not a formality:
+                    // on a failed call the value at index 0 is the ERROR OBJECT, and
+                    // reading it as an optional<string> would store a Lua error message
+                    // in the cache and answer it to the client as the fetched value.
+                    // A raise still means a miss, which is what the catch this replaces
+                    // decided by falling through to the nil below.
+                    sol::protected_function_result res = lua()->on_miss()(args);
+                    if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
-                        auto res = lua()->on_miss()(args);
+                        sol::error e = res;
+                        std::cerr << "[lua] on_miss error: " << e.what() << "\n";
+                    }
+                    else
+                    {
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
                         {
@@ -1971,8 +1992,6 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                             break;
                         }
                     }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_miss error: " << e.what() << "\n"; }
                 }
 #endif
                 m_stat_get_misses++;
@@ -1999,9 +2018,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_delete())
                 {
-                    try { lua()->on_delete_cb()(args); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
+                    {
+                        sol::protected_function_result r = lua()->on_delete_cb()(args);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            std::cerr << "[lua] on_delete error: " << e.what() << "\n";
+                        }
+                    }
                 }
 #endif
             }
@@ -2158,9 +2182,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(key, val, 0); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                    {
+                        sol::protected_function_result r = lua()->on_write()(key, val, 0);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        }
+                    }
                 }
 #endif
                 if (sp2 == std::string_view::npos) break;
@@ -2597,9 +2626,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(key, val, 0); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                    {
+                        sol::protected_function_result r = lua()->on_write()(key, val, 0);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        }
+                    }
                 }
 #endif
             }
@@ -2625,9 +2659,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(key, val, sec); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(key, val, sec);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -2655,9 +2694,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(key, val, 0); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(key, val, 0);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -3443,9 +3487,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                 if (SOCKETLEY_UNLIKELY(lua() && lua()->has_on_write()))
                 {
-                    try { lua()->on_write()(args[1], args[2], 0); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                    {
+                        sol::protected_function_result r = lua()->on_write()(args[1], args[2], 0);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        }
+                    }
                 }
 #endif
                 break;
@@ -3494,9 +3543,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(args[1], args[2], ex_sec); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(args[1], args[2], ex_sec);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -3516,9 +3570,20 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                 if (SOCKETLEY_UNLIKELY(lua() && lua()->has_on_miss()))
                 {
-                    try
+                    // Checked BEFORE the result is read, and that is not a formality:
+                    // on a failed call the value at index 0 is the ERROR OBJECT, and
+                    // reading it as an optional<string> would store a Lua error message
+                    // in the cache and answer it to the client as the fetched value.
+                    // A raise still means a miss, which is what the catch this replaces
+                    // decided by falling through to the nil below.
+                    sol::protected_function_result res = lua()->on_miss()(args[1]);
+                    if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
-                        auto res = lua()->on_miss()(args[1]);
+                        sol::error e = res;
+                        std::cerr << "[lua] on_miss error: " << e.what() << "\n";
+                    }
+                    else
+                    {
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
                         {
@@ -3532,8 +3597,6 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                             break;
                         }
                     }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_miss error: " << e.what() << "\n"; }
                 }
 #endif
                 m_stat_get_misses++;
@@ -3557,9 +3620,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                     if (lua() && lua()->has_on_delete())
                     {
-                        try { lua()->on_delete_cb()(args[i]); }
-                        catch (const sol::error& e)
-                        { std::cerr << "[lua] on_delete error: " << e.what() << "\n"; }
+                        {
+                            sol::protected_function_result r = lua()->on_delete_cb()(args[i]);
+                            if (SOCKETLEY_UNLIKELY(!r.valid()))
+                            {
+                                sol::error e = r;
+                                std::cerr << "[lua] on_delete error: " << e.what() << "\n";
+                            }
+                        }
                     }
 #endif
                 }
@@ -3687,9 +3755,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
-                    try { lua()->on_write()(args[i], args[i+1], 0); }
-                    catch (const sol::error& e)
-                    { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                    {
+                        sol::protected_function_result r = lua()->on_write()(args[i], args[i+1], 0);
+                        if (SOCKETLEY_UNLIKELY(!r.valid()))
+                        {
+                            sol::error e = r;
+                            std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                        }
+                    }
                 }
 #endif
             }
@@ -4003,9 +4076,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (did_set && lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(args[1], args[2], 0); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(args[1], args[2], 0);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -4029,9 +4107,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(args[1], args[3], sec); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(args[1], args[3], sec);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;
@@ -4055,9 +4138,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
-                try { lua()->on_write()(args[1], args[3], 0); }
-                catch (const sol::error& e)
-                { std::cerr << "[lua] on_write error: " << e.what() << "\n"; }
+                {
+                    sol::protected_function_result r = lua()->on_write()(args[1], args[3], 0);
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error e = r;
+                        std::cerr << "[lua] on_write error: " << e.what() << "\n";
+                    }
+                }
             }
 #endif
             break;

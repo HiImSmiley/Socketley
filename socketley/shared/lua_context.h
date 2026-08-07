@@ -157,10 +157,10 @@ public:
     sol::protected_function& on_master_auth() { return m_on_master_auth; }
     sol::protected_function& on_client_message() { return m_on_client_message; }
     sol::protected_function& on_tick() { return m_on_tick; }
-    sol::function& on_miss()      { return m_on_miss; }
-    sol::function& on_write()     { return m_on_write; }
-    sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
-    sol::function& on_expire()    { return m_on_expire; }
+    sol::protected_function& on_miss()      { return m_on_miss; }
+    sol::protected_function& on_write()     { return m_on_write; }
+    sol::protected_function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
+    sol::protected_function& on_expire()    { return m_on_expire; }
     sol::protected_function& on_auth()        { return m_on_auth; }
     sol::protected_function& on_websocket()   { return m_on_websocket; }
     sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
@@ -261,10 +261,10 @@ private:
     sol::protected_function m_on_master_auth;
     sol::protected_function m_on_client_message;
     sol::protected_function m_on_tick;
-    sol::function m_on_miss;
-    sol::function m_on_write;
-    sol::function m_on_delete;
-    sol::function m_on_expire;
+    sol::protected_function m_on_miss;
+    sol::protected_function m_on_write;
+    sol::protected_function m_on_delete;
+    sol::protected_function m_on_expire;
     // The callback that decides whether a client is served at all, so a
     // failure has to arrive as a value for the same reason on_master_auth's
     // does — and a test now pins that its error is reported, which under the
