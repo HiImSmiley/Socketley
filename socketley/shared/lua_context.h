@@ -162,15 +162,15 @@ public:
     sol::function& on_delete_cb() { return m_on_delete; }  // avoid clash with std::delete
     sol::function& on_expire()    { return m_on_expire; }
     sol::protected_function& on_auth()        { return m_on_auth; }
-    sol::function& on_websocket()   { return m_on_websocket; }
+    sol::protected_function& on_websocket()   { return m_on_websocket; }
     sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
     sol::protected_function& on_proxy_response() { return m_on_proxy_response; }
     sol::function& on_cluster_join()   { return m_on_cluster_join; }
     sol::function& on_cluster_leave()  { return m_on_cluster_leave; }
     sol::function& on_group_change()   { return m_on_group_change; }
-    sol::function& on_upstream()           { return m_on_upstream; }
-    sol::function& on_upstream_connect()   { return m_on_upstream_connect; }
-    sol::function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
+    sol::protected_function& on_upstream()           { return m_on_upstream; }
+    sol::protected_function& on_upstream_connect()   { return m_on_upstream_connect; }
+    sol::protected_function& on_upstream_disconnect() { return m_on_upstream_disconnect; }
     sol::function& on_http_request()       { return m_on_http_request; }
     // The chain, in the order the script listed it.  Only valid to read when
     // has_filters() is true; empty otherwise.
@@ -270,7 +270,7 @@ private:
     // does — and a test now pins that its error is reported, which under the
     // try/catch it was not in the Sanitize build.
     sol::protected_function m_on_auth;
-    sol::function m_on_websocket;
+    sol::protected_function m_on_websocket;
     // Both refuse on error, so the error has to arrive as a value: a refusal
     // nobody can explain is barely better than the admission it replaced.
     sol::protected_function m_on_proxy_request;
@@ -278,9 +278,9 @@ private:
     sol::function m_on_cluster_join;
     sol::function m_on_cluster_leave;
     sol::function m_on_group_change;
-    sol::function m_on_upstream;
-    sol::function m_on_upstream_connect;
-    sol::function m_on_upstream_disconnect;
+    sol::protected_function m_on_upstream;
+    sol::protected_function m_on_upstream_connect;
+    sol::protected_function m_on_upstream_disconnect;
     sol::function m_on_http_request;
 
     // The `filters` chain.  A vector and not a single sol::function because the
