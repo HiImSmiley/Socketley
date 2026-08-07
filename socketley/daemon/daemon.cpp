@@ -77,12 +77,12 @@ static uint16_t load_daemon_config(const std::string& config_path)
     }
 
     // Parse config table
-    sol::optional<sol::table> config = lua["config"];
+    sol::optional<sol::table> config = lua["config"].get<sol::optional<sol::table>>();
     if (!config)
         return 0;
 
     // log_level
-    sol::optional<std::string> ll = (*config)["log_level"];
+    sol::optional<std::string> ll = (*config)["log_level"].get<sol::optional<std::string>>();
     if (ll)
     {
         log_level level;
@@ -91,7 +91,7 @@ static uint16_t load_daemon_config(const std::string& config_path)
     }
 
     // metrics_port
-    sol::optional<int> mp = (*config)["metrics_port"];
+    sol::optional<int> mp = (*config)["metrics_port"].get<sol::optional<int>>();
     if (mp && *mp > 0 && *mp <= 65535)
         metrics_port = static_cast<uint16_t>(*mp);
 

@@ -995,7 +995,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 std::string_view reason = http_reason(status);
 
                 std::vector<std::pair<std::string, std::string>> resp_headers;
-                sol::optional<sol::table> h = resp_tbl["headers"];
+                sol::optional<sol::table> h = resp_tbl["headers"].get<sol::optional<sol::table>>();
                 if (h)
                 {
                     h->for_each([&](sol::object key, sol::object val) {

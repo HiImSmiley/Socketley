@@ -37,10 +37,10 @@ int cli_config(int argc, char** argv)
     }
 
     // Apply daemon settings (name, cluster) before runtimes
-    sol::optional<sol::table> daemon = lua["daemon"];
+    sol::optional<sol::table> daemon = lua["daemon"].get<sol::optional<sol::table>>();
     if (daemon)
     {
-        sol::optional<std::string> name = (*daemon)["name"];
+        sol::optional<std::string> name = (*daemon)["name"].get<sol::optional<std::string>>();
         if (name && !name->empty())
         {
             std::string response;
@@ -49,7 +49,7 @@ int cli_config(int argc, char** argv)
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
 
-        sol::optional<std::string> cluster = (*daemon)["cluster"];
+        sol::optional<std::string> cluster = (*daemon)["cluster"].get<sol::optional<std::string>>();
         if (cluster && !cluster->empty())
         {
             std::string response;
@@ -80,39 +80,39 @@ int cli_config(int argc, char** argv)
 
         std::string command = "create " + type_str + " " + name;
 
-        sol::optional<int> port = t["port"];
+        sol::optional<int> port = t["port"].get<sol::optional<int>>();
         if (port)
             command += " -p " + std::to_string(*port);
 
-        sol::optional<std::string> target = t["target"];
+        sol::optional<std::string> target = t["target"].get<sol::optional<std::string>>();
         if (target)
             command += " -t " + *target;
 
-        sol::optional<std::string> mode = t["mode"];
+        sol::optional<std::string> mode = t["mode"].get<sol::optional<std::string>>();
         if (mode)
             command += " --mode " + *mode;
 
-        sol::optional<std::string> log = t["log"];
+        sol::optional<std::string> log = t["log"].get<sol::optional<std::string>>();
         if (log)
             command += " --log " + *log;
 
-        sol::optional<std::string> write_file = t["write"];
+        sol::optional<std::string> write_file = t["write"].get<sol::optional<std::string>>();
         if (write_file)
             command += " -w " + *write_file;
 
-        sol::optional<std::string> persistent = t["persistent"];
+        sol::optional<std::string> persistent = t["persistent"].get<sol::optional<std::string>>();
         if (persistent)
             command += " --persistent " + *persistent;
 
-        sol::optional<std::string> protocol = t["protocol"];
+        sol::optional<std::string> protocol = t["protocol"].get<sol::optional<std::string>>();
         if (protocol)
             command += " --protocol " + *protocol;
 
-        sol::optional<std::string> strategy = t["strategy"];
+        sol::optional<std::string> strategy = t["strategy"].get<sol::optional<std::string>>();
         if (strategy)
             command += " --strategy " + *strategy;
 
-        sol::optional<sol::table> backends = t["backends"];
+        sol::optional<sol::table> backends = t["backends"].get<sol::optional<sol::table>>();
         if (backends)
         {
             std::string joined;
@@ -125,13 +125,13 @@ int cli_config(int argc, char** argv)
             command += " --backend " + joined;
         }
 
-        sol::optional<std::string> lua_script = t["config"];
+        sol::optional<std::string> lua_script = t["config"].get<sol::optional<std::string>>();
         if (!lua_script || lua_script->empty())
-            lua_script = t["lua"];
+            lua_script = t["lua"].get<sol::optional<std::string>>();
         if (lua_script && !lua_script->empty())
             command += " --lua " + *lua_script;
 
-        sol::optional<std::string> bash = t["bash"];
+        sol::optional<std::string> bash = t["bash"].get<sol::optional<std::string>>();
         if (bash)
         {
             switch (fnv1a(*bash))
@@ -156,15 +156,15 @@ int cli_config(int argc, char** argv)
             }
         }
 
-        sol::optional<std::string> cache_name = t["cache"];
+        sol::optional<std::string> cache_name = t["cache"].get<sol::optional<std::string>>();
         if (cache_name)
             command += " --cache " + *cache_name;
 
-        sol::optional<std::string> group = t["group"];
+        sol::optional<std::string> group = t["group"].get<sol::optional<std::string>>();
         if (group && !group->empty())
             command += " -g " + *group;
 
-        sol::optional<std::string> master_pw = t["master_pw"];
+        sol::optional<std::string> master_pw = t["master_pw"].get<sol::optional<std::string>>();
         if (master_pw && !master_pw->empty())
             command += " --master-pw " + *master_pw;
 
@@ -172,7 +172,7 @@ int cli_config(int argc, char** argv)
         if (master_forward)
             command += " --master-forward";
 
-        sol::optional<std::string> http_dir = t["http"];
+        sol::optional<std::string> http_dir = t["http"].get<sol::optional<std::string>>();
         if (http_dir && !http_dir->empty())
             command += " --http " + *http_dir;
 

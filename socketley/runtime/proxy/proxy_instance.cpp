@@ -4349,7 +4349,7 @@ static void filter_collect_header(sol::table& out, std::string_view line)
     // Repeats are combined, in the order sent, as RFC 9110 Section 5.2 defines
     // the field value of a field that appears more than once.  A table holds one
     // value per key, and dropping the later ones would hide half a Cookie.
-    sol::optional<std::string> prev = out[name];
+    sol::optional<std::string> prev = out[name].get<sol::optional<std::string>>();
     if (prev)
     {
         std::string joined = std::move(*prev);
@@ -4453,15 +4453,15 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         }
 
         sol::table t = r.as<sol::table>();
-        sol::optional<sol::object> status_obj = t["status"];
+        sol::optional<sol::object> status_obj = t["status"].get<sol::optional<sol::object>>();
         const bool is_answer = status_obj && *status_obj != sol::nil;
 
         if (!is_answer)
         {
             // Continue, with the request rewritten.  The only other thing a
             // returned table may be.
-            sol::optional<sol::table> set = t["set_headers"];
-            sol::optional<sol::table> remove = t["remove_headers"];
+            sol::optional<sol::table> set = t["set_headers"].get<sol::optional<sol::table>>();
+            sol::optional<sol::table> remove = t["remove_headers"].get<sol::optional<sol::table>>();
             if (!set && !remove)
             {
                 fprintf(stderr, "[lua] filter returned a table with none of "
@@ -4591,7 +4591,7 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
 
         std::string body;
         {
-            sol::optional<std::string> b = t["body"];
+            sol::optional<std::string> b = t["body"].get<sol::optional<std::string>>();
             if (b)
                 body = std::move(*b);
         }
@@ -4606,7 +4606,7 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         response += filter_reason(status);
         response += "\r\n";
 
-        sol::optional<sol::table> rh = t["headers"];
+        sol::optional<sol::table> rh = t["headers"].get<sol::optional<sol::table>>();
         if (rh)
         {
             rh->for_each([&](sol::object key, sol::object val) {
