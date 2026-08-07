@@ -3366,19 +3366,47 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 // with a typo in it denied in complete silence, indistinguishable
                 // from one that had considered the request and refused it — so
                 // the operator saw a gate that worked and had no way to learn
-                // their gate was not running.  Fail closed and say why: this is
-                // the convention invoke_on_auth has used all along, one file
-                // away, for the same reason.
+                // their gate was not running.  Fail closed and say why.
+                //
+                // A PROTECTED call, and that is not a detail.  Written with a
+                // try/catch — the convention invoke_on_auth uses one file away —
+                // the denial still happened but the message did not, because the
+                // catch depends on sol2's panic handler throwing and on that
+                // throw being able to unwind out of the interpreter.  Measured
+                // in this repository's own Sanitize build: the hook ran, the
+                // request was denied, and no `on_master_auth error` line was
+                // ever written, while a `socketley.log` from the same callback
+                // reached the same log file.  The catch simply never ran.
+                //
+                // A silent auth hook is the exact defect this callback was being
+                // fixed for, so a reporting mechanism that stops working in a
+                // build configuration is not good enough.  Protected calls
+                // return the error as a value; see m_on_master_auth's note in
+                // lua_context.h and the on_route precedent in proxy_instance.
                 auto* lctx = lua();
                 if (lctx && lctx->has_on_master_auth())
                 {
 #ifndef SOCKETLEY_NO_LUA
-                    try {
-                        sol::optional<bool> res = lctx->on_master_auth()(sender->fd, pw);
-                        auth_ok = res.value_or(false);
-                    } catch (const sol::error& e) {
-                        std::cerr << "[lua] on_master_auth error: " << e.what() << std::endl;
+                    sol::protected_function_result r =
+                        lctx->on_master_auth()(sender->fd, pw);
+
+                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    {
+                        sol::error err = r;
+                        std::cerr << "[lua] on_master_auth error: " << err.what()
+                                  << std::endl;
                         auth_ok = false;
+                    }
+                    else
+                    {
+                        // Read as an optional<bool>, which is a type check
+                        // rather than a truth test: only the boolean `true`
+                        // grants.  A hook that returned nothing has not
+                        // answered, and a non-answer is a denial.
+                        sol::optional<bool> res = r.return_count() > 0
+                                                  ? r.get<sol::optional<bool>>()
+                                                  : sol::optional<bool>{};
+                        auth_ok = res.value_or(false);
                     }
 #endif
                 }

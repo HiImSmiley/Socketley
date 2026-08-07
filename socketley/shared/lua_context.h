@@ -154,7 +154,7 @@ public:
     // protected_function, like filters() and unlike every other callback here.
     // See m_on_route below for why.
     sol::protected_function& on_route() { return m_on_route; }
-    sol::function& on_master_auth() { return m_on_master_auth; }
+    sol::protected_function& on_master_auth() { return m_on_master_auth; }
     sol::function& on_client_message() { return m_on_client_message; }
     sol::function& on_tick() { return m_on_tick; }
     sol::function& on_miss()      { return m_on_miss; }
@@ -163,8 +163,8 @@ public:
     sol::function& on_expire()    { return m_on_expire; }
     sol::function& on_auth()        { return m_on_auth; }
     sol::function& on_websocket()   { return m_on_websocket; }
-    sol::function& on_proxy_request()  { return m_on_proxy_request; }
-    sol::function& on_proxy_response() { return m_on_proxy_response; }
+    sol::protected_function& on_proxy_request()  { return m_on_proxy_request; }
+    sol::protected_function& on_proxy_response() { return m_on_proxy_response; }
     sol::function& on_cluster_join()   { return m_on_cluster_join; }
     sol::function& on_cluster_leave()  { return m_on_cluster_leave; }
     sol::function& on_group_change()   { return m_on_group_change; }
@@ -221,13 +221,30 @@ private:
     sol::function m_on_connect;
     sol::function m_on_disconnect;
 
-    // protected_function, for the same reason m_filters below is one, and it is
-    // the only other callback that needs to be.  Every callback above is invoked
-    // inside a try/catch that catches sol::error; that only works because sol2's
-    // panic handler happens to throw one, and whether the throw can unwind out
-    // of the interpreter at all depends on how LuaJIT was built — so the catch
-    // is a bet, not a guarantee.  A protected call does not make the bet: the
-    // error comes back as a value.
+    // protected_function, for the same reason m_filters below is one.  Every
+    // callback still declared sol::function is invoked inside a try/catch that
+    // catches sol::error; that only works because sol2's panic handler happens
+    // to throw one, and whether the throw can unwind out of the interpreter at
+    // all depends on how LuaJIT was built — so the catch is a bet, not a
+    // guarantee.  A protected call does not make the bet: the error comes back
+    // as a value.
+    //
+    // The bet is not hypothetical and it is not only about exotic toolchains:
+    // it loses in this repository's own Sanitize configuration.  Measured, one
+    // script per row, the callback raising after logging a marker so that
+    // "did it run" and "was the error reported" are separate questions:
+    //
+    //                       marker logged   error logged (Release / Sanitize)
+    //     on_auth  (catch)       yes                 yes    /    NO
+    //     filters  (protected)   yes                 yes    /    yes
+    //
+    // The same daemon, the same log file, the same std::cerr — so the message
+    // is not being lost on the way out, the catch simply never runs.  Every
+    // `catch (const sol::error&)` diagnostic in this tree is therefore dead
+    // under the sanitizer build, which is the build the nightly job uses to
+    // find regressions.  The three callbacks below were moved across because a
+    // silent auth hook and a silent proxy hook are the two places where losing
+    // the message costs the most; the rest are recorded as a finding.
     //
     // on_route is the callback that decides where a request goes, and the
     // routing path already has a defined answer for "no usable index came back"
@@ -237,7 +254,11 @@ private:
     // called with no arguments, so the ordinary `hash(path) % n` errors on the
     // very first request.
     sol::protected_function m_on_route;
-    sol::function m_on_master_auth;
+
+    // An auth hook that raises must deny AND say so; a hook whose error is
+    // swallowed is indistinguishable from one that considered the request and
+    // refused it, which is the whole defect this callback was just fixed for.
+    sol::protected_function m_on_master_auth;
     sol::function m_on_client_message;
     sol::function m_on_tick;
     sol::function m_on_miss;
@@ -246,8 +267,10 @@ private:
     sol::function m_on_expire;
     sol::function m_on_auth;
     sol::function m_on_websocket;
-    sol::function m_on_proxy_request;
-    sol::function m_on_proxy_response;
+    // Both refuse on error, so the error has to arrive as a value: a refusal
+    // nobody can explain is barely better than the admission it replaced.
+    sol::protected_function m_on_proxy_request;
+    sol::protected_function m_on_proxy_response;
     sol::function m_on_cluster_join;
     sol::function m_on_cluster_leave;
     sol::function m_on_group_change;

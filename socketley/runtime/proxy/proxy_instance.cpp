@@ -8729,34 +8729,45 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         // function's own stated rule — see its header: every path out of it
         // that does not deliver takes the client down with it, because a
         // connection that silently swallows data is worse than one that drops.
-        try {
-            sol::object r = lctx->on_proxy_request()(conn->fd, data);
-            // Both spellings of "said nothing" — an explicit nil and a hook
-            // that returned no value at all — keep meaning drop, which is what
-            // this build already did and what the man page documents.  Stated
-            // rather than left to sol2's index arithmetic, because the branch
-            // below is now a refusal: a toolchain that reported an absent
-            // return as `none` instead of `nil` would otherwise close every
-            // connection through a hook that only logs.  run_request_filters
-            // checks return_count() == 0 for the same reason.
-            if (r.get_type() == sol::type::nil ||
-                r.get_type() == sol::type::none) return;   // drop
-            if (SOCKETLEY_LIKELY(r.is<std::string>())) {
-                hook_storage = r.as<std::string>();
-                hook_modified = true;
-            }
-            else {
-                fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
-                                "a string or nil — refusing the request\n",
-                        lua_typename(lctx->state().lua_state(),
-                                     static_cast<int>(r.get_type())));
-                bconn->closing = true;
-                conn->closing = true;
-                return;
-            }
-        } catch (const sol::error& e) {
+        // Protected, like on_route above and the filter chain.  A try/catch
+        // here reported nothing at all under the Sanitize build — measured: the
+        // hook ran, the request was refused, and no `on_proxy_request error`
+        // line was written — because the catch depends on the panic handler
+        // throwing and on that throw unwinding out of the interpreter.  A
+        // refusal nobody can explain is barely better than the admission it
+        // replaced, so the error has to come back as a value.
+        sol::protected_function_result r = lctx->on_proxy_request()(conn->fd, data);
+
+        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        {
+            sol::error err = r;
             fprintf(stderr, "[lua] on_proxy_request error: %s — refusing the "
-                            "request\n", e.what());
+                            "request\n", err.what());
+            bconn->closing = true;
+            conn->closing = true;
+            return;
+        }
+
+        // "Said nothing" keeps meaning drop, in both its spellings — no return
+        // value at all, and an explicit nil — which is what this build already
+        // did and what the man page documents.  Checked explicitly because the
+        // branch below is a refusal, and a hook that only logs must not close
+        // every connection through it.
+        if (r.return_count() == 0) return;              // drop
+        sol::object obj = r;
+        if (obj.get_type() == sol::type::nil) return;   // drop
+
+        if (SOCKETLEY_LIKELY(obj.is<std::string>()))
+        {
+            hook_storage = obj.as<std::string>();
+            hook_modified = true;
+        }
+        else
+        {
+            fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
+                            "a string or nil — refusing the request\n",
+                    lua_typename(lctx->state().lua_state(),
+                                 static_cast<int>(obj.get_type())));
             bconn->closing = true;
             conn->closing = true;
             return;
@@ -8846,26 +8857,35 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         // because the redactor raised delivers exactly the response the hook
         // existed to prevent.  The client is closed rather than answered: the
         // status line, if there was one, may already be on its wire.
-        try {
-            sol::object r = lctx->on_proxy_response()(conn->client_fd, data);
-            // Same two spellings of "said nothing" as the request hook.
-            if (r.get_type() == sol::type::nil ||
-                r.get_type() == sol::type::none) return;   // drop
-            if (SOCKETLEY_LIKELY(r.is<std::string>())) {
-                hook_storage = r.as<std::string>();
-                hook_modified = true;
-            }
-            else {
-                fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
-                                "a string or nil — refusing the response\n",
-                        lua_typename(lctx->state().lua_state(),
-                                     static_cast<int>(r.get_type())));
-                cconn->closing = true;
-                return;
-            }
-        } catch (const sol::error& e) {
+        // Protected, for the same reason as the request hook.
+        sol::protected_function_result r =
+            lctx->on_proxy_response()(conn->client_fd, data);
+
+        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        {
+            sol::error err = r;
             fprintf(stderr, "[lua] on_proxy_response error: %s — refusing the "
-                            "response\n", e.what());
+                            "response\n", err.what());
+            cconn->closing = true;
+            return;
+        }
+
+        // Same two spellings of "said nothing" as the request hook.
+        if (r.return_count() == 0) return;              // drop
+        sol::object obj = r;
+        if (obj.get_type() == sol::type::nil) return;   // drop
+
+        if (SOCKETLEY_LIKELY(obj.is<std::string>()))
+        {
+            hook_storage = obj.as<std::string>();
+            hook_modified = true;
+        }
+        else
+        {
+            fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
+                            "a string or nil — refusing the response\n",
+                    lua_typename(lctx->state().lua_state(),
+                                 static_cast<int>(obj.get_type())));
             cconn->closing = true;
             return;
         }
