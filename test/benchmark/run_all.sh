@@ -160,90 +160,55 @@ EOF
             >> "$SUMMARY_FILE" 2>/dev/null
     fi
 
-    cat >> "$SUMMARY_FILE" << 'EOF'
+    # One table per results file, built from what the file contains rather than
+    # from a list of field names kept here.
+    #
+    # That list is why this report printed empty cells: it asked for
+    # connections_per_sec, messages_per_sec, throughput_mb_sec and
+    # max_concurrent, and none of them has ever appeared in these files.  What
+    # the harness writes is median_throughput, median_throughput_mb and lat_*.
+    # Only the handful of rows the shell scripts write themselves --
+    # flush_time_ms, requests_per_sec, overhead_percent -- happened to match, so
+    # the report came out looking partly filled instead of broken, and an empty
+    # cell reads as "not measured" rather than "not found".  A table derived
+    # from the data cannot drift away from it.
+    #
+    # Two shapes share one file.  The C harness rows carry median_throughput and
+    # repeat `test` across message sizes -- so the size is part of the row's
+    # identity, and selecting on the name alone is what collapsed 64B and 1024B
+    # into a single line.  The rows the shell writes carry their own fields and
+    # are listed as name/value pairs under the same heading.
+    bench_section() {
+        local title=$1 file=$2 extra
+        [[ -f "$file" ]] || return 0
+        printf '\n### %s\n\n' "$title" >> "$SUMMARY_FILE"
+        printf '| Test | Size | Median | Bandwidth | p50 us | p99 us |\n' >> "$SUMMARY_FILE"
+        printf '|------|------|--------|-----------|--------|--------|\n' >> "$SUMMARY_FILE"
+        jq -r '
+            .[] | select(has("median_throughput"))
+            | "| \(.test)"
+            + " | \(if .msg_size then "\(.msg_size) B" else "-" end)"
+            + " | \(.median_throughput)"
+            + " | \(if .median_throughput_mb then "\(.median_throughput_mb) MB/s" else "-" end)"
+            + " | \(.lat_p50_us // "-") | \(.lat_p99_us // "-") |"
+        ' "$file" >> "$SUMMARY_FILE" 2>/dev/null
 
-### Server Runtime
+        extra=$(jq -r '
+            .[] | select(has("median_throughput") | not) | . as $o | .test as $t
+            | ($o | keys_unsorted[] | select(. != "test" and . != "timestamp"))
+            | "| \($t) | \(.) | \($o[.]) |"
+        ' "$file" 2>/dev/null)
+        if [[ -n "$extra" ]]; then
+            printf '\n| Test | Field | Value |\n|------|-------|-------|\n' >> "$SUMMARY_FILE"
+            printf '%s\n' "$extra" >> "$SUMMARY_FILE"
+        fi
+    }
 
-| Test | Metric | Value |
-|------|--------|-------|
-EOF
-
-    # Parse server results
-    local server_file="${RESULTS_DIR}/server_${TIMESTAMP}.json"
-    if [[ -f "$server_file" ]]; then
-        # Connection rate
-        local conn_rate=$(grep -oP '"connections_per_sec":\s*\K[0-9.]+' "$server_file" | head -1)
-        local conn_lat=$(grep -oP '"avg_latency_ms":\s*\K[0-9.]+' "$server_file" | head -1)
-        echo "| Connection Rate | conn/sec | $conn_rate |" >> "$SUMMARY_FILE"
-        echo "| Connection Latency | ms (avg) | $conn_lat |" >> "$SUMMARY_FILE"
-
-        # Message throughput
-        local msg_rate=$(grep -A5 '"test": "server_single_client_throughput"' "$server_file" | grep -oP '"messages_per_sec":\s*\K[0-9.]+' | head -1)
-        local msg_mb=$(grep -A5 '"test": "server_single_client_throughput"' "$server_file" | grep -oP '"throughput_mb_sec":\s*\K[0-9.]+' | head -1)
-        echo "| Single Client Throughput | msg/sec | $msg_rate |" >> "$SUMMARY_FILE"
-        echo "| Single Client Throughput | MB/sec | $msg_mb |" >> "$SUMMARY_FILE"
-
-        # Concurrent
-        local concurrent_rate=$(grep -A5 '"test": "server_concurrent_clients"' "$server_file" | grep -oP '"messages_per_sec":\s*\K[0-9.]+' | head -1)
-        echo "| Concurrent Clients | msg/sec | $concurrent_rate |" >> "$SUMMARY_FILE"
-
-        # Max connections
-        local max_conn=$(grep -oP '"max_concurrent":\s*\K[0-9]+' "$server_file" | head -1)
-        echo "| Max Concurrent Connections | count | $max_conn |" >> "$SUMMARY_FILE"
-    fi
-
-    cat >> "$SUMMARY_FILE" << 'EOF'
-
-### Cache Runtime
-
-| Test | Metric | Value |
-|------|--------|-------|
-EOF
-
-    # Parse cache results
-    local cache_file="${RESULTS_DIR}/cache_${TIMESTAMP}.json"
-    if [[ -f "$cache_file" ]]; then
-        local set_ops=$(grep -A5 '"test": "cache_set_throughput"' "$cache_file" | grep -oP '"ops_per_sec":\s*\K[0-9.]+' | head -1)
-        local get_ops=$(grep -A5 '"test": "cache_get_throughput"' "$cache_file" | grep -oP '"ops_per_sec":\s*\K[0-9.]+' | head -1)
-        local mixed_ops=$(grep -A5 '"test": "cache_mixed_workload"' "$cache_file" | grep -oP '"ops_per_sec":\s*\K[0-9.]+' | head -1)
-        local concurrent_ops=$(grep -A5 '"test": "cache_concurrent_access"' "$cache_file" | grep -oP '"ops_per_sec":\s*\K[0-9.]+' | head -1)
-
-        echo "| SET Operations | ops/sec | $set_ops |" >> "$SUMMARY_FILE"
-        echo "| GET Operations | ops/sec | $get_ops |" >> "$SUMMARY_FILE"
-        echo "| Mixed Workload (80/20) | ops/sec | $mixed_ops |" >> "$SUMMARY_FILE"
-        echo "| Concurrent Access | ops/sec | $concurrent_ops |" >> "$SUMMARY_FILE"
-
-        local flush_time=$(grep -oP '"flush_time_ms":\s*\K[0-9]+' "$cache_file" | head -1)
-        local load_time=$(grep -oP '"load_time_ms":\s*\K[0-9]+' "$cache_file" | head -1)
-        echo "| Persistence FLUSH | ms | $flush_time |" >> "$SUMMARY_FILE"
-        echo "| Persistence LOAD | ms | $load_time |" >> "$SUMMARY_FILE"
-    fi
-
-    cat >> "$SUMMARY_FILE" << 'EOF'
-
-### Proxy Runtime
-
-| Test | Metric | Value |
-|------|--------|-------|
-EOF
-
-    # Parse proxy results
-    local proxy_file="${RESULTS_DIR}/proxy_${TIMESTAMP}.json"
-    if [[ -f "$proxy_file" ]]; then
-        local http_rps=$(grep -A5 '"test": "proxy_http_single_backend"' "$proxy_file" | grep -oP '"requests_per_sec":\s*\K[0-9.]+' | head -1)
-        local http_lb_rps=$(grep -A5 '"test": "proxy_http_load_balancing"' "$proxy_file" | grep -oP '"requests_per_sec":\s*\K[0-9.]+' | head -1)
-        local tcp_rate=$(grep -A5 '"test": "proxy_tcp_throughput"' "$proxy_file" | grep -oP '"messages_per_sec":\s*\K[0-9.]+' | head -1)
-        local tcp_mb=$(grep -A5 '"test": "proxy_tcp_throughput"' "$proxy_file" | grep -oP '"throughput_mb_sec":\s*\K[0-9.]+' | head -1)
-        local overhead=$(grep -oP '"overhead_ms":\s*\K[0-9.]+' "$proxy_file" | head -1)
-        local overhead_pct=$(grep -oP '"overhead_percent":\s*"?\K[0-9.]+' "$proxy_file" | head -1)
-
-        echo "| HTTP Single Backend | req/sec | $http_rps |" >> "$SUMMARY_FILE"
-        echo "| HTTP Load Balancing | req/sec | $http_lb_rps |" >> "$SUMMARY_FILE"
-        echo "| TCP Throughput | msg/sec | $tcp_rate |" >> "$SUMMARY_FILE"
-        echo "| TCP Throughput | MB/sec | $tcp_mb |" >> "$SUMMARY_FILE"
-        echo "| Proxy Overhead | ms | $overhead |" >> "$SUMMARY_FILE"
-        echo "| Proxy Overhead | % | $overhead_pct |" >> "$SUMMARY_FILE"
-    fi
+    bench_section "Server Runtime" "${RESULTS_DIR}/server_${TIMESTAMP}.json"
+    bench_section "Cache Runtime"  "${RESULTS_DIR}/cache_${TIMESTAMP}.json"
+    bench_section "Cache vs Redis" "${RESULTS_DIR}/cache_resp_${TIMESTAMP}.json"
+    bench_section "Proxy Runtime"  "${RESULTS_DIR}/proxy_${TIMESTAMP}.json"
+    bench_section "WebSocket"      "${RESULTS_DIR}/websocket_${TIMESTAMP}.json"
 
     cat >> "$SUMMARY_FILE" << EOF
 
