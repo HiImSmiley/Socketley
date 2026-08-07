@@ -1478,6 +1478,13 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.get(name) → table {name, type, state, port, connections, owner} or nil
+    //
+    // reported_connection_count(), not get_connection_count(): `name` is some
+    // OTHER runtime, and since 2313c26 another runtime is normally one in a
+    // worker process, whose connections this object does not hold.  The three
+    // calls in this file that ask about another runtime are the three that had
+    // to change; every self.connections() below asks its own object in its own
+    // process and is right to walk the tables.
     sk["get"] = [owner, this](std::string name) -> sol::object {
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return sol::nil;
@@ -1488,7 +1495,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         info["type"] = type_to_string(inst->get_type());
         info["state"] = state_to_string(inst->get_state());
         info["port"] = inst->get_port();
-        info["connections"] = inst->get_connection_count();
+        info["connections"] = inst->reported_connection_count();
         auto ow = inst->get_owner();
         info["owner"] = ow.empty() ? sol::object(sol::nil) : sol::make_object(m_lua, std::string(ow));
         return info;
@@ -1658,7 +1665,7 @@ void lua_context::register_bindings(runtime_instance* owner)
                 r["port"] = inst->get_port();
                 r["group"] = std::string(inst->get_group());
                 r["state"] = state_to_string(inst->get_state());
-                r["connections"] = static_cast<int>(inst->get_connection_count());
+                r["connections"] = static_cast<int>(inst->reported_connection_count());
                 result[i++] = r;
             }
         }
@@ -1704,7 +1711,11 @@ void lua_context::register_bindings(runtime_instance* owner)
                     m["daemon"] = std::string(cd->get_daemon_name());
                     m["host"] = std::string(cd->get_cluster_addr());
                     m["port"] = inst->get_port();
-                    m["connections"] = static_cast<int>(inst->get_connection_count());
+                    // The figure a least-connections choice is made on.  A local
+                    // member in a worker reported 0 here beside a remote
+                    // member's true count, so every such choice picked the
+                    // local one, however busy it was.
+                    m["connections"] = static_cast<int>(inst->reported_connection_count());
                     result[i++] = m;
                 }
             }
