@@ -269,6 +269,37 @@ lua_context::lua_context()
     m_lua["os"]["tmpname"] = sol::nil;
     m_lua["os"]["exit"]    = sol::nil;
 
+    // ─── os.setlocale, which reaches further than any of the five above ──────
+    //
+    // The other five are removed because a script can use them to act outside
+    // its own runtime: run a program, delete a file, end the process.  This one
+    // was left, and it is the only one that damages every other runtime in the
+    // daemon without the script doing anything else at all.
+    //
+    // setlocale(LC_ALL, ...) is process-wide, and this daemon serves every
+    // runtime from one process.  Two of its own primitives read the C locale:
+    // socketley.json_encode formats numbers with "%.14g" and json_decode parses
+    // them with std::stod, both of which take the decimal separator from
+    // LC_NUMERIC.  Measured, with a de_DE.UTF-8 locale available:
+    //
+    //     before                snprintf("%.14g", 1.5) -> "1.5"
+    //     os.setlocale("de_DE.UTF-8")
+    //     after                 snprintf("%.14g", 1.5) -> "1,5"
+    //                           strtod("1.5")          -> 1.0
+    //
+    // So one line in one script turns every other script's JSON into something
+    // no JSON parser accepts, and makes every number it decodes truncate at the
+    // decimal point — silently, with no error anywhere, and for as long as the
+    // daemon lives.  A cache holding "1,5" does not become "1.5" again when the
+    // script that did it is removed.
+    //
+    // Removed rather than wrapped, because that is what the five above are and
+    // because there is nothing to wrap it down to: the legitimate uses of a
+    // locale are reads, and os.date, os.time and os.clock — which stay — are
+    // the reads.  Nothing a script in this tree does needs to CHANGE the
+    // process's idea of how a number is spelled.
+    m_lua["os"]["setlocale"] = sol::nil;
+
     install_deadline_hook();
 }
 

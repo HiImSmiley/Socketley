@@ -886,6 +886,15 @@ lua_config() {
     echo "    arithmetic ops per message ran at 80%.  Setting 0 installs no hook."
     echo ""
 
+    echo -e "${BOLD}Sandbox:${NC}"
+    echo "  base, string, table, math, os, io and package are open.  Six os"
+    echo "  functions are not: execute, remove, rename, tmpname, exit and"
+    echo "  setlocale.  setlocale is process-wide and json_encode/json_decode read"
+    echo "  LC_NUMERIC, so one script switching to a comma locale would make every"
+    echo "  runtime in the daemon emit 1,5 and read 1.5 as 1."
+    echo "  os.time, os.clock, os.date and os.difftime stay — those are reads."
+    echo ""
+
     echo -e "${BOLD}Runtime Properties (self.):${NC}"
     echo "  self.name, self.port, self.state, self.type"
     echo "  self.protocol   server/client: tcp|udp;  proxy: tcp|http;  cache: unset"

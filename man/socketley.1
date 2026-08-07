@@ -2321,6 +2321,48 @@ For a script at
 loads
 .IR /home/user/utils.lua .
 The default Lua package path is appended, so standard modules still work.
+.PP
+.B Standard library:
+.BR base ", " string ", " table ", " math ", " os ", " io " and " package
+are open. Six
+.B os
+functions are removed, because a daemon serving every runtime from one process
+cannot let one script reach outside its own runtime:
+.BR os.execute ,
+.BR os.remove ,
+.BR os.rename ,
+.BR os.tmpname ,
+.B os.exit
+and
+.BR os.setlocale .
+The last of those is not a filesystem or process call and is removed for a
+reason of its own:
+.B setlocale
+is process-wide, and
+.B socketley.json_encode
+formats numbers with
+.B %.14g
+while
+.B socketley.json_decode
+parses them with
+.BR strtod ,
+both of which read
+.BR LC_NUMERIC .
+One script switching to a comma-decimal locale therefore makes
+.I every
+runtime in the daemon emit
+.B 1,5
+and truncate
+.B 1.5
+to
+.BR 1 ,
+for as long as the daemon lives.
+.B os.time,
+.BR os.clock ,
+.B os.date
+and
+.B os.difftime
+stay \(em those are reads.
 .SS Configuration File Format
 .nf
 \-\- Optional: configure daemon name and cluster directory
