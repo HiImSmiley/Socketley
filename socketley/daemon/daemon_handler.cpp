@@ -189,6 +189,12 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     m_manager.set_deliver_sink([this](std::string_view name,
                                       std::string_view message)
                                { return deliver_to_worker(name, message); });
+
+    // And the moment before a runtime leaves the map, for whoever is holding a
+    // pointer into it.  This is the reconcile cmd_remove() runs by hand, given
+    // to the manager so that a caller which has only the manager — a Lua
+    // script — cannot free a placeholder out from under its supervisor.
+    m_manager.set_worker_release_sink([this] { reconcile_proxy_workers(); });
 }
 
 daemon_handler::~daemon_handler()
@@ -341,6 +347,7 @@ void daemon_handler::teardown()
     m_manager.set_endpoint_sink(nullptr);
     m_manager.set_publish_sink(nullptr);
     m_manager.set_deliver_sink(nullptr);
+    m_manager.set_worker_release_sink(nullptr);
 
     // Reap managed children
     {

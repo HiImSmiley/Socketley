@@ -1448,6 +1448,11 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* inst = mgr->get(name);
         if (inst && inst->get_state() == runtime_running)
             mgr->stop(name, *loop);
+        // Before the instance leaves the map, and for the reason cmd_remove()
+        // gives at the same point in the same order: a worker's supervisor
+        // holds a pointer to the placeholder, and that pointer has to be
+        // dropped while the object it names is still there.
+        mgr->release_workers();
         return mgr->remove(name);
     };
 

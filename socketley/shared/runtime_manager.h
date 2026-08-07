@@ -138,6 +138,19 @@ public:
         std::function<bool(std::string_view name, std::string_view message)> sink);
     bool deliver_out_of_process(std::string_view name, std::string_view message) const;
 
+    // "The map has changed; let go of anything that names a runtime leaving
+    // it."  The fourth of the same shape, and the one with no payload: what
+    // crosses here is a moment, not an answer.
+    //
+    // A supervisor holds a raw pointer to the placeholder it writes stats into
+    // and clears an override on, and only proxy_supervisor::retire() severs
+    // that safely — while the placeholder is still known to be alive.
+    // cmd_remove() reaches retire() by reconciling before the instance leaves
+    // the map, and says so in a comment.  socketley.remove() had no way to, so
+    // it freed the instance under a supervisor still holding it.
+    void set_worker_release_sink(std::function<void()> sink);
+    void release_workers() const;
+
     // Where a runtime sends a request meant for another runtime.  One per
     // daemon, attached to the event loop by daemon_start() and detached before
     // the ring goes; see shared/request_channel.h for why this is a channel and
@@ -169,6 +182,7 @@ private:
     std::function<void(const endpoint_table&)> m_endpoint_sink;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
     std::function<bool(std::string_view, std::string_view)> m_deliver_sink;
+    std::function<void()> m_worker_release_sink;
 
     // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER
     // them.  A runtime revokes its origin as it goes — ~server_instance calls

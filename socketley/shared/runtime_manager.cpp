@@ -756,6 +756,17 @@ bool runtime_manager::deliver_out_of_process(std::string_view name,
     return m_deliver_sink ? m_deliver_sink(name, message) : false;
 }
 
+void runtime_manager::set_worker_release_sink(std::function<void()> sink)
+{
+    m_worker_release_sink = std::move(sink);
+}
+
+void runtime_manager::release_workers() const
+{
+    if (m_worker_release_sink)
+        m_worker_release_sink();
+}
+
 const runtime_manager::runtime_map& runtime_manager::list() const
 {
     return runtimes;
