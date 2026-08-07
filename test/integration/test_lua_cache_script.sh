@@ -238,6 +238,7 @@ ops["identity"] = function()
     return "conns=" .. tostring(self.connections()) ..
            " name=" .. self.name ..
            " type=" .. self.type ..
+           " state=" .. tostring(self.state) ..
            " port=" .. tostring(self.port)
 end
 
@@ -269,6 +270,23 @@ function on_miss(key)
     -- Everything else misses for real: on_miss returning nil must leave the
     -- key absent, not write an empty string into the store.
     return nil
+end
+
+-- Defined for one reason, written down because it is not obvious: self.state
+-- is only ever updated from inside invoke_on_start / invoke_on_stop, and both
+-- return early when the script has not defined the callback —
+--
+--     if (!m_lua || !m_lua->has_on_start()) return;
+--     m_lua->update_self_state("running");
+--
+-- so a script with no on_start reads self.state as "created" for the whole life
+-- of a running runtime.  Measured, two identical servers, both Up in `ls`:
+-- with on_start defined, self.state=running; without it, self.state=created.
+-- Reported as a defect rather than worked around; this file asserts the field
+-- on the path where it does work, and says so here so the assertion is not
+-- mistaken for evidence that it works on the other one.
+function on_start()
+    socketley.log("CSTART " .. tostring(self.state))
 end
 
 function on_write(key, value, ttl)
@@ -397,8 +415,11 @@ for _ in $(seq 1 100); do
     [ "$("$BIN" stats lc_cache 2>/dev/null | awk -F: '$1=="connections"{print $2}')" = "0" ] && break
     sleep 0.1
 done
-assert_eq "self.connections(), self.name, self.type, self.port" \
-          "conns=1 name=lc_cache type=cache port=$PORT" \
+# self.state is written by update_self_state as the runtime changes state, so
+# it is a field that can go stale rather than a constant — asked here while the
+# runtime is up, which is the only value it should ever have on this path.
+assert_eq "self.connections(), self.name, self.type, self.state, self.port" \
+          "conns=1 name=lc_cache type=cache state=running port=$PORT" \
           "$(reply 1 "GET ops:identity")"
 
 # ── 8. publish, counted and delivered ──────────────────────────────────────
