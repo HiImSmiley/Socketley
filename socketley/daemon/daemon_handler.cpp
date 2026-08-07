@@ -819,6 +819,35 @@ int daemon_handler::check_empty_names(const std::vector<std::string>& names,
 
 int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
 {
+    // ─── One guard, for every command ───────────────────────────────────────
+    //
+    // cout_to_reply was written to "reach every one of them at once" and was
+    // then installed on two of them.  cmd_create and cmd_edit had it; cmd_send,
+    // cmd_start, cmd_attach and the `default:` arm below did not, and every
+    // std::cout in those went to the daemon's own stdout — which is /dev/null
+    // once it has daemonised.  Measured, against a daemon whose stdout and
+    // stderr were both redirected to a file:
+    //
+    //     $ socketley send nosuchruntime hello ; echo $?
+    //     1                        <- and not one word, on either stream
+    //     $ socketley start ; echo $?
+    //     1                        <- the usage line, likewise gone
+    //
+    // "runtime not found: nosuchruntime" is written, and nobody can read it.
+    // An exit code with no sentence behind it is the same defect this whole
+    // audit is about, one command family over from the Lua one.
+    //
+    // Here rather than in each handler, because a per-handler guard is a list
+    // that goes stale the moment somebody adds a command — which is exactly how
+    // these four came to be missing one.  There is a single caller and no
+    // re-entry, and the destructor runs before append_response() reads
+    // write_buf, so the text is in the frame that answers this command.
+    //
+    // It also fixes cmd_send without changing its signature: the guard needs a
+    // connection, the handler does not, and cmd_send is the one command whose
+    // parameter list has no ipc_connection at all.
+    const cout_to_reply reply_guard(conn);
+
     parsed_args pa;
     pa.parse(line);
 
@@ -860,10 +889,14 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
     }
 }
 
-int daemon_handler::cmd_create(ipc_connection* conn, const parsed_args& pa)
+// conn is unused now and the parameter stays anyway: the dispatcher hands every
+// handler the connection, and a handler that prints its refusals needs nothing
+// else — process_command holds the reply guard for all of them.  Dropping it
+// here would make this signature the odd one out for a reason that is no longer
+// about this command.
+int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
+                              const parsed_args& pa)
 {
-    const cout_to_reply reply_guard(conn);
-
     if (pa.count < 3)
     {
         std::cout << "usage: create <type> <name> [flags]\n";
@@ -2503,12 +2536,10 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     }
 }
 
-int daemon_handler::cmd_edit(ipc_connection* conn, const parsed_args& pa)
+// Same as cmd_create: guarded by process_command, along with every other command.
+int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
+                             const parsed_args& pa)
 {
-    // Same reason as cmd_create: every refusal below, and every one the flag
-    // parsers print, went to the daemon's stdout and never to the client.
-    const cout_to_reply reply_guard(conn);
-
     if (pa.count < 3)
     {
         std::cout << "usage: edit <name> [flags]\n";
