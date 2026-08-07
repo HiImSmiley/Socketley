@@ -140,19 +140,30 @@ namespace lua_deadline
     // not, deliberately — see cli_config.cpp.
     void install(lua_State* L, uint32_t limit_ms);
 
-    // Arm the deadline for one callback invocation.
+    // Arm the deadline for one callback invocation, and mark that this thread is
+    // inside one.
     //
     // Nesting is deliberate and only the outermost scope arms.  A callback that
     // reaches a second interpreter — socketley.publish running a subscriber that
     // belongs to another runtime — is one stretch of time the event loop is held
     // for, and that is the thing being bounded, so the inner call spends the
     // outer call's budget rather than being handed a fresh one.
+    //
+    // The second duty is why this class is not only about the deadline.  A
+    // scope is constructed for exactly one callback invocation and destroyed
+    // when it returns — that is what makes it, and nothing else in this tree,
+    // able to answer in_callback() below.  It is bracketed here rather than at
+    // the forty call sites for the reason lua_guarded_call gives for arming
+    // here: the next callback added to this tree gets both by being written the
+    // way its neighbours are.
     class scope
     {
     public:
         // `what` names the callback for the diagnostic; it must outlive the
         // scope, which every call site satisfies by passing a literal.
-        // `limit_ms` of 0 leaves the deadline unarmed.
+        // `limit_ms` of 0 leaves the deadline unarmed.  It does not stop the
+        // scope counting: a callback is on the stack whether or not anyone is
+        // timing it.
         scope(const char* what, uint32_t limit_ms) noexcept;
         ~scope() noexcept;
         scope(const scope&)            = delete;
@@ -160,12 +171,30 @@ namespace lua_deadline
 
     private:
         bool m_outermost;
+        bool m_first_frame;
     };
 
     // Milliseconds left in the armed invocation; -1 when nothing is armed or
     // the mechanism is off.  socketley.http asks, so that its own wait lives
     // inside the callback's budget instead of beside it.
     long remaining_ms() noexcept;
+
+    // True while a Lua callback is somewhere on this thread's stack.
+    //
+    // Asked by runtime_manager before it frees a runtime_instance outright.  Its
+    // graveyard exists because io_uring may be holding addresses inside an
+    // instance, and it has one shortcut for instances the ring cannot be holding
+    // — but the ring is not the only holder.  A subscriber may call
+    // socketley.remove on its own runtime, and the frames underneath that call
+    // are inside the very lua_context the free would destroy.  While this
+    // answers true, nothing is freed on the spot; the health timer takes it a
+    // moment later, with the stack empty.
+    //
+    // NOT the same question as remaining_ms() >= 0.  The deadline is off
+    // entirely when SOCKETLEY_LUA_TIMEOUT_MS=0, and an operator who turns off a
+    // timeout has not thereby said that a script may free the object it is
+    // running in.
+    bool in_callback() noexcept;
 }
 
 // One callback, with the deadline armed for exactly the length of the call.

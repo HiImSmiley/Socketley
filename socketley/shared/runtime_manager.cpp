@@ -152,12 +152,34 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
         return;
 
     // An instance that never reached setup() never put an io_request of its own
-    // into the ring, so nothing can point into it and it goes now.  That covers
-    // create-then-reject-a-flag, and external runtimes, which do no I/O of
-    // their own — and which have to keep being dropped untouched, the way
+    // into the ring, so nothing in the RING can point into it and it goes now.
+    // That covers create-then-reject-a-flag, and external runtimes, which do no
+    // I/O of their own — and which have to keep being dropped untouched, the way
     // removal has always treated them, rather than being handed the SIGTERM
     // that stopping one sends.
-    if (!inst->has_armed_io())
+    //
+    // ─── The ring is not the only holder ───────────────────────────────────
+    //
+    // The C++ stack is another, and it is reachable from a script.
+    // socketley.remove is bound in the interpreter every callback runs in, and a
+    // subscriber calling it on its OWN runtime is standing on frames inside the
+    // very lua_context this `return` would destroy — the unique_ptr is by value,
+    // so returning here IS the free.  dispatch_publish re-resolves each name
+    // before it delivers, which protects the other runtimes in its loop and
+    // cannot protect the one that is executing.
+    //
+    // Measured on the parent commit: a server created and never started, its
+    // subscription made at the script's top level, one PUBLISH — SIGSEGV, and
+    // then a daemon auto-started by the next CLI command with the runtime
+    // restored from the state file, so the operator's evidence was a restart
+    // and a removal that had not happened.  A running runtime was never at risk
+    // and still is not: it has armed io, so it takes the graveyard below.
+    //
+    // The deferral costs one health tick.  The instance is out of the map here
+    // exactly as before — ps, stats, start and rename cannot see it and its name
+    // is free — and reap_retired() frees it on the next sweep, with the stack
+    // empty.
+    if (!inst->has_armed_io() && !script_frame_live())
         return;
 
     // Every caller that can reach a running runtime stops it first, so this is
@@ -220,6 +242,27 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
     }
 }
 
+// See the declaration.  One question, asked in the two places that would
+// otherwise run a runtime_instance's destructor on the spot.
+//
+// Conservative on purpose: it says "a callback is running somewhere on this
+// thread", not "a callback belonging to THIS instance is running".  The narrow
+// question cannot be asked — a subscriber may publish, which runs another
+// runtime's subscriber, which may remove the first one, so the instance whose
+// frames are live is not always the instance being freed — and the cost of the
+// broad answer is one health tick of deferral for a free that was going to
+// happen anyway.
+bool runtime_manager::script_frame_live()
+{
+#ifndef SOCKETLEY_NO_LUA
+    return lua_deadline::in_callback();
+#else
+    // No interpreter in this build, so no callback can be on the stack and
+    // nothing can reach remove() from inside one.
+    return false;
+#endif
+}
+
 void runtime_manager::enable_offthread_stats()
 {
     m_offthread_stats.store(true, std::memory_order_relaxed);
@@ -252,6 +295,16 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
     publish_offthread_stats();
 
     if (loop.owner_table_full())
+        return 0;
+
+    // Not from inside a callback.  retire() calls this on its way out, and
+    // retire() is reachable from socketley.remove — so on that path this sweep
+    // runs with Lua frames underneath it, and the instance retire() has just
+    // parked is the one those frames belong to.  It owes the ring nothing
+    // (that is why the shortcut above wanted to free it outright), so without
+    // this it would be freed here instead, two lines later and for the same
+    // crash.  The health timer calls this with an empty stack and takes it then.
+    if (script_frame_live())
         return 0;
 
     std::vector<std::unique_ptr<runtime_instance>> doomed;

@@ -90,6 +90,12 @@ static thread_local uint32_t                              t_limit_ms{0};
 // thousand instructions later, and that must stop the script without also
 // filling the log with one line per raise.
 static thread_local bool                                  t_reported{false};
+// How many callback invocations are on this thread's stack, counted whether or
+// not the deadline is armed.  t_depth cannot answer that question: it stays 0
+// when the mechanism is off, deliberately, because remaining_ms() has to keep
+// answering -1 so socketley.http keeps the timeout the script asked for.  See
+// in_callback() in the header for who asks and why the difference matters.
+static thread_local unsigned                              t_frames{0};
 
 uint32_t default_ms()
 {
@@ -119,7 +125,16 @@ uint32_t default_ms()
 
 scope::scope(const char* what, uint32_t limit_ms) noexcept
     : m_outermost(t_depth == 0 && limit_ms != 0)
+    , m_first_frame(t_frames == 0)
 {
+    // Unconditional, and reset at the boundary rather than decremented, for the
+    // reason the destructor gives about t_depth: a path that skips an inner
+    // destructor must not leave this stuck above zero.  Stuck here is quieter
+    // than a stuck deadline and worse — nothing would ever be freed on the spot
+    // again, and a create/remove churn would grow the graveyard until the health
+    // timer's two-second sweep became the only thing draining it.
+    ++t_frames;
+
     if (m_outermost)
     {
         t_deadline = std::chrono::steady_clock::now()
@@ -156,6 +171,17 @@ scope::~scope() noexcept
     {
         --t_depth;
     }
+
+    // Same rule, same reason, on the frame count.  The outermost frame is the
+    // one that knows the stack is about to be empty of callbacks, so it says so
+    // outright instead of trusting that every inner scope was unwound.
+    if (m_first_frame)      t_frames = 0;
+    else if (t_frames != 0) --t_frames;
+}
+
+bool in_callback() noexcept
+{
+    return t_frames != 0;
 }
 
 long remaining_ms() noexcept

@@ -179,6 +179,11 @@ private:
     // lock released.
     void retire(std::unique_ptr<runtime_instance> inst);
 
+    // True while a Lua callback is on this thread's stack, and false in a build
+    // with no Lua at all.  Both places below that would otherwise destroy a
+    // runtime_instance immediately ask this first; see retire().
+    static bool script_frame_live();
+
     std::function<void(const endpoint_table&)> m_endpoint_sink;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
     std::function<bool(std::string_view, std::string_view)> m_deliver_sink;
