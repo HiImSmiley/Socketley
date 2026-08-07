@@ -147,6 +147,18 @@ function on_start()
     local stats = socketley.cluster.stats()
     append("stats_daemons=" .. stats.daemons)
     append("stats_runtimes=" .. stats.runtimes)
+    -- The other two fields the call returns.  `running` and `groups` were
+    -- never read by anything: a script choosing where to place work reads
+    -- exactly these, and a build that returned an empty groups table or a
+    -- zero running count satisfied every assertion this file used to make.
+    append("stats_running=" .. stats.running)
+    local gn, gsum = 0, 0
+    for name, count in pairs(stats.groups) do
+        gn = gn + 1
+        gsum = gsum + count
+        append("stats_group_" .. name .. "=" .. count)
+    end
+    append("stats_groupcount=" .. gn)
 end
 
 function on_cluster_join(daemon)
@@ -163,6 +175,12 @@ end
 
 tick_ms = 500
 function on_tick(dt)
+    -- The argument, which nothing has ever looked at.  tick_ms is 500, so a dt
+    -- expressed in seconds is about 0.5 and one expressed in milliseconds is
+    -- about 500 -- two readings a factor of a thousand apart, and a script
+    -- doing rate arithmetic gets it wrong silently either way.  Recorded in
+    -- thousandths so the shell can compare integers.
+    append("TICKDT_MILLI=" .. math.floor((tonumber(dt) or -1) * 1000))
     -- Periodically check runtimes
     local rts = socketley.cluster.runtimes()
     if #rts > 1 then
@@ -219,6 +237,9 @@ assert_contains "$OUT" "daemon=nodeA"
 assert_contains "$OUT" "stats_daemons=1"
 assert_ge "$(num_max daemons_count)" 1 "cluster.daemons() count at on_start"
 assert_ge "$(num_max stats_runtimes)" 1 "cluster.stats().runtimes at on_start"
+assert_ge "$(num_max stats_running)" 1 "cluster.stats().running at on_start"
+assert_ge "$(num_max stats_groupcount)" 1 "cluster.stats().groups is not empty"
+assert_ge "$(num_max stats_group_api)" 1 "cluster.stats().groups counts the api group"
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 start_node "$SOCK_B" nodeB
@@ -274,6 +295,30 @@ sleep 13
 
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "LEAVE=nodeB"
+
+# ─── on_tick's argument ─────────────────────────────────────────────────────
+#
+# tick_ms is 500 and the man page says dt is "the actual elapsed time in
+# milliseconds since the last tick (double)".  Measured: 500.128.  Nothing had
+# ever read the argument, so neither the unit nor the magnitude was held down —
+# and the two plausible readings are a factor of a thousand apart, which a
+# script doing rate arithmetic gets wrong in silence.
+#
+# The bound is wide on purpose: this runs beside two daemons and a suite, so the
+# actual gap drifts.  What it excludes is the reading that matters — dt in
+# SECONDS would land at 500 thousandths, three orders of magnitude below the
+# floor, and dt in microseconds three above the ceiling.
+DT_MILLI=$(num_max TICKDT_MILLI)
+assert_ge "$DT_MILLI" 300000 "on_tick dt is milliseconds and near tick_ms (lower bound)"
+TOTAL=$((TOTAL+1))
+if [ "${DT_MILLI:-0}" -le 5000000 ] 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL: on_tick dt is '$DT_MILLI' thousandths of a ms, wanted at most 5000000"
+    echo "        (dt should be about 500 for tick_ms=500; this is the upper bound"
+    echo "         that a microsecond or nanosecond reading would break)"
+fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
