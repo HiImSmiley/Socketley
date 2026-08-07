@@ -544,7 +544,13 @@ public:
 
 protected:
     // Invoke Lua callbacks safely
-    void invoke_on_start();
+    //
+    // on_start answers whether it ran without raising, because it is the one
+    // callback in this list that runs inside a command rather than on traffic:
+    // `start`, `create -s` and — since it began re-running scripts' set-up —
+    // `reload-lua`.  reload_lua_script() is the caller that acts on it; start()
+    // ignores it deliberately, for the reason written there.
+    bool invoke_on_start();
     void invoke_on_stop();
     void invoke_on_message(std::string_view msg);
     void invoke_on_connect(int client_id);

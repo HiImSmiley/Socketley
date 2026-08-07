@@ -406,6 +406,44 @@ Lua scripts are skipped. With
 .BR * ,
 reloads Lua on all runtimes that have scripts loaded.
 .IP
+.B on_start
+runs again, on the new script, and this is the whole difference between
+reloading a file and reloading a runtime. Everything a script establishes at
+run time lives in its Lua context \(em every
+.B socketley.subscribe
+registration and every
+.B set_timeout
+or
+.B set_interval
+timer \(em and destroying the context destroys all of it. Since the ordinary
+place to make those is
+.BR on_start ,
+a reload that did not re-run it left the runtime serving with no subscriptions
+and no timers, and said nothing. So: anything
+.B on_start
+does must be safe to do twice.
+.B socketley.create
+there is the case that costs something, and it refuses a name that already
+exists rather than duplicating it.
+.IP
+.B on_stop
+does
+.B not
+run for the outgoing script. The runtime is not stopping \(em it keeps its
+listener, its clients and its state right through the reload \(em and
+.B on_stop
+is where a script says goodbye to exactly those.
+.IP
+An
+.B on_start
+that raises is reported like a script that would not load: exit 1, with the
+reason on the terminal. The new script is in force in that case, with whatever
+its
+.B on_start
+managed before it failed; a script that would not
+.I compile
+leaves the previous one running instead. The message says which.
+.IP
 A runtime that runs in a worker is asked rather than reloaded here: its script
 lives in that process and only that process can re-run it. The command waits
 for the worker to report the declaration the new script makes \(em bounded the
@@ -3337,7 +3375,9 @@ so there is nothing for a later
 .B start
 to replay; use
 .B reload\-lua
-to arm them again.
+to arm them again \(em it re-runs
+.BR on_start ,
+so timers armed there do come back.
 .TP
 .B socketley.clear_timeout(timer_id)
 Cancel a pending timeout. The timer will not fire. Safe to call with

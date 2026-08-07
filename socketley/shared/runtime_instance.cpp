@@ -225,7 +225,13 @@ bool runtime_instance::start(event_loop& loop)
 
     m_state.store(runtime_running, std::memory_order_release);
     m_start_time = std::chrono::system_clock::now();
-    invoke_on_start();
+    // The answer is deliberately not acted on here.  A raise in on_start has
+    // never failed a start: the runtime is already listening by this line, the
+    // state is already running, and turning a script's error into "the runtime
+    // is failed" would take down a listener over a callback the tree reports
+    // and carries on from everywhere else.  reload_lua_script() reads it
+    // because it has a command in flight that asked for exactly this to happen.
+    if (!invoke_on_start()) {}
     if ((m_cb_on_tick || (m_lua && m_lua->has_on_tick())) && m_event_loop)
         start_tick_timer();
     return true;
@@ -575,6 +581,48 @@ bool runtime_instance::reload_lua_script()
         m_tick = nullptr;
     }
 
+    // ─── The new script's set-up runs, or the reload only half happened ─────
+    //
+    // Everything a script establishes at runtime lives in its lua_context, and
+    // the assignment above destroyed the outgoing one: every
+    // socketley.subscribe registration went with it, and ~lua_context severs
+    // every set_timeout and set_interval timer by name.  Both are ordinarily
+    // made from on_start — it is the shape the man page documents and every
+    // example uses — and on_start was called from start() and from nowhere
+    // else.
+    //
+    // So the ordinary script came back from `reload-lua` with no subscriptions
+    // and no timers, went on serving, and the command reported success.  The
+    // runtime looked healthy from every angle an operator has: `ls` running,
+    // `stats` counting connections, the new callbacks firing on traffic.  Only
+    // the periodic half of it was gone.
+    //
+    // Re-running on_start is what makes reload-lua mean what it reads as, and
+    // it makes on_start's contract one sentence instead of two: it runs
+    // whenever this runtime begins executing a script.  That is a promise a
+    // script author has to be able to rely on in both directions, so the man
+    // page states the obligation it creates — anything on_start does must be
+    // safe to do twice.  socketley.create from on_start is the case that costs
+    // something, and it refuses a name that already exists rather than
+    // duplicating it.
+    //
+    // on_stop is NOT run for the outgoing script, and that asymmetry is the
+    // point rather than an omission.  The runtime is not stopping: it keeps its
+    // listener, its clients and its state right through this, and on_stop is
+    // where a script says goodbye to exactly those.  A reload that fired it
+    // would have every edit to a file publish a farewell and close what it had
+    // opened, for a runtime that never went away.
+    //
+    // A raise here is reported to whoever asked for the reload.  The script IS
+    // in force — this is past the swap — but it is in force with whatever
+    // on_start managed to do before it failed, which is not the thing the
+    // operator asked for, and this tree's rule is that a command does not
+    // report success for something that did not happen.  invoke_on_start()
+    // writes the reason into lua_diag; cmd_reload_lua and proxy_worker both
+    // read it from there.
+    if (!invoke_on_start())
+        return false;
+
     return true;
 }
 
@@ -583,11 +631,11 @@ std::string_view runtime_instance::get_lua_script_path() const
     return m_lua_script_path;
 }
 
-void runtime_instance::invoke_on_start()
+bool runtime_instance::invoke_on_start()
 {
-    if (m_cb_on_start) { m_cb_on_start(); return; }
+    if (m_cb_on_start) { m_cb_on_start(); return true; }
     if (!m_lua || !m_lua->has_on_start())
-        return;
+        return true;
 
 #ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("running");
@@ -597,8 +645,21 @@ void runtime_instance::invoke_on_start()
     {
         sol::error e = r;
         std::cerr << "[lua] on_start error: " << e.what() << std::endl;
+
+        // Recorded as well as printed, for the reason lua_context.h gives for
+        // the load-time diagnostics: this is a tee, not a redirect.  The
+        // restriction stated there — "load time only, because a callback's
+        // error happens on traffic with no command in flight to carry it
+        // anywhere" — does not describe on_start.  on_start runs synchronously
+        // inside `start`, `create -s` and `reload-lua`, so there IS a caller to
+        // carry it to, and reload_lua_script() is the one that does.  The
+        // buffer is per-thread and cleared by whoever is about to read it, so
+        // writing here costs the callers that do not nothing at all.
+        lua_diag::record(std::string("on_start error: ") + e.what());
+        return false;
     }
 #endif
+    return true;
 }
 
 void runtime_instance::invoke_on_stop()

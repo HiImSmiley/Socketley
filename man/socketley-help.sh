@@ -236,6 +236,10 @@ cli_commands() {
 
     echo -e "${BOLD}reload-lua <name|pattern>...${NC}"
     echo "  Hot-reload Lua script without stopping the runtime"
+    echo "  on_start runs again on the new script — subscriptions and timers live"
+    echo "    in the context that was just destroyed, so anything on_start does"
+    echo "    must be safe to do twice.  on_stop does NOT run: nothing stopped."
+    echo "  Exit 1 when the script would not load, or when its on_start raised."
     echo -e "  ${CYAN}socketley reload-lua myserver${NC}"
     echo -e "  ${CYAN}socketley reload-lua *${NC}"
     echo ""
