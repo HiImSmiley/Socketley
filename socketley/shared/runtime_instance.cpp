@@ -510,14 +510,30 @@ bool runtime_instance::reload_lua_script()
         return true;
     }
 
-    m_lua.reset();
-    m_lua = std::make_unique<lua_context>();
+    // ─── The replacement is built before the old one is given up ────────────
+    //
+    // This used to reset m_lua and then load into the empty slot, so a script
+    // that no longer compiled left the runtime with NO interpreter: every
+    // callback stopped firing and nothing said so.  Both halves of the tree
+    // claim otherwise -- proxy_worker's reload warns that "the previous one is
+    // still in force", and cmd_reload_lua relies on the same promise when it
+    // reads the declaration back afterwards -- so the contract was written down
+    // twice and kept nowhere.
+    //
+    // Measured before this change, on a server whose script logs every message:
+    // one edit that dropped a closing paren, one reload-lua reporting success,
+    // and then total_messages 1 -> 3 with no further callback line.  The traffic
+    // arrived; the script it was supposed to reach was gone.
+    //
+    // Swapping on success is the whole fix.  The two contexts overlap only for
+    // the duration of the load: bindings are per-state, and the C++ callbacks
+    // this instance holds are not the Lua ones.
+    auto next = std::make_unique<lua_context>();
 
-    if (!m_lua->load_script(m_lua_script_path, this))
-    {
-        m_lua.reset();
+    if (!next->load_script(m_lua_script_path, this))
         return false;
-    }
+
+    m_lua = std::move(next);
 
 #ifndef SOCKETLEY_NO_LUA
     m_lua->update_self_state("running");
