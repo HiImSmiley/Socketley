@@ -793,9 +793,23 @@ private:
         // A script that will not compile leaves the previous one in force --
         // reload_lua_script()'s own contract -- so the declaration read below is
         // still the one being enforced either way, and still the right answer.
+        //
+        // But it is not the answer the operator asked for, and the WARN below
+        // is in a log they are not reading.  The reason goes up the control
+        // socket as well, so `reload-lua` can refuse rather than reporting
+        // success for an edit that did not take effect.  Written before the
+        // routes frame, which is what ends the daemon's wait.
+        lua_diag::clear();
         if (!m_rt->reload_lua_script())
+        {
             LOG_WARN("proxy worker: reload-lua could not load the script; the "
                      "previous one is still in force");
+            std::string why = lua_diag::text();
+            if (why.empty())
+                why = "the script did not load";
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::reload_err, std::move(why)))) {}
+        }
         send_routes();
     }
 

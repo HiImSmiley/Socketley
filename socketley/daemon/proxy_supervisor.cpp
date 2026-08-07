@@ -576,7 +576,17 @@ void proxy_supervisor::send_stop()
 
 void proxy_supervisor::send_reload()
 {
+    // Cleared here rather than when the answer arrives: a worker that reloaded
+    // cleanly sends nothing, so "no reload_err since the ask" is the only shape
+    // success has, and a stale message from the previous reload would otherwise
+    // be reported as this one's.
+    m_reload_error.clear();
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::reload, {}))) {}
+}
+
+std::string proxy_supervisor::take_reload_error()
+{
+    return std::move(m_reload_error);
 }
 
 void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
@@ -832,6 +842,15 @@ void proxy_supervisor::ingest(const std::string&)
                 }
                 break;
             }
+
+            case worker_proto::frame_type::reload_err:
+                // Only sent when a reload failed, and only between the ask and
+                // the routes frame that ends the wait for it — so this is the
+                // answer to the reload cmd_reload_lua is holding, and it is
+                // read back there rather than logged: the worker has already
+                // logged it, and the point of the frame is the other terminal.
+                m_reload_error = payload;
+                break;
 
             case worker_proto::frame_type::publish:
             {

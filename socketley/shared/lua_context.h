@@ -1,5 +1,39 @@
 #pragma once
 
+#include <string>
+#include <string_view>
+
+// ─── What the script said, on its way to the person who asked ───────────────
+//
+// Every Lua diagnostic in this tree is written to stderr, and stderr is the
+// daemon's log.  A CLI command's reply channel is std::cout: daemon_handler
+// borrows cout for the length of a command and hands whatever was printed back
+// as the reply (see cout_to_reply).  stderr is not borrowed, and cannot be —
+// the metrics endpoint has a thread of its own and logs there, so swapping a
+// process-wide streambuf for an ostringstream would be a data race between two
+// threads at the moment something has already gone wrong.
+//
+// So the load-time diagnostics are collected as well as printed, into a buffer
+// belonging to the calling thread, and the commands that load or reload a
+// script read it back and put the reason on the terminal of whoever typed the
+// command.  The log keeps its copy: this is a tee, not a redirect.
+//
+// Load time only, deliberately.  A callback's error happens on traffic, with no
+// command in flight to carry it anywhere; those keep going to the log alone.
+namespace lua_diag
+{
+    // Begin one load, discarding whatever the previous one left behind.
+    void clear();
+
+    // Everything that load reported, newline separated, empty if it was silent.
+    // Only meaningful immediately after the call that failed.
+    const std::string& text();
+
+    // Record one line.  Called from lua_context and runtime_instance's
+    // compile-only paths; nothing else should need it.
+    void record(std::string_view line);
+}
+
 #ifndef SOCKETLEY_NO_LUA
 
 #include <sol/sol.hpp>

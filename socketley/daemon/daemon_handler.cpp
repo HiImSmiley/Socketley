@@ -17,6 +17,7 @@
 #include "../shared/tls_context.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
+#include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
 #include <unistd.h>
@@ -2798,6 +2799,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (!instance->load_lua_script(cfg.lua_script))
             {
                 conn->write_buf = "could not load Lua script: " + cfg.lua_script + "\n";
+                // Same reason as the --lua flag's: the parse error or the
+                // validator's sentence is on stderr, which is the daemon's log
+                // rather than the terminal that asked for this.
+                if (!lua_diag::text().empty())
+                    conn->write_buf += lua_diag::text() + "\n";
                 return 1;
             }
         }
@@ -3024,7 +3030,30 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     // A runtime whose script runs in a worker has to be asked, and the answer
     // waited for.  Every reload is sent before any of them is waited on, so
     // reloading N runtimes costs one round trip rather than N of them.
-    std::vector<std::pair<proxy_supervisor*, const void*>> pending;
+    std::vector<std::tuple<proxy_supervisor*, const void*, std::string>> pending;
+
+    // ─── A reload that did not happen is not a success ──────────────────────
+    //
+    // The bool from reload_lua_script() was discarded here, so `reload-lua`
+    // answered 0 with an empty reply for a script that no longer compiled — and
+    // the reason went to stderr, which is the daemon's log rather than the
+    // terminal of whoever ran the command.  An operator edited a file, ran
+    // this, was told nothing, and went on believing the edit was live.  The
+    // previous script stays in force in that case, which is the right
+    // behaviour and the worst possible one to be silent about: everything
+    // keeps working, and it keeps working the old way.
+    //
+    // Failures are collected rather than returned at the first: `reload-lua`
+    // takes a pattern, and reloading eight runtimes of which two are broken
+    // should say which two.  The other six are still reloaded.
+    std::string failures;
+    auto note_failure = [&failures](std::string_view name, std::string_view why) {
+        failures += "reload-lua ";
+        failures += name;
+        failures += ": ";
+        failures += why.empty() ? std::string_view("the script did not load") : why;
+        failures += '\n';
+    };
 
     for (const auto& n : names)
     {
@@ -3040,13 +3069,25 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
             // Read before the ask, so the answer cannot be missed for having
             // arrived between the two.
             const void* prev = inst ? inst->worker_routes().get() : nullptr;
-            pending.emplace_back(it->second.get(), prev);
+            pending.emplace_back(it->second.get(), prev, n);
             it->second->send_reload();
             continue;
         }
 
-        if (inst && !inst->get_lua_script_path().empty())
-            inst->reload_lua_script();
+        // The two preconditions reload_lua_script() returns false on without
+        // anything having gone wrong — no script, and a runtime that is not
+        // running — are checked here rather than reported.  A stopped runtime
+        // loads its script when it is started, so "nothing to reload" is not a
+        // failure and must not print like one; only a file that would not load
+        // is.  Everything past this point that answers false has written a
+        // reason, which is what note_failure carries.
+        if (inst && !inst->get_lua_script_path().empty() &&
+            inst->get_state() == runtime_running)
+        {
+            lua_diag::clear();
+            if (!inst->reload_lua_script())
+                note_failure(n, lua_diag::text());
+        }
         // Rebuild HTTP file cache on reload-lua (picks up new/changed files)
         if (inst && inst->get_type() == runtime_server)
         {
@@ -3074,17 +3115,45 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     // the one `create` uses, for the reason given there: one timescale in this
     // file rather than two.  A worker that never answers leaves the declaration
     // it had in force, and the publish below carries that.
-    for (auto& [sup, prev] : pending)
+    for (auto& [sup, prev, name] : pending)
+    {
         if (!sup->await_routes(prev, worker_startup_bound))
             LOG_WARN("reload-lua: a worker did not report its declaration in "
                      "time; the gateway keeps enforcing the previous one");
+        // Read after the wait, never before: the child writes reload_err ahead
+        // of the routes frame the wait ends on, so by here it has been ingested
+        // if it was sent at all.  Empty means the reload loaded.
+        if (std::string why = sup->take_reload_error(); !why.empty())
+            note_failure(name, why);
+    }
 
     // A script is where a runtime's route declaration lives, so reloading one
     // can change what it says it will answer.  Without this the proxies in
     // front of it would go on enforcing the declaration from the previous
     // version of the file — the exact drift publishing exists to prevent, and
     // the worst kind, because the two copies came from the same script.
+    //
+    // Published even when one of the reloads was refused: a script that would
+    // not load left the previous one in force, so the declaration the daemon
+    // holds for it is still the one being enforced, and the runtimes that did
+    // reload have new ones that have to go out.
     m_manager.publish_endpoints();
+
+    if (!failures.empty())
+    {
+        // Straight into the reply buffer rather than through cout: the
+        // cout_to_reply guard that borrows cout for a command exists only in
+        // cmd_create and cmd_edit, so cout from here would land on the daemon's
+        // own stdout — which is the very place these messages were already
+        // being lost.  A null connection is the boot-time restore, which has no
+        // reply channel; that keeps the old destination.
+        //
+        // Bad input — the file the operator named is the thing that is wrong —
+        // so exit 1, per the project's codes.  Success stays silent.
+        if (conn) conn->write_buf += failures;
+        else      std::cout << failures;
+        return 1;
+    }
     return 0;
 }
 

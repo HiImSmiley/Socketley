@@ -88,7 +88,23 @@ enum class frame_type : uint16_t
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply
     routes    = 5,   // payload: see encode_routes
+    reload_err = 6,  // payload: why a `reload` failed; see below
 };
+
+// ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
+//
+// A worker's reload either loads the file or leaves the previous script in
+// force, and until this frame existed the only record of the second outcome was
+// a WARN in the daemon's log.  cmd_reload_lua waited for the `routes` frame,
+// got one either way — the declaration in force is still the right answer — and
+// returned 0 with an empty reply.  The operator was told their edit had taken
+// effect by a command that knew it had not.
+//
+// The payload is the diagnostic, verbatim, and the frame is only sent when the
+// reload failed: a worker that reloaded cleanly sends nothing, so success costs
+// no frame and the daemon's "did anything go wrong" is "did one arrive".  It is
+// written before the `routes` frame that ends the daemon's wait, so by the time
+// cmd_reload_lua stops waiting it has already been read.
 
 // ── routes: what a runtime in a worker says it will answer ──────────────────
 //

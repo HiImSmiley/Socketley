@@ -1,5 +1,24 @@
 #include "lua_context.h"
 
+// Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
+// and the callers that read a load failure back are not conditional on Lua.
+namespace lua_diag
+{
+    // Thread-local, which is what makes this safe where a cerr swap is not.
+    // A CLI command runs on the daemon's own thread and each worker has its
+    // own; nothing here is shared and nothing needs a lock.
+    static thread_local std::string s_text;
+
+    void clear() { s_text.clear(); }
+    const std::string& text() { return s_text; }
+
+    void record(std::string_view line)
+    {
+        if (!s_text.empty()) s_text += '\n';
+        s_text += line;
+    }
+}
+
 #ifndef SOCKETLEY_NO_LUA
 
 #include "runtime_instance.h"
@@ -198,8 +217,21 @@ static const char* state_to_string(runtime_state s)
     return "unknown";
 }
 
+// One load-time refusal: into the daemon's log, and into the buffer the command
+// that asked for this load reads back.  Every `return false` in load_script and
+// in the two declaration validators goes through here, because every one of
+// them is a sentence written for the person editing the script — and until now
+// not one of them could reach them.
+static void load_diag(const std::string& msg)
+{
+    std::cerr << "[lua] " << msg << std::endl;
+    lua_diag::record(msg);
+}
+
 bool lua_context::script_compiles(std::string_view path, std::string& err)
 {
+    lua_diag::clear();
+
     // Its own state, with nothing registered on it.  load_file compiles the
     // chunk and leaves it on the stack unexecuted, so no top-level line runs
     // and there is nothing for a top-level line to reach even if one did.
@@ -210,11 +242,13 @@ bool lua_context::script_compiles(std::string_view path, std::string& err)
 
     sol::error e = chunk;
     err = e.what();
+    lua_diag::record(std::string("script error: ") + err);
     return false;
 }
 
 bool lua_context::load_script(std::string_view path, runtime_instance* owner)
 {
+    lua_diag::clear();
     register_bindings(owner);
 
     // Set package.path so require() resolves modules relative to the script's directory
@@ -240,7 +274,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (!result.valid())
     {
         sol::error err = result;
-        std::cerr << "[lua] script error: " << err.what() << std::endl;
+        load_diag(std::string("script error: ") + err.what());
         return false;
     }
 
@@ -317,7 +351,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         {
             if (!fobj.is<sol::table>())
             {
-                std::cerr << "[lua] `filters` must be a table of functions" << std::endl;
+                load_diag("`filters` must be a table of functions");
                 return false;
             }
             sol::table ft = fobj.as<sol::table>();
@@ -331,7 +365,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                     break;
                 if (!entry.is<sol::function>())
                 {
-                    std::cerr << "[lua] filters[" << i << "] is not a function" << std::endl;
+                    load_diag("filters[" + std::to_string(i) + "] is not a function");
                     return false;
                 }
                 m_filters.push_back(entry.as<sol::protected_function>());
@@ -346,8 +380,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 ft.for_each([&](sol::object, sol::object) { any = true; });
                 if (any)
                 {
-                    std::cerr << "[lua] `filters` has no entry at index 1 — a chain is "
-                                 "an ordered array, not a keyed table" << std::endl;
+                    load_diag("`filters` has no entry at index 1 — a chain is "
+                              "an ordered array, not a keyed table");
                     return false;
                 }
             }
@@ -377,8 +411,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         {
             if (!robj.is<sol::table>())
             {
-                std::cerr << "[lua] `routes` must be a table of { path, methods } entries"
-                          << std::endl;
+                load_diag("`routes` must be a table of { path, methods } entries");
                 return false;
             }
             sol::table rt = robj.as<sol::table>();
@@ -389,7 +422,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                     break;
                 if (!entry.is<sol::table>())
                 {
-                    std::cerr << "[lua] routes[" << i << "] is not a table" << std::endl;
+                    load_diag("routes[" + std::to_string(i) + "] is not a table");
                     return false;
                 }
                 sol::table e = entry.as<sol::table>();
@@ -397,7 +430,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 sol::optional<std::string> path = e["path"];
                 if (!path)
                 {
-                    std::cerr << "[lua] routes[" << i << "] has no `path`" << std::endl;
+                    load_diag("routes[" + std::to_string(i) + "] has no `path`");
                     return false;
                 }
 
@@ -421,8 +454,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                             break;
                         if (!m.is<std::string>())
                         {
-                            std::cerr << "[lua] routes[" << i << "].methods[" << j
-                                      << "] is not a string" << std::endl;
+                            load_diag("routes[" + std::to_string(i) + "].methods["
+                                      + std::to_string(j) + "] is not a string");
                             return false;
                         }
                         methods.push_back(m.as<std::string>());
@@ -430,9 +463,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 }
                 else
                 {
-                    std::cerr << "[lua] routes[" << i << "] (" << *path
-                              << ") has no `methods` list — a route that named no method "
-                                 "would refuse every request at the edge" << std::endl;
+                    load_diag("routes[" + std::to_string(i) + "] (" + *path
+                              + ") has no `methods` list — a route that named no method "
+                                "would refuse every request at the edge");
                     return false;
                 }
 
@@ -455,8 +488,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 }
                 if (why)
                 {
-                    std::cerr << "[lua] routes[" << i << "] (" << *path << "): " << why
-                              << std::endl;
+                    load_diag("routes[" + std::to_string(i) + "] (" + *path + "): " + why);
                     return false;
                 }
             }
@@ -471,9 +503,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 rt.for_each([&](sol::object, sol::object) { any = true; });
                 if (any)
                 {
-                    std::cerr << "[lua] `routes` has no entry at index 1 — it is an array "
-                                 "of { path = ..., methods = { ... } }, not a keyed table"
-                              << std::endl;
+                    load_diag("`routes` has no entry at index 1 — it is an array "
+                              "of { path = ..., methods = { ... } }, not a keyed table");
                     return false;
                 }
             }

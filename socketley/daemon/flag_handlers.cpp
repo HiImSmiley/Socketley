@@ -1,5 +1,6 @@
 #include "flag_handlers.h"
 #include "../shared/runtime_instance.h"
+#include "../shared/lua_context.h"
 #include "../shared/tls_context.h"
 #include <iostream>
 #include <charconv>
@@ -87,7 +88,16 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             }
             if (!instance->load_lua_script(pa.args[++i]))
             {
-                std::cout << "could not load Lua script\n";
+                // The reason, not just the fact.  This used to print exactly
+                // the four words below while the parse error, or the sentence
+                // one of the `filters`/`routes` validators wrote for the person
+                // editing the file, went to stderr — and stderr is the daemon's
+                // log, one process away from the terminal that ran the command.
+                // An operator was told their script would not load and never
+                // told why.
+                std::cout << "could not load Lua script: " << pa.args[i] << "\n";
+                if (!lua_diag::text().empty())
+                    std::cout << lua_diag::text() << "\n";
                 return 1;
             }
             return 0;

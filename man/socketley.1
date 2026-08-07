@@ -418,6 +418,15 @@ edit removed the
 table altogether. A worker that does not answer in time leaves the previous
 declaration in force and says so in the log; a script that does not compile
 leaves the previous one running, as it does in the daemon.
+.IP
+A reload that succeeds prints nothing and exits 0. A script that would not load
+is named on stdout with the reason \(em the parse error, or whichever
+.B filters
+or
+.B routes
+rule it broke \(em and the command exits 1. The runtimes that did reload are
+still reloaded, and the ones that did not go on running the script they had, so
+the message is the only sign that an edit is not live.
 .TP
 .BI "show " "name|pattern" "..."
 Print runtime JSON configuration to stdout. Accepts multiple names,
@@ -885,7 +894,13 @@ Log state transitions (created, running, stopped, failed) to file.
 Write every received message to file.
 .TP
 .BI "\-\-lua " "script"
-Attach Lua configuration script with callbacks.
+Attach Lua configuration script with callbacks. A script that does not load
+refuses the command with exit 1, and the reason is printed \(em the parse error,
+or whichever
+.B filters
+or
+.B routes
+rule it broke \(em rather than only the fact.
 .TP
 .B \-b
 Output received messages to stdout (bash mode).

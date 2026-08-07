@@ -188,6 +188,14 @@ public:
     // never answered, and the caller publishes what it already had.
     bool await_routes(const void* previous, std::chrono::milliseconds bound);
 
+    // Why this child's last reload failed, or empty if it did not.
+    //
+    // send_reload() clears it and the child sets it by sending a `reload_err`
+    // frame before the `routes` frame that ends await_routes(), so reading it
+    // straight after that wait is reading the answer to that reload and no
+    // other.  Taken rather than peeked: one reload, one report.
+    std::string take_reload_error();
+
     // A new membership snapshot.  Cheap enough to send unconditionally: the
     // daemon publishes only when a runtime is created, started, stopped,
     // removed or renamed, or when the cluster's view moves.
@@ -352,6 +360,10 @@ private:
     bool         m_state_changed{false};
     bool         m_routes_changed{false};
     bool         m_reachability_changed{false};
+
+    // Why the last `reload` this child was sent did not load.  Empty when it
+    // did, because a worker that reloaded cleanly sends no frame at all.
+    std::string  m_reload_error;
 
     // The last state the child reported about itself, observed and not adopted.
     //
