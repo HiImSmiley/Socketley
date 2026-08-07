@@ -170,28 +170,49 @@ discipline.
 |------------------------------------|--------------------|--------|
 | Connection rate (2000 conns)       | **81K conn/s**     | ±16%   |
 | Burst (5000 simultaneous)          | **113K conn/s**    | ±2%    |
-| Single client, 64B messages        | **424K msg/s**     | ±7%    |
-| Single client, 1KB messages        | **364K msg/s**     | ±11%   |
-| 100 clients × 500 msgs (aggregate) | ~2.3M msg/s        | ±52%   |
-| Proxy, TCP forwarding (128B)       | **648K msg/s**     | ±5%    |
-| Proxy, 20 concurrent clients       | ~2.1M msg/s        | ±88%   |
 | WebSocket handshakes (200)         | **30K/s**          | ±7%    |
-| WebSocket frames (64B)             | **407K frame/s**   | ±1%    |
 | WebSocket, 20 concurrent clients   | **80K/s**          | ±6%    |
 
-Two rows are given without emphasis on purpose. The proxy's concurrent figure
-moves by 88% between runs on this machine and the server's by 52% across four
-observations — too much to publish as a number, and worth saying so rather than
-quoting a median that looks precise. They are the two aggregate tests, which is
-not a coincidence; see the weakness below.
+**Six rows have been withdrawn rather than restated.** Single client 64B and
+1KB, 100 clients × 500 msgs, proxy TCP forwarding, proxy 20 concurrent, and
+WebSocket frames were all produced by benchmarks that sent in a loop and never
+read a reply. What those measured was how fast the load generator could fill a
+socket buffer — roughly 1/latency of a `write()` — and not how fast anything was
+served. Their latency percentiles were the cost of `write()`. The figures were
+therefore too high by a large and *test-dependent* factor: measured on this tree
+after the loops were fixed, between 4× (single client) and 40× (100 concurrent
+clients).
+
+Those benchmarks now complete a round trip per operation against an echoing
+backend, so the numbers they produce are not comparable with the ones that stood
+here, and quoting either in the other's place would be wrong. They are left out
+until they have been re-recorded with the pinning and `TIME_WAIT` discipline the
+rest of this table was taken under — `test/benchmark/record_throughput.sh`. An
+absent row is a smaller error than a confident one.
+
+The two connection-rate rows and the two WebSocket handshake rows are unchanged:
+those never depended on a reply that was not being read. `socketley_bench` now
+states beside every figure whether it is a round trip, a write with nothing read
+back, or a connection establishment, and publishes each under a JSON key named
+for its kind, so this cannot happen again silently.
+
+One row that remains is still given without emphasis on purpose: the WebSocket
+concurrent figure is an aggregate test, and aggregates are where the spread on
+this machine is worst. See the weakness below.
 
 **Known weakness, stated rather than omitted.** Single connections are fast and
 pipelined depth is fast; many *simultaneous* connections are not proportionally
-fast. The aggregate figures above are roughly half of what the same tests
-produced against a build from February 2026 measured on the same day — while
-single-connection and pipelined figures are the same or better. The cost per
-connection has grown, and it disappears at one connection and dominates at a
-hundred.
+fast. The cost per connection has grown, and it disappears at one connection and
+dominates at a hundred.
+
+How much of that conclusion survives the withdrawn rows is itself open. It was
+drawn by comparing aggregate figures against a February 2026 build measured on
+the same day — but both sides of that comparison were write-only numbers, so it
+compared two socket-buffer fill rates and not two service rates. The pipelined
+RESP tables above are unaffected (`redis-benchmark` reads its replies), and they
+show the same shape, which is why the weakness is still stated rather than
+withdrawn with the rows. It needs re-establishing on round trips before the
+figure attached to it means anything.
 
 Part of that is the price of correctness: the February build did not release
 registered file slots on teardown, did not cancel operations armed on them,

@@ -20,6 +20,14 @@
  *   cache  set|get|mixed|concurrent
  *   proxy  tcp|concurrent|overhead
  *   ws     handshake|echo|concurrent
+ *
+ * Every rate here is completed round trips per second except `server conn`,
+ * `server burst` (connection establishments) and `server ingest` (writes with
+ * nothing read back, which is the only thing measurable about a --mode in
+ * runtime).  Each result says which of the three it is, in the output and in the
+ * JSON key it is published under; see `enum metric_kind`.  The round-trip tests
+ * need a backend that answers -- test/benchmark/echo.lua -- because no --mode of
+ * a plain server runtime replies on its own.
  */
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -194,6 +202,77 @@ static void set_recv_timeout(int fd, int ms)
     tv.tv_sec  = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0) { }
+}
+
+/* ── What a reported number means ──────────────────────────────────────────
+ *
+ * Five benchmarks here used to send in a loop and never read a reply, and call
+ * the result throughput.  What that measures is how fast this process can fill a
+ * socket buffer: the rate is roughly 1/latency of a write syscall, and the
+ * "latency percentiles" are the cost of write() and nothing else.  Measured on
+ * the same 64B traffic against the same server, 372,700/sec write-only against
+ * 39,199/sec for a completed round trip -- a factor of ten between two numbers
+ * that were both being published as "msg/sec".
+ *
+ * So a result now carries what it measured, the JSON key it is published under
+ * says the same thing, and the two cannot drift apart because the key is derived
+ * from the kind rather than written next to it.  Results from before this exist
+ * in test/benchmark/results/ under the old names and are not comparable; that is
+ * why the names changed rather than the numbers quietly moving.
+ *
+ * METRIC_WRITE_ONLY has not been abolished -- it is a real property of a
+ * `--mode in` runtime, which by definition never answers, and the only thing
+ * that can be asked of one.  It is kept where it is deliberate (server ingest)
+ * and named so nobody reads it as a service rate. */
+enum metric_kind {
+    METRIC_ROUND_TRIP = 0,  /* request sent, its reply read, before the next goes */
+    METRIC_WRITE_ONLY,      /* bytes handed to the kernel; no reply is expected */
+    METRIC_CONNECT          /* completed TCP connection establishments */
+};
+
+static const char *metric_name(enum metric_kind m)
+{
+    switch (m) {
+        case METRIC_ROUND_TRIP: return "round_trip";
+        case METRIC_WRITE_ONLY: return "write_only";
+        default:                return "connect";
+    }
+}
+
+/* The JSON key the rate is published under.  Deliberately not one shared key:
+ * a tool that reads both an old file and a new one must see two different
+ * fields, because they are two different measurements. */
+static const char *metric_rate_key(enum metric_kind m)
+{
+    switch (m) {
+        case METRIC_ROUND_TRIP: return "median_round_trips_per_sec";
+        case METRIC_WRITE_ONLY: return "median_writes_per_sec";
+        default:                return "median_connects_per_sec";
+    }
+}
+
+static const char *metric_lat_prefix(enum metric_kind m)
+{
+    switch (m) {
+        case METRIC_ROUND_TRIP: return "rtt";
+        case METRIC_WRITE_ONLY: return "write";
+        default:                return "connect";
+    }
+}
+
+/* One line, printed beside the number, saying what it is.  A reader who takes a
+ * figure out of this output and puts it in a README should not have to find this
+ * file to know whether anything was served. */
+static const char *metric_meaning(enum metric_kind m)
+{
+    switch (m) {
+        case METRIC_ROUND_TRIP:
+            return "completed round trips: each request's reply was read before the next was sent";
+        case METRIC_WRITE_ONLY:
+            return "writes accepted by the kernel; nothing was read back, so this is not a service rate";
+        default:
+            return "completed TCP connection establishments";
+    }
 }
 
 /* Count newlines in buffer (for plaintext cache responses). */
@@ -407,6 +486,38 @@ static int ws_build_frame(char *out, const char *payload, int payload_len)
     return off;
 }
 
+/* Read one server->client text frame and return its payload length, or -1.
+ *
+ * A server frame is never masked (RFC 6455 §5.1), so the header is 2 bytes plus
+ * an extended length when the payload is 126 bytes or more.  The length is read
+ * from the wire rather than assumed to match what was sent: assuming it would
+ * turn a server that replied with something else -- a close frame, a pong, a
+ * truncated frame -- into a silent success, and this is the read that makes the
+ * WebSocket benchmark a round trip in the first place.
+ *
+ * `cap` bounds the payload this will accept into `out`; a frame larger than that
+ * is a failure rather than an overrun. */
+static int ws_recv_frame(int fd, char *out, int cap)
+{
+    unsigned char hdr[2];
+    if (recv_exact(fd, hdr, 2) != 2) return -1;
+    if ((hdr[0] & 0x0F) != 0x1) return -1;   /* not a text frame */
+    if (hdr[1] & 0x80) return -1;            /* a server frame must not be masked */
+
+    int len = hdr[1] & 0x7F;
+    if (len == 126) {
+        unsigned char ext[2];
+        if (recv_exact(fd, ext, 2) != 2) return -1;
+        len = (ext[0] << 8) | ext[1];
+    } else if (len == 127) {
+        return -1;   /* 64-bit lengths are past anything this tool sends */
+    }
+
+    if (len > cap) return -1;
+    if (len > 0 && recv_exact(fd, out, (size_t)len) != len) return -1;
+    return len;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * H. Server benchmarks
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -478,7 +589,67 @@ static struct run_result bench_server_burst(struct bench_config *cfg)
     return r;
 }
 
+/* Single-client message throughput: one request out, its reply read, then the
+ * next.  Against test/benchmark/echo.lua, because a plain server runtime answers
+ * nothing in any --mode and this loop would otherwise be timing write().
+ *
+ * The reply is the same bytes back, newline included, so its length is known and
+ * recv_exact can insist on all of it: a short read here means the server stopped
+ * mid-message, which is a defect and not a slow run, and `expected` below is what
+ * makes the harness say so instead of averaging it in. */
 static struct run_result bench_server_msg(struct bench_config *cfg)
+{
+    struct run_result r = {0};
+    lat_init(&r.latencies, cfg->num_ops);
+
+    int fd = tcp_connect(cfg->host, cfg->port);
+    if (fd < 0) { r.failed = cfg->num_ops; return r; }
+    set_recv_timeout(fd, 2000);
+
+    char *msg = (char *)malloc(cfg->msg_size + 1);
+    memset(msg, 'X', cfg->msg_size);
+    msg[cfg->msg_size] = '\n';
+    char *rep = (char *)malloc(cfg->msg_size + 1);
+
+    int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    r.expected = cfg->num_ops;
+
+    int64_t start = time_ns();
+
+    for (int i = 0; i < cfg->num_ops; i++) {
+        int64_t t0 = time_ns();
+        if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
+        if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
+        int64_t t1 = time_ns();
+
+        r.success++;
+        if (i >= warmup)
+            lat_record(&r.latencies, t1 - t0);
+    }
+
+    int64_t end = time_ns();
+    close(fd);
+    free(msg);
+    free(rep);
+
+    double elapsed = ns_to_s(end - start);
+    r.throughput = r.success / elapsed;
+    /* One direction.  A round trip moves this much each way; counting both would
+     * double a figure that is read as "how much payload got through". */
+    r.throughput_mb = (r.success * (double)(cfg->msg_size + 1)) / elapsed / (1024.0 * 1024.0);
+
+    return r;
+}
+
+/* The write-only loop, kept on purpose and named for what it is.
+ *
+ * A `--mode in` runtime accepts messages and never answers -- that is the mode,
+ * not a missing feature -- so the rate at which one can be fed is the only thing
+ * measurable about it, and it is worth measuring.  What it is NOT is a service
+ * rate: nothing here waits for the server to do anything, so a run can finish
+ * with most of the traffic still sitting in socket buffers.  That is why it is a
+ * separate test under a separate name rather than the same number as `msg`. */
+static struct run_result bench_server_ingest(struct bench_config *cfg)
 {
     struct run_result r = {0};
     lat_init(&r.latencies, cfg->num_ops);
@@ -534,11 +705,13 @@ static void *server_concurrent_worker(void *arg)
 
     int fd = tcp_connect(cfg->host, cfg->port);
 
-    char *msg = NULL;
+    char *msg = NULL, *rep = NULL;
     if (fd >= 0) {
+        set_recv_timeout(fd, 5000);
         msg = (char *)malloc(cfg->msg_size + 1);
         memset(msg, 'Y', cfg->msg_size);
         msg[cfg->msg_size] = '\n';
+        rep = (char *)malloc(cfg->msg_size + 1);
     }
 
     /* All threads connected — wait for barrier before sending.
@@ -550,14 +723,24 @@ static void *server_concurrent_worker(void *arg)
     pthread_barrier_wait(a->barrier);
     if (fd < 0) return NULL;
 
+    /* One request in flight per client, its reply read before the next goes.
+     *
+     * Not a pipeline, on purpose.  With N clients each holding one outstanding
+     * request the server is under exactly the concurrency the test claims to be
+     * measuring, and every operation counted has been served.  The loop this
+     * replaces sent all of them without reading any, which on this traffic
+     * (100 x 500 x 65B is ~32 KB per connection) fits inside socket buffers --
+     * so a run could and did finish before the server had read most of it. */
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
-        if (send_all(fd, msg, cfg->msg_size + 1) == cfg->msg_size + 1) local++;
-        else break;
+        if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) break;
+        if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) break;
+        local++;
     }
 
     close(fd);
     free(msg);
+    free(rep);
     a->thread_success = local;
     return NULL;
 }
@@ -807,6 +990,10 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
  * J. Proxy benchmarks
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* TCP forwarding: one request through the proxy to the backend and its reply
+ * back, before the next.  The backend must echo (test/benchmark/echo.lua) --
+ * without a reply this timed a write into the proxy's accept buffer and said
+ * nothing about forwarding at all. */
 static struct run_result bench_proxy_tcp(struct bench_config *cfg)
 {
     struct run_result r = {0};
@@ -814,33 +1001,34 @@ static struct run_result bench_proxy_tcp(struct bench_config *cfg)
 
     int fd = tcp_connect(cfg->host, cfg->port);
     if (fd < 0) { r.failed = cfg->num_ops; return r; }
+    set_recv_timeout(fd, 2000);
 
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 128;
     char *msg = (char *)malloc(msize + 1);
     memset(msg, 'P', msize);
     msg[msize] = '\n';
+    char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    r.expected = cfg->num_ops;
 
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
         int64_t t0 = time_ns();
-        ssize_t n = send_all(fd, msg, msize + 1);
+        if (send_all(fd, msg, msize + 1) != msize + 1) { r.failed++; break; }
+        if (recv_exact(fd, rep, msize + 1) != msize + 1) { r.failed++; break; }
         int64_t t1 = time_ns();
 
-        if (n == msize + 1) {
-            r.success++;
-            if (i >= warmup)
-                lat_record(&r.latencies, t1 - t0);
-        } else {
-            r.failed++;
-        }
+        r.success++;
+        if (i >= warmup)
+            lat_record(&r.latencies, t1 - t0);
     }
 
     int64_t end = time_ns();
     close(fd);
     free(msg);
+    free(rep);
 
     double elapsed = ns_to_s(end - start);
     r.throughput = r.success / elapsed;
@@ -864,25 +1052,31 @@ static void *proxy_concurrent_worker(void *arg)
     int fd = tcp_connect(cfg->host, cfg->port);
 
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 128;
-    char *msg = NULL;
+    char *msg = NULL, *rep = NULL;
     if (fd >= 0) {
+        set_recv_timeout(fd, 5000);
         msg = (char *)malloc(msize + 1);
         memset(msg, 'P', msize);
         msg[msize] = '\n';
+        rep = (char *)malloc(msize + 1);
     }
 
     /* Barrier is reached even on a failed connect — see server_concurrent_worker. */
     pthread_barrier_wait(a->barrier);
     if (fd < 0) return NULL;
 
+    /* Read the reply before sending the next — see server_concurrent_worker for
+     * why the version without this measured socket buffers. */
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
-        ssize_t n = send_all(fd, msg, msize + 1);
-        if (n == msize + 1) local++;
+        if (send_all(fd, msg, msize + 1) != msize + 1) break;
+        if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
+        local++;
     }
 
     close(fd);
     free(msg);
+    free(rep);
     a->thread_success = local;
     return NULL;
 }
@@ -1056,8 +1250,14 @@ static struct run_result bench_ws_handshake(struct bench_config *cfg)
     return r;
 }
 
-/* WS frame send throughput — measures how fast we can push masked frames
- * over an established WS connection. No echo expected from the server. */
+/* WebSocket echo round trip: one masked text frame out, the server's frame read
+ * back, before the next goes.
+ *
+ * The name was always "echo" and the loop never read one: it pushed masked
+ * frames at a plain server, which relays to every client except the sender and
+ * therefore answered nothing at all.  So the figure was the cost of write() on a
+ * frame, and the p50 was the cost of write().  It needs test/benchmark/echo.lua
+ * on the server for the same reason the TCP benchmarks do. */
 static struct run_result bench_ws_echo(struct bench_config *cfg)
 {
     struct run_result r = {0};
@@ -1079,6 +1279,7 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
         nanosleep(&pause, NULL);
     }
     if (fd < 0) { r.failed = cfg->num_ops; return r; }
+    set_recv_timeout(fd, 2000);
 
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 64;
     char *payload = (char *)malloc(msize);
@@ -1086,18 +1287,21 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
 
     char *frame = (char *)malloc(msize + 14);
     int frame_len = ws_build_frame(frame, payload, msize);
+    char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    r.expected = cfg->num_ops;
 
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
         int64_t t0 = time_ns();
 
-        if (send_all(fd, frame, frame_len) < 0) {
-            r.failed++;
-            break;
-        }
+        if (send_all(fd, frame, frame_len) < 0) { r.failed++; break; }
+        /* The echoed payload is the same bytes back: self.send strips the
+         * newline it appends when the connection is a WebSocket, so a frame of
+         * any other length means the server answered something else. */
+        if (ws_recv_frame(fd, rep, msize) != msize) { r.failed++; break; }
         int64_t t1 = time_ns();
 
         r.success++;
@@ -1109,6 +1313,7 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     close(fd);
     free(payload);
     free(frame);
+    free(rep);
 
     double elapsed = ns_to_s(end - start);
     r.throughput = r.success / elapsed;
@@ -1201,7 +1406,7 @@ typedef struct run_result (*bench_fn)(struct bench_config *);
 
 static void run_and_report(struct bench_config *cfg, bench_fn fn,
                            const char *category, const char *test,
-                           const char *unit)
+                           const char *unit, enum metric_kind metric)
 {
     int runs = cfg->runs;
     double *throughputs = (double *)malloc(runs * sizeof(double));
@@ -1282,9 +1487,14 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
            and without this the resulting records are indistinguishable, so
            tooling comparing two benchmark runs cannot line them up. */
         json_kv_int(stdout, "msg_size", cfg->msg_size);
-        json_kv_dbl(stdout, "median_throughput", med);
+        /* What was measured, and the rate under a key that says the same.  A
+         * file from before this carries median_throughput and nothing else; a
+         * reader that finds neither key it knows has been told the two runs are
+         * not comparable, which is the truth. */
+        json_kv_str(stdout, "metric", metric_name(metric));
+        json_kv_dbl(stdout, metric_rate_key(metric), med);
         if (med_mb > 0)
-            json_kv_dbl(stdout, "median_throughput_mb", med_mb);
+            json_kv_dbl(stdout, "median_MB_per_sec", med_mb);
         json_kv_int(stdout, "success", all_results[best_idx].success);
         if (all_results[best_idx].expected > 0) {
             json_kv_int(stdout, "expected", all_results[best_idx].expected);
@@ -1293,11 +1503,16 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         }
         json_kv_int(stdout, "failed", all_results[best_idx].failed);
         if (lat->count > 0) {
-            json_kv_dbl(stdout, "lat_min_us", ns_to_us(lat_percentile(lat, 0)));
-            json_kv_dbl(stdout, "lat_p50_us", ns_to_us(lat_percentile(lat, 50)));
-            json_kv_dbl(stdout, "lat_p95_us", ns_to_us(lat_percentile(lat, 95)));
-            json_kv_dbl(stdout, "lat_p99_us", ns_to_us(lat_percentile(lat, 99)));
-            json_kv_dbl(stdout, "lat_max_us", ns_to_us(lat_percentile(lat, 100)));
+            /* Prefixed by what a sample is.  "lat_p50_us" on a write-only loop
+             * was the cost of write() presented as a service latency, and the
+             * name is what let it be read as one. */
+            char k[32];
+            const char *p = metric_lat_prefix(metric);
+            snprintf(k, sizeof k, "%s_min_us", p); json_kv_dbl(stdout, k, ns_to_us(lat_percentile(lat, 0)));
+            snprintf(k, sizeof k, "%s_p50_us", p); json_kv_dbl(stdout, k, ns_to_us(lat_percentile(lat, 50)));
+            snprintf(k, sizeof k, "%s_p95_us", p); json_kv_dbl(stdout, k, ns_to_us(lat_percentile(lat, 95)));
+            snprintf(k, sizeof k, "%s_p99_us", p); json_kv_dbl(stdout, k, ns_to_us(lat_percentile(lat, 99)));
+            snprintf(k, sizeof k, "%s_max_us", p); json_kv_dbl(stdout, k, ns_to_us(lat_percentile(lat, 100)));
         }
         /* Per-run throughputs */
         fprintf(stdout, ",\"per_run\":[");
@@ -1320,11 +1535,17 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
 
         printf("\n  Median: %12.0f %s", med, unit);
         if (med_mb > 0)
-            printf("  (%.1f MB/s)", med_mb);
+            printf("  (%.1f MB/s one way)", med_mb);
         printf("\n");
+        /* Beside the number, every time.  A figure copied out of this output
+         * carries no context with it, so the context goes next to it. */
+        printf("  Measures: %s\n", metric_meaning(metric));
 
         if (lat->count > 0) {
-            printf("  Latency (us):  min=%.1f  p50=%.1f  p95=%.1f  p99=%.1f  max=%.1f\n",
+            printf("  %s (us):  min=%.1f  p50=%.1f  p95=%.1f  p99=%.1f  max=%.1f\n",
+                   metric == METRIC_ROUND_TRIP ? "Round-trip latency"
+                                               : (metric == METRIC_WRITE_ONLY ? "write() cost"
+                                                                              : "Connect latency"),
                    ns_to_us(lat_percentile(lat, 0)),
                    ns_to_us(lat_percentile(lat, 50)),
                    ns_to_us(lat_percentile(lat, 95)),
@@ -1360,8 +1581,9 @@ static void usage(const char *prog)
         "Categories and tests:\n"
         "  server conn <count>                  Connection rate\n"
         "  server burst <count>                 Burst connections\n"
-        "  server msg <count> <size>            Message throughput\n"
-        "  server concurrent <clients> <msgs>   Multi-client throughput\n"
+        "  server msg <count> <size>            Round-trip rate (needs an echoing backend)\n"
+        "  server ingest <count> <size>         Write-only: how fast --mode in can be fed\n"
+        "  server concurrent <clients> <msgs>   Multi-client round trips (echoing backend)\n"
         "\n"
         "  cache set <count> [value_size]        SET throughput\n"
         "  cache get <count>                     GET throughput\n"
@@ -1435,21 +1657,26 @@ int main(int argc, char **argv)
     if (strcmp(category, "server") == 0) {
         if (strcmp(test, "conn") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_server_conn, "server", "conn", "conn/sec");
+            run_and_report(&cfg, bench_server_conn, "server", "conn", "conn/sec", METRIC_CONNECT);
         }
         else if (strcmp(test, "burst") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_server_burst, "server", "burst", "conn/sec");
+            run_and_report(&cfg, bench_server_burst, "server", "burst", "conn/sec", METRIC_CONNECT);
         }
         else if (strcmp(test, "msg") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_server_msg, "server", "msg", "msg/sec");
+            run_and_report(&cfg, bench_server_msg, "server", "msg", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "concurrent") == 0) {
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_server_concurrent, "server", "concurrent", "msg/sec");
+            run_and_report(&cfg, bench_server_concurrent, "server", "concurrent", "round-trip/sec", METRIC_ROUND_TRIP);
+        }
+        else if (strcmp(test, "ingest") == 0) {
+            if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
+            run_and_report(&cfg, bench_server_ingest, "server", "ingest", "write/sec", METRIC_WRITE_ONLY);
         }
         else {
             fprintf(stderr, "Unknown server test: %s\n", test);
@@ -1461,20 +1688,20 @@ int main(int argc, char **argv)
         if (strcmp(test, "set") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_cache_set, "cache", "set", "ops/sec");
+            run_and_report(&cfg, bench_cache_set, "cache", "set", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "get") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_cache_get, "cache", "get", "ops/sec");
+            run_and_report(&cfg, bench_cache_get, "cache", "get", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "mixed") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_cache_mixed, "cache", "mixed", "ops/sec");
+            run_and_report(&cfg, bench_cache_mixed, "cache", "mixed", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "concurrent") == 0) {
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_cache_concurrent, "cache", "concurrent", "ops/sec");
+            run_and_report(&cfg, bench_cache_concurrent, "cache", "concurrent", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else {
             fprintf(stderr, "Unknown cache test: %s\n", test);
@@ -1486,12 +1713,12 @@ int main(int argc, char **argv)
         if (strcmp(test, "tcp") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_proxy_tcp, "proxy", "tcp", "msg/sec");
+            run_and_report(&cfg, bench_proxy_tcp, "proxy", "tcp", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "concurrent") == 0) {
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_proxy_concurrent, "proxy", "concurrent", "msg/sec");
+            run_and_report(&cfg, bench_proxy_concurrent, "proxy", "concurrent", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "overhead") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
@@ -1507,17 +1734,17 @@ int main(int argc, char **argv)
     else if (strcmp(category, "ws") == 0) {
         if (strcmp(test, "handshake") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_ws_handshake, "ws", "handshake", "handshake/sec");
+            run_and_report(&cfg, bench_ws_handshake, "ws", "handshake", "handshake/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "echo") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_ws_echo, "ws", "echo", "frame/sec");
+            run_and_report(&cfg, bench_ws_echo, "ws", "echo", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else if (strcmp(test, "concurrent") == 0) {
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_ws_concurrent, "ws", "concurrent", "handshake/sec");
+            run_and_report(&cfg, bench_ws_concurrent, "ws", "concurrent", "handshake/sec", METRIC_ROUND_TRIP);
         }
         else {
             fprintf(stderr, "Unknown ws test: %s\n", test);

@@ -66,17 +66,23 @@ test_burst_connections() {
     socketley_cmd remove bench_srv
 }
 
-# Test 3: Single-client message throughput
+# Test 3: Single-client round-trip throughput
+#
+# An echoing backend, because a plain server runtime answers nothing in any
+# --mode and the loop would otherwise time its own writes -- the same reason
+# 6c6f841 gave the overhead test one.  --mode in as before: echo.lua replies to
+# the sender itself, so the mode only decides whether the message is ALSO
+# relayed, and here it should not be.
 test_single_client_throughput() {
     local num_messages=${1:-100000}
     local message_size=${2:-64}
     local test_name="server_single_client_throughput"
 
-    log_section "Test: Single Client Throughput ($num_messages msgs, ${message_size}B)"
+    log_section "Test: Single Client Round Trips ($num_messages msgs, ${message_size}B)"
 
     ensure_clean
     wait_for_port_free $SERVER_PORT
-    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
+    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
@@ -88,17 +94,44 @@ test_single_client_throughput() {
     socketley_cmd remove bench_srv
 }
 
-# Test 4: Concurrent clients
+# Test 3b: Ingest rate — the write-only number, kept deliberately.
+#
+# A --mode in runtime never answers; that is the mode. So how fast it can be fed
+# is the only thing measurable about it, and it is worth knowing. It is NOT a
+# service rate — nothing here waits for the server — which is why it has a name
+# and a JSON key of its own instead of being reported as throughput.
+test_ingest_rate() {
+    local num_messages=${1:-100000}
+    local message_size=${2:-64}
+    local test_name="server_ingest_rate"
+
+    log_section "Test: Ingest Rate, write-only ($num_messages msgs, ${message_size}B)"
+
+    ensure_clean
+    wait_for_port_free $SERVER_PORT
+    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
+    wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
+
+    append_result
+    bench_run -j server ingest 127.0.0.1 $SERVER_PORT $num_messages $message_size >> "$RESULTS_FILE"
+    bench_run server ingest 127.0.0.1 $SERVER_PORT $num_messages $message_size
+
+    socketley_cmd stop bench_srv
+    sleep 0.5
+    socketley_cmd remove bench_srv
+}
+
+# Test 4: Concurrent clients, one round trip in flight each
 test_concurrent_clients() {
     local num_clients=${1:-100}
     local msgs_per_client=${2:-500}
     local test_name="server_concurrent_clients"
 
-    log_section "Test: Concurrent Clients ($num_clients clients × $msgs_per_client msgs)"
+    log_section "Test: Concurrent Clients ($num_clients clients × $msgs_per_client round trips)"
 
     ensure_clean
     wait_for_port_free $SERVER_PORT
-    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in -s
+    socketley_cmd create server bench_srv -p $SERVER_PORT --mode in --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $SERVER_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
 
     append_result
@@ -134,6 +167,11 @@ run_server_benchmarks() {
     log_bench "START" "server_throughput_1024B"
     test_single_client_throughput 100000 1024
     log_bench "DONE" "server_throughput_1024B"
+    fresh_daemon
+
+    log_bench "START" "server_ingest_64B"
+    test_ingest_rate 100000 64
+    log_bench "DONE" "server_ingest_64B"
     fresh_daemon
 
     log_bench "START" "server_concurrent_clients"

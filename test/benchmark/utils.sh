@@ -29,6 +29,12 @@ else
     USE_SYSTEMD=0
 fi
 SOCKETLEY_BENCH="${PROJECT_ROOT}/bin/Release/socketley_bench"
+# The echoing backend every round-trip measurement needs.  No --mode of a plain
+# server runtime replies on its own, so a benchmark pointed at one without this
+# times its own writes; see the file's own header and `enum metric_kind` in
+# bench.c.  Named once here because five scripts need the same path and a
+# private copy in each is a fifth chance to point at nothing.
+BENCH_ECHO_LUA="${SCRIPT_DIR}/echo.lua"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
 

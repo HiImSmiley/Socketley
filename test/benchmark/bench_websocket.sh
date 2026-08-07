@@ -56,7 +56,12 @@ test_ws_echo() {
 
     ensure_clean
     wait_for_port_free $WS_PORT
-    socketley_cmd create server bench_ws -p $WS_PORT -s
+    # The one test in this file that needs an answering server.  A plain server
+    # relays to every client except the sender, so a single WebSocket client
+    # sending frames at one was answered by nothing -- and a test called "echo
+    # RTT" measured the cost of write().  echo.lua replies to the sender through
+    # its own framing, so the client reads a text frame back.
+    socketley_cmd create server bench_ws -p $WS_PORT --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; ensure_clean; return 1; }
     sleep 0.5
 

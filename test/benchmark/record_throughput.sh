@@ -109,12 +109,16 @@ for rep in $(seq 1 "$REPS"); do
     SRV=$((BASEPORT + rep * 10 + 1))
     PRX=$((BASEPORT + rep * 10 + 2))
     WS=$((BASEPORT  + rep * 10 + 3))
-    "$BIN" create server bsrv -p "$SRV" -s >/dev/null 2>&1
+    # Echoing, because every rate below except the connection ones is a
+    # completed round trip and a plain server runtime answers nothing in any
+    # --mode.  Without it the msg/concurrent/proxy rows report 0 completed and
+    # the ws row times out.
+    "$BIN" create server bsrv -p "$SRV" --lua "$ROOT/test/benchmark/echo.lua" -s >/dev/null 2>&1
     "$BIN" create proxy  bprx -p "$PRX" --backend "127.0.0.1:$SRV" --protocol tcp -s >/dev/null 2>&1
     # A plain server: WebSocket is detected from the Upgrade header, not enabled
     # by a flag.  Creating it with --websocket fails silently and every ws
     # measurement then reports 100% failures against a port nothing serves.
-    "$BIN" create server bws -p "$WS" -s >/dev/null 2>&1
+    "$BIN" create server bws -p "$WS" --lua "$ROOT/test/benchmark/echo.lua" -s >/dev/null 2>&1
     sleep 1.2
 
     one() {  # one <label> <port> <category> <test> <params...>
@@ -125,7 +129,11 @@ for rep in $(seq 1 "$REPS"); do
         # operation count and reports every one of them failed.
         local out thr fail
         out=$(taskset -c "$LCPU" "$BENCH" -j "$cat" "$test" 127.0.0.1 "$port" "$@" 2>/dev/null | tail -1)
-        thr=$(sed -n 's/.*"median_throughput":\([0-9.]*\).*/\1/p' <<<"$out")
+        # Whichever of the three rate keys this test publishes.  They are
+        # separate keys because they are separate measurements -- a round-trip
+        # rate and a write-only rate differ by ~10x on the same traffic -- and
+        # asking for one shared field is what let those be compared.
+        thr=$(sed -n 's/.*"median_\(round_trips\|writes\|connects\)_per_sec":\([0-9.]*\).*/\2/p' <<<"$out")
         fail=$(sed -n 's/.*"failed":\([0-9]*\).*/\1/p' <<<"$out")
         printf '%s,%s,%s\n' "$label" "${thr:-0}" "${fail:-NA}" >> "$OUT"
         printf '  %-30s %12s  failed=%s\n' "$label" "${thr:-0}" "${fail:-NA}" >&2
@@ -133,13 +141,14 @@ for rep in $(seq 1 "$REPS"); do
 
     one "connection rate 2000"        "$SRV" server conn 2000
     one "burst 5000"                  "$SRV" server burst 5000
-    one "single client 64B"           "$SRV" server msg 100000 64
-    one "single client 1KB"           "$SRV" server msg 100000 1024
-    one "100 clients x 500 msgs"      "$SRV" server concurrent 100 500
-    one "proxy tcp 128B"              "$PRX" proxy tcp 100000 128
-    one "proxy 20 concurrent"         "$PRX" proxy concurrent 20 100
+    one "single client 64B rtt"       "$SRV" server msg 100000 64
+    one "single client 1KB rtt"       "$SRV" server msg 100000 1024
+    one "ingest 64B (write-only)"     "$SRV" server ingest 100000 64
+    one "100 clients x 500 rtt"       "$SRV" server concurrent 100 500
+    one "proxy tcp 128B rtt"          "$PRX" proxy tcp 100000 128
+    one "proxy 20 concurrent rtt"     "$PRX" proxy concurrent 20 100
     one "ws handshakes 200"           "$WS"  ws handshake 200
-    one "ws frames 64B"               "$WS"  ws echo 100000 64
+    one "ws frames 64B rtt"           "$WS"  ws echo 100000 64
     one "ws 20 concurrent"            "$WS"  ws concurrent 20 100
 
     sweep

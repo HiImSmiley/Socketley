@@ -194,7 +194,10 @@ test_tcp_throughput() {
     log_section "Test: TCP Proxy Throughput ($num_messages msgs, ${message_size}B)"
 
     ensure_clean
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
+    # An echoing backend: this measures a request forwarded and its reply
+    # returned, and a backend that answers nothing leaves the client timing a
+    # write into the proxy's accept buffer.  Same reason test 5 has one.
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -223,7 +226,10 @@ test_concurrent_proxy_connections() {
     log_section "Test: Concurrent Proxy Connections ($num_clients clients)"
 
     ensure_clean
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
+    # An echoing backend: this measures a request forwarded and its reply
+    # returned, and a backend that answers nothing leaves the client timing a
+    # write into the proxy's accept buffer.  Same reason test 5 has one.
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -255,9 +261,7 @@ test_proxy_overhead() {
     # paths, and a comparison needs each of them to have carried a request to
     # completion; a backend that answers nothing leaves both legs timing their
     # own writes, which is how this test came to report a negative overhead.
-    local echo_lua
-    echo_lua=$(cd "$(dirname "$0")" && pwd)/echo.lua
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --lua "$echo_lua" -s
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \
@@ -285,7 +289,7 @@ test_runtime_name_backend() {
     log_section "Test: Backend by Runtime Name ($num_requests requests)"
 
     ensure_clean
-    socketley_cmd create server named_backend -p $BACKEND_PORT_1 --mode in -s
+    socketley_cmd create server named_backend -p $BACKEND_PORT_1 --mode in --lua "$BENCH_ECHO_LUA" -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \

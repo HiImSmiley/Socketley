@@ -165,36 +165,49 @@ EOF
     #
     # That list is why this report printed empty cells: it asked for
     # connections_per_sec, messages_per_sec, throughput_mb_sec and
-    # max_concurrent, and none of them has ever appeared in these files.  What
-    # the harness writes is median_throughput, median_throughput_mb and lat_*.
-    # Only the handful of rows the shell scripts write themselves --
-    # flush_time_ms, requests_per_sec, overhead_percent -- happened to match, so
-    # the report came out looking partly filled instead of broken, and an empty
-    # cell reads as "not measured" rather than "not found".  A table derived
-    # from the data cannot drift away from it.
+    # max_concurrent, and none of them has ever appeared in these files.  Only
+    # the handful of rows the shell scripts write themselves -- flush_time_ms,
+    # requests_per_sec, overhead_percent -- happened to match, so the report came
+    # out looking partly filled instead of broken, and an empty cell reads as
+    # "not measured" rather than "not found".  A table derived from the data
+    # cannot drift away from it.
     #
-    # Two shapes share one file.  The C harness rows carry median_throughput and
-    # repeat `test` across message sizes -- so the size is part of the row's
-    # identity, and selecting on the name alone is what collapsed 64B and 1024B
-    # into a single line.  The rows the shell writes carry their own fields and
-    # are listed as name/value pairs under the same heading.
+    # Two shapes share one file.  The C harness rows carry `metric` and repeat
+    # `test` across message sizes -- so the size is part of the row's identity,
+    # and selecting on the name alone is what collapsed 64B and 1024B into a
+    # single line.  The rows the shell writes carry their own fields and are
+    # listed as name/value pairs under the same heading.
+    #
+    # A file written before the metric split carries median_throughput and no
+    # `metric`, so its harness rows land in the name/value table below rather
+    # than in the main one.  That is deliberate: those numbers are not
+    # comparable with these, and a row that will not line up is better than one
+    # that lines up wrongly.
     bench_section() {
         local title=$1 file=$2 extra
         [[ -f "$file" ]] || return 0
         printf '\n### %s\n\n' "$title" >> "$SUMMARY_FILE"
-        printf '| Test | Size | Median | Bandwidth | p50 us | p99 us |\n' >> "$SUMMARY_FILE"
-        printf '|------|------|--------|-----------|--------|--------|\n' >> "$SUMMARY_FILE"
+        # "Measures" is a column and not a footnote.  A round-trip rate and a
+        # write-only rate differ by about 10x on the same traffic, and a table
+        # that put them in one "Median" column invited exactly the comparison
+        # that number cannot support.  The rate arrives under a key named for
+        # its kind, so this reads whichever one is present rather than a shared
+        # field that would let the two merge again.
+        printf '| Test | Size | Measures | Median | Bandwidth | p50 us | p99 us |\n' >> "$SUMMARY_FILE"
+        printf '|------|------|----------|--------|-----------|--------|--------|\n' >> "$SUMMARY_FILE"
         jq -r '
-            .[] | select(has("median_throughput"))
+            .[] | select(has("metric"))
             | "| \(.test)"
             + " | \(if .msg_size then "\(.msg_size) B" else "-" end)"
-            + " | \(.median_throughput)"
-            + " | \(if .median_throughput_mb then "\(.median_throughput_mb) MB/s" else "-" end)"
-            + " | \(.lat_p50_us // "-") | \(.lat_p99_us // "-") |"
+            + " | \(.metric)"
+            + " | \(.median_round_trips_per_sec // .median_writes_per_sec // .median_connects_per_sec // "-")"
+            + " | \(if .median_MB_per_sec then "\(.median_MB_per_sec) MB/s" else "-" end)"
+            + " | \(.rtt_p50_us // .write_p50_us // .connect_p50_us // "-")"
+            + " | \(.rtt_p99_us // .write_p99_us // .connect_p99_us // "-") |"
         ' "$file" >> "$SUMMARY_FILE" 2>/dev/null
 
         extra=$(jq -r '
-            .[] | select(has("median_throughput") | not) | . as $o | .test as $t
+            .[] | select(has("metric") | not) | . as $o | .test as $t
             | ($o | keys_unsorted[] | select(. != "test" and . != "timestamp"))
             | "| \($t) | \(.) | \($o[.]) |"
         ' "$file" 2>/dev/null)
