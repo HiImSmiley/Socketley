@@ -1,9 +1,13 @@
 -- WebSocket session tracking via browser Cookie header.
 -- on_websocket fires after the WS handshake; browser sends Cookie automatically.
 -- TCP clients use on_connect only (on_websocket does not fire for them).
+--
+-- socketley.json_encode rather than `require "cjson"`: cjson is not bundled
+-- with LuaJIT and no binary module ships with socketley, so that require fails
+-- the script load and leaves the runtime failed.  json_encode is already in
+-- the interpreter and needs nothing installed.
 
-local cjson    = require "cjson"
-local sessions = {}   -- client_id → { sid, ip, origin }
+local sessions = {}   -- client_id -> { sid, ip, origin }
 
 function on_connect(client_id)
     -- Both TCP and WS clients pass through on_connect.
@@ -35,5 +39,5 @@ end
 
 function on_client_message(client_id, msg)
     local s = sessions[client_id] or {}
-    self.broadcast(cjson.encode({ sid = s.sid, data = msg }))
+    self.broadcast(socketley.json_encode({ sid = s.sid, data = msg }))
 end

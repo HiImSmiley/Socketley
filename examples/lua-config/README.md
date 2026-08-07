@@ -6,31 +6,89 @@ Lua-based configuration and scripting for socketley.
 
 The daemon must be running. When installed via package, it runs as a systemd service automatically. In dev mode, start it manually: `./bin/Release/socketley daemon &`
 
+## Two kinds of `.lua` file
+
+This is the distinction everything else here depends on.
+
+| | **Configuration** | **Handler** |
+|---|---|---|
+| Example | `simple-config.lua` | `simple-config-handler.lua` |
+| Run by | `socketley --lua config.lua` | the daemon, via `--lua` on a `create` |
+| Read for | `daemon` and `runtimes` tables | `on_*` callbacks, `filters`, `routes` |
+| Callbacks in it | **never loaded, never called** | are the whole point |
+
+A configuration runs in the CLI process. socketley reads two tables out of it,
+turns them into `create` commands, and exits — the file never reaches the
+daemon. Writing `function on_start()` in one is dead code, and nothing says so:
+the create succeeds, `ls` is green, and the callback never fires.
+
+A configuration attaches a handler by naming its path:
+
+```lua
+runtimes = {
+  { type = "server", name = "api", port = 9000,
+    config = "examples/lua-config/simple-config-handler.lua",  -- becomes --lua
+    start = true },
+}
+```
+
+`config` and `lua` are the same key. That path is opened by the **daemon**, so
+it resolves against the daemon's working directory, not the config file's — run
+these from the repository root, or use absolute paths.
+
+A handler needs no configuration at all; it can be attached directly:
+
+```bash
+socketley create server tracker -p 9000 --lua callbacks-connect.lua -s
+```
+
+### The configuration interpreter is smaller than the daemon's
+
+It opens `base`, `package` and `table`, and nothing else.
+
+- No `os`. `os.execute("mkdir -p /tmp/logs")` is not a sandbox refusal but
+  `attempt to index global 'os' (a nil value)`: the file is refused whole,
+  exit 1, and not one runtime is created. Make directories from the shell.
+- No `string`, so `string.format` and the method form `path:match(...)` are
+  unavailable. `..` and `tostring()` are core and still work.
+- No `math`, no `io`.
+
+A handler has all of these, minus five `os` functions the sandbox removes:
+`os.execute`, `os.remove`, `os.rename`, `os.tmpname`, `os.exit`. `os.time`,
+`os.clock`, `os.date` and `os.difftime` remain.
+
 ## Examples
 
 ### Simple Config
-Basic Lua configuration file structure.
+`simple-config.lua` + `simple-config-handler.lua` — the basic pair, one handler
+serving both a server and a client.
 
 ### Callbacks
-Event callbacks (on_start, on_stop, on_message, on_send).
+`callbacks.lua` + `callbacks-handler.lua` — on_start, on_stop, on_message,
+on_send, and what each one sees.
+
+### Callbacks: connect / disconnect
+`callbacks-connect.lua` — a handler used directly, with no configuration file.
 
 ### Custom Routing
-Lua-based proxy routing with on_route().
+`custom-routing.lua` + `custom-routing-handler.lua` — `on_route`. Needs
+`strategy = "lua"`, which the configuration sets; without it the proxy never
+consults the callback.
 
 ### Full Setup
-Complete orchestration with all features.
+`full-setup.lua` + `full-setup-handler.lua` — cache, three services, an HTTP
+gateway and two clients, one handler branching on `self.name`.
 
 ## Key Concepts
 
-### Configuration Structure
-```lua
-runtimes = {
-    { type = "server", name = "...", port = ..., mode = "inout", ... },
-    { type = "client", name = "...", target = "...", mode = "inout", ... },
-    { type = "proxy", name = "...", backends = {...}, strategy = "round-robin", ... },
-    { type = "cache", name = "...", persistent = "...", mode = "readwrite", ... },
-}
-```
+### Runtimes table keys
+`type`, `name`, `port`, `target`, `mode`, `log`, `write`, `persistent`,
+`protocol`, `strategy`, `backends`, `config`/`lua`, `bash`, `cache`, `group`,
+`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`, `start`.
+
+An unrecognised key is ignored in silence. Flags this list does not reach —
+`--daemon-process`, and the health-check, circuit-breaker, retry and TLS
+families — cannot be set from a configuration at all; use `create` or `edit`.
 
 ### Cache Modes
 | Mode | Allowed Commands |
@@ -46,8 +104,25 @@ runtimes = {
 | `on_stop()` | Runtime stopped | none |
 | `on_message(msg)` | Message received (claims handling; no default broadcast) | message string |
 | `on_send(msg)` | Message sent | message string |
-| `on_route(method, path)` | HTTP request (proxy), *after* a backend is needed | method, path (see below) |
+| `on_route(method, path)` | HTTP request (proxy) under `--strategy lua` ONLY, *after* a backend is needed | method, path (see below) |
 | `filters = {fn, ...}` | HTTP request (proxy), *before* backend selection | req table |
+| `on_client_message(id, msg)` | Message received, with sender (server) | client_id, message |
+| `on_miss(key)` | Cache GET found nothing | key; return value[, ttl] |
+| `on_write(key, val, ttl)` | After a successful cache SET | key, value, ttl |
+| `on_delete(key)` | After a cache DEL that removed something | key |
+| `on_expire(key)` | After the TTL sweep removed a key | key |
+| `routes = {{path=,methods=}}` | Not a callback: what this runtime answers, published to the proxies in front of it | — |
+
+`on_route` is consulted only when the proxy was created `--strategy lua`.
+Without that flag the proxy keeps round-robin, never looks the callback up, and
+the script silently does nothing — the usual reason an `on_route` "that works"
+appears to have no effect.
+
+`path` is the path **as the client sent it**, with this proxy's own
+`/<name>/` prefix still on the front; the prefix is stripped on the way to the
+backend, after this callback. So a proxy named `gw` sees `/gw/api/users` and a
+pattern anchored `^/api/` never matches. Strip `"/" .. self.name` first, as
+`custom-routing-handler.lua` does.
 
 `on_route` receives its two arguments on `--protocol http` only. A TCP proxy
 has no request line to read them from and calls it with none, so a body written
@@ -93,19 +168,67 @@ no measurable difference; one whose cost is its own arithmetic loop runs at
 about 80% of its unhooked rate. Setting the bound to `0` installs no hook.
 
 ### Runtime Methods
+
+`self` carries a different set of methods depending on the runtime's type.
+Calling a cache method on a server is `attempt to call field 'get' (a nil
+value)`, not a no-op.
+
 ```lua
-self.name         -- Runtime name
-self.port         -- Port number
-self.state        -- Current state
-self.type         -- Runtime type
-self.send(msg)    -- Send message
-self.broadcast(msg) -- Broadcast (server)
-self.get(key)     -- Cache get
-self.set(key,val) -- Cache set
-self.del(key)     -- Cache delete
+-- All four types
+self.name, self.port, self.state, self.type
+self.connections()          -- current connection count
+
+-- Server
+self.send(client_id, msg)   -- TWO arguments
+self.broadcast(msg)
+self.clients(), self.multicast(ids, msg), self.disconnect(id)
+self.peer_ip(id), self.ws_headers(id)
+self.set_data(id, k, v), self.get_data(id, k)
+self.join_group(id, g), self.leave_group(id, g), self.group_send(g, msg)
+self.route(id, target)      -- refused in a worker: needs --daemon-process
+self.unroute(id), self.get_route(id)
+self.owner_send(id, msg), self.owner_broadcast(msg)
+
+-- Client
+self.send(msg)              -- ONE argument
+
+-- Cache
+self.get(k), self.set(k, v), self.del(k)
+self.lpush/rpush/lpop/rpop/llen, self.sadd/srem/sismember/scard
+self.hset/hget/hdel/hlen, self.expire/ttl/persist, self.publish(ch, msg)
+
+-- Proxy
+self.clients(), self.peer_ip(id), self.close_client(id)
+self.backends()             -- 1-based; on_route's n is backends()[n + 1]
+self.backend_health()       -- "closed" | "open" | "half_open", same order
+self.stats()                -- {connections, bytes_in, bytes_out, ...}
 ```
 
 ### Global Functions
 ```lua
-socketley.log(msg) -- Log with [lua] prefix
+socketley.log(msg)                 -- Log with [lua] prefix
+socketley.json_encode(v)           -- Lua value -> JSON string
+socketley.json_decode(s)           -- JSON string -> Lua value
+socketley.set_timeout(ms, fn)      -- one-shot timer, returns an id
+socketley.set_interval(ms, fn)     -- repeating timer, returns an id
+socketley.subscribe(cache, ch, fn) -- receive a cache's PUBLISH
+socketley.http(opts)               -- blocking HTTP/HTTPS client
 ```
+
+`require "cjson"` is not one of the options: cjson is not bundled with LuaJIT,
+no binary module ships with socketley, and `package.cpath` is left at its
+default — the require fails the script load and the runtime is left `failed`.
+`socketley.json_encode` needs nothing installed.
+
+### The cross-runtime API needs `--daemon-process`
+
+`socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe`, everything
+under `socketley.cluster`, and `self.route()` all act on the runtime map, which
+lives in the daemon. A runtime gets its own worker process unless it was
+created with `--daemon-process`, and a worker has no map — so each of these
+raises a Lua error there naming the call and the way out.
+
+At a script's top level that fails the load and the `create` is refused, which
+is loud. Inside a callback it is caught and logged and the runtime carries on —
+`ls` green, connections accepted, and none of the work done. That second case
+is the one to watch for.

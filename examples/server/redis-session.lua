@@ -2,6 +2,12 @@
 -- Demonstrates: distributed rate limiting (INCR/EXPIRE per IP),
 -- presence tracking (SADD/SREM), and session key-value store.
 -- Requires: luarocks install redis-lua
+--
+-- socketley leaves package.cpath at its default and ships no binary module, so
+-- the install has to land where the system Lua would find it (LuaJIT looks in
+-- /usr/local/share/lua/5.1 and /usr/local/lib/lua/5.1).  A require that cannot
+-- be resolved fails the script LOAD, and a runtime whose script did not load
+-- does not serve -- the create is refused with the reason on stderr.
 
 local redis = require "redis"
 local r     = redis.connect("127.0.0.1", 6379)

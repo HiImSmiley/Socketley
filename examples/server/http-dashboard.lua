@@ -12,14 +12,18 @@
 
 local clients = {}
 
+-- self.connections() is the binding, on all four runtime types.  There is no
+-- self.count(): calling it is "attempt to call field 'count' (a nil value)",
+-- which raises inside on_connect before the broadcast is reached, so nobody is
+-- ever told that anybody joined.
 function on_connect(id)
     clients[id] = true
-    self.broadcast("system: client " .. id .. " joined (" .. self.count() .. " online)")
+    self.broadcast("system: client " .. id .. " joined (" .. self.connections() .. " online)")
 end
 
 function on_disconnect(id)
     clients[id] = nil
-    self.broadcast("system: client " .. id .. " left (" .. self.count() .. " online)")
+    self.broadcast("system: client " .. id .. " left (" .. self.connections() .. " online)")
 end
 
 function on_client_message(id, msg)

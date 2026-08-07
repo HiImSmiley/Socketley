@@ -59,18 +59,27 @@ examples/
 - `tcp-proxy.sh` - Raw TCP byte forwarding
 - `tls-proxy.sh` - TLS on both legs: the proxy's own listener, and an
   `https://` backend whose chain and name are verified
-- `multi-backend.lua` - Multiple backends with Lua
+- `multi-backend.lua` + `multi-backend-handler.lua` - Method- and path-based
+  backend selection. Needs `--strategy lua`; the config sets it
 
 ### Cache
 - `basic-cache.sh` - In-memory key-value store
 - `persistent-cache.sh` - Cache with file persistence
-- `cache-integration.lua` - Cache with server/client
+- `cache-integration.lua` + `cache-integration-handler.lua` - A cache as shared
+  state, reached by a server's clients over `--cache`
 
 ### Lua Config
-- `simple-config.lua` - Basic Lua configuration
-- `callbacks.lua` - Event callbacks (on_start, on_stop, etc.)
-- `custom-routing.lua` - Lua-based proxy routing
-- `full-setup.lua` - Complete orchestration
+Each of these is a **pair**: a configuration read by the CLI, and a handler
+loaded by the daemon. A callback written in the configuration is never loaded
+and never called — see `lua-config/README.md`.
+
+- `simple-config.lua` + `simple-config-handler.lua` - Basic Lua configuration
+- `callbacks.lua` + `callbacks-handler.lua` - Event callbacks (on_start,
+  on_stop, on_message, on_send)
+- `custom-routing.lua` + `custom-routing-handler.lua` - Lua-based proxy routing
+- `full-setup.lua` + `full-setup-handler.lua` - Complete orchestration
+- `callbacks-connect.lua` - A handler on its own, attached with
+  `create ... --lua`
 
 ### Managed External Runtimes
 - `echo-service.cpp` - Minimal C++ echo server using the SDK
@@ -88,7 +97,9 @@ examples/
 ### Advanced
 - `io-tuning.sh` - `--cpus` and `--sqpoll`: where a runtime's I/O runs, and
   whether its ring carries a polling kernel thread
-- `microservices.lua` - Microservice architecture
-- `high-availability.lua` - HA setup with failover
-- `logging-pipeline.lua` - Centralized logging
-- `development-env.lua` - Development environment setup
+- `microservices.lua` + `microservices-handler.lua` - Microservice architecture
+- `high-availability.lua` + `high-availability-handler.lua` - HA with failover
+- `logging-pipeline.lua` + `logging-pipeline-handler.lua` - Centralized logging
+- `development-env.lua` + `development-env-handler.lua` - Development stack
+- `game-routing.lua` - A lobby that creates and routes to sub-servers. Must be
+  created with `--daemon-process`; see the file for why

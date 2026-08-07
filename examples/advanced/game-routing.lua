@@ -1,11 +1,41 @@
 -- Game server with mode-based routing
 -- Main server (lobby) routes players to mode-specific sub-servers
 --
--- Usage:
---   socketley create server lobby -p 9000 --lua examples/advanced/game-routing.lua -s
+-- Usage (from the repository root):
+--   socketley create server lobby -p 9000 --daemon-process \
+--     --lua examples/advanced/game-routing.lua -s
 --   # Then connect: nc localhost 9000
 --   # Send "join rapid" to route to rapid mode
 --   # Send "join blitz" to route to blitz mode
+--
+-- --daemon-process IS REQUIRED.  Do not drop it.
+--
+-- A runtime gets its own worker process unless that flag is given, and a
+-- worker holds one runtime and no runtime map.  Everything this file does
+-- reaches for that map: socketley.create, socketley.start, socketley.get,
+-- socketley.list, and self.route -- which names another runtime and so counts
+-- as reaching for it too.  In a worker every one of them raises.
+--
+-- The raise is caught and logged wherever a callback runs, which is what makes
+-- this worth a paragraph rather than a footnote: without the flag the lobby
+-- comes up looking perfectly healthy.  `ls` is green, the port accepts
+-- connections, on_start reports "creating game modes..." -- and no game mode
+-- exists, "join rapid" answers nothing at all, and the only sign is a line in
+-- the daemon's log.  Measured both ways: without the flag, zero sub-servers
+-- and no reply; with it, chess-rapid and chess-blitz running and "join rapid"
+-- answered by the rapid handler.
+--
+-- It cannot be added afterwards -- `edit` rejects it, because honouring it
+-- would mean moving a configured runtime between address spaces underneath
+-- whatever already points at it.  Create the lobby with it or recreate it.
+--
+-- The sub-servers do not need the flag: a runtime created by socketley.create
+-- is created inside the daemon that ran the call, which is where self.route
+-- needs it to be.
+--
+-- The --lua path is opened by the DAEMON, so it resolves against the daemon's
+-- working directory, not this file's.  Run from the repository root, or use an
+-- absolute path.
 
 function on_start()
     socketley.log("lobby started, creating game modes...")

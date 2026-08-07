@@ -9,6 +9,13 @@
 --   luarocks install luasql-postgres  (PostgreSQL)
 --   luarocks install lsqlite3         (SQLite — embedded, no server needed)
 --
+-- socketley leaves package.cpath at its default and ships no binary module, so
+-- the install has to land where the system Lua would find it (LuaJIT looks in
+-- /usr/local/share/lua/5.1 and /usr/local/lib/lua/5.1).  These requires are
+-- inside on_start rather than at the top level on purpose: an unresolvable
+-- require at the top level fails the script LOAD and the create is refused,
+-- while here it fails one callback and the cache goes on serving from memory.
+--
 -- Schema (MySQL / Postgres):
 --   CREATE TABLE cache_kv (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT now());
 
