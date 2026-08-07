@@ -248,6 +248,11 @@ function on_client_message(id, msg)
         local i = socketley.get("made")
         reply(id, "stop=" .. tostring(ok) .. " state=" .. tostring(i and i.state))
 
+    elseif cmd == "startmade" then
+        local ok = socketley.start("made")
+        local i = socketley.get("made")
+        reply(id, "start=" .. tostring(ok) .. " state=" .. tostring(i and i.state))
+
     elseif cmd == "removemade" then
         local ok = socketley.remove("made")
         reply(id, "remove=" .. tostring(ok) ..
@@ -365,6 +370,10 @@ assert_eq "...and socketley.list() counts it too" \
     "the count moved with the inventory, which a constant cannot do"
 assert_eq "socketley.stop() stops it" \
           "stop=true state=stopped" "$(ask "$RPC_PORT" stopmade)"
+assert_eq "socketley.start() brings the stopped runtime back up" \
+          "start=true state=running" "$(ask "$RPC_PORT" startmade)" \
+    "asked of socketley.get afterwards rather than of the return value, which" \
+    "is what stop already returned for a runtime it had not stopped"
 assert_eq "socketley.remove() removes it, and it is gone afterwards" \
           "remove=true gone=true" "$(ask "$RPC_PORT" removemade)" \
     "the second half is the assertion: remove returning true is what it" \

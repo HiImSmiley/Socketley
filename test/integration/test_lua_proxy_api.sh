@@ -111,6 +111,30 @@ print(out.decode("latin-1").replace("\r", "").replace("\n", "|").strip("|"))
 PYEOF
 ask() { python3 "$SOCKETLEY_TMPD/ask.py" "$1" "$2" "${3:-1.0}"; }
 
+# fate PORT TEXT — "closed" if the peer hung up inside the budget, "open" if it
+# did not.  A dropped request and a closed client both give the caller no bytes;
+# only this tells them apart.
+cat > "$SOCKETLEY_TMPD/fate.py" <<'PYEOF'
+import select, socket, sys, time
+port, text, budget = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+s = socket.create_connection(("127.0.0.1", port), 5)
+s.sendall((text + "\n").encode())
+end, verdict = time.time() + budget, "open"
+while time.time() < end:
+    r, _, _ = select.select([s], [], [], 0.05)
+    if not r:
+        continue
+    try:
+        d = s.recv(65536)
+    except Exception:
+        verdict = "closed"; break
+    if not d:
+        verdict = "closed"; break
+s.close()
+print(verdict)
+PYEOF
+fate() { python3 "$SOCKETLEY_TMPD/fate.py" "$1" "$2" "${3:-1.5}"; }
+
 # The backend behind the hook proxy: it records exactly what arrived and answers
 # with a fixed string, so both hooks have an unambiguous side to be read from.
 BE_LUA="$SOCKETLEY_TMPD/be.lua"
@@ -138,6 +162,10 @@ end
 -- the assertions cannot be confused by three different interpreters.
 function on_proxy_request(client_id, data)
     local m = mode()
+    if m == "closeclient" then
+        self.close_client(client_id)
+        return nil
+    end
     if m == "reqdrop"    then return nil end
     if m == "reqreplace" then return "REPLACED-BY-REQUEST-HOOK\n" end
     -- Anything that is neither nil nor a string forwards the bytes untouched.
@@ -278,6 +306,22 @@ assert_eq "control: the backend did answer the dropped one" \
           "1" "$(hits 'PBE got=\[RESP-DROPPED\]' "$SOCKETLEY_DLOG")" \
     "without this, 'the client got nothing' is satisfied by a request that" \
     "never reached the backend, which is a different hook and a different bug"
+
+# ── 2b. self.close_client ──────────────────────────────────────────────────
+#
+# Paired with the drop above, because both give the caller nothing back and the
+# difference between them is the whole point of the call: a dropped request
+# leaves the client connected and waiting, and close_client does not.
+echo reqdrop > "$MODE_FILE"
+assert_eq "control: a dropped request leaves the client connected" \
+          "open" "$(fate "$HOOK_PORT" "FATE-DROPPED")" \
+    "without this, 'the connection closed' below is satisfied by a proxy" \
+    "that hangs up on everybody"
+
+echo closeclient > "$MODE_FILE"
+assert_eq "self.close_client() closes the connection it named" \
+          "closed" "$(fate "$HOOK_PORT" "FATE-CLOSED")"
+echo forward > "$MODE_FILE"
 
 # ── 3. on_route: the index is 0-based ──────────────────────────────────────
 echo 1 > "$ROUTE_FILE"
