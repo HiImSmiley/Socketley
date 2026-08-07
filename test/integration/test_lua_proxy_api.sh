@@ -168,15 +168,16 @@ function on_proxy_request(client_id, data)
     end
     if m == "reqdrop"    then return nil end
     if m == "reqreplace" then return "REPLACED-BY-REQUEST-HOOK\n" end
-    -- Anything that is neither nil nor a string forwards the bytes untouched.
-    return 0
+    if m == "reqbadtype" then return 0 end
+    -- Falls off the end without returning: the observer shape, which forwards.
 end
 
 function on_proxy_response(client_id, data)
     local m = mode()
-    if m == "respdrop"    then return nil end
-    if m == "respreplace" then return "REPLACED-BY-RESPONSE-HOOK\n" end
-    return 0
+    if m == "respdrop"     then return nil end
+    if m == "respreplace"  then return "REPLACED-BY-RESPONSE-HOOK\n" end
+    if m == "respbadtype"  then return 0 end
+    -- Falls off the end: the observer shape, which forwards.
 end
 LUAEOF
 
@@ -263,10 +264,12 @@ done
 # ── 1. on_proxy_request: forward, replace, drop ────────────────────────────
 echo forward > "$MODE_FILE"
 OUT=$(ask "$HOOK_PORT" "PROBE-FORWARD" 1.5)
-assert_eq "on_proxy_request returning a non-string, non-nil forwards unchanged" \
+assert_eq "a hook that returns nothing forwards the bytes unchanged" \
           "1" "$(hits 'PBE got=\[PROBE-FORWARD\]' "$SOCKETLEY_DLOG")" \
     "read off the backend's own record of what arrived, so a hook that" \
-    "silently rewrote the bytes fails here rather than passing quietly"
+    "silently rewrote the bytes fails here rather than passing quietly." \
+    "This is the observer shape -- log(data) and nothing else -- and it" \
+    "read as nil until 60c73fd, which emptied every connection through it"
 assert_eq "...and the backend's answer comes back to the client" \
           "BACKEND-SAID-HELLO" "$OUT"
 
@@ -290,9 +293,23 @@ assert_eq "...and the backend received nothing at all in their place" \
     "the second oracle for the same claim: 'the payload is absent from the" \
     "log' is also true of a hook that replaced it with something else"
 
+# A value the other side cannot read is a refusal, not a forward.  The filter
+# chain answers 500 to the same shape and on_auth answers value_or(false); this
+# is the byte path, so it closes.  Asserted off the backend, because the client
+# sees the same silence for a refusal as for a backend that never answered.
+echo reqbadtype > "$MODE_FILE"
+BEFORE_BAD=$(stat pbe total_messages)
+ask "$HOOK_PORT" "PROBE-BADTYPE" 1.5 >/dev/null
+sleep 0.6
+assert_eq "on_proxy_request returning a non-string, non-nil refuses the request" \
+          "0" "$(hits 'PBE got=\[PROBE-BADTYPE\]' "$SOCKETLEY_DLOG")"
+assert_eq "...and nothing reached the backend in its place" \
+          "$BEFORE_BAD" "$(stat pbe total_messages)" \
+    "the second oracle: absent from the log is also true of a rewrite"
+
 # ── 2. on_proxy_response: forward, replace, drop ───────────────────────────
 echo forward > "$MODE_FILE"
-assert_eq "on_proxy_response returning a non-string, non-nil forwards unchanged" \
+assert_eq "a response hook that returns nothing forwards the reply unchanged" \
           "BACKEND-SAID-HELLO" "$(ask "$HOOK_PORT" "RESP-FORWARD" 1.5)"
 
 echo respreplace > "$MODE_FILE"

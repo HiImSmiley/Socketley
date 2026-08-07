@@ -8753,24 +8753,46 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         // did and what the man page documents.  Checked explicitly because the
         // branch below is a refusal, and a hook that only logs must not close
         // every connection through it.
-        if (r.return_count() == 0) return;              // drop
-        sol::object obj = r;
-        if (obj.get_type() == sol::type::nil) return;   // drop
+        // Saying nothing is not the same as saying nil, and this is the whole
+        // difference between an observer and a refusal.
+        //
+        //     function on_proxy_request(id, data) log(data) end
+        //
+        // is how anyone writes a hook that watches traffic, and it ends without
+        // a return.  Reading that as `nil` made it drop every byte through the
+        // proxy — the most natural three lines in this API silently emptied the
+        // connection.  run_request_filters settled the same question the same
+        // way one screen up: "Nothing returned, or nil: this filter has no
+        // opinion", and it continues the chain.
+        //
+        // The two part company here only because `nil` is already documented as
+        // the way to drop a chunk, and that is worth keeping — so `nil` stays a
+        // refusal and an empty return becomes what it reads as.
+        if (r.return_count() > 0)
+        {
+            sol::object obj = r;
+            if (obj.get_type() == sol::type::nil) return;   // drop
 
-        if (SOCKETLEY_LIKELY(obj.is<std::string>()))
-        {
-            hook_storage = obj.as<std::string>();
-            hook_modified = true;
-        }
-        else
-        {
-            fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
-                            "a string or nil — refusing the request\n",
-                    lua_typename(lctx->state().lua_state(),
-                                 static_cast<int>(obj.get_type())));
-            bconn->closing = true;
-            conn->closing = true;
-            return;
+            if (SOCKETLEY_LIKELY(obj.is<std::string>()))
+            {
+                hook_storage = obj.as<std::string>();
+                hook_modified = true;
+            }
+            else
+            {
+                // Refused, not forwarded, and deliberately the same answer the
+                // filter chain gives a value it cannot read.  `return false`
+                // meant as a rejection is the case this exists for: forwarding
+                // it would admit exactly what the hook was written to refuse,
+                // and on_auth reaches the same conclusion with value_or(false).
+                fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
+                                "a string or nil — refusing the request\n",
+                        lua_typename(lctx->state().lua_state(),
+                                     static_cast<int>(obj.get_type())));
+                bconn->closing = true;
+                conn->closing = true;
+                return;
+            }
         }
     }
 #endif
@@ -8870,24 +8892,30 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
             return;
         }
 
-        // Same two spellings of "said nothing" as the request hook.
-        if (r.return_count() == 0) return;              // drop
-        sol::object obj = r;
-        if (obj.get_type() == sol::type::nil) return;   // drop
+        // The request hook's reasoning, unchanged: an empty return is an
+        // observer and forwards, an explicit nil is a refusal and drops.  A
+        // hook that only logs the backend's answer is written exactly like one
+        // that only logs the client's request, and it must not empty the
+        // response for the same reason.
+        if (r.return_count() > 0)
+        {
+            sol::object obj = r;
+            if (obj.get_type() == sol::type::nil) return;   // drop
 
-        if (SOCKETLEY_LIKELY(obj.is<std::string>()))
-        {
-            hook_storage = obj.as<std::string>();
-            hook_modified = true;
-        }
-        else
-        {
-            fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
-                            "a string or nil — refusing the response\n",
-                    lua_typename(lctx->state().lua_state(),
-                                 static_cast<int>(obj.get_type())));
-            cconn->closing = true;
-            return;
+            if (SOCKETLEY_LIKELY(obj.is<std::string>()))
+            {
+                hook_storage = obj.as<std::string>();
+                hook_modified = true;
+            }
+            else
+            {
+                fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
+                                "a string or nil — refusing the response\n",
+                        lua_typename(lctx->state().lua_state(),
+                                     static_cast<int>(obj.get_type())));
+                cconn->closing = true;
+                return;
+            }
         }
     }
 #endif
