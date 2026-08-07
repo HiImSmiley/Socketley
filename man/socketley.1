@@ -2309,12 +2309,30 @@ Proxy only. Called for every chunk forwarded from a client to a backend.
 Return a modified string to replace the data, or
 .B nil
 to drop the chunk entirely (the backend never receives it).
+.IP
+Fail\-closed, like the filter chain and for the same reason. A hook that throws
+a Lua error, or that returns anything other than a string or
+.BR nil ,
+refuses the request: the connection to the client and the one to the backend are
+both closed, and the reason is logged. The hook is where a script strips a
+header or rejects a request, so forwarding the unmodified bytes when it could
+not run would admit exactly what it was there to refuse \(em and
+.B "return false"
+is a rejection, not a value to guess at.
+.IP
+The refusal closes rather than answering a status: this callback is on the byte
+path, is called with body chunks as well as with the request head, and carries
+TCP as readily as HTTP. To refuse a request with a status line, use the filter
+chain \(em see
+.BR "Proxy Filter Chain" .
 .TP
 .B on_proxy_response(client_id, data) \(-> string | nil
 Proxy only. Called for every chunk forwarded from a backend to a client.
 Same semantics as
 .BR on_proxy_request :
-return a replacement string or nil to drop.
+return a replacement string or nil to drop, and an error or a return of any
+other type refuses \(em here by closing the client connection, since the
+response this hook was to redact must not be delivered unredacted.
 .TP
 .B on_master_auth(client_id, password) \(-> bool
 Server only (master mode). Custom authentication. Return

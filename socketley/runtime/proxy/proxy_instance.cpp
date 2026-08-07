@@ -8706,15 +8706,60 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
 #ifndef SOCKETLEY_NO_LUA
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_request())
     {
+        // ─── A hook that could not say what it meant refuses ────────────────
+        //
+        // This is where a script strips a header, redacts a field or rejects a
+        // request outright.  Both branches below used to fall through to the
+        // forward at the bottom of this function with the bytes untouched, so
+        // an error in the hook admitted precisely what the hook was there to
+        // refuse — and `return false`, the one unambiguous way to write a
+        // rejection, was an admission.
+        //
+        // run_request_filters settled this question the other way, one screen
+        // up, with the reasoning written out: a filter that raises has not said
+        // "carry on", and a third kind of return value is a script that means
+        // something this side cannot read.  Two hook APIs on one runtime with
+        // opposite rules is the part that could not stand.
+        //
+        // Refusal here is closing rather than a 500.  This function is the byte
+        // path: it carries TCP as readily as HTTP, and on HTTP it is called
+        // with body chunks as well as with the head, so a status line written
+        // from here would either be injected into a stream that is not HTTP or
+        // spliced into the middle of one that is.  Closing is also this
+        // function's own stated rule — see its header: every path out of it
+        // that does not deliver takes the client down with it, because a
+        // connection that silently swallows data is worse than one that drops.
         try {
             sol::object r = lctx->on_proxy_request()(conn->fd, data);
-            if (r.get_type() == sol::type::nil) return;   // drop
-            if (r.is<std::string>()) {
+            // Both spellings of "said nothing" — an explicit nil and a hook
+            // that returned no value at all — keep meaning drop, which is what
+            // this build already did and what the man page documents.  Stated
+            // rather than left to sol2's index arithmetic, because the branch
+            // below is now a refusal: a toolchain that reported an absent
+            // return as `none` instead of `nil` would otherwise close every
+            // connection through a hook that only logs.  run_request_filters
+            // checks return_count() == 0 for the same reason.
+            if (r.get_type() == sol::type::nil ||
+                r.get_type() == sol::type::none) return;   // drop
+            if (SOCKETLEY_LIKELY(r.is<std::string>())) {
                 hook_storage = r.as<std::string>();
                 hook_modified = true;
             }
+            else {
+                fprintf(stderr, "[lua] on_proxy_request returned a %s; expected "
+                                "a string or nil — refusing the request\n",
+                        lua_typename(lctx->state().lua_state(),
+                                     static_cast<int>(r.get_type())));
+                bconn->closing = true;
+                conn->closing = true;
+                return;
+            }
         } catch (const sol::error& e) {
-            fprintf(stderr, "[lua] on_proxy_request error: %s\n", e.what());
+            fprintf(stderr, "[lua] on_proxy_request error: %s — refusing the "
+                            "request\n", e.what());
+            bconn->closing = true;
+            conn->closing = true;
+            return;
         }
     }
 #endif
@@ -8795,15 +8840,34 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
 #ifndef SOCKETLEY_NO_LUA
     else if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
     {
+        // The same rule on the way back, for the same reason.  This hook is
+        // where a script strips a Set-Cookie, masks a field or takes a stack
+        // trace out of an error page; forwarding the backend's bytes unchanged
+        // because the redactor raised delivers exactly the response the hook
+        // existed to prevent.  The client is closed rather than answered: the
+        // status line, if there was one, may already be on its wire.
         try {
             sol::object r = lctx->on_proxy_response()(conn->client_fd, data);
-            if (r.get_type() == sol::type::nil) return;   // drop
-            if (r.is<std::string>()) {
+            // Same two spellings of "said nothing" as the request hook.
+            if (r.get_type() == sol::type::nil ||
+                r.get_type() == sol::type::none) return;   // drop
+            if (SOCKETLEY_LIKELY(r.is<std::string>())) {
                 hook_storage = r.as<std::string>();
                 hook_modified = true;
             }
+            else {
+                fprintf(stderr, "[lua] on_proxy_response returned a %s; expected "
+                                "a string or nil — refusing the response\n",
+                        lua_typename(lctx->state().lua_state(),
+                                     static_cast<int>(r.get_type())));
+                cconn->closing = true;
+                return;
+            }
         } catch (const sol::error& e) {
-            fprintf(stderr, "[lua] on_proxy_response error: %s\n", e.what());
+            fprintf(stderr, "[lua] on_proxy_response error: %s — refusing the "
+                            "response\n", e.what());
+            cconn->closing = true;
+            return;
         }
     }
 #endif
