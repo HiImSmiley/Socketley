@@ -45,7 +45,29 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
     // has to be in its hands by the time start() below reaches that code.
     publish_endpoints();
 
-    bool started = false;
+    // ─── The lock covers the lookup, and stops there ────────────────────────
+    //
+    // runtime_instance::start() runs the script's on_start, and a script is
+    // entitled to call socketley.create / .start / .stop / .remove from it —
+    // bringing a sub-server up as its parent starts is the obvious thing to
+    // write.  Every one of those reaches back into this manager and asks for
+    // this same mutex, create() and remove() in unique mode; `mutex` is a
+    // std::shared_mutex, which is not recursive.  Holding it across the
+    // callback therefore deadlocked the daemon's only event-loop thread against
+    // itself: measured, both threads parked in futex_do_wait, the IPC socket
+    // still accepting connections and answering none, which reads as a hang
+    // rather than a crash and takes every other runtime the daemon serves with
+    // it.  `create` never returned, and the operator's evidence was a daemon
+    // that had to be killed.
+    //
+    // Taking the pointer out and calling through it unlocked is not a weakening
+    // of the invariant: get() has always handed raw runtime_instance* to callers
+    // that use them outside any lock — socketley.get, socketley.send and the
+    // whole cross-runtime Lua surface are written that way — because removal
+    // happens on this same thread, so nothing can free the object between these
+    // two statements.  What changes is only that the callback is no longer
+    // executed underneath a lock it is allowed to reach for.
+    runtime_instance* inst = nullptr;
     {
         std::shared_lock lock(mutex);
 
@@ -53,8 +75,10 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
         if (it == runtimes.end())
             return false;
 
-        started = it->second->start(loop);
+        inst = it->second.get();
     }
+
+    const bool started = inst->start(loop);
 
     // And after, because this runtime is now a member others may route to.
     if (started)
@@ -65,14 +89,18 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
 
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
 {
+    // The same shape as start(), for the same reason and with the same
+    // reasoning: stop() runs the script's on_stop, which may call back in here.
+    runtime_instance* inst = nullptr;
     {
         std::shared_lock lock(mutex);
         auto it = runtimes.find(name);
         if (it == runtimes.end())
             return false;
-        if (!it->second->stop(loop))
-            return false;
+        inst = it->second.get();
     }
+    if (!inst->stop(loop))
+        return false;
 
     // Cascade to children based on child_policy
     auto children = get_children(name);
@@ -373,12 +401,33 @@ void runtime_manager::remove_children(std::string_view parent_name, event_loop& 
 
 void runtime_manager::stop_all(event_loop& loop)
 {
-    std::unique_lock lock(mutex);
-
-    for (auto& [name, instance] : runtimes)
+    // Names, not pointers, and the lock released before any of them is stopped
+    // — the same shape as dispatch_publish() below and for a superset of its
+    // reason.  stop() runs on_stop, a script is entitled to call
+    // socketley.create / .remove from there, and both take this mutex in unique
+    // mode; holding it across the callback deadlocked the daemon against itself
+    // in start(), and this is the same call one level up.  Here it would do it
+    // while the daemon was trying to exit, which is a shutdown that never
+    // completes and a process that needs SIGKILL.
+    //
+    // Names rather than pointers because this one is a loop: an on_stop that
+    // removes another runtime erases it from the map, and a pointer collected
+    // before that would be stopped afterwards.  get() re-checks, and answers
+    // null for anything that has since gone.
+    std::vector<std::string> names;
     {
-        if (instance->get_state() == runtime_running)
-            instance->stop(loop);
+        std::unique_lock lock(mutex);
+        names.reserve(runtimes.size());
+        for (auto& [name, instance] : runtimes)
+            if (instance->get_state() == runtime_running)
+                names.emplace_back(name);
+    }
+
+    for (const auto& name : names)
+    {
+        auto* inst = get(name);
+        if (inst && inst->get_state() == runtime_running)
+            inst->stop(loop);
     }
 }
 
