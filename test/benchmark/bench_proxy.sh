@@ -293,7 +293,13 @@ test_proxy_overhead() {
     log_section "Test: Proxy Overhead (Direct vs Proxied)"
 
     ensure_clean
-    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --mode in -s
+    # An echoing backend, unlike the other tests here.  This one compares two
+    # paths, and a comparison needs each of them to have carried a request to
+    # completion; a backend that answers nothing leaves both legs timing their
+    # own writes, which is how this test came to report a negative overhead.
+    local echo_lua
+    echo_lua=$(cd "$(dirname "$0")" && pwd)/echo.lua
+    socketley_cmd create server backend1 -p $BACKEND_PORT_1 --lua "$echo_lua" -s
     wait_for_port $BACKEND_PORT_1 || { log_error "Backend failed"; ensure_clean; return 1; }
 
     socketley_cmd create proxy bench_proxy -p $PROXY_PORT \

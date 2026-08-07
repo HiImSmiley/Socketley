@@ -165,6 +165,37 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
     return (ssize_t)sent;
 }
 
+/* Read exactly len bytes, or fail.
+ *
+ * A send that returns tells you the kernel took the bytes, not that anything
+ * served them.  Timing a loop of sends alone measures how fast this process can
+ * fill a socket buffer, and once it is full, how fast the peer drains it --
+ * which is a property of buffer sizes and of the peer's read loop, not of the
+ * work being asked for. */
+static ssize_t recv_exact(int fd, void *buf, size_t len)
+{
+    char *p = (char *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, p + got, len - got);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    return (ssize_t)got;
+}
+
+/* A reply that never arrives has to end the run rather than hang it: without a
+ * deadline a mute backend turns the measurement into a stall that the outer
+ * script timeout eventually kills, and that reports as infrastructure trouble
+ * instead of as this benchmark's own answer. */
+static void set_recv_timeout(int fd, int ms)
+{
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0) { }
+}
+
 /* Count newlines in buffer (for plaintext cache responses). */
 static int count_newlines(const char *buf, size_t len)
 {
@@ -908,61 +939,82 @@ static void bench_proxy_overhead(struct bench_config *cfg)
     memset(msg, 'O', msize);
     msg[msize] = '\n';
 
-    double direct_rate = 0, proxied_rate = 0;
+    char *rep = (char *)malloc(msize + 1);
 
-    /* Direct to backend (port2) */
-    {
-        int fd = tcp_connect(cfg->host, cfg->port2);
-        if (fd >= 0) {
-            int success = 0;
-            int64_t start = time_ns();
-            for (int i = 0; i < cfg->num_ops; i++) {
-                ssize_t n = send_all(fd, msg, msize + 1);
-                if (n == msize + 1) success++;
-            }
-            int64_t end = time_ns();
-            close(fd);
-            direct_rate = success / ns_to_s(end - start);
-        }
-    }
+    /* Both legs, same loop: the only difference between them is the port, and
+     * writing it once is what keeps that true.  Each request is sent and its
+     * reply read before the next goes out, so the rate is completed round trips
+     * per second and the two legs are comparable by construction.
+     *
+     * They were not.  Each leg used to time a loop of sends with nothing read
+     * back, against a backend that answers nothing at all -- so neither number
+     * described serving a request, and the quotient of two such numbers could
+     * fall anywhere.  It fell at -106%: the proxied leg "beat" the direct one,
+     * which is how a measurement says it is not measuring what its name claims.
+     * Overhead cannot be negative, and that impossibility was the only reason
+     * anyone looked. */
+    double rate[2] = {0, 0};
+    int    done[2] = {0, 0};
+    const int port[2] = { cfg->port2, cfg->port };
 
-    /* Through proxy (port) */
-    {
-        int fd = tcp_connect(cfg->host, cfg->port);
-        if (fd >= 0) {
-            int success = 0;
-            int64_t start = time_ns();
-            for (int i = 0; i < cfg->num_ops; i++) {
-                ssize_t n = send_all(fd, msg, msize + 1);
-                if (n == msize + 1) success++;
-            }
-            int64_t end = time_ns();
-            close(fd);
-            proxied_rate = success / ns_to_s(end - start);
+    for (int leg = 0; leg < 2; leg++) {
+        int fd = tcp_connect(cfg->host, port[leg]);
+        if (fd < 0) continue;
+        set_recv_timeout(fd, 2000);
+
+        int success = 0;
+        int64_t start = time_ns();
+        for (int i = 0; i < cfg->num_ops; i++) {
+            if (send_all(fd, msg, msize + 1) != msize + 1) break;
+            if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
+            success++;
         }
+        int64_t end = time_ns();
+        close(fd);
+
+        done[leg] = success;
+        if (success > 0)
+            rate[leg] = success / ns_to_s(end - start);
     }
 
     free(msg);
+    free(rep);
 
+    /* Only when both legs actually ran the whole thing.  A leg that stopped
+     * early -- a backend that does not answer, a proxy that dropped the
+     * connection -- makes the quotient meaningless, and reporting it anyway is
+     * what produced a number nobody could act on.  The counts travel with it so
+     * a short run says so instead of hiding inside an average. */
+    int    complete     = (done[0] == cfg->num_ops && done[1] == cfg->num_ops);
     double overhead_pct = 0;
-    if (direct_rate > 0)
-        overhead_pct = (1.0 - proxied_rate / direct_rate) * 100.0;
+    if (complete && rate[0] > 0)
+        overhead_pct = (1.0 - rate[1] / rate[0]) * 100.0;
 
     if (cfg->json) {
         json_reset();
         json_start(stdout);
         json_kv_str(stdout, "test", "proxy_overhead");
         json_kv_int(stdout, "operations", cfg->num_ops);
-        json_kv_dbl(stdout, "direct_msg_per_sec", direct_rate);
-        json_kv_dbl(stdout, "proxied_msg_per_sec", proxied_rate);
-        json_kv_dbl(stdout, "overhead_percent", overhead_pct);
+        json_kv_int(stdout, "direct_completed", done[0]);
+        json_kv_int(stdout, "proxied_completed", done[1]);
+        json_kv_dbl(stdout, "direct_msg_per_sec", rate[0]);
+        json_kv_dbl(stdout, "proxied_msg_per_sec", rate[1]);
+        if (complete)
+            json_kv_dbl(stdout, "overhead_percent", overhead_pct);
+        else
+            json_kv_str(stdout, "overhead_percent", "not measurable");
         json_end(stdout);
     } else {
         printf("socketley-bench: proxy overhead  %s  %d ops  direct=%d  proxied=%d\n\n",
                cfg->host, cfg->num_ops, cfg->port2, cfg->port);
-        printf("  Direct:   %12.0f msg/sec\n", direct_rate);
-        printf("  Proxied:  %12.0f msg/sec\n", proxied_rate);
-        printf("  Overhead: %11.1f%%\n", overhead_pct);
+        printf("  Direct:   %12.0f msg/sec  (%d/%d round trips)\n",
+               rate[0], done[0], cfg->num_ops);
+        printf("  Proxied:  %12.0f msg/sec  (%d/%d round trips)\n",
+               rate[1], done[1], cfg->num_ops);
+        if (complete)
+            printf("  Overhead: %11.1f%%\n", overhead_pct);
+        else
+            printf("  Overhead:  not measurable — a leg did not complete\n");
     }
 }
 
