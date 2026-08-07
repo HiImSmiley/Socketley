@@ -275,6 +275,11 @@ private:
     void publish_to_workers(std::string_view cache_name, std::string_view channel,
                             std::string_view message);
 
+    // Hand one message to the single worker holding a named runtime's
+    // connections.  False when there is no such worker or its control socket
+    // would not take the frame — the caller has to be able to say so.
+    bool deliver_to_worker(std::string_view name, std::string_view message);
+
     // A publish that came UP from a worker's cache, fanned out to everything
     // this daemon can reach — its own runtimes and every OTHER worker.  The
     // sender is excluded: it has already delivered to its own runtime.

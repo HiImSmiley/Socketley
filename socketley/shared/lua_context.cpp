@@ -1452,11 +1452,21 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.send(name, msg) → bool
+    //
+    // The connections are wherever the runtime is — the same sentence cmd_send()
+    // is written under, and for the same reason.  Calling lua_broadcast() on a
+    // placeholder reaches an object that has the name, the port and the state
+    // and not one connection: it succeeds, it returns true, and the message
+    // goes nowhere.  That was fixed for the CLI when the deliver frame was
+    // added and left standing here, so since 2313c26 made the worker the
+    // default it was the ordinary case for a script.
     sk["send"] = [owner](std::string name, std::string msg) -> bool {
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return false;
         auto* inst = mgr->get(name);
         if (!inst || inst->get_state() != runtime_running) return false;
+        if (inst->is_out_of_process())
+            return mgr->deliver_out_of_process(name, msg);
         if (inst->get_type() == runtime_server)
             inst->lua_broadcast(msg);
         else

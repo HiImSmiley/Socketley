@@ -181,6 +181,14 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
                                       std::string_view channel,
                                       std::string_view message)
                                { publish_to_workers(cache_name, channel, message); });
+
+    // And a message addressed to one named runtime whose connections are in a
+    // worker.  cmd_send() reaches the supervisor by hand because it has
+    // m_proxy_workers in scope; socketley.send() has only the manager, so the
+    // manager gets the same route the other two have.
+    m_manager.set_deliver_sink([this](std::string_view name,
+                                      std::string_view message)
+                               { return deliver_to_worker(name, message); });
 }
 
 daemon_handler::~daemon_handler()
@@ -332,6 +340,7 @@ void daemon_handler::teardown()
     // handler and the lambda captures `this`.
     m_manager.set_endpoint_sink(nullptr);
     m_manager.set_publish_sink(nullptr);
+    m_manager.set_deliver_sink(nullptr);
 
     // Reap managed children
     {
@@ -3353,6 +3362,17 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
             continue;
         sup->send_publish(payload);
     }
+}
+
+// One runtime, not every worker: this message is addressed to a name, and the
+// connections it is meant for are held by exactly one child.
+bool daemon_handler::deliver_to_worker(std::string_view name,
+                                       std::string_view message)
+{
+    auto it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end())
+        return false;
+    return it->second->send_deliver(message);
 }
 
 void daemon_handler::on_worker_publish(proxy_supervisor* from,

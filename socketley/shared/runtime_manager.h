@@ -118,6 +118,26 @@ public:
                                              std::string_view channel,
                                              std::string_view message)> sink);
 
+    // Where a message for a named runtime goes when that runtime's connections
+    // are in another process — the third of the same shape, for the third thing
+    // the daemon used to do by calling into an instance.
+    //
+    // `socketley.send(name, msg)` broadcasts to a runtime's connections, and
+    // since 2313c26 those are normally held by a worker.  Called on the
+    // placeholder the call succeeds, returns true and delivers to the empty
+    // tables of an object that serves nothing.  cmd_send() was fixed for
+    // exactly this in the commit that added the deliver frame; the Lua binding
+    // was left calling lua_broadcast() on the placeholder, so a script's send
+    // went nowhere while reporting that it had gone.
+    //
+    // Returns whether the message was handed to the process holding the
+    // connections, so the binding can answer false rather than repeat the lie
+    // in a quieter voice.  Unset — a manager inside a worker, or one with no
+    // daemon around it — is false for the same reason: nothing was delivered.
+    void set_deliver_sink(
+        std::function<bool(std::string_view name, std::string_view message)> sink);
+    bool deliver_out_of_process(std::string_view name, std::string_view message) const;
+
     // Where a runtime sends a request meant for another runtime.  One per
     // daemon, attached to the event loop by daemon_start() and detached before
     // the ring goes; see shared/request_channel.h for why this is a channel and
@@ -148,6 +168,7 @@ private:
 
     std::function<void(const endpoint_table&)> m_endpoint_sink;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
+    std::function<bool(std::string_view, std::string_view)> m_deliver_sink;
 
     // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER
     // them.  A runtime revokes its origin as it goes — ~server_instance calls

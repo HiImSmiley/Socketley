@@ -744,6 +744,18 @@ void runtime_manager::set_publish_sink(
     m_publish_sink = std::move(sink);
 }
 
+void runtime_manager::set_deliver_sink(
+    std::function<bool(std::string_view, std::string_view)> sink)
+{
+    m_deliver_sink = std::move(sink);
+}
+
+bool runtime_manager::deliver_out_of_process(std::string_view name,
+                                             std::string_view message) const
+{
+    return m_deliver_sink ? m_deliver_sink(name, message) : false;
+}
+
 const runtime_manager::runtime_map& runtime_manager::list() const
 {
     return runtimes;
