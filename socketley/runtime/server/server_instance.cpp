@@ -215,6 +215,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->partial.clear();
     conn->meta.clear();
     conn->write_queue.clear();
+    conn->relay_hold.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
@@ -2914,6 +2915,18 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
 submit_next_read:
+    // Relay traffic that arrived while this connection had no protocol yet.
+    //
+    // Here and not at any of the points above that decide one, because every
+    // path through this function reaches this label and only some of them
+    // classify: a read that leaves the connection mid-line or mid-header
+    // settles nothing, and proto_unsettled() is what tells those apart.  By
+    // this point whatever this read produced — a 101, an HTTP response, a pong
+    // — is already in the write queue, so the held bytes append behind it
+    // rather than in front of it, which was the entire defect.
+    if (SOCKETLEY_UNLIKELY(!conn->relay_hold.empty()) && !proto_unsettled(conn))
+        relay_hold_flush(conn);
+
     // Everything this read produced for the cache goes now.  One post for the
     // whole buffer instead of one per line, and — because every path above
     // reaches this label — nothing is left sitting in the batch waiting for a
@@ -3431,6 +3444,16 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
         if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
+        // Nothing is known yet about what this client speaks, and writing to it
+        // now would put these bytes in front of the response to a request it
+        // has already sent.  Hold them; handle_read releases them the moment
+        // the protocol is settled, behind that response and in this order.
+        if (SOCKETLEY_UNLIKELY(proto_unsettled(conn)))
+        {
+            relay_hold_push(conn, msg);
+            continue;
+        }
+
         if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
         {
             conn->closing = true;
@@ -3487,6 +3510,38 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
 
     if (SOCKETLEY_LIKELY(!conn->write_pending))
         flush_write_queue(conn);
+}
+
+void server_instance::relay_hold_push(server_connection* conn,
+                                      const std::shared_ptr<const std::string>& msg)
+{
+    conn->relay_hold.push(msg);
+
+    // A loop and not a single pop: one relayed message can be larger than the
+    // whole bound by itself, and popping once would leave the hold over its
+    // limit for as long as the connection stayed silent — which for a pure
+    // listener is for ever, and this bound is the only thing standing between
+    // that and unbounded growth.
+    while (SOCKETLEY_UNLIKELY(conn->relay_hold.bytes() > RELAY_HOLD_MAX_BYTES)
+           && !conn->relay_hold.empty())
+        conn->relay_hold.pop();
+}
+
+void server_instance::relay_hold_flush(server_connection* conn)
+{
+    if (SOCKETLEY_LIKELY(conn->relay_hold.empty()))
+        return;
+
+    // send_to() rather than a push straight into the write queue, and that is
+    // the whole reason this is a function and not three lines at the call site:
+    // the connection has a protocol *now*, and for a WebSocket that means every
+    // one of these has to go out as a frame.  Flushing raw would trade one
+    // corrupted stream for another — the client reads the 101, switches to
+    // frame parsing, and is handed plain text.  send_to is where that framing
+    // decision already lives, so this path cannot drift away from the one
+    // broadcast() takes for a connection that was classified in time.
+    while (!conn->relay_hold.empty())
+        send_to(conn, conn->relay_hold.take_front());
 }
 
 bool server_instance::conn_has_output(const server_connection* conn) const

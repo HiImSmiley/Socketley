@@ -95,6 +95,24 @@ struct alignas(64) server_connection
     std::string partial;
     socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
 
+    // Relay traffic that arrived before this connection said what it speaks.
+    //
+    // A connection joins the relay set the moment it is accepted, but nothing
+    // is known about its protocol until its first read has been classified —
+    // and a client whose opening move is an HTTP request or a WebSocket
+    // upgrade is waiting for the response to it.  Writing relay bytes in the
+    // meantime does not merely deliver them early, it puts them *in front of*
+    // that response: the client reads "hello tcp 7" where the "HTTP/1.1 101"
+    // it is parsing for should be, and the handshake is corrupted.
+    //
+    // So they are held here and released by relay_hold_flush() once the
+    // protocol is settled — behind whatever the classifying read queued, and
+    // through the framing that protocol uses.  Held rather than dropped
+    // because the client is entitled to them: an inout server relays every
+    // client's messages to every other client, and this connection goes on
+    // receiving exactly this traffic for the rest of its life.
+    socketley::byte_counted_queue<std::shared_ptr<const std::string>> relay_hold;
+
     // writev batch: holds refs alive until CQE completes
     std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
@@ -224,6 +242,10 @@ struct alignas(64) server_connection
         read_req = {};
         write_req = {};
         write_queue.clear();
+        // The previous occupant's unclassified relay traffic must not be
+        // handed to this one.  pool_release() already did it; repeated here for
+        // the same reason the TLS session above is.
+        relay_hold.clear();
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
         write_batch_count = 0;
         read_pending = false;
@@ -490,6 +512,48 @@ private:
     // would overtake the answers already queued ahead of it, and a client that
     // cannot tell which answer belongs to which question has no protocol left.
     static constexpr uint32_t MAX_CACHE_PENDING = 4096;
+
+    // ── Relay traffic held across classification ────────────────────────────
+    // What one connection may accumulate while it is still unclassified,
+    // before the oldest held message is dropped to make room.
+    //
+    // This is not a transient.  A connection that never sends anything is
+    // never classified, so a pure listener holds up to this bound for as long
+    // as it stays connected, and a server with many of them pays it per
+    // connection.  The figure is therefore sized for the window it exists to
+    // cover — accept to first read, normally a single turn of the event loop —
+    // and deliberately not for a backlog: 64 KB is four full 16 KB reads'
+    // worth of relayed lines, far more than that window can produce, and
+    // 1/128th of the 8 MB a connection's own write queue may hold, so an idle
+    // listener cannot cost more than an active client already may.
+    //
+    // Overflow drops the oldest.  The three alternatives are all worse:
+    // growing is the memory-exhaustion path this bound exists to close;
+    // disconnecting punishes a client that has done nothing but stay quiet;
+    // and blocking would let one silent listener stall every client that is
+    // talking, which is a far worse failure than a listener missing the start
+    // of a conversation it has not joined yet.
+    static constexpr size_t RELAY_HOLD_MAX_BYTES = 64 * 1024;
+
+    // Is this connection still waiting to be classified?  Both states mean the
+    // same thing to the relay — nothing has been decided about what the client
+    // speaks, so nothing unsolicited may be written to it.  proto_ws_upgrading
+    // counts because it is the middle of a handshake and not the end of one:
+    // headers can span several reads, and the 101 has not been queued yet.
+    static bool proto_unsettled(const server_connection* conn)
+    {
+        return conn->proto == proto_unknown || conn->proto == proto_ws_upgrading;
+    }
+
+    // Hold one relayed message for a connection that has no protocol yet.
+    void relay_hold_push(server_connection* conn,
+                         const std::shared_ptr<const std::string>& msg);
+
+    // Release what was held, once the protocol is known.  Called from the one
+    // point every path through handle_read reaches, so a connection cannot be
+    // classified without its held traffic going out behind the response to the
+    // very read that classified it.
+    void relay_hold_flush(server_connection* conn);
 
     // ── the --cache auto-store ──────────────────────────────────────────────
     // Every message a linked server receives is written to the cache under an
