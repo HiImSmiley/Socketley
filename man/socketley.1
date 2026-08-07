@@ -1282,6 +1282,34 @@ which are executed against the linked cache and the response returned to
 the sender only. Normal messages are still processed according to the
 server's mode.
 .IP
+.B "The link also archives: every ordinary message is written to that cache."
+A message that is not a
+.B cache
+command is stored under an auto\-incrementing integer key \(em
+.BR 1 ,
+.BR 2 ,
+.B 3
+and on \(em as well as being handled by the server's mode. So two clients
+saying
+.B hello
+and
+.B world
+to a linked server leave
+.B "get 1"
+answering
+.B hello
+and
+.B "get 2"
+answering
+.BR world .
+The counter is per server and starts again when the server restarts, so a
+.B "\-\-persistent"
+cache keeps growing across restarts while keys are overwritten from
+.B 1
+upward. Link a cache to a server only when that archive is wanted; a server
+that merely wants its clients to be able to reach a cache pays for a write per
+message.
+.IP
 The command is not executed on the connection that asked for it. The
 server hands it to the daemon and answers when the reply comes back, one
 turn of the event loop later, so a
@@ -1363,7 +1391,16 @@ socketley create cache store -p 9001 -s
 socketley create server api -p 9000 --cache store -s
 # Client sends: "cache set foo bar" \(-> receives "ok"
 # Client sends: "cache get foo" \(-> receives "bar"
+# Client sends: "hello"            \(-> handled by the server's mode, AND
+#                                     stored in `store` under the key "1"
 .fi
+.PP
+The last line is the part that surprises people. An ordinary message is
+archived into the linked cache under an auto\-incrementing integer key as well
+as being handled normally; see
+.B \-\-cache
+under
+.BR "SERVER FLAGS" .
 .PP
 The request is asynchronous. The server does not run the cache's command
 interpreter itself \(em it posts the command and answers the client when
@@ -2482,6 +2519,23 @@ on such a proxy is loaded, is reported by nothing, and routes exactly as if the
 function were not there. That is the usual reason a
 .B on_route
 that was tested and works appears to do nothing.
+.IP
+.I path
+is the path
+.I as the client sent it,
+this proxy's own
+.BI / name /
+prefix included. The prefix is stripped on the way to the backend and not
+before this callback, so a proxy named
+.B gw
+sees
+.B /gw/api/users
+and a pattern anchored
+.B ^/api/
+never matches. Strip
+.B "\(dq/\(dq .. self.name"
+from the front before matching, or write the prefix into the pattern. The
+filter chain is handed the same path for the same reason.
 .IP
 The two arguments are passed on
 .B "\-\-protocol http"
