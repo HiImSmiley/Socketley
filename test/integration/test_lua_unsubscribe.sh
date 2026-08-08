@@ -43,10 +43,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaunsub
 
-PB=${PB:-23030}
+PB=$((SL_PORT_BASE+1030))
 SRV_PORT=$((PB + 0))
 CACHE_PORT=$((PB + 1))
 

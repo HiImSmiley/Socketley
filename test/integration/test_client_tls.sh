@@ -35,13 +35,14 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-clienttls-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-PEER=19781
+PEER=$((SL_PORT_BASE+781))
 DPID=""; PEERPID=""
 PASS=0; FAIL=0; TOTAL=0
 
@@ -410,7 +411,7 @@ else
 fi
 
 # ── 10. a cache still refuses TLS ────────────────────────────────────────────
-"$BIN" create cache tcache -p 19782 --tls >/dev/null 2>&1
+"$BIN" create cache tcache -p $((SL_PORT_BASE+782)) --tls >/dev/null 2>&1
 if [ $? -ne 0 ]; then ok; else
     bad "a cache still refuses TLS" \
         "a cache accepted --tls and would listen in cleartext on a port reported as encrypted"

@@ -61,13 +61,14 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaworker
 
 # One base, so the whole file can be driven on a private block while it is being
 # written without editing sixteen literals.  The default is the range the suite
 # runs it on; nothing but a developer's shell ever sets the variable.
-PB=${SOCKETLEY_PORT_BASE:-19100}
+PB=$((SL_PORT_BASE+100))
 CTL_PORT=$((PB + 0))       # controller, in the daemon: the script under test
 PEER_PORT=$((PB + 1))      # the worker-backed target
 INPROC_PORT=$((PB + 2))    # the in-daemon target — control for send

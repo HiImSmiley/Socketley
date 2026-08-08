@@ -5,6 +5,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate basic
 PASS=0; FAIL=0; TOTAL=0
 
@@ -57,7 +58,7 @@ echo "=== Integration: basic lifecycle ==="
 daemon_start "$BIN"
 
 # Test: create server
-create_ok "create server" "$BIN" create server testsvr -p 19000
+create_ok "create server" "$BIN" create server testsvr -p $((SL_PORT_BASE+0))
 
 # Test: ls shows it
 #
@@ -101,7 +102,7 @@ else
 fi
 
 # Test: create with -s (start immediately)
-create_ok "create+start" "$BIN" create server autosvr -p 19001 -s
+create_ok "create+start" "$BIN" create server autosvr -p $((SL_PORT_BASE+1)) -s
 sleep 0.2
 OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
 assert_contains "$OUT" "autosvr"

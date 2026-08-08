@@ -34,10 +34,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate toobig
 
-HOLD_BE=19731; HOLD_PX=19730
-STREAM_BE=19741; STREAM_PX=19740
+HOLD_BE=$((SL_PORT_BASE+731)); HOLD_PX=$((SL_PORT_BASE+730))
+STREAM_BE=$((SL_PORT_BASE+741)); STREAM_PX=$((SL_PORT_BASE+740))
 PASS=0; FAIL=0; TOTAL=0
 BE_PIDS=()
 TMPD=$(mktemp -d)

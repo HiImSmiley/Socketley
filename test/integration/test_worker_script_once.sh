@@ -36,6 +36,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 echo "=== Integration: an out-of-process proxy loads its script once ==="
 
@@ -60,13 +61,13 @@ cat > "$SOCKETLEY_TMPD/s.lua" <<EOF
 local f = io.open("$MARK", "a")
 f:write("ran\n")
 f:close()
-pcall(function() socketley.create("server", "ghost_from_toplevel", 27488) end)
+pcall(function() socketley.create("server", "ghost_from_toplevel", $((SL_PORT_BASE+1488))) end)
 EOF
 
 daemon_start "$BIN"
 
-BE_PORT=27499
-PROXY_PORT=27487
+BE_PORT=$((SL_PORT_BASE+8499))
+PROXY_PORT=$((SL_PORT_BASE+8487))
 
 # ── the control: an in-process proxy, which must run its script exactly once ──
 create_ok "in-process proxy created" \

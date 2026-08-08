@@ -36,10 +36,17 @@
 # long form and the reasoning); it is a library because twenty-four copies of a
 # cleanup sweep is twenty-four chances to get one of them subtly wrong.
 #
+# A daemon of one's own is half of it.  The other half is ports, which are not
+# private to a daemon: two runs of this suite each start their own daemons and
+# then ask the same kernel for the same 19200.  That is lib_ports.sh, and a test
+# that binds anything sources it too.
+#
 # Usage:
 #
 #     . "$(dirname "$0")/lib_daemon.sh"
+#     . "$(dirname "$0")/lib_ports.sh"
 #     daemon_isolate cache            # before anything touches the daemon
+#     PORT=$((SL_PORT_BASE + 150))    # never a literal
 #     cleanup() { ...; daemon_stop; } # daemon_stop LAST: it deletes the state dir
 #     trap cleanup EXIT
 #     daemon_start "$BIN"

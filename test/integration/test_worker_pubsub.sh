@@ -54,13 +54,14 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate workerpubsub
 
-BE_PORT=19420
-CACHE_PORT=19421
-PX_IN_PORT=19422
-PX_OOP_PORT=19423
+BE_PORT=$((SL_PORT_BASE+420))
+CACHE_PORT=$((SL_PORT_BASE+421))
+PX_IN_PORT=$((SL_PORT_BASE+422))
+PX_OOP_PORT=$((SL_PORT_BASE+423))
 MSG="published-at-$$"
 
 PASS=0; FAIL=0; TOTAL=0

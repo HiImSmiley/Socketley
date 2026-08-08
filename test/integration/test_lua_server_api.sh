@@ -48,10 +48,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luasrvapi
 
-PB=${SOCKETLEY_PORT_BASE:-19170}
+PB=$((SL_PORT_BASE+170))
 API_PORT=$((PB + 0))     # the RPC server, --mode in
 RELAY_ON_PORT=$((PB + 1))  # --mode inout WITH on_message
 RELAY_OFF_PORT=$((PB + 2)) # --mode inout WITHOUT on_message

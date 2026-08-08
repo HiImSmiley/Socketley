@@ -63,10 +63,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaauth
 
-PB=${SOCKETLEY_PORT_BASE:-19130}
+PB=$((SL_PORT_BASE+130))
 SRV_PORT=$((PB + 0))       # server with the gate
 SRV_OPEN_PORT=$((PB + 1))  # server with no gate — the control
 BE_PORT=$((PB + 2))        # the proxy's backend

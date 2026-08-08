@@ -47,6 +47,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate proxyhookclosed
 
@@ -175,24 +176,26 @@ stand() {
 }
 
 L="$SOCKETLEY_TMPD"
+# Seven proxy/backend pairs, PH+0 through PH+13.
+PH=$((SL_PORT_BASE+1860))
 printf 'function on_proxy_request(id, data)\n  error("policy engine unreachable")\nend\n' > "$L/raise.lua"
 printf 'function on_proxy_request(id, data)\n  return false\nend\n'                       > "$L/false.lua"
 printf 'function on_proxy_request(id, data)\n  return "MODIFIED-PAYLOAD"\nend\n'          > "$L/mod.lua"
 printf 'function on_proxy_response(id, data)\n  error("redactor unreachable")\nend\n'     > "$L/rraise.lua"
 printf 'function on_proxy_response(id, data)\n  return "REDACTED-REPLY"\nend\n'           > "$L/rmod.lua"
 
-stand ph_raise  21860 21861 "$L/raise.lua"
-stand ph_false  21862 21863 "$L/false.lua"
-stand ph_mod    21864 21865 "$L/mod.lua"
-stand ph_rraise 21866 21867 "$L/rraise.lua"
-stand ph_rmod   21868 21869 "$L/rmod.lua"
+stand ph_raise  $((PH+0)) $((PH+1)) "$L/raise.lua"
+stand ph_false  $((PH+2)) $((PH+3)) "$L/false.lua"
+stand ph_mod    $((PH+4)) $((PH+5)) "$L/mod.lua"
+stand ph_rraise $((PH+6)) $((PH+7)) "$L/rraise.lua"
+stand ph_rmod   $((PH+8)) $((PH+9)) "$L/rmod.lua"
 sleep 0.8
 
-REPLY_RAISE=$(python3 "$POKE_PY" 21860 || true)
-REPLY_FALSE=$(python3 "$POKE_PY" 21862 || true)
-REPLY_MOD=$(python3   "$POKE_PY" 21864 || true)
-REPLY_RRAISE=$(python3 "$POKE_PY" 21866 || true)
-REPLY_RMOD=$(python3  "$POKE_PY" 21868 || true)
+REPLY_RAISE=$(python3 "$POKE_PY" $((PH+0)) || true)
+REPLY_FALSE=$(python3 "$POKE_PY" $((PH+2)) || true)
+REPLY_MOD=$(python3   "$POKE_PY" $((PH+4)) || true)
+REPLY_RRAISE=$(python3 "$POKE_PY" $((PH+6)) || true)
+REPLY_RMOD=$(python3  "$POKE_PY" $((PH+8)) || true)
 sleep 0.6
 
 seen() { cat "$SOCKETLEY_TMPD/$1.seen" 2>/dev/null || printf ''; }
@@ -334,12 +337,12 @@ PY_EOF
 # hold_probe PORT -> "closed|open <nbytes> <data>"
 hold_probe() { python3 "$HOLD_PY" "$1" 4 2>/dev/null || printf 'error 0 '; }
 
-stand ph_qhold 21870 21871 "$L/raise.lua"  hold
-stand ph_rhold 21872 21873 "$L/rraise.lua" hold
+stand ph_qhold $((PH+10)) $((PH+11)) "$L/raise.lua"  hold
+stand ph_rhold $((PH+12)) $((PH+13)) "$L/rraise.lua" hold
 sleep 0.8
 
-Q_HOLD=$(hold_probe 21870)
-R_HOLD=$(hold_probe 21872)
+Q_HOLD=$(hold_probe $((PH+10)))
+R_HOLD=$(hold_probe $((PH+12)))
 
 # ── Control 4: the harness can see a close at all ───────────────────────────
 #

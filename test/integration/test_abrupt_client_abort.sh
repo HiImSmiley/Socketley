@@ -58,6 +58,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: abrupt client aborts ==="
@@ -76,10 +77,10 @@ mkdir -p "$HOME"
 DPID=""
 BEPID=""
 
-CACHE_PORT=19520
-PROXY_PORT=19521
-BE_PORT=19522
-FINAL_PORT=19523
+CACHE_PORT=$((SL_PORT_BASE+520))
+PROXY_PORT=$((SL_PORT_BASE+521))
+BE_PORT=$((SL_PORT_BASE+522))
+FINAL_PORT=$((SL_PORT_BASE+523))
 CACHE_NAME=ab_cache
 PROXY_NAME=ab_proxy
 LOAD_SECS=1.5       # almost all of this test's runtime

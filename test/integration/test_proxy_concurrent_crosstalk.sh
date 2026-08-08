@@ -51,6 +51,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — auto-restart hides a crash, and a leftover runtime from an
@@ -62,8 +63,8 @@ mkdir -p "$HOME"
 DPID=""
 BEPID=""
 
-BE_PORT=19430
-PX_PORT=19431
+BE_PORT=$((SL_PORT_BASE+430))
+PX_PORT=$((SL_PORT_BASE+431))
 PX_NAME=xtalk_px
 # Load knobs.  These are the dials to turn if this test ever becomes slow or
 # flaky on a loaded machine: LOAD_SECS is almost all of the runtime, and

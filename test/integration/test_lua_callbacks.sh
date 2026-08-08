@@ -50,10 +50,11 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate luacb
 # One base, so this file can be driven on a private port block while a change to
 # it is being verified.  The default is the port it has always used.
-PORT=${SOCKETLEY_PORT_BASE:-19400}
+PORT=$((SL_PORT_BASE+400))
 PASS=0; FAIL=0; TOTAL=0
 LUA_SCRIPT="/tmp/test-callbacks-$$.lua"
 

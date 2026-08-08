@@ -352,12 +352,19 @@ See [`examples/cache/db-backend.lua`](examples/cache/db-backend.lua) for MySQL a
 ./bin/Release/test_resp_parser
 ./bin/Release/test_ws_parser
 
-# Integration tests (starts daemon automatically)
+# Integration tests (each test starts a daemon of its own)
 bash test/run_all.sh
 
 # Benchmarks
 bash test/benchmark/run_all.sh
 ```
+
+Two integration runs on one machine no longer interfere. Each test brings up its
+own daemon on its own socket and state directory, and each run claims a private
+window of two thousand ports for every port it binds, so a second run — an agent
+verifying a change while somebody measures a baseline — collides with the first
+on nothing. The benchmarks are a different matter: those measure the machine and
+still want it to themselves.
 
 ## Architecture
 

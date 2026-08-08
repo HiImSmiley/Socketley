@@ -44,10 +44,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luatimer
 
-PORT_BASE=${PORT_BASE:-19980}
+PORT_BASE=$((SL_PORT_BASE+980))
 RT_PORT=$((PORT_BASE+1))
 
 PASS=0; FAIL=0; TOTAL=0

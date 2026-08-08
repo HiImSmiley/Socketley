@@ -57,10 +57,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luadeadline
 
-PORT=${SOCKETLEY_PORT_BASE:-22100}
+PORT=$((SL_PORT_BASE+1100))
 SPIN_PORT=$((PORT + 1))
 BYST_PORT=$((PORT + 2))
 OWN_PORT=$((PORT + 3))

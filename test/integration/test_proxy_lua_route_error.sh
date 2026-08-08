@@ -48,13 +48,14 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaroute
 
 # One base so a second run — or a run beside another agent's — can move the
 # whole block.  A collision here looks exactly like a proxy that will not
 # forward, which is the diagnosis this file must never invite.
-PORT_BASE=${PORT_BASE:-19970}
+PORT_BASE=$((SL_PORT_BASE+970))
 OK_BE0=$((PORT_BASE+1))
 OK_BE1=$((PORT_BASE+2))
 OK_PROXY=$((PORT_BASE+3))

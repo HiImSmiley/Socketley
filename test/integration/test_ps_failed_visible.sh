@@ -33,13 +33,14 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate psfailed
 
-BROKEN_PORT=19891
-SRV_PORT=19890
+BROKEN_PORT=$((SL_PORT_BASE+891))
+SRV_PORT=$((SL_PORT_BASE+890))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -139,7 +140,7 @@ fi
 # because every row it could print was running.  A row for a failed runtime that
 # still claims "running" is worse than no row.
 PSAJ=$("$BIN" ps -a --json 2>&1 || true)
-if has "$PSAJ" '"name":"brokencli","type":"server","port":19891,"status":"failed"'; then
+if has "$PSAJ" "\"name\":\"brokencli\",\"type\":\"server\",\"port\":$BROKEN_PORT,\"status\":\"failed\""; then
     ok
 else
     bad "ps -a --json reports the real state" \

@@ -43,9 +43,10 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate importrt
-SVR_PORT=19820
-CACHE_PORT=19821
+SVR_PORT=$((SL_PORT_BASE+820))
+CACHE_PORT=$((SL_PORT_BASE+821))
 PASS=0; FAIL=0; TOTAL=0
 WORK="/tmp/test-import-$$"
 

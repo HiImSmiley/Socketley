@@ -58,10 +58,11 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate lualocale
 
-PB=${PB:-23020}
+PB=$((SL_PORT_BASE+1020))
 VANDAL_PORT=$((PB + 0))
 VICTIM_PORT=$((PB + 1))
 

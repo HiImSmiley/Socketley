@@ -45,6 +45,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate masterauthstrict
 
@@ -58,6 +59,8 @@ fail() {
 }
 
 NAMES="ma_string ma_zero ma_table ma_raise ma_true ma_false"
+# One port per case, MA+0 through MA+5, in the order of $NAMES.
+MA=$((SL_PORT_BASE+1801))
 
 cleanup() {
     # shellcheck disable=SC2086
@@ -93,34 +96,34 @@ case_server() {
         --mode master --lua "$lua" --daemon-process -s
 }
 
-case_server ma_string 21801 '    return "denied"'
-case_server ma_zero   21802 '    return 0'
-case_server ma_table  21803 '    return {}'
-case_server ma_raise  21804 '    error("auth backend unreachable")'
-case_server ma_true   21805 '    return true'
-case_server ma_false  21806 '    return false'
+case_server ma_string $((MA+0)) '    return "denied"'
+case_server ma_zero   $((MA+1)) '    return 0'
+case_server ma_table  $((MA+2)) '    return {}'
+case_server ma_raise  $((MA+3)) '    error("auth backend unreachable")'
+case_server ma_true   $((MA+4)) '    return true'
+case_server ma_false  $((MA+5)) '    return false'
 
 sleep 0.5
 
 # ── Control 1: a hook that says yes still grants ────────────────────────────
-GOT_TRUE=$(ask 21805)
+GOT_TRUE=$(ask $((MA+4)))
 if [ "$GOT_TRUE" = "master: ok" ]; then pass; else
     fail "control: return true grants master" \
-         "port 21805 answered '${GOT_TRUE:-<nothing>}', wanted 'master: ok'" \
+         "port $((MA+4)) answered '${GOT_TRUE:-<nothing>}', wanted 'master: ok'" \
          "every denial asserted below is also produced by a build where" \
          "on_master_auth never grants at all, so without this they prove nothing"
 fi
 
 # ── Control 2: a hook that says no denies ───────────────────────────────────
-GOT_FALSE=$(ask 21806)
+GOT_FALSE=$(ask $((MA+5)))
 if [ "$GOT_FALSE" = "master: denied" ]; then pass; else
     fail "control: return false denies" \
-         "port 21806 answered '${GOT_FALSE:-<nothing>}', wanted 'master: denied'"
+         "port $((MA+5)) answered '${GOT_FALSE:-<nothing>}', wanted 'master: denied'"
 fi
 
 # ── The three truthy non-booleans ───────────────────────────────────────────
-for spec in "ma_string:21801:a string" "ma_zero:21802:the number 0" \
-            "ma_table:21803:an empty table"; do
+for spec in "ma_string:$((MA+0)):a string" "ma_zero:$((MA+1)):the number 0" \
+            "ma_table:$((MA+2)):an empty table"; do
     name=${spec%%:*}; rest=${spec#*:}; port=${rest%%:*}; what=${rest#*:}
     GOT=$(ask "$port")
     if [ "$GOT" = "master: denied" ]; then pass; else
@@ -133,10 +136,10 @@ for spec in "ma_string:21801:a string" "ma_zero:21802:the number 0" \
 done
 
 # ── A hook that raised denies, and says why ─────────────────────────────────
-GOT_RAISE=$(ask 21804)
+GOT_RAISE=$(ask $((MA+3)))
 if [ "$GOT_RAISE" = "master: denied" ]; then pass; else
     fail "an on_master_auth that raises denies" \
-         "ma_raise on 21804 answered '${GOT_RAISE:-<nothing>}', wanted 'master: denied'" \
+         "ma_raise on $((MA+3)) answered '${GOT_RAISE:-<nothing>}', wanted 'master: denied'" \
          "an auth hook that could not run has not authenticated anybody"
 fi
 

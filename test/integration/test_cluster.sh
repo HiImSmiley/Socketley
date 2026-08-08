@@ -25,6 +25,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 PASS=0; FAIL=0; TOTAL=0
 
 TMPD=$(mktemp -d /tmp/socketley-cluster-XXXXXX)
@@ -39,9 +40,9 @@ SOCK_GW="$TMPD/gw.sock"
 SOCK_WIT="$TMPD/witness.sock"
 SOCK_RJ="$TMPD/rejoin.sock"
 SOCK_IN="$TMPD/intruder.sock"
-NODE1_PORT=19301
-NODE2_PORT=19302
-GW_PORT=19310
+NODE1_PORT=$((SL_PORT_BASE+301))
+NODE2_PORT=$((SL_PORT_BASE+302))
+GW_PORT=$((SL_PORT_BASE+310))
 DAEMON_PIDS=()
 
 # Three roles, three names.  These used to be spelled distinctly because the
@@ -276,9 +277,9 @@ sleep 1
 #
 # The entire assertion was nc's exit status, which is 0 for anything at all that
 # accepts a TCP connection on that port.  Staged: with a foreign process holding
-# 19310 so `create proxy` was refused and clst_gw never existed, this file
-# printed 30/31 and `proxy @group connect` was not the one failure.  It passed
-# against a stranger.
+# the gateway's port so `create proxy` was refused and clst_gw never existed,
+# this file printed 30/31 and `proxy @group connect` was not the one failure.
+# It passed against a stranger.
 #
 # Connecting is not the claim.  The claim is the one thing this whole file is
 # about: that `--backend @api` resolved a *group name* into runtimes living on
@@ -418,7 +419,7 @@ assert_not_contains "$(echo "$OUT" | grep node1)" "stale"
 # file carrying our own triple was written by a process that is gone.
 
 RJ_DIR="$TMPD/cluster2"; mkdir -p "$RJ_DIR"
-RJ_PORT=19303
+RJ_PORT=$((SL_PORT_BASE+303))
 
 wit() { SOCKETLEY_SOCKET="$SOCK_WIT" "$BIN" "$@"; }
 rj()  { SOCKETLEY_SOCKET="$SOCK_RJ"  "$BIN" "$@"; }

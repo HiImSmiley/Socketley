@@ -38,6 +38,7 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../../socketley/daemon/flag_handlers.cpp"
 MAN="$HERE/../../man/socketley.1"
@@ -127,10 +128,10 @@ fi
 # ── layer 2: reachability, one runtime per type ─────────────────────────────
 daemon_start "$BIN"
 
-"$BIN" create server efs_server -p 31711                          >/dev/null 2>&1
-"$BIN" create client efs_client -t 127.0.0.1:31799                >/dev/null 2>&1
-"$BIN" create proxy  efs_proxy  -p 31712 --backend 127.0.0.1:31799 >/dev/null 2>&1
-"$BIN" create cache  efs_cache  -p 31713                          >/dev/null 2>&1
+"$BIN" create server efs_server -p $((SL_PORT_BASE+1711))                          >/dev/null 2>&1
+"$BIN" create client efs_client -t 127.0.0.1:$((SL_PORT_BASE+1799))                >/dev/null 2>&1
+"$BIN" create proxy  efs_proxy  -p $((SL_PORT_BASE+1712)) --backend 127.0.0.1:$((SL_PORT_BASE+1799)) >/dev/null 2>&1
+"$BIN" create cache  efs_cache  -p $((SL_PORT_BASE+1713))                          >/dev/null 2>&1
 
 MISSING=""
 for t in server client proxy cache; do

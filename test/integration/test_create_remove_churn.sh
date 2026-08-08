@@ -94,6 +94,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: create/remove churn ==="
@@ -111,10 +112,10 @@ mkdir -p "$HOME"
 DPID=""
 BEPID=""
 
-CHURN_PORT=19510    # every created runtime binds this one, on purpose
-BE_PORT=19511       # echo backend behind the proxy cycles
-SENTINEL_PORT=19512
-FINAL_PORT=19513
+CHURN_PORT=$((SL_PORT_BASE+510))    # every created runtime binds this one, on purpose
+BE_PORT=$((SL_PORT_BASE+511))       # echo backend behind the proxy cycles
+SENTINEL_PORT=$((SL_PORT_BASE+512))
+FINAL_PORT=$((SL_PORT_BASE+513))
 CYCLES=45           # 15 each of cache, server, proxy
 WARM_CYCLES=3       # one of each, before the resource baseline is taken
 ROUNDTRIPS=3        # verified exchanges per connection per cycle

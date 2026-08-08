@@ -73,9 +73,10 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate wstunnel
 
-PORT_BASE=${PORT_BASE:-19680}
+PORT_BASE=$((SL_PORT_BASE+680))
 BE=$((PORT_BASE+1))
 PX=$((PORT_BASE+2))
 PXI=$((PORT_BASE+3))

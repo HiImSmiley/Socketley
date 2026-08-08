@@ -41,12 +41,13 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate workerstatsage
 
-BE_PORT=19490
-PX_IN_PORT=19491
-PX_OOP_PORT=19492
+BE_PORT=$((SL_PORT_BASE+490))
+PX_IN_PORT=$((SL_PORT_BASE+491))
+PX_OOP_PORT=$((SL_PORT_BASE+492))
 STOP_MS=1500
 
 PASS=0; FAIL=0; TOTAL=0

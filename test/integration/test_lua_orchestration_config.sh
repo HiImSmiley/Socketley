@@ -36,10 +36,11 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate orchcfg
 
-PB=${SOCKETLEY_PORT_BASE:-21920}
+PB=$((SL_PORT_BASE+1920))
 FULL_PORT=$((PB + 0))
 MIN_PORT=$((PB + 1))
 

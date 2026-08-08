@@ -43,10 +43,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luarlstart
 
-PB=${PB:-23040}
+PB=$((SL_PORT_BASE+1040))
 SRV_PORT=$((PB + 0))
 CACHE_PORT=$((PB + 1))
 

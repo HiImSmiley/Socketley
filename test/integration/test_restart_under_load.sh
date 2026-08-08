@@ -55,6 +55,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # defines functions without running anything, so nothing here changes hands.
 # shellcheck source=lib_daemon.sh
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "=== Integration: restart under load ==="
@@ -72,10 +73,10 @@ mkdir -p "$HOME"
 DPID=""
 BEPID=""
 
-CACHE_PORT=19500
-PROXY_PORT=19501
-BE_PORT=19502
-FINAL_PORT=19503
+CACHE_PORT=$((SL_PORT_BASE+500))
+PROXY_PORT=$((SL_PORT_BASE+501))
+BE_PORT=$((SL_PORT_BASE+502))
+FINAL_PORT=$((SL_PORT_BASE+503))
 CACHE_NAME=rl_cache
 PROXY_NAME=rl_proxy
 CYCLES=6            # restarts; alternates cache, proxy, cache, ...

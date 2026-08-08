@@ -5,10 +5,13 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate mesh
-BE1_PORT=19381
-BE2_PORT=19382
-PROXY_PORT=19383
+BE1_PORT=$((SL_PORT_BASE+381))
+BE2_PORT=$((SL_PORT_BASE+382))
+PROXY_PORT=$((SL_PORT_BASE+383))
+SIDECAR_BE_PORT=$((SL_PORT_BASE+384))
+SIDECAR_PX_PORT=$((SL_PORT_BASE+385))
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
@@ -268,12 +271,12 @@ sleep 0.5
 "$BIN" remove mesh_be2 2>/dev/null || true
 
 # --- Test 3: --sidecar shorthand ---
-create_ok "sidecar backend created" "$BIN" create server sidecar_be -p 19384 -s
+create_ok "sidecar backend created" "$BIN" create server sidecar_be -p "$SIDECAR_BE_PORT" -s
 sleep 0.3
 
 create_ok "create proxy with --sidecar" \
-    "$BIN" create proxy sidecar_proxy -p 19385 \
-    --backend "127.0.0.1:19384" \
+    "$BIN" create proxy sidecar_proxy -p "$SIDECAR_PX_PORT" \
+    --backend "127.0.0.1:$SIDECAR_BE_PORT" \
     --protocol tcp --sidecar \
     -s
 sleep 0.5
@@ -290,7 +293,7 @@ assert_contains "$OUT" "retry_count"
 # check, so it gets the same oracle.  This one was not in the brief; it is the
 # identical defect three lines further down the file, and leaving it would have
 # meant fixing one of a matched pair.
-assert_proxy_served sidecar_proxy 19385 "sidecar test" "sidecar proxy" sidecar_be
+assert_proxy_served sidecar_proxy "$SIDECAR_PX_PORT" "sidecar test" "sidecar proxy" sidecar_be
 
 # --- Test 4: Edit mesh flags on running proxy ---
 RC=0; OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || RC=$?

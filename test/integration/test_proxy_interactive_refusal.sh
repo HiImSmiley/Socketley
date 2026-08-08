@@ -36,13 +36,14 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate proxyinteractive
 
-BE_PORT=19480
-PX_PORT=19481
-PX_OOP_PORT=19482
-SRV_PORT=19483
+BE_PORT=$((SL_PORT_BASE+480))
+PX_PORT=$((SL_PORT_BASE+481))
+PX_OOP_PORT=$((SL_PORT_BASE+482))
+SRV_PORT=$((SL_PORT_BASE+483))
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }

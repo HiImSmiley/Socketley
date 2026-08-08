@@ -32,13 +32,14 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate silentnames
 
-PORT_A=19875
-PORT_B=19876
+PORT_A=$((SL_PORT_BASE+875))
+PORT_B=$((SL_PORT_BASE+876))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }

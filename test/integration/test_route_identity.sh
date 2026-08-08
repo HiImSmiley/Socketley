@@ -21,14 +21,17 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(readlink -f "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 WORK=$(mktemp -d /tmp/socketley-routeid-XXXXXX)
 export SOCKETLEY_SOCKET="$WORK/s.sock"
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 
-PARENT_PORT=19771
-SUB_PORT=19772
+PARENT_PORT=$((SL_PORT_BASE+771))
+SUB_PORT=$((SL_PORT_BASE+772))
+LONE_PORT=$((SL_PORT_BASE+773))
+PAR2_PORT=$((SL_PORT_BASE+774))
 DPID=""
 
 cleanup() {
@@ -367,17 +370,17 @@ EOLUA
 # question about bookkeeping between two runtimes that share one, which is what
 # the flag restores.  Routing a connection between processes is a separate
 # feature and is not what this file measures.
-"$BIN" create server rid_lone -p 19773 --lua "$WORK/lone.lua" \
+"$BIN" create server rid_lone -p "$LONE_PORT" --lua "$WORK/lone.lua" \
        --daemon-process -s >/dev/null 2>&1
-"$BIN" create server rid_par2 -p 19774 --lua "$WORK/parent2.lua" \
+"$BIN" create server rid_par2 -p "$PAR2_PORT" --lua "$WORK/parent2.lua" \
        --daemon-process -s >/dev/null 2>&1
 sleep 0.6
 
 lone_conns() { "$BIN" stats rid_lone 2>/dev/null | grep -E "^connections:" | head -1 | cut -d: -f2; }
 
-python3 - <<'PY' >/dev/null 2>&1 &
-import socket, time
-s = socket.create_connection(("127.0.0.1", 19774))
+python3 - "$PAR2_PORT" <<'PY' >/dev/null 2>&1 &
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
 s.settimeout(2)
 s.sendall(b"join_lone\n")
 time.sleep(8)

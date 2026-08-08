@@ -14,6 +14,7 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(readlink -f "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 WORK=$(mktemp -d /tmp/socketley-cpus-XXXXXX)
 export SOCKETLEY_SOCKET="$WORK/s.sock"
 export HOME="$WORK/home"
@@ -93,7 +94,7 @@ iou_threads() {
 refuses() {
     local why=$1 expect=$2; shift 2
     local out rc=0
-    out=$("$BIN" create server "cpus_$RANDOM" -p 19960 "$@" 2>&1) || rc=$?
+    out=$("$BIN" create server "cpus_$RANDOM" -p $((SL_PORT_BASE+960)) "$@" 2>&1) || rc=$?
     if [ "$rc" -eq 0 ];  then bad "$why: create succeeded, expected refusal"; return; fi
     if [ -z "$out" ];    then bad "$why: refused with exit $rc but printed nothing"; return; fi
     case "$out" in
@@ -111,7 +112,7 @@ accepts() {
     local why=$1; shift
     local name="cpus_$RANDOM"
     local out rc=0
-    out=$("$BIN" create server "$name" -p 19961 "$@" 2>&1) || rc=$?
+    out=$("$BIN" create server "$name" -p $((SL_PORT_BASE+961)) "$@" 2>&1) || rc=$?
     "$BIN" remove "$name" >/dev/null 2>&1
     if [ "$rc" -ne 0 ]; then bad "$why: create failed (rc=$rc): $out"; return; fi
     ok
@@ -126,7 +127,7 @@ echo "=== Integration: --cpus / --sqpoll ($NCPU CPUs online) ==="
 # ─── 1. A daemon nobody asked for a poller ──────────────────────────────────
 start_daemon SOCKETLEY_TEST=1 || exit 1
 
-"$BIN" create server cpus_base -p 19951 -s >/dev/null 2>&1
+"$BIN" create server cpus_base -p $((SL_PORT_BASE+951)) -s >/dev/null 2>&1
 sleep 0.3
 
 [ "$(stat_field cpus_base sqpoll)" = "off" ] && ok || bad "default: stats says sqpoll=$(stat_field cpus_base sqpoll), expected off"
@@ -139,8 +140,8 @@ N=$(iou_threads)
 
 # A second and third runtime add no rings, so they add no threads either.  This
 # is the whole reason the switch is not per runtime.
-"$BIN" create cache cpus_c1 -p 19952 -s >/dev/null 2>&1
-"$BIN" create server cpus_s2 -p 19953 -s >/dev/null 2>&1
+"$BIN" create cache cpus_c1 -p $((SL_PORT_BASE+952)) -s >/dev/null 2>&1
+"$BIN" create server cpus_s2 -p $((SL_PORT_BASE+953)) -s >/dev/null 2>&1
 sleep 0.3
 N=$(iou_threads)
 [ "$N" -eq 0 ] && ok || bad "three runtimes, no poller: $N polling thread(s), expected 0"
@@ -185,7 +186,7 @@ done
 
 # ─── 4. A daemon that was asked for a poller ────────────────────────────────
 start_daemon SOCKETLEY_SQPOLL=1 || exit 1
-"$BIN" create server cpus_sq -p 19954 -s >/dev/null 2>&1
+"$BIN" create server cpus_sq -p $((SL_PORT_BASE+954)) -s >/dev/null 2>&1
 sleep 0.3
 
 MODE=$(stat_field cpus_sq sqpoll)
@@ -198,8 +199,8 @@ else
     N=$(iou_threads)
     [ "$N" -eq 1 ] && ok || bad "SOCKETLEY_SQPOLL=1: $N polling thread(s), expected exactly 1"
 
-    "$BIN" create cache cpus_c2 -p 19955 -s >/dev/null 2>&1
-    "$BIN" create server cpus_s3 -p 19956 -s >/dev/null 2>&1
+    "$BIN" create cache cpus_c2 -p $((SL_PORT_BASE+955)) -s >/dev/null 2>&1
+    "$BIN" create server cpus_s3 -p $((SL_PORT_BASE+956)) -s >/dev/null 2>&1
     sleep 0.3
     N=$(iou_threads)
     [ "$N" -eq 1 ] && ok || bad "three runtimes on one ring: $N polling thread(s), expected 1"
@@ -212,7 +213,7 @@ fi
 if [ "$NCPU" -ge 2 ]; then
     SET="0-1"
     start_daemon SOCKETLEY_SQPOLL=1 SOCKETLEY_CPUS="$SET" || exit 1
-    "$BIN" create server cpus_pin -p 19957 -s >/dev/null 2>&1
+    "$BIN" create server cpus_pin -p $((SL_PORT_BASE+957)) -s >/dev/null 2>&1
     sleep 0.3
 
     REPORTED=$(stat_field cpus_pin cpus)
@@ -287,7 +288,7 @@ daemon_refuses "a CPU this machine does not have"     "does not exist on this ma
 # not from the daemon's own report.
 if [ "$NCPU" -ge 2 ]; then
     start_daemon -- --cpus 0-1 || exit 1
-    "$BIN" create server cpus_flagpin -p 19963 -s >/dev/null 2>&1
+    "$BIN" create server cpus_flagpin -p $((SL_PORT_BASE+963)) -s >/dev/null 2>&1
     sleep 0.3
     [ "$(stat_field cpus_flagpin cpus)" = "0-1" ] && ok \
         || bad "daemon --cpus 0-1: stats says cpus=$(stat_field cpus_flagpin cpus)"
@@ -305,7 +306,7 @@ fi
 # that wins is the one nobody typed: SOCKETLEY_SQPOLL is usually exported once
 # and forgotten, --no-sqpoll is typed for this run.
 start_daemon SOCKETLEY_SQPOLL=1 -- --no-sqpoll || exit 1
-"$BIN" create server cpus_over -p 19964 -s >/dev/null 2>&1
+"$BIN" create server cpus_over -p $((SL_PORT_BASE+964)) -s >/dev/null 2>&1
 sleep 0.3
 [ "$(stat_field cpus_over sqpoll)" = "off" ] && ok \
     || bad "--no-sqpoll under SOCKETLEY_SQPOLL=1: stats says sqpoll=$(stat_field cpus_over sqpoll)"
@@ -325,9 +326,9 @@ N=$(iou_threads)
 # nothing with what it read.
 SET7=0
 start_daemon SOCKETLEY_CPUS="$SET7" || exit 1
-"$BIN" create server cpus_keep   -p 19965 --cpus "$SET7" -s >/dev/null 2>&1
-"$BIN" create server cpus_nosq   -p 19966 --no-sqpoll -s >/dev/null 2>&1
-"$BIN" create server cpus_plain  -p 19967 -s >/dev/null 2>&1
+"$BIN" create server cpus_keep   -p $((SL_PORT_BASE+965)) --cpus "$SET7" -s >/dev/null 2>&1
+"$BIN" create server cpus_nosq   -p $((SL_PORT_BASE+966)) --no-sqpoll -s >/dev/null 2>&1
+"$BIN" create server cpus_plain  -p $((SL_PORT_BASE+967)) -s >/dev/null 2>&1
 sleep 0.5
 
 F=$(state_file cpus_keep)

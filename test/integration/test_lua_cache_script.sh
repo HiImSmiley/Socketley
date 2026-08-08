@@ -43,10 +43,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luacache
 
-PB=${SOCKETLEY_PORT_BASE:-19140}
+PB=$((SL_PORT_BASE+140))
 PORT=$((PB + 0))
 
 PASS=0; FAIL=0; TOTAL=0

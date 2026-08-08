@@ -16,6 +16,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 # one the library was generalised from — and sourcing defines functions without
 # running anything, so nothing here changes hands.
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-routing-XXXXXX)
@@ -29,7 +30,7 @@ DPID=""
 # state directory are already per-run; the ports were the one thing left that
 # made a second run collide with the first, and a collision here looks exactly
 # like a proxy that will not forward.
-PORT_BASE=${PORT_BASE:-19260}
+PORT_BASE=$((SL_PORT_BASE+260))
 BE1_PORT=$((PORT_BASE+1))
 BE2_PORT=$((PORT_BASE+2))
 TCP_PROXY_PORT=$((PORT_BASE+3))
@@ -167,8 +168,8 @@ assert_contains "$OUT" "proxy_tcp" "proxy in ps"
 #
 # The entire assertion was nc's exit status, which is 0 for anything at all that
 # accepts a TCP connection on that port.  Staged: with a foreign process holding
-# 19263 so `create proxy` was refused and proxy_tcp never existed, this file
-# printed 6/8 and `TCP proxy connect` was not one of the two failures.  It passed
+# the proxy's port so `create proxy` was refused and proxy_tcp never existed,
+# this file printed 6/8 and `TCP proxy connect` was not one of the two.  It passed
 # against a stranger.  Connecting is not the claim.
 #
 # The claim is that *this* proxy served the connection and forwarded it to *this

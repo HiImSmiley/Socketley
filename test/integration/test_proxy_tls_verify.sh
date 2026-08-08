@@ -26,13 +26,14 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-tlsverify-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-BE=19681; PX_OK=19682; PX_BADCA=19683; PX_NOCA=19684; PX_BADNAME=19685
+BE=$((SL_PORT_BASE+681)); PX_OK=$((SL_PORT_BASE+682)); PX_BADCA=$((SL_PORT_BASE+683)); PX_NOCA=$((SL_PORT_BASE+684)); PX_BADNAME=$((SL_PORT_BASE+685))
 DPID=""; BEPID=""
 PASS=0; FAIL=0; TOTAL=0
 

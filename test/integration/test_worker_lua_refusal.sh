@@ -48,14 +48,18 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate workerrefusal
 
-BE_PORT=19450
-CB_IN_PORT=19451
-CB_OOP_PORT=19452
-TOP_IN_PORT=19453
-TOP_OOP_PORT=19454
+BE_PORT=$((SL_PORT_BASE+450))
+CB_IN_PORT=$((SL_PORT_BASE+451))
+CB_OOP_PORT=$((SL_PORT_BASE+452))
+TOP_IN_PORT=$((SL_PORT_BASE+453))
+TOP_OOP_PORT=$((SL_PORT_BASE+454))
+RT_TARGET_PORT=$((SL_PORT_BASE+455))
+RT_IN_PORT=$((SL_PORT_BASE+456))
+RT_OOP_PORT=$((SL_PORT_BASE+457))
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -287,11 +291,11 @@ cat > "$TARGET_LUA" <<'LUAEOF'
 function on_connect(client_id) socketley.log("RT_TARGET_GOT_ONE") end
 LUAEOF
 
-create_ok "route target created" "$BIN" create server rt_target -p 19455 \
+create_ok "route target created" "$BIN" create server rt_target -p "$RT_TARGET_PORT" \
           --lua "$TARGET_LUA" --daemon-process -s
-create_ok "routing server in the daemon created" "$BIN" create server rt_in -p 19456 \
+create_ok "routing server in the daemon created" "$BIN" create server rt_in -p "$RT_IN_PORT" \
           --lua "$ROUTE_LUA" --daemon-process -s
-create_ok "routing server in a worker created" "$BIN" create server rt_oop -p 19457 \
+create_ok "routing server in a worker created" "$BIN" create server rt_oop -p "$RT_OOP_PORT" \
           --lua "$ROUTE_LUA" -s
 
 # poke PORT — open a connection, read the greeting so the server has finished
@@ -304,8 +308,8 @@ try: s.recv(4096)
 except Exception: pass
 s.sendall(b'route\n');time.sleep(1.0);s.close()" "$1" 2>/dev/null || true; }
 
-poke 19456      # the control: in the daemon, this must actually route
-poke 19457      # the worker: this must be refused by name
+poke "$RT_IN_PORT"      # the control: in the daemon, this must actually route
+poke "$RT_OOP_PORT"      # the worker: this must be refused by name
 sleep 0.8
 
 if grep -q 'self\.route() is refused in a worker process' "$SOCKETLEY_DLOG" 2>/dev/null

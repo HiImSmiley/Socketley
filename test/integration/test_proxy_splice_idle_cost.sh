@@ -45,13 +45,14 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-spidle-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-PORT_BASE=${PORT_BASE:-19660}
+PORT_BASE=$((SL_PORT_BASE+660))
 BE=$((PORT_BASE+1))
 PX=$((PORT_BASE+2))
 

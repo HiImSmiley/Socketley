@@ -19,8 +19,9 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate cachettl
-PORT=19280
+PORT=$((SL_PORT_BASE+280))
 STORE="/tmp/test-cache-ttl-$$.bin"
 PASS=0; FAIL=0; TOTAL=0
 

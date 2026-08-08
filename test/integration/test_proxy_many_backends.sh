@@ -15,9 +15,10 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
-PROXY_PORT=19286
-SINK_PORT=19287
+PROXY_PORT=$((SL_PORT_BASE+286))
+SINK_PORT=$((SL_PORT_BASE+287))
 BACKENDS=300
 PASS=0; FAIL=0; TOTAL=0
 
@@ -49,7 +50,7 @@ sleep 0.3
 
 BE="127.0.0.1:$SINK_PORT"
 for i in $(seq 1 $((BACKENDS-1))); do
-    BE="$BE,127.0.0.1:$((21000+i))"
+    BE="$BE,127.0.0.1:$((SL_PORT_BASE+1000+i))"
 done
 
 create_ok "proxy with $BACKENDS backends created" \

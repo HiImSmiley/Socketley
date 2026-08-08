@@ -5,8 +5,9 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate httpworker
-HTTP_PORT=19391
+HTTP_PORT=$((SL_PORT_BASE+391))
 PASS=0; FAIL=0; TOTAL=0
 LUA_SCRIPT="/tmp/test_http_worker.lua"
 
@@ -130,7 +131,7 @@ assert_contains "$REPLY" "POST /api/echo"
 # --- Test 2: Multi-protocol auto-detection ---
 # Same server should also handle plain TCP connections
 
-PROTO_PORT=19392
+PROTO_PORT=$((SL_PORT_BASE+392))
 create_ok "multi-protocol server created" "$BIN" create server proto_svr -p "$PROTO_PORT" -s
 sleep 0.3
 
@@ -144,7 +145,7 @@ sleep 0.3
 #
 # The whole assertion was nc's exit status, which is 0 for anything at all that
 # accepts a TCP connection on that port.  Staged: with a foreign process holding
-# 19392 so `create server proto_svr` was refused and the runtime never existed,
+# $PROTO_PORT so `create server proto_svr` was refused and the runtime never existed,
 # this file printed 7/9 and `tcp connect` was not one of the two failures.  It
 # passed against a stranger.  Worth noting that `http connect`, three lines
 # below, went red in that same run without being touched -- curl has to parse a
@@ -217,7 +218,7 @@ function on_client_message(client_id, msg)
     self.send(client_id, "echo:" .. msg)
 end
 LUAEOF
-SHORT_PORT=19393
+SHORT_PORT=$((SL_PORT_BASE+393))
 create_ok "line-echo server created" "$BIN" create server short_svr -p "$SHORT_PORT" \
           --lua "$ECHO_LUA" -s
 sleep 0.3
@@ -297,7 +298,7 @@ fi
 # connection are served" rested entirely on nc's exit status.  It could not tell
 # two responses from zero.  A server that accepts and immediately closes passes
 # it; so does a stranger on the port.  Staged with a foreign process holding
-# 19391, so `create server http_svr` was refused and the runtime never existed,
+# $HTTP_PORT, so `create server http_svr` was refused and the runtime never existed,
 # this file printed 4/9 and `keep-alive` was not one of the five failures.
 #
 # Both halves of the name are now asserted separately, because they fail

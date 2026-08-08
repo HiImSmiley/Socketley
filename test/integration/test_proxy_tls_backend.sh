@@ -30,13 +30,14 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-tls-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-TLS_BE=19591; PX_UP=19592; PLAIN_BE=19593; PX_DOWN=19594
+TLS_BE=$((SL_PORT_BASE+591)); PX_UP=$((SL_PORT_BASE+592)); PLAIN_BE=$((SL_PORT_BASE+593)); PX_DOWN=$((SL_PORT_BASE+594))
 CLIENTS=${CLIENTS:-8}
 REQS=${REQS:-40}
 DPID=""; TBPID=""; PBPID=""

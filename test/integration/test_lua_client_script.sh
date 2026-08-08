@@ -39,10 +39,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaclient
 
-PB=${SOCKETLEY_PORT_BASE:-19160}
+PB=$((SL_PORT_BASE+160))
 SRV_PORT=$((PB + 0))
 UDP_PORT=$((PB + 1))
 

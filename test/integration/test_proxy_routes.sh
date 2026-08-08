@@ -41,6 +41,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 # Own daemon, socket and state directory: against the shared one this test does
@@ -52,12 +53,12 @@ export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
 mkdir -p "$HOME"
 DPID=""
 
-BE_PORT=19640
-PX_PORT=19641
-GA_PORT=19642
-GB_PORT=19643
-GP_PORT=19644
-MX_PORT=19645
+BE_PORT=$((SL_PORT_BASE+640))
+PX_PORT=$((SL_PORT_BASE+641))
+GA_PORT=$((SL_PORT_BASE+642))
+GB_PORT=$((SL_PORT_BASE+643))
+GP_PORT=$((SL_PORT_BASE+644))
+MX_PORT=$((SL_PORT_BASE+645))
 BE_NAME=route_be
 PX_NAME=route_px
 GA_NAME=route_ga
@@ -244,7 +245,7 @@ cat > "$BAD_LUA" <<'LUAEOF'
 routes = { { path = "endpoint/login", methods = { "GET" } } }
 LUAEOF
 BAD_RC=0
-BAD_OUT=$("$BIN" create server route_bad1 -p 19648 --lua "$BAD_LUA" -s 2>&1) || BAD_RC=$?
+BAD_OUT=$("$BIN" create server route_bad1 -p $((SL_PORT_BASE+648)) --lua "$BAD_LUA" -s 2>&1) || BAD_RC=$?
 TOTAL=$((TOTAL+1))
 if grep -q "must start with '/'" "$TMPDIR_T/daemon.log" 2>/dev/null && [ "$BAD_RC" = "1" ]; then
     PASS=$((PASS+1))
@@ -265,7 +266,7 @@ LUAEOF
 # not exist at all.  The status is still captured, so a create that *succeeded*
 # can be named in the failure rather than left to be inferred.
 BAD2_RC=0
-"$BIN" create server route_bad2 -p 19649 --lua "$BAD_LUA" -s >/dev/null 2>&1 || BAD2_RC=$?
+"$BIN" create server route_bad2 -p $((SL_PORT_BASE+649)) --lua "$BAD_LUA" -s >/dev/null 2>&1 || BAD2_RC=$?
 TOTAL=$((TOTAL+1))
 if grep -q "no entry at index 1" "$TMPDIR_T/daemon.log" 2>/dev/null; then
     PASS=$((PASS+1))

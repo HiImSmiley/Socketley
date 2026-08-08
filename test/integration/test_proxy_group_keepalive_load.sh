@@ -47,6 +47,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 # For daemon_sweep in cleanup only.  Sourcing defines functions without running
 # anything, so this file's own inline isolation is untouched.
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-grpka-XXXXXX)
@@ -58,7 +59,7 @@ mkdir -p "$HOME"
 # and state directory are already per-run; the ports were the one thing left
 # that made a second run of this test collide with the first, and a collision
 # looks exactly like a broken gateway.
-PORT_BASE=${PORT_BASE:-19540}
+PORT_BASE=$((SL_PORT_BASE+540))
 CTRL=$PORT_BASE
 BE1=$((PORT_BASE+1)); BE2=$((PORT_BASE+2)); BE3=$((PORT_BASE+3)); BE4=$((PORT_BASE+4))
 M1=$((PORT_BASE+11)); M2=$((PORT_BASE+12)); M3=$((PORT_BASE+13)); M4=$((PORT_BASE+14))

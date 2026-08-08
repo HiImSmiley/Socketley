@@ -61,10 +61,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # no isolation is claimed here -- this file arranges its own, deliberately.
 # shellcheck source=lib_daemon.sh
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 DEFAULT_SOCK=/tmp/socketley.sock
-PORT_A=19930
-PORT_B=19931
+PORT_A=$((SL_PORT_BASE+930))
+PORT_B=$((SL_PORT_BASE+931))
 PASS=0; FAIL=0; TOTAL=0
 
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }

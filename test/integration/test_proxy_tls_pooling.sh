@@ -57,12 +57,13 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_daemon.sh
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate proxy-tls-pool
 TMPD="$SOCKETLEY_TMPD"
 
-BE_A=19621; BE_B=19622; BE_C=19623
-PX_ONE=19625; PX_TWO=19626; PX_UNBID=19627
+BE_A=$((SL_PORT_BASE+621)); BE_B=$((SL_PORT_BASE+622)); BE_C=$((SL_PORT_BASE+623))
+PX_ONE=$((SL_PORT_BASE+625)); PX_TWO=$((SL_PORT_BASE+626)); PX_UNBID=$((SL_PORT_BASE+627))
 REQS=${REQS:-40}
 BEPIDS=""
 PASS=0; FAIL=0; TOTAL=0

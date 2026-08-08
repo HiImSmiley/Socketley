@@ -42,6 +42,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ready.sh"
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 PASS=0; FAIL=0; TOTAL=0
 
@@ -69,11 +70,11 @@ export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
 mkdir -p "$HOME"
 DPID=""
 
-SRV_PORT=19731
-CACHE_PORT=19732
-MTLS_PORT=19733
-BAD_PORT=19734
-HTTP_PORT=19735
+SRV_PORT=$((SL_PORT_BASE+731))
+CACHE_PORT=$((SL_PORT_BASE+732))
+MTLS_PORT=$((SL_PORT_BASE+733))
+BAD_PORT=$((SL_PORT_BASE+734))
+HTTP_PORT=$((SL_PORT_BASE+735))
 
 cleanup() {
     [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true

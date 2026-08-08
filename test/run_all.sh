@@ -13,7 +13,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 SOCKETLEY_CONFIG="${SOCKETLEY_CONFIG:-Release}"
 BIN_DIR="${SOCKETLEY_BIN_DIR:-$ROOT/bin/$SOCKETLEY_CONFIG}"
 PASS=0; FAIL=0
-DAEMON_PID=""
 
 # Prefer the local build over an installed socketley.
 #
@@ -34,10 +33,20 @@ fi
 SYS_BIN=$(readlink -f "$SYS_BIN")
 echo "Testing binary: $SYS_BIN"
 
-# Use a fixed test socket path (avoids system-mode path resolution issues)
-export SOCKETLEY_SOCKET="/tmp/socketley-test.sock"
+# ─── A port window of this run's own ────────────────────────────────────────
+#
+# Claimed here, once, and exported: every port any test binds is derived from
+# it.  Holding it for the whole run rather than per file is what stops two
+# suites swapping windows underneath each other between tests — see
+# integration/lib_ports.sh for what a window is, how it is claimed, and the
+# eight-files-deep failure that fixed ports produced when two runs overlapped.
+#
+# A test run on its own claims its own window the same way, so this is a
+# convenience for the suite rather than the mechanism.
+. "$SCRIPT_DIR/integration/lib_ports.sh"
+echo "Port window:    $SL_PORT_BASE-$((SL_PORT_BASE + 1999))"
 
-# ...and a HOME of this run's own, because the socket is not the only path the
+# A HOME of this run's own, because the socket is not the only path the
 # daemon resolves.  SOCKETLEY_SOCKET moves the socket; the state directory comes
 # from HOME, so a shared daemon started with only the socket overridden persists
 # into the developer's real ~/.local/share/socketley/runtimes.  Measured, with
@@ -61,24 +70,61 @@ SUITE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/socketley-suite-home.XXXXXX") || {
     echo "ERROR: could not create a private HOME for this run"; exit 1; }
 export HOME="$SUITE_HOME"
 
-# Kill every daemon running THIS binary.
+# ─── The socket nothing is supposed to use ──────────────────────────────────
 #
-# Identity is the executable behind the process, read out of /proc/<pid>/exe,
-# never a command-line pattern.  `pkill -f "$SYS_BIN daemon"`, which is what this
-# used to be, matches any process whose command line merely contains that string
-# — including a shell running this script with the path in its arguments — and an
-# -f match one character too broad kills the run doing the killing.  The exe link
-# cannot be spoofed by an argument and distinguishes checkouts and worktrees from
-# each other, which is the property the old pattern was reaching for.
+# This was /tmp/socketley-test.sock — one path, shared by every run on the
+# machine — and a daemon was started on it for the whole suite to share.
+#
+# Nothing has driven that daemon since ad06685 gave each file its own.  Checked
+# rather than assumed: on 8d0658b, with the suite mid-run, the shared daemon's
+# state directory held nothing but `.adopted` and `ps -a` listed no runtime, and
+# every file in integration/ either calls daemon_isolate or exports a socket of
+# its own before its first CLI command.  What the shared daemon still did was
+# couple the runs — one fixed path, removed by whichever run finished first, and
+# a daemon on it that the other run's sweep was entitled to kill.
+#
+# So it is private, and nothing is started on it.  It survives only as the value
+# a test inherits before it isolates; the check after the test loop reports it if
+# one ever arrives here, rather than letting a test quietly share a daemon with
+# whatever runs next.
+export SOCKETLEY_SOCKET="$SUITE_HOME/suite.sock"
+
+# ─── Kill the daemons belonging to THIS run, and no others ──────────────────
+#
+# Two facts together, and neither is sufficient alone.
+#
+# The executable, read out of /proc/<pid>/exe.  `pkill -f "$SYS_BIN daemon"`,
+# which this used to be, matches any process whose command line merely contains
+# that string — including a shell running this script with the path in its
+# arguments — and an -f match one character too broad kills the run doing the
+# killing.  The exe link cannot be spoofed by an argument.
+#
+# And the port window, read out of the environment.  The exe alone was still too
+# broad, and that cost a day on 2026-08-06: an agent verifying in a worktree and
+# a suite run in the same worktree share the executable, so each run's sweep
+# SIGKILLed the other's daemons.  What it looks like is `Killed` in the log,
+# failures wandering between tests and the score falling run to run — a leak, or
+# the OOM killer, or anything but two runs of the same file.  SL_PORT_BASE is
+# exported above and inherited by every daemon any test of this run starts, and
+# it is different in every concurrent run by construction.
+#
+# The environment check cannot hit this script or the test shells, because they
+# do not satisfy the exe test — which is the trap the -f form fell into.
 sweep_own_daemons() {
-    local p exe
-    for p in $(pgrep -x socketley 2>/dev/null || true); do
+    local d p
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "/proc/$p/exe" -ef "$SYS_BIN" ] || continue
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
             *) continue ;;
         esac
-        exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
-        [ "$exe" = "$SYS_BIN" ] || continue
+        # NOT `grep -q`: it exits at its first match and SIGPIPEs the writer,
+        # and under `set -o pipefail` the pipeline then reports 141 — taking the
+        # "no match" branch precisely when it matched.  lib_daemon.sh carries the
+        # same warning for the same reason.
+        { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
+            | grep -x "SL_PORT_BASE=$SL_PORT_BASE" >/dev/null || continue
         kill -9 "$p" 2>/dev/null || true
     done
 }
@@ -89,12 +135,7 @@ sweep_own_daemons() {
 # individual tests each clean up their own daemon; this is the backstop for the
 # case where one of them dies before its trap can run.
 cleanup() {
-    if [ -n "$DAEMON_PID" ]; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
     sweep_own_daemons
-    rm -f "$SOCKETLEY_SOCKET"
     # After the daemons are gone, never before: the private HOME holds their
     # state directory, and removing it out from under a live daemon is the
     # "answers for a state directory that has been deleted underneath it" case
@@ -154,37 +195,40 @@ if [ "$unit_found" -eq 0 ]; then
     exit 1
 fi
 
-# Integration tests — start shared daemon
+# Integration tests — each file brings up its own daemon
 echo "--- Integration Tests ---"
 echo ""
 
-# Kill any existing daemon of the binary this run is about to use — including
-# anything a previous run of this suite left behind.
-#
-# Killing every socketley daemon on the machine would take out ones belonging to
-# a different checkout; two suites running from separate worktrees killed each
-# other's daemon mid-test, and the resulting failures pointed at whatever test
-# happened to be running rather than at the collision.  The executable is what
-# distinguishes them.
+# Anything a previous run left behind on this window.  It can only be a daemon
+# whose ports are already gone, because a window with a live listener in it is
+# not a window this run would have been given — but it would still be holding a
+# state directory that no longer exists, and it costs nothing to be sure.
 sweep_own_daemons
 sleep 0.2
-rm -f "$SOCKETLEY_SOCKET"
 
 export BIN="$SYS_BIN"
-"$BIN" daemon 2>/dev/null &
-DAEMON_PID=$!
-sleep 0.5
-
-if [ ! -S "$SOCKETLEY_SOCKET" ]; then
-    echo "ERROR: daemon failed to start"
-    exit 1
-fi
 
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
     name=$(basename "$script" .sh)
     run_test "$name" bash "$script"
 done
+
+# Did anything drive the run-level socket?
+#
+# Nothing should: every file in integration/ brings up a daemon of its own, on a
+# socket out of mktemp.  If one stops doing that, its first CLI command
+# auto-starts a daemon on the path exported at the top, and the evidence is that
+# the path now exists.  Named rather than ignored — a test sharing a daemon with
+# whatever ran before it is how this suite used to delete runtimes it had never
+# created, and the report for that was twenty red assertions in an innocent file.
+if [ -e "$SOCKETLEY_SOCKET" ]; then
+    echo "WARNING: a test used this run's fallback socket, $SOCKETLEY_SOCKET."
+    echo "         Every file here is supposed to isolate before its first CLI"
+    echo "         command; one of them did not, and shared a daemon with"
+    echo "         whichever files ran around it."
+    echo ""
+fi
 
 echo "=============================="
 echo " Summary: $PASS passed, $FAIL failed"

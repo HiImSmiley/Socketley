@@ -45,6 +45,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaerrreport
 
@@ -58,6 +59,8 @@ fail() {
 }
 
 NAMES="ok_srv rl_srv rl_be rl_wrk"
+# This file's seven ports, LE+0 through LE+6, in the order they are used.
+LE=$((SL_PORT_BASE+1810))
 
 cleanup() {
     # shellcheck disable=SC2086
@@ -108,11 +111,11 @@ refuse() {
 }
 
 # ── The script that does not parse ──────────────────────────────────────────
-refuse parse 21810 "$BROKEN" "')' expected"
+refuse parse $((LE+0)) "$BROKEN" "')' expected"
 
 # ── The two declaration validators ──────────────────────────────────────────
-refuse keyedfilters 21811 "$KEYED"    "an ordered array, not a keyed table"
-refuse badroute     21812 "$BADROUTE" "must start with '/'"
+refuse keyedfilters $((LE+1)) "$KEYED"    "an ordered array, not a keyed table"
+refuse badroute     $((LE+2)) "$BADROUTE" "must start with '/'"
 
 # ── Control 3: the log still has it ─────────────────────────────────────────
 #
@@ -131,7 +134,7 @@ GOOD="$SOCKETLEY_TMPD/good.lua"
 printf 'function on_message(m) end\n' > "$GOOD"
 
 OK_RC=0
-OK_OUT=$("$BIN" create server ok_srv -p 21813 --lua "$GOOD" --daemon-process -s 2>&1) || OK_RC=$?
+OK_OUT=$("$BIN" create server ok_srv -p $((LE+3)) --lua "$GOOD" --daemon-process -s 2>&1) || OK_RC=$?
 if [ "$OK_RC" = "0" ] && [ -z "$OK_OUT" ]; then pass; else
     fail "control: a script that loads says nothing and exits 0" \
          "create exited $OK_RC and said '${OK_OUT:-<nothing>}'" \
@@ -142,7 +145,7 @@ fi
 # ── reload-lua, for a runtime in the daemon ─────────────────────────────────
 RL="$SOCKETLEY_TMPD/reload.lua"
 printf 'function on_message(m) end\n' > "$RL"
-create_ok "reload subject created" "$BIN" create server rl_srv -p 21814 \
+create_ok "reload subject created" "$BIN" create server rl_srv -p $((LE+4)) \
     --lua "$RL" --daemon-process -s
 
 # Control 2: a reload that works is silent and succeeds.
@@ -178,9 +181,9 @@ esac
 # WARN and the command still exited 0.
 WRL="$SOCKETLEY_TMPD/wreload.lua"
 printf 'function on_message(m) end\n' > "$WRL"
-create_ok "worker backend created" "$BIN" create server rl_be -p 21815 -s
-create_ok "worker-backed proxy created" "$BIN" create proxy rl_wrk -p 21816 \
-    --backend "127.0.0.1:21815" --protocol http --lua "$WRL" -s
+create_ok "worker backend created" "$BIN" create server rl_be -p $((LE+5)) -s
+create_ok "worker-backed proxy created" "$BIN" create proxy rl_wrk -p $((LE+6)) \
+    --backend "127.0.0.1:$((LE+5))" --protocol http --lua "$WRL" -s
 sleep 1
 
 printf 'function on_message(m)\n  print(m\nend\n' > "$WRL"

@@ -40,6 +40,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate cmdreply
 
@@ -99,12 +100,12 @@ says "start with no arguments" "usage: start" 1 \
      "$BIN" start
 
 # ── send to a runtime that exists but is not running ────────────────────────
-create_ok "stopped runtime created" "$BIN" create server cr_down -p 21901
+create_ok "stopped runtime created" "$BIN" create server cr_down -p $((SL_PORT_BASE+1901))
 says "send to a stopped runtime" "runtime is not running: cr_down" 1 \
      "$BIN" send cr_down hello
 
 # ── Control 1: a command that works is silent ───────────────────────────────
-create_ok "running runtime created" "$BIN" create server cr_up -p 21902 -s
+create_ok "running runtime created" "$BIN" create server cr_up -p $((SL_PORT_BASE+1902)) -s
 sleep 0.4
 OK_RC=0
 OK_OUT=$("$BIN" send cr_up hello 2>&1) || OK_RC=$?
@@ -119,7 +120,7 @@ fi
 BROKEN="$SOCKETLEY_TMPD/broken.lua"
 printf 'function on_message(m)\n  print(m\nend\n' > "$BROKEN"
 says "create still reports a refusal" "could not load Lua script" 1 \
-     "$BIN" create server cr_never -p 21903 --lua "$BROKEN" --daemon-process -s
+     "$BIN" create server cr_never -p $((SL_PORT_BASE+1903)) --lua "$BROKEN" --daemon-process -s
 "$BIN" remove cr_never >/dev/null 2>&1 || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

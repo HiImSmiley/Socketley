@@ -32,9 +32,10 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate cacheaccess
-CACHE_PORT=19240
-SERVER_PORT=19241
+CACHE_PORT=$((SL_PORT_BASE+240))
+SERVER_PORT=$((SL_PORT_BASE+241))
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {

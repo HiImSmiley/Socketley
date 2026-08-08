@@ -55,11 +55,12 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate wfd
 
-BE_PORT=19694       # a plain backend, so the worker has something to answer with
-SRV_PORT=19690      # an unrelated server runtime — the port that must not leak
-PX_PORT=19692       # the worker's own port
+BE_PORT=$((SL_PORT_BASE+694))       # a plain backend, so the worker has something to answer with
+SRV_PORT=$((SL_PORT_BASE+690))      # an unrelated server runtime — the port that must not leak
+PX_PORT=$((SL_PORT_BASE+692))       # the worker's own port
 SRV_NAME=wfd_srv
 PX_NAME=wfd_px
 PASS=0; FAIL=0; TOTAL=0
@@ -236,7 +237,7 @@ else
 fi
 
 # (c) any LISTEN socket that is not the worker's own port.  Stated this way
-#     rather than as "not port 19690" so that a fourth listener nobody thought
+#     rather than as "not $SRV_PORT" so that a fourth listener nobody thought
 #     of is caught by the same line.
 STRAY=$(printf '%s\n' "$FDS" \
         | awk -v px=":$PX_HEX" '$2=="tcp" && $4=="0A" && $3 !~ px" *$" {print $1" -> "$3}')

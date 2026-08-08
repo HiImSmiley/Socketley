@@ -37,14 +37,15 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate hctls
 
-GOOD_BE=19771     # trusted certificate, answers the health path 200
-SICK_BE=19773     # trusted certificate, answers the health path 503
-UNTR_BE=19775     # answers everything 200, signed by a CA we never hand over
-HTTP_PX=19770     # the two backends above, probed with --health-check http
-TCP_PX=19772      # the same two, probed with --health-check tcp (the control)
-VER_PX=19774      # good + untrusted, probed with --health-check http
+GOOD_BE=$((SL_PORT_BASE+771))     # trusted certificate, answers the health path 200
+SICK_BE=$((SL_PORT_BASE+773))     # trusted certificate, answers the health path 503
+UNTR_BE=$((SL_PORT_BASE+775))     # answers everything 200, signed by a CA we never hand over
+HTTP_PX=$((SL_PORT_BASE+770))     # the two backends above, probed with --health-check http
+TCP_PX=$((SL_PORT_BASE+772))      # the same two, probed with --health-check tcp (the control)
+VER_PX=$((SL_PORT_BASE+774))      # good + untrusted, probed with --health-check http
 REQS=12
 PASS=0; FAIL=0; TOTAL=0
 BE_PIDS=()

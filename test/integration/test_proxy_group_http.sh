@@ -23,6 +23,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 # For daemon_required only.  This file keeps its own inline isolation; sourcing
 # defines functions without running anything, so nothing here changes hands.
 . "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 TMPD=$(mktemp -d /tmp/socketley-grphttp-XXXXXX)
@@ -33,7 +34,7 @@ DLOG="$TMPD/daemon.log"
 DPID=""
 
 # Ports come off one base so two runs can share a machine.
-PORT_BASE=${PORT_BASE:-19280}
+PORT_BASE=$((SL_PORT_BASE+280))
 GW_PORT=$((PORT_BASE+2))
 MEMBER_PORT=$((PORT_BASE+3))
 SINK_PORT=$((PORT_BASE+4))

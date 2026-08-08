@@ -35,11 +35,16 @@ set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT="$HERE/../.."
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate wcfgcov
+
+# The two ports this file binds, out of this run's window.
+WC_UDP_PORT=$((SL_PORT_BASE+1932))
+WC_HTTP_PORT=$((SL_PORT_BASE+1931))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -134,10 +139,10 @@ daemon_start "$BIN"
 #    This assertion used to be `--udp --tls`, which fails as a pair.  That pair
 #    is refused at create now, on both paths, so it no longer reaches a worker
 #    at all — a better answer, and a worse test.
-"$BIN" create server wc_udp -p 31932 --udp -s >/dev/null 2>&1
+"$BIN" create server wc_udp -p "$WC_UDP_PORT" --udp -s >/dev/null 2>&1
 sleep 2.5
 if command -v nc >/dev/null 2>&1; then
-    printf 'hello-from-a-datagram\n' | timeout 3 nc -u -q1 127.0.0.1 31932 >/dev/null 2>&1 || true
+    printf 'hello-from-a-datagram\n' | timeout 3 nc -u -q1 127.0.0.1 "$WC_UDP_PORT" >/dev/null 2>&1 || true
     sleep 2.5      # one stats push from the worker
     # total_messages, not bytes_in.  The datagram path does not add to bytes_in
     # at all — measured, and identically for a server in the daemon and one in a
@@ -160,14 +165,14 @@ fi
 #    file it had been pointed at.
 WWW=$(mktemp -d)
 echo "<h1>from the worker</h1>" > "$WWW/index.html"
-"$BIN" create server wc_http -p 31931 --http "$WWW" -s >/dev/null 2>&1
+"$BIN" create server wc_http -p "$WC_HTTP_PORT" --http "$WWW" -s >/dev/null 2>&1
 for _ in $(seq 1 40); do
-    curl -s -o /dev/null "http://127.0.0.1:31931/index.html" 2>/dev/null && break
+    curl -s -o /dev/null "http://127.0.0.1:$WC_HTTP_PORT/index.html" 2>/dev/null && break
     sleep 0.25
 done
 
 if command -v curl >/dev/null 2>&1; then
-    BODY=$(curl -s --max-time 5 "http://127.0.0.1:31931/index.html" 2>/dev/null)
+    BODY=$(curl -s --max-time 5 "http://127.0.0.1:$WC_HTTP_PORT/index.html" 2>/dev/null)
     case "$BODY" in
         *"from the worker"*) ok ;;
         *) bad "a worker serves the directory it was given" \

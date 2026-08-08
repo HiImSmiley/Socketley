@@ -37,6 +37,7 @@ SDIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${BIN:-$SDIR/../../bin/Release/socketley}"
 [ -x "$BIN" ] || { echo "ERROR: socketley not found at $BIN"; exit 1; }
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 . "$SDIR/lib_ready.sh"
 . "$SDIR/lib_create.sh"
@@ -65,7 +66,7 @@ LOAD_SECS=${LOAD_SECS:-4}
 # pass.  Far under what the machine does when it is idle (~25k/s observed).
 MIN_RATE=3000
 
-PORT_BASE=${PORT_BASE:-19860}
+PORT_BASE=$((SL_PORT_BASE+860))
 BE1=$((PORT_BASE+1)); BE2=$((PORT_BASE+2)); BE3=$((PORT_BASE+3))
 M1=$((PORT_BASE+11)); M2=$((PORT_BASE+12)); M3=$((PORT_BASE+13))
 GW=$((PORT_BASE+20))

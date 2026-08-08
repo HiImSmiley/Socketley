@@ -68,6 +68,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 TMPD=$(mktemp -d /tmp/socketley-failover-XXXXXX)
 export HOME="$TMPD/home"
@@ -76,7 +77,7 @@ mkdir -p "$HOME"
 
 # Ports come off one base so two runs can share a machine -- the socket and the
 # state directory already do.
-PORT_BASE=${PORT_BASE:-19570}
+PORT_BASE=$((SL_PORT_BASE+570))
 CTRL=$PORT_BASE
 BE1=$((PORT_BASE+1)); BE2=$((PORT_BASE+2)); BE3=$((PORT_BASE+3))
 PX=$((PORT_BASE+10))

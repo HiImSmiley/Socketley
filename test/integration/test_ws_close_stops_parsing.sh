@@ -16,6 +16,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — leftover state and a warm daemon change what the server
@@ -26,7 +27,7 @@ export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
 mkdir -p "$HOME"
 DPID=""
 
-SRV_PORT=19288
+SRV_PORT=$((SL_PORT_BASE+288))
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {

@@ -42,10 +42,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaproxy
 
-PB=${SOCKETLEY_PORT_BASE:-19330}
+PB=$((SL_PORT_BASE+330))
 BE_PORT=$((PB + 0))       # backend for the hook and introspection proxies
 HOOK_PORT=$((PB + 1))     # proxy carrying on_proxy_request / on_proxy_response
 INTRO_PORT=$((PB + 2))    # proxy answering with its own self.* values

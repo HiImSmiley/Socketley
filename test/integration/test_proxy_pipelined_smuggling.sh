@@ -32,6 +32,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 # Own daemon, socket and state directory: against the shared one this test does
 # not discriminate — auto-restart hides a crash, and a leftover runtime from an
@@ -43,8 +44,8 @@ mkdir -p "$HOME"
 DPID=""
 BEPID=""
 
-BE_PORT=19440
-PX_PORT=19441
+BE_PORT=$((SL_PORT_BASE+440))
+PX_PORT=$((SL_PORT_BASE+441))
 PX_NAME=smug_px
 RAW="$TMPDIR_T/backend.raw"
 OUT="$TMPDIR_T/client.out"

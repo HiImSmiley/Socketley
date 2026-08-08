@@ -33,10 +33,11 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate halfclose
 
-BE_PORT=19960
-PX_PORT=19961
+BE_PORT=$((SL_PORT_BASE+960))
+PX_PORT=$((SL_PORT_BASE+961))
 PX_NAME=halfclose_px
 NREQ=6
 PASS=0; FAIL=0; TOTAL=0

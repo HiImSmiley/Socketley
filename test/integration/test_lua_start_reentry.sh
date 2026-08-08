@@ -44,10 +44,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luastartre
 
-PB=${SOCKETLEY_PORT_BASE:-19210}
+PB=$((SL_PORT_BASE+210))
 P_A=$((PB + 0))   # parent using create{start=true}
 S_A=$((PB + 1))
 P_B=$((PB + 2))   # parent using create then socketley.start

@@ -33,6 +33,7 @@ SDIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${BIN:-$SDIR/../../bin/Release/socketley}"
 [ -x "$BIN" ] || { echo "ERROR: socketley not found at $BIN"; exit 1; }
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 
 . "$SDIR/lib_ready.sh"
 . "$SDIR/lib_create.sh"
@@ -48,7 +49,7 @@ PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
-PORT_BASE=${PORT_BASE:-19960}
+PORT_BASE=$((SL_PORT_BASE+960))
 BE=$((PORT_BASE+1))
 PX=$((PORT_BASE+2))     # TLS listener
 PXP=$((PORT_BASE+3))    # cleartext listener, the control

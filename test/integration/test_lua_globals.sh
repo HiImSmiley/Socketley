@@ -34,10 +34,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaglobals
 
-PB=${SOCKETLEY_PORT_BASE:-19350}
+PB=$((SL_PORT_BASE+350))
 RPC_PORT=$((PB + 0))    # the script under test, in the daemon
 HTTP_PORT=$((PB + 1))   # what socketley.http dials
 MADE_PORT=$((PB + 2))   # the runtime the script creates and removes

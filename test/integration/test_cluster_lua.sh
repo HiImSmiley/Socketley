@@ -15,6 +15,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 PASS=0; FAIL=0; TOTAL=0
 
 TMPD=$(mktemp -d /tmp/socketley-clua-XXXXXX)
@@ -26,7 +27,7 @@ SOCK_A="$TMPD/nodeA.sock"
 SOCK_B="$TMPD/nodeB.sock"
 # One base, so this file can be driven on a private port block while it is being
 # changed.  The default is the pair it has always used.
-PB=${SOCKETLEY_PORT_BASE:-19401}
+PB=$((SL_PORT_BASE+401))
 PORT_A=$((PB + 0))
 PORT_B=$((PB + 1))
 DAEMON_PIDS=()

@@ -43,10 +43,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luatmrcancel
 
-PB=${PB:-23050}
+PB=$((SL_PORT_BASE+1050))
 PORT=$((PB + 0))
 STOP_PORT=$((PB + 1))
 

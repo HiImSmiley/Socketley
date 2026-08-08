@@ -109,6 +109,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_ready.sh
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 PASS=0; FAIL=0; HERR=0; TOTAL=0
 
@@ -155,12 +156,12 @@ state_dir() {
     printf '%s\n' "$base/runtimes"
 }
 
-TLS_PORT=19741
-LINE_PORT=19742
-MTLS_PORT=19743
-BAD_PORT=19744
-LEADER_PORT=19745
-FOLLOWER_PORT=19746
+TLS_PORT=$((SL_PORT_BASE+741))
+LINE_PORT=$((SL_PORT_BASE+742))
+MTLS_PORT=$((SL_PORT_BASE+743))
+BAD_PORT=$((SL_PORT_BASE+744))
+LEADER_PORT=$((SL_PORT_BASE+745))
+FOLLOWER_PORT=$((SL_PORT_BASE+746))
 
 cleanup() {
     [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true

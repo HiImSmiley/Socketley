@@ -14,10 +14,11 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate cacherepl
-LEADER_PORT=19290
-FOLLOWER_PORT=19291
-PLAIN_PORT=19292
+LEADER_PORT=$((SL_PORT_BASE+290))
+FOLLOWER_PORT=$((SL_PORT_BASE+291))
+PLAIN_PORT=$((SL_PORT_BASE+292))
 KEYS=${KEYS:-20000}
 PASS=0; FAIL=0; TOTAL=0
 

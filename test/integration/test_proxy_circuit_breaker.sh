@@ -62,10 +62,11 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 daemon_isolate breaker
-OK_BE=19901; OK_PROXY=19900
-BAD_BE=19911; BAD_PROXY=19910
-CUT_BE=19921; CUT_PROXY=19920
+OK_BE=$((SL_PORT_BASE+901)); OK_PROXY=$((SL_PORT_BASE+900))
+BAD_BE=$((SL_PORT_BASE+911)); BAD_PROXY=$((SL_PORT_BASE+910))
+CUT_BE=$((SL_PORT_BASE+921)); CUT_PROXY=$((SL_PORT_BASE+920))
 PASS=0; FAIL=0; HERR=0; TOTAL=0
 BE_PIDS=()
 

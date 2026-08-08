@@ -45,10 +45,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luareload
 
-PB=${SOCKETLEY_PORT_BASE:-19120}
+PB=$((SL_PORT_BASE+120))
 IN_PORT=$((PB + 0))     # the runtime in the daemon
 OOP_PORT=$((PB + 1))    # the runtime in a worker
 
