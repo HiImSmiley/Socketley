@@ -1,5 +1,6 @@
 #include "cli.h"
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <sol/sol.hpp>
 
@@ -72,17 +73,67 @@ int cli_config(int argc, char** argv)
     if (!runtimes.valid())
         return 0;
 
+    // ─── WHAT THE DAEMON SAID, AND WHETHER ANYBODY LISTENED ─────────────────
+    //
+    // Every create below used to be sent with `if (ipc_send(...) < 0)`, which
+    // asks only whether the socket answered.  The exit code and the sentence
+    // the daemon wrote were both dropped, the loop went on, and the function
+    // ended with `return 0`.  A configuration file whose every runtime failed
+    // reported success and printed nothing.  Measured, against a config naming
+    // a script that does not exist:
+    //
+    //     $ socketley --lua badconf.lua ; echo $?
+    //     0                                     <- silence
+    //
+    //     $ socketley create server conf_a -p 18703 --lua /nonexistent/x.lua -s
+    //     could not load Lua script: /nonexistent/x.lua
+    //     script error: cannot open /nonexistent/x.lua: No such file or directory
+    //     1
+    //
+    // The daemon wrote the diagnosis both times.  Only one of the two callers
+    // read it.
+    //
+    // Collected rather than returned at the first failure: a config file is a
+    // set of runtimes, and the eleven that came up are worth having.  What is
+    // not on offer is finishing quietly.
+    int failed = 0;
+
     for (auto& pair : runtimes)
     {
         sol::table t = pair.second;
-        std::string type_str = t["type"];
-        std::string name     = t["name"];
+
+        // sol::optional, like every other field below.  Read as a plain
+        // std::string these two throw on a table that has no such key — and
+        // sol2's safety checks follow NDEBUG, so in Release they do not throw,
+        // they convert whatever is there.  A config with a misspelled key got
+        // undefined behaviour in the build everybody runs.
+        sol::optional<std::string> type_opt = t["type"].get<sol::optional<std::string>>();
+        sol::optional<std::string> name_opt = t["name"].get<sol::optional<std::string>>();
+
+        if (!name_opt || name_opt->empty())
+        {
+            std::cerr << "runtime entry without a name: every entry in `runtimes` "
+                         "needs name and type\n";
+            ++failed;
+            continue;
+        }
+        if (!type_opt || type_opt->empty())
+        {
+            std::cerr << "runtime \"" << *name_opt << "\" has no type "
+                         "(server, client, proxy or cache)\n";
+            ++failed;
+            continue;
+        }
+
+        const std::string type_str = *type_opt;
+        const std::string name     = *name_opt;
 
         runtime_type type;
 
         if (!parse_runtime_type(type_str.c_str(), type))
         {
             std::cerr << "unknown runtime type: " << type_str << "\n";
+            ++failed;
             continue;
         }
 
@@ -230,12 +281,50 @@ int cli_config(int argc, char** argv)
             command += " -s";
 
         std::string response;
-        if (ipc_send(command, response) < 0)
+        const int rc = ipc_send(command, response);
+
+        if (rc < 0)
         {
+            // No daemon is a different thing from a runtime that would not
+            // build: nothing after this can succeed either, so it stops here.
             std::cerr << "failed to connect to daemon\n";
-            return 1;
+            return 2;
         }
 
+        if (rc != 0)
+        {
+            std::cerr << "could not create " << name << ":\n";
+            if (!response.empty())
+            {
+                // The daemon's own sentence, indented so a multi-line refusal
+                // reads as belonging to the runtime named above it.
+                std::istringstream lines(response);
+                std::string line;
+                while (std::getline(lines, line))
+                    std::cerr << "  " << line << "\n";
+            }
+            else
+            {
+                std::cerr << "  the daemon refused it and said nothing "
+                             "(exit " << rc << ")\n";
+            }
+            ++failed;
+            continue;
+        }
+
+        // Success is silent, per this project's convention — but a create that
+        // printed something while succeeding has something to say (an on_start
+        // that raised, for one), and dropping it here is what this whole change
+        // is about.
+        if (!response.empty())
+            std::cout << response;
+    }
+
+    if (failed > 0)
+    {
+        std::cerr << failed << " of " << runtimes.size()
+                  << " runtimes in this configuration were not created\n";
+        return 1;
     }
 
     return 0;
