@@ -87,7 +87,51 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
     return started;
 }
 
+// ─── WHY EVERY CASCADE CARRIES A SET OF WHERE IT HAS BEEN ───────────────────
+//
+// `owner` is a plain string on the instance and nothing validates it:
+// set_owner() is a bare setter, `attach --owner` writes whatever it is given,
+// a script's socketley.create writes the creating runtime's name, and the
+// daemon's restore writes back whatever the state file says.  So the ownership
+// relation is a directed GRAPH, and it is free to contain a cycle — including
+// the shortest one, a runtime that names itself.
+//
+// The three functions below walk that graph, and they used to walk it with no
+// memory of where they had been.  A runtime that owns itself is its own child,
+// so the recursion had no bottom.  Measured on the parent commit, two commands
+// and no traffic at all:
+//
+//     socketley attach server selfown 18760 --owner selfown
+//     socketley stop selfown
+//     failed to connect to daemon          <- SIGSEGV, core dumped
+//
+// Every other runtime that daemon was holding went with it.  A two-runtime
+// cycle (a owns b, b owns a) did the same, and `remove` on either shape did not
+// crash but stopped answering — remove_children() recurses without exhausting
+// the stack, so the daemon kept its socket and had to be killed.
+//
+// The owner is persisted and restored, so a cycle survives a restart: a daemon
+// that met one was permanently one command away from dying again.  That is why
+// the fix is here and not only at the setters — validating set_owner() would
+// leave every cycle already written to disk arriving exactly as before.
+//
+// The set is threaded through rather than being a member because a cascade is
+// one call tree: two of them must not share state, and a script's on_stop is
+// entitled to start a second one from inside the first.
+//
+// It also makes the double walk below harmless.  The loop in stop_cascading()
+// descends into a child's subtree and then calls stop_cascading() on the child,
+// which descends into the same subtree again; without the set that was
+// redundant work on every stop, and with it the second pass finds everything
+// already marked and returns immediately.
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
+{
+    cascade_seen seen;
+    return stop_cascading(name, loop, seen);
+}
+
+bool runtime_manager::stop_cascading(std::string_view name, event_loop& loop,
+                                     cascade_seen& seen)
 {
     // The same shape as start(), for the same reason and with the same
     // reasoning: stop() runs the script's on_stop, which may call back in here.
@@ -102,28 +146,45 @@ bool runtime_manager::stop(std::string_view name, event_loop& loop)
     if (!inst->stop(loop))
         return false;
 
+    // Marked before descending, and the answer is what decides whether to
+    // descend at all: a name already on this path has had its children walked
+    // by the frame that put it there.
+    if (!seen.insert(std::string(name)).second)
+    {
+        publish_endpoints();
+        return true;
+    }
+
     // Cascade to children based on child_policy
     auto children = get_children(name);
     for (const auto& child : children)
     {
+        if (seen.count(child))
+            continue;
+
         auto* child_inst = get(child);
         if (!child_inst) continue;
 
         if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
-            remove_children(child, loop);
+            remove_children_cascading(child, loop, seen);
         else
-            stop_children(child, loop);
+            stop_children_cascading(child, loop, seen);
+
+        // Re-resolved: the walk above ran on_stop for a whole subtree, and a
+        // script there is entitled to have removed this child.
+        child_inst = get(child);
+        if (!child_inst) continue;
 
         if (child_inst->get_child_policy() == runtime_instance::child_policy::remove)
         {
             if (child_inst->get_state() == runtime_running)
-                stop(child, loop);
+                stop_cascading(child, loop, seen);
             remove(child);
         }
         else
         {
             if (child_inst->get_state() == runtime_running)
-                stop(child, loop);
+                stop_cascading(child, loop, seen);
         }
     }
 
@@ -454,27 +515,53 @@ std::vector<std::string> runtime_manager::get_children(std::string_view parent_n
     return children;
 }
 
+// The public spellings start a fresh walk.  See the note above stop() for why
+// every walk carries a set of the names it has already descended into.
 void runtime_manager::stop_children(std::string_view parent_name, event_loop& loop)
 {
-    auto children = get_children(parent_name);
-    for (const auto& child : children)
-    {
-        // Recurse: stop grandchildren first
-        stop_children(child, loop);
-        stop(child, loop);
-    }
+    cascade_seen seen;
+    seen.insert(std::string(parent_name));
+    stop_children_cascading(parent_name, loop, seen);
 }
 
 void runtime_manager::remove_children(std::string_view parent_name, event_loop& loop)
 {
+    cascade_seen seen;
+    seen.insert(std::string(parent_name));
+    remove_children_cascading(parent_name, loop, seen);
+}
+
+void runtime_manager::stop_children_cascading(std::string_view parent_name,
+                                              event_loop& loop, cascade_seen& seen)
+{
     auto children = get_children(parent_name);
     for (const auto& child : children)
     {
+        // Marked on the way in.  Without this a child that owns its own parent
+        // sends the next line straight back here with the same argument.
+        if (!seen.insert(child).second)
+            continue;
+
+        // Recurse: stop grandchildren first
+        stop_children_cascading(child, loop, seen);
+        stop_cascading(child, loop, seen);
+    }
+}
+
+void runtime_manager::remove_children_cascading(std::string_view parent_name,
+                                                event_loop& loop, cascade_seen& seen)
+{
+    auto children = get_children(parent_name);
+    for (const auto& child : children)
+    {
+        if (!seen.insert(child).second)
+            continue;
+
         // Recurse: remove grandchildren first
-        remove_children(child, loop);
+        remove_children_cascading(child, loop, seen);
         auto* inst = get(child);
         if (inst && inst->get_state() == runtime_running)
-            stop(child, loop);
+            stop_cascading(child, loop, seen);
         remove(child);
     }
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -76,7 +77,16 @@ public:
     // Cluster event dispatch: forward topology changes to all runtimes with Lua callbacks
     void dispatch_cluster_events(const std::vector<cluster_event>& events);
 
-    // Ownership cascading
+    // ── Ownership cascading ─────────────────────────────────────────────────
+    //
+    // Stopping a runtime applies each child's on_parent_stop policy to it, and
+    // to that child's own descendants.  The walk is over a graph, not a tree:
+    // `owner` is a plain string that nothing validates, so it can name a
+    // runtime already on the path — including the runtime itself.
+    //
+    // Every entry point below therefore carries a set of the names it has
+    // already descended into.  See the note on cascade_seen in the .cpp for the
+    // crash that arrives without it.
     std::vector<std::string> get_children(std::string_view parent_name) const;
     void stop_children(std::string_view parent_name, event_loop& loop);
     void remove_children(std::string_view parent_name, event_loop& loop);
@@ -175,6 +185,20 @@ public:
     mutable std::shared_mutex mutex;
 
 private:
+    // The names one cascade has already descended into.
+    //
+    // Not a member: a cascade is a single call tree, and two of them must not
+    // share state.  It is threaded through the three functions below instead,
+    // which is also what keeps the public entry points re-entrant — a script's
+    // on_stop may call socketley.stop from inside one of these.
+    using cascade_seen = std::unordered_set<std::string>;
+
+    // The recursive halves of stop()/stop_children()/remove_children().  The
+    // public spellings create an empty set and call these.
+    bool stop_cascading(std::string_view name, event_loop& loop, cascade_seen& seen);
+    void stop_children_cascading(std::string_view parent, event_loop& loop, cascade_seen& seen);
+    void remove_children_cascading(std::string_view parent, event_loop& loop, cascade_seen& seen);
+
     // Takes over an instance that has just left the map.  Called with the map
     // lock released.
     void retire(std::unique_ptr<runtime_instance> inst);
