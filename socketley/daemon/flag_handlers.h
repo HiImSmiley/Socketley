@@ -3,6 +3,7 @@
 #include <string_view>
 #include <cstdint>
 #include <charconv>
+#include <limits>
 
 #include "../cli/arg_parser.h"
 #include "../cli/command_hashing.h"
@@ -21,12 +22,23 @@ inline bool parse_uint32(std::string_view sv, uint32_t& out)
     return ec == std::errc{} && ptr == sv.data() + sv.size();
 }
 
+// The same contract as the two above: the whole string, or nothing.
+//
+// std::stod stops at the first character it cannot use and reports success for
+// what it read, so `--rate-limit 5abc` was accepted as 5 and `--rate-limit 0x10`
+// as 16.  It also throws, which is why it is wrapped — and the wrapper is the
+// reason this one allocates a std::string under a comment promising
+// allocation-free parsing.  The position stod reports is what closes the gap.
 inline bool parse_double(std::string_view sv, double& out)
 {
+    if (sv.empty()) return false;
     // Simple manual parse for doubles (from_chars for double is not always available)
     try {
         std::string s(sv);
-        out = std::stod(s);
+        size_t consumed = 0;
+        const double v = std::stod(s, &consumed);
+        if (consumed != s.size()) return false;
+        out = v;
         return true;
     } catch (...) {
         return false;
@@ -34,6 +46,32 @@ inline bool parse_double(std::string_view sv, double& out)
 }
 
 // Parse size with optional K/M/G suffix (e.g. "100M" -> 104857600)
+//
+// ─── TWO THINGS THIS DID NOT CHECK, AND WHAT THEY COST ──────────────────────
+//
+// The two parsers above both end with `ptr == sv.data() + sv.size()` — the
+// whole string had to be consumed.  This one did not, and from_chars reports
+// success for a prefix.  So a suffix it does not know was simply left on the
+// end and the number in front of it taken:
+//
+//     --maxmemory 100M    ->  104857600     correct
+//     --maxmemory 100MB   ->        100     accepted
+//     --maxmemory 100X    ->        100     accepted
+//
+// `100MB` is the likeliest typo there is for a size, and it configured a cache
+// to a hundred bytes — one that runs, accepts connections and stores nothing.
+//
+// The multiplication was unchecked as well, and that one is worse for being
+// plausible: 2^34 G is exactly 2^64, so it wraps to zero —
+//
+//     --maxmemory 17179869184G  ->  0
+//
+// and 0 is documented as "unlimited" (socketley.1, MEMORY).  Asking for an
+// absurdly high cap therefore removed the cap, which is the one direction a
+// misread limit must never fail in.
+//
+// Both are refusals now rather than corrections: there is no reading of `100MB`
+// that is safe to guess at, and the flag's own error names the suffixes.
 inline bool parse_size_suffix(std::string_view sv, size_t& out)
 {
     if (sv.empty()) return false;
@@ -46,7 +84,25 @@ inline bool parse_size_suffix(std::string_view sv, size_t& out)
     uint64_t val;
     auto [ptr, ec] = std::from_chars(num_part.data(), num_part.data() + num_part.size(), val);
     if (ec != std::errc{}) return false;
-    out = static_cast<size_t>(val * multiplier);
+
+    // The whole of it, digits and one known suffix and nothing else.
+    if (ptr != num_part.data() + num_part.size()) return false;
+
+    // Checked before it is done, not after: the wrapped value is
+    // indistinguishable from a legitimate small one.
+    //
+    // size_t is the accumulator rather than uint64_t, so the bound is the one
+    // the caller will actually store into.  On this target they are the same
+    // width and the static_assert says so out loud — written the other way
+    // round, a `bytes > size_t::max()` after the fact would be an always-false
+    // comparison here and a real one on a 32-bit build, which is the sort of
+    // check that reads as covered and is not.
+    static_assert(sizeof(size_t) >= sizeof(uint32_t),
+                  "parse_size_suffix accumulates into size_t");
+    if (val > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / multiplier)
+        return false;
+
+    out = static_cast<size_t>(val) * multiplier;
     return true;
 }
 

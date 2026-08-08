@@ -132,8 +132,14 @@ assert_same "server took the edit and nothing else" "$WORK/svr-edited.json" "$WO
 
 # ── CACHE ────────────────────────────────────────────────────────────────────
 # A different document: persistent_path, cache_mode, max_memory, eviction.
+# 4M, not 4mb.  It was written "4mb" here, and parse_size_suffix took the
+# digits and dropped the rest — so this cache was configured to FOUR BYTES and
+# the line read as four megabytes to everyone since.  Nothing caught it because
+# this file asserts that the round trip preserves the value, never what the
+# value is.  The parser refuses an unknown suffix now, which is what turned a
+# silent misreading into a failing create and brought the typo up.
 "$BIN" create cache rt_cache -p "$CACHE_PORT" \
-    --maxmemory 4mb --eviction allkeys-lru --mode admin \
+    --maxmemory 4M --eviction allkeys-lru --mode admin \
     --persistent "$WORK/cache.aof" >/dev/null 2>&1
 
 "$BIN" show rt_cache > "$WORK/cache.json"

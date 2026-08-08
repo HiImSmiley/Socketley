@@ -437,6 +437,42 @@ project "test_name_resolver"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: flag value parsers ───
+--
+-- Header-only, so nothing links against the daemon: the four parsers are
+-- inline in flag_handlers.h and that is the whole dependency.
+
+project "test_flag_parsers"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_flag_parsers.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: managed runtime ───
 
 project "test_request_channel"
