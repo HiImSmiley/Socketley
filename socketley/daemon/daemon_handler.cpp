@@ -3270,7 +3270,18 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 srv->set_master_forward(true);
             srv->clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
-                srv->add_upstream_target(u);
+            {
+                // Reported rather than dropped.  This is a document a person
+                // edited, and the list was cleared a line ago — silently
+                // storing fewer upstreams than the document names is the
+                // half-applied import this command already refuses elsewhere.
+                if (!srv->add_upstream_target(u))
+                {
+                    conn->write_buf = "invalid upstream address: " + u +
+                                      " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             break;
         }
         case runtime_client:

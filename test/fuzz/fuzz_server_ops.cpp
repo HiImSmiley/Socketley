@@ -1000,8 +1000,11 @@ void run_step(world& w, const step& s)
             // Port 9 (discard) with nothing on it: the connect fails at once and
             // the runtime arms a reconnect timer, which is the request a stop has
             // to withdraw or the instance is held for up to thirty seconds.
+            // The literal is a valid address, so this cannot refuse; the result
+            // is consumed rather than cast away because (void) does not silence
+            // nodiscard on this toolchain.
             if (w.rt && w.rt->get_state() != runtime_running)
-                w.rt->add_upstream_target("127.0.0.1:9");
+                if (!w.rt->add_upstream_target("127.0.0.1:9")) {}
             break;
 
         case OP_CACHE:

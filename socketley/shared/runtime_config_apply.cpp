@@ -1,5 +1,6 @@
 #include "runtime_config_apply.h"
 
+#include "logging.h"
 #include "state_persistence.h"
 #include "runtime_instance.h"
 #include "../runtime/server/server_instance.h"
@@ -102,7 +103,22 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             if (cfg.http_cache)          srv.set_http_cache(true);
             srv.clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
-                srv.add_upstream_target(u);
+            {
+                // The worker's config frame carries what the daemon's state
+                // file holds, so this is the same situation as the boot restore
+                // in daemon.cpp and takes the same answer: log and skip.  There
+                // is no command in flight to refuse to, and dropping the whole
+                // runtime over one unreadable entry would take down a listener
+                // that the rest of the configuration can still serve.
+                //
+                // A configuration typed today cannot reach here — `create`,
+                // `edit` and `import` all refuse an unusable upstream before it
+                // is ever written down.  What reaches here is a file an older
+                // daemon wrote.
+                if (!srv.add_upstream_target(u))
+                    LOG_WARN(("dropping upstream \"" + u +
+                              "\": the port is not a number between 1 and 65535").c_str());
+            }
             break;
         }
         case runtime_client:

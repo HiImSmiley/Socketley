@@ -450,17 +450,35 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
             }
             std::string_view upstream_str = pa.args[++i];
             // Parse semicolon-separated: "host1:port1;host2:port2"
+            //
+            // A refused address fails the whole flag rather than being skipped:
+            // `--upstream a:8080;b:abc` asked for two targets, and coming up
+            // with one of them is the silent half-configuration this refusal
+            // exists to stop.  The instance is discarded by the caller on a
+            // non-zero return, so the partly-filled list goes with it.
             size_t start = 0;
             size_t semi;
             while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
             {
                 auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty())
-                    srv->add_upstream_target(addr);
+                if (!addr.empty() && !srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
                 start = semi + 1;
             }
             if (start < upstream_str.size())
-                srv->add_upstream_target(upstream_str.substr(start));
+            {
+                auto addr = upstream_str.substr(start);
+                if (!srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             return 0;
         }
         default:
@@ -1175,17 +1193,34 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
                 return 1;
             }
             std::string_view upstream_str = pa.args[++i];
+            // Same contract as the create path above.  On `edit` the list has
+            // already been cleared by the time this runs, so a refusal here
+            // leaves the runtime with fewer upstreams than it started with —
+            // which is why it is reported rather than skipped, and why the
+            // message names the address that could not be read.
             size_t start = 0;
             size_t semi;
             while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
             {
                 auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty())
-                    srv->add_upstream_target(addr);
+                if (!addr.empty() && !srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
                 start = semi + 1;
             }
             if (start < upstream_str.size())
-                srv->add_upstream_target(upstream_str.substr(start));
+            {
+                auto addr = upstream_str.substr(start);
+                if (!srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             return 0;
         }
         default:

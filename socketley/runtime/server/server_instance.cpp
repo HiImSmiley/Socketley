@@ -487,7 +487,22 @@ bool server_instance::get_http_cache() const
     return m_http_cache_enabled;
 }
 
-void server_instance::add_upstream_target(std::string_view addr)
+// ─── AN UPSTREAM WITHOUT A USABLE PORT IS NOT AN UPSTREAM ───────────────────
+//
+// The from_chars result was discarded, so `--upstream host:abc`, `--upstream
+// host:` and any port above 65535 all left resolved_port at 0 and were stored
+// anyway.  A target that can never be connected to sat in the list looking
+// exactly like one that could, and `upstream_try_connect` discovered it at
+// traffic time — the same shape as the proxy's backend, one runtime over.
+//
+// The address with no colon at all is a different thing and stays: it is the
+// documented spelling for a target whose port comes from elsewhere, and it has
+// always stored 0 deliberately.  Only an address that ASKED for a port and gave
+// an unusable one is refused.
+//
+// Returns false without storing anything, so a caller that can refuse has a
+// list it did not half-fill.
+bool server_instance::add_upstream_target(std::string_view addr)
 {
     upstream_target t;
     t.address = std::string(addr);
@@ -496,7 +511,11 @@ void server_instance::add_upstream_target(std::string_view addr)
     {
         t.resolved_host = std::string(addr.substr(0, colon));
         auto port_sv = addr.substr(colon + 1);
-        std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), t.resolved_port);
+        const auto [ptr, ec] = std::from_chars(
+            port_sv.data(), port_sv.data() + port_sv.size(), t.resolved_port);
+        if (ec != std::errc{} || ptr != port_sv.data() + port_sv.size() ||
+            t.resolved_port == 0)
+            return false;
     }
     else
     {
@@ -504,6 +523,7 @@ void server_instance::add_upstream_target(std::string_view addr)
         t.resolved_port = 0;
     }
     m_upstream_targets.push_back(std::move(t));
+    return true;
 }
 
 void server_instance::clear_upstream_targets()

@@ -532,7 +532,10 @@ public:
     void rebuild_http_cache();
 
     // Upstream connections
-    void add_upstream_target(std::string_view addr);
+    // False when the address named a port that cannot work; nothing is stored
+    // in that case.  See the definition for which spellings are refused and
+    // why a bare host is not one of them.
+    [[nodiscard]] bool add_upstream_target(std::string_view addr);
     void clear_upstream_targets();
     const std::vector<upstream_target>& get_upstream_targets() const;
 
