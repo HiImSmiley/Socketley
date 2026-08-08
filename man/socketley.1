@@ -339,7 +339,11 @@ and
 .B set_interval
 timer and every
 .B socketley.subscribe
-registration it holds is severed, so nothing it armed can fire afterwards.
+registration it holds is severed, so nothing it armed can fire afterwards \(em
+and none of the three can be armed again until it is started, which is what
+stops a script that called
+.B socketley.stop
+on itself from putting one straight back.
 .TP
 .BI "remove " "name|pattern" "..."
 Remove one or more runtimes from the registry. Cannot be undone.
@@ -3553,7 +3557,19 @@ Both return
 .B 0
 and arm nothing when
 .I ms
-is not greater than zero, or when the runtime has no event loop. Real ids
+is not greater than zero, when the runtime has no event loop, or when the
+runtime has been stopped \(em the last of those covers the script that calls
+.B socketley.stop
+on its own runtime and carries on, since
+.B stop
+returns to it and everything after that line runs on a runtime that is already
+down. A
+.B start
+lifts it, before
+.BR on_start ,
+so a restarted runtime arms exactly as it did the first time.
+.B socketley.subscribe
+answers 0 in the same situation and for the same reason. Real ids
 start at 1, so
 .B 0
 is unambiguous; the reason is written to the daemon's log, because a timer that
@@ -3595,7 +3611,14 @@ Multiple subscriptions to the same channel are all fired in registration order.
 .IP
 Returns an integer id for
 .BR socketley.unsubscribe() .
-Ids start at 1 and are never reused.
+Ids start at 1 and are never reused, so
+.B 0
+is a refusal: it means the runtime has been stopped and this registration would
+have outlived the stop that ended the others. See
+.B socketley.set_interval
+for the whole of it \(em the two refuse together and a
+.B start
+lifts both.
 .IP
 Only a
 .B running

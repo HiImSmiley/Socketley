@@ -225,6 +225,19 @@ bool runtime_instance::start(event_loop& loop)
 
     m_state.store(runtime_running, std::memory_order_release);
     m_start_time = std::chrono::system_clock::now();
+
+    // The latch stop() raised comes down here, and here rather than anywhere
+    // later: on_start is where a script arms its timers and makes its
+    // subscriptions, so a latch still up at that line would make `stop; start`
+    // produce a runtime that is up, serving, and unable to schedule anything —
+    // green from every angle an operator has, and a worse defect than the one
+    // the latch exists for.  After the state store, so a callback that reads
+    // self.state during on_start sees the same answer this line acted on.
+#ifndef SOCKETLEY_NO_LUA
+    if (m_lua)
+        m_lua->allow_registrations();
+#endif
+
     // The answer is deliberately not acted on here.  A raise in on_start has
     // never failed a start: the runtime is already listening by this line, the
     // state is already running, and turning a script's error into "the runtime

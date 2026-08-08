@@ -335,6 +335,28 @@ public:
     // from inside a delivery — see the definition — and idempotent.
     void cancel_subscriptions();
 
+    // ─── The latch the two severances leave behind ──────────────────────────
+    //
+    // Severing is not enough on its own, because stop() RETURNS — to a script,
+    // when socketley.stop is what called it — and whatever that handler does
+    // next runs on a runtime that is already down.  set_interval and
+    // socketley.subscribe were happy to arm it again, which put back the exact
+    // defect the severance exists to prevent: measured, an interval firing 41
+    // times in two seconds on a runtime `ls` reported as Stopped.
+    //
+    // So both severances raise this, and while it is up the two calls that
+    // SCHEDULE work — the timers and the subscriptions, and nothing else —
+    // refuse and say so.  It is deliberately not a general "the script may not
+    // run" gate: socketley.log, .http and the json calls do their work and
+    // return, and a handler that was entitled to be running when it started is
+    // entitled to finish.  What it may not do is leave something behind.
+    //
+    // start() lowers it, before on_start, because on_start is where a script
+    // arms both and a latch that never opened would make `stop; start` a way to
+    // get a runtime that is up and can schedule nothing.
+    bool registrations_severed() const { return m_severed; }
+    void allow_registrations() { m_severed = false; }
+
     // Callback bitmask constants
     enum : uint32_t {
         CB_ON_START              = 1u << 0,
@@ -698,6 +720,12 @@ private:
     // bool: a subscriber may publish, and a publish may come back here.
     unsigned m_dispatch_depth{0};
 
+    // See registrations_severed().  Raised by either severance, lowered by
+    // start().  False here rather than in a constructor body because a fresh
+    // context belongs to a runtime that is about to run: reload_lua_script()
+    // builds one on a runtime that never stopped, and it must be able to arm.
+    bool m_severed{false};
+
     // Whether unsubscribe() marked anything while m_dispatch_depth was nonzero.
     bool m_subscriptions_dirty{false};
 
@@ -741,6 +769,8 @@ public:
     void update_self_state(const char*) {}
     void cancel_timers() {}
     void cancel_subscriptions() {}
+    bool registrations_severed() const { return false; }
+    void allow_registrations() {}
 
     bool has_on_start()          const { return false; }
     bool has_on_stop()           const { return false; }

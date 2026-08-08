@@ -1188,6 +1188,12 @@ void lua_context::settle_subscriptions()
 // and it is what the id's contract says.
 void lua_context::cancel_subscriptions()
 {
+    // Up before anything is torn down, and it stays up until start() lowers it.
+    // See registrations_severed(): severing what is armed does not stop the
+    // script that called socketley.stop from arming more the moment stop()
+    // returns to it.
+    m_severed = true;
+
     // Nothing is walking the pending queue — dispatch_publish reads the map —
     // so these go outright whether or not a dispatch is in flight.  They are
     // registrations made during this dispatch, which is to say made by a script
@@ -1224,6 +1230,13 @@ void lua_context::cancel_subscriptions()
 // would name timers this context has already given away.
 void lua_context::cancel_timers()
 {
+    // The same latch, raised by both severances rather than by one of them:
+    // they are called together from stop() and they answer the same sentence,
+    // and a script that re-arms afterwards re-arms whichever it likes.  The
+    // destructor reaches this too, where it costs nothing — the context is
+    // going, so nothing will read it again.
+    m_severed = true;
+
     for (auto* p : m_active_timers)
         sever_timer(static_cast<lua_timer*>(p));
     m_active_timers.clear();
@@ -2732,6 +2745,15 @@ void lua_context::register_bindings(runtime_instance* owner)
     // move from a callback that never fires to a type error at a line that has
     // nothing wrong with it.
     sk["set_timeout"] = [this, owner](int ms, sol::protected_function fn) -> int {
+        // A third refusal, and the same 0.  See registrations_severed(): the
+        // runtime is down and this call would schedule work for it.
+        if (m_severed)
+        {
+            std::cerr << lua_diag::tag(owner->get_name())
+                      << " set_timeout(" << ms << ") armed nothing: this "
+                         "runtime has been stopped" << std::endl;
+            return 0;
+        }
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0)
         {
@@ -2763,6 +2785,15 @@ void lua_context::register_bindings(runtime_instance* owner)
     //
     // 0 on refusal, said out loud; see set_timeout above for the whole of it.
     sk["set_interval"] = [this, owner](int ms, sol::protected_function fn) -> int {
+        // See set_timeout above.  This is the one the measurement came from: 41
+        // ticks in two seconds on a runtime that had been stopped.
+        if (m_severed)
+        {
+            std::cerr << lua_diag::tag(owner->get_name())
+                      << " set_interval(" << ms << ") armed nothing: this "
+                         "runtime has been stopped" << std::endl;
+            return 0;
+        }
         auto* loop = owner->get_event_loop();
         if (!loop || ms <= 0)
         {
@@ -2849,6 +2880,17 @@ void lua_context::register_bindings(runtime_instance* owner)
     // handlers on one channel, of which the script wants to drop one.
     sk["subscribe"] = [this](std::string cache_name, std::string channel,
                              sol::protected_function fn) -> int {
+        // 0, which is never an id — see the note above on where ids start.  The
+        // runtime is down and a registration made now would outlive the stop
+        // that was supposed to end them all; see registrations_severed().
+        if (m_severed)
+        {
+            std::cerr << lua_diag::tag(owner_name())
+                      << " subscribe(" << cache_name << ", " << channel
+                      << ") registered nothing: this runtime has been stopped"
+                      << std::endl;
+            return 0;
+        }
         const int   id  = ++m_next_subscription_id;
         std::string key = cache_name + '\0' + channel;
         m_subscription_keys.emplace(id, key);
