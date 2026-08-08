@@ -40,10 +40,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaargs
 
-PB=${SOCKETLEY_PORT_BASE:-24300}
+PB=$((SL_PORT_BASE+1130))
 RPC_PORT=$((PB + 0))    # the script under test, in the daemon
 MADE_PORT=$((PB + 1))   # the child it is asked to build
 TAKEN_PORT=$((PB + 2))  # held by python, so a bind there must fail
