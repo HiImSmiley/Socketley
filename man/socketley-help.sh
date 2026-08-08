@@ -2433,5 +2433,65 @@ sdk_cross() {
     sdk_help
 }
 
+# ─── A terminal gets the browser.  Anything else gets text, and exit 0 ───────
+#
+# This file is what `socketley --help` runs, and it was written as an
+# interactive program only: it clears the screen, draws a menu, and ends on
+# `read`.  With stdin closed — a pipe, a redirect, a CI step, `socketley --help
+# | less` — that `read` fails under `set -e`, so the script died at the bottom
+# and the CLI handed the shell its status:
+#
+#     socketley --help >/dev/null     exit 1
+#
+# Exit 1 is this project's code for bad input.  Asking for help is not bad
+# input, so every script that checked the status of `--help` was told it had
+# made a mistake, and every one that captured the output got an ANSI screen
+# clear and a menu nobody can answer.
+#
+# The test is the terminal, not an argument, because the caller does not know
+# to pass one: `socketley --help` is what a person types either way, and the
+# difference is where it is typed.  Both descriptors are checked — a pipe on
+# stdout with a live stdin still cannot show a menu worth drawing.
+plain_help() {
+    cat <<'EOF'
+socketley — a daemon for long-living network runtimes (server, client, proxy, cache)
+
+USAGE
+  socketley <command> [options]
+  socketley daemon [--sqpoll|--no-sqpoll] [--cpus <set>] [--name <name>]
+  socketley --lua <file>
+
+RUNTIMES
+  create <type> <name> [flags]   create a server, client, proxy or cache
+  start|stop|restart <name>      lifecycle
+  remove <name>                  remove a runtime
+  ls | ps [-a] [--json]          list runtimes
+  stats [name]                   counters
+  edit <name> [flags]            change a runtime's configuration
+  rename <old> <new>             rename a runtime
+  send <name> <data>             send through a runtime
+  reload | reload-lua <name>     reload configuration, or the Lua script
+
+OTHER
+  add <path> [--name <name>]     adopt a runtime from a file
+  import | show | owner          state and relationships
+  cluster [ls|ps|group|show|stats|watch]
+  attach <name>                  attach to a runtime's stream
+  dashboard                      terminal dashboard
+  ping                           is the daemon answering
+  version | --version | -v       version
+
+  --help, -h                     this text; in a terminal, an interactive browser
+
+Exit codes: 0 success, 1 bad input, 2 fatal.
+Full documentation: man socketley
+EOF
+}
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    plain_help
+    exit 0
+fi
+
 # Start the interactive help
 main_menu

@@ -879,18 +879,37 @@ refused, with nothing sent to it.
 .RE
 .TP
 .B help \fR| \fB\-\-help\fR | \fB\-h\fR
-Open the interactive help browser. It is a menu, not a page: it reads from the
-terminal and waits, so it is for a person at a keyboard and not for a script or
-a pipe. Takes no topic argument \(em everything is reached from the menu.
+Print help. What it prints depends on where it is printing to.
 .RS
 .PP
+On a
+.BR terminal ,
+it opens the interactive browser: a menu, not a page, reached by number and
+taking no topic argument \(em everything is behind the menu.
+.PP
+Anywhere
+.BR else \(em
+a pipe, a redirect, a CI step \(em it prints a plain\-text summary of the
+commands and exits
+.BR 0 .
+Neither standard input nor standard output being a terminal is what decides
+it; there is no flag, because
+.B socketley \-\-help
+is what a person types either way and only the destination differs. A menu
+drawn into a pipe is a menu nobody can answer, and it used to arrive with a
+screen\-clear escape at the front of the captured output and an exit status
+of 1 behind it \(em this project's code for bad input, reported to a caller
+whose only mistake was asking for help.
+.PP
 Does not require, and does not start, a daemon. The browser is
-.I /usr/share/socketley/socketley\-help.sh
-where socketley is installed, and
 .I man/socketley\-help.sh
-under the source tree the binary was built in otherwise; if neither is readable
-the command says so and exits 1. This page is the reference and that browser is the tour \(em they
-cover the same ground and are kept in step with each other.
+under the source tree the binary was built in, and
+.I /usr/share/socketley/socketley\-help.sh
+otherwise \(em nearest first, so a binary built in a tree prints that tree's
+help rather than an installed copy from another version. If neither is
+readable the command says so and exits 1. This page is the reference and that
+browser is the tour \(em they cover the same ground and are kept in step with
+each other.
 .RE
 .TP
 .B version \fR| \fB\-\-version\fR | \fB\-v\fR

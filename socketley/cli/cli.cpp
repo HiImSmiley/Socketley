@@ -360,9 +360,26 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("--help"):
         case fnv1a("-h"):
         {
-            // Try system install path first, then relative to binary
-            std::string help_script = "/usr/share/socketley/socketley-help.sh";
-            if (access(help_script.c_str(), R_OK) != 0)
+            // The binary's own copy first, then the installed one.
+            //
+            // This was the other way round, and on any machine with socketley
+            // installed that made `./bin/Release/socketley --help` print
+            // /usr/share's help — a different version's, describing flags this
+            // binary may not have and omitting the ones it just grew.  Measured
+            // here: the installed copy was eight months older than the tree.
+            //
+            // The order below cannot misfire in the other direction.  An
+            // installed binary lives at /usr/bin/socketley, so three
+            // parent_path() calls land on "/" and the candidate is
+            // "/man/socketley-help.sh", which does not exist — it falls through
+            // to /usr/share exactly as before.  Only a binary that really does
+            // sit under a tree carrying man/ takes the first branch, and that
+            // binary's help is the one that matches it.
+            //
+            // Everything else in this project decides dev-versus-system in
+            // paths.cpp; this lookup predates that and answered a different
+            // question. Nearest-wins is the same answer paths.cpp gives.
+            std::string help_script;
             {
                 char self_exe[4096];
                 ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
@@ -373,6 +390,8 @@ int cli_dispatch(int argc, char** argv)
                     help_script = (bin_dir / "man" / "socketley-help.sh").string();
                 }
             }
+            if (help_script.empty() || access(help_script.c_str(), R_OK) != 0)
+                help_script = "/usr/share/socketley/socketley-help.sh";
             if (access(help_script.c_str(), R_OK) != 0)
             {
                 std::cerr << "help script not found\n";
