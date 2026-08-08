@@ -26,6 +26,11 @@ public:
     using runtime_map = std::unordered_map<std::string, std::unique_ptr<runtime_instance>,
                                             runtime_string_hash, runtime_string_equal>;
 
+    // What a runtime may be called.  Enforced by create() and rename(), which
+    // are the only two ways a name is acquired; see the definition for the four
+    // places a name has to survive.
+    static bool valid_name(std::string_view name);
+
     bool create(runtime_type type, std::string_view name);
     bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);

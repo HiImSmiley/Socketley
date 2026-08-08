@@ -11,11 +11,25 @@
 #include <mutex>
 #include <shared_mutex>
 
-bool runtime_manager::create(runtime_type type, std::string_view name)
+// ─── ONE PLACE THAT DECIDES WHAT A RUNTIME MAY BE CALLED ────────────────────
+//
+// The rule was written out inside create() and nowhere else, so rename() — the
+// other way a runtime acquires a name, and the one `import` uses — enforced
+// nothing at all.  Measured:
+//
+//     socketley create server 'q"uote/../x'    refused
+//     socketley import plain '{"name":"q\"uote/../x", ...}'   exit 0
+//
+// and the daemon then held a runtime whose name broke `ls --json` into invalid
+// JSON and whose state file collided with every other invalidly-named runtime
+// in one shared `invalid.json`.
+//
+// A name reaches the filesystem (state_persistence::config_path), a JSON
+// document (cmd_ls, cmd_ps), a command line (the IPC protocol is one command
+// per line) and a cluster file name.  This character set is what all four can
+// carry without escaping.
+bool runtime_manager::valid_name(std::string_view name)
 {
-    std::unique_lock lock(mutex);
-
-    // Validate name: alphanumeric + -_. only, max 128 chars, no leading dot
     if (name.empty() || name.size() > 128 || name[0] == '.')
         return false;
     for (char c : name)
@@ -23,6 +37,15 @@ bool runtime_manager::create(runtime_type type, std::string_view name)
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')
             return false;
     }
+    return true;
+}
+
+bool runtime_manager::create(runtime_type type, std::string_view name)
+{
+    std::unique_lock lock(mutex);
+
+    if (!valid_name(name))
+        return false;
 
     if (runtimes.find(name) != runtimes.end())
         return false;
@@ -485,6 +508,11 @@ size_t runtime_manager::retired_count() const
 bool runtime_manager::rename(std::string_view old_name, std::string_view new_name)
 {
     std::unique_lock lock(mutex);
+
+    // The same rule create() enforces, and it was missing here — see
+    // valid_name().  This is the door `import` comes through.
+    if (!valid_name(new_name))
+        return false;
 
     auto it = runtimes.find(old_name);
     if (it == runtimes.end())
