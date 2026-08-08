@@ -271,32 +271,66 @@ bool json_get_bool(const std::string& json, std::string_view key, bool default_v
     return default_val;
 }
 
-int json_get_int(const std::string& json, std::string_view key, int default_val = 0)
+// ─── A VALUE THAT IS ONLY PARTLY A NUMBER IS NOT A NUMBER ───────────────────
+//
+// The four below all wrapped a std::sto* in a try/catch and returned the
+// default when it threw — which covered "abc" and did nothing at all for
+// "80abc", because stoi stops at the first character it cannot use and returns
+// what it read.  A field whose value had a typo in the tail was silently taken
+// as the digits in front of it:
+//
+//     "port": "80abc"          ->  80
+//     "max_memory": "4mb"      ->  4
+//
+// The same defect the flag parsers had, one layer in.  parse_uint16 and
+// parse_uint32 in flag_handlers.h are the shape this follows: the whole of the
+// token, or nothing.
+//
+// "Or nothing" means the default, which is what an ABSENT key already gives —
+// so a malformed value now behaves exactly like a missing one, and that is the
+// point.  It is also no change at all for a value that will not parse in any
+// part: `stoi("abc")` already threw and already fell back here.  What changes is
+// only the half-parsed case, and there the default is the honest answer.
+//
+// These read files this daemon wrote, so in practice the input is clean.  They
+// also read whatever `import` was handed, which is a document a person edited.
+template <typename T, typename Fn>
+T json_get_number(const std::string& json, std::string_view key, T default_val, Fn convert)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
-    try { return std::stoi(v); } catch (...) { return default_val; }
+    try
+    {
+        size_t consumed = 0;
+        const T out = convert(v, consumed);
+        if (consumed != v.size()) return default_val;   // trailing anything
+        return out;
+    }
+    catch (...) { return default_val; }
+}
+
+int json_get_int(const std::string& json, std::string_view key, int default_val = 0)
+{
+    return json_get_number<int>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return std::stoi(s, &n); });
 }
 
 uint32_t json_get_uint32(const std::string& json, std::string_view key, uint32_t default_val = 0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return static_cast<uint32_t>(std::stoul(v)); } catch (...) { return default_val; }
+    return json_get_number<uint32_t>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return static_cast<uint32_t>(std::stoul(s, &n)); });
 }
 
 double json_get_double(const std::string& json, std::string_view key, double default_val = 0.0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return std::stod(v); } catch (...) { return default_val; }
+    return json_get_number<double>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return std::stod(s, &n); });
 }
 
 size_t json_get_size(const std::string& json, std::string_view key, size_t default_val = 0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return static_cast<size_t>(std::stoull(v)); } catch (...) { return default_val; }
+    return json_get_number<size_t>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return static_cast<size_t>(std::stoull(s, &n)); });
 }
 
 std::vector<std::string> json_get_array(const std::string& json, std::string_view key)

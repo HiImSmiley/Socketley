@@ -174,6 +174,34 @@ fi
 RC=0; OUT=$(printf '' | "$BIN" import rt_svr 2>&1) || RC=$?
 assert_rc "empty stdin document exits 1" 1 "$RC"
 
+# ── A NUMBER THAT IS ONLY PARTLY A NUMBER ────────────────────────────────────
+#
+# json_get_int and its three siblings wrapped std::sto* in a try/catch, which
+# caught "abc" and did nothing for "55abc": sto* stops at the first character it
+# cannot use and returns what it read.  So a field with a typo in its tail was
+# applied as the digits in front of it, and the document the operator edited did
+# not mean what it said.
+#
+# The default is what an ABSENT key already gives, so a malformed value now
+# behaves exactly like a missing one.  That is also no change for a value that
+# will not parse at all — sto*("abc") already threw and already landed here.
+"$BIN" import rt_svr \
+    '{"name":"rt_svr","type":"server","port":'"$SVR_PORT"',"max_connections":"55abc"}' \
+    >/dev/null 2>&1 || true
+if "$BIN" show rt_svr | grep -q '"max_connections": 55'; then
+    bad "a half-numeric value was applied as its prefix (max_connections became 55)"
+else
+    ok
+fi
+
+# Paired with it: a clean value still lands, or the assertion above would pass
+# on a build that stopped reading numbers altogether.
+"$BIN" import rt_svr \
+    '{"name":"rt_svr","type":"server","port":'"$SVR_PORT"',"max_connections":42}' \
+    >/dev/null 2>&1 || true
+if "$BIN" show rt_svr | grep -q '"max_connections": 42'; then ok
+else bad "a clean numeric value no longer imports (max_connections is not 42)"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
