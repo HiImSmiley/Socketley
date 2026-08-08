@@ -17,6 +17,7 @@
 #include "../shared/tls_context.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
+#include "../shared/ipc_framing.h"
 #include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
@@ -999,18 +1000,55 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    size_t pos;
+    // ─── TWO FRAMINGS ON ONE CONNECTION ─────────────────────────────────────
+    //
+    // A command is a line, unless it begins with the frame marker — see
+    // ipc_framing.h for the whole of it and for why a marker rather than a
+    // negotiation.  The short version: a payload with a newline in it cannot
+    // travel on a line protocol, and every command that has no newline is sent
+    // exactly as it always was, so nothing about the ordinary path changes.
+    //
+    // Both are handled in one loop because both can arrive in one packet: a CLI
+    // is free to pipeline, and the `send` that needs a frame may follow a `ls`
+    // that does not.
     bool queued = false;
-    while ((pos = conn->partial.find('\n')) != std::string::npos)
+    while (!conn->partial.empty())
     {
-        std::string line = conn->partial.substr(0, pos);
-        conn->partial.erase(0, pos + 1);
+        std::string command;
 
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
+        if (conn->partial[0] == ipc_frame::marker)
+        {
+            std::string payload;
+            const auto r = ipc_frame::take_frame(conn->partial, payload);
+            if (r == ipc_frame::take::need_more)
+                break;
+            if (r == ipc_frame::take::fatal)
+            {
+                // A length past the cap means this stream's framing is wrong,
+                // and there is no point in the buffer that is provably the
+                // start of the next frame.  Closing is the only answer that
+                // cannot make it worse.
+                LOG_ERROR("daemon: a CLI connection sent a frame longer than the "
+                          "limit; closing it rather than guessing where the next "
+                          "one starts");
+                close_client(it);
+                return;
+            }
+            command = std::move(payload);
+        }
+        else
+        {
+            const size_t pos = conn->partial.find('\n');
+            if (pos == std::string::npos)
+                break;
+            command = conn->partial.substr(0, pos);
+            conn->partial.erase(0, pos + 1);
+            if (!command.empty() && command.back() == '\r')
+                command.pop_back();
+        }
 
         conn->write_buf.clear();
-        int exit_code = process_command(conn, line);
+        int exit_code = process_command(conn, command);
         append_response(conn, exit_code);
         queued = true;
     }

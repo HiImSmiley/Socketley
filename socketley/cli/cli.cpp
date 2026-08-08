@@ -564,6 +564,13 @@ int cli_send(int argc, char** argv)
         ss << std::cin.rdbuf();
         message = ss.str();
 
+        // Only the trailing newline goes, and only the trailing one.
+        //
+        // `echo hi | socketley send x` should not deliver "hi\n", which is what
+        // this strip is for.  Newlines INSIDE the message are the message: they
+        // used to end the command and turn everything after them into commands
+        // of their own (see ipc_framing.h), and ipc_send frames the command now
+        // rather than the CLI mangling it.
         while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
             message.pop_back();
     }
@@ -605,6 +612,7 @@ int cli_stdin_send(int /*argc*/, char** argv)
     ss << std::cin.rdbuf();
     std::string message = ss.str();
 
+    // The trailing newline only — see cli_send() above.
     while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
         message.pop_back();
 
