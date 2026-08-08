@@ -757,7 +757,26 @@ bool proxy_instance::resolve_backend(backend_info& b)
             b.resolved_host = std::string(addr.substr(0, colon));
             const char* pstart = addr.data() + colon + 1;
             const char* pend   = addr.data() + addr.size();
-            std::from_chars(pstart, pend, b.resolved_port);
+
+            // Checked, and a failure fails the whole setup.
+            //
+            // The result was discarded, so `--backend host:abc`, `--backend
+            // host:` and any port above 65535 all left resolved_port at 0 —
+            // an address that provably cannot work.  Nothing said so at
+            // `create`: the proxy came up, `ls` showed it running, and the
+            // first request through it answered 503.  The daemon knew at
+            // configuration time and reported it at traffic time.
+            //
+            // Refusing here reaches both paths that build a backend, because
+            // setup() returns false the moment this does — the same answer an
+            // unresolvable runtime name already gets four lines down.
+            const auto [pptr, pec] = std::from_chars(pstart, pend, b.resolved_port);
+            if (pec != std::errc{} || pptr != pend || b.resolved_port == 0)
+            {
+                LOG_ERROR(("proxy backend \"" + b.address +
+                           "\": the port is not a number between 1 and 65535").c_str());
+                return false;
+            }
         }
         else
         {
