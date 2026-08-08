@@ -196,6 +196,35 @@ int cli_config(int argc, char** argv)
         if (test)
             command += " --test";
 
+        // Where this runtime runs.  The one flag a configuration could not
+        // reach, and the one it could least afford to miss.
+        //
+        // A runtime gets its own worker process unless it asks not to, and a
+        // worker holds one runtime and no runtime map.  The cross-runtime Lua
+        // API — socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe,
+        // everything under socketley.cluster, and self.route(), which names
+        // another runtime — is exactly the part that needs the map, so in a
+        // worker every one of those calls raises.
+        //
+        // Inside a callback that raise is caught and logged and the runtime
+        // carries on, which is what made this worth adding rather than
+        // documenting: the runtime comes up green, `ls` lists it, the port
+        // accepts connections, and none of the work is done.  A configuration
+        // that wanted such a runtime had no way to say so, and no way to find
+        // out that it had not.
+        //
+        // Nor could it be repaired afterwards: `edit` refuses the flag, because
+        // honouring it would mean moving a configured runtime between address
+        // spaces underneath whatever already points at it.  A configuration
+        // that omitted it had to be deleted and recreated by hand.
+        //
+        // Emitted wherever it lands in the string: create pre-scans its
+        // arguments for this flag before parsing any of them, precisely so that
+        // its position cannot change what --lua does.
+        bool daemon_process = t["daemon_process"].get_or(false);
+        if (daemon_process)
+            command += " --daemon-process";
+
         bool start = t["start"].get_or(false);
         if (start)
             command += " -s";

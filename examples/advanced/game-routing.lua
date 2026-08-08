@@ -1,98 +1,70 @@
--- Game server with mode-based routing
--- Main server (lobby) routes players to mode-specific sub-servers
+-- =============================================================================
+-- game-routing.lua - Game Lobby With Mode-Based Routing
+-- =============================================================================
 --
--- Usage (from the repository root):
---   socketley create server lobby -p 9000 --daemon-process \
---     --lua examples/advanced/game-routing.lua -s
+-- A lobby that creates mode-specific sub-servers and routes players into them.
+--
+-- USAGE (from the repository root):
+--   socketley --lua examples/advanced/game-routing.lua
 --   # Then connect: nc localhost 9000
---   # Send "join rapid" to route to rapid mode
---   # Send "join blitz" to route to blitz mode
+--   # Send "modes"      to list the game modes and their player counts
+--   # Send "join rapid" to be routed to the rapid-mode sub-server
 --
--- --daemon-process IS REQUIRED.  Do not drop it.
+-- WHY daemon_process = true IS THE POINT OF THIS EXAMPLE
 --
--- A runtime gets its own worker process unless that flag is given, and a
--- worker holds one runtime and no runtime map.  Everything this file does
--- reaches for that map: socketley.create, socketley.start, socketley.get,
--- socketley.list, and self.route -- which names another runtime and so counts
--- as reaching for it too.  In a worker every one of them raises.
+-- The lobby's handler calls socketley.create, socketley.start, socketley.get,
+-- socketley.list and self.route.  Every one of those acts on the runtime map,
+-- and the map lives in the daemon.  A runtime gets its own worker process
+-- unless it asks not to, and a worker holds one runtime and no map, so in a
+-- worker all five raise.
 --
--- The raise is caught and logged wherever a callback runs, which is what makes
--- this worth a paragraph rather than a footnote: without the flag the lobby
--- comes up looking perfectly healthy.  `ls` is green, the port accepts
--- connections, on_start reports "creating game modes..." -- and no game mode
--- exists, "join rapid" answers nothing at all, and the only sign is a line in
--- the daemon's log.  Measured both ways: without the flag, zero sub-servers
--- and no reply; with it, chess-rapid and chess-blitz running and "join rapid"
--- answered by the rapid handler.
+-- Inside a callback that raise is caught and logged, and the runtime carries
+-- on.  Drop the key and the lobby comes up looking perfectly healthy: `ls` is
+-- green, port 9000 accepts connections, on_start reports "creating game
+-- modes..." -- and no game mode exists, "join rapid" answers nothing at all,
+-- and the only sign is a line in the daemon's log.
 --
--- It cannot be added afterwards -- `edit` rejects it, because honouring it
--- would mean moving a configured runtime between address spaces underneath
--- whatever already points at it.  Create the lobby with it or recreate it.
+-- `edit` will not add the flag afterwards, because honouring it would mean
+-- moving a configured runtime between address spaces underneath whatever
+-- already points at it.  A lobby created without it has to be removed and
+-- created again.
 --
--- The sub-servers do not need the flag: a runtime created by socketley.create
--- is created inside the daemon that ran the call, which is where self.route
--- needs it to be.
+-- The sub-servers the lobby creates do not need it: a runtime created by
+-- socketley.create is created inside the daemon that ran the call, which is
+-- where self.route needs it to be.
 --
--- The --lua path is opened by the DAEMON, so it resolves against the daemon's
--- working directory, not this file's.  Run from the repository root, or use an
--- absolute path.
+-- WHY THE CALLBACKS ARE IN game-routing-handler.lua
+--
+-- socketley reads `daemon` and `runtimes` out of this file, emits `create`
+-- commands, and exits.  Callbacks written here would never be loaded and never
+-- called.  The `config` key attaches the handler -- it becomes `--lua <path>`
+-- on the create, and the DAEMON opens that path against its own working
+-- directory, hence the repository-root spelling.
+--
+-- =============================================================================
 
-function on_start()
-    socketley.log("lobby started, creating game modes...")
+runtimes = {
+    -- The lobby.  chess-rapid and chess-blitz are not declared here: the
+    -- handler's on_start creates them, on port 0 -- they are reached by
+    -- routing, never dialled directly, so they need no port of their own.
+    {
+        type = "server",
+        name = "lobby",
+        port = 9000,
+        config = "examples/advanced/game-routing-handler.lua",
+        daemon_process = true,   -- REQUIRED: see above
+        start = true
+    }
+}
 
-    socketley.create("server", "chess-rapid", {
-        port = 0,
-        config = "examples/advanced/rapid-handler.lua",
-        on_parent_stop = "remove"
-    })
-    socketley.start("chess-rapid")
+--[[
+Test:
+  printf 'modes\n'      | nc -q2 localhost 9000     # available: chess-rapid (0 players), ...
+  printf 'join rapid\n' | nc -q2 localhost 9000
 
-    socketley.create("server", "chess-blitz", {
-        port = 0,
-        config = "examples/advanced/blitz-handler.lua",
-        on_parent_stop = "remove"
-    })
-    socketley.start("chess-blitz")
+  socketley ls                                      # lobby, chess-rapid, chess-blitz
 
-    socketley.log("game modes ready")
-end
-
-function on_client_message(client_id, msg)
-    if msg:match("^join ") then
-        local mode = msg:match("^join (%S+)")
-        local target = "chess-" .. mode
-
-        local info = socketley.get(target)
-        if not info then
-            self.send(client_id, "unknown mode: " .. mode)
-            return
-        end
-
-        if self.route(client_id, target) then
-            socketley.log("routed client " .. client_id .. " to " .. target)
-        else
-            self.send(client_id, "could not join " .. mode)
-        end
-        return
-    end
-
-    if msg == "modes" then
-        local names = socketley.list()
-        local modes = {}
-        for _, name in ipairs(names) do
-            if name:match("^chess%-") then
-                local info = socketley.get(name)
-                table.insert(modes, name .. " (" .. info.connections .. " players)")
-            end
-        end
-        self.send(client_id, "available: " .. table.concat(modes, ", "))
-        return
-    end
-
-    -- Unrouted messages are broadcast normally
-end
-
-function on_stop()
-    -- Children auto-removed via on_parent_stop = "remove"
-    socketley.log("lobby shutting down")
-end
+Cleanup:
+  socketley stop lobby                              # takes the game modes with it
+  socketley remove lobby
+]]

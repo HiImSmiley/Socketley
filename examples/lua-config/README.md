@@ -99,11 +99,20 @@ gateway and two clients, one handler branching on `self.name`.
 ### Runtimes table keys
 `type`, `name`, `port`, `target`, `mode`, `log`, `write`, `persistent`,
 `protocol`, `strategy`, `backends`, `config`/`lua`, `bash`, `cache`, `group`,
-`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`, `start`.
+`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`,
+`daemon_process`, `start`.
 
-An unrecognised key is ignored in silence. Flags this list does not reach —
-`--daemon-process`, and the health-check, circuit-breaker, retry and TLS
-families — cannot be set from a configuration at all; use `create` or `edit`.
+`daemon_process = true` is what a runtime whose handler uses the cross-runtime
+API has to say — see [The cross-runtime API needs
+`--daemon-process`](#the-cross-runtime-api-needs---daemon-process) below for
+which calls those are. Omit it and the runtime is created, listed and
+connectable while every one of those calls raises inside its callbacks, is
+caught, logged, and does nothing; `edit` will not add the flag afterwards, so
+the runtime has to be recreated.
+
+An unrecognised key is ignored in silence. Flags this list does not reach — the
+health-check, circuit-breaker, retry and TLS families — cannot be set from a
+configuration at all; use `create` or `edit`.
 
 ### Cache Modes
 | Mode | Allowed Commands |
@@ -242,6 +251,9 @@ under `socketley.cluster`, and `self.route()` all act on the runtime map, which
 lives in the daemon. A runtime gets its own worker process unless it was
 created with `--daemon-process`, and a worker has no map — so each of these
 raises a Lua error there naming the call and the way out.
+
+From a configuration file that flag is the `daemon_process = true` key on the
+runtime's entry; from the command line it is `--daemon-process` on `create`.
 
 At a script's top level that fails the load and the `create` is refused, which
 is loud. Inside a callback it is caught and logged and the runtime carries on —

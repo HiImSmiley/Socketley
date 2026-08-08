@@ -101,5 +101,6 @@ and never called — see `lua-config/README.md`.
 - `high-availability.lua` + `high-availability-handler.lua` - HA with failover
 - `logging-pipeline.lua` + `logging-pipeline-handler.lua` - Centralized logging
 - `development-env.lua` + `development-env-handler.lua` - Development stack
-- `game-routing.lua` - A lobby that creates and routes to sub-servers. Must be
-  created with `--daemon-process`; see the file for why
+- `game-routing.lua` + `game-routing-handler.lua` - A lobby that creates and
+  routes to sub-servers. The lobby needs `daemon_process = true`; see the file
+  for why

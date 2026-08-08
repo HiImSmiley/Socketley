@@ -56,11 +56,13 @@ routing proxy and a seeded mock database. Run
 `mkdir -p /tmp/socketley-dev` first.
 
 ### Game Routing
-`game-routing.lua` + `rapid-handler.lua` / `blitz-handler.lua`. A lobby that
-creates sub-servers and routes players to them. **Must be created with
-`--daemon-process`** — every call it makes reaches for the runtime map, which
-lives in the daemon and not in a worker. Without the flag the lobby comes up
-green and answers nothing.
+`game-routing.lua` + `game-routing-handler.lua`, which in turn creates
+sub-servers running `rapid-handler.lua` / `blitz-handler.lua`. A lobby that
+creates its game modes and routes players into them. The lobby entry carries
+**`daemon_process = true`** — every call its handler makes reaches for the
+runtime map, which lives in the daemon and not in a worker. Without that key
+the lobby comes up green and answers nothing, and `edit` will not add it
+afterwards.
 
 ## Architecture Patterns
 

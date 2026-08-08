@@ -2449,14 +2449,37 @@ http                       \-\-http
 http_cache (bool)          \-\-http\-cache
 udp (bool)                 \-\-udp
 test (bool)                \-\-test
+daemon_process (bool)      \-\-daemon\-process
 start (bool)               \-s
 .fi
 .PP
+.B daemon_process
+is the one to reach for when the handler named by
+.B config
+uses the cross\-runtime API \(em
+.BR socketley.create ,
+.BR .start ,
+.BR .stop ,
+.BR .remove ,
+.BR .send ,
+.BR .list ,
+.BR .get ,
+.BR .pipe ,
+anything under
+.BR socketley.cluster ,
+or
+.B self.route
+\(em because all of those act on the runtime map, which lives in the daemon and
+not in a worker. Without it the runtime still comes up: it is listed, it accepts
+connections, and every one of those calls raises inside its callbacks, is caught
+and logged, and nothing gets done. It cannot be added later either \(em
+.B edit
+refuses the flag \(em so a configuration that omits it has to be recreated.
+.PP
 A key this list does not name is ignored in silence, and a flag this list does
-not reach \(em
-.B \-\-daemon\-process
-and the whole health\-check, circuit\-breaker, retry and TLS families among them
-\(em cannot be set from a configuration at all. Create those runtimes with
+not reach \(em the whole health\-check, circuit\-breaker, retry and TLS families
+among them \(em cannot be set from a configuration at all. Create those runtimes
+with
 .B create
 directly, or
 .B edit
