@@ -103,6 +103,12 @@ excused = {
     'pid':              "the daemon's record of a managed child",
     'lua_script':       'loaded by the worker itself: a failure to load means '
                         'different things on the two sides (exit_config_refused)',
+    'present':          'not configuration at all -- it records which keys the '
+                        'JSON document named, so that `import` can leave a field '
+                        'alone rather than clearing it.  A worker is handed a '
+                        'complete config frame over the worker protocol, never a '
+                        'document, so it is empty there and there is nothing '
+                        'conditional for the applier to do',
 }
 
 missing = [f for f in fields if f not in applied and f not in excused]
