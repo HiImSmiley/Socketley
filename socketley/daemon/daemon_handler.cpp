@@ -38,6 +38,43 @@
 #include <csignal>
 #include "../shared/logging.h"
 
+// ─── How long a command will wait for a worker to answer ────────────────────
+//
+// Measured on this machine: a worker that has to compile a script, build its
+// ring and bind its listener reports back 17-22 ms after `create` has forked it,
+// over ten runs.  A refusal comes back sooner, because the child stops at the
+// script and exits rather than going on to bind anything.
+//
+// Two seconds is therefore about a hundred times the cost of the case it is
+// timing, which is the point: it is not a budget the normal path spends, it is
+// the backstop for a worker that has wedged and will never answer.  The wait
+// ends on the answer, so what a create actually costs is the 20 ms, and the
+// bound is only ever reached when something is already wrong.
+//
+// Two seconds rather than a new number of its own because it is the interval
+// this daemon already uses for the health tick -- the longest anything here
+// waits to notice a worker. One timescale in the file is easier to reason about
+// than two, and a wait that outlived the tick meant to supersede it would be the
+// confusing combination.
+//
+// Four commands wait on this: `create`, for the verdict on a configuration;
+// `reload-lua`, for the declaration a re-read script produces; and `start` and
+// `reload`, which fork exactly the same child `create -s` does and used to
+// return the moment they had asked for the fork.  All four are the control
+// path, and all four would otherwise report success for something the worker
+// had not done yet.
+//
+// It is one budget per COMMAND, not per runtime.  Each of those commands forks
+// every child it is going to fork before it waits for any of them, so the
+// children come up concurrently and the waits overlap: `start` of twenty pays
+// about one child's startup.  Spending the bound per name instead would let a
+// single wedged worker multiply it by the number of names on the command line,
+// which is how a two-second backstop becomes a minute.
+namespace
+{
+constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
+}
+
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 bool        daemon_handler::system_socket = false;
 
@@ -1255,8 +1292,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         // too.  A create that refuses and leaves nothing to look at would make
         // the worker's reason the only record, in a log, of a runtime the
         // operator can no longer ask about.
-        if (const int wrc = await_worker_startup(name); wrc != 0)
+        std::string wmsg;
+        const int   wrc = await_worker_startup(
+            name, wmsg, std::chrono::steady_clock::now() + worker_startup_bound);
+        if (wrc != 0)
+        {
+            std::cout << wmsg;
             return wrc;
+        }
     }
 
     // ─── A script whose on_start raised is not a silent success ─────────────
@@ -1290,13 +1333,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         // Asking only the first would have covered the flag nobody passes:
         // since 2313c26 a runtime is out of process unless it says otherwise,
         // so the worker leg IS the ordinary `create -s`.
-        std::string why(instance->last_on_start_error());
-        if (why.empty())
-        {
-            if (auto it = m_proxy_workers.find(std::string(name));
-                it != m_proxy_workers.end())
-                why = it->second->take_start_error();
-        }
+        std::string why = on_start_error(name);
 
         if (!why.empty())
         {
@@ -1375,6 +1412,10 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     }
 
     int failed = 0;
+    // The ones this command actually brought up, in order.  Collected because
+    // the verdict on a runtime that lives in a worker cannot be read until
+    // reconcile_proxy_workers() below has forked the child; see the wait there.
+    std::vector<std::string> started;
     for (const auto& n : names)
     {
         // Allow -i on already-running runtimes (attach without start)
@@ -1402,6 +1443,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             if (m_persistence)
                 m_persistence->set_was_running(n, true);
             inst = m_manager.get(n);
+            started.push_back(n);
 
             // The runtime is up; its script's set-up is not.  Counted as a
             // failure and reported with the reason, for the reasoning written
@@ -1413,15 +1455,11 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // operator asked for this runtime to be up, and it is up.  Clearing
             // it would mean a daemon restart silently leaving down a listener
             // that is serving traffic right now.
-            if (inst && !inst->last_on_start_error().empty())
-            {
-                conn->write_buf += "start " + std::string(n) + ": "
-                                 + inst->last_on_start_error() + "\n"
-                                 + "the runtime is running, with whatever on_start "
-                                   "established before it raised; fix the script and "
-                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
-                ++failed;
-            }
+            // Read below rather than here.  When the script runs in a worker
+            // the reason is a frame that has not arrived yet — the child has
+            // not even been forked until reconcile_proxy_workers() — so asking
+            // at this line would answer "nothing went wrong" for the case that
+            // is now the ordinary one.
         }
 
         if (want_interactive && inst)
@@ -1437,6 +1475,74 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     // child.  Doing it here rather than waiting for the health timer is what
     // makes `start` followed immediately by a request work.
     reconcile_proxy_workers();
+
+    // ─── And `start` waits for the answer, exactly as `create -s` does ──────
+    //
+    // It did not, and what that cost is not the on_start report it was noticed
+    // through.  Measured on the parent commit, one runtime whose script
+    // declares `path = "no-slash"` — faultless Lua, so the placeholder's
+    // compile-only check passes it and only the worker discovers it is not a
+    // path:
+    //
+    //     create -s        exit 1   "the worker did not accept its configuration"
+    //     start            exit 0   (silence)      ls, 2s later: Failed
+    //     reload           exit 0   (silence)      ls, 2s later: Failed
+    //
+    // Same runtime, same configuration, same refusal, and the answer depended
+    // on which command reached it.  `start` was reporting success for a start
+    // that did not happen — not a missing detail about one that did.
+    // await_worker_startup()'s own comment already says the wait is what turns
+    // "the fork was requested" into "the child is serving", and `start` forks
+    // exactly the same child.
+    //
+    // ─── What the wait costs ────────────────────────────────────────────────
+    //
+    // One child's startup, not one per runtime.  reconcile_proxy_workers()
+    // above forks every one of them before this loop begins, so they come up
+    // concurrently and these waits overlap; the deadline is shared across the
+    // command for the same reason, so a wedged child cannot multiply the bound
+    // by the number of names.  Measured, ten worker-backed servers started with
+    // one `start 'wk*'`:
+    //
+    //     before   84 ms / 103 ms   returning before any child had bound
+    //     after    (see the commit) returning when all ten were serving
+    //
+    // The runtimes are left exactly where the verdict put them, and `failed`
+    // is counted rather than returned, for the reason the TLS refusal above is
+    // written under: `start a b c` has to start b and c whatever a did.
+    if (!started.empty())
+    {
+        const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
+        for (const auto& n : started)
+        {
+            std::string wmsg;
+            if (await_worker_startup(n, wmsg, deadline) != 0)
+            {
+                conn->write_buf += wmsg;
+                ++failed;
+                continue;   // it is not serving; on_start is the smaller news
+            }
+
+            // The runtime is up; its script's set-up is not.  Counted as a
+            // failure and reported with the reason, for the reasoning written
+            // out at the end of cmd_create — and counted rather than returned,
+            // because `start a b c` has to start b and c whatever a's script
+            // did, exactly as it does for a TLS refusal above.
+            //
+            // was_running is set anyway, deliberately: it records that the
+            // operator asked for this runtime to be up, and it is up.  Clearing
+            // it would mean a daemon restart silently leaving down a listener
+            // that is serving traffic right now.
+            if (std::string why = on_start_error(n); !why.empty())
+            {
+                conn->write_buf += "start " + std::string(n) + ": " + why + "\n"
+                                 + "the runtime is running, with whatever on_start "
+                                   "established before it raised; fix the script and "
+                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
+                ++failed;
+            }
+        }
+    }
 
     return failed > 0 ? 1 : 0;
 }
@@ -3232,6 +3338,8 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
     if (rc >= 0) return rc;
 
     int refused = 0;
+    // What this command actually brought back up; see the wait below.
+    std::vector<std::string> restarted;
     for (const auto& n : names)
     {
         auto* inst = m_manager.get(n);
@@ -3247,54 +3355,90 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
             continue;
         }
         m_manager.stop(n, m_loop);
-        if (m_manager.start(n, m_loop) && m_persistence)
-            m_persistence->set_was_running(n, true);
 
-        // "reload is a stop followed by a start, so it is a start" — the
-        // sentence above, applied to the other thing a start now answers for.
-        // Leaving this one out would put back exactly the inconsistency the
-        // rest of this commit removes: the same script and the same raise
-        // reported by `start` and not by the command that is a start.
-        if (inst = m_manager.get(n); inst && !inst->last_on_start_error().empty())
+        // ─── The child comes down here, or the reload never reaches it ──────
+        //
+        // Without this line `reload` did nothing at all to a runtime in a
+        // worker, which since 2313c26 is every runtime that did not ask
+        // otherwise.  The two calls around it move the PLACEHOLDER's state to
+        // stopped and back to running, and reconciliation is what turns a
+        // placeholder's state into a live child — so reconciling only at the
+        // end sees `running`, the same thing it saw before, and leaves the
+        // original child alone.  Measured on the parent commit, a worker-backed
+        // server whose script was edited under it:
+        //
+        //     reload   exit 0   (silence)   ls: Up   — old script still serving
+        //
+        // The command reported success for a reload that had not happened, and
+        // the script the operator had just edited was not running anywhere.
+        // With the child taken down while the placeholder says stopped, the
+        // reconcile after the loop forks a fresh one that reads the new file:
+        //
+        //     reload   exit 1   "on_start error: ..."          — the new script
+        //     reload   exit 1   "the worker did not accept ..."  ls: Failed
+        //
+        // Per name rather than once for the whole command, because the start
+        // that follows is per name too: batching the stops would take every
+        // named runtime down before bringing any back, which is a different
+        // command from the one this is.
+        reconcile_proxy_workers();
+
+        if (m_manager.start(n, m_loop) && m_persistence)
         {
-            conn->write_buf += "reload " + std::string(n) + ": "
-                             + inst->last_on_start_error() + "\n"
-                             + "the runtime is running, with whatever on_start "
-                               "established before it raised; fix the script and "
-                               "run `reload-lua " + std::string(n) + "` to re-run it.\n";
-            ++refused;
+            m_persistence->set_was_running(n, true);
+            restarted.push_back(n);
+        }
+
+        // The on_start report is read in the collect pass below, for the reason
+        // cmd_start gives at the same point: when the script runs in a worker
+        // the reason is a frame that has not been asked for yet.
+    }
+
+    // The same sentence a third time: reload is a stop followed by a start, so
+    // it is a start, and a start now brings the child back and waits for it.
+    //
+    // Neither half was here.  A worker-backed runtime reloaded through this
+    // command had its placeholder flipped and nothing else: the child came back
+    // on the health tick up to two seconds later, and the command returned 0 in
+    // the meantime — including for a configuration the child was about to
+    // refuse, which `ls` then showed as Failed.  Reconciling here is what
+    // cmd_start's own comment gives the reason for, one command along: it is
+    // what makes `reload` followed immediately by a request work.
+    if (!restarted.empty())
+    {
+        reconcile_proxy_workers();
+
+        const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
+        for (const auto& n : restarted)
+        {
+            std::string wmsg;
+            if (await_worker_startup(n, wmsg, deadline) != 0)
+            {
+                conn->write_buf += wmsg;
+                ++refused;
+                continue;
+            }
+
+            // "reload is a stop followed by a start, so it is a start" — the
+            // sentence this command is already written under, applied to the
+            // other thing a start answers for.  Leaving it out would put the
+            // inconsistency back one command along: the same script and the
+            // same raise reported by `start` and not by the command that is a
+            // start.
+            if (std::string why = on_start_error(n); !why.empty())
+            {
+                conn->write_buf += "reload " + std::string(n) + ": " + why + "\n"
+                                 + "the runtime is running, with whatever on_start "
+                                   "established before it raised; fix the script and "
+                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
+                ++refused;
+            }
         }
     }
+
     return refused > 0 ? 1 : 0;
 }
 
-// ─── How long a command will wait for a worker to answer ────────────────────
-//
-// Measured on this machine: a worker that has to compile a script, build its
-// ring and bind its listener reports back 17-22 ms after `create` has forked it,
-// over ten runs.  A refusal comes back sooner, because the child stops at the
-// script and exits rather than going on to bind anything.
-//
-// Two seconds is therefore about a hundred times the cost of the case it is
-// timing, which is the point: it is not a budget the normal path spends, it is
-// the backstop for a worker that has wedged and will never answer.  The wait
-// ends on the answer, so what a create actually costs is the 20 ms, and the
-// bound is only ever reached when something is already wrong.
-//
-// Two seconds rather than a new number of its own because it is the interval
-// this daemon already uses for the health tick -- the longest anything here
-// waits to notice a worker. One timescale in the file is easier to reason about
-// than two, and a wait that outlived the tick meant to supersede it would be the
-// confusing combination.
-//
-// Two commands wait on this: `create`, for the verdict on a configuration, and
-// `reload-lua`, for the declaration a re-read script produces.  Both are the
-// control path, and both would otherwise report success for something the
-// worker had not done yet.
-namespace
-{
-constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
-}
 
 int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
 {
@@ -3882,13 +4026,37 @@ void daemon_handler::reconcile_proxy_workers()
     }
 }
 
-int daemon_handler::await_worker_startup(std::string_view name)
+std::string daemon_handler::on_start_error(std::string_view name)
+{
+    if (auto* inst = m_manager.get(name); inst && !inst->last_on_start_error().empty())
+        return inst->last_on_start_error();
+
+    // Nothing on the instance means either that on_start ran, or that it ran
+    // somewhere else: for a runtime in a worker the placeholder never touches
+    // the script, and the reason came up the control socket instead.
+    if (auto it = m_proxy_workers.find(std::string(name)); it != m_proxy_workers.end())
+        return it->second->take_start_error();
+
+    return {};
+}
+
+int daemon_handler::await_worker_startup(std::string_view name, std::string& out,
+                                         std::chrono::steady_clock::time_point deadline)
 {
     auto it = m_proxy_workers.find(std::string(name));
     if (it == m_proxy_workers.end())
         return 0;   // in-daemon, or never spawned: nothing in another process
 
-    switch (it->second->await_startup(worker_startup_bound))
+    // Whatever is left of the command's budget, never less than zero.  A caller
+    // waiting on several children has already spent some of it on the ones
+    // ahead of this — which costs nothing when they answered in 20 ms, and is
+    // the whole point when one of them did not answer at all.
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+    if (left < std::chrono::milliseconds(0))
+        left = std::chrono::milliseconds(0);
+
+    switch (it->second->await_startup(left))
     {
         case proxy_supervisor::startup::serving:
             // The child is listening, so it is a group member others may be
@@ -3917,9 +4085,10 @@ int daemon_handler::await_worker_startup(std::string_view name)
             // Exit 1 for both, because both are the configuration that was
             // handed in: a script that will not load, a backend that cannot be
             // resolved, a port already taken.  That is bad input, not a fatal.
-            std::cout << "runtime " << name
-                      << " could not start: the worker did not accept its "
-                         "configuration (the reason is in the daemon log)\n";
+            out += "runtime ";
+            out += name;
+            out += " could not start: the worker did not accept its "
+                   "configuration (the reason is in the daemon log)\n";
             return 1;
 
         case proxy_supervisor::startup::pending:
@@ -3933,9 +4102,10 @@ int daemon_handler::await_worker_startup(std::string_view name)
     // are both worse than saying what is actually known.  The supervisor still
     // owns the child, the health tick still settles the state, and `ls` will
     // show whichever it turns out to be.
-    std::cout << "runtime " << name
-              << " did not report back within 2s of starting; it is still being "
-                 "supervised -- check `socketley ls` for what it settled on\n";
+    out += "runtime ";
+    out += name;
+    out += " did not report back within 2s of starting; it is still being "
+           "supervised -- check `socketley ls` for what it settled on\n";
     return 2;
 }
 

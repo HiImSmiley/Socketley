@@ -170,6 +170,10 @@ cli_commands() {
     echo -e "  ${CYAN}socketley start api -i${NC}    # interactive session"
     echo -e "  ${CYAN}socketley start *${NC}         # start all non-running"
     echo -e "  ${CYAN}socketley start my*${NC}       # start all starting with 'my'"
+    echo "  A runtime in a worker process is waited for: the port is accepting by"
+    echo "    the time the command returns, and exit 1 names the runtime if the"
+    echo "    worker refused its configuration or its on_start raised.  One 2s"
+    echo "    budget for the whole command, not one per runtime."
     echo ""
 
     echo -e "${BOLD}stop <name|pattern>...${NC}"
@@ -229,6 +233,9 @@ cli_commands() {
 
     echo -e "${BOLD}reload <name|pattern>...${NC}"
     echo "  Restart running runtimes (stop + start). Glob patterns supported"
+    echo "  A runtime in a worker process has its child taken down and forked"
+    echo "    again, so an edited script takes effect.  Waited for and answered"
+    echo "    for like start: exit 1 if the worker refuses it or on_start raises."
     echo -e "  ${CYAN}socketley reload myserver${NC}"
     echo -e "  ${CYAN}socketley reload api*${NC}  # restart all api- runtimes"
     echo -e "  ${CYAN}socketley reload *${NC}     # restart all running"

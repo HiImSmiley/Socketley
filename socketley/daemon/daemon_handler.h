@@ -207,10 +207,33 @@ private:
     // Wait for a just-started out-of-process runtime to say whether it can serve
     // the configuration it was handed, and turn that into an exit status.
     //
-    // Returns 0 if the child is serving, non-zero with the reason already
-    // printed otherwise.  A runtime that is not out-of-process, or that has no
+    // Returns 0 if the child is serving, non-zero otherwise, with the reason
+    // appended to `out`.  A runtime that is not out-of-process, or that has no
     // supervisor, is 0: there is nothing in another process to wait for.
-    int await_worker_startup(std::string_view name);
+    //
+    // The reason goes into a string rather than onto std::cout because the two
+    // callers answer on different channels: cmd_create borrows cout for the
+    // length of the command (cout_to_reply), and cmd_start and cmd_reload write
+    // to conn->write_buf.  Printing from in here put `start`'s reason on the
+    // daemon's own stdout, which is the place these messages were already being
+    // lost — the same mistake cmd_reload_lua writes its own note about.
+    //
+    // `deadline` is an absolute point, not a duration, so that a command
+    // starting several runtimes spends ONE budget across all of them.  The
+    // children are forked by a single reconcile_proxy_workers() before any of
+    // these waits, so they come up concurrently: a `start` of twenty pays about
+    // one child's startup, and only a wedged child can reach the bound.
+    int await_worker_startup(std::string_view name, std::string& out,
+                             std::chrono::steady_clock::time_point deadline);
+
+    // Why this runtime's on_start raised, wherever the script ran.
+    //
+    // The instance holds it when the script ran in the daemon; when it ran in a
+    // worker the child sent it up as a `start_err` frame and the supervisor
+    // holds it.  Taken, not peeked — one start, one report — so this must be
+    // called once per start, after the wait that guarantees the frame has been
+    // ingested.  Empty when on_start ran, which is the ordinary case.
+    std::string on_start_error(std::string_view name);
 
     // Drain every worker's control socket so the figures are current.  Called
     // before the commands that print them.

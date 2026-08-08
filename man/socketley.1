@@ -323,6 +323,20 @@ so the runtime is left exactly as it was; see
 Press Ctrl+C to detach (runtime continues running).
 If the runtime is already running, attaches without restarting.
 .RE
+.IP
+For a runtime that lives in a worker process,
+.B start
+waits for the child to report before it returns \(em so the port is accepting
+by the time the command exits, and a refusal the child alone can judge is the
+command's own exit status rather than something
+.B ls
+shows two seconds later. Exit 1 names the runtime if the worker would not take
+its configuration, and carries the reason if the script's
+.B on_start
+raised. One budget of two seconds is spent for the whole command, not one per
+runtime: the children are forked together and come up concurrently, so a
+.B start
+of twenty costs about the same wait as a start of one.
 .TP
 .BI "stop " "name|pattern" "..."
 Stop one or more running runtimes. Accepts multiple names, glob patterns
@@ -441,6 +455,16 @@ names, glob patterns, or a mix. Non-running runtimes are skipped.
 With
 .BR * ,
 restarts all running runtimes.
+.IP
+A runtime that lives in a worker process has its child taken down and forked
+again, so the script on disk is re-read and a change to it takes effect. The
+command waits for the new child, exactly as
+.B create \-s
+does, and answers for it: exit 1 naming the runtime if the worker refuses the
+configuration it was handed, and exit 1 with the reason if the reloaded
+script's
+.B on_start
+raises. Success stays silent.
 .TP
 .BI "reload-lua " "name|pattern" "..."
 Hot-reload the Lua script attached to one or more runtimes. The Lua
