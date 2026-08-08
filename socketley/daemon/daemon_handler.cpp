@@ -1771,14 +1771,17 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
-            out << "{\"id\":\"" << instance->get_id()
-                << "\",\"name\":\"" << name
+            // Escaped, all of them.  A name is validated now, but a group and
+            // an owner are arbitrary operator strings, and a quote in either
+            // used to produce a document no JSON parser would accept.
+            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
+                << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"status\":\"" << state_str
                 << "\",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
-                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << ",\"owner\":\"" << sp_detail::json_escape(owner)
+                << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
         }
         out << "]\n";
@@ -1975,16 +1978,16 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             // failed runtime claiming to be up, which is worse than no row.
             // uptime goes empty for the same reason: a runtime that never
             // started has no start time to measure from.
-            out << "{\"id\":\"" << instance->get_id()
-                << "\",\"name\":\"" << name
+            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
+                << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
                 << "\",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
-                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << ",\"owner\":\"" << sp_detail::json_escape(owner)
+                << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
         }
         out << "]\n";
@@ -3116,23 +3119,52 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 
     // Same gate as the create path: a config carrying TLS this build cannot
     // honour is rejected before anything is applied or written back to the
-    // state file.  Note the check is on what the incoming JSON *sets* — a
-    // config that omits the TLS fields is accepted, which is how an operator
-    // clears them from a runtime restored out of an older state file (dump,
-    // drop the fields, import).
+    // state file.
     //
-    // The replication target comes from the same document, not from the live
-    // instance: this is the configuration that is about to take effect, and an
-    // import is exactly how a cleartext replicating cache would otherwise be
-    // handed a certificate one field at a time.  A document that drops
-    // replicate_target drops the replication with it (set_replicate_target
-    // below is called unconditionally), so the pair being judged here is the
-    // pair that will exist afterwards.
+    // ─── JUDGED ON THE RESULT, NOT ON THE DOCUMENT ──────────────────────────
+    //
+    // This used to read cfg directly, on the reasoning that a document which
+    // omits the TLS fields is clearing them — which was true when every field
+    // was applied unconditionally.  It is not any more: an omitted field now
+    // leaves the runtime's own value in place (see the apply block below), so
+    // reading cfg would judge a configuration that is not the one about to
+    // exist.
+    //
+    // Concretely, and this is the hole it would have opened: a TLS cache with
+    // no replication, handed a document that names only replicate_target.  cfg
+    // says tls=false, the gate passes, and the apply gives it a replication
+    // leg — the exact cleartext-replication pair tls_config_refusal exists to
+    // refuse.  So each value is taken from the document where the document
+    // names it and from the instance where it does not, which is what the
+    // runtime will be carrying a few lines from now.
+    std::string_view inst_mca, inst_mcert, inst_mkey;
+    instance->get_mesh_tls_paths(inst_mca, inst_mcert, inst_mkey);
+
+    const auto merged = [&cfg](const char* key, auto from_doc, auto from_inst) {
+        return cfg.has(key) ? from_doc : from_inst;
+    };
+
+    const bool        eff_tls  = merged("tls", cfg.tls, instance->get_tls());
+    const bool        eff_udp  = merged("udp", cfg.udp, instance->is_udp());
+    const std::string eff_cert = merged("cert_path", cfg.cert_path,
+                                        std::string(instance->get_cert_path()));
+    const std::string eff_key  = merged("key_path", cfg.key_path,
+                                        std::string(instance->get_key_path()));
+    const std::string eff_ca   = merged("ca_path", cfg.ca_path,
+                                        std::string(instance->get_ca_path()));
+    const std::string eff_mca  = merged("mesh_client_ca", cfg.mesh_client_ca,
+                                        std::string(inst_mca));
+    const std::string eff_mcrt = merged("mesh_client_cert", cfg.mesh_client_cert,
+                                        std::string(inst_mcert));
+    const std::string eff_mkey = merged("mesh_client_key", cfg.mesh_client_key,
+                                        std::string(inst_mkey));
+    const std::string eff_repl = merged("replicate_target", cfg.replicate_target,
+                                        std::string(instance->get_replication_target()));
+
     if (const std::string msg = tls_config_refusal(type,
-                                                   cfg.tls, cfg.udp, cfg.cert_path, cfg.key_path,
-                                                   cfg.ca_path, cfg.mesh_client_ca,
-                                                   cfg.mesh_client_cert, cfg.mesh_client_key,
-                                                   cfg.replicate_target);
+                                                   eff_tls, eff_udp, eff_cert, eff_key,
+                                                   eff_ca, eff_mca, eff_mcrt, eff_mkey,
+                                                   eff_repl);
         !msg.empty())
     {
         conn->write_buf = msg;
@@ -3147,6 +3179,18 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (is_running)
         {
             conn->write_buf = "cannot rename while running\n";
+            return 1;
+        }
+        // Two reasons, said apart.  rename() refuses a taken name and an
+        // invalid one, and "already taken" for a name with a slash in it sends
+        // the operator looking for a runtime that does not exist — the same
+        // defect cmd_create still has one command over.
+        if (!runtime_manager::valid_name(cfg.name))
+        {
+            conn->write_buf = "invalid runtime name: " + cfg.name + "\n"
+                "  A name may contain letters, digits, '-', '_' and '.', "
+                "may not begin with '.',\n"
+                "  and may be at most 128 characters.\n";
             return 1;
         }
         if (!m_manager.rename(old_name, cfg.name))
@@ -3214,30 +3258,56 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Apply common fields
-    instance->set_port(cfg.port);
-    instance->set_log_file(cfg.log_file);
-    instance->set_write_file(cfg.write_file);
-    instance->set_bash_output(cfg.bash_output);
-    instance->set_bash_prefix(cfg.bash_prefix);
-    instance->set_bash_timestamp(cfg.bash_timestamp);
-    instance->set_max_connections(cfg.max_connections);
-    instance->set_rate_limit(cfg.rate_limit);
-    instance->set_global_rate_limit(cfg.global_rate_limit);
-    instance->set_idle_timeout(cfg.idle_timeout);
-    instance->set_drain(cfg.drain);
-    instance->set_reconnect(cfg.reconnect);
-    instance->set_tls(cfg.tls);
-    instance->set_cert_path(cfg.cert_path);
-    instance->set_key_path(cfg.key_path);
-    instance->set_ca_path(cfg.ca_path);
-    instance->set_target(cfg.target);
-    instance->set_cache_name(cfg.cache_name);
-    instance->set_group(cfg.group);
+    // ─── ONLY WHAT THE DOCUMENT NAMES ───────────────────────────────────────
+    //
+    // Every field in runtime_config has a default, and this used to apply all
+    // of them unconditionally — so a document that left a field out cleared it.
+    // Measured, against a runtime with a port, a log path, two limits and a
+    // complete TLS set:
+    //
+    //     socketley import c '{"name":"c"}'
+    //     exit 0, no output
+    //     ... and port, log_file, max_connections, idle_timeout, tls,
+    //         cert_path and key_path were all gone.
+    //
+    // A runtime configured to speak TLS answered in cleartext afterwards, and
+    // the command that did it reported success.  The whole tls_config_refusal
+    // apparatus misses it, because it judges the INCOMING document and that
+    // document no longer has any TLS in it to be incomplete.
+    //
+    // ─── CLEARING IS STILL POSSIBLE, AND IS NOW SAID OUT LOUD ───────────────
+    //
+    // Emptying a field was the documented escape hatch — dump, delete the
+    // lines, import — and it stays available: `"tls": false`, `"cert_path": ""`.
+    // What changes is that it has to be written rather than implied.  The
+    // ordinary round trip is unaffected, because `show` emits every field.
+    const auto has = [&cfg](const char* key) { return cfg.has(key); };
 
-    // Lua script: reload if changed
+    if (has("port"))              instance->set_port(cfg.port);
+    if (has("log_file"))          instance->set_log_file(cfg.log_file);
+    if (has("write_file"))        instance->set_write_file(cfg.write_file);
+    if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
+    if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
+    if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
+    if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);
+    if (has("rate_limit"))        instance->set_rate_limit(cfg.rate_limit);
+    if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);
+    if (has("idle_timeout"))      instance->set_idle_timeout(cfg.idle_timeout);
+    if (has("drain"))             instance->set_drain(cfg.drain);
+    if (has("reconnect"))         instance->set_reconnect(cfg.reconnect);
+    if (has("tls"))               instance->set_tls(cfg.tls);
+    if (has("cert_path"))         instance->set_cert_path(cfg.cert_path);
+    if (has("key_path"))          instance->set_key_path(cfg.key_path);
+    if (has("ca_path"))           instance->set_ca_path(cfg.ca_path);
+    if (has("target"))            instance->set_target(cfg.target);
+    if (has("cache_name"))        instance->set_cache_name(cfg.cache_name);
+    if (has("group"))             instance->set_group(cfg.group);
+
+    // Lua script: reload if changed — and only when the document says which
+    // script it wants.  Without the guard, a partial document reads as
+    // lua_script="" and detaches the runtime's handler.
     std::string cur_lua(instance->get_lua_script_path());
-    if (cfg.lua_script != cur_lua)
+    if (has("lua_script") && cfg.lua_script != cur_lua)
     {
         if (!cfg.lua_script.empty())
         {
@@ -3260,14 +3330,20 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         case runtime_server:
         {
             auto* srv = static_cast<server_instance*>(instance);
-            srv->set_mode(static_cast<server_mode>(cfg.mode));
-            srv->set_udp(cfg.udp);
+            if (has("mode")) srv->set_mode(static_cast<server_mode>(cfg.mode));
+            if (has("udp"))  srv->set_udp(cfg.udp);
             if (!cfg.cache_name.empty())
                 srv->set_runtime_manager(&m_manager);
             if (!cfg.master_pw.empty())
                 srv->set_master_pw(cfg.master_pw);
             if (cfg.master_forward)
                 srv->set_master_forward(true);
+
+            // The list is replaced only when the document names it.  Clearing
+            // it on a document that never mentioned upstreams is the same
+            // silent loss as the common fields above, and the loudest version
+            // of it: a server whose upstream leg simply stops existing.
+            if (!has("upstreams")) break;
             srv->clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
             {
@@ -3287,37 +3363,42 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         case runtime_client:
         {
             auto* cli = static_cast<client_instance*>(instance);
-            cli->set_mode(static_cast<client_mode>(cfg.mode));
-            cli->set_udp(cfg.udp);
+            if (has("mode")) cli->set_mode(static_cast<client_mode>(cfg.mode));
+            if (has("udp"))  cli->set_udp(cfg.udp);
             break;
         }
         case runtime_proxy:
         {
             auto* prx = static_cast<proxy_instance*>(instance);
-            prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
-            prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
-            prx->clear_backends();
-            for (const auto& b : cfg.backends)
-                prx->add_backend(b);
+            if (has("protocol")) prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
+            if (has("strategy")) prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
+            if (has("backends"))
+            {
+                prx->clear_backends();
+                for (const auto& b : cfg.backends)
+                    prx->add_backend(b);
+            }
             prx->set_runtime_manager(&m_manager);
-            // The gate above guarantees these three are empty, so this is the
-            // clearing half of the escape hatch: without it a proxy restored
-            // from a state file with mesh mTLS paths could never be emptied,
-            // and would refuse to start forever.
-            prx->set_mesh_client_ca(cfg.mesh_client_ca);
-            prx->set_mesh_client_cert(cfg.mesh_client_cert);
-            prx->set_mesh_client_key(cfg.mesh_client_key);
+            // The clearing half of the escape hatch: without it a proxy
+            // restored from a state file with mesh mTLS paths could never be
+            // emptied, and would refuse to start forever.  Each is applied only
+            // when the document names it, so emptying is now written as
+            // `"mesh_client_ca": ""` rather than by leaving the key out — the
+            // gate above judged whatever this is about to produce.
+            if (has("mesh_client_ca"))   prx->set_mesh_client_ca(cfg.mesh_client_ca);
+            if (has("mesh_client_cert")) prx->set_mesh_client_cert(cfg.mesh_client_cert);
+            if (has("mesh_client_key"))  prx->set_mesh_client_key(cfg.mesh_client_key);
             break;
         }
         case runtime_cache:
         {
             auto* cache = static_cast<cache_instance*>(instance);
-            cache->set_persistent(cfg.persistent_path);
-            cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
-            cache->set_resp_forced(cfg.resp_forced);
-            cache->set_replicate_target(cfg.replicate_target);
-            cache->set_max_memory(cfg.max_memory);
-            cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
+            if (has("persistent_path"))  cache->set_persistent(cfg.persistent_path);
+            if (has("cache_mode"))       cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
+            if (has("resp_forced"))      cache->set_resp_forced(cfg.resp_forced);
+            if (has("replicate_target")) cache->set_replicate_target(cfg.replicate_target);
+            if (has("max_memory"))       cache->set_max_memory(cfg.max_memory);
+            if (has("eviction"))         cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
             break;
         }
     }
