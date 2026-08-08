@@ -1094,6 +1094,42 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         return 1;
     }
 
+    // ─── A COMMAND WITH MORE ARGUMENTS THAN THE PARSER HAS SLOTS ────────────
+    //
+    // parsed_args puts the whole remainder in its last slot, so a command whose
+    // final argument is free text is complete and correct: `send`, `action` and
+    // `import` all read their payload with rest_from(), which spans to the end
+    // of the line.  That is the case worth keeping — a message, a cache value
+    // or a configuration document has no business having a word limit.
+    //
+    // Every other command reads its arguments as a LIST, and for those the
+    // merged tail is not the request that was made.  `start a b c ...` past the
+    // limit would look up one impossible name made of the rest; `create` would
+    // lose flags and build a runtime nobody asked for.  Both used to happen
+    // silently, which is what this refuses.
+    //
+    // The allowlist is here rather than in parsed_args because this is where
+    // the commands are known, and it is three entries rather than a rule
+    // because there are three: everything else would be guessing.
+    if (pa.overflowed)
+    {
+        switch (pa.hashes[0])
+        {
+            case fnv1a("send"):
+            case fnv1a("action"):
+            case fnv1a("import"):
+                break;   // the tail is the payload, and it is all there
+
+            default:
+                std::cout << "too many arguments for " << pa.args[0]
+                          << " (at most " << (MAX_ARGS - 1) << ")\n"
+                             "  Everything past that used to be dropped without a word; "
+                             "it is refused now\n"
+                             "  rather than acted on in part.\n";
+                return 1;
+        }
+    }
+
     switch (pa.hashes[0])
     {
         case fnv1a("create"):     return cmd_create(conn, pa);
