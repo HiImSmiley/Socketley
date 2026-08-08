@@ -77,9 +77,19 @@ cat > "$PKG_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 set -e
 
-# Create system user
+# Create system user and the group that reaches its socket.
+#
+# Explicit, not useradd's default: the IPC socket is 0660 socketley:socketley,
+# so membership of `socketley` is the set of people who may administer this
+# daemon — and whether useradd creates a matching group at all depends on
+# USERGROUPS_ENAB, which differs between distributions.
+if ! getent group socketley >/dev/null 2>&1; then
+    groupadd --system socketley
+fi
+
 if ! id -u socketley >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin socketley
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid socketley socketley
 fi
 
 # Fix ownership
@@ -93,6 +103,13 @@ pkill -x socketley 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable socketley.service
 systemctl try-restart socketley.service 2>/dev/null || true
+
+# Said on install because an upgrade changes who can reach the daemon.  The
+# socket was 0666 and is now 0660 socketley:socketley, so anyone who has been
+# driving the system daemon without being in that group stops being able to.
+echo "socketley: the daemon's IPC socket is 0660 socketley:socketley."
+echo "socketley: to let a user run socketley commands against it:"
+echo "socketley:   usermod -aG socketley <user>   (the user must log in again)"
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postinst"
 

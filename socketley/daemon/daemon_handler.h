@@ -66,6 +66,16 @@ public:
 
     static std::string socket_path;
 
+    // Whether the path above is the packaged deployment's socket — /run/socketley
+    // — rather than a socket this daemon owns alone.  Set from
+    // socketley_paths::system_mode by the one caller that starts a daemon, and
+    // read only by setup(), which uses it to decide who may open the control
+    // plane.  See the block of reasoning there.
+    //
+    // False is the safe answer and therefore the default: a daemon that never
+    // says otherwise gets a socket only its own uid can open.
+    static bool system_socket;
+
 private:
     using client_map = std::unordered_map<int, std::unique_ptr<ipc_connection>>;
 

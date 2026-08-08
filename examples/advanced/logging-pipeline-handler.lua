@@ -7,9 +7,11 @@
 -- below is per-runtime and `self` is whichever runtime is running the
 -- callback.
 --
--- os.date() is available here -- the handler sandbox keeps os.time, os.clock,
--- os.date and os.difftime, and removes only os.execute, os.remove, os.rename,
--- os.tmpname and os.exit.
+-- os.date() is available here.  A handler is not sandboxed: it runs with the
+-- daemon's full privileges, and io, package and the whole of os are open to it
+-- apart from os.exit and os.setlocale, which are removed because one call to
+-- either damages every OTHER runtime in the shared process.  See "Handler
+-- Privileges" in socketley(1).
 --
 -- =============================================================================
 

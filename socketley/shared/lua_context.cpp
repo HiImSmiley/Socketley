@@ -262,19 +262,54 @@ lua_context::lua_context()
                          sol::lib::math, sol::lib::os, sol::lib::io,
                          sol::lib::package);
 
-    // Remove dangerous os functions — keep os.time, os.clock, os.date, os.difftime
-    m_lua["os"]["execute"] = sol::nil;
-    m_lua["os"]["remove"]  = sol::nil;
-    m_lua["os"]["rename"]  = sol::nil;
-    m_lua["os"]["tmpname"] = sol::nil;
-    m_lua["os"]["exit"]    = sol::nil;
-
-    // ─── os.setlocale, which reaches further than any of the five above ──────
+    // ─── THIS IS NOT A SANDBOX, AND SAYING SO IS THE POINT ──────────────────
     //
-    // The other five are removed because a script can use them to act outside
-    // its own runtime: run a program, delete a file, end the process.  This one
-    // was left, and it is the only one that damages every other runtime in the
-    // daemon without the script doing anything else at all.
+    // What used to be here removed five names — os.execute, os.remove,
+    // os.rename, os.tmpname, os.exit — under the heading "dangerous os
+    // functions".  Four of those five bought nothing.  `io` is open, so
+    // io.popen("...") is a shell and io.open(path, "w") truncates any file this
+    // uid can write; `package` is open, so package.loadlib maps arbitrary
+    // native code; `base` is open, so load/loadstring/dofile/loadfile compile
+    // anything a handler can produce.  Removing os.execute while io.popen sits
+    // beside it does not deny a capability, it hides where the capability is.
+    //
+    // That is worse than leaving it alone.  A script author who sees os.remove
+    // come back nil concludes the daemon protects its files, and it does not.
+    // Anyone deciding whether to accept a handler from a colleague was reading
+    // a boundary that was never enforced anywhere.
+    //
+    // And the capability is not one to take away.  Handlers legitimately read
+    // and write files — a logging pipeline appends, a config-driven handler
+    // reads its table off disk — so closing `io` would break supported use for
+    // the sake of a fence with a gate next to it.
+    //
+    // THE HONEST STATEMENT, which the man page now carries in these words: a
+    // Lua handler runs with the daemon's full privileges.  Treat a handler the
+    // way you would treat a program you are about to run as that user, because
+    // that is what it is.  What keeps an untrusted local user from supplying
+    // one is the permission on the IPC socket — see daemon_handler::setup() —
+    // not anything in this interpreter.
+    //
+    // ─── WHAT IS STILL REMOVED, AND ON WHAT GROUNDS ─────────────────────────
+    //
+    // Two names, and the test is not "could a script misuse this" — every name
+    // here fails that test.  It is: does ONE call damage the process that every
+    // other runtime shares, in a way no other single call does?  That is a
+    // guard against an accident in a handler that is trusted, which is a real
+    // thing to want and is not a security claim.
+    //
+    // os.exit() ends the daemon.  A handler is very often a standalone script
+    // that grew into one, and standalone scripts end with os.exit; copied in as
+    // written it takes down every runtime in the process, from inside a
+    // callback, with no error anywhere.  Yes, a determined script can reach the
+    // same end through io.popen and a signal — that is the point of the
+    // paragraphs above — but it cannot reach it by accident.
+    m_lua["os"]["exit"] = sol::nil;
+
+    // ─── os.setlocale, which reaches further than any name yet named ─────────
+    //
+    // It is the one that damages every other runtime in the daemon without the
+    // script doing anything else at all.
     //
     // setlocale(LC_ALL, ...) is process-wide, and this daemon serves every
     // runtime from one process.  Two of its own primitives read the C locale:
@@ -293,7 +328,7 @@ lua_context::lua_context()
     // daemon lives.  A cache holding "1,5" does not become "1.5" again when the
     // script that did it is removed.
     //
-    // Removed rather than wrapped, because that is what the five above are and
+    // Removed rather than wrapped, for the same reason as os.exit above and
     // because there is nothing to wrap it down to: the legitimate uses of a
     // locale are reads, and os.date, os.time and os.clock — which stay — are
     // the reads.  Nothing a script in this tree does needs to CHANGE the
@@ -1196,7 +1231,16 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 
 #ifdef SOCKETLEY_NO_HTTPS
     if (is_https) {
-        result["error"] = "HTTPS not supported in this build; use io.popen(\"curl -s https://...\")";
+        // The wording here used to be `use io.popen("curl -s https://...")`.
+        // A diagnostic that hands the caller a shell is the wrong answer twice
+        // over: it turns one runtime's missing TLS into an arbitrary command
+        // executed with the daemon's privileges, and it teaches that as the
+        // normal way to fetch a URL, in the one message a script author is
+        // guaranteed to read at the moment they are looking for a workaround.
+        // What is actually missing is a build, so that is what it says.
+        result["error"] = "HTTPS not supported in this build (compiled with "
+                          "SOCKETLEY_NO_HTTPS); use http://, or rebuild with "
+                          "TLS support";
         return result;
     }
 #endif

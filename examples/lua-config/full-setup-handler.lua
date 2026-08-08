@@ -10,7 +10,7 @@
 -- =============================================================================
 
 -- Per-runtime state.  Each runtime has its own copy of these.
-local startup_time  = os.time()   -- os.time survives the sandbox; os.execute does not
+local startup_time  = os.time()   -- the whole os table is here; a handler is not sandboxed
 local request_count = 0
 
 -- The path on_route is handed is the one the CLIENT sent, and it still carries

@@ -54,3 +54,13 @@ if [ "$UPGRADE" = true ]; then
 else
   echo "Done. Start the daemon with: sudo systemctl start socketley"
 fi
+
+cat <<'PERMS'
+
+The daemon's IPC socket is 0660 socketley:socketley. Every socketley command
+goes through it, and a runtime's --lua script runs with the daemon's
+privileges, so reaching it is an administrative right. To grant it:
+
+  sudo usermod -aG socketley "$USER"     # then log in again
+
+PERMS

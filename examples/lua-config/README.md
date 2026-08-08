@@ -53,9 +53,24 @@ It opens `base`, `package` and `table`, and nothing else.
   unavailable. `..` and `tostring()` are core and still work.
 - No `math`, no `io`.
 
-A handler has all of these, minus five `os` functions the sandbox removes:
-`os.execute`, `os.remove`, `os.rename`, `os.tmpname`, `os.exit`. `os.time`,
-`os.clock`, `os.date` and `os.difftime` remain.
+### A handler is not sandboxed
+
+A handler's interpreter has all of the above plus `os`, `io` and `package`, and
+**it runs with the daemon's full privileges** — `io.popen` is a shell,
+`io.open(path, "w")` truncates any file that user can write, `package.loadlib`
+maps native code. Treat a handler as a program you are about to run as that
+user.
+
+Two `os` names are removed, and neither is a security boundary: `os.exit`,
+which ends the daemon from inside a callback, and `os.setlocale`, which changes
+the `LC_NUMERIC` that `json_encode`/`json_decode` spell numbers with. Both are
+guards against one line damaging every *other* runtime in the shared process by
+accident. `os.time`, `os.clock`, `os.date` and `os.difftime` remain — they are
+reads.
+
+What decides *who* may hand this daemon a handler is the permission on its IPC
+socket (`0660 socketley:socketley` for the packaged daemon, `0600` otherwise),
+not anything in the interpreter.
 
 ## Examples
 

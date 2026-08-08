@@ -3,10 +3,19 @@
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
-# The Lua sandbox nils five os functions — execute, remove, rename, tmpname,
-# exit — and left os.setlocale.  The five are removed because a script can use
-# them to act outside its own runtime.  setlocale is the one that damages every
-# OTHER runtime in the daemon without the script doing anything else at all:
+# A handler's interpreter nils exactly two os names — os.exit and os.setlocale
+# — and neither removal is a security boundary.  A handler runs with the
+# daemon's full privileges: io.popen is a shell, io.open(path,"w") truncates,
+# package.loadlib maps native code.  (Four more names, os.execute, os.remove,
+# os.rename and os.tmpname, used to be nil too; they were restored because
+# removing them denied nothing and advertised a fence with an open gate.  What
+# limits who may supply a handler is the IPC socket's permission — see
+# test_ipc_socket_permissions.sh — not this interpreter.)
+#
+# The test the two survivors pass is narrower and is about accidents, not
+# attackers: one call damages the process every OTHER runtime shares.  os.exit
+# ends the daemon from inside a callback, which is what a standalone script
+# copied in as written does.  And setlocale, this file's subject:
 # setlocale(LC_ALL, ...) is process-wide, this daemon serves every runtime from
 # one process, and two of its own primitives read the C locale —
 # socketley.json_encode formats with "%.14g" and json_decode parses with
@@ -37,8 +46,12 @@
 #
 #   * os.time, os.clock, os.date and os.difftime must still be callable.  They
 #     are the reads; setlocale is the write, and only the write is the problem.
-#   * the five already-removed names must still be removed, so a build that
-#     restored the whole os table would not pass this file.
+#   * os.exit must still be nil, so a build that restored the whole os table
+#     would not pass this file.
+#   * os.execute, os.remove, os.rename and os.tmpname must be present, because
+#     their absence is what this tree decided NOT to keep pretending to.  A
+#     build that quietly nils them again puts the misleading fence back, and
+#     the man page then describes an interpreter that does not exist.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -113,10 +126,13 @@ function on_start()
     socketley.log("LOC reads=" ..
         tostring(type(os.time)) .. "," .. tostring(type(os.clock)) .. "," ..
         tostring(type(os.date)) .. "," .. tostring(type(os.difftime)))
-    socketley.log("LOC gone=" ..
-        tostring(os.execute) .. "," .. tostring(os.remove) .. "," ..
-        tostring(os.rename) .. "," .. tostring(os.tmpname) .. "," ..
-        tostring(os.exit))
+    socketley.log("LOC exit=" .. tostring(os.exit))
+    -- And the four that were restored.  Their absence used to be reported as
+    -- a boundary; it never was one, and a build that nils them again must not
+    -- pass this file with the man page saying otherwise.
+    socketley.log("LOC back=" ..
+        type(os.execute) .. "," .. type(os.remove) .. "," ..
+        type(os.rename) .. "," .. type(os.tmpname))
 end
 LUAEOF
 
@@ -142,12 +158,24 @@ then pass; else
          "setlocale is the write; the reads are what a script legitimately needs"
 fi
 
-# ── Control: the five already removed are still removed ─────────────────────
-if grep -qa "LOC gone=nil,nil,nil,nil,nil" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
-    GONE=$(grep -a "LOC gone=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
-    fail "control: execute/remove/rename/tmpname/exit are still nil" \
+# ── Control: os.exit is still nil ───────────────────────────────────────────
+if grep -qa "LOC exit=nil" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    GONE=$(grep -a "LOC exit=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+    fail "control: os.exit is still nil" \
          "got: ${GONE:-<no line at all>}" \
-         "a build that restored the whole os table must not pass this file"
+         "a build that restored the whole os table must not pass this file;" \
+         "os.exit() ends the daemon from inside a callback, by accident, in" \
+         "any handler that grew out of a standalone script"
+fi
+
+# ── Control: the four that were restored really are back ────────────────────
+if grep -qa "LOC back=function,function,function,function" "$SOCKETLEY_DLOG" 2>/dev/null
+then pass; else
+    BACK=$(grep -a "LOC back=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+    fail "control: execute/remove/rename/tmpname are present" \
+         "got: ${BACK:-<no line at all>}" \
+         "nilling them denies nothing — io.popen is a shell and io.open(p,'w')" \
+         "truncates — and it tells a script author the daemon guards its files"
 fi
 
 # ── The damage, in a runtime that did nothing ───────────────────────────────

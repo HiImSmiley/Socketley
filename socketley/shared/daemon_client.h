@@ -38,6 +38,19 @@ enum class daemon_identity
     // this from outside.  Still not sent to — but it is a different sentence.
     mute,
 
+    // The socket is there and this uid may not open it: connect() came back
+    // EACCES or EPERM.
+    //
+    // Distinct from `absent` because the two call for opposite responses.
+    // `absent` means the path is free and the CLI should start a daemon on it;
+    // this means a daemon that is not ours is serving it, and starting one
+    // would either fail on the bind or — where the path happens to be
+    // unlinkable — take the socket away from the daemon that owns it.  Since
+    // the IPC socket became owner-and-group-only this is the shape an ordinary
+    // mistake takes (a second user on one box, an operator not in the
+    // `socketley` group), so it gets a sentence that names the fix.
+    forbidden,
+
     // A socketley daemon from a build before `ping` existed.  Its reply to an
     // unknown command is a two-byte frame — exit code 1, empty body — which no
     // arbitrary program produces by accident, and which does not depend on the

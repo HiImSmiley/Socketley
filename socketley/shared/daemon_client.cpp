@@ -1,5 +1,6 @@
 #include "daemon_client.h"
 #include "paths.h"
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <cstring>
@@ -63,7 +64,16 @@ daemon_identity daemon_probe(const char*   socket_path,
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        // EACCES/EPERM is not "nothing is there".  The socket exists and this
+        // uid has no write permission on it, which since the mode was tightened
+        // is what a second user on one machine, or an operator who is not in
+        // the `socketley` group, gets.  Reported as `absent` it became "failed
+        // to start daemon" after the CLI forked a daemon that could not bind —
+        // a message that names neither the cause nor the fix.
+        const int err = errno;
         close(fd);
+        if (err == EACCES || err == EPERM)
+            return daemon_identity::forbidden;
         return daemon_identity::absent;
     }
 

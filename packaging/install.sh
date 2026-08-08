@@ -16,9 +16,22 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
-# Create system user
+# Create system user and the group that reaches its socket.
+#
+# The group is created explicitly rather than left to useradd's default,
+# because it is no longer only the daemon's own group: the IPC socket is
+# 0660 socketley:socketley, so membership of `socketley` is exactly the
+# set of people who can run socketley commands against the system daemon.
+# Whether useradd makes a matching group depends on USERGROUPS_ENAB, which
+# differs between distributions, and "who may administer this daemon" is
+# not a thing to leave to /etc/login.defs.
+if ! getent group socketley >/dev/null 2>&1; then
+    groupadd --system socketley
+fi
+
 if ! id -u socketley >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin socketley
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid socketley socketley
 fi
 
 # Install binary
@@ -49,3 +62,8 @@ echo "socketley installed successfully"
 echo "  start:   systemctl start socketley"
 echo "  status:  systemctl status socketley"
 echo "  logs:    journalctl -u socketley -f"
+echo ""
+echo "  The daemon's IPC socket is 0660 socketley:socketley. Every socketley"
+echo "  command goes through it, and a runtime's --lua script runs with the"
+echo "  daemon's privileges, so reaching it is an administrative right:"
+echo "    usermod -aG socketley <user>     (the user must log in again)"

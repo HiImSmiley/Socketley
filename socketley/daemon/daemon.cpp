@@ -569,6 +569,29 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
 
+    // ...and whether that path is the packaged deployment's, which is what
+    // decides who may open the socket.  Only here: the CLI resolves paths too,
+    // but the CLI never calls setup() and a value it set would be read by
+    // nothing.  See the block in daemon_handler::setup().
+    //
+    // system_mode ALONE is not the question, though it is the obvious spelling
+    // of this line.  It is decided in paths.cpp from the uid and from whether
+    // socketley is installed, and it is decided BEFORE SOCKETLEY_SOCKET moves
+    // the socket —
+    // so root on a machine with the package installed carries system_mode into
+    // a daemon whose socket is a mktemp path in /tmp, and that socket would
+    // then be handed to the `socketley` group.  A test daemon, or any second
+    // daemon, opened to a group nobody meant to invite.
+    //
+    // default_socket_path is the path this namespace resolves to with the
+    // variable out of the picture — the one the deployed daemon binds — so the
+    // two together say "this daemon is the packaged daemon" and nothing less.
+    // Compared as written rather than canonicalised: a deployment that spells
+    // the default path unusually falls to the owner-only side, which is the
+    // safe direction, and no deployment sets the variable at all.
+    daemon_handler::system_socket =
+        paths.system_mode && paths.socket_path == paths.default_socket_path;
+
     // Load config file (sets log level, metrics port, etc.) before anything else
     uint16_t metrics_port = load_daemon_config(paths.config_path.string());
 

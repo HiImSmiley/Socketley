@@ -2490,7 +2490,51 @@ and
 are core and still work. Create the directories a configuration needs from the
 shell that invokes it, and do the string work in the handler, whose interpreter
 has all of these.
-.SS Handler Sandbox
+.SS Handler Privileges
+.B "A Lua handler runs with the daemon's full privileges."
+It is not sandboxed and there is no supported way to sandbox it. Read a
+handler the way you would read a program you are about to run as the user the
+daemon runs as, because that is exactly what it is.
+.PP
+Concretely, a handler can:
+.TP
+.B run any command
+.B io.popen("...")
+and
+.B os.execute("...")
+are both present.
+.TP
+.B read or write any file that user can
+.B io.open()
+is present in every mode, including
+.BR w ,
+which truncates.
+.TP
+.B load native code
+.B package.loadlib()
+is present, as are
+.BR load (),
+.BR loadstring (),
+.B dofile()
+and
+.BR loadfile ().
+.TP
+.B read the daemon's environment
+.B os.getenv()
+is present.
+.PP
+This is deliberate. Handlers legitimately read and write files \(em a logging
+pipeline appends to one, a configuration\-driven handler reads its table off
+disk \(em so closing
+.B io
+would break supported use. What it means in practice is that
+.B "the right to hand this daemon a \-\-lua script is the right to run code as its user,"
+and the thing that controls that right is the permission on the IPC socket, not
+anything in the interpreter. See
+.B THE IPC SOCKET
+under
+.BR FILES .
+.PP
 A handler's interpreter opens
 .BR base ,
 .BR string ,
@@ -2500,33 +2544,58 @@ A handler's interpreter opens
 .B io
 and
 .BR package .
-Five
-.B os
-functions are then removed, and calling one is
+Two names are removed from
+.BR os ,
+and calling one is
 .B "attempt to call field '...' (a nil value)"
 rather than a refusal with a reason:
 .PP
 .nf
-os.execute    os.remove    os.rename    os.tmpname    os.exit
+os.exit    os.setlocale
 .fi
+.PP
+Neither removal is a security boundary \(em nothing here is. The test both
+pass is narrower: one call damages the process that every
+.I other
+runtime in this daemon shares, and does so by accident rather than by intent.
+.B os.exit()
+ends the daemon from inside a callback, and a handler is very often a
+standalone script that grew into one, ending the way standalone scripts end.
+.B os.setlocale()
+changes the process's
+.BR LC_NUMERIC ,
+which is what
+.B socketley.json_encode
+and
+.B socketley.json_decode
+format and parse numbers with \(em one line in one handler and every other
+handler's JSON spells 1.5 as 1,5 and decodes it as 1, silently, for as long as
+the daemon lives.
 .PP
 .BR os.time (),
 .BR os.clock (),
 .BR os.date ()
 and
 .BR os.difftime ()
-remain \(em the handler needs to tell the time, not to run programs, unlink
-files or end the process it shares with every other runtime in the daemon.
-.B os.exit()
-in particular would take the daemon down from inside a callback.
+remain: they are reads, and reading the clock or the locale harms nothing.
 .PP
-To run a command or create a directory, do it from the shell that creates the
-runtime, before
-.BR create .
-To write a file, use
+Earlier releases also removed
+.BR os.execute (),
+.BR os.remove (),
+.BR os.rename ()
+and
+.BR os.tmpname ().
+Those four are back, because removing them denied no capability \(em
+.B io.popen
+is a shell and
+.B io.open(path, \(dqw\(dq)
+truncates \(em while suggesting to anyone reading a handler that the daemon
+guarded its files and its shell. It did not. A fence with an open gate beside
+it is worse than no fence, because people plan around it.
+.PP
+Note that
 .B io.open
-in append or write mode, which is not removed \(em bearing in mind that it
-blocks the event loop for as long as the write takes.
+and every write through it block the event loop for as long as the write takes.
 .PP
 .B require()
 resolves against the script's directory and then the default
@@ -4760,6 +4829,9 @@ systemd unit file.
 .TP
 .I /run/socketley/socketley.sock
 Unix domain socket for daemon IPC.
+.BR 0660 ,
+owned by
+.BR socketley:socketley .
 .TP
 .I /var/lib/socketley/runtimes/
 Per-runtime JSON configuration files.
@@ -4770,12 +4842,86 @@ Daemon configuration (log_level, metrics_port).
 .TP
 .I /tmp/socketley.sock
 Unix domain socket for daemon IPC.
+.BR 0600 ,
+owned by the user who started the daemon.
 .TP
 .I ~/.local/share/socketley/runtimes/
 Per-runtime JSON configuration files.
 .TP
 .I ~/.config/socketley/config.lua
 Daemon configuration (or set SOCKETLEY_CONFIG env var).
+.SS THE IPC SOCKET
+Every
+.B socketley
+command travels over the socket above, and everything the daemon can do is
+reachable through it: stopping a runtime, reading
+.BR stats ,
+rewriting a runtime's configuration with
+.BR edit ,
+and \(em since a
+.B \-\-lua
+handler runs with the daemon's privileges, see
+.B Handler Privileges
+under
+.B LUA CONFIGURATION
+\(em running arbitrary code as the user the daemon runs as.
+.PP
+So opening the socket is an administrative right, and the mode says so:
+.PP
+.nf
+/run/socketley/socketley.sock   0660  socketley:socketley
+any other path                  0600  the user who started the daemon
+.fi
+.PP
+The packaged daemon runs as
+.B socketley
+and the operator does not, so the packaged socket is shared with one group and
+membership of that group is how the right is granted:
+.PP
+.nf
+sudo usermod \-aG socketley "$USER"     # then log in again
+.fi
+.PP
+A daemon on any other path \(em a development daemon, or one started with
+.B SOCKETLEY_SOCKET
+\(em keeps its socket to itself. That is owner\-only rather than
+owner\-and\-group because a shared primary group is not unusual \(em
+.B users
+on several distributions \(em and there the daemon's group is every human on
+the machine.
+.PP
+.B "This socket used to be 0666,"
+world\-writable, on both paths. Any local uid could drive any daemon on the
+machine, whoever it belonged to. After upgrading past that, a user who has
+been running
+.B socketley
+against a system daemon without being in the
+.B socketley
+group will get
+.PP
+.nf
+not permitted to open the daemon socket at /run/socketley/socketley.sock
+.fi
+.PP
+and needs to be added to it. A user who is not added is not locked out of the
+program: with the system socket unreachable the CLI falls back to development
+mode and starts a daemon of that user's own, with that user's privileges and
+that user's runtimes.
+.PP
+On a machine where two people use development mode at once, the second gets the
+same message about
+.I /tmp/socketley.sock
+\(em one path, one owner, and it is no longer shared. That was never a
+supported arrangement, it was a shared daemon nobody had asked for. Give each
+their own:
+.PP
+.nf
+export SOCKETLEY_SOCKET="/tmp/socketley-$USER.sock"
+.fi
+.PP
+which also gives each a state directory of its own; see
+.B WHERE STATE LIVES
+above.
 .SS WHERE STATE LIVES
 The two paths above are where a daemon's runtimes live when it is serving the
 default socket, which is every deployed daemon and every daemon that has never
@@ -5393,6 +5539,20 @@ int main() {
 }
 // g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
 .fi
+.PP
+.B daemon_attach()
+returns false when the process may not open the daemon's IPC socket, which is
+the same permission every
+.B socketley
+command needs \(em see
+.B THE IPC SOCKET
+under
+.BR FILES .
+A program that runs as a different user from the daemon must be in the
+.B socketley
+group to register with it. False is not an error to abort on: the example above
+is the intended shape, the program runs standalone and is simply not in the
+daemon's inventory.
 .SS Mixed: Engine + Daemon Attach (Tier 2 + 3)
 Embed the full engine for maximum performance, and register with the daemon
 for fleet monitoring. Best of both worlds.

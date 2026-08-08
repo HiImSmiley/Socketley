@@ -132,6 +132,22 @@ static bool ensure_daemon(char* /*argv0*/)
                          "wedged, or the path belongs to something else.\n";
             return false;
 
+        // Not forked over.  The socket belongs to another user, and starting a
+        // daemon here would at best fail on the bind and at worst unlink a
+        // running daemon's socket out from under it.
+        case socketley::daemon_identity::forbidden:
+            std::cerr << "not permitted to open the daemon socket at "
+                      << daemon_handler::socket_path << "\n"
+                      << "  It belongs to another user. The daemon's socket is "
+                         "reachable by its owner\n"
+                         "  and, for the packaged daemon, by the socketley "
+                         "group:\n"
+                         "    sudo usermod -aG socketley $USER    (then log in "
+                         "again)\n"
+                         "  For a daemon of your own, point SOCKETLEY_SOCKET at "
+                         "a path you own.\n";
+            return false;
+
         case socketley::daemon_identity::absent:
             break;   // the path is free — including when a stale file is on it
     }
@@ -241,6 +257,15 @@ int cli_dispatch(int argc, char** argv)
                 case socketley::daemon_identity::foreign:
                     std::cerr << "the socket at " << daemon_handler::socket_path
                               << " is held by something that is not a socketley daemon\n";
+                    break;
+
+                // Worth a word even here, where no command is being sent: the
+                // version this printed is not the version that will answer,
+                // because nothing this uid sends will be answered at all.
+                case socketley::daemon_identity::forbidden:
+                    std::cerr << "the socket at " << daemon_handler::socket_path
+                              << " belongs to another user and this one may not "
+                                 "open it\n";
                     break;
 
                 // Nothing there, or there and busy.  Neither is worth a word:

@@ -25,8 +25,14 @@ absolute paths.
 The configuration is read by a smaller interpreter than the daemon's: `base`,
 `package` and `table` only. There is no `os` (so no `os.execute` — make
 directories from the shell first) and no `string` (so no `string.format` and no
-`path:match()`). The handler has all of them, minus `os.execute`, `os.remove`,
-`os.rename`, `os.tmpname` and `os.exit`.
+`path:match()`).
+
+The **handler** has all of them and is not sandboxed: it runs with the daemon's
+full privileges. `io.popen` is a shell, `io.open(p, "w")` truncates,
+`package.loadlib` maps native code. Only `os.exit` and `os.setlocale` are
+removed, and not as a boundary — one call to either damages every *other*
+runtime in the shared process. Read a handler the way you would read a program
+you are about to run as the daemon's user, because that is what it is.
 
 ## Examples
 

@@ -21,11 +21,14 @@
 #include "proxy_supervisor.h"
 
 #include <unistd.h>
+#include <cerrno>
 #include <cstring>
 #include <charconv>
 #include <chrono>
+#include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include "../shared/name_resolver.h"
 #include <iomanip>
 #include <sstream>
@@ -36,6 +39,7 @@
 #include "../shared/logging.h"
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
+bool        daemon_handler::system_socket = false;
 
 // Why this runtime's TLS configuration cannot be honoured, or an empty string
 // if it can.
@@ -223,6 +227,22 @@ bool daemon_handler::is_running()
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
     bool alive = connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+
+    // EACCES/EPERM counts as running.  The socket is there and this uid may not
+    // open it, which since the mode was tightened is what another user's daemon
+    // looks like — and the caller's next move on `false` is setup(), which
+    // opens with unlink(socket_path).  On /tmp the sticky bit refuses that, but
+    // SOCKETLEY_SOCKET can name a directory with no sticky bit, and there the
+    // unlink succeeds: a second user starting a daemon would take the path away
+    // from the daemon that owns it, leaving that daemon serving a socket with
+    // no name and every CLI command going to the new one.  Refusing to start is
+    // the same answer as for a daemon we could talk to, and the right one.
+    if (!alive)
+    {
+        const int err = errno;
+        alive = (err == EACCES || err == EPERM);
+    }
+
     // Raw close on purpose: this is a static probe with no event loop anywhere
     // in reach, so no SQE can ever have named this number and there is nothing
     // for close_fd() to hold it against.
@@ -250,6 +270,61 @@ bool daemon_handler::setup()
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
+    // ─── WHO MAY OPEN THE CONTROL PLANE ─────────────────────────────────────
+    //
+    // This was `chmod(socket_path, 0666)` — "Allow all users to connect".  It
+    // did exactly that, and connecting is not a small thing to grant: every
+    // command the CLI can send arrives here.  Any local uid could stop a
+    // runtime, read `stats`, rewrite a runtime's configuration, and — because
+    // `create --lua` takes a script and a handler runs with the daemon's
+    // privileges, which is a property of the design and not a defect (see the
+    // sandbox note in lua_context.cpp) — run code as the daemon's user.
+    //
+    // Measured on the parent commit, dev mode, daemon owned by uid 1000:
+    //
+    //     socket mode                                srw-rw-rw-  (0666)
+    //     uid nobody: connect + "ping"               answered
+    //     uid nobody: create --lua + start           accepted
+    //     the handler's io.popen("id -un") wrote     the daemon's user
+    //     the file it created was owned by           the daemon's user
+    //
+    // That is privilege escalation with Lua as one route to it and the rest of
+    // the command set as the others, so the fix is here rather than in the
+    // interpreter.
+    //
+    // THE RULE.  A daemon serving the packaged path shares its socket with its
+    // own group and nobody else; every other daemon keeps its socket to itself.
+    //
+    //     /run/socketley/socketley.sock   0660  socketley:socketley
+    //     anything else                   0600  <the user who started it>
+    //
+    // Both halves matter.  0600 everywhere would break the packaged deployment,
+    // where the daemon runs as `socketley` and the operator does not; 0660
+    // everywhere would be a hole on any distribution that gives its users a
+    // shared primary group — `users`, which several do — since there the
+    // daemon's group is every human on the machine.  system_socket is the only
+    // thing that distinguishes the two, and it defaults to false.
+    //
+    // The unprivileged single-user case, which is the ordinary one, is
+    // unaffected: the socket belongs to the uid that started the daemon and
+    // that uid is the one running the CLI.
+    //
+    // WHERE THE MODE IS SET, AND WHY THERE IS NO WINDOW.  bind() creates the
+    // file with 0777 & ~umask — commonly 0755 — and the mode is not corrected
+    // until a few lines below it.  That gap is not reachable: an AF_UNIX
+    // stream socket that has been bound but not yet listen()ed refuses every
+    // connect() with ECONNREFUSED, and the listen() below is the first moment
+    // a connect() to this path can succeed.  Both chmods are above it, so the
+    // socket is never both connectable and open, in either order.  The widening
+    // pair is ordered the same way — chown to the group first, chmod second —
+    // so the group bits are never granted to a group that has not been set.
+    //
+    // Setting a umask around the bind instead would also work and was tried;
+    // it was dropped because umask is process-wide and state_persistence has
+    // already started its writer thread by the time setup() runs, so the
+    // narrow window would silently apply to whatever that thread happened to
+    // create.  A property of the socket should not be paid for by every other
+    // file in the process.
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
         // Raw close on purpose: the first submission this descriptor can ever
@@ -261,8 +336,60 @@ bool daemon_handler::setup()
         return false;
     }
 
-    // Allow all users to connect (needed when daemon runs as socketley user via systemd)
-    chmod(socket_path.c_str(), 0666);
+    // 0600 first and unconditionally, so the packaged branch below only ever
+    // widens from a closed door and every other path is done in one line.
+    //
+    // Fatal when it fails, which is the one place in this function where an
+    // errno is worth refusing to start over.  Everything that reaches this
+    // socket is a command, so a daemon that could not put a mode on it would
+    // be serving its control plane at whatever the umask left — 0755 under the
+    // usual one, which already refuses another uid's connect(), but 0777 for a
+    // daemon started from a shell with `umask 0`.  "Started, and might be open
+    // to the machine" is not a state to have; not starting says so plainly and
+    // costs nothing that cannot be retried.
+    if (::chmod(socket_path.c_str(), 0600) < 0)
+    {
+        LOG_ERROR("ipc socket: could not set its mode, so it may be reachable "
+                  "by other users; refusing to serve it");
+        close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+
+    if (system_socket)
+    {
+        // The group by name, not by whatever this process happens to have.  The
+        // unit runs the daemon as socketley:socketley and the two agree, but
+        // `sudo socketley daemon` on the same installation runs it as root:root
+        // and 0660 there would hand the socket to group root instead of to the
+        // operators who were added to `socketley` — an installation that works
+        // under systemd and not by hand.  Failure here is not fatal, unlike the
+        // 0600 above: a chown that is refused, or an installation with no such
+        // group, leaves the socket at the 0600 it already has — a working
+        // daemon with a narrower door rather than a broken one, and never a
+        // wider one.
+        if (struct group* gr = ::getgrnam("socketley"); gr != nullptr)
+        {
+            if (::chown(socket_path.c_str(), static_cast<uid_t>(-1), gr->gr_gid) < 0)
+                LOG_WARN("ipc socket: could not give it to group socketley; "
+                         "it stays owner-only");
+            else if (::chmod(socket_path.c_str(), 0660) < 0)
+                LOG_WARN("ipc socket: could not widen it to the group; "
+                         "it stays owner-only");
+        }
+        else if (::geteuid() != 0)
+        {
+            // Only worth saying when the daemon is a dedicated user, which is
+            // the packaged case: there, no group means no operator can reach
+            // it and someone needs to know before they go looking.  A daemon
+            // running as root with no such group is the container image's
+            // arrangement — root administers it and root opens anything — and
+            // a warning there is noise on every start.
+            LOG_WARN("ipc socket: no `socketley` group on this system, so the "
+                     "socket stays owner-only — members of that group are how "
+                     "an operator reaches the packaged daemon");
+        }
+    }
 
     if (listen(m_listen_fd, 16) < 0)
     {
