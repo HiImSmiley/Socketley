@@ -108,6 +108,79 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
                               inst->get_replication_target());
 }
 
+// ─── MAY THIS CALLER HAND THE DAEMON THIS PID ───────────────────────────────
+//
+// `attach --pid` is how an embedded process registers a runtime it is serving
+// itself, and it is meant to be its own: the SDK example passes getpid().  The
+// daemon remembers it and sends it SIGTERM when the runtime is stopped, which
+// is the feature — `socketley stop app_cache` stops the process behind it.
+//
+// Nothing checked whose pid it was.  Measured on the parent commit, against a
+// process the daemon had nothing to do with:
+//
+//     $ sleep 300 &                       # pid 1328283
+//     $ socketley attach server bystander 18790 --pid 1328283
+//     $ socketley stop bystander
+//     [2]+  Terminated              sleep 300
+//
+// On a single-user daemon that is not a boundary — whoever may open the socket
+// could signal the process themselves.  On the packaged one it is: the socket
+// is 0660 socketley:socketley precisely so operators can reach a daemon that
+// runs as its own user (as root, in the container image), and any member of
+// that group could make it signal anything that uid can signal.  That is the
+// one line the whole threat model rests on; see setup() below.
+//
+// So the pid has to belong to the caller.  SO_PEERCRED gives the uid on the
+// other end of this connection — the kernel's answer, not the client's — and
+// /proc/<pid> is owned by the uid running that process.  Equal, and the caller
+// could have signalled it without the daemon's help; different, and the daemon
+// would be lending out a privilege it was never asked to lend.
+//
+// Deliberately NOT a check that the pid is the peer itself.  Both documented
+// spellings are legitimate and neither is the peer: the SDK's own connection
+// carries the process's pid, and a shell that starts a program and attaches it
+// with `--pid $!` names a sibling of the CLI, not the CLI.  Ownership is the
+// property that separates those from the escalation.
+//
+// A root peer passes everything, because root can signal everything anyway and
+// refusing would only break the container image's own arrangement.
+//
+// Returns an empty string when the pid may be used.
+static std::string attach_pid_refusal(int conn_fd, pid_t pid)
+{
+    if (pid <= 0)
+        return {};
+
+    struct ucred cred{};
+    socklen_t    len = sizeof(cred);
+    if (conn_fd < 0 ||
+        ::getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0)
+    {
+        // No credentials means no way to judge, and this runs on the path that
+        // decides who may be signalled.  Refusing is the answer that cannot be
+        // wrong in the direction that matters.
+        return "could not establish who is asking, so --pid was not accepted\n";
+    }
+
+    if (cred.uid == 0)
+        return {};
+
+    struct stat st{};
+    const std::string proc = "/proc/" + std::to_string(static_cast<long long>(pid));
+    if (::stat(proc.c_str(), &st) < 0)
+        return "no process " + std::to_string(static_cast<long long>(pid)) +
+               " to attach to\n";
+
+    if (st.st_uid != cred.uid)
+        return "process " + std::to_string(static_cast<long long>(pid)) +
+               " belongs to another user, so --pid was refused\n"
+               "  The daemon signals this pid when the runtime is stopped, and "
+               "it will not do that\n"
+               "  on behalf of a caller who could not signal it themselves.\n";
+
+    return {};
+}
+
 // Why this runtime's --cpus / --sqpoll request cannot be honoured, or an empty
 // string if it can.
 //
@@ -3715,8 +3788,21 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     {
         if (pa.args[i] == "--pid" && i + 1 < pa.count)
         {
+            // Checked, like the port six lines up and unlike this call before
+            // it: `--pid abc` left pid at 0 and was silently ignored, so a
+            // mistyped pid produced a runtime the daemon could never stop.
             auto sv = pa.args[++i];
-            std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+            if (e != std::errc{} || p != sv.data() + sv.size() || pid <= 0)
+            {
+                conn->write_buf = "invalid pid: " + std::string(sv) + "\n";
+                return 1;
+            }
+            if (const std::string msg = attach_pid_refusal(conn->fd, pid); !msg.empty())
+            {
+                conn->write_buf = msg;
+                return 1;
+            }
         }
         else if (pa.args[i] == "--managed")
         {
