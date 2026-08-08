@@ -247,7 +247,7 @@ one. Fix the script and
 .B reload\-lua
 to re-run it.
 .TP
-.BI "attach " "type name port " "[\-\-owner " "name" "]"
+.BI "attach " "type name port " "[\-\-owner " "name" "] [\-\-pid " "pid" "]"
 Register an external process as a runtime visible in
 .BR ls / ps .
 The daemon does NOT bind the port or forward any I/O \(em the external process
@@ -266,6 +266,22 @@ Port number the external process is listening on (informational only).
 .TP
 .B \-\-owner \fIname\fR
 Optional owner runtime name.
+.TP
+.B \-\-pid \fIpid\fR
+The process behind this runtime. Recorded so that
+.B "socketley stop " \fIname\fR
+sends it
+.BR SIGTERM :
+without it the daemon has nothing to stop and the runtime only leaves the
+listing. An SDK-embedded process passes its own
+.BR getpid() .
+.IP
+The pid must belong to the user issuing the command. The daemon signals it on
+the caller's behalf, and it will not do that for a process the caller could not
+signal themselves \(em on the packaged daemon, whose socket is shared with the
+.B socketley
+group, that would lend out the daemon user's privileges. A daemon running as
+root is unrestricted, since root can signal anything in any case.
 .RE
 .TP
 .BI "add " "path " "[\-\-name " "name" "] [\-s]"
@@ -3669,14 +3685,39 @@ one-hour interval used to hold all of that for the hour.
 Both are safe to call from inside the timer's own callback, which is how a
 one-shot repeating timer is written.
 .TP
-.B socketley.json_encode(value) \(-> string
+.B socketley.json_encode(value) \(-> string | false, why
 Encode a Lua value (table, string, number, boolean, nil) as a JSON string.
 Tables with consecutive integer keys starting at 1 are encoded as JSON
 arrays; all others as objects.
+.IP
+Refused, with
+.BR false " and a reason, when the value cannot be written as a document:"
+a table that contains itself (directly or through any chain of fields), or one
+nested deeper than 128 levels. A table reachable twice by different paths is
+not a cycle and encodes normally.
+.IP
+A string is truthy and
+.B false
+is not, so
+.B "local s = socketley.json_encode(t)"
+reads unchanged and
+.B "if not s then"
+is how the refusal is tested.
 .TP
-.B socketley.json_decode(str) \(-> value
+.B socketley.json_decode(str) \(-> value | false, why
 Decode a JSON string into a Lua value. Objects become tables with string
 keys, arrays become tables with integer keys (1-based). Null becomes nil.
+.IP
+Refused, with
+.BR false " and a reason, for a document nested deeper than 128 levels."
+.IP
+This limit is not a formatting preference. This call is written to be pointed
+at data from the network \(em a request body, a message payload \(em so the
+nesting depth is chosen by whoever sent it, and the decoder recurses to follow
+it. Without the limit a few hundred kilobytes of
+.B [[[[
+took the whole daemon down, and no callback deadline covers it: those measure
+Lua execution, and this recursion is native.
 .TP
 .B socketley.subscribe(cache_name, channel, fn) \(-> subscription_id
 Register
