@@ -13,26 +13,16 @@
 local startup_time  = os.time()   -- the whole os table is here; a handler is not sandboxed
 local request_count = 0
 
--- The path on_route is handed is the one the CLIENT sent, and it still carries
--- the proxy's own "/<name>/" prefix -- the proxy strips that only on the way
--- to the backend.  "^/auth" therefore never matches "/api-gateway/auth/login",
--- so strip the prefix once and match against what the services serve.
---
--- self is bound before a handler's top level runs, so self.name is available
--- here; on the runtimes that are not the gateway, PREFIX is never used.
-local PREFIX = "/" .. self.name
-
-local function backend_path(p)
-    if p:sub(1, #PREFIX) ~= PREFIX then return p end
-    local rest = p:sub(#PREFIX + 1)
-    return rest ~= "" and rest or "/"
-end
+-- on_route is handed both paths: `raw_path` as the client sent it, prefix
+-- and all, and `path` with this proxy's own "/<name>/" prefix already
+-- removed -- which is what the backend receives and what the patterns
+-- below are written against.  This file used to compute the second from
+-- the first; the proxy knows it, so it hands it over.
 
 -- =============================================================================
 -- ROUTING LOGIC (api-gateway only; needs --strategy lua, which the config sets)
 -- =============================================================================
-function on_route(method, raw_path)
-    local path = backend_path(raw_path)
+function on_route(method, raw_path, path)
 
     -- Authentication endpoints
     if path:match("^/auth") or

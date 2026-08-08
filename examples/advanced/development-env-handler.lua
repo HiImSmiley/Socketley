@@ -8,28 +8,17 @@
 --
 -- =============================================================================
 
--- The path on_route is handed is the one the CLIENT sent, and it still carries
--- the proxy's own "/<name>/" prefix -- the proxy strips that only on the way
--- to the backend.  "^/api" therefore never matches "/dev-proxy/api/users", so
--- strip the prefix once and match against what the backends serve.
---
--- self is bound before this file's top level runs, so self.name is available
--- here.  On the three non-proxy runtimes that also load this file, PREFIX is
--- simply never used.
-local PREFIX = "/" .. self.name
-
-local function backend_path(p)
-    if p:sub(1, #PREFIX) ~= PREFIX then return p end
-    local rest = p:sub(#PREFIX + 1)
-    return rest ~= "" and rest or "/"
-end
+-- on_route is handed both paths: `raw_path` as the client sent it, prefix
+-- and all, and `path` with this proxy's own "/<name>/" prefix already
+-- removed -- which is what the backend receives and what the patterns
+-- below are written against.  This file used to compute the second from
+-- the first; the proxy knows it, so it hands it over.
 
 -- Route based on path.  Consulted on dev-proxy only, and only because that
 -- proxy was created --strategy lua.  method and raw_path arrive on --protocol
 -- http only; a TCP proxy would call this with no arguments and the match
 -- would raise.
-function on_route(method, raw_path)
-    local path = backend_path(raw_path)
+function on_route(method, raw_path, path)
 
     -- WebSocket upgrades
     if path:match("^/ws") or path:match("^/socket") then

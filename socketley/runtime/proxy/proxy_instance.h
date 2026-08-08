@@ -607,7 +607,7 @@ public:
 
     // Lua API
     std::string lua_peer_ip(int client_fd);
-    void lua_close_client(int client_fd);
+    bool lua_close_client(int client_fd);
     std::vector<std::string> lua_backends() const;
     std::vector<std::pair<int, std::string>> lua_backend_health() const;
     std::vector<int> lua_clients() const;
@@ -666,6 +666,18 @@ private:
     http_request_parse parse_http_request_line(proxy_client_connection* conn);
     std::string rewrite_http_request(proxy_client_connection* conn,
                                      std::string_view new_path);
+
+    // ── The path as the backend will see it ─────────────────────────────────
+    //
+    // An HTTP gateway answers on /<name>/… and forwards the remainder, so there
+    // are two paths in every request and a script is entitled to either.  This
+    // is the one place the transformation is written: the forwarding site and
+    // on_route's third argument both read it, so the two cannot drift.
+    //
+    // A path that does not carry this proxy's prefix comes back unchanged.  A
+    // TCP proxy has no path at all, and inventing a strip for a string that has
+    // not been through the prefix check would be worse than saying nothing.
+    std::string_view backend_path(std::string_view client_path) const;
 
     // ── Filter chain ────────────────────────────────────────────────────────
     //

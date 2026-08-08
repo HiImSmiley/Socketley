@@ -16,33 +16,28 @@
 --
 -- =============================================================================
 
--- The path on_route is handed is the one the CLIENT sent, and it still carries
--- this proxy's own "/<name>/" prefix -- the proxy strips that only on the way
--- to the backend.  "^/admin" therefore never matches "/smart-proxy/admin/x",
--- so strip the prefix once and write the patterns against what the backends
--- actually serve.
-local PREFIX = "/" .. self.name
-
-local function backend_path(p)
-    if p:sub(1, #PREFIX) ~= PREFIX then return p end
-    local rest = p:sub(#PREFIX + 1)
-    return rest ~= "" and rest or "/"
-end
-
 -- Custom routing logic
 -- Parameters:
 --   method:   HTTP method (GET, POST, PUT, DELETE, etc.)
 --   raw_path: Request path AS THE CLIENT SENT IT -- "/smart-proxy/api/users",
---             not "/api/users".
---   Both arrive on --protocol http only.  A TCP proxy has no request line and
---   calls on_route with NO arguments, so the match below would raise there.
+--             not "/api/users".  The filter chain is handed the same one.
+--   path:     the same request with this proxy's own "/<name>/" prefix removed
+--             -- "/api/users" -- which is what the backend will receive, and
+--             what a routing pattern is nearly always written against.
+--   All three arrive on --protocol http only.  A TCP proxy has no request line
+--   and calls on_route with NO arguments, so the match below would raise there.
 -- Returns:
 --   Backend index (0-based).  A raise, or an index outside the backend list,
 --   is logged and the proxy falls back to the pick it would have made anyway;
 --   the request is forwarded either way.  Refusing one is the filter chain's
 --   job -- see filter-chain.lua.
-function on_route(method, raw_path)
-    local path = backend_path(raw_path)
+--
+-- This file used to compute `path` itself, from `"/" .. self.name`, and the
+-- reason it no longer does is the bare case: the gateway's own root arrives as
+-- "/smart-proxy" -- shorter than the prefix -- and a sub() past the end yields
+-- "", which matches no pattern at all.  The proxy already knows the answer, so
+-- it hands it over.
+function on_route(method, raw_path, path)
     socketley.log("Routing: " .. method .. " " .. raw_path .. " (as " .. path .. ")")
 
     -- Admin routes go to admin-backend

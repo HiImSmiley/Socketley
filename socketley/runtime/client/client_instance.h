@@ -102,7 +102,7 @@ public:
     size_t get_connection_count() const override;
 
     // Lua actions
-    void lua_send(std::string_view msg) override;
+    bool lua_send(std::string_view msg) override;
 
 private:
     void handle_read(struct io_uring_cqe* cqe);

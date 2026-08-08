@@ -16,29 +16,24 @@
 --
 -- =============================================================================
 
--- The path on_route is handed is the one the CLIENT sent, and it still carries
--- this proxy's own "/<name>/" prefix -- the proxy strips that only on the way
--- to the backend.  A pattern anchored "^/api/" therefore never matches
--- "/smart-router/api/users", and every request falls through to the default.
--- Strip the prefix once, here, and write the patterns against the paths the
--- backends actually serve.
-local PREFIX = "/" .. self.name
-
-local function backend_path(p)
-    if p:sub(1, #PREFIX) ~= PREFIX then return p end
-    local rest = p:sub(#PREFIX + 1)
-    return rest ~= "" and rest or "/"
-end
+-- on_route is handed both paths: `raw_path` as the client sent it, prefix
+-- and all, and `path` with this proxy's own "/<name>/" prefix already
+-- removed -- which is what the backend receives and what the patterns
+-- below are written against.  This file used to compute the second from
+-- the first; the proxy knows it, so it hands it over.
 
 -- =============================================================================
 -- CALLBACK: on_route
 -- Triggered for each HTTP request in 'lua' strategy mode
 -- Parameters:
---   method - HTTP method (GET, POST, PUT, DELETE, etc.)
---   path   - Request path AS THE CLIENT SENT IT: "/smart-router/api/users",
---            not "/api/users".  See backend_path() above.
---     Both arguments arrive on --protocol http only.  A TCP proxy has no
---     request line to read them from and calls on_route with NO arguments, so
+--   method   - HTTP method (GET, POST, PUT, DELETE, etc.)
+--   raw_path - Request path AS THE CLIENT SENT IT: "/smart-router/api/users".
+--              The filter chain is handed the same one.
+--   path     - the same request with this proxy's "/<name>/" prefix removed:
+--              "/api/users".  That is what the backend receives, and what the
+--              patterns below are written against.
+--     All three arrive on --protocol http only.  A TCP proxy has no request
+--     line to read them from and calls on_route with NO arguments, so
 --     `path:match(...)` below would raise there on the first request.
 -- Returns:
 --   Backend index (0-based).  Anything else -- a raise, a nil, an index past
@@ -46,8 +41,7 @@ end
 --   pick it would have made anyway.  The request is forwarded either way;
 --   refusing one is the filter chain's job, not this callback's.
 -- =============================================================================
-function on_route(method, raw_path)
-    local path = backend_path(raw_path)
+function on_route(method, raw_path, path)
     socketley.log("Routing: " .. method .. " " .. raw_path .. " (as " .. path .. ")")
 
     -- Static content: images, CSS, JS, fonts

@@ -2945,12 +2945,11 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
             return;
         }
 
-        // Strip prefix
-        std::string_view new_path;
-        if (conn->path == bare)
-            new_path = "/";
-        else
-            new_path = std::string_view(conn->path).substr(m_prefix.size() - 1); // Keep leading /
+        // Strip prefix.  The three lines this replaces are now backend_path(),
+        // because on_route needs the same answer and two copies of a string
+        // transformation is two chances for a script to be told a path the
+        // backend never sees.
+        std::string_view new_path = backend_path(conn->path);
 
         // The route declaration, and the one place it is enforced.
         //
@@ -3777,6 +3776,35 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     out.append(port_buf, static_cast<size_t>(pend - port_buf));
     out += "\r\n";
     return true;
+}
+
+// ─── The path the backend is given, from the path the client sent ───────────
+//
+// See the declaration.  Two callers: the forwarding path, which has always done
+// this and now does it here, and on_route's third argument.
+//
+// THE BARE CASE IS THE POINT.  `/gw` and `/gw/` both address the gateway's root
+// and both must become `/`, and that is the case a script stripping the prefix
+// by hand gets wrong — `path:sub(#("/"..self.name.."/") )` on "/gw" reads past
+// the end and yields "", which is not a path any router matches.  Written once,
+// it is right once.
+//
+// A string_view into the caller's own path, so this allocates nothing on a
+// per-request path; the one substring it does not return a view of is the "/"
+// literal, which has static storage.
+std::string_view proxy_instance::backend_path(std::string_view client_path) const
+{
+    // "/" + name + "/" is at least two characters.  A prefix shorter than that
+    // means the name was never set, and there is nothing to strip.
+    if (m_prefix.size() < 2)
+        return client_path;
+
+    const std::string_view bare(m_prefix.data(), m_prefix.size() - 1);
+    if (client_path == bare)
+        return "/";
+    if (client_path.starts_with(m_prefix))
+        return client_path.substr(m_prefix.size() - 1);   // keeps the leading /
+    return client_path;
 }
 
 // Case-insensitive header name match helper
@@ -4770,8 +4798,10 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
             // anything, and the process ended in the Lua panic handler.  The
             // whole of that outage was a script that raised.
             sol::protected_function_result r =
-                m_protocol == protocol_http ? lua()->on_route()(conn->method, conn->path)
-                                            : lua()->on_route()();
+                m_protocol == protocol_http
+                    ? lua()->on_route()(conn->method, conn->path,
+                                        backend_path(conn->path))
+                    : lua()->on_route()();
 
             // A raising on_route is routed round-robin, not refused, and that is
             // the deliberate difference from the filter chain.  A filter that
@@ -4962,8 +4992,10 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
             // down through either path and this one needed no traffic the other
             // did not.
             sol::protected_function_result r =
-                m_protocol == protocol_http ? lua()->on_route()(conn->method, conn->path)
-                                            : lua()->on_route()();
+                m_protocol == protocol_http
+                    ? lua()->on_route()(conn->method, conn->path,
+                                        backend_path(conn->path))
+                    : lua()->on_route()();
 
             // Report and leave `selected` where it is — pool[0], which is
             // already what an out-of-range index gets here.  Same decision as
@@ -8623,14 +8655,20 @@ std::string proxy_instance::lua_peer_ip(int client_fd)
     return ip;
 }
 
-void proxy_instance::lua_close_client(int client_fd)
+// Whether there was a client connection here to close.
+//
+// Three silent returns: an fd outside the table, an fd that is the BACKEND
+// half of a pair rather than the client half, and one already closing.  The
+// second is the one a script gets wrong, because both halves are ints.
+bool proxy_instance::lua_close_client(int client_fd)
 {
-    if (client_fd < 0 || client_fd >= MAX_FDS) return;
+    if (client_fd < 0 || client_fd >= MAX_FDS) return false;
     auto& ce = m_conn_idx[client_fd];
-    if (ce.side != conn_client) return;
+    if (ce.side != conn_client) return false;
     auto* conn = ce.client;
-    if (conn->closing) return;
+    if (conn->closing) return false;
     close_pair(client_fd, conn->backend_fd);
+    return true;
 }
 
 std::vector<std::string> proxy_instance::lua_backends() const

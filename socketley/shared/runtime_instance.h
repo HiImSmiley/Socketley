@@ -524,9 +524,16 @@ public:
     virtual void on_publish_dispatch(std::string_view cache_name, std::string_view channel, std::string_view message);
 
     // Virtual methods for Lua actions (overridden by specific runtimes)
-    virtual void lua_send(std::string_view /*msg*/) {}
+    // Whether the message was written or queued.  A runtime with no outward
+    // connection of its own — a server, a cache — has nowhere to send it, and
+    // saying so is better than the silent nothing this used to be.
+    virtual bool lua_send(std::string_view /*msg*/) { return false; }
     virtual void lua_broadcast(std::string_view /*msg*/) {}
-    virtual void lua_send_to(int /*client_id*/, std::string_view /*msg*/) {}
+    // Whether the bytes reached a connection.  The base holds none, so the
+    // honest answer here is no: a client or cache runtime handed a client_id
+    // is being asked for something it does not have, and that used to be a
+    // silent nothing.
+    virtual bool lua_send_to(int /*client_id*/, std::string_view /*msg*/) { return false; }
 
     // Virtual methods for Lua cache access (overridden by cache_instance)
     virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }

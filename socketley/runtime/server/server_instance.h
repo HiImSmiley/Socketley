@@ -425,27 +425,27 @@ public:
 
     // Lua actions
     void lua_broadcast(std::string_view msg) override;
-    void lua_send_to(int client_id, std::string_view msg) override;
-    void        lua_disconnect(int client_fd);
+    bool lua_send_to(int client_id, std::string_view msg) override;
+    bool        lua_disconnect(int client_fd);
     std::string lua_peer_ip(int client_fd);
 
     // Lua client enumeration + multicast
     std::vector<int> lua_clients() const;
-    void lua_multicast(const std::vector<int>& fds, std::string_view msg);
+    size_t lua_multicast(const std::vector<int>& fds, std::string_view msg);
 
     // Lua per-connection metadata
-    void        lua_set_data(int fd, std::string_view key, std::string_view val);
-    void        lua_del_data(int fd, std::string_view key);
+    bool        lua_set_data(int fd, std::string_view key, std::string_view val);
+    bool        lua_del_data(int fd, std::string_view key);
     std::string lua_get_data(int fd, std::string_view key) const;
 
     // Multicast groups
-    void lua_join_group(int fd, std::string_view group);
-    void lua_leave_group(int fd, std::string_view group);
-    void lua_group_send(std::string_view group, std::string_view msg);
+    bool lua_join_group(int fd, std::string_view group);
+    bool lua_leave_group(int fd, std::string_view group);
+    size_t lua_group_send(std::string_view group, std::string_view msg);
 
     // Zero-copy pipe pairing (data forwarded directly, bypasses Lua callbacks)
-    void lua_pipe(int fd_a, int fd_b);
-    void lua_unpipe(int fd);
+    bool lua_pipe(int fd_a, int fd_b);
+    bool lua_unpipe(int fd);
 
     struct ws_headers_result {
         bool is_websocket{false};
@@ -469,7 +469,7 @@ public:
     bool route_client(int client_id, std::string_view target_name);
     bool unroute_client(int client_id);
     std::string_view get_client_route(int client_id) const;
-    void send_to_client(int client_id, std::string_view msg);
+    bool send_to_client(int client_id, std::string_view msg);
 
     // Owner-targeted sending (sub-server → the connection that was routed here)
     //
@@ -537,7 +537,7 @@ public:
     const std::vector<upstream_target>& get_upstream_targets() const;
 
     // Lua upstream actions
-    void lua_upstream_send(int conn_id, std::string_view msg);
+    bool lua_upstream_send(int conn_id, std::string_view msg);
     void lua_upstream_broadcast(std::string_view msg);
     std::vector<int> lua_upstreams() const;
 

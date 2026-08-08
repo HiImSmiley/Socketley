@@ -902,10 +902,15 @@ void client_instance::process_message(std::string_view msg)
     }
 }
 
-void client_instance::lua_send(std::string_view msg)
+// Whether the message was written or queued.
+//
+// It was void, and the three conditions below are the ordinary ones: a client
+// that has not connected yet, one whose server dropped it, and one created
+// --mode in, which does not send at all.  self.send() reported none of them.
+bool client_instance::lua_send(std::string_view msg)
 {
     if (!m_loop || !m_connected || m_mode == client_mode_in)
-        return;
+        return false;
 
     invoke_on_send(msg);
 
@@ -913,7 +918,7 @@ void client_instance::lua_send(std::string_view msg)
     {
         // UDP: send as-is, no newline needed
         send_to_server(msg);
-        return;
+        return true;
     }
 
     // Queue message if a write is already in flight — or always, on a TLS
@@ -940,7 +945,7 @@ void client_instance::lua_send(std::string_view msg)
                               << m_write_queue.bytes()
                               << " bytes queued), dropping messages\n";
                 }
-                return;
+                return false;
             }
             std::string out(msg.data(), msg.size());
             if (out.empty() || out.back() != '\n')
@@ -953,7 +958,8 @@ void client_instance::lua_send(std::string_view msg)
         // unrelated happens to arrive.
         if (m_conn->ssl)
             tls_flush();
-        return;
+        // Queued, or dropped because the connection is already closing.
+        return !m_conn->closing;
     }
 
     m_conn->write_buf.assign(msg.data(), msg.size());
@@ -962,6 +968,7 @@ void client_instance::lua_send(std::string_view msg)
 
     m_conn->write_off = 0;
     arm_write(m_conn->write_buf.data(), static_cast<uint32_t>(m_conn->write_buf.size()));
+    return true;
 }
 
 // The datagram path.  Reached only from lua_send's UDP branch, and a UDP client

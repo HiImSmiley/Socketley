@@ -11,26 +11,18 @@
 --
 -- =============================================================================
 
--- The path on_route is handed is the one the CLIENT sent, and it still carries
--- this proxy's own "/<name>/" prefix -- the proxy strips that only on the way
--- to the backend.  "^/users" therefore never matches "/api-gateway/users", so
--- strip the prefix once and write the patterns against what the services
--- actually serve.
-local PREFIX = "/" .. self.name
-
-local function backend_path(p)
-    if p:sub(1, #PREFIX) ~= PREFIX then return p end
-    local rest = p:sub(#PREFIX + 1)
-    return rest ~= "" and rest or "/"
-end
+-- on_route is handed both paths: `raw_path` as the client sent it, prefix
+-- and all, and `path` with this proxy's own "/<name>/" prefix already
+-- removed -- which is what the backend receives and what the patterns
+-- below are written against.  This file used to compute the second from
+-- the first; the proxy knows it, so it hands it over.
 
 -- Route requests to the appropriate service.
 --
 -- method and raw_path arrive on --protocol http only.  A TCP proxy calls
 -- on_route with no arguments at all, so the match below would raise there on
 -- the first request -- this handler belongs to an HTTP gateway, nothing else.
-function on_route(method, raw_path)
-    local path = backend_path(raw_path)
+function on_route(method, raw_path, path)
 
     local routes = {
         { pattern = "^/users",      backend = 0, name = "user-service" },

@@ -128,7 +128,7 @@ configuration at all; use `create` or `edit`.
 | `on_stop()` | Runtime stopped | none |
 | `on_message(msg)` | Message received (claims handling; no default broadcast) | message string |
 | `on_send(msg)` | Message sent | message string |
-| `on_route(method, path)` | HTTP request (proxy) under `--strategy lua` ONLY, *after* a backend is needed | method, path (see below) |
+| `on_route(method, path, backend_path)` | HTTP request (proxy) under `--strategy lua` ONLY, *after* a backend is needed | method, path, backend_path (see below) |
 | `filters = {fn, ...}` | HTTP request (proxy), *before* backend selection | req table |
 | `on_client_message(id, msg)` | Message received, with sender (server) | client_id, message |
 | `on_miss(key)` | Cache GET found nothing | key; return value[, ttl] |
@@ -143,12 +143,29 @@ the script silently does nothing — the usual reason an `on_route` "that works"
 appears to have no effect.
 
 `path` is the path **as the client sent it**, with this proxy's own
-`/<name>/` prefix still on the front; the prefix is stripped on the way to the
-backend, after this callback. So a proxy named `gw` sees `/gw/api/users` and a
-pattern anchored `^/api/` never matches. Strip `"/" .. self.name` first, as
-`custom-routing-handler.lua` does.
+`/<name>/` prefix still on the front — the same path the filter chain is handed,
+because a filter judges the request the client made. `backend_path` is that
+path with the prefix removed: what the backend actually receives, and what a
+routing pattern is nearly always written against. A proxy named `gw` handed
+`/gw/api/users` sees both:
 
-`on_route` receives its two arguments on `--protocol http` only. A TCP proxy
+```lua
+function on_route(method, path, backend_path)
+    -- path         == "/gw/api/users"
+    -- backend_path == "/api/users"
+    if backend_path:match("^/api/") then return 0 end
+    return 1
+end
+```
+
+`backend_path` exists so scripts stop computing it. Every proxy example in this
+tree used to do it by hand, and the case that makes it worth handing over is the
+bare one: the gateway's own root arrives as `/gw`, which is *shorter* than the
+five-character prefix, so `sub()` past the end yields `""` and matches nothing.
+A handler that declares only two parameters is unaffected — Lua discards
+arguments a function does not name.
+
+`on_route` receives its arguments on `--protocol http` only. A TCP proxy
 has no request line to read them from and calls it with none, so a body written
 for HTTP — `return hash(path) % n` — raises on the first request once it is
 moved to a TCP proxy. A call that raises is reported on stderr and the proxy

@@ -4474,11 +4474,11 @@ void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_
     }
 }
 
-void server_instance::lua_disconnect(int client_fd)
+bool server_instance::lua_disconnect(int client_fd)
 {
     auto* conn = (client_fd >= 0 && client_fd < MAX_FDS)
                  ? m_conn_idx[client_fd] : nullptr;
-    if (!conn || conn->closing) return;
+    if (!conn || conn->closing) return false;
     conn->closing = true;
     // SHUT_RD only: keeps the write side open so any queued message
     // (e.g. "AUTH FAIL" sent just before disconnect) still reaches the client.
@@ -4486,6 +4486,7 @@ void server_instance::lua_disconnect(int client_fd)
     // can clean up. If no ops are pending, handle_read's submit_next_read
     // branch handles the cleanup when it sees closing=true, write_pending=false.
     shutdown(client_fd, SHUT_RD);
+    return true;
 }
 
 std::string server_instance::lua_peer_ip(int client_fd)
@@ -4546,10 +4547,10 @@ server_instance::ws_headers_result server_instance::lua_ws_headers(int client_fd
     return {true, conn->ws_cookie, conn->ws_origin, conn->ws_protocol, conn->ws_auth};
 }
 
-void server_instance::lua_send_to(int client_id, std::string_view msg)
+bool server_instance::lua_send_to(int client_id, std::string_view msg)
 {
     if (!m_loop || m_udp)
-        return;
+        return false;
 
     // This used to try its own connection table first and fall back to the
     // forwarded one, which is only unambiguous while the two ranges cannot
@@ -4561,7 +4562,7 @@ void server_instance::lua_send_to(int client_id, std::string_view msg)
     // The two ranges cannot meet now, so there is no order to get right:
     // send_to_client() reads which kind of id this is and asks the right
     // runtime.
-    send_to_client(client_id, msg);
+    return send_to_client(client_id, msg);
 }
 
 std::string server_instance::get_stats() const
@@ -4704,28 +4705,34 @@ std::string_view server_instance::get_client_route(int client_id) const
     return it->second;
 }
 
-void server_instance::send_to_client(int client_id, std::string_view msg)
+// Whether the bytes were handed to a connection.
+//
+// It was void, and every `return;` below was a message that went nowhere with
+// nothing said: a handle naming a connection that has since gone, an origin
+// runtime that has stopped, a descriptor that is not a connection, a
+// connection already closing.  self.send() reported none of them because it
+// had nothing to report with.
+bool server_instance::send_to_client(int client_id, std::string_view msg)
 {
     // A handle names a connection that lives somewhere else, so the write is
     // asked of whoever owns it rather than performed here.
     if (SOCKETLEY_UNLIKELY(is_conn_handle(client_id)))
     {
         auto it = m_forwarded.find(client_id);
-        if (it == m_forwarded.end()) return;
+        if (it == m_forwarded.end()) return false;
 
         auto* mgr = get_runtime_manager();
-        if (!mgr) return;
+        if (!mgr) return false;
         auto* origin = mgr->get(it->second.origin);
         if (!origin || origin->get_type() != runtime_server ||
-            origin->get_state() != runtime_running) return;
+            origin->get_state() != runtime_running) return false;
 
-        static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
-        return;
+        return static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
     }
 
-    if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return;
+    if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return false;
     auto* conn = m_conn_idx[client_id];
-    if (SOCKETLEY_UNLIKELY(conn->closing)) return;
+    if (SOCKETLEY_UNLIKELY(conn->closing)) return false;
 
     std::string buf;
     buf.reserve(msg.size() + 1);
@@ -4733,6 +4740,11 @@ void server_instance::send_to_client(int client_id, std::string_view msg)
     if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
     auto shared = std::make_shared<const std::string>(std::move(buf));
     send_to(conn, shared);
+    // Queued, which is what "sent" means on an async write path everywhere else
+    // in this file.  send_to() can still close the connection for exceeding the
+    // write-queue bound, and that is reported by the connection going away
+    // rather than by this call.
+    return true;
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)
@@ -4923,31 +4935,43 @@ std::vector<int> server_instance::lua_clients() const
     return m_active_fds;
 }
 
-void server_instance::lua_multicast(const std::vector<int>& fds, std::string_view msg)
+// How many of the named connections the message was queued to.
+//
+// Ids that name nothing are still skipped, as they always were — what changes
+// is that the caller is told how many were skipped rather than having to
+// assume none were.  A malformed LIST is refused by the binding before this is
+// reached; this count is about ids that were well-formed and stale, which is
+// ordinary and not an error.
+size_t server_instance::lua_multicast(const std::vector<int>& fds, std::string_view msg)
 {
-    if (!m_loop || m_udp) return;
+    if (!m_loop || m_udp) return 0;
     auto shared = std::make_shared<const std::string>(msg);
+    size_t sent = 0;
     for (int fd : fds)
     {
         if (fd < 0 || fd >= MAX_FDS) continue;
         auto* conn = m_conn_idx[fd];
         if (!conn || conn->closing) continue;
         send_to(conn, shared);
+        ++sent;
     }
+    return sent;
 }
 
 // ─── Lua per-connection metadata ───
 
-void server_instance::lua_set_data(int fd, std::string_view key, std::string_view val)
+bool server_instance::lua_set_data(int fd, std::string_view key, std::string_view val)
 {
-    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return false;
     m_conn_idx[fd]->meta[std::string(key)] = std::string(val);
+    return true;
 }
 
-void server_instance::lua_del_data(int fd, std::string_view key)
+bool server_instance::lua_del_data(int fd, std::string_view key)
 {
-    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return false;
     m_conn_idx[fd]->meta.erase(std::string(key));
+    return true;
 }
 
 std::string server_instance::lua_get_data(int fd, std::string_view key) const
@@ -4978,23 +5002,26 @@ void server_instance::remove_from_all_groups(int fd)
     conn->groups.clear();
 }
 
-void server_instance::lua_join_group(int fd, std::string_view group)
+bool server_instance::lua_join_group(int fd, std::string_view group)
 {
-    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return false;
     auto* conn = m_conn_idx[fd];
     std::string gname(group);
 
     // Check if already in group
+    // Already a member is not a failure: join is idempotent, and a script that
+    // joins on every message must not read `false` as "it did not work".
     for (const auto& g : conn->groups)
-        if (g == gname) return;
+        if (g == gname) return true;
 
     conn->groups.push_back(gname);
     m_groups[gname].push_back(fd);
+    return true;
 }
 
-void server_instance::lua_leave_group(int fd, std::string_view group)
+bool server_instance::lua_leave_group(int fd, std::string_view group)
 {
-    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return;
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) return false;
     auto* conn = m_conn_idx[fd];
     std::string gname(group);
 
@@ -5012,13 +5039,20 @@ void server_instance::lua_leave_group(int fd, std::string_view group)
         if (vec.empty())
             m_groups.erase(it);
     }
+    return true;
 }
 
-void server_instance::lua_group_send(std::string_view group, std::string_view msg)
+// How many connections the message was queued to.
+//
+// A count and not a bool, because the interesting failure is not "no such
+// group" — it is "the group exists and has nobody left in it", which is what a
+// misspelled group name looks like the moment its last real member leaves.
+// Zero says that; a bool cannot.
+size_t server_instance::lua_group_send(std::string_view group, std::string_view msg)
 {
-    if (!m_loop) return;
+    if (!m_loop) return 0;
     auto it = m_groups.find(std::string(group));
-    if (it == m_groups.end()) return;
+    if (it == m_groups.end()) return 0;
 
     // Build newline-terminated message (single allocation, shared across all recipients)
     std::string buf;
@@ -5028,6 +5062,7 @@ void server_instance::lua_group_send(std::string_view group, std::string_view ms
         buf.push_back('\n');
     auto shared_msg = std::make_shared<const std::string>(std::move(buf));
 
+    size_t sent = 0;
     for (int fd : it->second)
     {
         auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
@@ -5038,15 +5073,17 @@ void server_instance::lua_group_send(std::string_view group, std::string_view ms
             continue;
         }
         send_to(conn, shared_msg);
+        ++sent;
     }
+    return sent;
 }
 
-void server_instance::lua_pipe(int fd_a, int fd_b)
+bool server_instance::lua_pipe(int fd_a, int fd_b)
 {
-    if (!m_loop || fd_a == fd_b) return;
+    if (!m_loop || fd_a == fd_b) return false;
     auto* a = (fd_a >= 0 && fd_a < MAX_FDS) ? m_conn_idx[fd_a] : nullptr;
     auto* b = (fd_b >= 0 && fd_b < MAX_FDS) ? m_conn_idx[fd_b] : nullptr;
-    if (!a || !b || a->closing || b->closing) return;
+    if (!a || !b || a->closing || b->closing) return false;
 
     // Unpipe any existing pairings first
     if (a->pipe_peer_fd >= 0) lua_unpipe(fd_a);
@@ -5054,12 +5091,13 @@ void server_instance::lua_pipe(int fd_a, int fd_b)
 
     a->pipe_peer_fd = fd_b;
     b->pipe_peer_fd = fd_a;
+    return true;
 }
 
-void server_instance::lua_unpipe(int fd)
+bool server_instance::lua_unpipe(int fd)
 {
     auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
-    if (!conn || conn->pipe_peer_fd < 0) return;
+    if (!conn || conn->pipe_peer_fd < 0) return false;
 
     int peer_fd = conn->pipe_peer_fd;
     conn->pipe_peer_fd = -1;
@@ -5067,6 +5105,7 @@ void server_instance::lua_unpipe(int fd)
     auto* peer = (peer_fd >= 0 && peer_fd < MAX_FDS) ? m_conn_idx[peer_fd] : nullptr;
     if (peer && peer->pipe_peer_fd == fd)
         peer->pipe_peer_fd = -1;
+    return true;
 }
 
 // ─── Upstream Connections ───
@@ -5439,11 +5478,11 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
 
 // ─── Lua upstream actions ───
 
-void server_instance::lua_upstream_send(int conn_id, std::string_view msg)
+bool server_instance::lua_upstream_send(int conn_id, std::string_view msg)
 {
     auto it = m_upstreams.find(conn_id);
     if (it == m_upstreams.end() || !it->second->connected)
-        return;
+        return false;
 
     std::string buf;
     buf.reserve(msg.size() + 1);
@@ -5452,6 +5491,7 @@ void server_instance::lua_upstream_send(int conn_id, std::string_view msg)
         buf.push_back('\n');
     auto shared = std::make_shared<const std::string>(std::move(buf));
     upstream_send(it->second.get(), std::move(shared));
+    return true;
 }
 
 void server_instance::lua_upstream_broadcast(std::string_view msg)

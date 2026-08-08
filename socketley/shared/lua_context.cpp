@@ -674,6 +674,90 @@ static void api_diag(runtime_instance* owner, const std::string& msg)
     lua_diag::record(msg);
 }
 
+// ─── ONE RETURN CONTRACT FOR EVERYTHING A SCRIPT ASKS FOR ───────────────────
+//
+// `true` when it happened; `false, "<reason>"` when it did not.
+//
+// 7b951e3 fixed the calls that took a value, altered it and reported success.
+// This is the same defect one step along: the call answers, and the answer
+// carries nothing.  `socketley.start("web")` returned a bare `false` for a
+// runtime that does not exist, for one that is already running, for one whose
+// port another process holds, and for one whose --cpus cannot be met by this
+// daemon's ring.  Four situations, four different things to do about them, one
+// answer — so a script that wants to be idempotent has to guess, and a script
+// that wants to report has nothing to report.
+//
+// ─── WHY TWO RETURNS, AND EXACTLY WHAT IT BREAKS ────────────────────────────
+//
+// `false, "reason"` is what Lua itself does — io.open, os.remove, and pcall —
+// so it is the shape a script author already knows, and `assert(socketley.start(n))`
+// starts printing the reason with no change to anything.
+//
+// It is also nearly free to adopt, because Lua truncates a multiple-return call
+// to one value in every context but two.  UNCHANGED: assignment
+// (`local ok = f()`), `if not f() then`, `and`/`or`, concatenation, tostring,
+// comparison, and any argument position that is not the last.  CHANGED, and
+// this is the whole list:
+//
+//     print(socketley.stop(n))     -- "false   <reason>", was "false"
+//     { socketley.start(n) }       -- a two-element table, was one
+//     g(socketley.start(n))        -- g receives two arguments, was one
+//
+// Only the third can alter behaviour rather than output, and it needs the call
+// to be the LAST argument of a function that also reads its second parameter.
+// Nothing in examples/ or test/ is written that way — checked, every call site
+// of the six — and where it does occur the fix is a pair of parentheses.
+//
+// Success returns ONE value, not `true, nil`, which is why this is
+// sol::variadic_results rather than std::tuple: `print(socketley.start(n))` on
+// the ordinary path still prints "true", and a script collecting answers in a
+// table does not get a hole punched in it.
+static sol::variadic_results api_yes(lua_State* L)
+{
+    sol::variadic_results r;
+    r.push_back({ L, sol::in_place_type<bool>, true });
+    return r;
+}
+
+// The refusal.  NOT logged, and that is the deliberate difference from
+// api_diag above.
+//
+// api_diag belongs to `create`, which is construction: its failures are
+// configuration mistakes, they can happen at a script's top level with a CLI
+// command in flight, and the operator is the one who has to see them.  These
+// are control flow.  `socketley.stop(name)` on something already stopped is how
+// an idempotent teardown is written, and a daemon that printed a line every
+// time would be punishing a script for being careful.  The caller is handed the
+// reason; what to do with it is the caller's business.
+static sol::variadic_results api_why(lua_State* L, std::string why)
+{
+    sol::variadic_results r;
+    r.push_back({ L, sol::in_place_type<bool>, false });
+    r.push_back({ L, sol::in_place_type<std::string>, std::move(why) });
+    return r;
+}
+
+// A count, for the two calls whose interesting answer is "how many" rather than
+// "did it".  See self.group_send and self.multicast.
+static sol::variadic_results api_count(lua_State* L, size_t n)
+{
+    sol::variadic_results r;
+    r.push_back({ L, sol::in_place_type<size_t>, n });
+    return r;
+}
+
+// `"name"` — quoted, so an empty name or one carrying a space is visible in the
+// sentence rather than vanishing into it.
+static std::string q(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size() + 2);
+    out += '"';
+    out += s;
+    out += '"';
+    return out;
+}
+
 bool lua_context::script_compiles(std::string_view path, std::string& err)
 {
     lua_diag::clear();
@@ -2353,15 +2437,23 @@ void lua_context::register_bindings(runtime_instance* owner)
     // which is indistinguishable from no third argument at all — so
     // socketley.create("server", "s", 8080) built a portless server and
     // reported success.  An object says which of the two it was.
-    sk["create"] = [owner](std::string type_str, std::string name, sol::object config) -> bool {
+    sk["create"] = [owner](sol::this_state L, std::string type_str, std::string name,
+                           sol::object config) -> sol::variadic_results {
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
-        if (!mgr || !loop) return false;
+        if (!mgr || !loop)
+            return api_why(L, "this runtime has no runtime manager");
 
         const std::string where = "socketley.create(\"" + type_str + "\", \"" + name + "\")";
+        // Logged AND returned, which makes this the one call in the family that
+        // does both — and both callers are real.  api_why alone would serve the
+        // script; api_diag alone is what a TOP-LEVEL create needs, because that
+        // one runs inside the `create` command and the operator who typed
+        // `create --lua x.lua` is the person who wrote the mistake.  cmd_create
+        // reads the buffer back to their terminal.
         auto refuse = [&](const std::string& why) {
             api_diag(owner, where + ": " + why);
-            return false;
+            return api_why(L, why);
         };
 
         runtime_type type;
@@ -2624,39 +2716,103 @@ void lua_context::register_bindings(runtime_instance* owner)
                                        : std::string{}));
         }
 
-        return true;
+        return api_yes(L);
     };
 
     // socketley.start(name) → bool
-    sk["start"] = [owner](std::string name) -> bool {
+    // ─── THE DIAGNOSIS IS MADE HERE, FROM WHAT THIS SIDE CAN KNOW ───────────
+    //
+    // runtime_manager::start answers a bool, and the reasons behind it are
+    // spread through runtime_instance::start: a state that cannot be started, a
+    // ring policy this loop cannot meet, a TLS pair that is not a pair, a bind
+    // that failed.  Two of those four can be asked about from here, exactly and
+    // in O(1), BEFORE anything is attempted — so they are, and they are named.
+    //
+    // The other two cannot, and this deliberately does not pretend otherwise.
+    // setup() is where a held port is discovered and it reports to the daemon's
+    // log; a second diagnosis invented here would be a guess wearing the
+    // clothes of a fact.  What is said instead is true and is the part a script
+    // can act on: the attempt was made, it failed, and this is the state the
+    // runtime is in now.
+    //
+    // The ring check runs before the attempt rather than after it for a reason
+    // beyond tidiness: runtime_instance::start stores `failed` on that path, so
+    // a call that could have been refused would otherwise leave the runtime
+    // unstartable for the rest of the daemon's life.
+    sk["start"] = [owner](sol::this_state L, std::string name) -> sol::variadic_results {
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
-        if (!mgr || !loop) return false;
-        return mgr->start(name, *loop);
-    };
+        if (!mgr || !loop)
+            return api_why(L, "this runtime has no runtime manager");
 
-    // socketley.stop(name) → bool
-    sk["stop"] = [owner](std::string name) -> bool {
-        auto* mgr = owner->get_runtime_manager();
-        auto* loop = owner->get_event_loop();
-        if (!mgr || !loop) return false;
-        return mgr->stop(name, *loop);
-    };
-
-    // socketley.remove(name) → bool
-    sk["remove"] = [owner](std::string name) -> bool {
-        auto* mgr = owner->get_runtime_manager();
-        auto* loop = owner->get_event_loop();
-        if (!mgr || !loop) return false;
         auto* inst = mgr->get(name);
-        if (inst && inst->get_state() == runtime_running)
+        if (!inst)
+            return api_why(L, "there is no runtime called " + q(name));
+
+        switch (inst->get_state())
+        {
+            case runtime_running:
+                return api_why(L, q(name) + " is already running");
+            case runtime_failed:
+                return api_why(L, q(name) + " is failed, and a failed runtime "
+                                            "cannot be started again — remove it "
+                                            "and create it anew");
+            default: break;
+        }
+
+        if (const std::string msg = inst->ring_policy_refusal(*loop); !msg.empty())
+            return api_why(L, msg);
+
+        if (mgr->start(name, *loop))
+            return api_yes(L);
+
+        return api_why(L, q(name) + " could not be started; it is "
+                       + state_to_string(inst->get_state())
+                       + " now, and the reason is in the daemon's log");
+    };
+
+    // socketley.stop(name) → true | false, reason
+    sk["stop"] = [owner](sol::this_state L, std::string name) -> sol::variadic_results {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop)
+            return api_why(L, "this runtime has no runtime manager");
+
+        auto* inst = mgr->get(name);
+        if (!inst)
+            return api_why(L, "there is no runtime called " + q(name));
+        if (inst->get_state() != runtime_running)
+            return api_why(L, q(name) + " is "
+                              + state_to_string(inst->get_state()) + ", not running");
+
+        if (mgr->stop(name, *loop))
+            return api_yes(L);
+        return api_why(L, q(name) + " could not be stopped; the reason is in "
+                                    "the daemon's log");
+    };
+
+    // socketley.remove(name) → true | false, reason
+    sk["remove"] = [owner](sol::this_state L, std::string name) -> sol::variadic_results {
+        auto* mgr = owner->get_runtime_manager();
+        auto* loop = owner->get_event_loop();
+        if (!mgr || !loop)
+            return api_why(L, "this runtime has no runtime manager");
+        auto* inst = mgr->get(name);
+        if (!inst)
+            return api_why(L, "there is no runtime called " + q(name));
+        if (inst->get_state() == runtime_running)
             mgr->stop(name, *loop);
         // Before the instance leaves the map, and for the reason cmd_remove()
         // gives at the same point in the same order: a worker's supervisor
         // holds a pointer to the placeholder, and that pointer has to be
         // dropped while the object it names is still there.
         mgr->release_workers();
-        return mgr->remove(name);
+        if (mgr->remove(name))
+            return api_yes(L);
+        // Unreachable while the lookup above succeeds and nothing else runs on
+        // this thread in between — said anyway, because a bare false is what
+        // this whole change exists to stop returning.
+        return api_why(L, q(name) + " could not be removed");
     };
 
     // socketley.send(name, msg) → bool
@@ -2668,18 +2824,32 @@ void lua_context::register_bindings(runtime_instance* owner)
     // goes nowhere.  That was fixed for the CLI when the deliver frame was
     // added and left standing here, so since 2313c26 made the worker the
     // default it was the ordinary case for a script.
-    sk["send"] = [owner](std::string name, std::string msg) -> bool {
+    sk["send"] = [owner](sol::this_state L, std::string name,
+                         std::string msg) -> sol::variadic_results {
         auto* mgr = owner->get_runtime_manager();
-        if (!mgr) return false;
+        if (!mgr)
+            return api_why(L, "this runtime has no runtime manager");
         auto* inst = mgr->get(name);
-        if (!inst || inst->get_state() != runtime_running) return false;
+        if (!inst)
+            return api_why(L, "there is no runtime called " + q(name));
+        if (inst->get_state() != runtime_running)
+            return api_why(L, q(name) + " is " + state_to_string(inst->get_state())
+                              + ", not running; nothing is connected to it");
         if (inst->is_out_of_process())
-            return mgr->deliver_out_of_process(name, msg);
+        {
+            if (mgr->deliver_out_of_process(name, msg))
+                return api_yes(L);
+            // Named as the transport it is.  A script told only `false` would
+            // look at its own runtime for a fault that is in the pipe to
+            // somebody else's process.
+            return api_why(L, q(name) + " runs in a worker process, and the "
+                                        "message could not be handed to it");
+        }
         if (inst->get_type() == runtime_server)
             inst->lua_broadcast(msg);
         else
             inst->lua_send(msg);
-        return true;
+        return api_yes(L);
     };
 
     // socketley.list() → table of names
@@ -2980,10 +3150,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     // Four is the pipe and requires one runtime; three is the route and
     // requires two.  Asking for the combination that does not exist is refused
     // by name rather than served as the other one.
-    sk["pipe"] = [owner](std::string src_name, int src_fd, std::string dst_name,
-                         sol::optional<int> dst_fd) -> bool {
+    sk["pipe"] = [owner](sol::this_state L, std::string src_name, int src_fd,
+                         std::string dst_name,
+                         sol::optional<int> dst_fd) -> sol::variadic_results {
         auto* mgr = owner->get_runtime_manager();
-        if (!mgr) return false;
+        if (!mgr)
+            return api_why(L, "this runtime has no runtime manager");
 
         const std::string where = "socketley.pipe(\"" + src_name + "\", "
                                 + std::to_string(src_fd) + ", \"" + dst_name + "\""
@@ -2991,7 +3163,7 @@ void lua_context::register_bindings(runtime_instance* owner)
                                 + ")";
         auto refuse = [&](const std::string& why) {
             api_diag(owner, where + ": " + why);
-            return false;
+            return api_why(L, why);
         };
 
         if (src_name == dst_name)
@@ -3009,8 +3181,10 @@ void lua_context::register_bindings(runtime_instance* owner)
                               "argument is the second one");
             if (owner->get_type() != runtime_server)
                 return refuse("only a server has connections to pipe");
-            static_cast<server_instance*>(owner)->lua_pipe(src_fd, *dst_fd);
-            return true;
+            if (!static_cast<server_instance*>(owner)->lua_pipe(src_fd, *dst_fd))
+                return refuse("one of those is not an open connection of this "
+                              "server");
+            return api_yes(L);
         }
 
         if (dst_fd)
@@ -3026,7 +3200,15 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server)
             return refuse("both ends must be servers");
         auto* src_srv = static_cast<server_instance*>(src_rt);
-        return src_srv->route_client(src_fd, dst_name);
+        if (src_srv->route_client(src_fd, dst_name))
+            return api_yes(L);
+        // route_client refuses three different things, and the bare false told
+        // them apart no better than it told any of them from success.
+        return refuse("connection " + std::to_string(src_fd) + " could not be "
+                      "routed to " + q(dst_name) + " — it is not an open "
+                      "connection of " + q(src_name) + ", or it was itself "
+                      "routed in from another runtime, or " + q(dst_name)
+                      + " refused it");
     };
 
     // ─── socketley.cluster.* — cluster introspection API ───
@@ -3259,8 +3441,32 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     self["broadcast"] = [owner](std::string msg) {
         owner->lua_broadcast(msg);
     };
-    self["send"] = [owner](int client_id, std::string msg) {
-        owner->lua_send_to(client_id, msg);
+    // ─── THE SAME CONTRACT AT THE OTHER DOOR ────────────────────────────────
+    //
+    // socketley.create refuses a port it cannot honour.  Every mutator below
+    // used to take whatever it was given and, when it could not honour it, do
+    // nothing and say nothing.  Checking at one door and not the other is worse
+    // than checking at neither, because it teaches a script author that the
+    // check exists.
+    //
+    // So these answer the way the management family answers: `true`, or
+    // `false, "<reason>"`.  Nothing that exists can be reading a value that
+    // changed, because every one of them returned NOTHING before — the only
+    // scripts affected are the ones that now have an answer where they had
+    // silence.
+    self["send"] = [owner, this](sol::this_state L, int client_id,
+                                 std::string msg) -> sol::variadic_results {
+        if (owner->is_udp())
+            return api_why(L, "a UDP server has no connection to send to; use "
+                              "self.broadcast");
+        if (owner->lua_send_to(client_id, msg))
+            return api_yes(L);
+        // Four ways this used to be a silent no-op: an id that is not a
+        // connection, one already closing, a routed-in handle whose origin is
+        // gone, and an origin that has stopped.
+        return api_why(L, "there is no open connection " + std::to_string(client_id)
+                          + " on " + q(m_owner_name)
+                          + " — it may have closed, or it may never have been one");
     };
     self["connections"] = [owner]() -> size_t {
         return owner->get_connection_count();
@@ -3289,8 +3495,12 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
 
     // Connection control
-    self["disconnect"] = [owner](int client_id) {
-        static_cast<server_instance*>(owner)->lua_disconnect(client_id);
+    self["disconnect"] = [owner, this](sol::this_state L,
+                                       int client_id) -> sol::variadic_results {
+        if (static_cast<server_instance*>(owner)->lua_disconnect(client_id))
+            return api_yes(L);
+        return api_why(L, "there is no open connection " + std::to_string(client_id)
+                          + " on " + q(m_owner_name) + " to disconnect");
     };
     self["peer_ip"] = [owner](int client_id) -> std::string {
         return static_cast<server_instance*>(owner)->lua_peer_ip(client_id);
@@ -3315,20 +3525,64 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
 
     // Targeted multicast to a subset of clients
-    self["multicast"] = [owner](sol::table ids, std::string msg) {
+    // ─── A LIST WITH A HOLE IN IT IS NOT A SHORTER LIST ─────────────────────
+    //
+    // `if (v.is<int>()) fds.push_back(...)` dropped every entry that was not an
+    // integer and sent to whatever was left.  `self.multicast({1, "2", 3}, m)`
+    // therefore reached two of the three clients the script named and reported
+    // nothing — and the entry it skipped is exactly the one whose id came back
+    // from json_decode as a string, which is how this happens in practice.
+    //
+    // Refused, for the reason the `filters` validator gives in this same file: a
+    // hole in a list is not visible from the outside, so the call fails rather
+    // than half-works.  The array part only, stopping at the first gap, exactly
+    // as `filters` and `routes` are read — and a keyed table, which reaches
+    // nobody at all, is named rather than treated as an empty list.
+    self["multicast"] = [owner](sol::this_state L, sol::table ids,
+                                std::string msg) -> sol::variadic_results {
         std::vector<int> fds;
-        ids.for_each([&](sol::object, sol::object v) {
-            if (v.is<int>()) fds.push_back(v.as<int>());
-        });
-        static_cast<server_instance*>(owner)->lua_multicast(fds, msg);
+        for (size_t i = 1;; ++i)
+        {
+            sol::object v = ids[i];
+            if (!v.valid() || v == sol::nil) break;
+            if (v.get_type() != sol::type::number)
+                return api_why(L, "multicast list entry " + std::to_string(i)
+                                  + " is not a client id");
+            const double d = v.as<double>();
+            if (d != std::floor(d))
+                return api_why(L, "multicast list entry " + std::to_string(i)
+                                  + " is not a whole number");
+            fds.push_back(static_cast<int>(d));
+        }
+        if (fds.empty())
+        {
+            bool any = false;
+            ids.for_each([&](sol::object, sol::object) { any = true; });
+            if (any)
+                return api_why(L, "the multicast list has no entry at index 1 — "
+                                  "it is an array of client ids, not a keyed table");
+        }
+        // The count, not a bool: every id was well formed, and how many still
+        // name an open connection is the thing worth knowing.
+        return api_count(L,
+            static_cast<server_instance*>(owner)->lua_multicast(fds, msg));
     };
 
     // Per-connection metadata: nil value deletes the key
-    self["set_data"] = [owner](int id, std::string key, sol::optional<std::string> val) {
-        if (val)
-            static_cast<server_instance*>(owner)->lua_set_data(id, key, *val);
-        else
-            static_cast<server_instance*>(owner)->lua_del_data(id, key);
+    self["set_data"] = [owner, this](sol::this_state L, int id, std::string key,
+                                     sol::optional<std::string> val) -> sol::variadic_results {
+        // An empty key is a key nothing can read back — get_data("") answers nil
+        // whether it was ever set or not — so storing under it is a write that
+        // cannot be observed.  It is also what a missing table field looks like
+        // after `..`.
+        if (key.empty())
+            return api_why(L, "the metadata key is empty");
+        auto* srv = static_cast<server_instance*>(owner);
+        const bool ok = val ? srv->lua_set_data(id, key, *val)
+                            : srv->lua_del_data(id, key);
+        if (ok) return api_yes(L);
+        return api_why(L, "there is no open connection " + std::to_string(id)
+                          + " on " + q(m_owner_name) + " to carry metadata");
     };
     self["get_data"] = [owner, this](int id, std::string key) -> sol::object {
         auto v = static_cast<server_instance*>(owner)->lua_get_data(id, key);
@@ -3337,8 +3591,13 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
 
     // Upstream actions
-    self["upstream_send"] = [owner](int conn_id, std::string msg) {
-        static_cast<server_instance*>(owner)->lua_upstream_send(conn_id, msg);
+    self["upstream_send"] = [owner](sol::this_state L, int conn_id,
+                                    std::string msg) -> sol::variadic_results {
+        if (static_cast<server_instance*>(owner)->lua_upstream_send(conn_id, msg))
+            return api_yes(L);
+        return api_why(L, "upstream " + std::to_string(conn_id)
+                          + " is not connected — self.upstreams() lists the ones "
+                            "that are");
     };
     self["upstream_broadcast"] = [owner](std::string msg) {
         static_cast<server_instance*>(owner)->lua_upstream_broadcast(msg);
@@ -3351,22 +3610,50 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
 
     // Multicast groups
-    self["join_group"] = [owner](int fd, std::string group) {
-        static_cast<server_instance*>(owner)->lua_join_group(fd, group);
+    // An empty group name is refused at all three doors rather than at none:
+    // it is a name no client can be reached by, and it is what a missing table
+    // field looks like after `..`.
+    self["join_group"] = [owner, this](sol::this_state L, int fd,
+                                       std::string group) -> sol::variadic_results {
+        if (group.empty()) return api_why(L, "the group name is empty");
+        if (static_cast<server_instance*>(owner)->lua_join_group(fd, group))
+            return api_yes(L);
+        return api_why(L, "there is no open connection " + std::to_string(fd)
+                          + " on " + q(m_owner_name) + " to put in a group");
     };
-    self["leave_group"] = [owner](int fd, std::string group) {
-        static_cast<server_instance*>(owner)->lua_leave_group(fd, group);
+    self["leave_group"] = [owner, this](sol::this_state L, int fd,
+                                        std::string group) -> sol::variadic_results {
+        if (group.empty()) return api_why(L, "the group name is empty");
+        if (static_cast<server_instance*>(owner)->lua_leave_group(fd, group))
+            return api_yes(L);
+        return api_why(L, "there is no open connection " + std::to_string(fd)
+                          + " on " + q(m_owner_name));
     };
-    self["group_send"] = [owner](std::string group, std::string msg) {
-        static_cast<server_instance*>(owner)->lua_group_send(group, msg);
+    // The count, for the reason lua_group_send gives: a group that exists and is
+    // empty is what a misspelled name looks like once its last real member has
+    // left, and a bool cannot tell that from a group that is full.
+    self["group_send"] = [owner](sol::this_state L, std::string group,
+                                 std::string msg) -> sol::variadic_results {
+        if (group.empty()) return api_why(L, "the group name is empty");
+        return api_count(L,
+            static_cast<server_instance*>(owner)->lua_group_send(group, msg));
     };
 
     // Zero-copy pipe pairing
-    self["pipe"] = [owner](int fd_a, int fd_b) {
-        static_cast<server_instance*>(owner)->lua_pipe(fd_a, fd_b);
+    self["pipe"] = [owner, this](sol::this_state L, int fd_a,
+                                 int fd_b) -> sol::variadic_results {
+        if (fd_a == fd_b)
+            return api_why(L, "a pipe joins two connections, and those are one");
+        if (static_cast<server_instance*>(owner)->lua_pipe(fd_a, fd_b))
+            return api_yes(L);
+        return api_why(L, "one of " + std::to_string(fd_a) + " and "
+                          + std::to_string(fd_b) + " is not an open connection on "
+                          + q(m_owner_name));
     };
-    self["unpipe"] = [owner](int fd) {
-        static_cast<server_instance*>(owner)->lua_unpipe(fd);
+    self["unpipe"] = [owner](sol::this_state L, int fd) -> sol::variadic_results {
+        if (static_cast<server_instance*>(owner)->lua_unpipe(fd))
+            return api_yes(L);
+        return api_why(L, "connection " + std::to_string(fd) + " is not piped");
     };
 
     // ── Last, and over the top of the binding above ─────────────────────────
@@ -3413,8 +3700,15 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
 
 void lua_context::register_client_table(runtime_instance* owner, sol::table& self)
 {
-    self["send"] = [owner](std::string msg) {
-        owner->lua_send(msg);
+    // Same contract as the server's mutators, and the same three silent
+    // no-ops behind it: a client that has not connected yet, one whose server
+    // has dropped it, and one created --mode in, which does not send at all.
+    self["send"] = [owner, this](sol::this_state L,
+                                 std::string msg) -> sol::variadic_results {
+        if (owner->lua_send(msg))
+            return api_yes(L);
+        return api_why(L, q(m_owner_name) + " is not connected to its server, "
+                          "or was created --mode in and does not send");
     };
     self["connections"] = [owner]() -> size_t {
         return owner->get_connection_count();
@@ -3512,8 +3806,16 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
     self["peer_ip"] = [proxy](int client_id) -> std::string {
         return proxy->lua_peer_ip(client_id);
     };
-    self["close_client"] = [proxy](int client_id) {
-        proxy->lua_close_client(client_id);
+    self["close_client"] = [proxy](sol::this_state L,
+                                   int client_id) -> sol::variadic_results {
+        if (proxy->lua_close_client(client_id))
+            return api_yes(L);
+        // Both halves of a proxied pair are ints, and handing this the backend
+        // half is the mistake a script makes; it used to do nothing at all.
+        return api_why(L, "there is no open client connection "
+                          + std::to_string(client_id)
+                          + " on this proxy — self.clients() lists the ones "
+                            "there are");
     };
     self["clients"] = [proxy, this]() -> sol::table {
         auto ids = proxy->lua_clients();

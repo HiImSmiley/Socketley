@@ -2760,7 +2760,7 @@ Called when a client disconnects (server/client).
 .B on_send(msg)
 Called when message sent.
 .TP
-.B on_route(method, path)
+.B on_route(method, path, backend_path)
 Proxy only, and
 .B "\-\-strategy lua"
 only. Custom backend selection. Returns backend index (0-based).
@@ -2784,25 +2784,54 @@ is the path
 .I as the client sent it,
 this proxy's own
 .BI / name /
-prefix included. The prefix is stripped on the way to the backend and not
-before this callback, so a proxy named
+prefix included, and
+.I backend_path
+is the same path with that prefix removed \(em what the backend will actually
+receive. A proxy named
 .B gw
-sees
+handed
 .B /gw/api/users
-and a pattern anchored
-.B ^/api/
-never matches. Strip
-.B "\(dq/\(dq .. self.name"
-from the front before matching, or write the prefix into the pattern. The
-filter chain is handed the same path for the same reason.
+sees both:
+.nf
+
+function on_route(method, path, backend_path)
+    -- path         == "/gw/api/users"
+    -- backend_path == "/api/users"
+    if backend_path:match("^/api/") then return 0 end
+    return 1
+end
+
+.fi
+Both are offered because both are the truth about a different thing: the filter
+chain judges the request the client made, so it is handed
+.IR path ,
+and a routing decision is usually about the endpoint being addressed, which is
+.IR backend_path .
 .IP
-The two arguments are passed on
+.I backend_path
+exists so that scripts stop computing it. Doing it by hand means stripping
+.B "\(dq/\(dq .. self.name .. \(dq/\(dq"
+and getting the bare case right, and the bare case is the one nobody gets
+right: the gateway's own root arrives as
+.B /gw
+\(em three characters against a five-character prefix \(em and must become
+.BR / ,
+where a
+.B sub()
+past the end yields the empty string and matches no pattern at all.
+.IP
+The arguments are passed on
 .B "\-\-protocol http"
 only. A TCP proxy has no request line to read them from and calls
 .B on_route
 with none, so a body written for HTTP \(em
 .RB ` "return hash(path) % n" `
 \(em raises on the first request when it is moved to a TCP proxy.
+.IP
+A handler declaring two parameters is unaffected: Lua discards arguments a
+function does not name, so every
+.B on_route
+written before this existed behaves exactly as it did.
 .IP
 A call that raises, or that returns anything other than an index inside the
 backend list, selects nothing: the proxy reports the error on stderr and falls
@@ -3438,6 +3467,8 @@ self.persist(key)           -- Remove expiry
 self.publish(channel, msg)  -- Publish to channel
 
 -- Server: connection control
+-- Every mutator below answers `true`, or `false, "reason"`.  They returned
+-- nothing at all before, so an id that named no connection was a silent no-op.
 self.disconnect(client_id)         -- Terminate a connection from Lua
 self.peer_ip(client_id)            -- Get client IP (IPv4 or IPv6 string)
                                    -- also on a proxy, same meaning
@@ -3446,12 +3477,16 @@ self.ws_headers(client_id)         -- Get WS upgrade headers table (nil for TCP)
 -- Server: client enumeration and multicast
 self.clients()                     -- Return table of all connected client_ids
                                    -- also on a proxy, same meaning
-self.multicast(ids, msg)           -- Send msg to a subset of clients (ids = table of client_ids)
+self.multicast(ids, msg)           -- Send msg to a subset of clients (ids = array of
+                                   -- client_ids).  Returns how many were reached.
+                                   -- An entry that is not a whole number refuses the
+                                   -- whole call rather than being dropped from it.
 
 -- Server: named groups
 self.join_group(id, group)         -- Add client to a named group
 self.leave_group(id, group)        -- Remove client from a group
-self.group_send(group, msg)        -- Send msg to all clients in a group
+self.group_send(group, msg)        -- Send msg to all clients in a group.  Returns how
+                                   -- many were reached; 0 is a group with nobody in it.
 
 -- Server: zero-copy pipe pairing (bypasses Lua callbacks)
 self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly between them
@@ -3763,6 +3798,48 @@ socketley.pipe(src, fd_a, src, fd_b)  -- Pair two connections of one server
 socketley.pipe(src, fd, dst)          -- Route a connection to another server
 .fi
 .P
+.B "Every call above answers " true " when it happened, or " false ", \(dqreason\(dq" " when it did not."
+.RS
+.PP
+The reason is a sentence naming the runtime and what was wrong with the
+request, so a script can tell the four situations apart that all used to answer
+a bare
+.BR false :
+.PP
+.nf
+local ok, why = socketley.start("web")
+--  false  there is no runtime called "web"
+--  false  "web" is already running
+--  false  "web" is failed, and a failed runtime cannot be started again ...
+--  false  "web" could not be started; it is failed now, and the reason is
+--         in the daemon's log        <- a held port, a TLS pair that is not one
+.fi
+.PP
+This is the shape Lua itself uses \(em
+.BR io.open ,
+.BR os.remove ,
+.B pcall
+\(em so
+.B "assert(socketley.start(n))"
+prints the reason with no other change. Success returns ONE value, not
+.BR "true, nil" .
+.PP
+.B What a second return value changes.
+Lua truncates a multiple-return call to one value everywhere except three
+places. Unaffected: assignment, \fBif not f() then\fR, \fBand\fR/\fBor\fR,
+concatenation,
+.BR tostring ,
+comparison, and any argument position that is not the last. Affected:
+.B print(f())
+now prints two values,
+.B "{ f() }"
+builds a two-element table, and
+.B g(f())
+passes
+.B g
+two arguments where it passed one.
+.RE
+.PP
 .B socketley.pipe
 is two calls and the argument count says which. With four arguments it pairs
 two connections of ONE server, both descriptors named and both used. With three
