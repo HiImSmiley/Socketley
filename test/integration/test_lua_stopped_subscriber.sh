@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test: a stopped runtime receives no published message.
+# Integration test: a runtime that is not running receives no published message.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
@@ -31,6 +31,27 @@
 # on_start.  So they do come back, and the last assertion here is that they do:
 # a severance that also broke the restart would pass every check above this
 # line while quietly making `stop; start` a way to lose your subscribers.
+#
+# ─── THE OTHER HALF OF "NOT RUNNING" ────────────────────────────────────────
+#
+# Severing at `stop` covers a runtime that stopped.  It does not cover one that
+# never started, and that runtime is delivered to as well: a script's top level
+# runs when the script is LOADED, which is `create`, so a top-level
+# socketley.subscribe is a live registration on a runtime `ls` reports as
+# Created.  Measured on the parent commit:
+#
+#     $ socketley create server nostart -p ... --lua top.lua --daemon-process
+#     $ socketley ls
+#     nostart   server   ...   Created
+#     $ printf 'PUBLISH news m1\r\n' | nc ... <the cache>
+#     [lua] CREATED-STATE HIT msg=m1 state=created
+#
+# There is no event to sever at — nothing happened to that runtime between the
+# load and the publish — so this half is answered where the delivery is decided
+# rather than where the registration is made: runtime_manager::dispatch_publish
+# filtered on `lua() && !is_out_of_process()` and never on state.  The rule the
+# two halves share is one sentence, and it is the sentence ebb6897 was written
+# under: a runtime that is not running executes no script.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -45,6 +66,7 @@ daemon_isolate luastopsub
 PB=$((SL_PORT_BASE+1060))
 SRV_PORT=$((PB + 0))
 CACHE_PORT=$((PB + 1))
+NEW_PORT=$((PB + 2))
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -56,14 +78,14 @@ fail() {
 }
 
 cleanup() {
-    "$BIN" stop   stopsub_srv stopsub_cache >/dev/null 2>&1 || true
+    "$BIN" stop   stopsub_srv stopsub_cache stopsub_new >/dev/null 2>&1 || true
     sleep 0.2
-    "$BIN" remove stopsub_srv stopsub_cache >/dev/null 2>&1 || true
+    "$BIN" remove stopsub_srv stopsub_cache stopsub_new >/dev/null 2>&1 || true
     daemon_stop
 }
 trap cleanup EXIT
 
-echo "=== Integration: a stopped runtime's subscribers do not fire ==="
+echo "=== Integration: a runtime that is not running receives no publish ==="
 
 daemon_start "$BIN"
 
@@ -82,9 +104,24 @@ function on_stop()
 end
 LUAEOF
 
+# The never-started half.  Its subscription is made at the script's TOP LEVEL,
+# which is what makes it exist at all on a runtime whose on_start has not run —
+# and the top level is not an exotic place to put one: it is where tick_ms and
+# callback_timeout_ms are declared and where the examples put their setup.
+NEW_LUA="$SOCKETLEY_TMPD/never_started.lua"
+cat > "$NEW_LUA" <<'LUAEOF'
+socketley.subscribe("stopsub_cache", "news", function(ch, msg)
+    socketley.log("NOSTART msg=" .. msg .. " state=" .. tostring(self.state))
+end)
+socketley.log("NOSTART SUBSCRIBED")
+LUAEOF
+
 create_ok "cache created"  "$BIN" create cache  stopsub_cache -p "$CACHE_PORT" -s
 create_ok "server created" "$BIN" create server stopsub_srv   -p "$SRV_PORT" \
     --lua "$LUA" --daemon-process -s
+# No -s: created, never started, and never stopped either.
+create_ok "never-started created" "$BIN" create server stopsub_new -p "$NEW_PORT" \
+    --lua "$NEW_LUA" --daemon-process
 ready_tcp 127.0.0.1 "$SRV_PORT"   10 || echo "  NOTE: the server never accepted"
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || echo "  NOTE: the cache never answered PING"
 
@@ -111,6 +148,35 @@ if grep -qa "HIT msg=m1 state=running" "$SOCKETLEY_DLOG" 2>/dev/null; then pass;
          "nothing below this point is measuring a severance if nothing was" \
          "ever subscribed"
 fi
+
+# ── The never-started runtime, on that same publish ────────────────────────
+#
+# One message, two runtimes, and the line above is this one's control: the
+# publish demonstrably reached the cache and was fanned out, so an absence here
+# is a decision rather than a message that never arrived.
+#
+# Its registration is proved live first, for the same reason — a build where the
+# top level never ran would satisfy "no delivery" without deciding anything.
+if grep -qa "NOSTART SUBSCRIBED" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    fail "control: the never-started runtime's top level ran and subscribed" \
+         "no 'NOSTART SUBSCRIBED' line" \
+         "a script's top level runs at load, which is 'create'; without it there" \
+         "is no registration here and the absence below means nothing"
+fi
+STATUS=$("$BIN" ls 2>/dev/null | awk '$2 == "stopsub_new" { print $7 }' || true)
+if [ "$STATUS" = "Created" ]; then pass; else
+    fail "control: ls reports the never-started runtime as created" \
+         "ls says '${STATUS:-<nothing>}', wanted 'Created'"
+fi
+if grep -qa "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null; then
+    GOT=$(grep -a "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+    fail "a runtime that never started receives nothing" \
+         "got: $GOT" \
+         "dispatch_publish filtered on lua() && !is_out_of_process() and never" \
+         "on state, so a top-level subscribe on a runtime the operator has not" \
+         "started is a live handler — self.send from it reaches the clients of" \
+         "a listener that was never opened"
+else pass; fi
 
 # ── The stop, proved rather than assumed ───────────────────────────────────
 #

@@ -520,12 +520,34 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     // whether the file parses when the runtime is out of process, and builds no
     // interpreter at all.  The skip is still right; the reason given for it was
     // not.
+    // ─── And only a runtime that is running ─────────────────────────────────
+    //
+    // A runtime that is not running executes no script.  That is the sentence
+    // ebb6897 established for the timers and that severing subscriptions at
+    // `stop` extended to this API — but severing at `stop` can only answer for
+    // a runtime that stopped, and there is a second way to be not-running with
+    // live registrations: never having started.  A script's top level runs when
+    // the script is LOADED, which is `create`, so a top-level
+    // socketley.subscribe is a live handler on a runtime `ls` reports as
+    // Created.  Measured on the parent commit, one PUBLISH on the linked cache:
+    //
+    //     [lua] CREATED-STATE HIT msg=m1 state=created
+    //
+    // There is no event to sever at — nothing happened to that runtime between
+    // the load and the publish — so this half is decided here, where the
+    // delivery is, rather than where the registration is made.  self.send from
+    // such a handler reaches the clients of a listener that was never opened.
+    //
+    // `failed` is covered by the same test and wants to be: a runtime whose
+    // setup() refused is not serving anything either.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
         names.reserve(runtimes.size());
         for (auto& [n, inst] : runtimes)
         {
+            if (inst->get_state() != runtime_running)
+                continue;
             if (inst->lua() && !inst->is_out_of_process())
                 names.push_back(n);
         }
@@ -537,12 +559,19 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
         // subscriber can call straight back into the manager, and remove() takes
         // this same mutex exclusively — holding it across the callback would
         // deadlock rather than dangle, which is not an improvement.
+        //
+        // The state is re-read here as well as filtered above, and for the same
+        // reason the name is re-resolved: socketley.stop is bound in the very VM
+        // these run in, so one subscriber can take another down in the middle of
+        // this fan-out.  Deciding once, before the loop, would deliver to it
+        // afterwards anyway.
         runtime_instance* inst;
         {
             std::shared_lock lock(mutex);
             auto it = runtimes.find(n);
             if (it == runtimes.end()) continue;
             inst = it->second.get();
+            if (inst->get_state() != runtime_running) continue;
         }
 
         inst->on_publish_dispatch(cache_name, channel, message);
@@ -561,6 +590,13 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
     // Re-lookup each name before invoking callbacks so that if a prior callback
     // removed/stopped a runtime, we safely skip it instead of dereferencing
     // a dangling pointer.
+    //
+    // "or stopped" is what the state test below makes true.  The comment above
+    // has always claimed it and only the map was ever checked, so a runtime a
+    // previous callback stopped went on receiving the rest of the batch — and,
+    // with no state test at all, so did one that had never been started: a
+    // cluster callback is a callback, and dispatch_publish's sentence is not
+    // about publishes.  A runtime that is not running executes no script.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
@@ -578,6 +614,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
             auto it = runtimes.find(n);
             if (it == runtimes.end()) continue;
             inst = it->second.get();
+            if (inst->get_state() != runtime_running) continue;
         }
 
         auto* lua = inst->lua();
@@ -585,10 +622,13 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 
         for (const auto& ev : events)
         {
-            // Re-validate: a previous event callback may have removed this runtime
+            // Re-validate: a previous event callback may have removed this
+            // runtime, or stopped it.  Both end this runtime's batch.
             {
                 std::shared_lock lock(mutex);
-                if (runtimes.find(n) == runtimes.end()) break;
+                auto it = runtimes.find(n);
+                if (it == runtimes.end()) break;
+                if (it->second->get_state() != runtime_running) break;
             }
 
             switch (ev.kind)

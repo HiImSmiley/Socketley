@@ -3597,9 +3597,13 @@ Returns an integer id for
 .BR socketley.unsubscribe() .
 Ids start at 1 and are never reused.
 .IP
-Every registration this runtime holds is ended when it stops, and a stopped
-runtime therefore receives nothing \(em a stopped runtime executes no script,
-the same rule the timers are severed under. They
+Only a
+.B running
+runtime is delivered to. Every registration this one holds is ended when it
+stops, and one that has never been started receives nothing either \(em its
+top level has run, so the registration exists, but a runtime that is not
+running executes no script, which is the same rule the timers are severed
+under. They
 .B do
 come back if it is started again, which is where they differ from
 .B set_interval
@@ -3877,6 +3881,12 @@ groups    table    Maps group name (string) \(-> member count (number)
 These optional callbacks fire when the cluster topology changes.
 Events are detected during the 2-second scan/publish cycle, so callbacks
 may fire up to 2 seconds after the actual change.
+They fire only on a
+.B running
+runtime: a cluster callback is a callback, and a runtime that has been stopped
+or has never been started executes no script. A batch of events that reaches a
+runtime and then stops it ends there \(em the remaining events in that batch are
+not delivered to it.
 A daemon is considered stale and triggers
 .B on_cluster_leave
 after 10 seconds without a heartbeat update.

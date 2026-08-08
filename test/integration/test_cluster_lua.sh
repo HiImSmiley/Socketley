@@ -30,15 +30,23 @@ SOCK_B="$TMPD/nodeB.sock"
 PB=$((SL_PORT_BASE+401))
 PORT_A=$((PB + 0))
 PORT_B=$((PB + 1))
+PORT_N=$((PB + 2))
 DAEMON_PIDS=()
 
 # Unique runtime names
 RT_A="clua_srvA"
 RT_B="clua_srvB"
+# Created on nodeA and never started.  A cluster callback is a callback, and a
+# runtime that has never run must not execute one; see Test 2b.
+RT_N="clua_srvN"
 
 # Temp files for Lua output
 LUA_OUT=$(mktemp)
 LUA_SCRIPT=$(mktemp --suffix=.lua)
+# Its own file, because the assertion is about WHOSE callback fired and both
+# runtimes would otherwise append to one.
+NEVER_OUT=$(mktemp)
+NEVER_SCRIPT=$(mktemp --suffix=.lua)
 
 nodeA() { SOCKETLEY_SOCKET="$SOCK_A" "$BIN" "$@"; }
 nodeB() { SOCKETLEY_SOCKET="$SOCK_B" "$BIN" "$@"; }
@@ -55,14 +63,14 @@ cleanup() {
     # behind; test_cluster.sh left the other.
     for sock in "$SOCK_A" "$SOCK_B"; do
         daemon_alive "$sock" || continue
-        for rt in "$RT_A" "$RT_B"; do
+        for rt in "$RT_A" "$RT_B" "$RT_N"; do
             SOCKETLEY_SOCKET="$sock" "$BIN" stop "$rt" &>/dev/null
         done
     done
     sleep 0.5
     for sock in "$SOCK_A" "$SOCK_B"; do
         daemon_alive "$sock" || continue
-        for rt in "$RT_A" "$RT_B"; do
+        for rt in "$RT_A" "$RT_B" "$RT_N"; do
             SOCKETLEY_SOCKET="$sock" "$BIN" remove "$rt" &>/dev/null
         done
     done
@@ -73,7 +81,7 @@ cleanup() {
     done
     daemon_sweep "$SOCK_A"
     daemon_sweep "$SOCK_B"
-    rm -f "$LUA_OUT" "$LUA_SCRIPT"
+    rm -f "$LUA_OUT" "$LUA_SCRIPT" "$NEVER_OUT" "$NEVER_SCRIPT"
     rm -rf "$TMPD"
 }
 trap cleanup EXIT
@@ -242,6 +250,33 @@ assert_ge "$(num_max stats_running)" 1 "cluster.stats().running at on_start"
 assert_ge "$(num_max stats_groupcount)" 1 "cluster.stats().groups is not empty"
 assert_ge "$(num_max stats_group_api)" 1 "cluster.stats().groups counts the api group"
 
+# ─── A runtime on A that is created and never started ───────────────────────
+#
+# Same daemon, same cluster, its own script and its own output file — the file
+# is why it needs a script of its own rather than a second copy of the one
+# above: both would append to CLUA_OUT_FILE and "JOIN=nodeB" would not say whose
+# callback wrote it.  The path is baked in for the same reason, since the
+# environment variable belongs to the daemon and both runtimes inherit it.
+#
+# Registered before nodeB exists, so the join it must not hear has not happened
+# yet when it is created.
+cat > "$NEVER_SCRIPT" <<LUAEOF
+local out_file = "$NEVER_OUT"
+local function append(line)
+    local f = io.open(out_file, "a")
+    if f then f:write(line .. "\n"); f:close() end
+end
+append("LOADED")
+function on_cluster_join(daemon)  append("NEVER_JOIN=" .. daemon.name) end
+function on_cluster_leave(daemon) append("NEVER_LEAVE=" .. daemon.name) end
+function on_group_change(group, members)
+    append("NEVER_GROUP=" .. group)
+end
+LUAEOF
+create_ok "never-started server on nodeA created" \
+    nodeA create server "$RT_N" -p "$PORT_N" -g api --lua "$NEVER_SCRIPT" \
+        --daemon-process
+
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 start_node "$SOCK_B" nodeB
 sleep 0.2
@@ -256,6 +291,31 @@ sleep 5
 echo "  Test 2: on_cluster_join fires for new daemon"
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "JOIN=nodeB"
+
+# ─── Test 2b: the never-started runtime heard none of it ────────────────────
+#
+# The assertion above is this one's control, and they are deliberately about the
+# same event: nodeB joined, the running runtime's on_cluster_join fired for it,
+# and a runtime on the same daemon that the operator has not started must not
+# have run a line.  A build that delivered to neither would fail Test 2 first.
+#
+# LOADED proves the second half that an absence cannot: the script was read and
+# its callbacks were registered, so "nothing in the file" is a decision about
+# delivery rather than a script that never existed.
+echo "  Test 2b: a runtime that was never started hears no cluster event"
+NEVER=$(cat "$NEVER_OUT" 2>/dev/null || echo "")
+assert_contains "$NEVER" "LOADED"
+TOTAL=$((TOTAL+1))
+case "$NEVER" in
+    *NEVER_JOIN=*|*NEVER_LEAVE=*|*NEVER_GROUP=*)
+        FAIL=$((FAIL+1))
+        echo "  FAIL: a created-but-never-started runtime ran a cluster callback"
+        echo "        got: $(printf '%s' "$NEVER" | grep -a NEVER_ | tr '\n' ' ')"
+        echo "        dispatch_cluster_events collected every runtime with a Lua"
+        echo "        VM and never asked what state it was in"
+        ;;
+    *) PASS=$((PASS+1)) ;;
+esac
 
 # ─── Test 3: on_group_change fired for "api" group ─────────────────────────
 echo "  Test 3: on_group_change fires for group membership change"
