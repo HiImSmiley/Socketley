@@ -46,7 +46,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 daemon_isolate luaret
 
-PB=$((SL_PORT_BASE + 1150))
+PB=$((SL_PORT_BASE+1190))
 RPC_PORT=$((PB + 0))    # the script under test, in the daemon
 SUBJ_PORT=$((PB + 1))   # the runtime it starts and stops
 PX_PORT=$((PB + 2))     # the HTTP proxy, --strategy lua
