@@ -6,12 +6,17 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../cli/command_hashing.h"
 
+#include "logging.h"
+
 #include <fstream>
 #include <sstream>
 #include <charconv>
+#include <cerrno>
 #include <cstdio>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace fs = std::filesystem;
 
@@ -815,38 +820,100 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     return !cfg.name.empty();
 }
 
-bool state_persistence::write_json(const runtime_config& cfg) const
+// ─── EVERY STATE FILE IS WRITTEN HERE, AND NOWHERE ELSE KNOWS HOW ───────────
+//
+// A state file is not a note about a runtime, it is the runtime.  The record
+// carries a server's --master-pw verbatim, the paths of the TLS and mTLS
+// private keys, and the --lua script the daemon runs with its own privileges;
+// and the daemon restores every runtime from these files at startup, so
+// whoever can write one chooses what the daemon runs next time it comes up.
+//
+// Both writers used std::ofstream, which creates with 0666 & ~umask.  That is
+// not a mode, it is whatever the daemon inherited.  Measured on the parent
+// commit, packaged shape — daemon as `socketley`, /var/lib/socketley/runtimes
+// at 0755 as packaging/install.sh creates it:
+//
+//     daemon's umask 002    state file 0664   uid nobody read master_pw
+//     daemon's umask 022    state file 0644   uid nobody read master_pw
+//     daemon's umask 0      state file 0666   uid nobody REWROTE the record
+//
+// The third line is the one that matters.  Disclosure of a password is bad;
+// a world-writable file that the daemon reads back as a runtime definition is
+// the same privilege escalation that the IPC socket's 0666 was — the socket
+// was closed in 39152d9 and this is the same door in the filesystem.
+//
+// So the mode is stated, not inherited, and it is stated at creation rather
+// than fixed afterwards.  A chmod after the write has a window that is
+// genuinely reachable here: unlike the daemon's listening socket, which
+// refuses connect() until listen(), a file is readable the instant it exists,
+// and the content is written into it before any chmod could run.  A umask
+// around the write would work and was rejected for the same reason it was
+// rejected for the socket, only more so: umask is process-wide and this code
+// runs on state_persistence's own writer thread, so the narrow window would
+// apply to whatever any other thread created inside it.
+//
+// O_EXCL on a path that was just unlinked is what makes 0600 a guarantee.
+// O_CREAT does not touch the mode of a file that already exists, and the .tmp
+// name is deterministic per runtime, so a leftover from a killed daemon would
+// otherwise donate its old mode to every write that followed it.
+static bool write_state_file(const fs::path& path, std::string_view bytes)
 {
-    std::string json = format_json_pretty(cfg);
-
-    // Atomic write: write to .tmp then rename
-    fs::path path = config_path(cfg.name);
     fs::path tmp_path = path;
     tmp_path += ".tmp";
 
-    std::ofstream f(tmp_path, std::ios::trunc);
-    if (!f.is_open())
+    std::error_code ec;
+    fs::remove(tmp_path, ec);
+
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
         return false;
 
-    f << json;
-    f.flush();
+    size_t off = 0;
+    while (off < bytes.size())
+    {
+        ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+        {
+            ::close(fd);
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
 
     // fsync before rename to guarantee data is on disk — prevents
-    // partial/empty state files on power loss or kernel crash
-    int fd = ::open(tmp_path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) { if (fsync(fd) < 0) {} ::close(fd); }
+    // partial/empty state files on power loss or kernel crash.
+    //
+    // Its failure is ignored, exactly as it was before this function existed.
+    // That is a durability question and this change is about the mode; turning
+    // a spurious fsync error into a failed save would be a different decision
+    // wearing this one's clothes.  It is now the descriptor that wrote the
+    // file rather than a second open() of the same path, which is one fewer
+    // moment in which the path could have become something else.
+    if (::fsync(fd) < 0) {}
 
-    f.close();
-
-    if (f.fail())
+    // Checked, where the fsync is not: close is where a deferred write error
+    // surfaces, and it stands in for the f.fail() the ofstream form tested.
+    if (::close(fd) < 0)
     {
-        fs::remove(tmp_path);
+        fs::remove(tmp_path, ec);
         return false;
     }
 
-    std::error_code ec;
     fs::rename(tmp_path, path, ec);
-    return !ec;
+    if (ec)
+    {
+        fs::remove(tmp_path, ec);
+        return false;
+    }
+    return true;
+}
+
+bool state_persistence::write_json(const runtime_config& cfg) const
+{
+    return write_state_file(config_path(cfg.name), format_json_pretty(cfg));
 }
 
 bool state_persistence::read_json(const fs::path& path, runtime_config& cfg) const
@@ -991,19 +1058,115 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
 
     json.replace(pos + 16, old_val.size(), new_val);
 
-    // Atomic write via .tmp + rename
-    fs::path tmp_path = path;
-    tmp_path += ".tmp";
-    std::ofstream out(tmp_path, std::ios::trunc);
-    if (!out.is_open())
-        return;
-    out << json;
-    out.close();
-    if (!out.fail())
+    // Through the same writer as write_json, and that is the point rather than
+    // tidiness.  This path rewrites the whole record — master_pw and all — on
+    // every start and every stop, so an ofstream here would have handed the
+    // mode back to the umask the first time a runtime was started, and a fix
+    // that only covered write_json would have looked correct on a fresh
+    // `create` and quietly undone itself on the next `start`.
+    if (!write_state_file(path, json)) {}
+}
+
+// ─── THE FILES THAT WERE ALREADY THERE ──────────────────────────────────────
+//
+// Writing new files at 0600 does nothing for an install that already has a
+// directory full of 0644 ones, and those are the files with the passwords in
+// them.  Nor does the problem age out on its own: a record is rewritten only
+// when its runtime changes, so a server created once and left running keeps
+// the mode it was born with for as long as the install lasts, and nothing
+// anywhere tells the operator to look.
+//
+// So the daemon repairs what it finds, once, when it takes ownership of the
+// directory at startup.  It only ever narrows — a file that is already
+// owner-only is not touched — it is idempotent, and it costs one stat per
+// runtime on a path that already walks every one of them.
+//
+// FILES ONLY, NOT THE DIRECTORY.  The mode on the files is what protects the
+// contents; the mode on the directory is a deployment decision, set by
+// packaging/install.sh and the deb postinst to 0750, and a daemon that
+// silently renarrowed a directory an operator had widened on purpose would be
+// changing a configuration it was not asked about.  The files it owns
+// outright.
+//
+// .tmp is included because a daemon killed mid-write leaves one, with the same
+// record and the same password in it, under a name nothing else cleans up
+// until that runtime is next written.
+// ─── THROUGH A DESCRIPTOR, NEVER THROUGH THE PATH ───────────────────────────
+//
+// This began as stat() then chmod() on entry.path(), and both follow symlinks.
+// A name in this directory pointing at /etc/shadow would have been a chmod of
+// /etc/shadow, and the daemon runs as root under `sudo socketley daemon`.
+//
+// It was not exploitable as written, because the same change puts the packaged
+// state directory at 0750 and nobody else can create a name in it.  That is
+// precisely the objection: the defence was the directory mode, and the file
+// layer was leaning on it.  A later loosening of that mode, or a state
+// directory somewhere else, would have moved the whole risk here with nothing
+// to see it coming — and the cache dump twenty lines' worth of file away
+// already does this correctly with fchmod, so the tree would have disagreed
+// with itself about the same hazard.
+//
+// So the file is opened once and every decision is made on that descriptor:
+//
+//   O_NOFOLLOW  a symlink fails the open with ELOOP instead of being followed.
+//               That is counted and reported rather than silently skipped —
+//               a symlink in this directory is not something socketley puts
+//               there, and an operator should hear that it is present.
+//   O_NONBLOCK  a FIFO named x.json would otherwise block open(O_RDONLY) until
+//               somebody wrote to it, which is a daemon that never finishes
+//               starting.  On a regular file the flag does nothing.
+//   fstat       the type and mode come from the object actually opened, so
+//               there is no window between the test and the change.
+static size_t tighten_dir_files(const fs::path& dir, size_t& symlinks)
+{
+    size_t fixed = 0;
+    std::error_code ec;
+    symlinks = 0;
+
+    for (const auto& entry : fs::directory_iterator(dir, ec))
     {
-        std::error_code ec;
-        fs::rename(tmp_path, path, ec);
+        const fs::path ext = entry.path().extension();
+        if (ext != ".json" && ext != ".tmp")
+            continue;
+
+        const int fd = ::open(entry.path().c_str(),
+                              O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+        {
+            if (errno == ELOOP)
+                ++symlinks;
+            continue;
+        }
+
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+            (st.st_mode & 0077) == 0)
+        {
+            ::close(fd);
+            continue;                       // not ours to touch, or already 0600
+        }
+
+        if (::fchmod(fd, 0600) == 0)
+            ++fixed;
+        ::close(fd);
     }
+
+    return fixed;
+}
+
+size_t state_persistence::tighten_existing() const
+{
+    size_t symlinks = 0;
+    const size_t fixed = tighten_dir_files(m_state_dir, symlinks);
+
+    if (symlinks > 0)
+        LOG_WARN(("state: " + std::to_string(symlinks) +
+                  " symlink(s) in " + m_state_dir.string() +
+                  " were left alone — socketley does not create them, and "
+                  "following one would change the mode of whatever it points "
+                  "at").c_str());
+
+    return fixed;
 }
 
 std::vector<runtime_config> state_persistence::load_all()
@@ -1016,6 +1179,16 @@ std::vector<runtime_config> state_persistence::load_all()
     // Blocking here is free.  load_all() runs at startup and in tests, never on
     // the event loop thread, which is the only place the stall mattered.
     drain();
+
+    // Before anything is read out of them.  Said out loud when it does
+    // something, because "your state files were readable by every user on this
+    // machine until just now" is news, and because an operator who sees it
+    // twice knows something is putting the modes back.
+    if (const size_t fixed = tighten_existing(); fixed > 0)
+        LOG_INFO(("state: tightened " + std::to_string(fixed) +
+                  " file(s) in " + m_state_dir.string() +
+                  " to 0600 — they carry master passwords and key paths and "
+                  "were readable by other users on this machine").c_str());
 
     std::vector<runtime_config> configs;
 

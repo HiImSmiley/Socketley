@@ -4968,6 +4968,65 @@ State is saved after create, start, stop, remove, and edit commands.
 The
 .B was_running
 field tracks whether a runtime should be auto-started on daemon startup.
+.SS A State File Is A Secret
+A runtime's record is not a note about the runtime, it
+.I is
+the runtime. It carries, in plaintext:
+.TP
+.B master_pw
+the password given to
+.BR "\-\-master\-pw" ,
+verbatim.
+.TP
+.BR key_path ", " mesh_client_key
+the paths of the TLS and mTLS private keys this runtime uses.
+.TP
+.B lua_script
+the path of the handler the daemon loads, which runs with the daemon's
+privileges \(em see
+.B Handler Privileges
+under
+.BR "LUA CONFIGURATION" .
+.PP
+And the daemon restores every runtime from these files when it starts. So
+whoever can
+.I write
+one chooses what the daemon runs at its next start, which is the same thing as
+being able to send it commands.
+.PP
+Accordingly the daemon writes them
+.BR 0600 ,
+stated at creation rather than inherited from its umask, and the packaged state
+directory is
+.B 0750
+owned by
+.BR socketley:socketley .
+Neither is configurable, and there is no supported reason to widen them: an
+operator reaches this data through the CLI, over a socket with the same
+group boundary, not by reading the directory.
+.PP
+.B "Earlier versions wrote these files 0666 & ~umask"
+\(em 0644 under systemd's default, 0666 for a daemon started from a shell with
+.BR "umask 0" .
+Any local user could read a master password, and in the last case rewrite the
+record. On its first start after an upgrade the daemon narrows every file it
+finds in its state directory to 0600 and logs how many:
+.PP
+.nf
+state: tightened 3 file(s) in /var/lib/socketley/runtimes to 0600 ...
+.fi
+.PP
+It only ever narrows, it is idempotent, and it does not touch the directory
+\(em that belongs to the installer. Seeing the line on every start means
+something outside socketley is putting the modes back.
+.PP
+.B "A password that was exposed should be treated as exposed."
+The repair closes the hole; it cannot un-read what was already readable. Rotate
+any
+.B \-\-master\-pw
+that lived on a multi-user machine under an affected version, with
+.B "socketley edit"
+or by recreating the runtime.
 .SH ENVIRONMENT
 Read at daemon startup; all are optional. The first selects which daemon this
 is. The rest are tuning knobs whose defaults suit a general-purpose deployment
@@ -5134,7 +5193,16 @@ owned by
 .BR socketley:socketley .
 .TP
 .I /var/lib/socketley/runtimes/
-Per-runtime JSON configuration files.
+Per-runtime JSON configuration files. Directory
+.BR 0750 ,
+files
+.BR 0600 ,
+owned by
+.BR socketley:socketley .
+They carry master passwords and private-key paths; see
+.B A State File Is A Secret
+under
+.BR "STATE PERSISTENCE" .
 .TP
 .I /etc/socketley/config.lua
 Daemon configuration (log_level, metrics_port).
@@ -5146,7 +5214,8 @@ Unix domain socket for daemon IPC.
 owned by the user who started the daemon.
 .TP
 .I ~/.local/share/socketley/runtimes/
-Per-runtime JSON configuration files.
+Per-runtime JSON configuration files,
+.BR 0600 .
 .TP
 .I ~/.config/socketley/config.lua
 Daemon configuration (or set SOCKETLEY_CONFIG env var).

@@ -64,3 +64,27 @@ privileges, so reaching it is an administrative right. To grant it:
   sudo usermod -aG socketley "$USER"     # then log in again
 
 PERMS
+
+# This script creates no directories of its own — the state directory's mode
+# comes from the package payload and the postinst, which set it to 0750. What
+# it owns is telling whoever ran it, and on an UPGRADE that is not optional:
+# every version before this one wrote those files world-readable with the
+# passwords in them, and no amount of tightening now un-reads what was already
+# readable.
+if [ "$UPGRADE" = true ]; then
+  cat <<'STATE'
+UPGRADE NOTE — read this one.
+
+Versions before this wrote /var/lib/socketley/runtimes/*.json with the mode the
+daemon's umask happened to give them: 0644 under systemd, 0666 from a shell
+with "umask 0". Those files carry each runtime's --master-pw in plaintext and
+the paths of its TLS private keys, so on a multi-user machine they were
+readable — and in the 0666 case writable — by every local account.
+
+The daemon narrows them to 0600 on its first start and says so in the log. It
+cannot undo the exposure. If this machine has accounts other than yours:
+
+  rotate every --master-pw    socketley edit <name>, or recreate the runtime
+
+STATE
+fi

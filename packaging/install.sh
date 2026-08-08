@@ -50,7 +50,13 @@ install -Dm755 "$PROJECT_ROOT/man/socketley-help.sh" /usr/share/socketley/socket
 install -Dm644 "$SCRIPT_DIR/socketley.service" /usr/lib/systemd/system/socketley.service
 
 # Create state directories
-install -dm755 -o socketley -g socketley /var/lib/socketley/runtimes
+# 0750, not 0755: the files in here are the runtime records, and each one
+# carries that runtime's --master-pw in plaintext along with the paths of its
+# TLS and mTLS private keys.  The daemon writes them 0600, which is what
+# actually protects the contents; this stops a user who is not in the socketley
+# group from even listing which runtimes exist.  Members of that group are the
+# operators — the same set the IPC socket admits.
+install -dm750 -o socketley -g socketley /var/lib/socketley/runtimes
 install -dm755 -o socketley -g socketley /run/socketley
 install -dm755 /etc/socketley
 

@@ -22,6 +22,11 @@ mkdir -p "$PKG_DIR/usr/bin"
 mkdir -p "$PKG_DIR/usr/lib/systemd/system"
 mkdir -p "$PKG_DIR/usr/share/man/man1"
 mkdir -p "$PKG_DIR/var/lib/socketley/runtimes"
+# Stated in the payload too, not only in the postinst: dpkg takes the mode from
+# the directory as built here, so a package built on a machine with a loose
+# umask would ship a 0777 state directory and be correct only after postinst
+# ran.  See the note beside the postinst's install -dm750.
+chmod 750 "$PKG_DIR/var/lib/socketley/runtimes"
 mkdir -p "$PKG_DIR/etc/socketley"
 
 # Binary
@@ -94,6 +99,11 @@ fi
 
 # Fix ownership
 chown -R socketley:socketley /var/lib/socketley
+# 0750 on an upgrade as well as a fresh install: the runtime records in here
+# carry --master-pw in plaintext and the paths of the TLS private keys, and an
+# install that predates this change has the directory at 0755.  The daemon
+# narrows the files themselves to 0600 at startup; this narrows the directory.
+install -dm750 -o socketley -g socketley /var/lib/socketley/runtimes
 install -dm755 -o socketley -g socketley /run/socketley
 
 # Kill any stale dev-mode daemon (user-space, socket at /tmp/socketley.sock)

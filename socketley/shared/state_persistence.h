@@ -200,6 +200,12 @@ private:
 
     std::filesystem::path config_path(std::string_view name) const;
     bool write_json(const runtime_config& cfg) const;
+
+    // Narrow any state file this directory already holds to 0600, returning
+    // how many were changed.  Called once from load_all(); see the reasoning
+    // there and at the definition.
+    size_t tighten_existing() const;
+
     bool read_json(const std::filesystem::path& path, runtime_config& cfg) const;
 
     std::filesystem::path m_state_dir;
