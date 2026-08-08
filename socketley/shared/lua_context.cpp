@@ -1945,8 +1945,56 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 }
 
 // ─── JSON encode/decode for Lua ───────────────────────────────────────────────
+//
+// ─── HOW DEEP EITHER SIDE MAY GO, AND WHY THERE IS A LIMIT AT ALL ────────────
+//
+// Both functions below are recursive, in C++, over a structure a script hands
+// them — and until this constant existed neither had a bottom.
+//
+// The encoder's was reachable by accident.  `t.self = t` is a typo every
+// scripting language forgives, and Lua forgives it too; this encoder followed
+// the reference forever.  Measured, one runtime whose on_start built exactly
+// that table:
+//
+//     [INFO] [lua jc] about to encode a cyclic table
+//     Segmentation fault (core dumped)
+//
+// The decoder's was reachable on purpose, and from outside.  socketley.json_decode
+// is written to be pointed at a request body — that is what the API is for — so
+// the nesting depth is chosen by whoever sent the request.  Measured, a runtime
+// decoding string.rep("[", n) .. string.rep("]", n):
+//
+//     n =   1000  (  2 KB)   survived
+//     n =   5000  ( 10 KB)   survived
+//     n =  20000  ( 40 KB)   survived
+//     n = 100000  (200 KB)   Segmentation fault (core dumped)
+//
+// 200 KB is an ordinary request body.  That made every script calling
+// json_decode on network input a way for an unauthenticated client to take the
+// whole daemon down, which is the only such path anybody found in this tree.
+//
+// The callback deadline does not help and was never going to: it is a
+// lua_sethook on Lua instructions plus a wall clock, and this recursion is C++
+// frames on the C stack.  The stack is gone long before ten seconds are.
+//
+// 128 is Redis's limit for the same job.  A document nested deeper than that is
+// not something a handler builds by hand, and the two failures above are both
+// well past it.
+namespace
+{
+constexpr int json_max_depth = 128;
+}
 
-static void json_encode_value(std::string& out, const sol::object& val);
+// `path` holds the tables currently being encoded, innermost last — an
+// ancestor chain, not a visited set.  The difference matters: a table that
+// appears twice as a SIBLING is ordinary and must still encode (two fields
+// pointing at one shared config table), while a table that appears twice on one
+// path is a cycle and cannot terminate.
+//
+// False means nothing was appended for this value and `err` says why.
+static bool json_encode_value(std::string& out, const sol::object& val,
+                              int depth, std::vector<const void*>& path,
+                              std::string& err);
 
 static void json_encode_string(std::string& out, const std::string& s)
 {
@@ -1989,7 +2037,9 @@ static bool is_array_table(const sol::table& t)
     return expected > 1;
 }
 
-static void json_encode_value(std::string& out, const sol::object& val)
+static bool json_encode_value(std::string& out, const sol::object& val,
+                              int depth, std::vector<const void*>& path,
+                              std::string& err)
 {
     switch (val.get_type())
     {
@@ -2024,6 +2074,39 @@ static void json_encode_value(std::string& out, const sol::object& val)
         case sol::type::table:
         {
             sol::table t = val.as<sol::table>();
+
+            // The cycle first: it is the case a script reaches by accident, and
+            // naming it beats reporting a depth limit for a table that is two
+            // levels deep and points at itself.
+            const void* const id = t.pointer();
+            for (const void* ancestor : path)
+            {
+                if (ancestor == id)
+                {
+                    err = "the table contains itself, so there is no end to "
+                          "encode: a JSON document cannot hold a cycle";
+                    return false;
+                }
+            }
+
+            if (depth >= json_max_depth)
+            {
+                err = "the table is nested deeper than " +
+                      std::to_string(json_max_depth) + " levels";
+                return false;
+            }
+
+            path.push_back(id);
+            // Every `return false` below leaves the pop to this guard: the
+            // early exits are the whole point of the ancestor chain, and a
+            // path that grows on the way in and not back out would report a
+            // cycle for the next sibling.
+            struct pop_guard
+            {
+                std::vector<const void*>& p;
+                ~pop_guard() { p.pop_back(); }
+            } guard{ path };
+
             if (is_array_table(t))
             {
                 out += '[';
@@ -2032,7 +2115,8 @@ static void json_encode_value(std::string& out, const sol::object& val)
                 {
                     if (!first) out += ',';
                     first = false;
-                    json_encode_value(out, kv.second);
+                    if (!json_encode_value(out, kv.second, depth + 1, path, err))
+                        return false;
                 }
                 out += ']';
             }
@@ -2080,13 +2164,19 @@ static void json_encode_value(std::string& out, const sol::object& val)
                     }
                     else
                     {
+                        // A key is a scalar in every case this branch can see —
+                        // a table key would be one more place a cycle could
+                        // hide, so it goes through the same guarded call rather
+                        // than a bare one.
                         std::string key_text;
-                        json_encode_value(key_text, kv.first);
+                        if (!json_encode_value(key_text, kv.first, depth + 1, path, err))
+                            return false;
                         json_encode_string(out, key_text);
                     }
 
                     out += ':';
-                    json_encode_value(out, kv.second);
+                    if (!json_encode_value(out, kv.second, depth + 1, path, err))
+                        return false;
                 }
                 out += '}';
             }
@@ -2096,9 +2186,14 @@ static void json_encode_value(std::string& out, const sol::object& val)
             out += "null";
             break;
     }
+    return true;
 }
 
-static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end);
+// `too_deep` is set once and never cleared: the first frame to hit the limit
+// stops descending, and every frame above it stops too rather than carrying on
+// with a half-built value that has no marker in it.
+static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end,
+                                     int depth, bool& too_deep);
 
 static void json_skip_ws(const char*& p, const char* end)
 {
@@ -2166,10 +2261,21 @@ static std::string json_decode_string(const char*& p, const char* end)
     return result;
 }
 
-static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end)
+static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end,
+                                     int depth, bool& too_deep)
 {
     json_skip_ws(p, end);
     if (p >= end) return sol::nil;
+
+    // Checked once, before the switch, so it covers both containers and every
+    // container added later.  A scalar cannot recurse and is let through
+    // whatever the depth, which keeps the limit about nesting rather than about
+    // where in a document a value happens to sit.
+    if ((*p == '{' || *p == '[') && depth >= json_max_depth)
+    {
+        too_deep = true;
+        return sol::nil;
+    }
 
     switch (*p)
     {
@@ -2187,7 +2293,8 @@ static sol::object json_decode_value(sol::state& lua, const char*& p, const char
                 auto key = json_decode_string(p, end);
                 json_skip_ws(p, end);
                 if (p < end && *p == ':') ++p;
-                auto val = json_decode_value(lua, p, end);
+                auto val = json_decode_value(lua, p, end, depth + 1, too_deep);
+                if (too_deep) return sol::nil;
                 t[key] = val;
                 json_skip_ws(p, end);
                 if (p < end && *p == ',') ++p;
@@ -2205,7 +2312,9 @@ static sol::object json_decode_value(sol::state& lua, const char*& p, const char
             int idx = 1;
             while (p < end)
             {
-                t[idx++] = json_decode_value(lua, p, end);
+                auto val = json_decode_value(lua, p, end, depth + 1, too_deep);
+                if (too_deep) return sol::nil;
+                t[idx++] = val;
                 json_skip_ws(p, end);
                 if (p < end && *p == ',') ++p;
                 else break;
@@ -3026,19 +3135,48 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.clear_interval(id) — cancel a repeating interval
     sk["clear_interval"] = cancel_timer_by_id;
 
-    // socketley.json_encode(value) → JSON string
-    sk["json_encode"] = [](sol::object val) -> std::string {
+    // socketley.json_encode(value) → JSON string, or false + why
+    //
+    // The refusal follows this file's return contract rather than raising: a
+    // string is truthy and false is not, so `local s = socketley.json_encode(t)`
+    // reads the same, and `if not s then` is how the two callers that care
+    // already test everything else here.  Both refusals used to be a crash of
+    // the whole daemon — see json_max_depth.
+    sk["json_encode"] = [](sol::this_state L, sol::object val)
+                        -> sol::variadic_results {
         std::string out;
         out.reserve(256);
-        json_encode_value(out, val);
-        return out;
+        std::vector<const void*> path;
+        std::string err;
+        if (!json_encode_value(out, val, 0, path, err))
+            return api_why(L, "socketley.json_encode(): " + err);
+
+        sol::variadic_results r;
+        r.push_back({ L, sol::in_place_type<std::string>, std::move(out) });
+        return r;
     };
 
-    // socketley.json_decode(str) → Lua value
-    sk["json_decode"] = [this](std::string str) -> sol::object {
+    // socketley.json_decode(str) → Lua value, or false + why
+    //
+    // The depth refusal is the one that matters here: this call is written to be
+    // pointed at a request body, so the nesting is chosen by whoever sent it.
+    // Answering nil would be indistinguishable from a document that really did
+    // decode to nil, which is the ambiguity this file's whole return contract
+    // exists to remove.
+    sk["json_decode"] = [this](sol::this_state L, std::string str)
+                        -> sol::variadic_results {
         const char* p = str.data();
         const char* end = p + str.size();
-        return json_decode_value(m_lua, p, end);
+        bool too_deep = false;
+        sol::object v = json_decode_value(m_lua, p, end, 0, too_deep);
+        if (too_deep)
+            return api_why(L, "socketley.json_decode(): the document is nested "
+                              "deeper than " + std::to_string(json_max_depth) +
+                              " levels");
+
+        sol::variadic_results r;
+        r.push_back({ L, std::move(v) });
+        return r;
     };
 
     // socketley.subscribe(cache_name, channel, fn) → subscription_id
