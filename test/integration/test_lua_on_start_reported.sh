@@ -49,10 +49,11 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaonstart
 
-PB=${PB:-24100}
+PB=$((SL_PORT_BASE+1120))
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }

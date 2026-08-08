@@ -53,10 +53,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ready.sh"
+. "$(dirname "$0")/lib_ports.sh"
 
 daemon_isolate luaselfrm
 
-PB=${PB:-24070}
+PB=$((SL_PORT_BASE+1070))
 CACHE_PORT=$((PB + 0))
 RUN_PORT=$((PB + 1))
 NEW_PORT=$((PB + 2))
