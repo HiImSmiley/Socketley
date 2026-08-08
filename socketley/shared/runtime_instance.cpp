@@ -36,6 +36,19 @@ void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
     rt->fire_tick(cqe->res);
 }
 
+// ─── NOTHING RE-ARMS THIS CHAIN BUT ITS OWN COMPLETION ──────────────────────
+//
+// So a submission that never reached the ring ends on_tick for this runtime for
+// the rest of the daemon's life, and it used to end it in silence: the answer
+// was discarded here and again in fire_tick().
+//
+// It also leaked.  tick_handler is a raw `new` whose `delete this` lives in its
+// own on_cqe — the completion is what frees it — so a timer that was never
+// queued has no completion coming and the object is never released.
+//
+// daemon_handler::start_health_timer() has the same shape and says both things
+// out loud when its submission is refused.  This is the same chain one layer
+// down, and it now does too.
 void runtime_instance::start_tick_timer()
 {
     uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
@@ -48,7 +61,24 @@ void runtime_instance::start_tick_timer()
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
     m_tick->last = std::chrono::steady_clock::now();
-    m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req);
+    if (!m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req))
+    {
+        LOG_ERROR("runtime tick timer refused: on_tick will not run again for "
+                  "this runtime");
+        // Nothing will complete for it, so this is the only place that can free
+        // it.  Cleared first: the handler's own on_cqe is the other owner, and
+        // it reaches this object through m_tick.
+        //
+        // Deregistered exactly as on_cqe's own teardown does it.  A refused
+        // submission may still have registered the owner — arm() claims the
+        // slot before it prepares the SQE — and deregister_owner() returns at
+        // once for a handler that never got a token, so the call is right
+        // either way.
+        tick_handler* dead = m_tick;
+        m_tick = nullptr;
+        m_event_loop->deregister_owner(dead);
+        delete dead;
+    }
 }
 
 void runtime_instance::fire_tick(int res)
@@ -75,7 +105,19 @@ void runtime_instance::fire_tick(int res)
     if (ms < lua_tick::floor_ms) ms = lua_tick::floor_ms;
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
-    m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req);
+
+    // The re-arm, and the same reasoning as the first one: this completion is
+    // the last thing that will ever name this handler unless the submission
+    // takes.  Freed here rather than leaked, and said out loud rather than
+    // found later as a runtime whose on_tick stopped for no visible reason.
+    if (!m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req))
+    {
+        LOG_ERROR("runtime tick timer could not be re-armed: on_tick will not "
+                  "run again for this runtime");
+        tick_handler* dead = m_tick;
+        m_tick = nullptr;
+        delete dead;
+    }
 }
 
 bool runtime_instance::start(event_loop& loop)
