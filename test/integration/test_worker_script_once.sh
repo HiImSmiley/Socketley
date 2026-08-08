@@ -66,8 +66,8 @@ EOF
 
 daemon_start "$BIN"
 
-BE_PORT=$((SL_PORT_BASE+8499))
-PROXY_PORT=$((SL_PORT_BASE+8487))
+BE_PORT=$((SL_PORT_BASE+1170))
+PROXY_PORT=$((SL_PORT_BASE+1171))
 
 # ── the control: an in-process proxy, which must run its script exactly once ──
 create_ok "in-process proxy created" \

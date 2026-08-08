@@ -25,7 +25,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 daemon_isolate cacheoop
 
-PORT=$((SL_PORT_BASE+9101))
+PORT=$((SL_PORT_BASE+1180))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
