@@ -644,25 +644,55 @@ int cli_stdin_send(int /*argc*/, char** argv)
     return exit_code;
 }
 
+// Strip the whitespace `show` pretty-prints with, leaving string literals alone.
+//
+// ─── LOOKING BACK ONE CHARACTER IS NOT ENOUGH ───────────────────────────────
+//
+// The test was `c == '"' && pretty[i-1] != '\\'` — a quote is a delimiter
+// unless the character before it is a backslash.  That is right for `\"` and
+// wrong for `\\"`, where the backslash is itself escaped and the quote really
+// does close the string.  A value ending in a backslash is all it takes:
+//
+//     "log_file": "C:\\",
+//
+// From that quote onwards in_string stayed true for the rest of the document,
+// so every newline was preserved — and IPC frames one command per line, so the
+// daemon received the first fragment as the whole `import` and the remaining
+// lines as commands of their own.  The fragment is truncated JSON, which
+// parse_json_string accepted, so the round trip `show | import` silently
+// dropped every field after the backslash and reported success.  Measured: two
+// fields lost, exit 0 on both sides.
+//
+// The state is carried forward now instead of being reconstructed by looking
+// back: inside a string, a backslash makes the next character literal whatever
+// it is, and that is the whole rule.
 static std::string compact_json(const std::string& pretty)
 {
     std::string result;
     result.reserve(pretty.size());
     bool in_string = false;
-    for (size_t i = 0; i < pretty.size(); ++i)
-    {
-        char c = pretty[i];
-        if (c == '"' && (i == 0 || pretty[i-1] != '\\'))
-            in_string = !in_string;
+    bool escaped   = false;
 
+    for (char c : pretty)
+    {
         if (in_string)
         {
             result += c;
+            if (escaped)        escaped = false;      // consumed, whatever it was
+            else if (c == '\\') escaped = true;
+            else if (c == '"')  in_string = false;
+            continue;
         }
-        else if (c != '\n' && c != '\r' && c != '\t' && c != ' ')
+
+        if (c == '"')
         {
+            in_string = true;
             result += c;
+            continue;
         }
+
+        if (c != '\n' && c != '\r' && c != '\t' && c != ' ')
+            result += c;
     }
     return result;
 }
