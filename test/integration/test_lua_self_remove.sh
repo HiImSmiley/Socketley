@@ -40,12 +40,37 @@
 # assertion below is on the pid of the daemon that was serving before the
 # publish, and never on what `ls` says afterwards.
 #
-# The narrow reading matters and is the reason the created-state runtime is the
-# one under test: a runtime that has never been started is one of the two kinds
-# that never arm io (the other is an external one, which has no Lua VM to
-# subscribe from).  A top-level socketley.subscribe is not exotic — the script's
-# top level is where tick_ms and callback_timeout_ms are declared and where the
-# examples put their configuration — and it runs at load, which is `create`.
+# ─── WHICH NEVER-ARMED RUNTIME IS STILL REACHABLE ───────────────────────────
+#
+# The case this file was written against was a never-started runtime reached by
+# a PUBLISH.  That is gone on purpose: delivery now requires a runtime to be
+# running, so a top-level socketley.subscribe on a runtime nobody started is
+# never called and cannot remove anything.  Deleting the assertion would have
+# been the wrong move — it would leave the guard with no test at all — so the
+# question was whether any reachable path remains.
+#
+# One does, and it never involved delivery.  A script's TOP LEVEL runs inside
+# `create`, before the runtime has started and therefore before it has armed a
+# single io_request; register_bindings() runs before the chunk, so
+# socketley.remove is already bound; and the top level runs inside a
+# lua_deadline::scope, so a Lua frame is live for the whole of it.  A top level
+# that removes its own runtime therefore asks retire() to free the instance
+# whose safe_script_file frame is two levels down.  Measured on this commit's
+# own code with the guard deleted:
+#
+#     [lua selfrm_top] TOP: about to remove myself
+#     Segmentation fault (core dumped)
+#
+# and then — because every CLI command auto-starts a daemon when the socket does
+# not answer — a fresh daemon comes up and restores the state file, so `ls`
+# afterwards shows the runtime as though nothing happened.  That is why survival
+# is asserted on the pid and start time of the daemon that was serving before
+# the create, and never on what `ls` says.
+#
+# Removing your own runtime from your own top level is not something a sensible
+# script does on purpose.  It does not have to be: the guard covers a class —
+# "an instance may not be freed while a script frame is on this thread's stack"
+# — and this is the reachable member of it, which is what a test is for.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -96,24 +121,19 @@ function on_start()
 end
 LUAEOF
 
-NEW_LUA="$SOCKETLEY_TMPD/never_started.lua"
+NEW_LUA="$SOCKETLEY_TMPD/top_level_remove.lua"
 cat > "$NEW_LUA" <<'LUAEOF'
--- At the top level on purpose: this runs when the script is LOADED, which is
--- `create`, so the registration exists on a runtime that has never started and
--- therefore has never armed a single io_request.
-socketley.subscribe("selfrm_cache", "gonew", function(ch, msg)
-    socketley.log("NEW: removing myself")
-    socketley.log("NEW: remove=" .. tostring(socketley.remove("selfrm_new")))
-end)
-socketley.log("NEW: ready")
+-- No callback and no delivery: this IS the top level, and it runs inside
+-- `create`, before this runtime has started or armed anything.  The line after
+-- the remove is what says whether the frame survived it.
+socketley.log("NEW: removing myself")
+local ok = socketley.remove("selfrm_new")
+socketley.log("NEW: survived, remove=" .. tostring(ok))
 LUAEOF
 
 create_ok "cache created"   "$BIN" create cache  selfrm_cache -p "$CACHE_PORT" -s
 create_ok "running created" "$BIN" create server selfrm_run   -p "$RUN_PORT" \
     --lua "$RUN_LUA" --daemon-process -s
-# No -s: this one is created and never started.
-create_ok "created created"  "$BIN" create server selfrm_new  -p "$NEW_PORT" \
-    --lua "$NEW_LUA" --daemon-process
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || echo "  NOTE: the cache never answered PING"
 
 said() {
@@ -137,7 +157,6 @@ survived() {
     daemon_alive "$SOCKETLEY_SOCKET"
 }
 
-said "NEW: ready" 10 || true
 said "RUN: ready" 10 || true
 
 # ── Control: the running case, which the graveyard has always covered ──────
@@ -154,27 +173,42 @@ if survived; then pass; else
          "this is the path retire()'s graveyard covers and it must keep working"
 fi
 
-# ── The one under test: a runtime that never armed io ──────────────────────
+# ── The one under test: a top level that removes its own runtime ───────────
 #
-# Both halves.  "The daemon survived" passes on a build where the publish never
-# reached the handler at all, so the handler is proved to have run and the
-# removal is proved to have taken effect before survival is allowed to count.
-publish gonew
-said "NEW: remove=" 8 || true
+# `create` is what runs it, so the create IS the measurement.  Its status is not
+# checked: the runtime removes itself out from under the command that is
+# building it, and whether that reports success is a separate question from the
+# one this file asks.  What matters is that the daemon is still the same daemon
+# afterwards.
+"$BIN" create server selfrm_new -p "$NEW_PORT" --lua "$NEW_LUA" --daemon-process \
+    >/dev/null 2>&1 || true
+
+# Three assertions, and the first two exist so the third cannot pass on a build
+# where nothing ran.  A script that was never loaded would satisfy "the daemon
+# survived" perfectly.
+said "NEW: removing myself" 8 || true
 if grep -qa "NEW: removing myself" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
-    fail "control: the publish reached the never-started runtime's handler" \
+    fail "control: the script's top level ran and reached the remove" \
          "no 'NEW: removing myself' line" \
-         "nothing below is measuring a self-removal if nothing removed anything"
+         "nothing below is measuring a self-removal if nothing was removed"
+fi
+if grep -qa "NEW: survived, remove=true" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    GOT=$(grep -a "NEW: survived" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+    fail "the frame that asked for the removal runs on past it" \
+         "got: ${GOT:-<no line after the remove>}" \
+         "the line after socketley.remove executes in the lua_context the free" \
+         "would have destroyed; without the guard the daemon dies between the" \
+         "two log lines and this one never appears"
 fi
 
 if survived; then pass; else
-    fail "the daemon survives a never-started runtime removing itself" \
-         "the daemon that was serving before the publish is gone" \
+    fail "the daemon survives a top level removing its own runtime" \
+         "the daemon that was serving before the create is gone" \
          "retire() frees an instance that never armed io on the spot, and the" \
          "C++ stack is a holder its ring test does not cover: the free lands" \
-         "under the live dispatch_publish frame of the very context that asked" \
-         "for it.  Measured on the parent: SIGSEGV, then a fresh daemon" \
-         "auto-started by the next CLI command with the runtime restored."
+         "under the live safe_script_file frame of the very context that asked" \
+         "for it.  Measured with the guard deleted: SIGSEGV, then a fresh" \
+         "daemon auto-started by the next CLI command."
 fi
 
 # The removal has to have happened, not merely not crashed: deferring the free
@@ -183,7 +217,7 @@ fi
 if survived; then
     if "$BIN" ls 2>/dev/null | grep -qa "selfrm_new"; then
         fail "the self-removal took effect" \
-             "'selfrm_new' is still listed after its own handler removed it" \
+             "'selfrm_new' is still listed after its own top level removed it" \
              "the instance leaves the map at remove(); only the free is deferred"
     else pass; fi
 else

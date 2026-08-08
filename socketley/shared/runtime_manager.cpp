@@ -168,12 +168,21 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
     // before it delivers, which protects the other runtimes in its loop and
     // cannot protect the one that is executing.
     //
-    // Measured on the parent commit: a server created and never started, its
-    // subscription made at the script's top level, one PUBLISH — SIGSEGV, and
-    // then a daemon auto-started by the next CLI command with the runtime
-    // restored from the state file, so the operator's evidence was a restart
-    // and a removal that had not happened.  A running runtime was never at risk
-    // and still is not: it has armed io, so it takes the graveyard below.
+    // The reachable case is a script's TOP LEVEL removing its own runtime.  It
+    // runs inside `create`, before the runtime has started and so before it has
+    // armed anything; register_bindings() runs before the chunk, so
+    // socketley.remove is already bound; and the top level runs inside a
+    // lua_deadline::scope, so a frame is live for all of it.  Measured with
+    // this line's guard deleted — the log's last word, then nothing:
+    //
+    //     [lua selfrm_top] TOP: about to remove myself
+    //     Segmentation fault (core dumped)
+    //
+    // It was first found through a never-started runtime reached by a PUBLISH.
+    // That way in is closed now — delivery requires a running runtime — and the
+    // test moved to the top level rather than being deleted with it.  A running
+    // runtime was never at risk and still is not: it has armed io, so it takes
+    // the graveyard below.
     //
     // The deferral costs one health tick.  The instance is out of the map here
     // exactly as before — ps, stats, start and rename cannot see it and its name
@@ -299,11 +308,29 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
 
     // Not from inside a callback.  retire() calls this on its way out, and
     // retire() is reachable from socketley.remove — so on that path this sweep
-    // runs with Lua frames underneath it, and the instance retire() has just
-    // parked is the one those frames belong to.  It owes the ring nothing
-    // (that is why the shortcut above wanted to free it outright), so without
-    // this it would be freed here instead, two lines later and for the same
-    // crash.  The health timer calls this with an empty stack and takes it then.
+    // runs with Lua frames underneath it, and an instance those frames belong
+    // to could be sitting in the graveyard.  The health timer calls this with
+    // an empty stack and takes it then.
+    //
+    // ─── This half has no case anyone has managed to reach ──────────────────
+    //
+    // Said plainly so the next reader does not take it for proved.  The
+    // shortcut in retire() above IS reachable and has a test that dies without
+    // it; this one is the same rule applied two lines later, and the case it
+    // would catch needs an instance that is in the graveyard, owes the ring
+    // nothing, and has a live frame — all at once.  It could not be built:
+    // inflight only falls when event_loop::run() dispatches completions, and it
+    // is not dispatching while a Lua frame is on the stack, so an instance
+    // stopped inside a callback still owes the ring whatever its teardown
+    // submitted.  Two attempts are on record — a subscriber removing itself and
+    // then a second runtime to force the sweep, and the same with a client whose
+    // target refuses — and neither crashed with both guards deleted.
+    //
+    // It stays because it costs one predicated load on a path that runs every
+    // two seconds, and because the rule it enforces is the one the class is
+    // written around rather than the one instance that happens to reach it.
+    // Removing it would mean re-deriving that argument the next time the
+    // ordering changes.
     if (script_frame_live())
         return 0;
 
