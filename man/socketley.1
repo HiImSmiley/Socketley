@@ -2016,6 +2016,24 @@ socketley create proxy slowapp \-\-sidecar \-\-backend 127.0.0.1:3000 \\
 .TP
 .BI "\-\-persistent " "file"
 Persistent storage file. Cache is saved on stop and loaded on start.
+.IP
+Written
+.BR 0600 .
+The dump holds whatever was cached, and because it is
+.I loaded
+on start it is not a record of what the cache held but what the cache will
+hold. Earlier versions wrote it
+.BR 0644 ,
+readable by every account on the machine; a dump left by one of those is
+narrowed when the cache next loads it, with a line in the daemon log.
+.IP
+The mode is all this can control. Replacing a file needs write permission on
+the
+.I directory
+rather than on the file, so put
+.I file
+somewhere only this daemon's user can write \(em not a world\-writable
+directory shared with other accounts.
 .TP
 .BI "\-\-mode " "mode"
 Access control mode:

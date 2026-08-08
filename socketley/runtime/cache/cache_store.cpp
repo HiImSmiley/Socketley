@@ -1,4 +1,5 @@
 #include "cache_store.h"
+#include "../../shared/logging.h"
 #include <fstream>
 #include <cstring>
 #include <random>
@@ -1066,7 +1067,35 @@ bool cache_store::save_v2(std::string_view path) const
     }
 
     // Phase 2: mmap temp file and serialize directly into mapped region
-    int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    //
+    // ─── 0600, AND CREATED THAT WAY ─────────────────────────────────────────
+    //
+    // This was a literal 0644, so a --persistent dump was readable by every
+    // account on the machine.  A cache holds whatever the application put in
+    // it; measured, one SET and a second uid:
+    //
+    //     SET session_token abc-super-secret
+    //     uid nobody: cat c1.rdb | strings  ->  session_token
+    //                                           abc-super-secret
+    //
+    // The same treatment as the runtime state files (state_persistence.cpp),
+    // and for a sharper reason than disclosure alone: cache_instance::start()
+    // calls load() on this path, so the dump is not a report of what the cache
+    // held, it is what the cache will hold.  0644 does not let another user
+    // rewrite the file — but replacing it needs write permission on the
+    // DIRECTORY, not on the file, and the directory is whatever path the
+    // operator passed to --persistent.  Narrowing the file is what this code
+    // can do; where the file lives is the operator's to choose.
+    //
+    // O_EXCL after an unlink, rather than O_TRUNC, for the reason spelled out
+    // in state_persistence.cpp: O_CREAT does not touch the mode of a file that
+    // already exists, and this .tmp name is deterministic, so a leftover from a
+    // killed daemon would hand its old mode to every save after it.  No chmod
+    // afterwards — the content is written before one could run — and no umask,
+    // which is process-wide and would apply to whatever else the daemon
+    // happened to create in the window.
+    unlink(tmp_path.c_str());
+    int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd_raw < 0) return false;
 
     if (ftruncate(fd_raw, static_cast<off_t>(total_size)) < 0)
@@ -1173,6 +1202,27 @@ bool cache_store::load(std::string_view path)
     {
         close(fd_raw);
         return false;
+    }
+
+    // ─── THE DUMPS THAT ARE ALREADY ON DISK ─────────────────────────────────
+    //
+    // Saving at 0600 does nothing for a cache that already has a 0644 dump
+    // beside it, and that dump does not get replaced until the next save —
+    // which for a cache that is running and never stopped is never.  This is
+    // the same repair state_persistence::tighten_existing() makes to the
+    // runtime records, at the same moment: the point where the daemon opens
+    // the file and takes it as its own.
+    //
+    // fchmod on the descriptor already opened, not chmod on the path, so this
+    // cannot be pointed at a different file between the fstat above and the
+    // change.  It only ever narrows, and a dump that is already owner-only is
+    // not touched.
+    if ((st.st_mode & 0077) != 0)
+    {
+        if (fchmod(fd_raw, 0600) == 0)
+            LOG_INFO(("cache: tightened " + std::string(path) +
+                      " to 0600 — a persistence dump holds whatever was cached "
+                      "and was readable by other users on this machine").c_str());
     }
 
     auto file_size = static_cast<size_t>(st.st_size);
