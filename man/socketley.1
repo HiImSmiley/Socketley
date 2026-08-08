@@ -359,6 +359,22 @@ If no message is given, reads from stdin:
 echo "hello" | socketley send myserver
 cat data.txt | socketley send myclient
 .fi
+.PP
+The word
+.B send
+may be left out when something is piped in, so
+.B "echo \(dqhello\(dq | socketley myserver"
+is the same command. This form is only taken when standard input is not a
+terminal, which is also every script, pipeline and CI step \(em so a
+mistyped command reaches it too. When nothing arrives on standard input,
+socketley cannot tell a misspelled command from a runtime that was piped
+zero bytes, and says so, naming both readings and leading with the typo:
+.nf
+$ socketley gibtsnicht < /dev/null
+unknown command: gibtsnicht
+  If gibtsnicht is a runtime you meant to send to, nothing arrived on standard input:
+    echo 'data' | socketley gibtsnicht
+.fi
 .TP
 .BI "stats " "name|pattern" "..."
 Display runtime statistics including total connections, messages processed,

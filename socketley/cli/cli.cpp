@@ -608,9 +608,23 @@ int cli_stdin_send(int /*argc*/, char** argv)
     while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
         message.pop_back();
 
+    // Nothing arrived on stdin, and this is the arm an unrecognised word falls
+    // into whenever stdin is not a terminal — which is every script, pipeline
+    // and CI step there is.  `socketley gibtsnicht` on a keyboard says "unknown
+    // command"; the same typo in a script used to say "empty message", naming
+    // neither the word it did not understand nor the reading it had chosen.
+    //
+    // From here the two cases are genuinely indistinguishable: this process
+    // cannot tell a misspelled command from a real runtime that was piped
+    // nothing, because both are one word with no data behind it.  So it names
+    // both instead of guessing, and leads with the likelier one — a runtime
+    // being sent zero bytes on purpose is rare, and a typo is not.
     if (message.empty())
     {
-        std::cerr << "empty message\n";
+        std::cerr << "unknown command: " << name << "\n"
+                  << "  If " << name << " is a runtime you meant to send to, "
+                     "nothing arrived on standard input:\n"
+                  << "    echo 'data' | socketley " << name << "\n";
         return 1;
     }
 
