@@ -9,7 +9,11 @@
 #include "../cli/command_hashing.h"
 #include "../shared/runtime_definitions.h"
 
-// Allocation-free integer parsing from string_view
+// Integer parsing from string_view, without allocating.
+//
+// parse_double below is the exception and says so where it stands: std::stod
+// takes a std::string, so it builds one.  from_chars for double is not
+// available everywhere this has to compile.
 inline bool parse_uint16(std::string_view sv, uint16_t& out)
 {
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);

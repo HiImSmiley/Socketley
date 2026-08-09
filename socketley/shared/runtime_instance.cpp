@@ -830,7 +830,7 @@ bool runtime_instance::invoke_on_auth(int client_id)
     if (!m_lua || !m_lua->has_on_auth()) return true;  // no hook = allow
 
     // A PROTECTED call.  Written as a try/catch on sol::error — which is what
-    // stood here, and what every other callback in this file still does — the
+    // stood here, and what every callback in this file did at the time — the
     // rejection happened and the message did not: the catch depends on sol2's
     // panic handler throwing and on that throw unwinding out of the
     // interpreter, and in this repository's Sanitize build it does neither.

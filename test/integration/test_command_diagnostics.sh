@@ -126,6 +126,40 @@ OUT=$("$BIN" restart cd_nosuch 2>&1) || RC=$?
 if [ "$RC" -ne 0 ] && grep -q "cd_nosuch" <<<"$OUT"; then pass
 else fail "restart of a missing runtime names it" "exit $RC, said: ${OUT:-<nothing>}"; fi
 
+# ─── edit on a cache: the flag exists, this command does not take it ────────
+#
+# There is no parse_cache_edit_flags, so every cache-specific flag fell through
+# to "unknown flag" — which reads as a typo, and the answer to a typo is to try
+# a different spelling.  No spelling works: `import` is the command that applies
+# these.  The message has to distinguish the two, or it sends the operator in a
+# circle.
+"$BIN" create cache cd_cache -p $((P + 30)) >/dev/null 2>&1 || true
+
+RC=0
+OUT=$("$BIN" edit cd_cache --maxmemory 50M 2>&1) || RC=$?
+if [ "$RC" -ne 0 ]; then pass
+else fail "a cache flag is refused by edit" "exit 0"; fi
+
+if grep -q "import" <<<"$OUT"; then pass
+else fail "the refusal names the command that does take it" \
+          "said: ${OUT:-<nothing>}" \
+          "'unknown flag' reads as a typo; no spelling of it works."; fi
+
+# A real typo still reads as one.  Without this, a build that answered the
+# import message for everything would pass the assertion above.
+RC=0
+OUT=$("$BIN" edit cd_cache --maxmemry 50M 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -q "unknown flag" <<<"$OUT"; then pass
+else fail "a misspelled flag still reads as unknown" "said: ${OUT:-<nothing>}"; fi
+
+# And the same flag on a runtime that has no such setting is unknown, not
+# redirected: --maxmemory means nothing on a server.
+RC=0
+OUT=$("$BIN" edit cd_r1 --maxmemory 50M 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -q "unknown flag" <<<"$OUT"; then pass
+else fail "a cache flag on a server is unknown, not redirected" \
+          "said: ${OUT:-<nothing>}"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"

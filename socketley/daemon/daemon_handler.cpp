@@ -3125,6 +3125,14 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                         static_cast<proxy_instance*>(instance), pa, i);
                     break;
                 case runtime_cache:
+                    // There is no parse_cache_edit_flags, so every
+                    // cache-specific flag falls through to the refusal below.
+                    // That is a decision rather than an omission — `import` is
+                    // the fuller of the two ways to reconfigure a runtime and
+                    // applies all of these — but "unknown flag" was the wrong
+                    // sentence for it: the flag exists, spelling it differently
+                    // will not help, and the operator needs to be sent to the
+                    // command that does take it.
                     result = -1;
                     break;
             }
@@ -3132,6 +3140,24 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
         if (result == -1)
         {
+            static constexpr uint32_t cache_only[] = {
+                fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
+                fnv1a("--replicate"), fnv1a("--resp"),
+            };
+            bool is_cache_flag = false;
+            for (uint32_t h : cache_only)
+                if (pa.hashes[i] == h) { is_cache_flag = true; break; }
+
+            if (is_cache_flag && type == runtime_cache)
+            {
+                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
+                             "  A cache's own settings are applied by `import`:\n"
+                             "    socketley show " << name
+                          << " > cfg.json   # edit the field, then\n"
+                             "    socketley import " << name << " < cfg.json\n";
+                return 1;
+            }
+
             std::cout << "unknown flag: " << pa.args[i] << "\n";
             return 1;
         }
