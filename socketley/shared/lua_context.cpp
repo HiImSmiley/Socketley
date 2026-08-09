@@ -2251,6 +2251,53 @@ static std::string json_decode_string(const char*& p, const char* end)
                             break;
                         }
                         p += 4;
+
+                        // ─── A surrogate is half a character ────────────────
+                        //
+                        // JSON has no way to write a codepoint above the BMP
+                        // except as a surrogate PAIR — \uD83D\uDE00 is one
+                        // emoji, not two characters.  Encoding each half on its
+                        // own produces bytes that are not valid UTF-8, and they
+                        // went straight into a Lua string that a handler then
+                        // wrote to a socket or a file.
+                        //
+                        // The pair is joined here.  A high surrogate with no low
+                        // one behind it, or a lone low surrogate, is not
+                        // repairable and becomes U+FFFD — the replacement
+                        // character exists for exactly this and is what every
+                        // other decoder answers.
+                        if (cp >= 0xD800 && cp <= 0xDBFF)
+                        {
+                            unsigned lo = 0;
+                            bool have_low = false;
+                            if (p + 6 < end && p[1] == '\\' && p[2] == 'u')
+                            {
+                                have_low = true;
+                                for (int i = 0; i < 4; ++i)
+                                {
+                                    const char d = p[3 + i];
+                                    lo <<= 4;
+                                    if (d >= '0' && d <= '9')      lo |= static_cast<unsigned>(d - '0');
+                                    else if (d >= 'a' && d <= 'f') lo |= static_cast<unsigned>(d - 'a' + 10);
+                                    else if (d >= 'A' && d <= 'F') lo |= static_cast<unsigned>(d - 'A' + 10);
+                                    else { have_low = false; break; }
+                                }
+                            }
+                            if (have_low && lo >= 0xDC00 && lo <= 0xDFFF)
+                            {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                p += 6;   // the \uXXXX of the low half
+                            }
+                            else
+                            {
+                                cp = 0xFFFD;
+                            }
+                        }
+                        else if (cp >= 0xDC00 && cp <= 0xDFFF)
+                        {
+                            cp = 0xFFFD;   // a low surrogate with no high one
+                        }
+
                         if (cp < 0x80)
                             result += static_cast<char>(cp);
                         else if (cp < 0x800)
@@ -2258,9 +2305,21 @@ static std::string json_decode_string(const char*& p, const char* end)
                             result += static_cast<char>(0xC0 | (cp >> 6));
                             result += static_cast<char>(0x80 | (cp & 0x3F));
                         }
-                        else
+                        else if (cp < 0x10000)
                         {
                             result += static_cast<char>(0xE0 | (cp >> 12));
+                            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            result += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                        else
+                        {
+                            // Four bytes, reachable only now that a surrogate
+                            // pair is joined above.  Before that this branch
+                            // could not be entered — cp came from four hex
+                            // digits and stopped at 0xFFFF — which is why the
+                            // three-byte form was the whole of it.
+                            result += static_cast<char>(0xF0 | (cp >> 18));
+                            result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
                             result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
                             result += static_cast<char>(0x80 | (cp & 0x3F));
                         }

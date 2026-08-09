@@ -1,4 +1,9 @@
 #include "server_instance.h"
+
+// http_whole_decimal: the checked Content-Length parser the proxy already
+// uses.  Shared rather than copied — a second implementation of "is this a
+// whole decimal" is a second place for the answer to differ.
+#include "../proxy/http_response_framing.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
@@ -2918,8 +2923,37 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                     std::string_view value = line.substr(vs);
                     hreq.headers.emplace_back(name, value);
 
+                    // ─── Checked, and a bad one ends the request ─────────
+                    //
+                    // The result was discarded, so a Content-Length that is not
+                    // a whole decimal left this at 0 and the body was treated
+                    // as empty — with everything after it read as the NEXT
+                    // request on the same keep-alive connection.  The two ways
+                    // in are a value with a non-digit in it, which from_chars
+                    // stops at, and one large enough to overflow, which it
+                    // refuses outright:
+                    //
+                    //     Content-Length: abc                     -> 0
+                    //     Content-Length: 99999999999999999999    -> 0
+                    //
+                    // There is no second framing party here the way there is in
+                    // the proxy, so this is not request smuggling — but the
+                    // boundaries between pipelined requests move, which is the
+                    // same class of defect one runtime along and is what
+                    // http_whole_decimal was written for.  The proxy has used
+                    // it for exactly this since it was added; the server was
+                    // still on the bare call.
                     if (fnv1a_lower(name) == fnv1a("content-length"))
-                        std::from_chars(value.data(), value.data() + value.size(), content_length);
+                    {
+                        if (!http_whole_decimal(value, content_length))
+                        {
+                            // Nothing about the rest of this connection can be
+                            // framed once the length is unreadable, so it goes
+                            // rather than being guessed at.
+                            conn->closing = true;
+                            return;
+                        }
+                    }
                 }
                 line_start = line_end + 2;
             }
