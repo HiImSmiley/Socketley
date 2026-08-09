@@ -31,7 +31,23 @@ public:
     // places a name has to survive.
     static bool valid_name(std::string_view name);
 
-    bool create(runtime_type type, std::string_view name);
+    // Why a create did not happen.
+    //
+    // create() answered a bare bool, and cmd_create reported every false as
+    // "runtime already exists" — measured on a daemon with NO runtimes at all:
+    //
+    //     $ socketley create server 'q"uote' -p 18722
+    //     runtime already exists: q"uote
+    //
+    // which sends the operator looking for a runtime that does not exist while
+    // the actual problem is a character in the name.
+    enum class create_result { ok, invalid_name, name_taken, internal };
+
+    create_result try_create(runtime_type type, std::string_view name);
+
+    // The old spelling, for callers that only need to know whether it worked.
+    bool create(runtime_type type, std::string_view name)
+    { return try_create(type, name) == create_result::ok; }
     bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
     // Takes the runtime out of the map.  The object itself may outlive the call

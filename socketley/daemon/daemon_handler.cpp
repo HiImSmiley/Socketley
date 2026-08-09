@@ -1223,10 +1223,29 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     std::string_view name = pa.args[2];
 
-    if (!m_manager.create(type, name))
+    // The reason, not a guess at it.  This reported "runtime already exists"
+    // for a name that was refused for its characters, on a daemon holding
+    // nothing — see runtime_manager::create_result.
+    switch (m_manager.try_create(type, name))
     {
-        std::cout << "runtime already exists: " << name << "\n";
-        return 1;
+        case runtime_manager::create_result::ok:
+            break;
+
+        case runtime_manager::create_result::name_taken:
+            std::cout << "runtime already exists: " << name << "\n";
+            return 1;
+
+        case runtime_manager::create_result::invalid_name:
+            std::cout << "invalid runtime name: " << name << "\n"
+                         "  A name may contain letters, digits, '-', '_' and "
+                         "'.', may not begin with '.',\n"
+                         "  and may be at most 128 characters.\n";
+            return 1;
+
+        case runtime_manager::create_result::internal:
+            std::cout << "could not build a runtime of type "
+                      << type_to_string(type) << "\n";
+            return 2;
     }
 
     auto* instance = m_manager.get(name);

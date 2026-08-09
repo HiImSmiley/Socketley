@@ -40,26 +40,27 @@ bool runtime_manager::valid_name(std::string_view name)
     return true;
 }
 
-bool runtime_manager::create(runtime_type type, std::string_view name)
+runtime_manager::create_result
+runtime_manager::try_create(runtime_type type, std::string_view name)
 {
     std::unique_lock lock(mutex);
 
     if (!valid_name(name))
-        return false;
+        return create_result::invalid_name;
 
     if (runtimes.find(name) != runtimes.end())
-        return false;
+        return create_result::name_taken;
 
     auto instance = create_runtime(type, name);
     if (!instance)
-        return false;
+        return create_result::internal;
 
     runtimes.emplace(std::string(name), std::move(instance));
     lock.unlock();
 
     // A name that can be routed to exists now, even if it has no port yet.
     publish_endpoints();
-    return true;
+    return create_result::ok;
 }
 
 bool runtime_manager::start(std::string_view name, event_loop& loop)

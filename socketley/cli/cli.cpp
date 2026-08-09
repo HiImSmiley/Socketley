@@ -425,15 +425,52 @@ int cli_dispatch(int argc, char** argv)
                     return cli_interactive(argc, argv);
             return cli_forward(argc, argv);
         }
+        // ─── restart = stop, then start.  Nothing else. ─────────────────────
+        //
+        // The comment here used to say "preserving all flags" and the loop below
+        // forwarded every argument to `start`.  `start` reads one flag, `-i`, and
+        // hands the rest to resolve_names(), which skips anything beginning with
+        // '-' and treats what follows as a RUNTIME NAME.  So a flag's value was
+        // looked up as a runtime — and when it happened to name one, that runtime
+        // was started:
+        //
+        //     $ socketley ls --name --status
+        //     r1      Up 15 seconds
+        //     victim  Stopped
+        //     $ socketley restart r1 --some-flag victim
+        //     $ socketley ls --name --status
+        //     r1      Up 0 seconds
+        //     victim  Up 0 seconds        <- nothing asked for this
+        //
+        // Exit 0 throughout, and the unknown flag accepted in silence.
+        //
+        // Configuration is `edit`'s job, and `import`'s.  A restart that pretended
+        // to take flags could only ever be the half of that which `start` happens
+        // to understand, so it takes the name and -i and refuses the rest by name.
         case fnv1a("restart"):
         {
-            // restart = stop + start (preserving all flags)
             if (argc < 3)
             {
-                std::cerr << "usage: restart <name> [flags]\n";
+                std::cerr << "usage: restart <name> [-i]\n";
                 return 1;
             }
-            // Stop the runtime
+
+            for (int i = 3; i < argc; ++i)
+            {
+                std::string_view arg = argv[i];
+                if (arg == "-i")
+                    continue;
+                std::cerr << "restart does not take " << arg << "\n"
+                          << "  It stops the runtime and starts it again with the "
+                             "configuration it already has.\n"
+                          << "  To change that configuration: socketley edit "
+                          << argv[2] << " " << arg << " ...\n";
+                return 1;
+            }
+
+            // The stop's answer is read now.  It was discarded, so `restart
+            // nosuchruntime` ran a start against a name the stop had already
+            // reported as missing — two refusals, one of them printed.
             std::string stop_cmd = std::string("stop ") + argv[2];
             std::string stop_data;
             int rc = ipc_send(stop_cmd, stop_data);
@@ -442,9 +479,13 @@ int cli_dispatch(int argc, char** argv)
                 std::cerr << "failed to connect to daemon\n";
                 return 2;
             }
-            // Build start command with all original flags
-            std::string start_cmd;
-            start_cmd = "start";
+            if (rc != 0)
+            {
+                if (!stop_data.empty()) std::cerr << stop_data;
+                return rc;
+            }
+
+            std::string start_cmd = "start";
             for (int i = 2; i < argc; ++i)
             {
                 start_cmd += ' ';
