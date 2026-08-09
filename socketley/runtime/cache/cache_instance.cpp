@@ -2283,6 +2283,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 rb.append(val);
                 rb.push_back('\n');
+                replicate_command(line);   // was not replicated at all
             }
             else
                 rb.append("nil\n", 4);
@@ -2301,6 +2302,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 rb.append(val);
                 rb.push_back('\n');
+                replicate_command(line);   // was not replicated at all
             }
             else
                 rb.append("nil\n", 4);
@@ -2424,7 +2426,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 return;
             }
             if (m_has_ttl_keys) m_store.check_expiry(key);
-            rb.append(m_store.srem(key, member) ? "ok\n" : "nil\n");
+            if (m_store.srem(key, member))
+            {
+                rb.append("ok\n", 3);
+                replicate_command(line);   // was not replicated at all
+            }
+            else
+                rb.append("nil\n", 4);
             break;
         }
         case fnv1a("sismember"):
@@ -2537,7 +2545,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 return;
             }
             if (m_has_ttl_keys) m_store.check_expiry(key);
-            rb.append(m_store.hdel(key, field) ? "ok\n" : "nil\n");
+            if (m_store.hdel(key, field))
+            {
+                rb.append("ok\n", 3);
+                replicate_command(line);   // was not replicated at all
+            }
+            else
+                rb.append("nil\n", 4);
             break;
         }
         case fnv1a("hlen"):
@@ -2591,6 +2605,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 mark_ttl_keys();
                 rb.append("ok\n", 3);
+                replicate_command(line);   // was not replicated at all
             }
             else
                 rb.append("nil\n", 4);
@@ -2610,7 +2625,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
-            rb.append(m_store.persist(args) ? "ok\n" : "nil\n");
+            if (m_store.persist(args))
+            {
+                rb.append("ok\n", 3);
+                replicate_command(line);   // was not replicated at all
+            }
+            else
+                rb.append("nil\n", 4);
             break;
         }
         case fnv1a("setnx"):
@@ -2720,6 +2741,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             {
                 mark_ttl_keys();
                 rb.append("1\n", 2);
+                replicate_command(line);   // was not replicated at all
             }
             else
                 rb.append("0\n", 2);
@@ -2745,9 +2767,22 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
-                if (remaining <= 0) { m_store.del(key); rb.append("1\n", 2); }
+                // Replicated verbatim, which is the right form for this one:
+                // the argument is an ABSOLUTE timestamp, so the follower
+                // arrives at the same expiry however long the line took to get
+                // there.  A relative `expire` would drift by the wire delay.
+                if (remaining <= 0)
+                {
+                    m_store.del(key);
+                    rb.append("1\n", 2);
+                    replicate_command(line);   // was not replicated at all
+                }
                 else if (m_store.set_expiry(key, remaining))
-                { mark_ttl_keys(); rb.append("1\n", 2); }
+                {
+                    mark_ttl_keys();
+                    rb.append("1\n", 2);
+                    replicate_command(line);   // was not replicated at all
+                }
                 else rb.append("0\n", 2);
             }
             break;
@@ -3454,6 +3489,50 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
         replicate_command(cmd);
     };
 
+    // ─── SET IS THE ONE COMMAND repl() CANNOT FLATTEN ───────────────────────
+    //
+    // repl() joins the arguments with spaces and the follower reads the result
+    // with the TEXT interpreter, which takes everything after the key as the
+    // value.  That is correct for every command whose arguments end with the
+    // value — including a value containing spaces — and wrong for the one whose
+    // options come AFTER it.  Measured, leader and follower side by side:
+    //
+    //     RESP  SET rk rv EX 100
+    //     leader    get rk -> 'rv'          ttl 96
+    //     follower  get rk -> 'rv EX 100'   ttl -1
+    //
+    // Not a stale value: a different one, on a key the leader holds correctly,
+    // with the expiry lost as well.  Neither side can tell.
+    //
+    // What is replicated is therefore the EFFECT rather than the command.  The
+    // leader has already decided what NX and XX mean — the follower must not
+    // re-evaluate them against its own copy — and `set` plus `pexpire` are two
+    // commands the text interpreter expresses exactly.  pexpire rather than
+    // expire because it is the finer unit and covers both spellings.
+    auto repl_set_effect = [&](std::string_view key, std::string_view val,
+                               int ex_sec, int64_t px_ms) {
+        if (m_repl_role != repl_leader || m_followers.empty()) return;
+
+        std::string cmd;
+        cmd.reserve(5 + key.size() + val.size());
+        cmd += "set ";
+        cmd.append(key.data(), key.size());
+        cmd += ' ';
+        cmd.append(val.data(), val.size());
+        replicate_command(cmd);
+
+        const int64_t ms = px_ms > 0 ? px_ms
+                         : (ex_sec > 0 ? static_cast<int64_t>(ex_sec) * 1000 : 0);
+        if (ms > 0)
+        {
+            std::string ttl_cmd = "pexpire ";
+            ttl_cmd.append(key.data(), key.size());
+            ttl_cmd += ' ';
+            ttl_cmd += std::to_string(ms);
+            replicate_command(ttl_cmd);
+        }
+    };
+
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
@@ -3539,7 +3618,7 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
             if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); mark_ttl_keys(); }
             else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); mark_ttl_keys(); }
             resp::encode_ok_into(rb);
-            repl(args, argc);
+            repl_set_effect(args[1], args[2], ex_sec, px_ms);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
@@ -4886,68 +4965,41 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
         if (!line.empty())
         {
-            // Temporarily allow writes for replication
+            // ─── THE SAME INTERPRETER THE LEADER RAN ────────────────────
+            //
+            // This used to be a hand-picked switch over six commands — set,
+            // del, lpush, rpush, sadd, hset — with everything else falling into
+            // `default: break`.  The leader replicates EVERY mutating command
+            // verbatim, so an incr, a decr, an incrby, an append, a getset, a
+            // setnx, an lpop, an srem, an hdel, an mset, an expire or a persist
+            // reached the follower and was dropped on the floor.  Both sides
+            // then believed they were in sync and neither could tell.  Measured
+            // on the parent commit, one assertion per command family:
+            //
+            //     incr    follower 5,  leader 6
+            //     append  follower "hello", leader "helloworld"
+            //     lpop    follower llen 1, leader llen 0
+            //     expire  follower ttl -1, leader ttl 100
+            //     ... ten more of the same shape.
+            //
+            // The comment that stood here — "Actually, we can just call the
+            // store methods directly" — is the shortcut that caused it, and it
+            // could never have been complete: the set of mutating commands is
+            // whatever the interpreter supports, and this was a copy of it that
+            // stopped being true the moment one was added.
+            //
+            // serve_request() is that interpreter.  A follower cannot loop back
+            // through it, because replicate_command() returns at once for any
+            // role that is not leader.
+            //
+            // The response is built and dropped: nothing is listening on a
+            // replication link, and it costs a string per command that the text
+            // path was already building for its own clients.
             cache_mode saved = m_mode;
             m_mode = cache_mode_readwrite;
 
-            // Create a temporary dummy connection for process_command
-            // Actually, we can just call the store methods directly
-            size_t sp = line.find(' ');
-            std::string_view cmd = (sp != std::string_view::npos) ? line.substr(0, sp) : line;
-            std::string_view args = (sp != std::string_view::npos) ? line.substr(sp + 1) : std::string_view{};
-
-            // Simple replication: just apply SET/DEL commands
-            auto extract_key = [](std::string_view a) -> std::pair<std::string_view, std::string_view> {
-                size_t s = a.find(' ');
-                if (s == std::string_view::npos) return {a, {}};
-                return {a.substr(0, s), a.substr(s + 1)};
-            };
-
-            switch (fnv1a_lower(cmd))
-            {
-                case fnv1a("set"):
-                {
-                    auto [key, val] = extract_key(args);
-                    if (!key.empty() && !val.empty())
-                        m_store.set(key, val);
-                    break;
-                }
-                case fnv1a("del"):
-                    if (!args.empty())
-                        m_store.del(args);
-                    break;
-                case fnv1a("lpush"):
-                {
-                    auto [key, val] = extract_key(args);
-                    if (!key.empty() && !val.empty())
-                        m_store.lpush(key, val);
-                    break;
-                }
-                case fnv1a("rpush"):
-                {
-                    auto [key, val] = extract_key(args);
-                    if (!key.empty() && !val.empty())
-                        m_store.rpush(key, val);
-                    break;
-                }
-                case fnv1a("sadd"):
-                {
-                    auto [key, member] = extract_key(args);
-                    if (!key.empty() && !member.empty())
-                        m_store.sadd(key, member);
-                    break;
-                }
-                case fnv1a("hset"):
-                {
-                    auto [key, rest] = extract_key(args);
-                    auto [field, val] = extract_key(rest);
-                    if (!key.empty() && !field.empty() && !val.empty())
-                        m_store.hset(key, field, val);
-                    break;
-                }
-                default:
-                    break;
-            }
+            std::string discard;
+            serve_request(line, discard);
 
             m_mode = saved;
         }

@@ -88,6 +88,101 @@ send_to "$LEADER_PORT" 'set livekey livevalue' >/dev/null
 sleep 1
 assert_eq "$(send_to "$FOLLOWER_PORT" 'get livekey')" "livevalue" "live write replicated"
 
+# ─── EVERY MUTATING COMMAND, NOT SIX OF THEM ─────────────────────────────────
+#
+# The leader replicates every mutating command verbatim.  The follower applied
+# six — set, del, lpush, rpush, sadd, hset — and let the rest fall into
+# `default: break`.  So an INCR, an EXPIRE, an LPOP, an SREM or an HDEL on the
+# leader never reached the follower at all: it kept the old value, both sides
+# believed they were in sync, and nothing on either end could tell.
+#
+# `set` with options was worse than missing.  The leader replicates
+# `SET key value EX 10` as the line `set key value ex 10`; the follower split it
+# on the first space and stored the VALUE as "value ex 10".  Not a stale value —
+# a different one, on a key the leader holds correctly.
+#
+# One assertion per command family, each one a command the six-case switch had
+# no arm for.  The pattern is the same throughout: establish a value on both
+# sides, mutate on the leader, read the follower.
+seed_and_check() {   # label, seed-command, mutate-command, read-command, expected
+    local label=$1 seed=$2 mutate=$3 read=$4 expected=$5
+    [ -n "$seed" ] && { send_to "$LEADER_PORT" "$seed" >/dev/null; sleep 0.3; }
+    send_to "$LEADER_PORT" "$mutate" >/dev/null
+    sleep 0.6
+    assert_eq "$(send_to "$FOLLOWER_PORT" "$read")" "$expected" "$label"
+}
+
+seed_and_check "incr replicates"        'set ctr 5'          'incr ctr'            'get ctr'        '6'
+seed_and_check "decr replicates"        'set ctr2 5'         'decr ctr2'           'get ctr2'       '4'
+seed_and_check "incrby replicates"      'set ctr3 5'         'incrby ctr3 10'      'get ctr3'       '15'
+seed_and_check "append replicates"      'set app hello'      'append app world'    'get app'        'helloworld'
+seed_and_check "getset replicates"      'set gs old'         'getset gs new'       'get gs'         'new'
+seed_and_check "setnx replicates"       ''                   'setnx nx firstvalue' 'get nx'         'firstvalue'
+seed_and_check "lpop replicates"        'rpush mylist a'     'lpop mylist'         'llen mylist'    '0'
+seed_and_check "srem replicates"        'sadd myset m1'      'srem myset m1'       'scard myset'    '0'
+seed_and_check "hdel replicates"        'hset myhash f v'    'hdel myhash f'       'hlen myhash'    '0'
+seed_and_check "mset replicates"        ''                   'mset ma 1 mb 2'      'get mb'         '2'
+
+# TTL commands: the follower has to learn that a key expires, not just what it
+# holds.  A key the leader has expired but the follower has not is the same
+# divergence one command later.
+send_to "$LEADER_PORT" 'set ttlkey ttlvalue' >/dev/null; sleep 0.3
+send_to "$LEADER_PORT" 'expire ttlkey 100'   >/dev/null; sleep 0.6
+TTL_ON_FOLLOWER=$(send_to "$FOLLOWER_PORT" 'ttl ttlkey')
+TOTAL=$((TOTAL+1))
+if [ "$TTL_ON_FOLLOWER" -gt 0 ] 2>/dev/null; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [expire replicates]: follower reports ttl '$TTL_ON_FOLLOWER', expected a positive number"
+fi
+
+# persist is the other half — the follower must also learn that a TTL is gone.
+send_to "$LEADER_PORT" 'persist ttlkey' >/dev/null; sleep 0.6
+assert_eq "$(send_to "$FOLLOWER_PORT" 'ttl ttlkey')" "-1" "persist replicates"
+
+# ─── SET WITH OPTIONS: the value itself was wrong ────────────────────────────
+#
+# Not a missing update — a different value on the same key.
+#
+# It has to be sent in RESP, and that is the whole point.  The TEXT protocol has
+# no SET options at all: `set k v ex 100` stores the literal string "v ex 100"
+# on the LEADER too, so a follower holding the same string is agreeing with it
+# and there is nothing to find.  Written against the text protocol this
+# assertion failed for a reason that had nothing to do with replication, which
+# is how it was caught.
+#
+# In RESP the leader applies the options properly — value "rv", a TTL — and then
+# replicates by joining the arguments with spaces into a text line.  The
+# follower reads that line with the text interpreter, which has no options, and
+# stores the option words as part of the value.
+resp_set_ex() {   # port key value seconds
+    printf '*5\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%s\r\n' \
+        "${#2}" "$2" "${#3}" "$3" "${#4}" "$4" \
+        | nc -q 1 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+resp_set_ex "$LEADER_PORT" optkey optvalue 100
+sleep 0.8
+
+# First that the leader did the right thing, or the comparison below is about
+# nothing.
+assert_eq "$(send_to "$LEADER_PORT" 'get optkey')" "optvalue" \
+          "RESP SET with EX stores the bare value on the leader"
+LEADER_TTL=$(send_to "$LEADER_PORT" 'ttl optkey')
+TOTAL=$((TOTAL+1))
+if [ "${LEADER_TTL:-0}" -gt 0 ] 2>/dev/null; then PASS=$((PASS+1))
+else FAIL=$((FAIL+1)); echo "  FAIL [RESP SET with EX sets a TTL on the leader]: ttl '$LEADER_TTL'"; fi
+
+# And now the follower, which used to answer 'optvalue EX 100'.
+assert_eq "$(send_to "$FOLLOWER_PORT" 'get optkey')" "optvalue" \
+          "the follower stores the value, not the option words"
+
+FOLLOWER_TTL=$(send_to "$FOLLOWER_PORT" 'ttl optkey')
+TOTAL=$((TOTAL+1))
+if [ "${FOLLOWER_TTL:-0}" -gt 0 ] 2>/dev/null; then PASS=$((PASS+1))
+else FAIL=$((FAIL+1)); echo "  FAIL [the TTL reaches the follower]: ttl '$FOLLOWER_TTL', expected a positive number"; fi
+
 # ─── A cache nobody asked to replicate is not a follower ─────────────────────
 #
 # Every `import` and every `edit` applies the whole document, and a cache that
