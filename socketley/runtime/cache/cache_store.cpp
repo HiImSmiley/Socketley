@@ -1003,17 +1003,28 @@ void cache_store::dump_commands(std::string& buf) const
         }
     }
 
-    // TTLs (emit as expire commands)
+    // ─── TTLs, in milliseconds ──────────────────────────────────────────────
+    //
+    // These were emitted as `expire key <seconds>`, truncated by the cast: a
+    // key with 500 ms left became `expire key 0`, which the `> 0` test then
+    // dropped entirely — so it came back from the dump with NO expiry at all
+    // and lived forever.  Every key under a second was immortalised by being
+    // written down.
+    //
+    // pexpire is the same command one unit finer, and the receiving side has
+    // had it as long as expire has.  The `> 0` test stays: a key whose deadline
+    // has already passed is expiring, not being given a new lease, and the
+    // sweep will take it.
     auto now = std::chrono::steady_clock::now();
     for (const auto& [key, tp] : m_expiry)
     {
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(tp - now).count();
-        if (secs > 0)
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
+        if (ms > 0)
         {
-            buf.append("expire ");
+            buf.append("pexpire ");
             buf.append(key);
             buf.push_back(' ');
-            buf.append(std::to_string(secs));
+            buf.append(std::to_string(ms));
             buf.push_back('\n');
         }
     }

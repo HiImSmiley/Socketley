@@ -3603,7 +3603,15 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
                         break;
                     case fnv1a("nx"): nx = true; break;
                     case fnv1a("xx"): xx = true; break;
-                    default: break;
+                    default:
+                        // Refused rather than ignored.  `SET k v FOO` matched no
+                        // case, fell through here and the SET reported success —
+                        // so a mistyped option silently became a plain SET, and
+                        // a caller that wrote EXX instead of EX got a key with
+                        // no expiry and an "+OK".  Redis answers a syntax error;
+                        // so does this now.
+                        resp::encode_error_into(rb, "syntax error");
+                        return;
                 }
             }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);

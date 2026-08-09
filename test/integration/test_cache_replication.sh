@@ -220,6 +220,67 @@ assert_eq "$(repl_role_of replplain)" "0" "an edit that says nothing about repli
 # leader again.
 assert_eq "$(send_to "$PLAIN_PORT" 'replicate')" "ok" "an edited plain cache still accepts REPLICATE"
 
+# ─── THE FULL SYNC CARRIES MILLISECONDS ──────────────────────────────────────
+#
+# dump_commands() emitted `expire key <seconds>`, cast from the remaining
+# duration.  A key with 500 ms left became `expire key 0`, which the `> 0` test
+# then dropped — so it came back from the dump with NO expiry and lived forever.
+# Every key under a second was immortalised by being written down, and anything
+# above one lost its fractional part.
+#
+# Asserted on the emitted text rather than on the follower's TTL, deliberately:
+# a follower applies the dump a moment after it was built, so its remaining time
+# is lower either way and a comparison cannot tell truncation from transmission
+# delay.  The wire is where the answer is.
+send_to "$LEADER_PORT" 'set dumpkey dumpvalue' >/dev/null
+send_to "$LEADER_PORT" 'pexpire dumpkey 30500' >/dev/null
+sleep 0.3
+# `|| true` is load-bearing, not decoration.  timeout kills nc at 3 s because a
+# replication link never closes, so the pipeline exits 124 — and under
+# `set -euo pipefail` a lone VAR=$(...) takes the file's exit status from it.
+# Without the guard this file ends here, silently: no assertions, no Results
+# line, exit 0.  lib_daemon.sh has the long version of this note.
+DUMP=$(printf 'replicate\n' | timeout 3 nc 127.0.0.1 "$LEADER_PORT" 2>/dev/null | tr -d '\r' || true)
+
+TOTAL=$((TOTAL+1))
+if grep -qE '^pexpire dumpkey [0-9]+$' <<<"$DUMP"; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the full sync emits a millisecond TTL]"
+    echo "        TTL lines in the dump: $(grep -E '^(p?expire) dumpkey' <<<"$DUMP" | tr '\n' ' ')"
+fi
+
+# And the seconds form is gone, or both could be present and the assertion above
+# would pass on a dump that still truncates.
+TOTAL=$((TOTAL+1))
+if grep -qE '^expire dumpkey ' <<<"$DUMP"; then
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the seconds form is no longer emitted]: $(grep -E '^expire dumpkey ' <<<"$DUMP")"
+else PASS=$((PASS+1)); fi
+
+# The remainder really survived: 30500 ms cannot be a whole number of seconds.
+DUMP_MS=$(grep -oE '^pexpire dumpkey [0-9]+$' <<<"$DUMP" | awk '{print $3}' || true)
+TOTAL=$((TOTAL+1))
+if [ -n "$DUMP_MS" ] && [ $((DUMP_MS % 1000)) -ne 0 ]; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the sub-second remainder survived]: got '${DUMP_MS:-<none>}' ms"
+fi
+
+# ─── RESP SET refuses an option it does not know ─────────────────────────────
+#
+# `SET k v FOO` matched no case, fell through `default: break` and reported
+# success — so a mistyped option silently became a plain SET.  A caller that
+# wrote EXX instead of EX got a key with no expiry and an "+OK".
+RESP_ERR=$(printf '*4\r\n$3\r\nSET\r\n$6\r\noptbad\r\n$2\r\nvv\r\n$3\r\nFOO\r\n' \
+    | timeout 3 nc -q 1 127.0.0.1 "$LEADER_PORT" 2>/dev/null | tr -d '\r' || true)
+TOTAL=$((TOTAL+1))
+if grep -qi "err" <<<"$RESP_ERR"; then PASS=$((PASS+1))
+else FAIL=$((FAIL+1)); echo "  FAIL [an unknown SET option is refused]: got '$RESP_ERR'"; fi
+
+assert_eq "$(send_to "$LEADER_PORT" 'get optbad')" "nil" \
+          "the refused SET stored nothing"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
