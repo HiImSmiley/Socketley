@@ -569,6 +569,10 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // left to say, and dropping it here is what keeps that map the size of the
     // group rather than the size of its history.
     drop_departed_endpoints();
+
+    // And the addresses for whatever the new snapshot added.  After the pruning
+    // above, so a member that just left is not looked up on its way out.
+    resolve_group_hosts();
 }
 
 // The declarations of the backends this proxy forwards to, folded into one
@@ -617,6 +621,100 @@ void proxy_instance::rebuild_route_view()
             m_routes.merge_alternative(*rt);
         }
     }
+}
+
+// ─── The group's half of "the request path does not resolve" ────────────────
+//
+// connect_to_backend stopped calling getaddrinfo, and for a configured backend
+// that is complete: setup() resolves it when the address is configured, and the
+// idle sweep retries it if that failed.  A GROUP member has neither.  Its
+// address arrives in the membership snapshot, it is written into a per-request
+// scratch backend, and the sweep — which walks m_backends — never sees it.  So
+// deferring its resolution to the sweep did not defer it; it removed it, and an
+// @group backend whose members advertise names stopped routing entirely.
+//
+// That is not hypothetical: a cluster member advertises gethostname(2), so
+// every @group backend across a real cluster is exactly this case.  Measured,
+// the payload through an @api gateway went from arriving to 0 bytes.
+//
+// Resolution belongs where the address arrives.  For a configured backend that
+// is setup(); for a group member it is here, on the membership change, which is
+// a control action and not traffic.  The property the change was made for is
+// intact — no request waits on a resolver — and the exposure that remains is a
+// membership change blocking for a lookup, which happens when a runtime starts,
+// stops or is renamed, rather than on every request through the proxy.
+void proxy_instance::resolve_group_hosts()
+{
+    if (!m_endpoints || m_backends.empty())
+    {
+        m_group_addr.clear();
+        m_group_unresolved = false;
+        return;
+    }
+
+    std::unordered_map<std::string, in_addr> kept;
+    bool unresolved = false;
+
+    for (const auto& b : m_backends)
+    {
+        if (!b.is_group)
+            continue;
+
+        const std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+        const auto* members = m_endpoints->find_group(group_name);
+        if (!members)
+            continue;
+
+        for (const auto& ep : *members)
+        {
+            // A literal address needs nothing: the selection path reads it with
+            // inet_pton and never asks this map.
+            in_addr literal{};
+            if (inet_pton(AF_INET, ep.host.c_str(), &literal) == 1)
+                continue;
+
+            if (kept.find(ep.host) != kept.end())
+                continue;
+
+            // Carried over rather than looked up again.  A membership change is
+            // a member joining or leaving, not every other member's address
+            // changing, so re-resolving the whole group on each one would make
+            // the cost of a change proportional to the size of the cluster.
+            if (const auto prev = m_group_addr.find(ep.host); prev != m_group_addr.end())
+            {
+                kept.emplace(ep.host, prev->second);
+                continue;
+            }
+
+            struct addrinfo hints{};
+            hints.ai_family   = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            struct addrinfo* res = nullptr;
+            if (getaddrinfo(ep.host.c_str(), nullptr, &hints, &res) == 0 && res)
+            {
+                if (res->ai_family == AF_INET &&
+                    res->ai_addrlen == sizeof(struct sockaddr_in))
+                {
+                    const auto* sin = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
+                    kept.emplace(ep.host, sin->sin_addr);
+                }
+                freeaddrinfo(res);
+            }
+
+            if (kept.find(ep.host) == kept.end())
+                unresolved = true;
+        }
+    }
+
+    m_group_addr.swap(kept);
+    m_group_unresolved = unresolved;
+
+    // A name that did not resolve is work for the sweep, the same way an
+    // unresolved configured backend is: without arming it, a member whose DNS
+    // was down when it joined would never be looked up again.
+    if (m_group_unresolved)
+        arm_idle_sweep();
 }
 
 // Called only when the membership snapshot changes, which is per control
@@ -1680,6 +1778,15 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 
                     if (!b.has_cached_addr)
                         unresolved_left = true;
+                }
+
+                // The group members too, for the same reason and on the same
+                // tick.  resolve_group_hosts() carries over what it already
+                // has, so this retries only the names that failed.
+                if (m_group_unresolved)
+                {
+                    resolve_group_hosts();
+                    unresolved_left = unresolved_left || m_group_unresolved;
                 }
 
                 // Keep the chain going only while it still has work.  An armed
@@ -5130,6 +5237,25 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         m_scratch_backend.cached_addr.sin_family = AF_INET;
         m_scratch_backend.cached_addr.sin_port = htons(m_scratch_backend.resolved_port);
         m_scratch_backend.has_cached_addr = true;
+    }
+    else if (const auto it = m_group_addr.find(m_scratch_backend.resolved_host);
+             it != m_group_addr.end())
+    {
+        // A name, resolved when the membership arrived.  The port is the
+        // member's rather than the entry's: one host can appear in several
+        // groups and on several ports, and the map is keyed by host alone.
+        m_scratch_backend.cached_addr.sin_family = AF_INET;
+        m_scratch_backend.cached_addr.sin_addr   = it->second;
+        m_scratch_backend.cached_addr.sin_port   = htons(m_scratch_backend.resolved_port);
+        m_scratch_backend.has_cached_addr = true;
+    }
+    else
+    {
+        // A member advertising a name that has not resolved yet.  Refusing this
+        // one request is the whole of the cost, and the sweep is what makes it
+        // temporary — resolving here is the thing that froze the daemon.
+        m_group_unresolved = true;
+        arm_idle_sweep();
     }
     return &m_scratch_backend;
 }

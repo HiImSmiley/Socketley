@@ -830,6 +830,18 @@ private:
     // only thing that can make a pooled socket unreachable while it is still
     // healthy, so this runs where membership arrives and nowhere else.
     void drop_departed_endpoints();
+    // Resolve the group members whose advertised address is a NAME.
+    //
+    // A cluster member advertises gethostname(2), so an @group backend routes to
+    // hostnames, and the address a request needs is not in m_backends at all —
+    // it is built per request from the membership snapshot.  The idle sweep
+    // walks m_backends and therefore never sees one.
+    //
+    // This is the group's equivalent of what setup() does for a configured
+    // backend: resolve where the address ARRIVES, which for a group member is
+    // the membership snapshot, not the request.  Runs from set_endpoints() and
+    // as a retry from the idle sweep; never from the request path.
+    void resolve_group_hosts();
 
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
@@ -1197,6 +1209,16 @@ private:
     };
     std::unordered_map<std::string, circuit_breaker, endpoint_key_hash,
                        std::equal_to<>> m_group_breakers;
+
+    // Addresses for group members advertised by name.  Keyed by the host as the
+    // snapshot spells it; the port is the member's and is applied at selection,
+    // so one entry serves a host that appears in several groups or on several
+    // ports.  Kept to the size of the membership rather than of its history —
+    // pruned in resolve_group_hosts(), the same discipline as m_group_breakers.
+    std::unordered_map<std::string, in_addr> m_group_addr;
+    // Some member did not resolve, so the idle sweep has a reason to run and to
+    // keep running.  Set by resolve_group_hosts(), cleared by it too.
+    bool m_group_unresolved = false;
     std::unique_ptr<timer_op> m_health_check_timer;
 
     // Async health checks.  One probe object per backend per sweep, held by
