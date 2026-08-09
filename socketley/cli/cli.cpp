@@ -4,6 +4,7 @@
 #include <string_view>
 #include <string>
 #include <sstream>
+#include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -898,20 +899,38 @@ int cli_edit(int argc, char** argv)
     }
 
     // 2. Write to tmpfile
-    char tmpl[] = "/tmp/socketley-edit-XXXXXX";
-    int tmpfd = mkstemp(tmpl);
+    //
+    // TMPDIR, then /tmp.  The file holds the runtime's whole configuration —
+    // which for a cache with a master password holds that too — so where it
+    // lands is the operator's decision to make, and an operator who points
+    // TMPDIR at a private directory is making exactly this one.  Hard-coding
+    // /tmp ignored them.  mkstemp opens it 0600 either way; a private TMPDIR
+    // additionally keeps the NAME out of a world-readable directory listing.
+    const char* tmpdir = std::getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+
+    std::string tmpl_s = std::string(tmpdir);
+    if (tmpl_s.back() != '/')
+        tmpl_s += '/';
+    tmpl_s += "socketley-edit-XXXXXX";
+
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+
+    int tmpfd = mkstemp(tmpl.data());
     if (tmpfd < 0)
     {
-        std::cerr << "failed to create temporary file\n";
+        std::cerr << "failed to create temporary file in " << tmpdir << "\n";
         return 2;
     }
 
-    std::string tmp_file = std::string(tmpl) + ".json";
+    std::string tmp_file = std::string(tmpl.data()) + ".json";
     close(tmpfd);
-    if (rename(tmpl, tmp_file.c_str()) < 0)
+    if (rename(tmpl.data(), tmp_file.c_str()) < 0)
     {
         std::cerr << "failed to rename temporary file\n";
-        unlink(tmpl);
+        unlink(tmpl.data());
         return 2;
     }
 

@@ -224,5 +224,47 @@ case "$CACHE_ONLY" in
            "if a cache edit parser was added, delete this assertion" ;;
 esac
 
+# ─── The interactive editor gets its file where TMPDIR says ─────────────────
+#
+# `edit <name>` with no flags dumps the runtime's whole configuration to a
+# temporary file and opens $EDITOR on it.  The path was the literal string
+# "/tmp/socketley-edit-XXXXXX", so an operator who points TMPDIR at a private
+# directory was ignored — and for a cache that file holds master_pw.
+#
+# Asserted by making $EDITOR record the path it is handed, which is the only
+# way to see the decision from outside: mkstemp opens the file 0600 wherever it
+# is, so permissions cannot tell the two apart, and the file is unlinked before
+# the command returns.
+PRIV="$SOCKETLEY_TMPD/priv"
+mkdir -p "$PRIV"
+SPY="$SOCKETLEY_TMPD/spy.sh"
+cat > "$SPY" <<'SPYEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$SPY_OUT"
+exit 0
+SPYEOF
+chmod +x "$SPY"
+: > "$SOCKETLEY_TMPD/spy.out"
+
+SPY_OUT="$SOCKETLEY_TMPD/spy.out" TMPDIR="$PRIV" EDITOR="$SPY" VISUAL="" \
+    timeout 10 "$BIN" edit efs_server >/dev/null 2>&1 || true
+SEEN=$(head -1 "$SOCKETLEY_TMPD/spy.out" 2>/dev/null || true)
+
+case "$SEEN" in
+    "$PRIV"/socketley-edit-*) ok ;;
+    "") bad "the editor was invoked at all" \
+            "nothing recorded a path — the assertion would be vacuous" ;;
+    /tmp/*) bad "edit honours TMPDIR" \
+                "the editor was handed '$SEEN' while TMPDIR was '$PRIV'" \
+                "that file holds the runtime's whole configuration." ;;
+    *) bad "edit honours TMPDIR" "the editor was handed '$SEEN'" ;;
+esac
+
+# And nothing is left behind holding it.
+LEFT=$(find "$PRIV" -name 'socketley-edit-*' 2>/dev/null | wc -l)
+if [ "$LEFT" -eq 0 ]; then ok
+else bad "the temporary file is removed" \
+         "$LEFT socketley-edit-* file(s) still in $PRIV with the config in them"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1
