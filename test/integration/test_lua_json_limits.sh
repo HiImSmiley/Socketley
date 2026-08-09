@@ -232,6 +232,183 @@ else fail "a document within the limit still decodes" \
           "64 levels of nesting was refused, so the limit is too tight" \
           "or the refusal fires regardless of depth."; fi
 
+# ─── Malformed input is refused rather than half-decoded ────────────────────
+#
+# The decoder reported nothing but the depth limit.  Everything else came back
+# as whatever it had understood by the time it gave up, so a script could not
+# tell a complete document from a fragment:
+#
+#     [1,2       -> a two-element table, indistinguishable from [1,2]
+#     {"a":}     -> an empty table, the field silently gone
+#     "x         -> the string x
+#     nul        -> nil, which is also the answer for a real null
+#     {a:1}      -> a table with an "" field
+#
+# `[1,2` is the case worth naming: that is a request body cut off by a dropped
+# connection, and the handler proceeded on it believing it was whole.
+#
+# Each is checked for a REFUSAL, not merely for "not equal to the whole
+# document" — a build that returned nil for all of them would pass the weaker
+# form while being just as unable to say what went wrong.
+cat > "$SCRIPTS/malformed.lua" <<'LUA'
+function on_start()
+  local cases = { "[1,2", '{"a":}', '"x', "nul", "{a:1}", "", "-", "{" }
+  local refused, accepted = 0, {}
+  for _, doc in ipairs(cases) do
+    local v, why = socketley.json_decode(doc)
+    if v == false and why then refused = refused + 1
+    else accepted[#accepted + 1] = doc end
+  end
+  socketley.log("MALFORMED_REFUSED " .. refused .. "/" .. #cases)
+  if #accepted > 0 then
+    socketley.log("MALFORMED_ACCEPTED " .. table.concat(accepted, " | "))
+  end
+  -- The control: a real null must still decode, and must NOT be reported as
+  -- an error.  It is the one document whose value is nil, and the refusal
+  -- contract exists precisely so the two are different answers.
+  local v, why = socketley.json_decode("null")
+  if v == false then socketley.log("NULL_REFUSED " .. tostring(why))
+  else socketley.log("NULL_OK") end
+end
+LUA
+run_script jsonmal $((P + 5)) "$SCRIPTS/malformed.lua"
+
+if said "MALFORMED_REFUSED 8/8"; then pass
+else fail "every malformed document is refused" \
+          "$(grep -o 'MALFORMED_REFUSED [0-9/]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "$(grep -o 'MALFORMED_ACCEPTED.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "a fragment decoded to a value the script cannot tell from a whole one."; fi
+
+if said "NULL_OK"; then pass
+else fail "a real null still decodes" \
+          "the document 'null' was reported as an error" \
+          "null is a value, not a failure; conflating them is the bug this" \
+          "whole contract exists to remove, only in the other direction."; fi
+
+# ─── Trailing data ──────────────────────────────────────────────────────────
+#
+# json_decode_value stops at the end of the first complete value and says
+# nothing about what follows, so the binding is where this is caught.  A body
+# with something appended to it is exactly the case worth noticing.
+cat > "$SCRIPTS/trailing.lua" <<'LUA'
+function on_start()
+  local v = socketley.json_decode('{"a":1} and then some')
+  if v == false then socketley.log("TRAILING_REFUSED")
+  else socketley.log("TRAILING_ACCEPTED") end
+  -- Control: trailing WHITESPACE is not trailing data.  A body that ends in a
+  -- newline is the normal case, and refusing it would break every caller.
+  local w = socketley.json_decode('  {"a":1}  \n\t')
+  if w and w.a == 1 then socketley.log("WS_OK")
+  else socketley.log("WS_REFUSED") end
+end
+LUA
+run_script jsontrail $((P + 6)) "$SCRIPTS/trailing.lua"
+
+if said "TRAILING_REFUSED"; then pass
+else fail "trailing data after the document is refused" \
+          "'{\"a\":1} and then some' decoded to {a=1} and the rest went unmentioned"; fi
+
+if said "WS_OK"; then pass
+else fail "trailing whitespace is still accepted" \
+          "a document ending in a newline was refused — that is the normal case"; fi
+
+# ─── encode is a function of its argument ───────────────────────────────────
+#
+# A Lua table has no order of its own, and lua_next does not produce the same
+# arbitrary order for two tables holding equal data.  So json_encode returned
+# different strings for the same content, which breaks every use that compares
+# its output: an ETag, a cache key, a signature, a dedup hash.
+#
+# Found by the fuzz target as encode(decode(encode(x))) != encode(x):
+#
+#     once : {"b":[1,2,{"c":"x"}],"e":3}
+#     twice: {"e":3,"b":[1,2,{"c":"x"}]}
+#
+# ─── Why this asserts SORTED and not merely EQUAL ───────────────────────────
+#
+# The first version of this case built two tables with five keys in opposite
+# insertion orders and asserted their encodings matched.  It passed against the
+# unfixed build: with five short keys LuaJIT happened to produce the same
+# arbitrary order for both, so the assertion reported "stable" about code that
+# was not.  Green on both sides is worth nothing, and it is the failure mode
+# this suite has been bitten by before.
+#
+# Sorted order is the contract itself rather than a proxy for it, and twenty
+# keys make an accidental pass effectively impossible — the unfixed build would
+# have to hash them into alphabetical order by chance.  Measured against it:
+#
+#   {"m":1,"c":2,"x":3,"a":4,"q":5,"b":6,"z":7,"d":8,"p":9,"e":10,
+#    "y":11,"f":12,"g":14,"w":15,"h":16,"r":17,"i":18,"v":19,"j":20,"n":13}
+#
+# so this assertion is red there.
+#
+# The equality of two differently-built tables is kept below because it is the
+# property a caller actually depends on — but it is the weaker check and it is
+# NOT red on the unfixed build: measured, both twenty-key tables still encoded
+# identically there.  It states the intent; the sorted check is what catches a
+# regression.
+cat > "$SCRIPTS/stable.lua" <<'LUA'
+function on_start()
+  local names = {"m","c","x","a","q","b","z","d","p","e",
+                 "y","f","n","g","w","h","r","i","v","j"}
+  local a = {}
+  for i, k in ipairs(names) do a[k] = i end
+  local b = {}
+  for i = #names, 1, -1 do b[names[i]] = i end
+
+  local sa, sb = socketley.json_encode(a), socketley.json_encode(b)
+
+  -- The contract: object keys come out in sorted order.  Values are numbers,
+  -- so every quoted run followed by a colon is a key.
+  local keys = {}
+  for k in string.gmatch(sa, '"([^"]*)":') do keys[#keys + 1] = k end
+  local sorted = (#keys == #names)
+  for i = 2, #keys do
+    if keys[i] <= keys[i - 1] then sorted = false end
+  end
+  if sorted then socketley.log("SORTED_OK")
+  else socketley.log("SORTED_BROKEN " .. tostring(sa)) end
+
+  if sa == sb then socketley.log("STABLE_OK")
+  else socketley.log("STABLE_DIFFERS " .. tostring(sa) .. " vs " .. tostring(sb)) end
+
+  -- And the round trip is a fixpoint: encode, decode, encode again.
+  local once = socketley.json_encode({ e = 3, b = {1,2,{ c = "x" }} })
+  local twice = socketley.json_encode(socketley.json_decode(once))
+  if once == twice then socketley.log("FIXPOINT_OK")
+  else socketley.log("FIXPOINT_DIFFERS " .. once .. " vs " .. twice) end
+
+  -- The control: sorting keys must not disturb ARRAY order, which is part of
+  -- the value.  [10,20,30] sorted as text would be "10","20","30" and look
+  -- fine; [3,20,100] would not.
+  local arr = socketley.json_encode({3, 20, 100})
+  if arr == "[3,20,100]" then socketley.log("ARRAY_ORDER_OK")
+  else socketley.log("ARRAY_ORDER_BROKEN " .. tostring(arr)) end
+end
+LUA
+run_script jsonstable $((P + 7)) "$SCRIPTS/stable.lua"
+
+if said "SORTED_OK"; then pass
+else fail "object keys are written in sorted order" \
+          "$(grep -o 'SORTED_BROKEN.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "without a defined order the output is whatever lua_next happened to" \
+          "produce, which is not the same twice for equal data."; fi
+
+if said "STABLE_OK"; then pass
+else fail "equal data encodes to equal strings" \
+          "$(grep -o 'STABLE_DIFFERS.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "json_encode was not a function of its argument, so an ETag or a" \
+          "cache key computed from it changed without the data changing."; fi
+
+if said "FIXPOINT_OK"; then pass
+else fail "encode(decode(encode(x))) == encode(x)" \
+          "$(grep -o 'FIXPOINT_DIFFERS.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)"; fi
+
+if said "ARRAY_ORDER_OK"; then pass
+else fail "array order survives the key sort" \
+          "$(grep -o 'ARRAY_ORDER_BROKEN.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "an array's order is part of the value; only object keys may be sorted."; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"

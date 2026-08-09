@@ -821,6 +821,31 @@ project "fuzz_resp"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the JSON pair behind socketley.json_decode / json_encode ─────────
+--
+-- The one binding written to be pointed at data from the network, and the one
+-- that had no depth limit: a few hundred kilobytes of nesting was a SIGSEGV.
+-- It became fuzzable when the pair moved out of lua_context.cpp into
+-- lua_json.h — see the header for why it had to.  Needs LuaJIT, because the
+-- decoder builds Lua values.
+
+project "fuzz_lua_json"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit" }
+    links { "luajit" }
+
+    files {
+        "test/fuzz/fuzz_lua_json.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: WebSocket frame parsing (needs OpenSSL for the accept-key path) ───
 
 project "fuzz_ws_frame"

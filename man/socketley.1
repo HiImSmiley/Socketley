@@ -1659,6 +1659,16 @@ is refused \(em that would need DTLS.
 .SH PROXY FLAGS
 .TP
 .BI "\-\-backend " "addr"
+.B A hostname is resolved off the request path.
+A backend named by hostname is looked up when the proxy starts and, if that
+fails, again on the proxy's periodic sweep \(em never while a request is being
+served. A request that arrives before the name resolves is refused rather than
+waiting for it. That is deliberate: the daemon has one thread for every runtime
+it holds, so a resolver that hangs on the request path stops not only this
+proxy's clients but every server, cache and client in the same daemon. The cost
+is that a name which starts resolving is picked up within one sweep instead of
+immediately.
+.IP
 .B IPv4 only.
 Every address this daemon resolves or binds is AF_INET: a backend, an upstream,
 a client target and every listener. A hostname that has only a AAAA record
@@ -2229,6 +2239,25 @@ Set key with millisecond-precision expiry. Returns "ok".
 .BI "scan " "cursor [match pattern] [count n]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B What an iteration guarantees.
+A key that is present for the whole iteration is returned at least once,
+provided the store did not grow enough to rehash its table during it. A key may
+be returned more than once, and a key added or removed while the iteration is
+running may or may not appear \(em so a caller that is counting should count
+distinct keys rather than replies.
+.IP
+The exception is worth being precise about, because it is the one Redis does not
+have. A rehash moves keys between buckets, and a key moved into a bucket this
+iteration has already passed will not be returned by it. Redis avoids that with
+reverse\-binary iteration, which needs a power\-of\-two bucket count; the tables
+here use prime counts and cannot offer one. The cursor carries the bucket count
+so a rehash is at least noticed: the map being walked restarts, which trades
+duplicates \(em allowed above \(em for the skip, which is not.
+.IP
+.B count
+is a hint, as it is in Redis. Whole buckets are returned, so a reply may carry
+somewhat more or fewer keys than asked for.
 .TP
 .B size
 Return number of stored keys (all types).
@@ -3746,6 +3775,16 @@ Encode a Lua value (table, string, number, boolean, nil) as a JSON string.
 Tables with consecutive integer keys starting at 1 are encoded as JSON
 arrays; all others as objects.
 .IP
+Object keys are written in sorted order, so encoding equal data twice gives the
+same string. A Lua table has no order of its own \(em one filled
+.IR alpha ", " beta ", " gamma ", " delta
+iterates
+.IR beta ", " gamma ", " delta ", " alpha
+\(em so without sorting the output was not a function of the value, and two
+tables holding the same data could encode differently. Anything that compares
+encoded documents depends on this: an ETag, a cache key, a signature, a
+deduplication hash, or a diff of two logged payloads.
+.IP
 Refused, with
 .BR false " and a reason, when the value cannot be written as a document:"
 a table that contains itself (directly or through any chain of fields), or one
@@ -3765,7 +3804,23 @@ Decode a JSON string into a Lua value. Objects become tables with string
 keys, arrays become tables with integer keys (1-based). Null becomes nil.
 .IP
 Refused, with
-.BR false " and a reason, for a document nested deeper than 128 levels."
+.BR false " and a reason, for a document nested deeper than 128 levels, for"
+bytes that are not a complete JSON document, and for trailing data after the
+document ends.
+.IP
+The refusal on malformed input is what makes the return value trustworthy. The
+decoder used to answer with whatever it had understood so far, so
+.B [1,2
+\(em a request body cut short by a dropped connection \(em decoded to an
+ordinary two-element table,
+.B {"a":}
+to an empty one, and
+.BR nul ", " garbage
+and an empty string all to nil, which was also the answer for a document that
+really was
+.BR null .
+A handler could not tell a truncated body from a whole one and carried on with
+the fields that happened to arrive.
 .IP
 This limit is not a formatting preference. This call is written to be pointed
 at data from the network \(em a request body, a message payload \(em so the
