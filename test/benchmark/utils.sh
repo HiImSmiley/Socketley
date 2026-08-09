@@ -14,7 +14,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Use system-installed binary if available (run as root), else dev binary.
 # Override with: SOCKETLEY_BIN=/path/to/socketley --dev
-if [[ "${BENCH_DEV:-0}" -eq 1 ]]; then
+if [[ -n "${SOCKETLEY_SOCKET:-}" ]]; then
+    # An already-exported SOCKETLEY_SOCKET wins over every branch below.  It is
+    # how a run is given a private daemon, and it has to be honoured in both
+    # directions: the CLI reads that variable, but start_daemon waits on
+    # $IPC_SOCKET, and the two branches below set IPC_SOCKET to
+    # /tmp/socketley.sock without exporting anything.  A caller who exported a
+    # private socket therefore got a daemon on the private one and a wait on the
+    # shared one — and two benchmark runs on this machine then measured, and
+    # swept, each other.
+    SOCKETLEY_BIN="${SOCKETLEY_BIN:-${PROJECT_ROOT}/bin/Release/socketley}"
+    IPC_SOCKET="$SOCKETLEY_SOCKET"
+    USE_SYSTEMD=0
+elif [[ "${BENCH_DEV:-0}" -eq 1 ]]; then
     SOCKETLEY_BIN="${PROJECT_ROOT}/bin/Release/socketley"
     IPC_SOCKET="/tmp/socketley.sock"
     export SOCKETLEY_SOCKET="$IPC_SOCKET"
@@ -36,7 +48,10 @@ SOCKETLEY_BENCH="${PROJECT_ROOT}/bin/Release/socketley_bench"
 # private copy in each is a fifth chance to point at nothing.
 BENCH_ECHO_LUA="${SCRIPT_DIR}/echo.lua"
 RESULTS_DIR="${SCRIPT_DIR}/results"
-DAEMON_PID_FILE="/tmp/socketley_bench_daemon.pid"
+# Keyed to the socket, so a run with a private SOCKETLEY_SOCKET also gets a
+# private pid file.  One fixed path meant the second run overwrote the first
+# run's pid and then stop_daemon killed a daemon it had never started.
+DAEMON_PID_FILE="/tmp/socketley_bench_daemon$(printf '%s' "$IPC_SOCKET" | md5sum | cut -c1-8).pid"
 
 # Ensure results directory exists
 mkdir -p "$RESULTS_DIR"
@@ -495,17 +510,19 @@ log_bench() {
 
 # Run socketley_bench with timeout — drop-in replacement for "$SOCKETLEY_BENCH"
 #
-# Exit code 2 means a run completed fewer operations than it was asked for. Such
-# a run did not measure throughput, it measured how long it waited, and folding
-# that number into the results turns a defect into what looks like slow
-# hardware. It is surfaced here rather than swallowed.
+# Exit code 2 means the invocation did not produce a result it stands behind:
+# either a run completed fewer operations than it was asked for — such a run did
+# not measure throughput, it measured how long it waited — or the repetitions
+# disagreed too widely for the figure to mean anything. Both are surfaced here
+# rather than swallowed, because both put a number in a results file that reads
+# exactly like a good one.
 bench_run() {
     timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" "$@"
     local rc=$?
     if [[ $rc -eq 124 ]]; then
         log_bench "TIMEOUT" "socketley_bench $*"
     elif [[ $rc -eq 2 ]]; then
-        log_bench "INCOMPLETE" "socketley_bench $* — fewer operations completed than requested"
+        log_bench "UNUSABLE" "socketley_bench $* — run short, or repetitions too far apart to resolve"
     fi
     return $rc
 }

@@ -2031,9 +2031,24 @@ bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     if (!sqe) return false;
 
     // off_in = off_out = -1 for pipes/sockets (no seekable offset)
-    // No SPLICE_F_NONBLOCK: io_uring handles the operation asynchronously, so the
-    // kernel waits for data internally. NONBLOCK would return EAGAIN immediately
-    // when the socket has no data, causing a tight re-submit loop in SQPOLL mode.
+    //
+    // Still no SPLICE_F_NONBLOCK — the EAGAIN-and-resubmit hazard the previous
+    // comment named is a real reason to leave it off, and nothing here has
+    // tested the empty-socket case that would trigger it.
+    //
+    // What that comment got wrong is the other half: it said io_uring "handles
+    // the operation asynchronously, so the kernel waits for data internally",
+    // which reads as though this were an ordinary poll-driven submission that
+    // merely sleeps until data arrives.  It is not.  Every splice is handed to
+    // an io-wq worker, and that happens whether or not the data is already
+    // there: with the pipe pre-filled and room at the far end, so that blocking
+    // was impossible, it still measured 17.19 us against 0.72 us for a read()
+    // from that same ready pipe — and 17.32 us for a send() deliberately forced
+    // async with IOSQE_ASYNC.  Setting NONBLOCK does not change that number
+    // either (17.18 us), because the punt happens before the flag is consulted.
+    //
+    // See submit_splice in the header for the full table and for the payload
+    // size at which the punt stops mattering.
     io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;

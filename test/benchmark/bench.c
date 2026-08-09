@@ -66,7 +66,34 @@ struct bench_config {
     int         runs;
     int         warmup_pct;
     int         json;
+    /* Time-box a run instead of counting it out (-d).  num_ops becomes an upper
+     * bound and the measured window is duration_ms wide, whatever rate the
+     * server turns out to have.
+     *
+     * This exists because the count-based form set the window from a guess.
+     * `proxy concurrent 8 200` is 1600 round trips, which on this machine is
+     * eighteen milliseconds — short enough that one scheduling delay is the
+     * whole measurement.  Repeated seven times it spanned 3.2x; the same case at
+     * 128000 round trips spanned 1.29x.  A guess that was right when it was
+     * written also stops being right the moment the thing under test gets
+     * faster, and nothing announces that.
+     *
+     * It also squares the finish line for the threaded tests.  With a count
+     * each thread stops when it personally is done, so the tail of the window
+     * has fewer connections in flight than the head, and the elapsed time
+     * charged to every thread is the slowest one's.  A deadline stops them all
+     * within one round trip of each other. */
+    int         duration_ms;
+    /* Runs executed and thrown away before the measured ones.  The first run
+     * against a freshly started process pays for its page faults, its accept
+     * path and its allocator; folding that into a median is how a harness
+     * reports a slower number for a faster program. */
+    int         warmup_runs;
 };
+
+/* Deadline for the current run, or 0 when the run is counted out rather than
+ * timed.  Set by run_and_report before each call; read by every worker. */
+static int64_t g_run_deadline_ns = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * B. Timing
@@ -83,6 +110,13 @@ static inline double ns_to_us(int64_t ns) { return ns / 1000.0; }
 static inline double ns_to_ms(int64_t ns) { return ns / 1000000.0; }
 static inline double ns_to_s(int64_t ns)  { return ns / 1000000000.0; }
 
+/* True once a time-boxed run's window has closed.  Costs one clock_gettime per
+ * round trip, beside a send and a recv that each cost more than that. */
+static inline int deadline_passed(void)
+{
+    return g_run_deadline_ns != 0 && time_ns() >= g_run_deadline_ns;
+}
+
 struct latency_log {
     int64_t *samples;
     int      count;
@@ -91,9 +125,16 @@ struct latency_log {
 
 static void lat_init(struct latency_log *l, int cap)
 {
+    /* Clamped, because callers pass the operation count and a time-boxed run's
+     * count is an upper bound rather than an estimate: `-d 1500` with a cap of
+     * a hundred million would ask for 800 MB to hold samples for round trips
+     * that will never happen.  MAX_LATENCIES is already the number of samples
+     * the percentiles are willing to look at. */
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    if (cap < 1) cap = 1;
     l->capacity = cap;
     l->count = 0;
-    l->samples = (int64_t *)malloc(cap * sizeof(int64_t));
+    l->samples = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
 }
 
 static void lat_free(struct latency_log *l)
@@ -1010,18 +1051,28 @@ static struct run_result bench_proxy_tcp(struct bench_config *cfg)
     char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    /* A timed run stops at the clock, not at a count, so falling short of
+     * num_ops is the normal outcome and must not be reported as a defect. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
+    /* The warm-up has to be measured in whatever unit ends the run.  A timed
+     * run is given an operation cap, not an estimate, so "the first 10% of
+     * num_ops" is ten million round trips that never happen — and the
+     * percentiles below would come out of an empty log. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? start + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
 
     for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
         int64_t t0 = time_ns();
         if (send_all(fd, msg, msize + 1) != msize + 1) { r.failed++; break; }
         if (recv_exact(fd, rep, msize + 1) != msize + 1) { r.failed++; break; }
         int64_t t1 = time_ns();
 
         r.success++;
-        if (i >= warmup)
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup))
             lat_record(&r.latencies, t1 - t0);
     }
 
@@ -1069,6 +1120,7 @@ static void *proxy_concurrent_worker(void *arg)
      * why the version without this measured socket buffers. */
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
         if (send_all(fd, msg, msize + 1) != msize + 1) break;
         if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
         local++;
@@ -1119,13 +1171,90 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
 }
 
-/* Proxy overhead: measure direct vs proxied throughput on same message pattern */
+/* ─── Proxy overhead ─────────────────────────────────────────────────────────
+ *
+ * What one proxy hop costs, as a percentage of the direct rate.
+ *
+ * The measurement is paired and interleaved, which is the whole of the repair.
+ * The version before this ran each leg exactly once, 500 round trips long — a
+ * seventeen-millisecond window — direct first and proxied second.  Over seven
+ * repetitions its direct leg alone came out anywhere between 15712 and 46364
+ * round trips a second, so the quotient of the two legs was free to land almost
+ * anywhere, and one recorded run reported an overhead of -106%.  A proxy hop
+ * cannot make a request faster than not taking it; that impossibility was the
+ * only thing that gave the number away, and a number that is merely wrong
+ * rather than impossible would have been believed.
+ *
+ * Three things are different here.  Each leg is timed rather than counted, so
+ * the window does not shrink as the code gets faster.  The legs alternate which
+ * one goes first, so whatever the first leg pays for — a cold path, a page not
+ * yet faulted — is charged to each of them equally instead of always to
+ * `direct`.  And the overhead is computed per pair and only then aggregated, so
+ * a machine that is slow for one pair slows both of its legs and leaves their
+ * ratio alone; the spread that survives that is reported next to the answer as
+ * a confidence interval.  When that interval is too wide to support the number,
+ * this says so rather than printing it.
+ */
+
+/* Half-width of the 95% confidence interval of the mean of `v`, expressed the
+ * same way `v` is.  Student's t for the small n a benchmark actually runs; the
+ * asymptotic 1.96 understates the interval at n = 5 by a third. */
+static double ci95_half_width(const double *v, int n)
+{
+    static const double t95[] = {
+        0,     0,     12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365,
+        2.306, 2.262, 2.228,  2.201, 2.179, 2.160, 2.145, 2.131, 2.120,
+        2.110, 2.101, 2.093,  2.086
+    };
+    if (n < 2) return 0;
+    double m = 0;
+    for (int i = 0; i < n; i++) m += v[i];
+    m /= n;
+    double ss = 0;
+    for (int i = 0; i < n; i++) ss += (v[i] - m) * (v[i] - m);
+    double sd = sqrt(ss / (n - 1));
+    double t  = (n <= 21) ? t95[n] : 1.96;
+    return t * sd / sqrt((double)n);
+}
+
+/* One leg: a timed round-trip loop against `port`.  Returns the rate, or 0 when
+ * the connection could not carry the whole window. */
+static double overhead_leg(struct bench_config *cfg, int port,
+                           const char *msg, char *rep, int msize, int *ops_out)
+{
+    *ops_out = 0;
+    int fd = tcp_connect(cfg->host, port);
+    if (fd < 0) return 0;
+    set_recv_timeout(fd, 2000);
+
+    int64_t window = (int64_t)cfg->duration_ms * 1000000LL;
+    int64_t start  = time_ns();
+    int64_t stop   = start + window;
+    int     success = 0;
+    int     broke   = 0;
+
+    for (int i = 0; i < cfg->num_ops; i++) {
+        if (window > 0 && time_ns() >= stop) break;
+        if (send_all(fd, msg, msize + 1) != msize + 1) { broke = 1; break; }
+        if (recv_exact(fd, rep, msize + 1) != msize + 1) { broke = 1; break; }
+        success++;
+    }
+    int64_t end = time_ns();
+    close(fd);
+
+    *ops_out = success;
+    if (broke || success == 0) return 0;
+    return success / ns_to_s(end - start);
+}
+
 static void bench_proxy_overhead(struct bench_config *cfg)
 {
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 128;
@@ -1135,81 +1264,124 @@ static void bench_proxy_overhead(struct bench_config *cfg)
 
     char *rep = (char *)malloc(msize + 1);
 
-    /* Both legs, same loop: the only difference between them is the port, and
-     * writing it once is what keeps that true.  Each request is sent and its
-     * reply read before the next goes out, so the rate is completed round trips
-     * per second and the two legs are comparable by construction.
-     *
-     * They were not.  Each leg used to time a loop of sends with nothing read
-     * back, against a backend that answers nothing at all -- so neither number
-     * described serving a request, and the quotient of two such numbers could
-     * fall anywhere.  It fell at -106%: the proxied leg "beat" the direct one,
-     * which is how a measurement says it is not measuring what its name claims.
-     * Overhead cannot be negative, and that impossibility was the only reason
-     * anyone looked. */
-    double rate[2] = {0, 0};
-    int    done[2] = {0, 0};
-    const int port[2] = { cfg->port2, cfg->port };
+    /* A leg that is not timed is a leg whose window is a guess.  Without -d the
+     * count still governs, so an explicit `proxy overhead 500 <port>` behaves as
+     * it always did — but the pairing below still applies, and 500 round trips
+     * is short enough that the interval will say so. */
+    int pairs = cfg->runs > 0 ? cfg->runs : 1;
+    int warm  = cfg->warmup_runs;
 
-    for (int leg = 0; leg < 2; leg++) {
-        int fd = tcp_connect(cfg->host, port[leg]);
-        if (fd < 0) continue;
-        set_recv_timeout(fd, 2000);
+    double *ratio  = (double *)malloc((size_t)pairs * sizeof(double));
+    double *direct = (double *)malloc((size_t)pairs * sizeof(double));
+    double *proxied = (double *)malloc((size_t)pairs * sizeof(double));
+    int kept = 0, short_legs = 0;
+    int min_direct_ops = 0, min_proxied_ops = 0;
 
-        int success = 0;
-        int64_t start = time_ns();
-        for (int i = 0; i < cfg->num_ops; i++) {
-            if (send_all(fd, msg, msize + 1) != msize + 1) break;
-            if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
-            success++;
+    for (int p = -warm; p < pairs; p++) {
+        double d, x;
+        int dops = 0, xops = 0;
+        /* Alternate which leg goes first.  Whatever the first leg of a pair
+         * pays that the second does not is then charged to `direct` and
+         * `proxied` in equal numbers instead of always to the same one. */
+        if ((p & 1) == 0) {
+            d = overhead_leg(cfg, cfg->port2, msg, rep, msize, &dops);
+            x = overhead_leg(cfg, cfg->port,  msg, rep, msize, &xops);
+        } else {
+            x = overhead_leg(cfg, cfg->port,  msg, rep, msize, &xops);
+            d = overhead_leg(cfg, cfg->port2, msg, rep, msize, &dops);
         }
-        int64_t end = time_ns();
-        close(fd);
+        if (p < 0) continue;                       /* warm-up pair, discarded */
 
-        done[leg] = success;
-        if (success > 0)
-            rate[leg] = success / ns_to_s(end - start);
+        if (d <= 0 || x <= 0) { short_legs++; continue; }
+        if (kept == 0 || dops < min_direct_ops)  min_direct_ops  = dops;
+        if (kept == 0 || xops < min_proxied_ops) min_proxied_ops = xops;
+        direct[kept]  = d;
+        proxied[kept] = x;
+        ratio[kept]   = x / d;
+        kept++;
     }
 
     free(msg);
     free(rep);
 
-    /* Only when both legs actually ran the whole thing.  A leg that stopped
-     * early -- a backend that does not answer, a proxy that dropped the
-     * connection -- makes the quotient meaningless, and reporting it anyway is
-     * what produced a number nobody could act on.  The counts travel with it so
-     * a short run says so instead of hiding inside an average. */
-    int    complete     = (done[0] == cfg->num_ops && done[1] == cfg->num_ops);
-    double overhead_pct = 0;
-    if (complete && rate[0] > 0)
-        overhead_pct = (1.0 - rate[1] / rate[0]) * 100.0;
+    /* The answer, and the width of the ground it stands on.  Both come from the
+     * per-pair ratios: a pair measured while the machine was busy has both of
+     * its legs slowed and its ratio survives, which is the point of pairing. */
+    double med_ratio = 0, half = 0, overhead_pct = 0, half_pct = 0;
+    double med_direct = 0, med_proxied = 0;
+    if (kept > 0) {
+        double *tmp = (double *)malloc((size_t)kept * sizeof(double));
+        memcpy(tmp, ratio, (size_t)kept * sizeof(double));
+        med_ratio = median_double(tmp, kept);
+        memcpy(tmp, direct, (size_t)kept * sizeof(double));
+        med_direct = median_double(tmp, kept);
+        memcpy(tmp, proxied, (size_t)kept * sizeof(double));
+        med_proxied = median_double(tmp, kept);
+        free(tmp);
+        half         = ci95_half_width(ratio, kept);
+        overhead_pct = (1.0 - med_ratio) * 100.0;
+        half_pct     = half * 100.0;
+    }
+
+    /* Two ways this refuses to answer, and they are different questions.
+     * `complete` asks whether both legs ever carried a request to completion;
+     * `resolved` asks whether the pairs agreed closely enough for the number to
+     * mean anything.  A run can be complete and unresolved — that is precisely
+     * the state the old single-shot version was in every time, with nothing in
+     * its output to say so. */
+    int complete = (kept > 0 && short_legs == 0);
+    int resolved = (complete && kept >= 3 && half_pct <= 5.0);
 
     if (cfg->json) {
         json_reset();
         json_start(stdout);
         json_kv_str(stdout, "test", "proxy_overhead");
-        json_kv_int(stdout, "operations", cfg->num_ops);
-        json_kv_int(stdout, "direct_completed", done[0]);
-        json_kv_int(stdout, "proxied_completed", done[1]);
-        json_kv_dbl(stdout, "direct_msg_per_sec", rate[0]);
-        json_kv_dbl(stdout, "proxied_msg_per_sec", rate[1]);
-        if (complete)
+        json_kv_int(stdout, "pairs", kept);
+        json_kv_int(stdout, "pairs_discarded_short", short_legs);
+        json_kv_int(stdout, "duration_ms_per_leg", cfg->duration_ms);
+        json_kv_int(stdout, "direct_min_round_trips", min_direct_ops);
+        json_kv_int(stdout, "proxied_min_round_trips", min_proxied_ops);
+        json_kv_dbl(stdout, "direct_msg_per_sec", med_direct);
+        json_kv_dbl(stdout, "proxied_msg_per_sec", med_proxied);
+        json_kv_dbl(stdout, "overhead_ci95_half_width_pct", half_pct);
+        if (resolved)
             json_kv_dbl(stdout, "overhead_percent", overhead_pct);
         else
-            json_kv_str(stdout, "overhead_percent", "not measurable");
+            json_kv_str(stdout, "overhead_percent",
+                        complete ? "not resolved" : "not measurable");
+        fprintf(stdout, ",\"per_pair_ratio\":[");
+        for (int i = 0; i < kept; i++)
+            fprintf(stdout, "%s%.4f", i ? "," : "", ratio[i]);
+        fprintf(stdout, "]");
         json_end(stdout);
     } else {
-        printf("socketley-bench: proxy overhead  %s  %d ops  direct=%d  proxied=%d\n\n",
-               cfg->host, cfg->num_ops, cfg->port2, cfg->port);
-        printf("  Direct:   %12.0f msg/sec  (%d/%d round trips)\n",
-               rate[0], done[0], cfg->num_ops);
-        printf("  Proxied:  %12.0f msg/sec  (%d/%d round trips)\n",
-               rate[1], done[1], cfg->num_ops);
-        if (complete)
-            printf("  Overhead: %11.1f%%\n", overhead_pct);
-        else
-            printf("  Overhead:  not measurable — a leg did not complete\n");
+        printf("socketley-bench: proxy overhead  %s  direct=%d  proxied=%d  "
+               "%d pairs", cfg->host, cfg->port2, cfg->port, kept);
+        if (cfg->duration_ms > 0) printf("  %d ms/leg", cfg->duration_ms);
+        printf("\n\n");
+        printf("  Direct:   %12.0f round trips/sec  (median of %d)\n", med_direct, kept);
+        printf("  Proxied:  %12.0f round trips/sec  (median of %d)\n", med_proxied, kept);
+        if (resolved) {
+            printf("  Overhead: %11.1f%%  ±%.1f (95%% CI over the pairs)\n",
+                   overhead_pct, half_pct);
+        } else if (complete) {
+            printf("  Overhead:  not resolved — the pairs span ±%.1f%%, which is "
+                   "wider than the answer\n", half_pct);
+            printf("             Give it more pairs (-r) or a longer window (-d) "
+                   "before believing a figure here.\n");
+        } else {
+            printf("  Overhead:  not measurable — %d pair(s) had a leg that did "
+                   "not carry the window\n", short_legs);
+        }
     }
+
+    free(ratio);
+    free(direct);
+    free(proxied);
+
+    /* A run that could not answer is a failed run.  Silence here is what let a
+     * -106%% into a results file. */
+    if (!resolved) g_incomplete_runs++;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1418,11 +1590,27 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
     struct run_result *all_results =
         (struct run_result *)malloc(runs * sizeof(struct run_result));
 
+    /* Warm-up runs are executed and dropped.  The first run against a freshly
+     * started runtime pays for its page faults and its first pass through every
+     * branch; averaged in, that cost is reported as the program being slower
+     * than it is, and it lands on whichever side of a comparison happens to go
+     * first. */
+    for (int i = 0; i < cfg->warmup_runs; i++) {
+        if (cfg->duration_ms > 0)
+            g_run_deadline_ns = time_ns() + (int64_t)cfg->duration_ms * 1000000LL;
+        struct run_result w = fn(cfg);
+        lat_free(&w.latencies);
+    }
+
     for (int i = 0; i < runs; i++) {
+        /* Set per run, not once: each run gets its own full window. */
+        if (cfg->duration_ms > 0)
+            g_run_deadline_ns = time_ns() + (int64_t)cfg->duration_ms * 1000000LL;
         all_results[i] = fn(cfg);
         throughputs[i] = all_results[i].throughput;
         throughputs_mb[i] = all_results[i].throughput_mb;
     }
+    g_run_deadline_ns = 0;
 
     double med = median_double(throughputs, runs);
     double med_mb = median_double(throughputs_mb, runs);
@@ -1475,6 +1663,17 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
     struct latency_log *lat = &all_results[best_idx].latencies;
     lat_sort(lat);
 
+    /* The smallest difference this invocation could have told from its own
+     * noise, as a percentage of the median.  Computed from the runs as they
+     * came out, before the sort that median_double left behind. */
+    double ci_pct = 0;
+    if (runs >= 2 && med > 0) {
+        double *raw = (double *)malloc((size_t)runs * sizeof(double));
+        for (int i = 0; i < runs; i++) raw[i] = all_results[i].throughput;
+        ci_pct = 100.0 * ci95_half_width(raw, runs) / med;
+        free(raw);
+    }
+
     if (cfg->json) {
         json_reset();
         json_start(stdout);
@@ -1493,6 +1692,13 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
          * not comparable, which is the truth. */
         json_kv_str(stdout, "metric", metric_name(metric));
         json_kv_dbl(stdout, metric_rate_key(metric), med);
+        /* How much of that figure is the measurement and how much is the
+         * machine.  A median with no width beside it invites a reader to treat
+         * a 10% move between two files as a result; this says whether it can
+         * be one. */
+        json_kv_int(stdout, "duration_ms", cfg->duration_ms);
+        json_kv_int(stdout, "warmup_runs", cfg->warmup_runs);
+        json_kv_dbl(stdout, "ci95_half_width_pct", ci_pct);
         if (med_mb > 0)
             json_kv_dbl(stdout, "median_MB_per_sec", med_mb);
         json_kv_int(stdout, "success", all_results[best_idx].success);
@@ -1537,6 +1743,9 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         if (med_mb > 0)
             printf("  (%.1f MB/s one way)", med_mb);
         printf("\n");
+        if (runs >= 2)
+            printf("  Resolves: differences above %.1f%% (95%% CI over %d runs); "
+                   "anything smaller is this machine\n", ci_pct, runs);
         /* Beside the number, every time.  A figure copied out of this output
          * carries no context with it, so the context goes next to it. */
         printf("  Measures: %s\n", metric_meaning(metric));
@@ -1576,7 +1785,14 @@ static void usage(const char *prog)
         "Options:\n"
         "  -j          JSON output\n"
         "  -r N        Number of runs (default %d)\n"
-        "  -w N        Warm-up percentage (default %d)\n"
+        "  -w N        Warm-up percentage of a run's operations (default %d)\n"
+        "  -d MS       Time-box each run to MS milliseconds; the operation count\n"
+        "              becomes an upper bound.  Use this rather than guessing a\n"
+        "              count: a count picked for today's speed shrinks the window\n"
+        "              as the code gets faster, and a window of a few tens of\n"
+        "              milliseconds measures the scheduler.  (proxy tcp,\n"
+        "              proxy concurrent, proxy overhead)\n"
+        "  -W N        Run and discard N runs before the measured ones\n"
         "\n"
         "Categories and tests:\n"
         "  server conn <count>                  Connection rate\n"
@@ -1592,7 +1808,7 @@ static void usage(const char *prog)
         "\n"
         "  proxy tcp <count> [msg_size]          TCP forwarding\n"
         "  proxy concurrent <clients> <msgs>     Multi-client\n"
-        "  proxy overhead <count> <backend_port> Direct vs proxied\n"
+        "  proxy overhead <count> <backend_port> Direct vs proxied, paired (-r pairs)\n"
         "\n"
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
@@ -1626,6 +1842,14 @@ int main(int argc, char **argv)
             cfg.warmup_pct = atoi(argv[optind_local + 1]);
             if (cfg.warmup_pct < 0) cfg.warmup_pct = 0;
             if (cfg.warmup_pct > 50) cfg.warmup_pct = 50;
+            optind_local += 2;
+        } else if (strcmp(opt, "-d") == 0 && optind_local + 1 < argc) {
+            cfg.duration_ms = atoi(argv[optind_local + 1]);
+            if (cfg.duration_ms < 0) cfg.duration_ms = 0;
+            optind_local += 2;
+        } else if (strcmp(opt, "-W") == 0 && optind_local + 1 < argc) {
+            cfg.warmup_runs = atoi(argv[optind_local + 1]);
+            if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
             optind_local += 2;
         } else if (strcmp(opt, "--help") == 0 || strcmp(opt, "-h") == 0) {
             usage(argv[0]);

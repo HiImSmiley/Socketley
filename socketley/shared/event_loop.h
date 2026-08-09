@@ -391,6 +391,44 @@ public:
 
     // Splice: zero-copy data transfer between two fds through a pipe.
     // fd_in -> fd_out, len bytes, off_in/off_out = -1 for pipes/sockets.
+    //
+    // This is the one submission here that never runs on the loop thread.
+    // IORING_OP_SPLICE has no non-blocking fast path: the kernel hands every
+    // one of them to an io-wq worker before it looks at whether the data is
+    // there, so the completion costs a worker round trip even when the
+    // operation could not possibly have blocked.  Measured directly, with the
+    // bytes already in the pipe and room at the far end (p50 over 3000
+    // submissions on 7.0.0-28):
+    //
+    //   read() from that same ready pipe        0.72 us
+    //   send() to that same ready socket        1.20 us
+    //   send() forced async with IOSQE_ASYNC   17.32 us
+    //   splice                                 17.19 us
+    //   splice + SPLICE_F_NONBLOCK             17.18 us
+    //   splice + SPLICE_F_FD_IN_FIXED          17.78 us
+    //
+    // Splice is indistinguishable from a submission deliberately forced onto a
+    // worker, and neither flag moves it.  There is no variant that stays on the
+    // fast path — registered pipes do not help, because the cost is the punt and
+    // not the descriptor lookup.
+    //
+    // What follows from that is a size rule, since the punt is a fixed cost per
+    // operation and a relay needs two of them per direction.  Over 16
+    // connections, 7 runs each:
+    //
+    //   128 B payload   splice 3037-83914 req/s   copy path 126673-152614 req/s
+    //   128 KB payload  splice 22286 req/s median, 5.06 us of loop-thread CPU
+    //                   copy   16014 req/s median, 55.89 us
+    //
+    // At small payloads splice is not merely slower, it is unstable: that 28x
+    // spread is one io-wq pool being contended by every connection at once, and
+    // the pool grew to 128 workers at 64 connections while throughput fell to
+    // 2676 req/s.  At large payloads the punt amortises and splice wins on both
+    // throughput and, by an order of magnitude, on loop-thread CPU.
+    //
+    // So: right for server_instance's file serving, wrong for a proxy relaying
+    // small messages.  A caller that cannot say which regime it is in should use
+    // the copy path, which is never catastrophic.
     bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
 
     // Async file read: uses io_uring_prep_read (not recv) for regular files.

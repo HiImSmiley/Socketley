@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proxy vs HAProxy — one thread each, one backend, one client.
+# Proxy vs HAProxy — one backend, one client, and a stated resolution.
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -11,25 +11,96 @@
 #
 # ─── WHAT MAKES THE COMPARISON FAIR, AND WHAT DOES NOT ──────────────────────
 #
-# One thread each.  HAProxy defaults to a thread per available core, so against
-# an untuned config this box would compare ten threads with one and the number
-# would mean nothing.  `nbthread 1` is in the config below, and the thread count
-# of BOTH processes is measured at run time and written into the results —
-# a claim about a config file is not a measurement, and bench_cache_resp.sh
-# records redis_io_threads for the same reason.
-#
 # One backend, and it is the same object.  Both proxies front the identical
 # socketley server runtime with echo.lua, started once and left alone, so a
 # difference between them cannot be a difference between two fixtures.  The
 # backend is itself single-threaded, which matters: at high connection counts it
 # can become the limit, and then the two proxies are being compared on how well
-# they queue rather than how fast they forward.  The per-run CPU of the backend
-# is recorded so that case is visible instead of silently changing the subject.
+# they queue rather than how fast they forward.  Its CPU is measured across every
+# run and a case that ran it near a whole core is labelled backend-bound instead
+# of being reported as a proxy result.
 #
 # One client, socketley_bench, driving plain TCP round trips.  It is protocol
 # agnostic — a request goes out, a reply is read before the next goes out — so
 # it measures the same thing through either proxy.  Using each proxy's preferred
 # client would measure the clients.
+#
+# One thread each was the old claim, and it was never true at run time.
+# `nbthread 1` does hold haproxy to a single thread, and it is in the config
+# below; but measured across a concurrent run haproxy burns 0.98–1.00 cores
+# while socketley's proxy burns 1.6–2.1, because io_uring grows kernel worker
+# threads on demand and they are created and reaped inside a run.  Counting
+# threads afterwards, which is what this file used to do, sees one or two and
+# reports parity.  So the CPU each proxy actually consumed is measured across
+# every run and published beside its throughput: that, not a thread count, is
+# what says whether a rate was bought at the same price.
+#
+# ─── WHAT MAKES A NUMBER HERE BELIEVABLE ────────────────────────────────────
+#
+# Everything below exists because the concurrent cases used to be unreadable.
+# Seven repetitions of the 8-connection case as it was written spanned
+# 36399..115116 round trips a second for haproxy — a factor of 3.2 — and the
+# ratio it produced flipped between invocations by more than the difference
+# anybody would be trying to measure.  A reader handed that ratio cannot tell a
+# finding from the harness.  Four things changed, in the order they mattered:
+#
+#   Runs are timed, not counted.  `proxy concurrent 8 200` is 1600 round trips,
+#   which on this machine is eighteen milliseconds, and eighteen milliseconds of
+#   a ten-core box is one scheduling decision.  Interleaving a 1600-operation run
+#   and a 1500-millisecond run against the same unchanged proxy, twelve of each,
+#   so that both forms see the same machine: socketley's spread went from 1.49x
+#   to 1.15x (coefficient of variation 10.1% -> 4.5%) and haproxy's from 2.79x
+#   to 1.96x (40.0% -> 28.0%).  A count also has to be re-guessed every time the
+#   code gets faster, and nothing announces when it has gone stale.
+#
+#   Those figures are smaller than the first ones measured for this change, and
+#   the difference is instructive.  Timing seven short runs and then seven long
+#   ones — rather than interleaving them — said 22.3% -> 2.1%, because the box
+#   happened to be steadier during the second block.  The same mistake this file
+#   makes about two proxies, made about two window lengths.
+#
+#   Timing the run squares the finish line as well.  With a count, each
+#   connection stops when it personally is finished and the elapsed time charged
+#   to all of them is the slowest one's, so the tail of the window has fewer
+#   connections in flight than the head.  That effect turned out to be small
+#   here — interleaving the two forms against one port put them 1.5% apart, the
+#   counted one higher — and it is recorded at that size rather than the size it
+#   first appeared to be.  Comparing the two forms in sequence rather than
+#   interleaved made it look like 23%, because the box drifted 23% downward
+#   during the comparison.  Which is the argument for the next paragraph.
+#
+#   The two proxies are measured in interleaved pairs, alternating which goes
+#   first, and the answer is the median of the per-pair ratios.  Running all of
+#   one arm and then all of the other lets any drift in the machine between the
+#   two blocks arrive as a difference between the proxies, and this box drifts:
+#   sixteen consecutive runs against one unchanged proxy fell from around 77000
+#   to around 59000 round trips a second inside a minute, and stayed down.  Split
+#   that sequence in half and call the halves A and B and you have measured a 23%
+#   regression in something nobody touched.  A pair shares its weather instead:
+#   when the box is slow both legs are slow and their ratio is untouched.  Under
+#   a synthetic six-core background load the paired overhead measurement in
+#   bench.c returned 69.4% and 69.6% on two invocations whose absolute rates
+#   differed by 26%; the unpaired form, on the same load, returned overheads
+#   between 11.1% and 75.8%.
+#
+#   Every case reports the smallest difference it could have resolved, and
+#   refuses the ratio when that is wider than the question.  This is the part
+#   that makes the rest safe: a number with no width beside it will be read as
+#   exact by whoever finds it next.
+#
+# What did not work, so that nobody spends the afternoon again: pinning.  With
+# taskset holding the backend on one core, both proxies on a dedicated pair, and
+# the client on six, haproxy's coefficient of variation came out at 21.8% where
+# the same case unpinned had measured 10.8%.  That pair of numbers was taken in
+# sequence rather than interleaved, so treat it as "did not help" rather than as
+# a measured harm — but there is no reason to expect it to help, and four
+# independent readings say so.  During a concurrent run this box has around seven
+# of its ten cores idle; steal time is zero; it exposes neither cpufreq nor
+# cpuidle to the guest, so the guest has nothing to hold still; and a fixed-work
+# calibration spin run either side of each measurement varies by ±10% while the
+# rate it brackets varies by ±25%, which is most of the spread left unexplained
+# by anything about CPU availability.  What is left behaves like a per-run
+# condition rather than a per-second one, and only more runs average it out.
 #
 # ─── WHAT IT DOES NOT COVER ─────────────────────────────────────────────────
 #
@@ -38,22 +109,74 @@
 # retries, connection reuse across many backends.  This measures forwarding, and
 # only forwarding.  HAProxy doing that slower or faster than socketley says
 # nothing about the rest of what HAProxy does.
+#
+# The interval each case prints describes repetitions of that case within one
+# invocation of this script.  It does not cover the machine being in a different
+# state tomorrow: the paired overhead measurement in bench.c read 74.7% on an
+# idle box and 69.5% under a six-core load, both with intervals under ±3%.
+# Within one machine state it holds up — three invocations at seven pairs, taken
+# back to back on a quiet box, returned ratios of 0.54/0.54/0.56, 0.52/0.56/0.54,
+# 0.64/0.66/0.67, 0.54/0.54/0.54, 0.82/0.76/0.78 and 0.95/0.93/0.95, every case
+# reproducing inside ±4%.  The same 8-connection case, before this change,
+# flipped from 0.64x to 1.51x between two invocations.
 
 source "$(dirname "$0")/utils.sh"
 
-BACKEND_PORT=19091
-SK_PORT=19092
-HA_PORT=19093
+# ─── Ports ──────────────────────────────────────────────────────────────────
+#
+# One base, three consecutive ports.  These were fixed at 19091-19093, which is
+# inside the block the integration suite uses, so this script and a suite run
+# could not share a machine.
+BENCH_PORT_BASE=${BENCH_PORT_BASE:-23000}
+BACKEND_PORT=$((BENCH_PORT_BASE + 0))
+SK_PORT=$((BENCH_PORT_BASE + 1))
+HA_PORT=$((BENCH_PORT_BASE + 2))
 
-RUNS=${1:-${BENCH_HAPROXY_RUNS:-3}}
+PAIRS=${1:-${BENCH_HAPROXY_RUNS:-7}}
+# Three is the floor, because two points have no spread worth the name and one
+# has none at all.  The suite used to ask for a single repetition here, and a
+# single repetition through this file would print a ratio with a ±0.0% beside
+# it — the most confident-looking output the script can produce, from the least
+# evidence it can gather.
+if (( PAIRS < 3 )); then
+    log_warn "raising pairs from $PAIRS to 3: fewer cannot produce an interval,"
+    log_warn "and a ratio printed without one is the thing this file exists to stop"
+    PAIRS=3
+fi
 SIZES=${BENCH_HAPROXY_SIZES:-"128 1024 16384"}
 CONNS=${BENCH_HAPROXY_CONNS:-"1 8 32"}
-MSGS_PER_CONN=200
-SERIAL_MSGS=3000
+
+# Milliseconds per measured run.  1500 is where the spread stops improving on
+# this box: tripling the window, from 1700 ms to 4400 ms, moved haproxy's
+# coefficient of variation only from 12% to 10%, because what is left is a
+# per-run condition rather than something a longer average smooths out.  More
+# pairs help there; a longer window does not, and it costs the same time.
+RUN_MS=${BENCH_RUN_MS:-1500}
+# An upper bound on operations, never the thing that ends a run.  Large enough
+# that the clock always wins.
+OPS_CAP=100000000
+
+# The question the reader came with.  A case whose interval is wider than this
+# is reported as unable to answer rather than answered badly.
+TARGET_PCT=${BENCH_RESOLUTION_TARGET:-15}
+
+# A pair measured while somebody else was using the machine is discarded.  This
+# is the box's own load with none of our processes running, sampled either side
+# of the pair, in cores.  The default allows for a developer's editor and shell;
+# a parallel build lands far above it.
+QUIET_CORES=${BENCH_QUIET_CORES:-1.0}
+
+# Compare socketley against another socketley instead of against haproxy: point
+# this at a second proxy's port and the B arm becomes that.  The pairing, the
+# interval and the verdict are what make a 15% claim about one's own change
+# checkable, and they should not require haproxy to be installed.
+PEER_PORT=${BENCH_PEER_PORT:-}
+PEER_NAME=${BENCH_PEER_NAME:-peer}
 
 RESULTS_FILE="${RESULTS_DIR}/proxy_vs_haproxy_${TIMESTAMP}.json"
 WORK=$(mktemp -d)
 HA_PID=""
+HZ=$(getconf CLK_TCK)
 
 cleanup() {
     [[ -n "$HA_PID" ]] && kill "$HA_PID" 2>/dev/null
@@ -66,12 +189,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v haproxy >/dev/null 2>&1; then
+if [[ -z "$PEER_PORT" ]] && ! command -v haproxy >/dev/null 2>&1; then
     log_error "haproxy not installed — nothing to compare against"
+    log_info  "set BENCH_PEER_PORT to compare against another socketley proxy instead"
     exit 0
 fi
 
-HA_VERSION=$(haproxy -v 2>&1 | head -1 | sed 's/[",]/ /g')
+if [[ -n "$PEER_PORT" ]]; then
+    B_PORT=$PEER_PORT
+    B_LABEL=$PEER_NAME
+    HA_VERSION="peer proxy on port $PEER_PORT"
+else
+    B_PORT=$HA_PORT
+    B_LABEL=hap
+    HA_VERSION=$(haproxy -v 2>&1 | head -1 | sed 's/[",]/ /g')
+fi
 
 echo "[" > "$RESULTS_FILE"
 FIRST_RESULT=true
@@ -79,32 +211,171 @@ append_result() {
     if [[ $FIRST_RESULT == true ]]; then FIRST_RESULT=false; else echo "," >> "$RESULTS_FILE"; fi
 }
 
-# threads_of PID — how many threads a process actually has right now.
-#
-# The fairness check, not a formality: it is what separates "the config says one
-# thread" from "one thread ran".  socketley's proxy grows io_uring kernel worker
-# threads (iou-wrk-*) on demand when an operation cannot be completed on the
-# fast path, so its count is not fixed by anything in its configuration either.
-threads_of() { ls "/proc/$1/task" 2>/dev/null | wc -l; }
-
-iou_workers_of() {
-    local pid=$1 n=0 t
-    for t in /proc/$pid/task/*; do
-        [[ -r "$t/comm" ]] || continue
-        [[ "$(cat "$t/comm" 2>/dev/null)" == iou-wrk-* ]] && n=$((n + 1))
-    done
-    echo "$n"
-}
-
 pid_on_port() {
     ss -ltnp 2>/dev/null | awk -v p=":$1\$" '$4 ~ p' \
         | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
 }
 
+# CPU a process has burned, in ticks, threads included.  /proc/PID/stat's utime
+# and stime are the whole thread group's, which is the point: socketley's proxy
+# creates and reaps io_uring workers inside a run, and their time lands here
+# even though counting threads afterwards never sees them.
 cpu_ticks_of() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
 
-log_section "Proxy vs HAProxy — one thread each"
+# Busy CPU across the box, in ticks.  Deliberately without iowait: iowait is
+# idle time that happens to have I/O outstanding, and on this box it runs to
+# four cores' worth during a benchmark.  Counting it as busy was how an earlier
+# version of this instrument reported a saturated machine with seven idle cores.
+box_busy_ticks() { awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat; }
+
+# What the rest of the machine is doing, in cores, measured with nothing of ours
+# running.  Sampled either side of a pair: a build that starts halfway through
+# would not be caught by a sample taken only before.
+box_load_cores() {
+    local t0 t1 w0 w1
+    t0=$(box_busy_ticks); w0=$(date +%s%N)
+    sleep 0.15
+    t1=$(box_busy_ticks); w1=$(date +%s%N)
+    awk -v d=$((t1 - t0)) -v hz="$HZ" -v ns=$((w1 - w0)) \
+        'BEGIN { printf "%.3f", d / hz / (ns / 1e9) }'
+}
+
+# ─── One measured run ───────────────────────────────────────────────────────
+#
+# Emits: rate proxy_cores backend_cores
+# Both CPU figures are per wall-clock second of the run, so 1.00 means the
+# process had one core busy for the whole of it.
+measure() {
+    local port=$1 mode=$2 a=$3 b=$4 px_pid=$5
+    local p0 p1 e0 e1 w0 w1 out rate
+
+    p0=$(cpu_ticks_of "$px_pid"); e0=$(cpu_ticks_of "$BE_PID"); w0=$(date +%s%N)
+    if [[ $mode == serial ]]; then
+        out=$(timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" -r 1 -d "$RUN_MS" \
+              proxy tcp 127.0.0.1 "$port" "$OPS_CAP" "$b" 2>/dev/null)
+    else
+        out=$(timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" -r 1 -d "$RUN_MS" \
+              proxy concurrent 127.0.0.1 "$port" "$a" "$OPS_CAP" 2>/dev/null)
+    fi
+    w1=$(date +%s%N); p1=$(cpu_ticks_of "$px_pid"); e1=$(cpu_ticks_of "$BE_PID")
+
+    rate=$(grep -oE '^\s*Median:\s+[0-9]+' <<<"$out" | grep -oE '[0-9]+' | head -1)
+    awk -v r="${rate:-0}" -v px=$((p1 - p0)) -v be=$((e1 - e0)) \
+        -v hz="$HZ" -v ns=$((w1 - w0)) \
+        'BEGIN { s = ns / 1e9; printf "%s %.3f %.3f", r, px / hz / s, be / hz / s }'
+}
+
+# ─── One case, as interleaved pairs ─────────────────────────────────────────
+#
+# Sets: C_A C_B C_RATIO C_CI C_A_CI C_APX C_BPX C_ABE C_BBE C_BE C_KEPT C_DROPPED
+# All of them, every time, so a caller cannot read a stale value from the case
+# before when this one fails.
+run_case() {
+    local mode=$1 a=$2 b=$3
+    local av=() bv=() rv=() apx=() bpx=() abe=() bbe=()
+    local a_rate a_px a_be b_rate b_px b_be
+    local kept=0 dropped=0 attempt=0 max_attempts=$((PAIRS * 2 + 2))
+
+    # A discarded warm-up pair.  The first run against a proxy that has just
+    # been left alone pays for a cold accept path on whichever arm goes first.
+    measure "$SK_PORT" "$mode" "$a" "$b" "$SK_PID" >/dev/null
+    measure "$B_PORT"  "$mode" "$a" "$b" "$B_PID"  >/dev/null
+
+    while (( kept < PAIRS && attempt < max_attempts )); do
+        attempt=$((attempt + 1))
+        local before after
+        before=$(box_load_cores)
+
+        local ra rb
+        # Alternate which arm leads.  Whatever the leading arm pays that the
+        # trailing one does not is then charged to each of them in turn.
+        if (( attempt % 2 == 1 )); then
+            ra=$(measure "$SK_PORT" "$mode" "$a" "$b" "$SK_PID")
+            rb=$(measure "$B_PORT"  "$mode" "$a" "$b" "$B_PID")
+        else
+            rb=$(measure "$B_PORT"  "$mode" "$a" "$b" "$B_PID")
+            ra=$(measure "$SK_PORT" "$mode" "$a" "$b" "$SK_PID")
+        fi
+        after=$(box_load_cores)
+
+        read -r a_rate a_px a_be <<<"$ra"
+        read -r b_rate b_px b_be <<<"$rb"
+
+        # Discard the whole pair, never one leg: a pair with one leg thrown away
+        # is exactly the unpaired comparison this is here to replace.
+        if awk -v x="$before" -v y="$after" -v lim="$QUIET_CORES" \
+               'BEGIN { exit !(x > lim || y > lim) }'; then
+            dropped=$((dropped + 1)); continue
+        fi
+        if [[ "${a_rate:-0}" -le 0 || "${b_rate:-0}" -le 0 ]]; then
+            dropped=$((dropped + 1)); continue
+        fi
+
+        av+=("$a_rate"); bv+=("$b_rate")
+        apx+=("$a_px");  bpx+=("$b_px")
+        abe+=("$a_be");  bbe+=("$b_be")
+        rv+=("$(awk -v x="$a_rate" -v y="$b_rate" 'BEGIN { printf "%.6f", x / y }')")
+        kept=$((kept + 1))
+    done
+
+    C_KEPT=$kept
+    C_DROPPED=$dropped
+    C_A=0; C_B=0; C_RATIO=0; C_CI=0; C_A_CI=0; C_APX=0; C_BPX=0
+    C_ABE=0; C_BBE=0; C_BE=0
+    if (( kept == 0 )); then return 0; fi
+
+    C_A=$(median_of "${av[*]}")
+    C_B=$(median_of "${bv[*]}")
+    C_APX=$(mean_of "${apx[*]}")
+    C_BPX=$(mean_of "${bpx[*]}")
+    # Per arm, and the median rather than the worst leg.  The question is
+    # whether the backend was the limit in the run this line reports, not
+    # whether it ever touched a whole core once in forty legs — with enough
+    # pairs a maximum finds an outlier every time.  Either arm saturating is
+    # enough to spoil the ratio: it is the faster arm that hits the ceiling
+    # first, and once it does, its number is the backend's and not its own.
+    C_ABE=$(median_of "${abe[*]}")
+    C_BBE=$(median_of "${bbe[*]}")
+    C_BE=$(awk -v x="$C_ABE" -v y="$C_BBE" 'BEGIN { print (x > y) ? x : y }')
+    C_RATIO=$(median_of "${rv[*]}")
+    C_CI=$(ci_pct_of "${rv[*]}")
+    C_A_CI=$(ci_pct_of "${av[*]}")
+}
+
+# ─── Small statistics, in awk ───────────────────────────────────────────────
+
+median_of() {
+    tr ' ' '\n' <<<"$1" | grep -E '^[0-9.]+$' | sort -g | awk '
+        {v[n++] = $1}
+        END { if (n == 0) { print 0; exit }
+              printf "%.6g", (n % 2) ? v[int(n/2)] : (v[n/2 - 1] + v[n/2]) / 2 }'
+}
+mean_of() {
+    tr ' ' '\n' <<<"$1" | grep -E '^[0-9.]+$' | awk \
+        '{s += $1; n++} END { printf "%.2f", n ? s / n : 0 }'
+}
+# Half-width of the 95% confidence interval of the mean, as a percentage of it.
+# Student's t, because at the five to nine repetitions a benchmark actually runs
+# the asymptotic 1.96 understates the interval by a fifth to a third — which is
+# the difference between "this resolves 15%" and "it does not".
+ci_pct_of() {
+    tr ' ' '\n' <<<"$1" | grep -E '^[0-9.]+$' | awk '
+        {v[n++] = $1; s += $1}
+        END {
+            if (n < 2 || s == 0) { print "0"; exit }
+            m = s / n
+            for (i = 0; i < n; i++) ss += (v[i] - m) ^ 2
+            sd = sqrt(ss / (n - 1))
+            split("0 0 12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 " \
+                  "2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
+            tv = (n <= 21) ? t[n + 1] : 1.96
+            printf "%.1f", 100 * tv * sd / sqrt(n) / m
+        }'
+}
+
+log_section "Proxy vs ${B_LABEL} — paired, timed, with a stated resolution"
 log_info "$HA_VERSION"
+log_info "ports ${BACKEND_PORT}/${SK_PORT}/${B_PORT}  ${PAIRS} pairs  ${RUN_MS} ms per run"
 
 # ─── The shared backend ──────────────────────────────────────────────────────
 #
@@ -128,7 +399,8 @@ socketley_cmd create proxy hap_prox -p "$SK_PORT" \
     --backend "127.0.0.1:$BACKEND_PORT" --protocol tcp -s
 wait_for_port "$SK_PORT" || { log_error "socketley proxy did not come up"; exit 1; }
 
-cat > "$WORK/haproxy.cfg" <<EOF
+if [[ -z "$PEER_PORT" ]]; then
+    cat > "$WORK/haproxy.cfg" <<EOF
 global
     nbthread 1
     maxconn 8192
@@ -147,114 +419,110 @@ backend be
     server s1 127.0.0.1:$BACKEND_PORT
 EOF
 
-haproxy -f "$WORK/haproxy.cfg" -db > "$WORK/haproxy.out" 2>&1 &
-HA_PID=$!
-wait_for_port "$HA_PORT" || { log_error "haproxy did not come up: $(cat "$WORK/haproxy.out")"; exit 1; }
+    haproxy -f "$WORK/haproxy.cfg" -db > "$WORK/haproxy.out" 2>&1 &
+    HA_PID=$!
+    wait_for_port "$HA_PORT" || { log_error "haproxy did not come up: $(cat "$WORK/haproxy.out")"; exit 1; }
+else
+    wait_for_port "$PEER_PORT" || { log_error "peer proxy on $PEER_PORT is not listening"; exit 1; }
+fi
 sleep 0.5
 
 SK_PID=$(pid_on_port "$SK_PORT")
 BE_PID=$(pid_on_port "$BACKEND_PORT")
-HA_RUN_PID=$(pgrep -x haproxy | head -1)
+B_PID=$(pid_on_port "$B_PORT")
 
-log_info "socketley proxy pid=$SK_PID  haproxy pid=$HA_RUN_PID  backend pid=$BE_PID"
+if [[ -z "$SK_PID" || -z "$BE_PID" || -z "$B_PID" ]]; then
+    log_error "could not identify one of the processes under test (sk=$SK_PID be=$BE_PID b=$B_PID)"
+    log_error "every CPU figure below would be zero, so nothing is measured"
+    exit 1
+fi
+log_info "socketley proxy pid=$SK_PID  ${B_LABEL} pid=$B_PID  backend pid=$BE_PID"
 
-# median_of "value value value" — the middle one, so a single outlier run does
-# not become the reported number.
-median_of() {
-    tr ' ' '\n' <<<"$1" | grep -E '^[0-9]+$' | sort -n \
-        | awk -v n="$(tr ' ' '\n' <<<"$1" | grep -cE '^[0-9]+$')" 'NR == int((n+1)/2)'
-}
+START_LOAD=$(box_load_cores)
+log_info "box load with nothing of ours running: ${START_LOAD} cores (pairs above ${QUIET_CORES} are discarded)"
 
-# one_case LABEL PORT MODE ARG1 ARG2 -> "median min max"
+# ─── Reporting ──────────────────────────────────────────────────────────────
 #
-# The spread is returned, not just the middle.  A single median hid a run-to-run
-# swing of 2.4x in the 8-connection case while this file was being written --
-# reported alone it would have been a finding, and it was the harness.  A reader
-# who can see min and max can tell the two apart; one who is handed one number
-# cannot.
-one_case() {
-    local port=$2 mode=$3 a=$4 b=$5 vals="" i out n
-    for ((i = 1; i <= RUNS; i++)); do
-        if [[ $mode == serial ]]; then
-            out=$(timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" -r 1 proxy tcp \
-                  127.0.0.1 "$port" "$a" "$b" 2>/dev/null)
-        else
-            out=$(timeout "$BENCH_TIMEOUT_CMD" "$SOCKETLEY_BENCH" -r 1 proxy concurrent \
-                  127.0.0.1 "$port" "$a" "$b" 2>/dev/null)
-        fi
-        n=$(grep -oE '^\s*Median:\s+[0-9]+' <<<"$out" | grep -oE '[0-9]+' | head -1)
-        vals+="${n:-0} "
-    done
-    local med lo hi
-    med=$(median_of "$vals")
-    lo=$(tr ' ' '\n' <<<"$vals" | grep -E '^[0-9]+$' | sort -n | head -1)
-    hi=$(tr ' ' '\n' <<<"$vals" | grep -E '^[0-9]+$' | sort -n | tail -1)
-    echo "$med $lo $hi"
+# The verdict column, not the ratio, is the thing to read first.  A ratio whose
+# interval is wider than the difference it claims is not a weaker result, it is
+# not a result.
+WORST_CI=0
+
+verdict_of() {   # ci kept backend_cores -> text
+    local ci=$1 kept=$2 be=$3
+    if (( kept == 0 )); then echo "no pair survived — the box was never quiet"; return; fi
+    if (( kept < 3 )); then echo "only $kept pair(s) survived — no interval"; return; fi
+    if awk -v b="$be" 'BEGIN { exit !(b > 0.85) }'; then
+        echo "backend-bound (${be} cores) — measures the backend"
+        return
+    fi
+    if awk -v c="$ci" -v t="$TARGET_PCT" 'BEGIN { exit !(c > t) }'; then
+        echo "cannot resolve ${TARGET_PCT}% — only ${ci}% and coarser"
+        return
+    fi
+    echo "resolves ${TARGET_PCT}%"
 }
 
-ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 == 0) print "N/A"; else printf "%.2fx", a/b }'; }
+emit() {   # label mode a b
+    local label=$1 mode=$2 a=$3 b=$4
+    run_case "$mode" "$a" "$b"
+    local v; v=$(verdict_of "$C_CI" "$C_KEPT" "$C_BE")
+    awk -v c="$C_CI" -v w="$WORST_CI" 'BEGIN { exit !(c > w) }' && WORST_CI=$C_CI
+
+    local pa pb pr
+    pa=$(printf '%.0f' "$C_A"); pb=$(printf '%.0f' "$C_B")
+    pr=$(printf '%.2f' "$C_RATIO")
+    printf "  %-11s %8s %8s   %6sx  ±%-6s %s\n" \
+        "$label" "$pa" "$pb" "$pr" "${C_CI}%" "$v"
+
+    append_result
+    cat >> "$RESULTS_FILE" <<EOF
+  {"test": "proxy_vs_${B_LABEL}_${mode}", "case": "$label",
+   "payload_bytes": ${b:-64}, "connections": ${a:-1},
+   "pairs_kept": $C_KEPT, "pairs_discarded_unquiet": $C_DROPPED,
+   "run_ms": $RUN_MS,
+   "socketley_rt_sec": ${C_A:-0}, "${B_LABEL}_rt_sec": ${C_B:-0},
+   "ratio_socketley_over_${B_LABEL}": ${C_RATIO:-0},
+   "ratio_ci95_half_width_pct": ${C_CI:-0},
+   "socketley_ci95_half_width_pct": ${C_A_CI:-0},
+   "socketley_proxy_cores": ${C_APX:-0}, "${B_LABEL}_proxy_cores": ${C_BPX:-0},
+   "backend_cores_during_socketley": ${C_ABE:-0},
+   "backend_cores_during_${B_LABEL}": ${C_BBE:-0},
+   "resolution_target_pct": $TARGET_PCT,
+   "verdict": "$v",
+   "peer_version": "$(sed 's/"/ /g' <<<"$HA_VERSION")"}
+EOF
+}
 
 # ─── Serial: one connection, one request in flight ──────────────────────────
 #
 # The latency regime.  Nothing to batch, so every wake-up shows up in the
 # number, which is exactly where the two implementations differ most.
 echo ""
-printf "  %-12s %8s %-13s %8s %-13s %8s\n" "payload" "sk" "[min-max]" "hap" "[min-max]" "s/h"
-printf "  %-12s %8s %-13s %8s %-13s %8s\n" "──────────" "───────" "───────────" "───────" "───────────" "───────"
+printf "  %-11s %8s %8s   %7s  %-7s %s\n" "payload" "sk" "$B_LABEL" "sk/$B_LABEL" "±95%CI" "verdict"
+printf "  %-11s %8s %8s   %7s  %-7s %s\n" "─────────" "───────" "───────" "───────" "──────" "───────"
 for sz in $SIZES; do
-    b0=$(cpu_ticks_of "$BE_PID")
-    read -r SK SK_LO SK_HI <<<"$(one_case sk "$SK_PORT" serial "$SERIAL_MSGS" "$sz")"
-    b1=$(cpu_ticks_of "$BE_PID")
-    read -r HA HA_LO HA_HI <<<"$(one_case ha "$HA_PORT" serial "$SERIAL_MSGS" "$sz")"
-    b2=$(cpu_ticks_of "$BE_PID")
-
-    printf "  %-12s %8s [%s-%s] %8s [%s-%s] %8s\n" "${sz} B" \
-        "$SK" "$SK_LO" "$SK_HI" "$HA" "$HA_LO" "$HA_HI" "$(ratio "$SK" "$HA")"
-
-    append_result
-    cat >> "$RESULTS_FILE" <<EOF
-  {"test": "proxy_vs_haproxy_serial", "payload_bytes": $sz, "connections": 1,
-   "messages": $SERIAL_MSGS, "runs": $RUNS,
-   "socketley_rt_sec": ${SK:-0}, "socketley_rt_min": ${SK_LO:-0}, "socketley_rt_max": ${SK_HI:-0},\n   "haproxy_rt_sec": ${HA:-0}, "haproxy_rt_min": ${HA_LO:-0}, "haproxy_rt_max": ${HA_HI:-0},
-   "socketley_threads": $(threads_of "$SK_PID"), "socketley_iou_workers": $(iou_workers_of "$SK_PID"),
-   "haproxy_threads": $(threads_of "$HA_RUN_PID"),
-   "backend_cpu_ticks_socketley_run": $((b1 - b0)),
-   "backend_cpu_ticks_haproxy_run": $((b2 - b1)),
-   "haproxy_version": "$(sed 's/"/ /g' <<<"$HA_VERSION")"}
-EOF
+    emit "${sz} B" serial "" "$sz"
 done
 
 # ─── Concurrent: where the wake-ups amortise ────────────────────────────────
 echo ""
-printf "  %-12s %8s %-13s %8s %-13s %8s\n" "conns" "sk" "[min-max]" "hap" "[min-max]" "s/h"
-printf "  %-12s %8s %-13s %8s %-13s %8s\n" "──────────" "───────" "───────────" "───────" "───────────" "───────"
+printf "  %-11s %8s %8s   %7s  %-7s %s\n" "conns" "sk" "$B_LABEL" "sk/$B_LABEL" "±95%CI" "verdict"
+printf "  %-11s %8s %8s   %7s  %-7s %s\n" "─────────" "───────" "───────" "───────" "──────" "───────"
 for c in $CONNS; do
-    b0=$(cpu_ticks_of "$BE_PID")
-    read -r SK SK_LO SK_HI <<<"$(one_case sk "$SK_PORT" concurrent "$c" "$MSGS_PER_CONN")"
-    b1=$(cpu_ticks_of "$BE_PID")
-    read -r HA HA_LO HA_HI <<<"$(one_case ha "$HA_PORT" concurrent "$c" "$MSGS_PER_CONN")"
-    b2=$(cpu_ticks_of "$BE_PID")
-
-    printf "  %-12s %8s [%s-%s] %8s [%s-%s] %8s\n" "$c" \
-        "$SK" "$SK_LO" "$SK_HI" "$HA" "$HA_LO" "$HA_HI" "$(ratio "$SK" "$HA")"
-
-    append_result
-    cat >> "$RESULTS_FILE" <<EOF
-  {"test": "proxy_vs_haproxy_concurrent", "payload_bytes": 64, "connections": $c,
-   "messages_per_connection": $MSGS_PER_CONN, "runs": $RUNS,
-   "socketley_rt_sec": ${SK:-0}, "socketley_rt_min": ${SK_LO:-0}, "socketley_rt_max": ${SK_HI:-0},\n   "haproxy_rt_sec": ${HA:-0}, "haproxy_rt_min": ${HA_LO:-0}, "haproxy_rt_max": ${HA_HI:-0},
-   "socketley_threads": $(threads_of "$SK_PID"), "socketley_iou_workers": $(iou_workers_of "$SK_PID"),
-   "haproxy_threads": $(threads_of "$HA_RUN_PID"),
-   "backend_cpu_ticks_socketley_run": $((b1 - b0)),
-   "backend_cpu_ticks_haproxy_run": $((b2 - b1)),
-   "haproxy_version": "$(sed 's/"/ /g' <<<"$HA_VERSION")"}
-EOF
+    emit "$c" concurrent "$c" 64
 done
 
 echo "" >> "$RESULTS_FILE"
 echo "]" >> "$RESULTS_FILE"
 
 echo ""
-log_info "socketley proxy: $(threads_of "$SK_PID") thread(s), $(iou_workers_of "$SK_PID") of them io_uring kernel workers"
-log_info "haproxy:         $(threads_of "$HA_RUN_PID") thread(s)"
+log_info "the widest interval in this run was ±${WORST_CI}% — a difference smaller"
+log_info "than that, in any case above, is this machine and not the proxy"
+if awk -v w="$WORST_CI" -v t="$TARGET_PCT" 'BEGIN { exit !(w > t) }'; then
+    log_warn "at least one case could not resolve ${TARGET_PCT}%; raise the pair count"
+    log_warn "(first argument, currently $PAIRS) — the interval narrows as 1/sqrt(pairs),"
+    log_warn "so four times the pairs halves it.  A longer BENCH_RUN_MS will not help:"
+    log_warn "measured on this box, 1700 ms to 4400 ms moved it by two points."
+fi
 log_info "results: $RESULTS_FILE"

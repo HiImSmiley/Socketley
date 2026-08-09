@@ -5,13 +5,19 @@
 
 source "$(dirname "$0")/utils.sh"
 
-PROXY_PORT=19080
-BACKEND_PORT_1=19081
+# Ports, from one base.  These were fixed at 19080-19082, inside the range the
+# integration suite binds, so a benchmark and a test run could not share a
+# machine — and neither of them says so when they collide; they say the proxy
+# was slow.  bench_proxy_vs_haproxy.sh takes the same base and the offsets below
+# keep the two scripts clear of each other.
+BENCH_PORT_BASE=${BENCH_PORT_BASE:-23000}
+PROXY_PORT=$((BENCH_PORT_BASE + 10))
+BACKEND_PORT_1=$((BENCH_PORT_BASE + 11))
 # Connections in flight for the two HTTP tests.  40 because that is what the
 # bash version ran per batch, so the load the proxy sees is unchanged and only
 # the client measuring it is different.
 HTTP_CONCURRENCY=${HTTP_CONCURRENCY:-40}
-BACKEND_PORT_2=19082
+BACKEND_PORT_2=$((BENCH_PORT_BASE + 12))
 RESULTS_FILE="${RESULTS_DIR}/proxy_${TIMESTAMP}.json"
 
 echo "[" > "$RESULTS_FILE"
@@ -250,11 +256,25 @@ test_concurrent_proxy_connections() {
 }
 
 # Test 5: Proxy connection overhead (direct vs proxied) — uses socketley-bench
+#
+# Timed and paired now, not counted and single-shot.  At 500 round trips a leg
+# this test measured for seventeen milliseconds and then divided one such number
+# by another: over seven repetitions on a quiet box its direct leg alone spanned
+# 60976..75092, and under a six-core background load the same seven repetitions
+# reported overheads between 11.1% and 75.8%.  Nothing in the output said which
+# of those to believe, and an earlier form of it put a -106% in a results file.
+# The paired form under that same load reported 69.4% ±3.1 and 69.6% ±2.4, and
+# declined to answer on the third invocation instead of guessing.
+#
+# OVERHEAD_PAIRS pairs of OVERHEAD_MS milliseconds each: 5 x 2 x 800 ms is eight
+# seconds of measurement, against the third of a second the old form spent.
 test_proxy_overhead() {
-    local num_requests=${1:-1000}
+    local ops_cap=${1:-100000000}
     local test_name="proxy_overhead"
+    local pairs=${OVERHEAD_PAIRS:-5}
+    local leg_ms=${OVERHEAD_MS:-800}
 
-    log_section "Test: Proxy Overhead (Direct vs Proxied)"
+    log_section "Test: Proxy Overhead (Direct vs Proxied, $pairs pairs of ${leg_ms}ms)"
 
     ensure_clean
     # An echoing backend, unlike the other tests here.  This one compares two
@@ -270,8 +290,10 @@ test_proxy_overhead() {
     sleep 0.5
 
     append_result
-    bench_run -j proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1 >> "$RESULTS_FILE"
-    bench_run proxy overhead 127.0.0.1 $PROXY_PORT $num_requests $BACKEND_PORT_1
+    bench_run -j -r "$pairs" -W 1 -d "$leg_ms" proxy overhead 127.0.0.1 $PROXY_PORT \
+        "$ops_cap" $BACKEND_PORT_1 >> "$RESULTS_FILE"
+    bench_run -r "$pairs" -W 1 -d "$leg_ms" proxy overhead 127.0.0.1 $PROXY_PORT \
+        "$ops_cap" $BACKEND_PORT_1
 
     socketley_cmd stop bench_proxy
     socketley_cmd stop backend1
@@ -336,7 +358,7 @@ run_proxy_benchmarks() {
     fresh_daemon
 
     log_bench "START" "proxy_overhead"
-    test_proxy_overhead 500
+    test_proxy_overhead
     log_bench "DONE" "proxy_overhead"
     fresh_daemon
 

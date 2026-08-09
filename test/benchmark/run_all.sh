@@ -127,12 +127,16 @@ run_benchmarks() {
     restart_daemon
 
     # The proxy's scale, the same arrangement bench_cache_resp.sh gives the
-    # cache: one thread each, one shared backend, one client.  One repetition
-    # inside the standard run for the same reason as the Redis comparison —
-    # raise BENCH_HAPROXY_RUNS when the numbers matter, since the concurrent
-    # cases need several before their spread means anything.  Exits cleanly
-    # when haproxy is not installed.
-    export BENCH_HAPROXY_RUNS=1
+    # cache: one shared backend, one client, and both proxies measured in
+    # interleaved pairs.  Three pairs inside the standard run: that is the
+    # fewest that yields a confidence interval at all, and the file's own output
+    # is built around printing one.  This used to be 1, which the script now
+    # refuses — a single pair produces a ratio with no error bar, which is the
+    # form the concurrent cases were unreadable in.  Raise BENCH_HAPROXY_RUNS
+    # when the numbers matter: the interval narrows as 1/sqrt(pairs), and on a
+    # ten-core box the 8-connection case needed about twenty pairs to get under
+    # 15%.  Exits cleanly when haproxy is not installed.
+    export BENCH_HAPROXY_RUNS=3
     run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
     unset BENCH_HAPROXY_RUNS
     restart_daemon
