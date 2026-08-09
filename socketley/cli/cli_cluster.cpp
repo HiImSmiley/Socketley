@@ -307,6 +307,23 @@ static int cluster_group(const std::string& dir, std::string_view group_name)
 
 static int cluster_show(const std::string& dir, std::string_view daemon_name)
 {
+    // The name is pasted into a path, so it has to be a name.  Nothing checked
+    // it, and `cluster show ../../etc/passwd` read <dir>/../../etc/passwd.json —
+    // harmless in itself, since it opens with the caller's own rights and only
+    // prints, but it is the same string cmd_daemon_name validates for exactly
+    // this reason one process over.  A cluster file is named after a daemon,
+    // and a daemon name has no path in it.
+    if (daemon_name.empty() ||
+        daemon_name.find('/')  != std::string_view::npos ||
+        daemon_name.find('\\') != std::string_view::npos ||
+        daemon_name.find("..") != std::string_view::npos)
+    {
+        std::cerr << "invalid daemon name: " << daemon_name << "\n"
+                  << "  A daemon name is a file name in the cluster directory, "
+                     "not a path.\n";
+        return 1;
+    }
+
     std::string path = dir + "/" + std::string(daemon_name) + ".json";
     std::ifstream f(path);
     if (!f.is_open())

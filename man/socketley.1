@@ -652,6 +652,25 @@ are ignored. Fields marked
 cannot be changed while the runtime is running.
 Port, protocol, and UDP settings cannot be changed while running.
 .PP
+.B "A field the document does not mention is left alone."
+Only what is named is applied, so a partial document changes only those fields.
+Clearing one is written out rather than implied \(em
+.BR """tls"": false" ,
+.BR """cert_path"": """"" \(em because a document that simply omitted a field
+used to CLEAR it, and a runtime configured for TLS could be handed
+.B {"name":"x"}
+and answer in cleartext afterwards with the command reporting success.
+.PP
+.B import
+is also the fuller of the two ways to reconfigure a runtime.
+.B edit
+takes a subset of the flags: it has no cache\-specific ones at all, and no
+.BR \-\-backend " or " \-\-lua .
+Anything it refuses with "unknown flag" can still be set by dumping the
+document with
+.BR show ,
+changing the field and importing it back.
+.PP
 A JSON document is held to the same rules the flags are: on every runtime type
 .BR tls ,
 .BR cert_path ,
@@ -1369,6 +1388,13 @@ Serve static files from the given directory over HTTP. When a browser makes a
 plain HTTP GET request (without a WebSocket upgrade header), the server responds
 with the requested file. GET / serves index.html. HTML files (.html, .htm)
 automatically get a WebSocket connection script injected before </head>.
+.IP
+.B "Note that this modifies the file it serves."
+Every .html and .htm response is rewritten on its way out, so a directory
+holding documents this server did not author \(em uploads, a generated report,
+a third\-party page \(em is delivered altered, with a script that opens a
+WebSocket back to this runtime. There is no flag to turn it off; if that is not
+wanted, serve those files from something else.
 Content-Type is detected from the file extension. WebSocket upgrades continue
 to work as before on the same port. Only GET requests are served; other HTTP
 methods fall through to raw TCP handling.
@@ -1633,6 +1659,13 @@ is refused \(em that would need DTLS.
 .SH PROXY FLAGS
 .TP
 .BI "\-\-backend " "addr"
+.B IPv4 only.
+Every address this daemon resolves or binds is AF_INET: a backend, an upstream,
+a client target and every listener. A hostname that has only a AAAA record
+resolves to nothing and the backend is reported unreachable, with no line
+anywhere saying why. This is a property of the whole daemon and not of this
+flag; it is written here because this is where an operator meets it first.
+.IP
 Add backend server. Can be ip:port, runtime name, or
 .BI @ groupname
 to dynamically target all running members of that group. Repeatable or comma-separated.
@@ -2063,6 +2096,16 @@ Access control mode:
 .BI "\-\-maxmemory " "size"
 Maximum memory for cache data. Supports K, M, G suffixes (e.g., 100M, 1G).
 When exceeded, behavior depends on eviction policy. 0 means unlimited (default).
+.IP
+Suffixes are
+.BR K ", " M " and " G
+and nothing else: a value the parser cannot read whole is refused rather than
+half\-read. That matters because the obvious near\-misses used to be accepted
+silently \(em
+.B 100MB
+was taken as a hundred BYTES, and a value so large that the multiplication
+wrapped came out as 0, which is the spelling for "unlimited". Both are errors
+now.
 .TP
 .BI "\-\-eviction " "policy"
 Eviction policy when maxmemory is reached:
@@ -2639,6 +2682,19 @@ has all of these.
 It is not sandboxed and there is no supported way to sandbox it. Read a
 handler the way you would read a program you are about to run as the user the
 daemon runs as, because that is exactly what it is.
+.PP
+Which makes the control socket's permission the whole of the boundary. A
+handler is attached with
+.BR "create \-\-lua" ,
+which is an ordinary command on that socket, so whoever may open it may run
+code as the daemon's user. The socket is
+.B 0600
+for a daemon you start yourself, and
+.B "0660 socketley:socketley"
+for the packaged one \(em membership of that group is therefore equivalent to
+being the daemon's user, and should be granted on that understanding. This is
+the same arrangement Docker has, and it is worth stating rather than inferring:
+nothing else in this daemon stands between a local account and the handler.
 .PP
 Concretely, a handler can:
 .TP
@@ -4851,6 +4907,15 @@ Load complex configuration:
 socketley --lua /etc/socketley/setup.lua
 .fi
 .SH CLUSTER MODE
+.B "The cluster directory is as privileged as the daemons that read it."
+A proxy with an
+.BI @ group
+backend picks its targets out of the files in that directory, so whoever can
+write there decides where that traffic goes. Treat write access to it exactly
+as you would treat the control socket: it belongs to the daemons and to nobody
+else. A shared volume between containers you control is the intended
+arrangement; a directory any other workload can write to is not.
+.PP
 Multi-daemon cluster discovery allows proxies to route to runtimes on remote
 daemons. Each daemon publishes its state to a shared directory (typically a
 Docker volume) every 2 seconds. Stale entries (heartbeat older than 10s) are
@@ -5090,6 +5155,18 @@ or by recreating the runtime.
 Read at daemon startup; all are optional. The first selects which daemon this
 is. The rest are tuning knobs whose defaults suit a general-purpose deployment
 and only need changing for an unusual workload.
+.TP
+.B SOCKETLEY_CACHE_BUF_SIZE
+Bytes per cache read buffer. Default suits ordinary key/value traffic; raise it
+only for a workload whose values routinely exceed it.
+.TP
+.B SOCKETLEY_CACHE_BUF_COUNT
+How many of those buffers a cache keeps.
+.TP
+.B SOCKETLEY_CACHE_TTL_SWEEP_MS
+How often a cache walks its expiry table, in milliseconds. Lower means expired
+keys disappear sooner and the sweep runs more often; the sweep is on the event
+loop thread, so it is not free.
 .TP
 .B SOCKETLEY_SOCKET
 Which daemon you are, or which one you are talking to. Overrides the default
