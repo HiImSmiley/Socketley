@@ -919,8 +919,12 @@ int cli_edit(int argc, char** argv)
         std::ofstream f(tmp_file, std::ios::trunc);
         if (!f.is_open())
         {
+            // tmp_file, not tmpl.  The rename above succeeded, so the name in
+            // tmpl no longer exists and this unlinked nothing — leaving the
+            // real file behind with the runtime's whole configuration in it,
+            // master_pw included.
             std::cerr << "failed to write temporary file\n";
-            unlink(tmpl);
+            unlink(tmp_file.c_str());
             return 2;
         }
         f << dump_data;

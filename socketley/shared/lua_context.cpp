@@ -2225,15 +2225,32 @@ static std::string json_decode_string(const char*& p, const char* end)
                 {
                     if (p + 4 < end)
                     {
+                        // The four digits are checked now.  A non-hex character
+                        // matched none of the three branches and contributed a
+                        // silent zero, so `\uZZZZ` decoded to U+0000 and
+                        // `\u00g0` to something no reader intended.  Malformed
+                        // input is kept verbatim instead, which is what the
+                        // `default` arm of this switch already does for every
+                        // other unknown escape.
                         unsigned cp = 0;
+                        bool hex_ok = true;
+                        const char* const digits = p + 1;
                         for (int i = 0; i < 4; ++i)
                         {
-                            ++p;
+                            const char d = digits[i];
                             cp <<= 4;
-                            if (*p >= '0' && *p <= '9')      cp |= static_cast<unsigned>(*p - '0');
-                            else if (*p >= 'a' && *p <= 'f') cp |= static_cast<unsigned>(*p - 'a' + 10);
-                            else if (*p >= 'A' && *p <= 'F') cp |= static_cast<unsigned>(*p - 'A' + 10);
+                            if (d >= '0' && d <= '9')      cp |= static_cast<unsigned>(d - '0');
+                            else if (d >= 'a' && d <= 'f') cp |= static_cast<unsigned>(d - 'a' + 10);
+                            else if (d >= 'A' && d <= 'F') cp |= static_cast<unsigned>(d - 'A' + 10);
+                            else { hex_ok = false; break; }
                         }
+                        if (!hex_ok)
+                        {
+                            result += '\\';
+                            result += 'u';
+                            break;
+                        }
+                        p += 4;
                         if (cp < 0x80)
                             result += static_cast<char>(cp);
                         else if (cp < 0x800)

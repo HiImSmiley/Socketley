@@ -1821,10 +1821,20 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--group"):   col_group   = true; break;
         }
         // Handle --format json
+        // `--format json` is the only spelling there is.  Anything else was
+        // consumed and ignored, so `--format xml` produced the default table
+        // and said nothing — an operator asking for a format they do not have
+        // deserves to be told, not answered in a different one.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
                 json_format = true;
+            else
+            {
+                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
+                                  " (the only one is json)\n";
+                return 1;
+            }
             ++i;
         }
     }
@@ -2024,10 +2034,20 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
         }
+        // `--format json` is the only spelling there is.  Anything else was
+        // consumed and ignored, so `--format xml` produced the default table
+        // and said nothing — an operator asking for a format they do not have
+        // deserves to be told, not answered in a different one.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
                 json_format = true;
+            else
+            {
+                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
+                                  " (the only one is json)\n";
+                return 1;
+            }
             ++i;
         }
     }

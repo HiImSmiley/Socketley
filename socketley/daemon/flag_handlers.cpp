@@ -645,6 +645,28 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 std::cout << "--health-path requires a value\n";
                 return 1;
             }
+            {
+                // The value is written into a GET request line as it stands, so
+                // anything that is not a path produces a request the backend
+                // cannot parse — which comes back as a failed health check, and
+                // every backend goes down for a reason that is a typo in a flag
+                // nobody thinks to re-read.
+                //
+                // Only the leading slash is checked, and that is deliberate:
+                // parsed_args splits the command line on whitespace before this
+                // runs, so `--health-path "/a b"` never arrives here as one
+                // argument — it arrives as `/a` followed by an unknown flag `b`,
+                // which is already refused one layer up.  A whitespace check
+                // here would be unreachable code with a comment claiming it
+                // guarded something.  Measured: the daemon answers
+                // "unknown flag: b".
+                const std::string_view hp = pa.args[i + 1];
+                if (hp.empty() || hp.front() != '/')
+                {
+                    std::cout << "--health-path must begin with '/'\n";
+                    return 1;
+                }
+            }
             proxy->set_health_path(pa.args[++i]);
             return 0;
         }
@@ -1355,6 +1377,28 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
             {
                 std::cout << "--health-path requires a value\n";
                 return 1;
+            }
+            {
+                // The value is written into a GET request line as it stands, so
+                // anything that is not a path produces a request the backend
+                // cannot parse — which comes back as a failed health check, and
+                // every backend goes down for a reason that is a typo in a flag
+                // nobody thinks to re-read.
+                //
+                // Only the leading slash is checked, and that is deliberate:
+                // parsed_args splits the command line on whitespace before this
+                // runs, so `--health-path "/a b"` never arrives here as one
+                // argument — it arrives as `/a` followed by an unknown flag `b`,
+                // which is already refused one layer up.  A whitespace check
+                // here would be unreachable code with a comment claiming it
+                // guarded something.  Measured: the daemon answers
+                // "unknown flag: b".
+                const std::string_view hp = pa.args[i + 1];
+                if (hp.empty() || hp.front() != '/')
+                {
+                    std::cout << "--health-path must begin with '/'\n";
+                    return 1;
+                }
             }
             proxy->set_health_path(pa.args[++i]);
             return 0;

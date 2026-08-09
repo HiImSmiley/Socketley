@@ -121,6 +121,23 @@ void proxy_instance::retire(std::shared_ptr<void> storage, io_request* const* ow
     retired_op op;
     op.storage = std::move(storage);
     constexpr size_t max_waiting = sizeof(op.waiting) / sizeof(op.waiting[0]);
+
+    // ─── The truncation this cannot afford to be silent about ───────────────
+    //
+    // waiting[] holds the requests the ring still owes this storage, and the
+    // storage is freed once every one of them has reported.  An entry that does
+    // not fit is a completion nobody is waiting for — which is the use-after-
+    // free this whole retire/absorb machinery exists to prevent, reopened
+    // quietly.
+    //
+    // Unreachable today: a connection struct carries at most six io_requests,
+    // which is exactly the size of the array.  It is a seventh request type
+    // that would reach it, added by someone who had no reason to look here.
+    // The bound is one comparison on a path that runs per connection teardown.
+    if (SOCKETLEY_UNLIKELY(count > max_waiting))
+        LOG_ERROR("proxy: a retired connection owes the ring more requests than "
+                  "the graveyard can track; its storage may be freed early");
+
     for (size_t i = 0; i < count && op.count < max_waiting; i++)
         op.waiting[op.count++] = owed[i];
     m_retired.push_back(std::move(op));
@@ -7497,6 +7514,24 @@ void proxy_instance::health_check_sweep()
     }
 }
 
+// Is this an HTTP response with a 2xx status.
+//
+// The test was `buf[9] == '2'` on a length above twelve — the byte where the
+// status code starts IF the response begins with "HTTP/1.x ".  Nothing checked
+// that it did, so any service answering something with a '2' at offset nine was
+// marked healthy: a TLS alert, a Redis error, a line of JSON.  A backend that
+// speaks the wrong protocol entirely would stay in rotation.
+//
+// The version digit is deliberately not pinned: HTTP/1.0 and HTTP/1.1 both
+// answer health checks, and pinning it would fail the ones that reply 1.0.
+static bool health_is_2xx(const char* buf, size_t len)
+{
+    if (len < 13) return false;
+    if (std::memcmp(buf, "HTTP/1.", 7) != 0) return false;
+    if (buf[8] != ' ') return false;
+    return buf[9] == '2';
+}
+
 void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req)
 {
     // Find which health check this belongs to
@@ -7753,13 +7788,12 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
                     drop_health_check(slot);
                 return;
             }
-            got_2xx = (hc->plain_len > 12 && hc->buf[9] == '2');
+            got_2xx = health_is_2xx(hc->buf, hc->plain_len);
         }
         else if (cqe->res > 12)
         {
             hc->buf[cqe->res] = '\0';
-            if (hc->buf[9] == '2')
-                got_2xx = true;
+            got_2xx = health_is_2xx(hc->buf, static_cast<size_t>(cqe->res));
         }
 
         record(got_2xx);

@@ -37,7 +37,22 @@ std::string json_escape(std::string_view s)
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                // Everything below 0x20 has to go as \u00xx or the document is
+                // not JSON.  Three of them were named above and the other
+                // twenty-six were emitted raw — reachable through any path
+                // field, which is operator text nothing validates.  The Lua
+                // encoder in lua_context.cpp has had this for longer.
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char hex[8];
+                    std::snprintf(hex, sizeof(hex), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += hex;
+                }
+                else
+                    out += c;
+                break;
         }
     }
     return out;
@@ -54,7 +69,22 @@ void json_escape_into(std::string& out, std::string_view s)
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                // Everything below 0x20 has to go as \u00xx or the document is
+                // not JSON.  Three of them were named above and the other
+                // twenty-six were emitted raw — reachable through any path
+                // field, which is operator text nothing validates.  The Lua
+                // encoder in lua_context.cpp has had this for longer.
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char hex[8];
+                    std::snprintf(hex, sizeof(hex), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += hex;
+                }
+                else
+                    out += c;
+                break;
         }
     }
 }
