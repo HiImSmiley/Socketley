@@ -193,16 +193,32 @@ fi
 
 # ── the asymmetry this found, held down so it cannot drift further ──────────
 #
-# There is no parse_cache_edit_flags.  A cache is editable only through the
-# common flags, so nothing a cache is actually configured with — --resp,
-# --maxmemory, --eviction, the replication flags — can be changed after create;
-# `edit` answers `unknown flag`, which reads like a typo rather than a missing
-# parser.  Recorded rather than fixed, because widening `edit` is a decision
-# about the CLI and not a bug in it.  If a cache edit parser is added, this
-# assertion goes red and should be deleted along with this paragraph.
+# There is still no parse_cache_edit_flags.  A cache is editable only through
+# the common flags, so nothing a cache is actually configured with — --resp,
+# --maxmemory, --eviction, the replication flags — can be changed by `edit`.
+# That stays a decision about the CLI rather than a bug in it, and `import`
+# applies all of them.
+#
+# What HAS changed is the sentence.  This used to check for `unknown flag`,
+# which reads like a typo and sends the operator looking for a spelling that
+# does not exist; the refusal names `import` now.  The assertion moved with it
+# rather than being deleted, because the thing it guards is unchanged: a
+# cache-only flag must not be silently accepted by a command that cannot apply
+# it.  If a cache edit parser is ever added, this goes red again and should be
+# deleted along with this paragraph.
 CACHE_ONLY=$("$BIN" edit efs_cache --resp 2>&1 | head -1)
+CACHE_ALL=$("$BIN" edit efs_cache --resp 2>&1 || true)
 case "$CACHE_ONLY" in
-    "unknown flag:"*) ok ;;
+    *"cannot be changed with"*)
+        # And it has to say where to go, or it is `unknown flag` with extra
+        # words: the whole point of the message is the way out.
+        if grep -q "import" <<<"$CACHE_ALL"; then ok
+        else bad "the cache-flag refusal names import" \
+                 "edit efs_cache --resp said '$CACHE_ALL'"; fi ;;
+    "unknown flag:"*)
+        bad "the cache-flag refusal explains itself" \
+            "edit efs_cache --resp still answers 'unknown flag', which reads" \
+            "as a typo — no spelling of --resp works on this command" ;;
     *) bad "a cache still has no edit parser of its own" \
            "edit efs_cache --resp answered '$CACHE_ONLY'" \
            "if a cache edit parser was added, delete this assertion" ;;
