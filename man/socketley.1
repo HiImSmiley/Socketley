@@ -1707,6 +1707,28 @@ Load balancing strategy:
 (default, path-based routing) or
 .B tcp
 (raw byte forwarding).
+.IP
+In
+.B tcp
+mode a client that shuts its write side with
+.BR shutdown (2)
+has that half\-close passed on to the backend, and the return direction is held
+open until the backend itself closes. That is the only way a byte relay can tell
+a backend where a request ended \(em there is no framing to say so \(em and it
+is what makes
+.BR "nc \-N" ,
+a one\-shot
+.BR redis\-cli ,
+and any shell pipeline into the proxy work: each of those sends, half\-closes,
+and then reads the answer. The half\-close is issued only once everything the
+client sent has actually reached the backend socket, so it cannot overtake the
+request it terminates.
+.IP
+What ends the hold is the backend's own close, a client that resets, or
+.B \-\-idle\-timeout
+where one is set. A half\-closed client is held no longer than one that never
+half\-closed: a TCP relay has no request and no response, so no deadline sweep
+applies to either.
 .PP
 Default port: 8080
 .PP
@@ -5362,6 +5384,38 @@ whole number of milliseconds in 0\(en3600000 is refused with a warning and the
 default is used.
 .IP
 Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_PROXY_SPLICE
+Forward
+.B \-\-protocol tcp
+proxy traffic with
+.BR splice (2)
+through io_uring instead of copying it through userspace. Unset (off) by
+default; any value other than
+.B 0
+turns it on. Read once per process and inherited by worker processes.
+.IP
+Off because it is slower here, and not by a little.
+.B IORING_OP_SPLICE
+is prepped
+.B REQ_F_FORCE_ASYNC
+in the kernel, so every splice is handed to an io\-wq worker thread \(em a cost
+per transfer that no way of submitting it avoids. Measured on loopback, one
+connection, serial round trips through a proxy in front of an echoing backend,
+round\-trip p50: 47.9\ \(mcs spliced against 26.3\ \(mcs copied at 128 B, 57.3
+against 38.4 at 16 KB, and 394.5 against 350.5 at 256 KB. The copy path wins at
+every size measured. It also costs a third less CPU \(em 0.53 cores against
+0.86 at 128 B, which is 2.9 times the CPU per request for splice.
+.IP
+It is kept because what was measured is one machine and one shape of traffic.
+Zero copy is a claim about memory bandwidth; the case it could still win is
+bulk streaming across a real NIC on a box with less of it, and nobody has
+measured that. A TLS listener or TLS backend never splices whatever this is set
+to, and neither does a proxy with an
+.B on_proxy_request
+or
+.B on_proxy_response
+hook \(em the kernel moves those bytes without the script ever seeing them.
 .TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by

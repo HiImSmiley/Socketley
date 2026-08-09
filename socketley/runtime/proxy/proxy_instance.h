@@ -199,7 +199,21 @@ struct alignas(64) proxy_client_connection
     // not a refusal by the backend, and it must not cost the client its
     // connection.  Bounded so a persistent problem still surfaces.
     bool connect_reattempted{false};
+    // The client has shut its write side.  It will send nothing more; it is
+    // still reading, and whatever it already asked for still has somewhere to
+    // go.  Set on the EOF completion and nowhere else, on both the copy path
+    // and the splice path.
     bool client_eof{false};
+    // …and that half-close has been passed on to the backend socket with
+    // shutdown(SHUT_WR).  TCP mode only: there is no framing to tell a backend
+    // where the request ended, so the FIN is the only thing that can, and a
+    // backend waiting for one will not answer until it arrives.
+    //
+    // A flag rather than "just call shutdown again": the call has to happen
+    // exactly once, at the moment the last byte the client sent has actually
+    // reached the socket, and every path that could reach that moment asks
+    // forward_client_half_close() rather than deciding for itself.
+    bool backend_half_closed{false};
     bool backend_from_group{false};
     std::string backend_host;
     uint16_t backend_port{0};
@@ -285,6 +299,12 @@ struct alignas(64) proxy_backend_connection
     // but the read that was armed on it has been cancelled and its completion
     // is still owed.  Nothing may touch the fd until that completion lands.
     bool pool_draining{false};
+    // Application bytes came off this backend socket and went to the client.
+    // The plain fact behind "did the backend answer", stated so a --protocol
+    // tcp proxy can ask it: response_started, which HTTP uses for the same
+    // purpose, is never set outside HTTP mode.  See the circuit breaker in
+    // handle_backend_read.
+    bool sent_to_client{false};
     int client_fd;
     uint32_t write_batch_count{0};
     // Bumped on every reuse from the struct pool and stamped into read_req.
@@ -773,6 +793,10 @@ private:
                                           proxy_backend_connection* bconn,
                                           proxy_client_connection* cconn);
     void reset_client_for_next_request(proxy_client_connection* cconn);
+    // TCP mode: take the hold on a client that has shut its write side, and
+    // pass that half-close on to the backend.  See the definitions.
+    bool hold_tcp_half_close(proxy_client_connection* conn);
+    void forward_client_half_close(proxy_client_connection* conn);
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
@@ -1151,7 +1175,12 @@ private:
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_send_zc{false};
+    // The kernel can do IORING_OP_SPLICE.  Says nothing about whether this
+    // proxy uses it — see m_splice_enabled and splice_opt_in().
     bool m_splice_supported{false};
+    // …and it is switched on for this instance.  Off by default; see
+    // splice_opt_in() for the measurements that decided that.
+    bool m_splice_enabled{false};
 
     // Connection pool for backend reuse (avoids connect() per request)
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
