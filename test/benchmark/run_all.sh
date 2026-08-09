@@ -126,6 +126,17 @@ run_benchmarks() {
     run_bench_script "$script_dir/bench_proxy.sh"
     restart_daemon
 
+    # The proxy's scale, the same arrangement bench_cache_resp.sh gives the
+    # cache: one thread each, one shared backend, one client.  One repetition
+    # inside the standard run for the same reason as the Redis comparison —
+    # raise BENCH_HAPROXY_RUNS when the numbers matter, since the concurrent
+    # cases need several before their spread means anything.  Exits cleanly
+    # when haproxy is not installed.
+    export BENCH_HAPROXY_RUNS=1
+    run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
+    unset BENCH_HAPROXY_RUNS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_websocket.sh"
     restart_daemon
 
