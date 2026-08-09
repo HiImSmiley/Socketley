@@ -1642,11 +1642,53 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     pooled_left = pooled_left || !pool.empty();
                 }
 
+                // ─── And the DNS the request path no longer does ────────
+                //
+                // A backend named by hostname whose lookup failed at setup has
+                // no cached address, and connect_to_backend refuses rather than
+                // blocking for it.  This is where it gets another chance: once
+                // per sweep, off the request path, where a resolver that hangs
+                // costs one tick instead of one request.
+                bool unresolved_left = false;
+                for (auto& b : m_backends)
+                {
+                    if (b.has_cached_addr || b.resolved_host.empty() ||
+                        b.resolved_port == 0)
+                        continue;
+
+                    char port_str[8];
+                    auto [pend, pec] = std::to_chars(port_str,
+                                                     port_str + sizeof(port_str),
+                                                     b.resolved_port);
+                    *pend = '\0';
+
+                    struct addrinfo hints{};
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_STREAM;
+
+                    struct addrinfo* res = nullptr;
+                    if (getaddrinfo(b.resolved_host.c_str(), port_str, &hints, &res) == 0 && res)
+                    {
+                        if (res->ai_family == AF_INET &&
+                            res->ai_addrlen == sizeof(struct sockaddr_in))
+                        {
+                            std::memcpy(&b.cached_addr, res->ai_addr, sizeof(struct sockaddr_in));
+                            b.has_cached_addr = true;
+                        }
+                        freeaddrinfo(res);
+                    }
+
+                    if (!b.has_cached_addr)
+                        unresolved_left = true;
+                }
+
                 // Keep the chain going only while it still has work.  An armed
                 // timeout is attached to no descriptor and cannot be cancelled,
                 // so one that runs for ever holds a removed proxy in the
-                // manager's graveyard for ever with it.
-                if (m_idle_timeout_cached > 0 || pooled_left)
+                // manager's graveyard for ever with it.  An unresolved backend
+                // is work: without it the sweep stops and the name is never
+                // looked up again.
+                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left)
                     arm_idle_sweep();
             }
             // Backend response deadline sweep.  As above: this link has spoken,
@@ -5822,31 +5864,29 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     }
     else
     {
-        // Slow path: getaddrinfo for hostname resolution (Docker DNS, etc.)
-        char port_str[8];
-        auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), target->resolved_port);
-        *pend = '\0';
-
-        struct addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        struct addrinfo* result = nullptr;
-        if (getaddrinfo(target->resolved_host.c_str(), port_str, &hints, &result) != 0 || !result)
-            return false;
-
-        if (result->ai_family == AF_INET && result->ai_addrlen == sizeof(struct sockaddr_in))
-            std::memcpy(&addr, result->ai_addr, sizeof(addr));
-
-        // Cache for future connections
-        auto* mutable_target = const_cast<backend_info*>(target);
-        std::memcpy(&mutable_target->cached_addr, result->ai_addr, sizeof(struct sockaddr_in));
-        mutable_target->has_cached_addr = true;
-
-        freeaddrinfo(result);
-
-        if (addr.sin_family == 0)
-            return false;
+        // ─── THE REQUEST PATH DOES NOT RESOLVE ──────────────────────────────
+        //
+        // This called getaddrinfo, per request, on the event loop thread — the
+        // one thread that serves every runtime in the daemon.  A backend whose
+        // DNS was slow or hanging therefore froze the whole daemon for the
+        // resolver's timeout, typically five seconds, on EVERY request through
+        // it: not only this proxy's clients but every server, cache and client
+        // runtime the daemon holds.  The comment that stood here called it the
+        // "slow path" and left it at that.
+        //
+        // Resolution happens on the idle sweep now, which is a timer.  The
+        // trade is deliberate and worth stating: a backend whose name starts
+        // resolving is picked up within one sweep rather than on the very next
+        // request, so recovery is bounded by the sweep interval instead of
+        // being immediate.  In exchange nothing the daemon serves can be
+        // stopped by somebody else's DNS.  For a proxy that is the right way
+        // round — a request that fails fast is a 503, a daemon that stops
+        // answering is every runtime at once.
+        //
+        // The sweep is armed here rather than assumed: it only keeps itself
+        // going while it has work, and an unresolved backend is work.
+        const_cast<proxy_instance*>(this)->arm_idle_sweep();
+        return false;
     }
 
     bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
