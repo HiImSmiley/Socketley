@@ -23,10 +23,12 @@ KEYS=${KEYS:-20000}
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
+    "$BIN" stop replfollower2 2>/dev/null || true
     "$BIN" stop replfollower 2>/dev/null || true
     "$BIN" stop replleader   2>/dev/null || true
     "$BIN" stop replplain    2>/dev/null || true
     sleep 0.5
+    "$BIN" remove replfollower2 2>/dev/null || true
     "$BIN" remove replfollower 2>/dev/null || true
     "$BIN" remove replleader   2>/dev/null || true
     "$BIN" remove replplain    2>/dev/null || true
@@ -280,6 +282,93 @@ else FAIL=$((FAIL+1)); echo "  FAIL [an unknown SET option is refused]: got '$RE
 
 assert_eq "$(send_to "$LEADER_PORT" 'get optbad')" "nil" \
           "the refused SET stored nothing"
+
+# ─── A value containing a newline ────────────────────────────────────────────
+#
+# The replication link was one command per line and a cache value is arbitrary
+# bytes, so a value with a line break ended at the break on the follower and the
+# remainder was interpreted as a command.  Measured on the parent commit:
+#
+#     leader    get nk  ->  a<LF>b
+#     follower  get nk  ->  a
+#
+# Written over RESP because the text protocol cannot express the value at all —
+# a newline is its command separator too, so a text `set nk a<LF>b` is not a
+# truncated write, it is two commands, and asserting on it would measure the
+# wrong layer.
+printf '*3\r\n$3\r\nSET\r\n$2\r\nnk\r\n$5\r\naa\nbb\r\n' \
+    | timeout 3 nc -q 1 127.0.0.1 "$LEADER_PORT" >/dev/null 2>&1 || true
+sleep 0.6
+
+# Read both sides over RESP as well: `get` on the text protocol answers with a
+# line, so it cannot show what came after the newline either.  This is the
+# assertion the first version got wrong — it compared text-protocol reads and
+# both sides said "aa", which looked like agreement and was two truncations.
+L_RAW=$(printf '*2\r\n$3\r\nGET\r\n$2\r\nnk\r\n' \
+    | timeout 3 nc -q 1 127.0.0.1 "$LEADER_PORT" 2>/dev/null | od -An -c | tr -s ' ' || true)
+F_RAW=$(printf '*2\r\n$3\r\nGET\r\n$2\r\nnk\r\n' \
+    | timeout 3 nc -q 1 127.0.0.1 "$FOLLOWER_PORT" 2>/dev/null | od -An -c | tr -s ' ' || true)
+
+TOTAL=$((TOTAL+1))
+if [ -n "$L_RAW" ] && [ "$L_RAW" = "$F_RAW" ]; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a value containing a newline replicates whole]:"
+    echo "        leader  : ${L_RAW:-<nothing>}"
+    echo "        follower: ${F_RAW:-<nothing>}"
+    echo "        the line-based link ended the value at its first newline and"
+    echo "        ran the remainder as a command of its own."
+fi
+
+# And the halves are not merely equal — equality alone passes when BOTH sides
+# lost the value, and a follower that stored nothing would satisfy it.  The
+# leader has to be holding the whole five bytes.
+TOTAL=$((TOTAL+1))
+if grep -q 'a a \\n b b' <<<"$L_RAW"; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the leader holds the whole value]: ${L_RAW:-<nothing>}"
+    echo "        without this the comparison above passes on two empty answers."
+fi
+
+# ─── The same value through the INITIAL FULL SYNC ────────────────────────────
+#
+# The two halves of the link are separate code: live writes go through
+# replicate_command, and a follower attaching gets dump_commands.  Fixing only
+# the live half would leave every value ALREADY stored broken while every value
+# written afterwards was fine — and the assertion above cannot tell, because its
+# follower was attached before the value was written.
+#
+# So a second follower attaches now, with `nk` already in the dataset, and has
+# to receive it through the dump.
+SECOND_PORT=$((SL_PORT_BASE+293))
+"$BIN" create cache replfollower2 -p "$SECOND_PORT" \
+    --replicate "127.0.0.1:$LEADER_PORT" -s >/dev/null 2>&1 || true
+sleep 3
+
+F2_RAW=$(printf '*2\r\n$3\r\nGET\r\n$2\r\nnk\r\n' \
+    | timeout 3 nc -q 1 127.0.0.1 "$SECOND_PORT" 2>/dev/null | od -An -c | tr -s ' ' || true)
+
+TOTAL=$((TOTAL+1))
+if [ -n "$L_RAW" ] && [ "$L_RAW" = "$F2_RAW" ]; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the full sync carries a value containing a newline]:"
+    echo "        leader   : ${L_RAW:-<nothing>}"
+    echo "        follower2: ${F2_RAW:-<nothing>}"
+    echo "        dump_commands writes one command per line, so a stored value"
+    echo "        with a newline truncates for every follower that attaches."
+fi
+
+# The control: this follower really did sync, rather than being empty and
+# matching an empty leader read by accident.
+TOTAL=$((TOTAL+1))
+F2_KEYS=$(key_count replfollower2)
+if [ "${F2_KEYS:-0}" -ge "$KEYS" ]; then PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the second follower completed its full sync]: holds ${F2_KEYS:-<none>} keys, expected at least $KEYS"
+fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

@@ -88,6 +88,40 @@ inline std::string encode(std::string_view command)
 
 enum class take { need_more, ok, fatal };
 
+// Read one frame starting at `off`, without consuming anything.
+//
+// The offset form exists for a reader that processes a whole batch before it
+// touches its buffer: erasing per command makes a read carrying many of them
+// quadratic in the buffer size, and the replication link on a busy leader
+// carries exactly that.  `payload` points INTO buf and stays valid only until
+// the caller modifies it — which is the same discipline a line scan over the
+// same buffer already has.
+//
+// `next` is where the frame ends, and is only meaningful when the answer is ok.
+inline take peek_frame(std::string_view buf, size_t off,
+                       std::string_view& payload, size_t& next)
+{
+    if (buf.size() - off < header_size)
+        return take::need_more;
+
+    const auto* h = reinterpret_cast<const unsigned char*>(buf.data() + off);
+    const uint32_t len =
+        static_cast<uint32_t>(h[1])        |
+        static_cast<uint32_t>(h[2]) << 8   |
+        static_cast<uint32_t>(h[3]) << 16  |
+        static_cast<uint32_t>(h[4]) << 24;
+
+    if (len > max_payload)
+        return take::fatal;
+
+    if (buf.size() - off < header_size + len)
+        return take::need_more;
+
+    payload = buf.substr(off + header_size, len);
+    next    = off + header_size + len;
+    return take::ok;
+}
+
 // Pull one whole frame off the front of `buf`.
 //
 // `need_more` leaves buf untouched and means exactly that — the caller keeps
@@ -96,23 +130,14 @@ enum class take { need_more, ok, fatal };
 // guessing where the next frame starts.
 inline take take_frame(std::string& buf, std::string& payload)
 {
-    if (buf.size() < header_size)
-        return take::need_more;
+    std::string_view view;
+    size_t           next = 0;
+    const take r = peek_frame(buf, 0, view, next);
+    if (r != take::ok)
+        return r;
 
-    const uint32_t len =
-        static_cast<uint32_t>(static_cast<unsigned char>(buf[1]))        |
-        static_cast<uint32_t>(static_cast<unsigned char>(buf[2])) << 8   |
-        static_cast<uint32_t>(static_cast<unsigned char>(buf[3])) << 16  |
-        static_cast<uint32_t>(static_cast<unsigned char>(buf[4])) << 24;
-
-    if (len > max_payload)
-        return take::fatal;
-
-    if (buf.size() < header_size + len)
-        return take::need_more;
-
-    payload.assign(buf, header_size, len);
-    buf.erase(0, header_size + len);
+    payload.assign(view.data(), view.size());
+    buf.erase(0, next);
     return take::ok;
 }
 

@@ -2136,6 +2136,16 @@ Connect as a follower to the specified leader cache. The follower receives
 a full data dump on connect, then receives ongoing write command replication.
 The follower operates in read-only mode.
 .IP
+A value containing a newline replicates whole. The link carries one command
+per line, and a cache value is arbitrary bytes, so such a value used to end at
+its first line break on the follower and the remainder was interpreted as a
+command of its own \(em on the initial dump and on live writes alike, with both
+sides reporting success. A command that cannot be written as a line is now
+length-framed instead; one that can is sent unchanged, so a leader and a
+follower of different versions agree on every dataset that previously worked.
+A follower too old to understand a frame stores nothing for that command rather
+than storing a truncated value.
+.IP
 Replication is
 .I not
 encrypted, in either direction, so it cannot be combined with

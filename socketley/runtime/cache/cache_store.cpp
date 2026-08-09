@@ -1,4 +1,5 @@
 #include "cache_store.h"
+#include "../../shared/ipc_framing.h"
 #include "../../shared/logging.h"
 #include <fstream>
 #include <cstring>
@@ -1052,14 +1053,39 @@ bool cache_store::exists(std::string_view key) const
 
 void cache_store::dump_commands(std::string& buf) const
 {
+    // ─── A VALUE MAY CONTAIN THE SEPARATOR ──────────────────────────────────
+    //
+    // This stream is one command per line and a cache value is arbitrary bytes,
+    // so a value with a newline in it ended the command here just as it did on
+    // the live replication path — the follower stored the part before the break
+    // and ran the rest as a command of its own.  The initial full sync is the
+    // same defect on the same link, and fixing only the live half would have
+    // left every value that was already stored broken while every value written
+    // afterwards was fine.
+    //
+    // Framed by the same rule and the same code: a frame only when the line
+    // cannot carry the command, so a dataset without newlines produces a stream
+    // that is byte-for-byte what it always was.
+    std::string cmd;
+    const auto emit = [&buf, &cmd]() {
+        if (ipc_frame::needs_frame(cmd))
+            buf += ipc_frame::encode(cmd);
+        else
+        {
+            buf.append(cmd);
+            buf.push_back('\n');
+        }
+        cmd.clear();
+    };
+
     // Strings
     for (const auto& [key, val] : m_data)
     {
-        buf.append("set ");
-        buf.append(key);
-        buf.push_back(' ');
-        buf.append(val);
-        buf.push_back('\n');
+        cmd.append("set ");
+        cmd.append(key);
+        cmd.push_back(' ');
+        cmd.append(val);
+        emit();
     }
 
     // Lists (emit rpush to preserve order)
@@ -1067,11 +1093,11 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& val : deq)
         {
-            buf.append("rpush ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(val);
-            buf.push_back('\n');
+            cmd.append("rpush ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(val);
+            emit();
         }
     }
 
@@ -1080,11 +1106,11 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& member : members)
         {
-            buf.append("sadd ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(member);
-            buf.push_back('\n');
+            cmd.append("sadd ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(member);
+            emit();
         }
     }
 
@@ -1093,13 +1119,13 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& [field, val] : fields)
         {
-            buf.append("hset ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(field);
-            buf.push_back(' ');
-            buf.append(val);
-            buf.push_back('\n');
+            cmd.append("hset ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(field);
+            cmd.push_back(' ');
+            cmd.append(val);
+            emit();
         }
     }
 
@@ -1121,11 +1147,11 @@ void cache_store::dump_commands(std::string& buf) const
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
         if (ms > 0)
         {
-            buf.append("pexpire ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(std::to_string(ms));
-            buf.push_back('\n');
+            cmd.append("pexpire ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(std::to_string(ms));
+            emit();
         }
     }
 }

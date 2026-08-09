@@ -1,5 +1,6 @@
 #include "cache_instance.h"
 #include "../../shared/blocking_write.h"
+#include "../../shared/ipc_framing.h"
 #include "../../shared/trace.h"
 #include "resp_parser.h"
 #include "../../shared/event_loop.h"
@@ -1778,7 +1779,17 @@ static bool parse_int_sv(std::string_view sv, int& out)
 // pushing a megabyte down a socket in one write posts a request per line, and
 // the queue's cap turns into dropped writes: measured at 88% loss on a 200 000
 // message burst before this was batched.
-void cache_instance::serve_request(std::string_view payload, std::string& out)
+// ─── One payload, split into lines or taken whole ───────────────────────────
+//
+// `split` is what separates a client socket from a replication frame.  A client
+// sends a stream and every newline in it ends a command.  A frame is one
+// command that CONTAINS a newline — that is the only reason it was framed — so
+// splitting it again undoes the framing and applies half of it.
+//
+// The two share everything else: the same connection setup, the same
+// re-entrancy guard, the same interpreter.  They are one function with a flag
+// rather than two because the setup is the part that must not drift.
+void cache_instance::serve_payload(std::string_view payload, std::string& out, bool split)
 {
     // The re-entrant case: a command that publishes reaches Lua, and a Lua
     // callback can ask this cache another question from inside the first.  Rare
@@ -1788,7 +1799,8 @@ void cache_instance::serve_request(std::string_view payload, std::string& out)
         client_connection nested{};
         nested.fd = -1;
         nested.rl_max = 0;
-        run_request_lines(&nested, payload);
+        if (split) run_request_lines(&nested, payload);
+        else if (!payload.empty()) process_command(&nested, payload);
         out.append(nested.response_buf);
         return;
     }
@@ -1808,8 +1820,20 @@ void cache_instance::serve_request(std::string_view payload, std::string& out)
     conn->rl_max = 0;
     conn->rl_tokens = 0.0;
     conn->response_buf.clear();
-    run_request_lines(conn, payload);
+    if (split) run_request_lines(conn, payload);
+    else if (!payload.empty()) process_command(conn, payload);
     out.append(conn->response_buf);
+}
+
+void cache_instance::serve_request(std::string_view payload, std::string& out)
+{
+    serve_payload(payload, out, true);
+}
+
+// One command, newlines and all — what a replication frame carries.
+void cache_instance::serve_one_command(std::string_view line, std::string& out)
+{
+    serve_payload(line, out, false);
 }
 
 void cache_instance::run_request_lines(client_connection* conn, std::string_view payload)
@@ -4713,10 +4737,48 @@ void cache_instance::replicate_command(std::string_view cmd)
     if (m_repl_role != repl_leader || m_followers.empty())
         return;
 
+    // ─── A VALUE WITH A NEWLINE IN IT ───────────────────────────────────────
+    //
+    // The replication link is one command per line, and a cache value is
+    // arbitrary bytes — a RESP bulk string may contain anything.  So a value
+    // with a line break ended at the break on the follower, and the remainder
+    // was interpreted as a command of its own.  Measured:
+    //
+    //     RESP  SET nk "a\nb"
+    //     leader    get nk  ->  a<LF>b
+    //     follower  get nk  ->  a
+    //
+    // The two stores then disagreed and neither side could tell: replication
+    // reports no error, because from the link's point of view nothing failed.
+    //
+    // This is the same defect as the control socket's, which ipc_framing.h
+    // fixed, so it is the same fix and literally the same framing — a second
+    // format for one job in one tree is how the two drift apart.
+    //
+    // ─── AND THE OLD FOLLOWER, WHICH IS THE ONLY DECISION HERE ──────────────
+    //
+    // A frame is sent ONLY when the line protocol cannot carry the command, so
+    // every value without a newline is byte-identical on the wire and an old
+    // follower sees exactly what it always saw.  The one case that changes is
+    // the case that was already broken: an old follower now receives a frame it
+    // does not understand and stores nothing, instead of storing a truncated
+    // value and executing the tail as a command.  Neither is replication, and
+    // between them, not applying a command is the one that does not corrupt the
+    // dataset or run something nobody sent.
+    //
+    // There is no negotiation on this link to do better with, and adding one to
+    // hand back a truncated value is not worth a protocol version.
     std::string line;
-    line.reserve(cmd.size() + 1);
-    line.append(cmd.data(), cmd.size());
-    line.push_back('\n');
+    if (ipc_frame::needs_frame(cmd))
+    {
+        line = ipc_frame::encode(cmd);
+    }
+    else
+    {
+        line.reserve(cmd.size() + 1);
+        line.append(cmd.data(), cmd.size());
+        line.push_back('\n');
+    }
 
     for (auto& f : m_followers)
     {
@@ -4962,14 +5024,46 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
     link.partial.append(link.buf, cqe->res);
 
-    // Process replicated commands
+    // ─── Framed or line, decided by the first byte ──────────────────────────
+    //
+    // 0x00 cannot begin a command in the line protocol — every one of them is
+    // printable text starting with a letter — so the two forms travel on one
+    // link and a leader that sends no frames is byte-identical to the one that
+    // never could.  See replicate_command() for why only some commands are
+    // framed and what an old peer makes of them.
+    //
+    // Scanned by offset with one erase at the end, rather than consumed per
+    // command: a single read from a busy leader carries many commands, and
+    // erasing the front for each would make the batch quadratic in its size.
     size_t scan_from = 0;
-    size_t pos;
-    while ((pos = link.partial.find('\n', scan_from)) != std::string::npos)
+    bool   framing_broken = false;
+    while (scan_from < link.partial.size())
     {
-        std::string_view line(link.partial.data() + scan_from, pos - scan_from);
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
+        std::string_view line;
+
+        if (link.partial[scan_from] == ipc_frame::marker)
+        {
+            size_t next = 0;
+            const auto r = ipc_frame::peek_frame(link.partial, scan_from, line, next);
+            if (r == ipc_frame::take::need_more)
+                break;
+            if (r == ipc_frame::take::fatal)
+            {
+                framing_broken = true;
+                break;
+            }
+            scan_from = next;
+        }
+        else
+        {
+            const size_t pos = link.partial.find('\n', scan_from);
+            if (pos == std::string::npos)
+                break;
+            line = std::string_view(link.partial.data() + scan_from, pos - scan_from);
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            scan_from = pos + 1;
+        }
 
         if (!line.empty())
         {
@@ -5007,12 +5101,25 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             m_mode = cache_mode_readwrite;
 
             std::string discard;
-            serve_request(line, discard);
+            serve_one_command(line, discard);
 
             m_mode = saved;
         }
+    }
 
-        scan_from = pos + 1;
+    // A length past max_payload means the stream's framing is wrong, and there
+    // is no point in it that says where the next command starts.  Guessing
+    // would apply whatever the bytes happened to spell to the dataset, so the
+    // link goes instead — which surfaces as a master disconnect, the one
+    // failure this side already knows how to report.
+    if (framing_broken)
+    {
+        LOG_ERROR("cache: replication frame longer than the protocol allows — "
+                  "the link is dropped rather than resynchronised");
+        if (link.fd >= 0)
+            close_tracked(link.fd);
+        m_master.reset();
+        return;
     }
 
     if (scan_from > 0)
