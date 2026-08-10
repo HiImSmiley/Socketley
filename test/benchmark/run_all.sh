@@ -141,6 +141,19 @@ run_benchmarks() {
     unset BENCH_HAPROXY_RUNS
     restart_daemon
 
+    # The same comparison in HTTP, which is the mode haproxy is written for and
+    # the one nothing in this suite had ever compared.  Two cases, because
+    # keep-alive and connection-per-request disagree about which proxy is
+    # faster and reporting only one of them would be picking a winner.
+    #
+    # Its own timeout: seven cases at three seconds a run is minutes, not the
+    # tens of seconds the shared BENCH_TIMEOUT_SCRIPT allows, and a benchmark
+    # killed mid-write leaves JSON that no longer parses.
+    export BENCH_HTTP_RUNS=3
+    BENCH_TIMEOUT_SCRIPT=900 run_bench_script "$script_dir/bench_proxy_http_vs_haproxy.sh"
+    unset BENCH_HTTP_RUNS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_websocket.sh"
     restart_daemon
 

@@ -239,11 +239,23 @@ stop_daemon() {
     # systemd-managed daemon out of it — that one runs the installed binary,
     # not this build, which is the protection the old comment was reaching for
     # with "do not use pkill -x socketley".
+    #
+    # The " (deleted)" suffix below is not cosmetic.  Rebuild the binary while a
+    # daemon from the previous build is still running and the kernel reports
+    # that process's exe as "<path> (deleted)", because the inode it was started
+    # from no longer carries that name.  An exact compare then stops recognising
+    # the very daemon this tree started: the sweep steps over it, reports
+    # success, and the next run finds its ports held by a process it has decided
+    # belongs to somebody else.  Rebuilding between benchmark runs is the normal
+    # case, so this was the normal case.  Observed exactly that way — a daemon
+    # left holding 23020-23022 after a rebuild, with the fixture setup reporting
+    # only "backend did not come up".
     local own_exe p exe
     own_exe=$(readlink -f "$SOCKETLEY_BIN" 2>/dev/null)
     if [ -n "$own_exe" ]; then
         for p in $(pgrep -x socketley 2>/dev/null || true); do
             exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+            exe=${exe% (deleted)}
             if [ "$exe" = "$own_exe" ]; then
                 kill -9 "$p" 2>/dev/null || true
             fi
@@ -257,6 +269,7 @@ stop_daemon() {
     if [ -n "$own_exe" ]; then
         for p in $(pgrep -x socketley 2>/dev/null || true); do
             exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+            exe=${exe% (deleted)}
             if [ "$exe" = "$own_exe" ]; then
                 log_warn "A daemon or worker process still exists after cleanup"
                 break
@@ -441,8 +454,29 @@ cleanup_all() {
     pkill -9 -f "k6 run" 2>/dev/null || true
     # Kill any redis-benchmark
     pkill -9 -f "redis-benchmark.*1900" 2>/dev/null || true
-    # Kill any socketley_bench
-    pkill -9 -f "socketley_bench" 2>/dev/null || true
+
+    # This tree's socketley_bench, and only this tree's.
+    #
+    # It was `pkill -9 -f socketley_bench`, which kills every one on the machine
+    # — including the one another worktree is halfway through a measurement
+    # with.  Two benchmark runs on this box then destroy each other's numbers
+    # while both report success, and the damage shows up as a spuriously slow
+    # run rather than as an error.  `-f` also matches any shell whose arguments
+    # merely carry the string, which is how a sweep reaches its own caller.
+    #
+    # The executable behind a pid cannot be spoofed by an argument and is
+    # per-worktree, so it separates ours from theirs.  The " (deleted)" suffix
+    # is stripped for the same reason as in stop_daemon: rebuild the binary and
+    # the kernel stops reporting the path the process was started from.
+    local bench_exe q qexe
+    bench_exe=$(readlink -f "$SOCKETLEY_BENCH" 2>/dev/null)
+    if [ -n "$bench_exe" ]; then
+        for q in $(pgrep -x socketley_bench 2>/dev/null || true); do
+            qexe=$(readlink -f "/proc/$q/exe" 2>/dev/null) || continue
+            qexe=${qexe% (deleted)}
+            [ "$qexe" = "$bench_exe" ] && kill -9 "$q" 2>/dev/null
+        done
+    fi
     # Clean up runtimes via IPC (best-effort, daemon might be dead)
     cleanup_runtimes 2>/dev/null || true
     log_bench "CLEANUP" "cleanup_all completed"
@@ -485,6 +519,25 @@ BENCH_TIMEOUT_CMD=180         # per socketley_bench invocation
 BENCH_TIMEOUT_NC=180          # per nc pipeline
 BENCH_TIMEOUT_K6=180          # per k6 run
 BENCH_TIMEOUT_REDIS=180       # per redis-benchmark run
+# How long a run measuring a socketley *server* runtime should last.
+#
+# Longer than anything the proxy benchmarks use, and it is not caution.  A
+# server runtime carries a periodic cost that a short window either catches or
+# misses, so short windows disagree with each other about a rate that is not
+# changing.  Measured on an --http server with eight keep-alive connections,
+# the two window lengths interleaved so both saw the same machine, seven runs
+# each: one-second windows spanned 154872..237487 requests a second, eight-
+# second windows 153385..194082 — coefficient of variation 16.0% against 8.9%,
+# for medians of 170707 and 169763.  The same work, sampled better.
+#
+# The spread this removes is not the server being erratic: its core stayed at
+# 0.99..1.00 in every one of those runs.  It is a sampling artefact of the
+# measurement, and reading it as a defect costs an afternoon.
+#
+# Anything fronting a server inherits a diluted version of it — see
+# bench_proxy_http_vs_haproxy.sh, which uses 3000 for that reason.
+BENCH_SERVER_RUN_MS=${BENCH_SERVER_RUN_MS:-8000}
+
 # Per bench_*.sh from run_all.sh.  bench_cache.sh alone runs well over three
 # minutes (a dozen sub-tests, each restarting the runtime), and when the timeout
 # fires mid-write it leaves a truncated JSON file that no longer parses — the

@@ -89,6 +89,11 @@ struct bench_config {
      * path and its allocator; folding that into a median is how a harness
      * reports a slower number for a faster program. */
     int         warmup_runs;
+    /* Request target for the HTTP tests (-u).  Both proxies are pointed at the
+     * same one, so it has to be a path the shared backend really serves: a 404
+     * is cheaper to produce than a file and would be measured as if it were a
+     * file. */
+    const char *path;
 };
 
 /* Deadline for the current run, or 0 when the run is counted out rather than
@@ -1385,6 +1390,237 @@ static void bench_proxy_overhead(struct bench_config *cfg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * J2. HTTP through a proxy
+ *
+ * The TCP path measures forwarding and nothing else, which is the narrowest
+ * slice of what a proxy does and the one where an HTTP proxy is least itself.
+ * These two tests measure the mode haproxy is written for.
+ *
+ * They come in a pair on purpose.  Keep-alive and connection-per-request are
+ * not two settings of one benchmark, they are the two halves of the thing that
+ * separates proxies: with keep-alive the connection is set up once and the
+ * proxy's per-request cost is all that is left; without it every request pays
+ * an accept, a backend connect (or a pooled one, which is exactly the
+ * difference being looked for), and a teardown.  A proxy can be good at one and
+ * ordinary at the other, and a suite that measures only the first will say so
+ * with a straight face.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Read one HTTP response and say how many bytes of it belonged to this reply.
+ *
+ * Framing is the whole difficulty of a keep-alive client.  Reading "some bytes"
+ * and calling it a response works exactly once per connection: the next reply
+ * starts inside whatever is left in the buffer, and from then on the client is
+ * counting boundaries that are no longer where it thinks they are.  A run like
+ * that still produces a number, and the number is larger than the truth.
+ *
+ * Returns 1 on a complete, well-formed response; 0 otherwise.  `carry` holds
+ * bytes already read that belong to the next response, so the caller can pass
+ * them back in.  *keep is set to 0 when the server said it is closing. */
+struct http_reader {
+    char buf[BUF_SIZE];
+    int  len;          /* bytes currently in buf */
+};
+
+static int hr_fill(struct http_reader *r, int fd)
+{
+    if (r->len >= (int)sizeof(r->buf)) return 0;   /* header larger than buffer */
+    ssize_t n = read(fd, r->buf + r->len, sizeof(r->buf) - r->len);
+    if (n <= 0) return 0;
+    r->len += (int)n;
+    return 1;
+}
+
+/* Case-insensitive search for a header value in a NUL-free byte range. */
+static const char *hdr_find(const char *h, int hlen, const char *name)
+{
+    int nlen = (int)strlen(name);
+    for (int i = 0; i + nlen <= hlen; i++) {
+        if (strncasecmp(h + i, name, nlen) == 0 &&
+            (i == 0 || h[i - 1] == '\n'))
+            return h + i + nlen;
+    }
+    return NULL;
+}
+
+static int http_read_response(struct http_reader *r, int fd, int *keep)
+{
+    int hdr_end = -1;
+    for (;;) {
+        for (int i = 0; i + 3 < r->len; i++) {
+            if (r->buf[i] == '\r' && r->buf[i + 1] == '\n' &&
+                r->buf[i + 2] == '\r' && r->buf[i + 3] == '\n') {
+                hdr_end = i + 4;
+                break;
+            }
+        }
+        if (hdr_end >= 0) break;
+        if (!hr_fill(r, fd)) return 0;
+    }
+
+    /* A status line, not merely bytes.  A proxy that closes on us delivers zero
+     * bytes, and counting that as a served request is how a broken backend
+     * turns into a throughput record. */
+    if (r->len < 7 || strncmp(r->buf, "HTTP/1.", 7) != 0) return 0;
+
+    long body = 0;
+    int  chunked = 0;
+    const char *v;
+    if ((v = hdr_find(r->buf, hdr_end, "Content-Length:")) != NULL)
+        body = strtol(v, NULL, 10);
+    else if ((v = hdr_find(r->buf, hdr_end, "Transfer-Encoding:")) != NULL &&
+             strncasecmp(v, " chunked", 8) == 0)
+        chunked = 1;
+
+    if ((v = hdr_find(r->buf, hdr_end, "Connection:")) != NULL &&
+        strncasecmp(v, " close", 6) == 0)
+        *keep = 0;
+
+    if (chunked) {
+        /* Only what a static file server actually emits is handled: the
+         * terminating zero-length chunk.  Anything else is refused rather than
+         * guessed at, because a client that mis-frames a body reports a rate
+         * for responses it never finished reading. */
+        for (;;) {
+            for (int i = 0; i + 4 < r->len; i++)
+                if (memcmp(r->buf + i, "0\r\n\r\n", 5) == 0) {
+                    int end = i + 5;
+                    memmove(r->buf, r->buf + end, r->len - end);
+                    r->len -= end;
+                    return 1;
+                }
+            if (!hr_fill(r, fd)) return 0;
+        }
+    }
+
+    /* The whole response has to fit in one buffer, headers included, because
+     * the leftover bytes after it are the start of the next one and there is
+     * nowhere else to keep them.  A body larger than BUF_SIZE therefore fails
+     * the request rather than being streamed — deliberately, because the other
+     * option is a client that loses framing on large files and reports a rate
+     * for responses it never finished reading.  Serve a smaller file; this is a
+     * proxy benchmark, not a download. */
+    long want = hdr_end + body;
+    if (want > (long)sizeof(r->buf)) return 0;
+    while (r->len < want) {
+        if (!hr_fill(r, fd)) return 0;
+    }
+    memmove(r->buf, r->buf + want, r->len - want);
+    r->len -= (int)want;
+    return 1;
+}
+
+struct http_args {
+    struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
+    const char          *request;
+    int                  req_len;
+    int                  keepalive;
+    int                  thread_success;
+    int                  thread_failed;
+};
+
+static void *http_worker(void *arg)
+{
+    struct http_args *a = (struct http_args *)arg;
+    struct bench_config *cfg = a->cfg;
+    struct http_reader r;
+    int fd = -1;
+
+    if (a->keepalive) {
+        fd = tcp_connect(cfg->host, cfg->port);
+        if (fd >= 0) { set_recv_timeout(fd, 5000); r.len = 0; }
+    }
+
+    pthread_barrier_wait(a->barrier);
+    if (a->keepalive && fd < 0) return NULL;
+
+    int local = 0;
+    for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
+
+        if (!a->keepalive) {
+            fd = tcp_connect(cfg->host, cfg->port);
+            if (fd < 0) { a->thread_failed++; break; }
+            set_recv_timeout(fd, 5000);
+            r.len = 0;
+        }
+
+        int keep = 1;
+        if (send_all(fd, a->request, a->req_len) != a->req_len) { a->thread_failed++; break; }
+        if (!http_read_response(&r, fd, &keep))                 { a->thread_failed++; break; }
+        local++;
+
+        if (!a->keepalive) {
+            close(fd); fd = -1;
+        } else if (!keep) {
+            /* The server ended the connection on a run that asked it not to.
+             * Reconnecting silently would turn a keep-alive measurement into a
+             * connection-per-request one and report it under the wrong name. */
+            close(fd); fd = -1;
+            a->thread_failed++;
+            break;
+        }
+    }
+
+    if (fd >= 0) close(fd);
+    a->thread_success = local;
+    return NULL;
+}
+
+static struct run_result bench_http(struct bench_config *cfg, int keepalive)
+{
+    struct run_result r = {0};
+    lat_init(&r.latencies, 1);
+
+    int nc = cfg->num_clients > 0 ? cfg->num_clients : 1;
+    char request[512];
+    int req_len = snprintf(request, sizeof request,
+        "GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n",
+        cfg->path ? cfg->path : "/", cfg->host,
+        keepalive ? "" : "Connection: close\r\n");
+
+    pthread_t *threads = (pthread_t *)malloc((size_t)nc * sizeof(pthread_t));
+    struct http_args *args = (struct http_args *)malloc((size_t)nc * sizeof(*args));
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
+
+    for (int i = 0; i < nc; i++) {
+        args[i].cfg = cfg;
+        args[i].barrier = &barrier;
+        args[i].request = request;
+        args[i].req_len = req_len;
+        args[i].keepalive = keepalive;
+        args[i].thread_success = 0;
+        args[i].thread_failed = 0;
+        pthread_create(&threads[i], NULL, http_worker, &args[i]);
+    }
+
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
+    for (int i = 0; i < nc; i++) pthread_join(threads[i], NULL);
+    int64_t end = time_ns();
+
+    int total = 0, failed = 0;
+    for (int i = 0; i < nc; i++) { total += args[i].thread_success; failed += args[i].thread_failed; }
+
+    pthread_barrier_destroy(&barrier);
+    free(threads);
+    free(args);
+
+    r.success  = total;
+    r.failed   = failed;
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    r.throughput = total / ns_to_s(end - start);
+    return r;
+}
+
+static struct run_result bench_http_keepalive(struct bench_config *cfg)
+{ return bench_http(cfg, 1); }
+static struct run_result bench_http_close(struct bench_config *cfg)
+{ return bench_http(cfg, 0); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * K. WebSocket benchmarks
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1793,6 +2029,7 @@ static void usage(const char *prog)
         "              milliseconds measures the scheduler.  (proxy tcp,\n"
         "              proxy concurrent, proxy overhead)\n"
         "  -W N        Run and discard N runs before the measured ones\n"
+        "  -u PATH     Request target for the HTTP tests (default /)\n"
         "\n"
         "Categories and tests:\n"
         "  server conn <count>                  Connection rate\n"
@@ -1809,6 +2046,8 @@ static void usage(const char *prog)
         "  proxy tcp <count> [msg_size]          TCP forwarding\n"
         "  proxy concurrent <clients> <msgs>     Multi-client\n"
         "  proxy overhead <count> <backend_port> Direct vs proxied, paired (-r pairs)\n"
+        "  proxy http-keepalive <clients> <reqs> HTTP on a reused connection\n"
+        "  proxy http-close <clients> <reqs>     HTTP, one connection per request\n"
         "\n"
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
@@ -1850,6 +2089,9 @@ int main(int argc, char **argv)
         } else if (strcmp(opt, "-W") == 0 && optind_local + 1 < argc) {
             cfg.warmup_runs = atoi(argv[optind_local + 1]);
             if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
+            optind_local += 2;
+        } else if (strcmp(opt, "-u") == 0 && optind_local + 1 < argc) {
+            cfg.path = argv[optind_local + 1];
             optind_local += 2;
         } else if (strcmp(opt, "--help") == 0 || strcmp(opt, "-h") == 0) {
             usage(argv[0]);
@@ -1948,6 +2190,18 @@ int main(int argc, char **argv)
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.port2 = atoi(argv[pstart + 1]);
             bench_proxy_overhead(&cfg);
+        }
+        else if (strcmp(test, "http-keepalive") == 0) {
+            if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
+            run_and_report(&cfg, bench_http_keepalive, "proxy", "http-keepalive",
+                           "request/sec", METRIC_ROUND_TRIP);
+        }
+        else if (strcmp(test, "http-close") == 0) {
+            if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
+            run_and_report(&cfg, bench_http_close, "proxy", "http-close",
+                           "request/sec", METRIC_ROUND_TRIP);
         }
         else {
             fprintf(stderr, "Unknown proxy test: %s\n", test);
