@@ -354,6 +354,12 @@ void proxy_client_connection::reset(int new_fd)
     backend_from_group = false;
     backend_host.clear();
     backend_port = 0;
+    // A struct out of the pool must not carry the previous connection's
+    // allowance — neither the tokens it had left nor, worse, a limit the
+    // current proxy is not configured with.  handle_accept fills these in.
+    rl_tokens = 0.0;
+    rl_max = 0.0;
+    rl_last = {};
     connect_pending = false;
     connect_fd = -1;
     connect_req = {};
@@ -1417,6 +1423,7 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
+    m_rate_limit_cached = get_rate_limit();
 
     // Fresh timer for this run, for the reason spelled out on timer_op.  It is
     // built whether or not it is armed here, because the backend pool arms it on
@@ -2329,6 +2336,18 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         if (m_idle_timeout_cached > 0)
             ptr->last_activity = std::chrono::steady_clock::now();
 
+        // The bucket starts full, so a connection may spend its whole second's
+        // allowance at once and then has to wait for it to refill.  Same shape
+        // as the server's, deliberately: a burst up to the configured rate is
+        // what a token bucket is for, and a limiter that started empty would
+        // delay every first request on every connection.
+        if (m_rate_limit_cached > 0)
+        {
+            ptr->rl_max = m_rate_limit_cached;
+            ptr->rl_tokens = m_rate_limit_cached;
+            ptr->rl_last = std::chrono::steady_clock::now();
+        }
+
         SKL_TRACE_SET(ptr, opened_ms, ::skl_trace::now_ms());
         invoke_on_connect(client_fd);
 
@@ -2748,6 +2767,57 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // Track bytes in
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+
+    // ── rate limiting, per connection and across the runtime ────────────────
+    //
+    // --rate-limit is documented under COMMON FLAGS as working with all runtime
+    // types, and this proxy did not implement it AT ALL.  The value was parsed,
+    // stored on the instance and reported back by `show` — so a proxy created
+    // with `--rate-limit 2` looked configured in every way a caller can check —
+    // and nothing ever read it.  Measured before this: 40 requests on one
+    // connection through such a proxy were all answered, at 5497/sec against a
+    // configured 2/sec.  The same flag on a server answers 2 of 40.  An
+    // operator who set it to protect a backend had no protection and no
+    // indication that there was none.
+    //
+    // WHAT A TOKEN COSTS.  One read completion, which is what "message" already
+    // means everywhere else in this runtime — m_stat_total_messages counts the
+    // same event one line above, and the global limiter below has always been
+    // charged on it.  It is deliberately NOT one HTTP request: a client that
+    // pipelines four requests into one segment pays one token.  The two
+    // limiters agreeing with each other matters more here than either matching
+    // the server's per-message notion, because on a proxy they are read
+    // together and a caller comparing them would otherwise be comparing
+    // different units.
+    //
+    // WHAT EXCEEDING IT COSTS.  The connection, exactly as for the global limit
+    // beside it — and that is a deliberate difference from the server, which
+    // drops the message and reads on.  A proxy that silently dropped a request
+    // would leave the client waiting for a response that is never coming, which
+    // is a hang rather than a refusal; a close is the one signal a client can
+    // act on without a timeout of its own.  Stated in the man page, next to the
+    // per-runtime differences --global-rate-limit already documents.
+    if (SOCKETLEY_UNLIKELY(conn->rl_max > 0))
+    {
+        const auto rl_now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(rl_now - conn->rl_last).count();
+        conn->rl_last = rl_now;
+        conn->rl_tokens += elapsed * conn->rl_max;
+        if (conn->rl_tokens > conn->rl_max)
+            conn->rl_tokens = conn->rl_max;
+
+        if (conn->rl_tokens < 1.0)
+        {
+            if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
+            {
+                uint16_t buf_id_rl = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+                m_loop->return_buf(BUF_GROUP_ID, buf_id_rl);
+            }
+            close_pair(fd, conn->backend_fd);
+            return;
+        }
+        conn->rl_tokens -= 1.0;
+    }
 
     // Global rate limiting
     if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
@@ -9044,11 +9114,25 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     if (conn->closing)
         return false;
 
-    // Only retry idempotent methods unless retry_all is set
+    // Only retry idempotent methods unless retry_all is set.
+    //
+    // OPTIONS belongs in this list and was missing from it.  The man page has
+    // named it as one of the retried methods for as long as --retry has been
+    // documented — "Only idempotent HTTP methods (GET, HEAD, PUT, DELETE,
+    // OPTIONS) are retried" — and RFC 7231 §4.2.2 agrees, so the code was the
+    // half that was wrong: a backend that died mid-exchange answered an OPTIONS
+    // with 502 while the identical GET beside it was retried and served.
+    //
+    // Safe by the same test as the other four, which is the only test that
+    // matters here: replaying it cannot change anything at the backend.  POST
+    // and PATCH stay out, and TRACE is left out too — it is idempotent, but
+    // nothing in this tree has ever claimed to retry it and adding it would be
+    // a behaviour change nobody asked for rather than a contract being kept.
     if (!m_mesh.retry_all)
     {
         if (conn->method != "GET" && conn->method != "HEAD" &&
-            conn->method != "PUT" && conn->method != "DELETE")
+            conn->method != "PUT" && conn->method != "DELETE" &&
+            conn->method != "OPTIONS")
             return false;
     }
 

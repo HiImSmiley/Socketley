@@ -1086,7 +1086,25 @@ are immediately closed. 0 means unlimited (default). Alias:
 .TP
 .BI "\-\-rate\-limit " "n"
 Limit messages per second per connection using a token bucket algorithm.
-Excess messages are silently dropped. 0 means unlimited (default).
+Excess messages are silently dropped (server); on a
+.B proxy
+the connection is closed instead, because a request dropped in silence leaves
+its client waiting for a response that is never coming \(em a hang rather than a
+refusal. The bucket starts full, so a connection may spend a whole second's
+allowance at once and then waits for it to refill. 0 means unlimited (default).
+.IP
+On a proxy a token is charged per read completion rather than per HTTP request,
+which is the same event
+.B \-\-global\-rate\-limit
+is charged on and the same one
+.B total_messages
+counts; a client that pipelines four requests into one segment therefore pays
+one token.
+.IP
+.B Not enforced by the cache or the client runtime.
+Both accept the flag and report it back from
+.BR show ,
+and neither applies it.
 .TP
 .BI "\-\-global\-rate\-limit " "n"
 Limit total messages per second across all connections using a shared

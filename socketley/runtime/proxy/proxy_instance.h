@@ -218,6 +218,14 @@ struct alignas(64) proxy_client_connection
     std::string backend_host;
     uint16_t backend_port{0};
 
+    // Rate limiting (token bucket), per connection.  Same three fields and the
+    // same names the server and the cache carry, so the three are recognisably
+    // one mechanism.  rl_max of 0 means no limit and is the common case, which
+    // is why the check is written to leave on that first.
+    double rl_tokens{0.0};
+    double rl_max{0.0};
+    std::chrono::steady_clock::time_point rl_last{};
+
     // Async connect state
     bool connect_pending{false};
     int connect_fd{-1};
@@ -1296,6 +1304,10 @@ private:
     // Cached config to avoid virtual calls on hot path
     uint32_t m_idle_timeout_cached{0};
     uint32_t m_max_conns_cached{0};
+    // --rate-limit, read once at setup like the two above.  Read at all, which
+    // it was not: this proxy stored the value, reported it from `show`, and
+    // never looked at it again.  See the check in handle_client_read.
+    double m_rate_limit_cached{0.0};
 
     // Peak connections high-water mark
     size_t m_peak_connections{0};
