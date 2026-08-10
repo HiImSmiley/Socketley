@@ -10,6 +10,41 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 
+// ─── Flags that describe inbound traffic, on a runtime that has none ────────
+//
+// The common flags are applied through a runtime_instance*, which does not know
+// what it is, so every one of them reached every runtime type.  Three of them
+// only mean something for a runtime that ACCEPTS connections, and a client does
+// not: it opens one connection outward and listens on nothing.
+//
+// They were taken, stored and reported.  `create client c -t host:port
+// --rate-limit 5` exited 0 and `show` answered `"rate_limit": 5`, while
+// client_instance.cpp contains no rate-limiting code at all — the same for
+// --max-connections and --idle-timeout.  An operator reading `show` was told a
+// control was in force that did not exist, which is worse than not having it.
+//
+// --maxmemory and --eviction were already refused here, so the shape of the
+// answer is the established one; these three simply escaped it.
+//
+// Refused rather than implemented, deliberately.  Each of them CAN be given a
+// meaning on a client, and each meaning is a decision rather than a
+// translation: an outbound throttle has to say what becomes of a message that
+// may not go yet — queue it (and report success for something that leaves in
+// ten seconds), fail the send, or drop it — and an idle timeout has to say what
+// happens next, since every connection loss in this runtime goes through
+// drop_connection() into schedule_reconnect(), so closing on idle reconnects
+// immediately and is churn rather than a saving.  Those are features to design,
+// not gaps to plug, and until one exists the honest answer is no.
+static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
+                                          const char* flag, const char* why)
+{
+    if (!instance || instance->get_type() != runtime_client)
+        return false;
+
+    std::cout << flag << " does not apply to a client: " << why << "\n";
+    return true;
+}
+
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script)
 {
@@ -151,6 +186,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid max-connections value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--max-connections",
+                                              "it opens one connection outward and "
+                                              "accepts none"))
+                return 1;
             instance->set_max_connections(max);
             return 0;
         }
@@ -168,6 +207,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid rate-limit value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--rate-limit",
+                                              "it limits what a peer may send to a "
+                                              "runtime, and nothing connects to a client"))
+                return 1;
             instance->set_rate_limit(rate);
             return 0;
         }
@@ -202,6 +245,11 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid idle-timeout value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
+                                              "it reaps idle inbound connections, and "
+                                              "a client's own connection is reconnected "
+                                              "the moment it is dropped"))
+                return 1;
             instance->set_idle_timeout(secs);
             return 0;
         }
@@ -999,6 +1047,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid max-connections value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--max-connections",
+                                              "it opens one connection outward and "
+                                              "accepts none"))
+                return 1;
             instance->set_max_connections(max);
             return 0;
         }
@@ -1016,6 +1068,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid rate-limit value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--rate-limit",
+                                              "it limits what a peer may send to a "
+                                              "runtime, and nothing connects to a client"))
+                return 1;
             instance->set_rate_limit(rate);
             return 0;
         }
@@ -1050,6 +1106,11 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid idle-timeout value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
+                                              "it reaps idle inbound connections, and "
+                                              "a client's own connection is reconnected "
+                                              "the moment it is dropped"))
+                return 1;
             instance->set_idle_timeout(secs);
             return 0;
         }

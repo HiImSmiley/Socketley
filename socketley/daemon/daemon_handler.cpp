@@ -3428,6 +3428,40 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
     if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
     if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
+    // ─── The three flags a client does not have, refused here too ───────────
+    //
+    // create and edit refuse --rate-limit, --max-connections and --idle-timeout
+    // on a client, because it accepts no connections and there is nothing for
+    // any of them to limit.  import writes the same fields through a different
+    // door: it does not go through the flag parser at all, so the refusal did
+    // not exist here.  Measured, on a build where create already said no:
+    //
+    //     socketley show c | jq '.rate_limit = 5' | socketley import c   -> 0
+    //     socketley show c                          -> "rate_limit": 5
+    //
+    // which is the same shape as 4af38f0, where import could give a runtime a
+    // name create would have refused.  A validation that only guards one entrance
+    // is a validation that is not there.
+    //
+    // Refused rather than ignored: silently dropping a field the caller wrote
+    // makes `show | import` stop being a round trip, and the caller is told
+    // nothing.  The whole document is rejected, so nothing half-applies.
+    if (type == runtime_client)
+    {
+        const char* offender = has("rate_limit")      ? "rate_limit"
+                             : has("max_connections") ? "max_connections"
+                             : has("idle_timeout")    ? "idle_timeout"
+                             : nullptr;
+        if (offender)
+        {
+            conn->write_buf = std::string("\"") + offender +
+                  "\" does not apply to a client: it accepts no connections, so "
+                  "there is nothing to limit or to time out. Remove the field and "
+                  "import again.\n";
+            return 1;
+        }
+    }
+
     if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);
     if (has("rate_limit"))        instance->set_rate_limit(cfg.rate_limit);
     if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);

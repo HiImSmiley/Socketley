@@ -1086,12 +1086,41 @@ are immediately closed. 0 means unlimited (default). Alias:
 .TP
 .BI "\-\-rate\-limit " "n"
 Limit messages per second per connection using a token bucket algorithm.
-Excess messages are silently dropped (server); on a
+Excess messages are silently dropped (server); a
+.B cache
+answers
+.BR "error: rate limited" ,
+since its protocol has a way to say so; on a
 .B proxy
 the connection is closed instead, because a request dropped in silence leaves
 its client waiting for a response that is never coming \(em a hang rather than a
 refusal. The bucket starts full, so a connection may spend a whole second's
 allowance at once and then waits for it to refill. 0 means unlimited (default).
+.IP
+Not accepted on a
+.BR client ,
+together with
+.B \-\-max\-connections
+and
+.BR \-\-idle\-timeout .
+All three describe inbound traffic, and a client opens one connection outward
+and accepts none, so there is nothing for any of them to act on. They were
+taken and reported before \(em
+.B show
+answered
+.B """rate_limit"": 5"
+on a runtime with no rate-limiting code at all, which tells an operator a
+control is in force that does not exist. Refused at
+.BR create ", " edit " and " import
+alike; import writes the field without passing the flag parser, so a guard in
+one place is not a guard.
+.IP
+Refused rather than implemented, because each could be given a meaning and each
+meaning is a decision. An outbound throttle has to say what becomes of a message
+that may not go yet \(em queue it and report success for something that leaves
+in ten seconds, fail the send, or drop it. An idle timeout has to say what
+happens after the close, since a client reconnects the moment its connection is
+dropped.
 .IP
 On a proxy a token is charged per read completion rather than per HTTP request,
 which is the same event
