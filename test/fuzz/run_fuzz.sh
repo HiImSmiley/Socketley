@@ -177,6 +177,98 @@ PROXY_MATRIX_DEFAULT='backend-timeout=0;circuit-threshold=0;backend-timeout=0,ci
 PROXY_MATRIX="${FUZZ_PROXY_MATRIX-$PROXY_MATRIX_DEFAULT}"
 MATRIX_SECONDS="${FUZZ_MATRIX_SECONDS:-0}"
 
+# ─── the targets, side by side ──────────────────────────────────────────────
+#
+# Nine targets run one after another is where this job's 92 minutes come from,
+# and none of that time is spent waiting on anything shared: each target has its
+# own corpus and work directory (CORPUS[$target] above), writes artifacts under
+# its own prefix, and binds ports from a base of 20000 + getpid() % 4096 — which
+# is chosen exactly so that two of these can run at once.  Nothing had to be
+# made concurrency-safe here; it already was, and only the loop was serial.
+#
+# Re-invoking this script once per target rather than backgrounding the loop
+# body: the body is long, it counts failures in variables a subshell would not
+# give back, and FUZZ_TARGETS already selects a subset. A wrapper that calls the
+# thing that works is worth more than a rewrite of ninety-seven lines that must
+# keep behaving identically.
+#
+# HOW MANY AT ONCE.  Cores are the obvious bound and the wrong one: libFuzzer is
+# given -rss_limit_mb=2048, so nine at once could ask for 18 GB on a machine
+# with ten. Measured peak RSS runs 44 MB (client_ops) to 457 MB (resp), so 600 MB
+# per job is a realistic budget with headroom, and the limit stays where it is —
+# lowering it would change what the fuzzer tolerates, and a target that hits it
+# is a finding rather than a tuning problem. The smaller of the two bounds wins,
+# and FUZZ_JOBS=1 restores the old serial behaviour exactly.
+FUZZ_JOBS="${FUZZ_JOBS:-0}"
+if [ "$FUZZ_JOBS" -eq 0 ]; then
+    fz_avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 2048)
+    fz_by_mem=$(( (fz_avail * 70 / 100) / 600 ))
+    [ "$fz_by_mem" -lt 1 ] && fz_by_mem=1
+    fz_by_cpu=$(nproc 2>/dev/null || echo 1)
+    FUZZ_JOBS=$fz_by_mem
+    [ "$fz_by_cpu" -lt "$FUZZ_JOBS" ] && FUZZ_JOBS=$fz_by_cpu
+fi
+[ "$FUZZ_JOBS" -gt "${#TARGETS[@]}" ] && FUZZ_JOBS=${#TARGETS[@]}
+
+if [ -z "${FUZZ_CHILD:-}" ] && [ "$FUZZ_JOBS" -gt 1 ] && [ "${#TARGETS[@]}" -gt 1 ]; then
+    fz_dir=$(mktemp -d "${TMPDIR:-/tmp}/socketley-fuzz-par.XXXXXX")
+    echo "=============================================="
+    echo " Fuzz run — ${SECS}s per target, config $CONFIG"
+    echo " targets: ${TARGETS[*]}"
+    echo " $FUZZ_JOBS at a time (cores $(nproc 2>/dev/null || echo ?), 600 MB budgeted each)"
+    echo "=============================================="
+
+    fz_started=$(date +%s)
+    for fz_t in "${TARGETS[@]}"; do
+        # Block until a slot frees. `wait -n` returns on the first child to
+        # finish rather than the oldest, so a quick target does not hold a slot
+        # behind a slow one.
+        while [ "$(jobs -pr | wc -l)" -ge "$FUZZ_JOBS" ]; do wait -n 2>/dev/null || break; done
+        FUZZ_CHILD=1 FUZZ_TARGETS="$fz_t" bash "$0" "$SECS" "$CONFIG" \
+            >"$fz_dir/$fz_t.log" 2>&1 &
+        echo "  started $fz_t"
+    done
+    wait
+
+    # In the order they were asked for, not the order they finished: a log that
+    # reorders itself run to run cannot be diffed against yesterday's.
+    fz_fail=0 fz_ran=0
+    for fz_t in "${TARGETS[@]}"; do
+        echo
+        cat "$fz_dir/$fz_t.log"
+        # Counts come out of each child's own summary line so that the total
+        # means the same thing it does serially — a target contributes several
+        # runs (libFuzzer, replay, matrix), not one.
+        fz_line=$(grep -oE '[0-9]+ of [0-9]+ fuzz runs failed' "$fz_dir/$fz_t.log" | tail -1)
+        if [ -n "$fz_line" ]; then
+            fz_fail=$(( fz_fail + $(echo "$fz_line" | awk '{print $1}') ))
+            fz_ran=$((  fz_ran  + $(echo "$fz_line" | awk '{print $3}') ))
+        else
+            fz_clean=$(grep -oE '[0-9]+ fuzz runs, all clean' "$fz_dir/$fz_t.log" | tail -1)
+            [ -n "$fz_clean" ] && fz_ran=$(( fz_ran + $(echo "$fz_clean" | awk '{print $1}') ))
+        fi
+    done
+
+    fz_elapsed=$(( $(date +%s) - fz_started ))
+    echo
+    echo "=============================================="
+    echo " $((fz_elapsed / 60))m $((fz_elapsed % 60))s wall, $FUZZ_JOBS at a time"
+    rm -rf "$fz_dir"
+    if [ "$fz_ran" -eq 0 ]; then
+        echo " ERROR: no fuzz target ran at all."
+        exit 2
+    fi
+    if [ "$fz_fail" -ne 0 ]; then
+        echo " $fz_fail of $fz_ran fuzz runs failed."
+        echo " Reproducers, if any, are in $ARTIFACTS"
+        ls -la "$ARTIFACTS" 2>/dev/null
+        exit 1
+    fi
+    echo " $fz_ran fuzz runs, all clean."
+    echo "=============================================="
+    exit 0
+fi
+
 fail=0
 ran=0
 
