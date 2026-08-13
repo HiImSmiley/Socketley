@@ -96,9 +96,11 @@ build() {
     # measured against whatever binaries were already under bin/, which is how
     # the fuzz job came to run a libFuzzer build twelve days old.
     local cfg=$1
+    local extra_cppflags=${2:-}
     local log="$RUNDIR/build-$cfg.log"
     printf '  build %-9s ' "$cfg"
-    if make -C make "config=${cfg}_x64" -j"$(nproc)" >"$log" 2>&1; then
+    if make -C make "config=${cfg}_x64" -j"$(nproc)" \
+            ${extra_cppflags:+CPPFLAGS="$extra_cppflags"} >"$log" 2>&1; then
         local w
         w=$(grep -cE 'warning:|error:' "$log")
         if [ "$w" -ne 0 ]; then
@@ -130,7 +132,46 @@ if [ "$SANITIZE_BUILT" -eq 0 ]; then
 fi
 
 want tsan       && { build tsan     || RESULT[tsan]=BUILD_FAIL; }
-want invariants && { build debug    || RESULT[invariants]=BUILD_FAIL; }
+# The invariants are a compile-time option, and the whole job is worthless
+# without them: a CPPFLAGS that never reached the compiler produces a binary with
+# every check compiled out, runs the harnesses, and reports green -- which is
+# indistinguishable from a run where the invariants held.  This ran that way from
+# 52c55fa until now, reporting "3 passed, 0 failed" from a build with no checks
+# in it.  invariants.h documents CPPFLAGS as the way to turn itself on; the
+# verification below is what makes the flag's arrival a fact rather than a hope.
+#
+# NOT `nm | grep skl_inv`, which is what this check said first and which was
+# measured passing on a binary with the checks compiled out.  Building
+# fuzz_proxy_ops with the flag while the socketley_sdk.a it links was built
+# without it produced exactly that: two skl_inv symbols in the binary, from the
+# fuzz target's own translation unit, and not one check body anywhere.  A symbol
+# from any single TU satisfies that grep, so it answers "did anything include the
+# header", not "did the flag reach the compiler".
+#
+# The markers below come from two different translation units on purpose -- one
+# from a check body in invariants.h, one from the SKL_INV_FAIL site in
+# proxy_instance.cpp.  Both present means the flag reached more than the file
+# that happened to be looked at.
+INV_MARKERS=(
+    'nothing in flight on either half'   # invariants.h, check_pair
+    'answer-owed-close'                  # proxy_instance.cpp, close_pair
+)
+if want invariants; then
+    if build debug "-DSOCKETLEY_INVARIANTS -DSOCKETLEY_INVARIANTS_WARN_ONLY"; then
+        for m in "${INV_MARKERS[@]}"; do
+            # Not `grep -q`: it exits at the first match, and `strings` on this
+            # binary is long enough that the SIGPIPE is reliable rather than
+            # theoretical.  The workflow carries the same note.
+            if ! strings bin/Debug/socketley 2>/dev/null | grep -F "$m" >/dev/null; then
+                echo "  invariants NOT compiled in — no '$m' in bin/Debug/socketley"
+                echo "  This job would have reported success while checking nothing."
+                RESULT[invariants]=BUILD_FAIL
+            fi
+        done
+    else
+        RESULT[invariants]=BUILD_FAIL
+    fi
+fi
 
 # The coverage-guided half, which nothing else here builds.
 #
@@ -223,13 +264,39 @@ if want load; then
 fi
 if want invariants && [ -z "${RESULT[invariants]:-}" ]; then
     printf '  invariants        '
-    if SOCKETLEY_CONFIG=Debug bash test/load/run_all.sh \
-           restart_under_load runtime_churn_leak churn_repro \
-           >"$RUNDIR/invariants.log" 2>&1; then
-        RESULT[invariants]=PASS; echo "pass"
+    ok=1
+    # The integration suite as well as the load harnesses, which is what the
+    # workflow does and this runner did not: three churn harnesses exercise far
+    # less of the tree than 128 integration tests, and the invariants are
+    # statements about connection handling, which is most of what those tests
+    # are.  Running only the harnesses is why this job reported on three files
+    # for as long as it has existed.
+    SOCKETLEY_CONFIG=Debug bash test/run_all.sh \
+        >"$RUNDIR/invariants-suite.log" 2>&1 || ok=0
+    SOCKETLEY_CONFIG=Debug bash test/load/run_all.sh \
+        restart_under_load runtime_churn_leak churn_repro \
+        >"$RUNDIR/invariants-load.log" 2>&1 || ok=0
+
+    # Exit codes are not the whole verdict here.  Under
+    # -DSOCKETLEY_INVARIANTS_WARN_ONLY a violation prints and does not abort, so
+    # a run can hold every assertion, exit 0, and still have reported that a
+    # property this project states about itself does not hold.  The grep is the
+    # enforcement; lib_daemon.sh's daemon_stop is what puts the line in reach of
+    # it, by echoing the daemon's own log before deleting it.
+    hits=$(grep -hF '[invariant]' "$RUNDIR/invariants-suite.log" \
+                                  "$RUNDIR/invariants-load.log" 2>/dev/null | wc -l)
+    if [ "$hits" -ne 0 ]; then
+        ok=0
+        echo "FAIL ($hits invariant violation(s))"
+        grep -hF '[invariant]' "$RUNDIR/invariants-suite.log" \
+                               "$RUNDIR/invariants-load.log" 2>/dev/null \
+            | sed 's/^ *//' | sort | uniq -c | sort -rn | head -10 | sed 's/^/      /'
+    elif [ "$ok" -eq 1 ]; then
+        echo "pass"
     else
-        RESULT[invariants]=FAIL; echo "FAIL"
+        echo "FAIL"
     fi
+    [ "$ok" -eq 1 ] && RESULT[invariants]=PASS || RESULT[invariants]=FAIL
 fi
 echo
 
@@ -242,7 +309,12 @@ for name in release sanitize tsan fuzz load invariants; do
     [ "$r" = "skipped" ] && continue
     # The count alongside the verdict: a suite that passes 141 and one that
     # passes 3 both say PASS, and only one of them ran.
-    summary=$(grep -hE "^ Summary:" "$RUNDIR/$name.log" 2>/dev/null | tail -1)
+    # The glob is for invariants, which writes two logs rather than one.  A
+    # missing file here costs the count and nothing else, which is precisely why
+    # it would go unnoticed -- the line still prints, just without the number
+    # that makes it mean anything.
+    summary=$(grep -hE "^ Summary:" "$RUNDIR/$name.log" "$RUNDIR/$name"-*.log \
+                   2>/dev/null | tail -1)
     printf '  %-11s %-10s %s\n' "$name" "$r" "$summary"
     [ "$r" = "PASS" ] || fail=1
 done
