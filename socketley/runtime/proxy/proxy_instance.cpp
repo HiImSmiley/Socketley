@@ -2759,7 +2759,20 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             }
         }
 
-        close_pair(fd, conn->backend_fd);
+        // Everything that reaches here has already been offered the hold and
+        // declined it: res == 0 is a clean half-close and was answered above,
+        // so what is left is res < 0 — a read that FAILED.  ECONNRESET is the
+        // common one, and a socket the kernel has reset cannot carry an answer
+        // however much is owed on it.
+        //
+        // Stated with force rather than left to the gate, because the gate
+        // cannot see the difference: by the time it runs, the only thing it has
+        // is the pair, and the pair looks identical whether the client shut its
+        // write side politely or the connection was torn out from under it.
+        // This is where the 389 connections the gate held on its second run
+        // were coming from.
+        close_pair(fd, conn->backend_fd,
+                   cqe->res < 0 ? close_reason::force : close_reason::normal);
         return;
     }
 
@@ -3107,7 +3120,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE))
     {
         answer_request_too_large(conn);
-        close_pair(fd, conn->backend_fd);
+        // force: the refusal IS the answer.  Nothing further is owed on a
+        // request that has just been refused, and holding here would leave the
+        // multishot recv armed and go on accepting the very bytes the ceiling
+        // exists to stop — measured, the payload then arrived whole where the
+        // test asks for it truncated.
+        close_pair(fd, conn->backend_fd, close_reason::force);
         return;
     }
 
@@ -3687,7 +3705,22 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             }
         }
 
-        close_pair(conn->client_fd, fd);
+        // force: the backend's read completed with EOF or an error, so this
+        // pair has no source of further bytes.  Everything that could still be
+        // answered was answered above -- the branch that retries or sends 502
+        // takes every client that has not seen a byte yet -- so what reaches
+        // here has either got what there was or is already closing.
+        //
+        // The answer-owed invariant found this site rather than the other way
+        // round: it was 5 of the 5 remaining violations in a suite run, all
+        // from test_proxy_circuit_breaker.sh, whose truncating backend stops
+        // mid-header-block.  Those bytes are on the wire and RFC 9112 6.3 makes
+        // a header block ended by a close a complete response, so the client
+        // has its answer; what is not complete is the FRAMING, which is what
+        // backend_response_complete() reads and why the check fired.  The
+        // finding was accurate and the close is right -- what was missing was
+        // this line saying so.
+        close_pair(conn->client_fd, fd, close_reason::force);
         return;
     }
 
@@ -7075,8 +7108,71 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
     }
 }
 
-void proxy_instance::close_pair(int client_fd, int backend_fd)
+void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reason)
 {
+    // ── the answer-owed invariant, asked once for every path ───────────────    //
+    // A client that has shut its write side is still owed the answer to the
+    // request it already sent.  handle_client_read knows that and holds;
+    // nothing else does.  The count is the argument: client_answer_owed() is
+    // consulted at 2 places while this function is called at 86, across 15
+    // functions, and this defect has been fixed four times at four different
+    // call sites -- 6de09db, 19d6003, 2ab585a, 9aa8e96 -- with the fuzzer
+    // finding a fifth.
+    //
+    // This CHECKS rather than decides, and the difference is the whole point.
+    // Holding here was tried and measured: 1484 connections held after an abort
+    // storm, then 389 with three callers told to force, then 294 with a fourth.
+    // Each force covered one more path, which is the four point fixes again
+    // with the sign reversed -- before, every path had to remember to hold;
+    // after, every path had to remember to force.  Inverting the default moved
+    // the per-path knowledge, it did not remove it.
+    //
+    // The reason is structural.  close_pair cannot tell a polite half-close
+    // from a connection torn out from under its client: by the time it runs,
+    // both are just a pair.  What decides it -- whether an answer can still be
+    // DELIVERED -- lives at the caller and does not survive the call.  A gate
+    // sited where that knowledge is absent can only ever be told, one caller at
+    // a time.
+    //
+    // So the invariant fires where the decision cannot be made.  It changes no
+    // behaviour: the hold stays where the knowledge is, and this turns 86 call
+    // sites into 86 places the fuzzer and the sanitized suite can catch rather
+    // than 86 places to edit.  close_reason::force is how a caller states that
+    // no answer can arrive on this pair -- and it is now a claim recorded for
+    // the invariant, not a bypass of a gate.
+    // HTTP only, for the same reason the hold is.  client_answer_owed() rests on
+    // response_started, and that flag is set at exactly one place -- the
+    // `m_protocol == protocol_http` branch in handle_backend_read -- so on a TCP
+    // proxy it is false for the life of every connection and the predicate reads
+    // "an answer is owed" for every client that has a backend at all, for ever.
+    //
+    // Measured before this line existed: a full suite run against the invariants
+    // build reported 468 violations across 7 tests, of which 426 came from one
+    // --protocol tcp test and 458 from the four tcp tests together.  Every one
+    // was a healthy close.  The hold carries this same gate and so was never
+    // wrong; the invariant without it was not the specification for the hold but
+    // a different claim sharing its predicate.
+    //
+    // What that leaves uncovered is stated rather than hidden: on a TCP proxy
+    // this asserts nothing.  Covering it needs a term that can decide "the
+    // backend still owes this client bytes" without HTTP framing, which
+    // sent_to_client is not -- it says bytes have flowed, never that they are
+    // finished.
+    if (reason == close_reason::normal &&
+        m_protocol == protocol_http &&
+        client_fd >= 0 && client_fd < MAX_FDS &&
+        m_conn_idx[client_fd].side == conn_client)
+    {
+        proxy_client_connection* c = m_conn_idx[client_fd].client;
+        const proxy_backend_connection* b = nullptr;
+        if (backend_fd >= 0 && backend_fd < MAX_FDS &&
+            m_conn_idx[backend_fd].side == conn_backend)
+            b = m_conn_idx[backend_fd].backend;
+
+        if (!c->closing && !conn_tunnelled(c) && client_answer_owed(c, b))
+            SKL_INV_FAIL("answer-owed-close", "proxy::close_pair");
+    }
+
     // Find client conn for pool-eligibility checks
     proxy_client_connection* client_for_pool = nullptr;
     if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd].side == conn_client)
@@ -8735,7 +8831,11 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     // still running for it is work nobody will ever collect.
     SKL_TRACE_LOG("client-abort cfd=%d revents=0x%x connect_pending=%d clients=%u",
                   client_fd, revents, (int)conn->connect_pending, (unsigned)m_client_count);
-    close_pair(client_fd, conn->backend_fd);
+    // force: POLLERR/POLLHUP on the client means the peer is gone.  Whatever
+    // answer is owed cannot be delivered to a socket in that state, so holding
+    // would keep the pair — and its descriptors — for a reply nobody will read.
+    // This is the 1484 connections the gate held on its first run.
+    close_pair(client_fd, conn->backend_fd, close_reason::force);
 }
 
 void proxy_instance::arm_response_deadline(proxy_client_connection* conn)
@@ -9364,7 +9464,11 @@ bool proxy_instance::lua_close_client(int client_fd)
     if (ce.side != conn_client) return false;
     auto* conn = ce.client;
     if (conn->closing) return false;
-    close_pair(client_fd, conn->backend_fd);
+    // force: the script asked for this connection to be closed.  That is an
+    // instruction and not an error condition, and self.close_client() promising
+    // to close is the whole of its contract — a hold would make it silently
+    // mean "close later, if the exchange happens to finish".
+    close_pair(client_fd, conn->backend_fd, close_reason::force);
     return true;
 }
 

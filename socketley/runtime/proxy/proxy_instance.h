@@ -796,7 +796,20 @@ private:
     // likely to be holding something.
     void close_tracked(int fd);
 
-    void close_pair(int client_fd, int backend_fd);
+    // close_reason::force is a caller stating that no answer can arrive on this
+    // pair any more -- the runtime is stopping, the backend is gone, the client
+    // aborted.  5 of the 86 calls say it; the other 81 leave the default, and
+    // the default is checked.
+    //
+    // It does not change what close_pair does.  The answer-owed invariant is an
+    // assertion, not a gate: holding here was tried and could not work, because
+    // by the time this function runs a polite half-close and a connection torn
+    // out from under its client are the same pair.  So `force` withdraws a
+    // claim rather than a guard, and a path added later inherits the check
+    // instead of having to remember it.
+    enum class close_reason { normal, force };
+    void close_pair(int client_fd, int backend_fd,
+                    close_reason reason = close_reason::normal);
     inline void close_pair_close_backend(int backend_fd,
                                           proxy_backend_connection* bconn,
                                           proxy_client_connection* cconn);
