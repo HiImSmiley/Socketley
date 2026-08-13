@@ -1897,6 +1897,20 @@ architecture() {
     echo "    real NIC, where zero copy could still pay. Never used on a TLS leg"
     echo "    or with an on_proxy_request/on_proxy_response hook."
     echo ""
+    echo -e "  ${CYAN}SOCKETLEY_SEND_ZC${NC}             unset (off)"
+    echo "    Send a single response of 512 KB or more with IORING_OP_SEND_ZC"
+    echo "    instead of copying it. Off because the peer releases it, not us:"
+    echo "    the kernel posts the notification that frees the buffer only once"
+    echo "    the socket's write queue drains, and a client that stops reading"
+    echo "    never lets that happen. Measured with a 544 KB send to a receiver"
+    echo "    that does not read: no notification after 300 rounds of ring"
+    echo "    activity, none after closing the sender's own descriptor, one"
+    echo "    immediately on the receiver reading. Unlike a write, it cannot be"
+    echo "    cancelled - a notification is not a request. While it is on, one"
+    echo "    client that declines to read pins a stopped runtime's whole"
+    echo "    storage indefinitely. Turn on only where readers are known to"
+    echo "    drain. Server, cache and proxy write paths alike."
+    echo ""
 
     read -p "Press Enter to continue..." || true
     main_menu

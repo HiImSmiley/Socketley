@@ -1342,7 +1342,12 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    m_send_zc = loop.send_zc_supported();
+    // Not send_zc_supported(): the kernel having the opcode is not the
+    // question.  A pending zero-copy notification is not a cancellable request
+    // and only the peer can release it, so it would hold this instance in
+    // retire()'s graveyard for as long as one client declines to read.  See
+    // event_loop::send_zc_enabled().
+    m_send_zc = loop.send_zc_enabled();
 
     // Probe for splice support (available on Linux 5.7+).  Asked even when the
     // opt-in below is off, so that `stats` can still say whether this kernel

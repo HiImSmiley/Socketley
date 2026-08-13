@@ -5464,6 +5464,33 @@ or
 .B on_proxy_response
 hook \(em the kernel moves those bytes without the script ever seeing them.
 .TP
+.B SOCKETLEY_SEND_ZC
+Send a single response of 512\ KB or more with
+.BR IORING_OP_SEND_ZC ,
+which hands the kernel the buffer instead of copying it. Unset (off) by
+default; only the value
+.B 1
+turns it on. Read once per process and inherited by worker processes. Applies
+to the server, cache and proxy write paths alike.
+.IP
+Off because a zero\-copy send is released by the peer, not by us. The kernel
+posts its notification \(em the signal that the buffer may be reused \(em only
+once the socket's write queue has been freed, and a client that stops reading
+never lets that happen. Measured on this kernel with a 544\ KB send to a
+receiver that does not read: no notification after 300 rounds of ring activity,
+none after closing the sender's own descriptor, and one immediately on the
+receiver reading. A plain write does not behave this way, because a write is a
+request and the cancel a teardown already submits withdraws it; a notification
+is not a request and cannot be cancelled.
+.IP
+What that costs while it is on is a runtime that cannot be freed. A stopped
+instance is held until the ring owes it nothing, so one client that declines to
+read a large response pins that instance \(em its buffer rings, its connection
+table, all of it \(em for as long as it likes;
+.B socketley stop
+returns, the runtime reports stopped, and the memory does not come back. Turn
+it on only where every reader is known to drain.
+.TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by
 default. Trades CPU for lower receive latency on busy links.

@@ -362,7 +362,51 @@ public:
     // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
     // Buffer must stay alive until NOTIF CQE arrives.
     bool submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
+
+    // Whether the kernel has the opcode.  Says nothing about whether using it
+    // is a good idea here — see send_zc_enabled().
     bool send_zc_supported() const;
+
+    // Whether a runtime should use it.  Off unless SOCKETLEY_SEND_ZC=1.
+    //
+    // A NOTIFICATION IS NOT A REQUEST, AND NOTHING LOCAL CAN MAKE IT ARRIVE.
+    //
+    // The notification is posted when the kernel has released the pages it
+    // borrowed, which for TCP means when the socket's write queue is freed.
+    // That is the peer's decision, not ours.  Measured directly against this
+    // kernel (test program in the commit message), on a loopback pair with a
+    // 544 KB zero-copy send and a receiver that does not read:
+    //
+    //     300 rounds of ring activity      no notification
+    //     close() the sender's descriptor  no notification
+    //     receiver reads the bytes         notification, immediately
+    //     SO_LINGER 0 + close (RST)        notification, immediately
+    //
+    // So the only two things that release it are the peer reading and an
+    // abortive close.  The second is not available to a graceful teardown: it
+    // would reset precisely those connections that have a large response in
+    // flight and have not read it yet, which turns "stop" into guaranteed
+    // truncation for the biggest responses.
+    //
+    // A plain write does not have this shape.  It is a request, so the cancel
+    // that free_fixed_file_slot() and close_fd() already submit withdraws it
+    // and it reports -ECANCELED.  A pending notification cannot be cancelled —
+    // there is no request left to name; the send has already completed.
+    // Observed on the seed that found this: the fixed-index cancel withdrew the
+    // multishot recv on the same index and left the notification standing.
+    //
+    // What that costs is a runtime that can never be freed.  retire()'s
+    // graveyard holds a stopped instance until owner_inflight() reaches zero,
+    // so one client that stops reading a >= 512 KB response pins the whole
+    // instance — its buffer rings, its connection table, all of it — for as
+    // long as it likes.  `socketley stop` returns, the runtime reports stopped,
+    // and the memory never comes back.
+    //
+    // The gain being given up is narrow by the callers' own rule: zero-copy is
+    // only ever reached for a single write of 512 KB or more, because below
+    // that the notification round trip costs more than the copy saves.  A
+    // deployment whose readers are known to drain can set SOCKETLEY_SEND_ZC=1.
+    bool send_zc_enabled() const;
 
     // Registered files: pre-register fds to avoid fget/fput per op
     bool register_files(const int* fds, uint32_t count);

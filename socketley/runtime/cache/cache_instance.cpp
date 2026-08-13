@@ -404,7 +404,12 @@ bool cache_instance::setup(event_loop& loop)
     }
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    m_send_zc = loop.send_zc_supported();
+    // Not send_zc_supported(): the kernel having the opcode is not the
+    // question.  A pending zero-copy notification is not a cancellable request
+    // and only the peer can release it, so it would hold this instance in
+    // retire()'s graveyard for as long as one client declines to read.  See
+    // event_loop::send_zc_enabled().
+    m_send_zc = loop.send_zc_enabled();
 
     // A fresh accept request for this run.  The previous one may still be owed
     // a completion — a multishot accept stays armed until it reports without

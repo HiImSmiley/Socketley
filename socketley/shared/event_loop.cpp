@@ -1235,7 +1235,70 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         // IORING_CQE_F_MORE the submission stays armed and is going to resolve
         // its descriptor again, so it is not a number anyone may give away yet.
         const bool final_cqe = (cqe->flags & IORING_CQE_F_MORE) == 0;
-        if (__builtin_expect(final_cqe, 1))
+
+        // THE DESCRIPTOR IS DONE BEFORE THE REQUEST IS, AND ONLY HERE.
+        //
+        // Two different questions are being answered on the way out of this
+        // function, and for every operation but one they are answered at the
+        // same moment:
+        //
+        //   may this number be closed, unregistered, reissued?   the targets
+        //   may this request's storage be freed?                 the owner
+        //
+        // IORING_OP_SEND_ZC reports twice — once for the send, and again with
+        // IORING_CQE_F_NOTIF once the kernel has released the pages it borrowed
+        // — and it answers the two at different times.  After the send CQE the
+        // file has done its last work: the SQE has been consumed and nothing
+        // queued will resolve the index or the descriptor again.  The
+        // notification resolves no file at all; it is the kernel saying it has
+        // finished with memory.  So the target reference has to come off here,
+        // while the owner count stays up, because that notification is still
+        // going to arrive and dispatch it through this same io_request.
+        //
+        // Holding the target until the notification is not merely
+        // conservative — it holds the number for a time nothing local bounds.
+        // The notification is released when the socket's write queue is freed,
+        // and that is the peer's decision; see send_zc_enabled() for the
+        // measurement.  Until it comes, free_fixed_file_slot() cannot run its
+        // deferred unregister so the index is never handed back, and close_fd()
+        // cannot run its deferred close so the descriptor number is never
+        // reissued — both of them waiting on a completion that resolves
+        // neither.  Measured on the seed that found it: a 544 KB zero-copy send
+        // to a peer that never read, then a stop — "1 operation(s) still owed
+        // at OP_DESTROY: send-zc=1 on fixed=0(1)", after 1970 rounds of polling
+        // in 2018 ms, with index 0 still reserved.  The cancel that
+        // free_fixed_file_slot() submits does not reach it: the send has
+        // already completed and a notification is not a request that can be
+        // cancelled — on that same seed the cancel withdrew the multishot recv
+        // on the index and left this standing.  The raw-descriptor path holds
+        // the same way through close_fd(), which is why this is settled here,
+        // once, rather than in either release path.
+        //
+        // Releasing the target here does not make the notification arrive, and
+        // is not meant to — nothing in this process can.  It stops one stalled
+        // peer from also taking a descriptor number and a registered-file slot
+        // out of circulation for the life of the loop.
+        const bool zc_send_phase = !final_cqe && rtype == op_send_zc &&
+                                   (cqe->flags & IORING_CQE_F_NOTIF) == 0;
+        if (__builtin_expect(zc_send_phase, 0))
+        {
+            // So the notification's own disarm() does not release them a second
+            // time.  Safe to clear before the dispatch: every caller of
+            // submit_send_zc* refuses to re-arm a request whose notification is
+            // outstanding (zc_notif_pending), and a re-arm would overwrite both
+            // fields here anyway.
+            req->armed_target  = IO_TARGET_NONE;
+            req->armed_target2 = IO_TARGET_NONE;
+        }
+
+        // What close_fd() discounts while the handler runs — see there.  Only
+        // for a completion after which the submission will not resolve its
+        // descriptor again: with IORING_CQE_F_MORE a multishot stays armed and
+        // is going to name that number once more, so it is not a number anyone
+        // may give away yet.  The zero-copy send phase is the exception above —
+        // its SQE is spent, so a handler closing the descriptor from inside
+        // this completion is entitled to the same discount.
+        if (__builtin_expect(final_cqe || zc_send_phase, 1))
         {
             m_cqe_target  = rt1;
             m_cqe_target2 = rt2;
@@ -1266,6 +1329,16 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         // readable whatever the handler did with its own.
         if (__builtin_expect(final_cqe, 1))
             disarm(tok, rtype, rt1, rt2);
+        else if (__builtin_expect(zc_send_phase, 0))
+        {
+            // The owner keeps its count — the notification is still owed — but
+            // the file is released now.  Last, and after the handler has run,
+            // for the reason disarm() gives: settle_deferred() can close a
+            // descriptor or unregister a file, and doing that before on_cqe
+            // would pull it out from under a handler still reading it.
+            target_unref(rt1);
+            target_unref(rt2);
+        }
     }
 
     return cqe_outcome::next;
@@ -1993,6 +2066,17 @@ bool event_loop::recv_multishot_supported() const
 bool event_loop::send_zc_supported() const
 {
     return m_send_zc_supported;
+}
+
+bool event_loop::send_zc_enabled() const
+{
+    // Read once: the answer cannot change under a running process, and this is
+    // consulted from every runtime's setup().
+    static const bool opted_in = [] {
+        const char* e = getenv("SOCKETLEY_SEND_ZC");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return m_send_zc_supported && opted_in;
 }
 
 bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
