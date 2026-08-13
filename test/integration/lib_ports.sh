@@ -96,7 +96,20 @@ if [ -z "${SL_PORT_BASE:-}" ]; then
             # in this directory uses it, and the one thing that must not happen
             # — the lock being released while the ports are still in use — is
             # then impossible without the shell exiting.
-            exec 9>"/tmp/socketley-ports-$sl_try.lock" 2>/dev/null || continue
+            # The `2>/dev/null` that used to sit on this line applied to the
+            # SHELL, not to the command.  A bare `exec` — one with no program to
+            # run — installs its redirections permanently, so that suffix
+            # silenced stderr for the whole of every test that sources this file:
+            # 124 of the 128.  ASan and UBSan write there, python tracebacks
+            # write there, `nc` and the shell's own error messages write there,
+            # and none of it reached a suite log.  Under Sanitize above all,
+            # which is where this project's serious findings surface.
+            #
+            # So the creatability test happens in a subshell, where a redirection
+            # is scoped to what it is written next to, and the exec that follows
+            # carries none.
+            ( : >"/tmp/socketley-ports-$sl_try.lock" ) 2>/dev/null || continue
+            exec 9>"/tmp/socketley-ports-$sl_try.lock"
             flock -n 9 2>/dev/null || continue
 
             # And then the machine's own opinion.  A window can be unlocked and
@@ -116,7 +129,11 @@ if [ -z "${SL_PORT_BASE:-}" ]; then
                 # Give the lock back before moving on, or the next run finds
                 # this window locked by a shell that is not using it.
                 flock -u 9 2>/dev/null || true
-                exec 9>&- 2>/dev/null || true
+                # Bare, for the reason given at the open above: a redirection
+                # here would outlive this line and take the rest of the test's
+                # stderr with it.  Closing a descriptor this shell just opened
+                # does not fail.
+                exec 9>&-
                 continue
             fi
 
