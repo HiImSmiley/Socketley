@@ -185,8 +185,20 @@ want release  && [ -z "${RESULT[release]:-}"  ] && \
     run_bg release  env SOCKETLEY_CONFIG=Release  bash test/run_all.sh
 want sanitize && [ -z "${RESULT[sanitize]:-}" ] && \
     run_bg sanitize env SOCKETLEY_CONFIG=Sanitize bash test/run_all.sh
+# Under setarch -R, which the workflow does not need and this machine does.
+#
+# ThreadSanitizer maps its shadow at fixed addresses and refuses to start when
+# the loader has put something where it wants to be: "FATAL: ThreadSanitizer:
+# unexpected memory mapping", before main().  With randomize_va_space=2 here
+# that happens every time -- 140 of 141 tests failed for it, which reads as a
+# catastrophic regression and is a binary that never ran.  GitHub's runners lay
+# memory out differently and the job passes there, which is exactly why this had
+# to be found by running it somewhere else.
+#
+# -R disables randomisation for the child only, so nothing outside this suite is
+# affected, and the sanitizer's own findings are unchanged by it.
 want tsan     && [ -z "${RESULT[tsan]:-}"     ] && \
-    run_bg tsan     env SOCKETLEY_CONFIG=TSan     bash test/run_all.sh
+    run_bg tsan     setarch "$(uname -m)" -R env SOCKETLEY_CONFIG=TSan bash test/run_all.sh
 # Positional, not an environment variable: run_fuzz.sh reads its budget from
 # $1 and defaults to 10 seconds, so passing FUZZ_SECONDS= would have run a
 # tenth-of-a-minute fuzz and reported it as a nightly.
