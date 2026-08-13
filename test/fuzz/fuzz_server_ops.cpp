@@ -430,11 +430,42 @@ uint16_t next_port()
     // listener can never collide with a client socket the harness or the
     // runtime opened, and rotated so a port left in an odd state by one input
     // does not decide the next one.
-    static uint16_t p = 0;
-    if (p == 0)
-        p = static_cast<uint16_t>(20000 + (::getpid() % 4096));
-    if (++p >= 30000)
-        p = 20000;
+    static uint16_t base = 0, top = 0, p = 0;
+    if (base == 0)
+    {
+        // Where to stay, when something else on this machine has claimed
+        // ports of its own.
+        //
+        // 20000-29999 is below the ephemeral range, which is what this was
+        // chosen for -- but it is also exactly where test/integration's
+        // lib_ports.sh hands out its 2000-wide windows (21000, 23000, 25000,
+        // 27000, 29000), and that claim is made under an flock this harness
+        // does not take.  A fuzz target squatting in a claimed window makes a
+        // suite fail on a port it was promised: measured, a Sanitize run in
+        // window 21000 came back 139/2 with fuzz targets live and 141/0 on a
+        // quiet machine.
+        //
+        // So the range is overridable, and test/nightly.sh points the fuzz job
+        // at 31000-32767 -- still below ephemeral, and the one stretch no
+        // window reaches.  Unset, this is what it always was.
+        base = 20000;
+        top  = 30000;
+        if (const char* env = ::getenv("SOCKETLEY_FUZZ_PORT_BASE"))
+        {
+            const long v = ::strtol(env, nullptr, 10);
+            if (v >= 1024 && v < 32000)
+            {
+                base = static_cast<uint16_t>(v);
+                const char* env_top = ::getenv("SOCKETLEY_FUZZ_PORT_TOP");
+                const long  t       = env_top ? ::strtol(env_top, nullptr, 10) : 0;
+                top = (t > v && t <= 32768) ? static_cast<uint16_t>(t)
+                                            : static_cast<uint16_t>(32768);
+            }
+        }
+        p = static_cast<uint16_t>(base + (::getpid() % (top - base)));
+    }
+    if (++p >= top)
+        p = base;
     return p;
 }
 

@@ -163,6 +163,15 @@ echo
 # Concurrent, because none of these reports a number that contention could
 # change -- they answer whether something is broken, and that answer is the same
 # under load.
+#
+# One thing did have to be arranged rather than merely observed.  The suites
+# claim 2000-wide port windows under an flock (integration/lib_ports.sh) at
+# 19000, 21000, 23000 and upwards; the fuzz targets bound ports from
+# 20000 + getpid() % 4096 and took that lock never.  Running the two together
+# therefore had a fuzz target squatting in a window a suite had been promised --
+# measured, a Sanitize run in window 21000 came back 139/2 with fuzz live, and
+# 141/0 on a quiet machine.  The fuzz job is now pointed at 31000-32767, still
+# below the ephemeral range and the one stretch no window reaches.
 echo "── phase 1 (concurrent) ──"
 declare -A PID
 run_bg() { # name, command...
@@ -182,7 +191,8 @@ want tsan     && [ -z "${RESULT[tsan]:-}"     ] && \
 # $1 and defaults to 10 seconds, so passing FUZZ_SECONDS= would have run a
 # tenth-of-a-minute fuzz and reported it as a nightly.
 want fuzz && [ -z "${RESULT[fuzz]:-}" ] && \
-    run_bg fuzz     bash test/fuzz/run_fuzz.sh "$FUZZ_SECONDS"
+    run_bg fuzz     env SOCKETLEY_FUZZ_PORT_BASE=31000 SOCKETLEY_FUZZ_PORT_TOP=32768 \
+                        bash test/fuzz/run_fuzz.sh "$FUZZ_SECONDS"
 
 for name in "${!PID[@]}"; do
     if wait "${PID[$name]}"; then RESULT[$name]=PASS; else RESULT[$name]=FAIL; fi
