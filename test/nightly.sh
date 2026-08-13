@@ -87,7 +87,16 @@ declare -A RESULT
 # where this machine has run out of memory before, and a build that dies halfway
 # costs more than the minutes it saved.
 build() {
-    local cfg=$1 log="$RUNDIR/build-$cfg.log"
+    # Two statements, not one.  bash expands every word of a `local` command
+    # before it assigns any of them, so `local cfg=$1 log=...$cfg...` reads cfg
+    # while it is still unset — which under `set -u` is a fatal error, not an
+    # empty string.  This function had therefore never run to completion: the
+    # only invocation anybody had tried was `nightly.sh fuzz`, which requested no
+    # build and so never called it.  Every job this runner has reported on was
+    # measured against whatever binaries were already under bin/, which is how
+    # the fuzz job came to run a libFuzzer build twelve days old.
+    local cfg=$1
+    local log="$RUNDIR/build-$cfg.log"
     printf '  build %-9s ' "$cfg"
     if make -C make "config=${cfg}_x64" -j"$(nproc)" >"$log" 2>&1; then
         local w
@@ -107,9 +116,46 @@ build() {
 
 echo "── builds ──"
 want release    && { build release  || RESULT[release]=BUILD_FAIL; }
-want sanitize   && { build sanitize || RESULT[sanitize]=BUILD_FAIL; }
+
+# Sanitize is two jobs' build, not one.  The fuzz job runs the replay half of
+# every target out of bin/Sanitize, so `nightly.sh fuzz` needs this
+# configuration even when the sanitize suite itself is not among the jobs.
+SANITIZE_BUILT=1
+if want sanitize || want fuzz; then
+    build sanitize || SANITIZE_BUILT=0
+fi
+if [ "$SANITIZE_BUILT" -eq 0 ]; then
+    want sanitize && RESULT[sanitize]=BUILD_FAIL
+    want fuzz     && RESULT[fuzz]=BUILD_FAIL
+fi
+
 want tsan       && { build tsan     || RESULT[tsan]=BUILD_FAIL; }
 want invariants && { build debug    || RESULT[invariants]=BUILD_FAIL; }
+
+# The coverage-guided half, which nothing else here builds.
+#
+# This job used to run whatever binaries happened to be under bin/ — on
+# 2026-08-13 that was a libFuzzer build twelve days old, against a Sanitize
+# build of three.  A stale fuzz binary does not merely test old code: its own
+# translation unit is recompiled at link time while its cached SDK objects are
+# not, so the two disagree about the layout of the runtime they share, and what
+# the job reports is a defect that exists in neither build.  That is what the
+# 2026-08-13 client finding was, and the seed 75afc3a filed as
+# stale_binary_artifact-f57f22fc before it.  So the fuzz job builds what it is
+# about to run, like every other job here.
+#
+# Exit 1 is "no clang, or no libFuzzer runtime" — build_libfuzzer.sh's own
+# contract, and the replay driver still covers the targets — so it is reported
+# and not fatal.  Exit 2 is a build that was attempted and failed, which is.
+if want fuzz && [ -z "${RESULT[fuzz]:-}" ]; then
+    printf '  build %-9s ' libfuzzer
+    bash test/fuzz/build_libfuzzer.sh >"$RUNDIR/build-libfuzzer.log" 2>&1
+    case $? in
+        0) echo "ok" ;;
+        1) echo "unavailable — replay driver only (see $RUNDIR/build-libfuzzer.log)" ;;
+        *) echo "FAIL (see $RUNDIR/build-libfuzzer.log)"; RESULT[fuzz]=BUILD_FAIL ;;
+    esac
+fi
 echo
 
 # ─── phase 1: everything that only decides pass or fail ─────────────────────
@@ -135,7 +181,7 @@ want tsan     && [ -z "${RESULT[tsan]:-}"     ] && \
 # Positional, not an environment variable: run_fuzz.sh reads its budget from
 # $1 and defaults to 10 seconds, so passing FUZZ_SECONDS= would have run a
 # tenth-of-a-minute fuzz and reported it as a nightly.
-want fuzz && \
+want fuzz && [ -z "${RESULT[fuzz]:-}" ] && \
     run_bg fuzz     bash test/fuzz/run_fuzz.sh "$FUZZ_SECONDS"
 
 for name in "${!PID[@]}"; do
