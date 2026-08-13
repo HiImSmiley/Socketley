@@ -122,6 +122,26 @@ static inline int deadline_passed(void)
     return g_run_deadline_ns != 0 && time_ns() >= g_run_deadline_ns;
 }
 
+/* The loop condition for a worker that counts operations.  Both terms, in one
+ * place, because the comment on g_run_deadline_ns above says it is "read by
+ * every worker" and that was not true of any of them but one.
+ *
+ * deadline_passed() was consulted at 3 sites against 11 measurements, of which
+ * 5 are concurrent.  The concurrent ones are where it matters: with no deadline
+ * a worker runs a fixed num_ops and the run ends at pthread_join over all of
+ * them, so `elapsed` is the MAXIMUM over nc threads while the numerator is
+ * fixed at nc*num_ops.  At 100 threads on 10 cores that is a straggler
+ * measurement wearing a throughput label, and the spread of a maximum over 100
+ * samples is what the 3-5x run-to-run variance on these tests was.
+ *
+ * Writing the condition rather than the test is the point: a worker added later
+ * gets both terms by using the loop form its neighbours use, instead of having
+ * to know that a global exists. */
+static inline int bench_op_continue(int i, const struct bench_config *cfg)
+{
+    return i < cfg->num_ops && !deadline_passed();
+}
+
 struct latency_log {
     int64_t *samples;
     int      count;
@@ -462,8 +482,21 @@ static char *build_mixed_pipeline(int count, const char *value, int value_len,
 
 /* Send a full pipeline buffer and drain responses (count newlines until we
  * have `expected` responses). Returns number of responses received. */
-static int pipeline_execute(int fd, const char *cmd_buf, size_t cmd_len,
-                            int expected_responses)
+/* `bounded` stops draining when a time-boxed run's window closes.
+ *
+ * It is a parameter and not a check inside, because the six callers want
+ * opposite things and the difference is not visible from here.  Three of them
+ * are measuring, and a measured drain must end with the window or the run's
+ * elapsed time is the slowest connection's rather than the window's.  The other
+ * three are PRE-POPULATING -- bench_cache_get and bench_cache_mixed fill the
+ * store before they measure reads against it -- and a fill cut short by a
+ * deadline leaves a half-populated store that the measurement afterwards then
+ * reports a throughput for.  That number would look entirely reasonable.
+ *
+ * The wrappers below carry the choice in their names, so a call site states
+ * which it is instead of passing a bare 1. */
+static int pipeline_drain(int fd, const char *cmd_buf, size_t cmd_len,
+                          int expected_responses, int bounded)
 {
     if (send_all(fd, cmd_buf, cmd_len) < 0)
         return 0;
@@ -472,11 +505,24 @@ static int pipeline_execute(int fd, const char *cmd_buf, size_t cmd_len,
     char rbuf[BUF_SIZE];
     int got = 0;
     while (got < expected_responses) {
+        if (bounded && deadline_passed()) break;
         ssize_t n = read(fd, rbuf, sizeof(rbuf));
         if (n <= 0) break;
         got += count_newlines(rbuf, n);
     }
     return got;
+}
+
+/* Setup: must complete, whatever the clock says. */
+static inline int pipeline_execute(int fd, const char *b, size_t n, int e)
+{
+    return pipeline_drain(fd, b, n, e, 0);
+}
+
+/* Measured: ends with the run's window when there is one. */
+static inline int pipeline_measure(int fd, const char *b, size_t n, int e)
+{
+    return pipeline_drain(fd, b, n, e, 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -658,11 +704,11 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
     char *rep = (char *)malloc(cfg->msg_size + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
 
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
         if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
@@ -778,7 +824,7 @@ static void *server_concurrent_worker(void *arg)
      * (100 x 500 x 65B is ~32 KB per connection) fits inside socket buffers --
      * so a run could and did finish before the server had read most of it. */
     int local = 0;
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) break;
         if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) break;
         local++;
@@ -831,7 +877,11 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops.  Same wording as the
+     * proxy's concurrent run, which is the one measurement of the five that had
+     * this when -d was built. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -859,8 +909,10 @@ static struct run_result bench_cache_set(struct bench_config *cfg)
     char *cmd_buf = build_set_pipeline(cfg->num_ops, value, vlen, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -894,8 +946,10 @@ static struct run_result bench_cache_get(struct bench_config *cfg)
     char *cmd_buf = build_get_pipeline(cfg->num_ops, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -931,8 +985,10 @@ static struct run_result bench_cache_mixed(struct bench_config *cfg)
     char *cmd_buf = build_mixed_pipeline(cfg->num_ops, value, 64, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -981,7 +1037,7 @@ static void *cache_concurrent_worker(void *arg)
 
     if (fd < 0) { free(buf); return NULL; }
 
-    a->thread_success = pipeline_execute(fd, buf, off, ops);
+    a->thread_success = pipeline_measure(fd, buf, off, ops);
     close(fd);
     free(buf);
     return NULL;
@@ -1026,7 +1082,11 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops.  Same wording as the
+     * proxy's concurrent run, which is the one measurement of the five that had
+     * this when -d was built. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -1698,11 +1758,11 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
 
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
 
         if (send_all(fd, frame, frame_len) < 0) { r.failed++; break; }
@@ -1750,7 +1810,7 @@ static void *ws_concurrent_worker(void *arg)
     pthread_barrier_wait(a->barrier);
 
     int local = 0;
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int fd = tcp_connect(cfg->host, cfg->port);
         if (fd < 0) continue;
         if (ws_upgrade(fd, cfg->host, cfg->port))
@@ -1800,7 +1860,11 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
 
     double elapsed = ns_to_s(end - start);
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops.  Same wording as the
+     * proxy's concurrent run, which is the one measurement of the five that had
+     * this when -d was built. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
     r.throughput = total / elapsed;
 
     return r;
@@ -2026,8 +2090,9 @@ static void usage(const char *prog)
         "              becomes an upper bound.  Use this rather than guessing a\n"
         "              count: a count picked for today's speed shrinks the window\n"
         "              as the code gets faster, and a window of a few tens of\n"
-        "              milliseconds measures the scheduler.  (proxy tcp,\n"
-        "              proxy concurrent, proxy overhead)\n"
+        "              milliseconds measures the scheduler.  Worth most on the\n"
+        "              concurrent tests, where without it a run ends at the\n"
+        "              SLOWEST of its threads and the rate reported is that one's.\n"
         "  -W N        Run and discard N runs before the measured ones\n"
         "  -u PATH     Request target for the HTTP tests (default /)\n"
         "\n"
