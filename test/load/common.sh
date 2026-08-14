@@ -298,3 +298,32 @@ nothing_measured() {
     echo "  A harness that measured nothing is not a passing harness."
     exit 2
 }
+
+# ─── a port window, claimed like everybody else's ───────────────────────────
+#
+# Every harness in this directory used to bind literals, and every one of those
+# literals sat inside a window integration/lib_ports.sh hands out: 19599, 19600
+# and 19700 in the FIRST window, the one a quiet run always takes; 23100, 23101,
+# 23200 and 23201 in the third; 25200, 25201, 26000 and 26010-26029 in the
+# fourth.  Nothing coordinated the two.
+#
+# It cost a nightly job on 2026-08-15:
+#
+#     OSError: [Errno 98] error while attempting to bind on address
+#              ('127.0.0.1', 23200): address already in use
+#     RESULT measure_ws: NO DATA — the WebSocket echo backend did not start
+#
+# The load phase runs alone, so the collision was not with another harness --
+# it was with something still holding a port out of a window a suite had
+# claimed.  CLAUDE.md also hands agents blocks at 21000-23999 by hand, which is
+# the same range from a third direction.
+#
+# Sited here because all seven harnesses source this file and none of them has
+# to know about it.  lib_ports.sh is idempotent -- it returns immediately when
+# SL_PORT_BASE is already set -- so a harness run from test/load/run_all.sh, or
+# under a suite that has already claimed a window, uses that one rather than
+# taking a second.
+#
+# The offsets each harness derives from SL_PORT_BASE are distinct across the
+# directory, so two of them running at once cannot collide either.
+. "$(dirname "${BASH_SOURCE[0]}")/../integration/lib_ports.sh"
