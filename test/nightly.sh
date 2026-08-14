@@ -35,6 +35,39 @@
 # taken under unknown contention is not a cheaper measurement, it is a different
 # question answered by accident.  They run alone, after the rest is finished.
 #
+# THE INVARIANTS SUITE STAYS IN PHASE 2, AND IT WAS TRIED IN PHASE 1.  It looks
+# like it belongs there: it decides pass or fail, which is this file's entry
+# condition for concurrency, and running it serially costs a full integration
+# suite of wall clock.  Measured on this ten-core machine:
+#
+#     four concurrent (Release, Sanitize, TSan, fuzz)          1453 s
+#     five concurrent (the same, plus Debug)                   1463 s
+#     the Debug suite on its own, which is what phase 2 pays   1204 s
+#
+# So the fifth suite costs no time that can be told from noise and would take
+# twenty minutes off the night.  All five came back 142/0.  It was moved -- and
+# the first real nightly on the new arrangement failed two jobs:
+#
+#     tsan         FAIL   connections reaped: still 1464 live 8 s after the
+#                         last client went away
+#     invariants   FAIL   enough healthy cache traffic to mean something:
+#                         cache_ok=9, wanted at least 60
+#
+# Both are test_abrupt_client_abort.sh, and both are that test measuring.  Its
+# floors are calibrated on Release and it demotes them for a build carrying
+# __tsan_ or __asan_ symbols -- a Debug build has neither, so a -O0 binary with
+# -DSOCKETLEY_INVARIANTS is held to Release numbers.  It clears them alone
+# (142/0 in two runs) and got 9 with four other suites on the cores.  The
+# reaping deadline is the same story without the calibration: eight seconds is
+# eight seconds however many suites are running.
+#
+# So this file's premise -- "none of these reports a number that contention
+# could change" -- is false for one test that is already in phase 1, and adding
+# a fifth suite is what made it say so.  One green run of the five-way
+# arrangement was not evidence; the nightly was.  Whoever tries this again:
+# the twenty minutes are real, and they cost a job that fails on a test which
+# passes alone, which is the fastest way to teach everyone to ignore red.
+#
 # Usage:  bash test/nightly.sh [job ...]
 #         FUZZ_SECONDS=120 bash test/nightly.sh fuzz
 #
