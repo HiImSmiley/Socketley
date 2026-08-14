@@ -1750,7 +1750,34 @@ void client_send(world& w, int idx, int shape)
     if (w.rt && c.proxy_fd >= 0 && c.proxy_fd < proxy_instance::MAX_FDS)
     {
         const auto* cc = w.rt->m_client_slots[c.proxy_fd].get();
-        proxy_ending = (cc == nullptr) || cc->closing;
+        // client_conn_close as well as closing, because `closing` is the
+        // teardown and the undertaking comes before it.
+        //
+        // A request carrying "Connection: close" is the CLIENT ending the
+        // connection.  The proxy records that while parsing the request and
+        // closes after answering it, which is what RFC 9112 Section 9.6
+        // requires -- and the same section forbids the client from sending
+        // another request on it.  But `closing` only becomes true at the
+        // teardown, so between the two there is a window where the proxy has
+        // undertaken to close, has not yet done it, and a request written into
+        // that window was counted as one deserving an answer.
+        //
+        // Measured on the 125-byte artefact the nightly of 2026-08-14 aborted
+        // on, at the second send:
+        //
+        //     closing=0  conn_close=1  announced=0  ->  counted=1
+        //
+        // The proxy then closed the pair with 57 bytes of that request still in
+        // its buffer, which is correct, and the oracle called it
+        // answer-lost-to-a-half-close.  Nothing was lost that had been promised.
+        //
+        // peer_announced_close does not cover it: that reads the proxy's own
+        // words, and here there are none to read.  The proxy forwards the
+        // backend's response verbatim -- which is what makes responses stream --
+        // so it has no rewriter with which to add the "close" connection option
+        // Section 9.6 says a server SHOULD send back.  The undertaking is real
+        // and only the connection state records it.
+        proxy_ending = (cc == nullptr) || cc->closing || cc->client_conn_close;
     }
 
     if (static_cast<size_t>(n) == buf.size() && whole > 0 &&
