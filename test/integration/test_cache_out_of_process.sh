@@ -111,9 +111,31 @@ if has "$ST" "keys:1"; then ok; else
         "expected keys:1 after one SET" "$(printf '%s' "$ST" | tr '\n' '|')"
 fi
 
-if printf '%s\n' "$ST" | grep -qE "commands_processed:[1-9]"; then ok; else
+# A shell match and not `printf | grep -q`, and the dump is why.
+#
+# The nightly of 2026-08-14 failed this assertion in the Release job alone --
+# Sanitize, TSan and the invariants build all passed it in the same run -- and
+# printed, as the value it had just declined to match,
+# "...|keys:1|commands_processed:4|get_hits:1|...".  The regex matches that
+# string.  The pipeline said otherwise.
+#
+# The obvious mechanism is `grep -q` exiting on its first match and leaving
+# printf to die on SIGPIPE, which `set -o pipefail` at the top of this file
+# would then turn into a failed condition.  That was tested and does NOT hold
+# here: 5000 iterations idle and 20000 under twelve-way CPU load produced zero
+# failures, and eight full runs of this test produced zero.  So the cause is
+# unexplained, and this is not a claim that it was the pipe.
+#
+# What it is: the same question asked with no pipe, no second process and no
+# exit status to be ambiguous about, so whatever it was cannot reach this line
+# again -- and, if the assertion ever does fail, `od -c` of the exact bytes the
+# daemon returned rather than a rendering of them, because a rendering is what
+# made the last failure impossible to read.
+if [[ "$ST" =~ commands_processed:[1-9] ]]; then ok; else
     bad "stats report commands the worker served" \
-        "$(printf '%s' "$ST" | tr '\n' '|')"
+        "$(printf '%s' "$ST" | tr '\n' '|')" \
+        "raw bytes of the stats reply:" \
+        "$(printf '%s' "$ST" | od -c | head -20)"
 fi
 
 # ── and a server in the daemon can ask it ───────────────────────────────────
