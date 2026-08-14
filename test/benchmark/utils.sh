@@ -383,6 +383,40 @@ format_duration() {
     fi
 }
 
+# Which tree produced a number.
+#
+# Every record in results/ carries a test name and a timestamp and nothing that
+# says what it was measured against, and the numbers in there span months of
+# development under unchanged test names.  What that costs is not hypothetical:
+# results/ holds four proxy_http_single_backend records from the night of
+# 2026-08-07 reading 674, 685, 710 and 7220 req/sec, all with requests=2000 and
+# success=2000.  Grouped by test and by day -- the grouping that is supposed to
+# isolate measurement noise -- that is a 10.7x spread, and it was read as one
+# until the timestamps were laid against the log: the fast one was taken nine
+# seconds after b80eae0, "The two HTTP proxy benchmarks were comparing two bash
+# fork rates".  The three slow numbers measured bash forking a subshell and a
+# `date` per request.  The fast one measured the proxy.
+#
+# So the spread was the benchmark being repaired, and nothing in the file said
+# so.  This does.  Computed once per run rather than per record, and empty
+# rather than absent when there is no checkout to ask -- a packaged benchmark is
+# a legitimate way to run these.
+bench_build_id() {
+    if [[ -n "${BENCH_BUILD_ID:-}" ]]; then
+        printf '%s' "$BENCH_BUILD_ID"
+        return
+    fi
+    local id=""
+    if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+        id=$(git rev-parse --short HEAD 2>/dev/null || true)
+        if [[ -n "$id" ]] && ! git diff --quiet 2>/dev/null; then
+            id="${id}-dirty"
+        fi
+    fi
+    BENCH_BUILD_ID="$id"
+    printf '%s' "$id"
+}
+
 # Write result to JSON
 write_json_result() {
     local test_name=$1
@@ -392,6 +426,7 @@ write_json_result() {
     echo "{" >> "$output_file"
     echo "  \"test\": \"$test_name\"," >> "$output_file"
     echo "  \"timestamp\": \"$(date -Iseconds)\"," >> "$output_file"
+    echo "  \"build\": \"$(bench_build_id)\"," >> "$output_file"
 
     local first=true
     while [[ $# -gt 0 ]]; do
