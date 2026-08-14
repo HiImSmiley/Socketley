@@ -345,6 +345,29 @@ struct http_response_framing
     // else's response as the start of its own.  Never pool one of these.
     bool unknown{false};
 
+    // More body bytes arrived than the response had room for.  Distinct from
+    // `unknown` on purpose, and it used to be spelled as it: the end of THIS
+    // response is known exactly — a Content-Length ran out — and what is wrong
+    // is the socket, which now carries bytes belonging to no request this proxy
+    // sent.  Spelling the two the same made http_response_frame_complete()
+    // answer no for a response that had plainly finished, so the exchange was
+    // never detached, the client was never reset for its next request, and a
+    // request pipelined behind this one sat in the proxy's buffer until the
+    // connection closed under it.  That is fuzz_proxy_ops's
+    // answer-lost-to-a-half-close.
+    //
+    // What it still means is what it always meant: never pool this socket.
+    // http_response_pool_safe() below is the predicate that says so.
+    bool overrun{false};
+
+    // How many bytes at the END of the chunk just scanned lie past that end.
+    // Per-chunk, cleared by every scan.  The caller forwards the rest and drops
+    // these: a byte past the end of the answer is a byte nobody asked for, and
+    // relaying it puts a stranger's bytes on the client's wire where they are
+    // read as the head of a response to a request the client has not had
+    // answered yet.
+    size_t excess_in_chunk{0};
+
     // The backend answered 101 Switching Protocols, so this connection has
     // stopped carrying HTTP messages altogether: what follows the blank line
     // is the protocol the two endpoints agreed on, and it has no message
@@ -382,9 +405,17 @@ struct http_response_framing
 // arrive is the peer's choice of when to flush and nothing else; the verdict
 // cannot depend on it.
 //
-// The bytes themselves are already on their way to the client either way (see
-// the note at the top of this file).  What this decides is only whether the
-// socket underneath may change hands, and the answer is no.
+// Those bytes used to go to the client anyway, and that was the whole of the
+// harm.  A backend flushing "a complete answer + the head of another" put the
+// head of that other response on the client's wire, where the client reads it
+// as the beginning of an answer to a request it has not had answered yet — the
+// crossed-delivery bug this file exists to prevent, arriving by the one route
+// the file was not watching.  excess_in_chunk is how many of them there are, so
+// the caller can forward the answer and drop the rest.
+//
+// And the socket, as before, may not change hands.  That verdict now travels on
+// `overrun` rather than on `unknown`, because the end of THIS response is known
+// exactly — see the field.
 inline void http_response_consume_body(http_response_framing& st, size_t avail)
 {
     const bool bounded = st.no_body ||
@@ -393,7 +424,10 @@ inline void http_response_consume_body(http_response_framing& st, size_t avail)
                                    : (st.has_content_length ? st.body_remaining : 0);
 
     if (SOCKETLEY_UNLIKELY(bounded && avail > left))
-        st.unknown = true;
+    {
+        st.overrun = true;
+        st.excess_in_chunk = avail - left;
+    }
 
     if (st.has_content_length)
         st.body_remaining = (avail >= st.body_remaining) ? 0 : st.body_remaining - avail;
@@ -407,6 +441,12 @@ inline void http_response_consume_body(http_response_framing& st, size_t avail)
 // consumes the one-shot header scan below without giving it anything to scan.
 inline void http_response_scan_chunk(http_response_framing& st, std::string_view chunk)
 {
+    // Per chunk, not per response: it names a count of bytes in the chunk the
+    // caller is holding right now, so a stale value from the previous read would
+    // truncate a forward that has nothing wrong with it.  Cleared here rather
+    // than at each return, because there are five of them.
+    st.excess_in_chunk = 0;
+
     // The connection switched protocols.  These bytes are not HTTP and must not
     // be read as though they were — not to find a header block in them, not to
     // count them against a body length, not for anything.
@@ -646,4 +686,22 @@ inline bool http_response_frame_complete(const http_response_framing& st)
     // response framed by connection close has no boundary short of EOF, so it
     // is not reusable by construction and correctly fails here.
     return st.has_content_length && st.body_remaining == 0;
+}
+
+// May this socket be handed to the pool?
+//
+// The response being finished is necessary and is not sufficient, and the two
+// used to be one predicate because nothing distinguished them: an overrun was
+// spelled `unknown`, which made the response itself read as unfinished.  That
+// cost a real defect — see the `overrun` field — so the questions are separate
+// now and this is the one the pool asks.
+//
+// "Finished" is about the message; this is about the stream position.  A
+// response can be complete to the last byte of its Content-Length while the
+// socket behind it already holds the head of something nobody requested, and
+// handing that socket on gives those bytes to the next borrower as its own
+// answer.
+inline bool http_response_pool_safe(const http_response_framing& st)
+{
+    return http_response_frame_complete(st) && !st.overrun;
 }

@@ -2182,6 +2182,11 @@ uint64_t proxy_instance::inv_digest(const proxy_backend_connection* b)
     f |= uint64_t(b->http_frame.unknown)             << 17;
     f |= uint64_t(b->ssl != nullptr)                 << 18;
     f |= uint64_t(b->sent_to_client)                 << 19;
+    // Here because it is a state change like the rest, and the progress ledger
+    // reports a connection whose state stops changing.  `unknown` sits two
+    // lines up and this used to be spelled as it; leaving it out would make the
+    // one transition that now travels separately invisible to that check.
+    f |= uint64_t(b->http_frame.overrun)             << 20;
     return inv_mix(h, f);
 }
 
@@ -3859,27 +3864,56 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         }
     }
 
+    // ── the scan runs BEFORE the forward, because it decides its length ─────
+    //
+    // It used to run after, and the note below still explains why that was
+    // thought harmless: "every byte is forwarded either way".  That is the
+    // sentence this change is about.  A backend that flushes a complete answer
+    // and the head of another in one write puts bytes on the client's wire that
+    // answer no request the client has outstanding, and the client reads them
+    // as the beginning of the answer to the one it is waiting for.
+    //
+    // The scan already noticed -- http_response_consume_body has always tested
+    // `avail > left` -- and only recorded it for the pool.  It now reports how
+    // many bytes at the end of this chunk are past the answer, and those are
+    // dropped.  Nothing legitimate is lost: this proxy sends one request down a
+    // backend socket and waits for its answer, so there is no second response
+    // it could be waiting for.
+    //
+    // Moving it up is safe by inspection: everything downstream reads the scan's
+    // RESULT (headers_parsed, switched_protocols, the pooling predicate) and
+    // framed_before / tunnel_before are both captured above either way.
+    const bool framed_before  = conn->http_frame.headers_parsed;
+    const bool tunnel_before  = conn->http_frame.switched_protocols;
+    size_t forward_len = data_len;
+    if (m_protocol == protocol_http)
+    {
+        http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
+        const size_t excess = conn->http_frame.excess_in_chunk;
+        if (SOCKETLEY_UNLIKELY(excess > 0 && excess <= data_len))
+            forward_len = data_len - excess;
+    }
+
     // Forward to client
-    forward_to_client(conn, {data_ptr, data_len});
+    forward_to_client(conn, {data_ptr, forward_len});
 
     // HTTP response tracking for connection pooling.
     //
-    // The mirror image of request smuggling lives here.  What this decides is
-    // not what the client sees — every byte is forwarded either way, just
-    // above — but whether the backend socket may be handed to the pool once the
-    // response is judged finished.  Judge it finished early and the socket is
-    // pooled with the rest of the answer still coming, and the next request to
-    // borrow it reads the tail of a stranger's response as the head of its own.
+    // The mirror image of request smuggling lives here.  What it decides is
+    // whether the backend socket may be handed to the pool once the response is
+    // judged finished: judge it finished early and the socket is pooled with the
+    // rest of the answer still coming, and the next request to borrow it reads
+    // the tail of a stranger's response as the head of its own.
+    //
+    // It also decides, since the scan moved above the forward, how much of this
+    // chunk the client is allowed to see.  Those were one question all along and
+    // only one of them was being asked.
     //
     // The scan itself is in runtime/proxy/http_response_framing.h.  It used to
     // be a hundred and twenty lines here, in the middle of a completion
     // handler, which meant nothing short of a running daemon could call it and
     // it was the last parser in the tree with no fuzz target.  It is the same
     // code, in a form test/fuzz/fuzz_http_response.cpp can drive directly.
-    const bool framed_before  = conn->http_frame.headers_parsed;
-    const bool tunnel_before  = conn->http_frame.switched_protocols;
-    if (m_protocol == protocol_http)
-        http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
 
     // And here, not above the forward, is where the breaker hears that this
     // backend answered.
@@ -7047,7 +7081,16 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // http_response_frame_complete() says so as its first act rather than
     // failing to find the end of a response that does not exist.  Handing one
     // to the pool would give the next request a live WebSocket session.
-    if (!backend_response_complete(bconn))
+    //
+    // http_response_pool_safe() and not backend_response_complete(), because the
+    // two are different questions and were one predicate until an overrun made
+    // the difference cost something.  "Finished" is about the message; poolable
+    // is about the stream position, and a response can be complete to the last
+    // byte of its Content-Length while the socket behind it already holds bytes
+    // nobody asked for.  The `unknown` refusal above is subsumed by this call --
+    // it is kept as its own line because the reason for it is not the reason for
+    // this one.
+    if (!http_response_pool_safe(bconn->http_frame))
         return false;
     if (!cconn)
         return false;
