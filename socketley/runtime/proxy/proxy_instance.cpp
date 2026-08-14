@@ -7196,11 +7196,24 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
     // wrong; the invariant without it was not the specification for the hold but
     // a different claim sharing its predicate.
     //
-    // What that leaves uncovered is stated rather than hidden: on a TCP proxy
-    // this asserts nothing.  Covering it needs a term that can decide "the
-    // backend still owes this client bytes" without HTTP framing, which
-    // sent_to_client is not -- it says bytes have flowed, never that they are
-    // finished.
+    // On a TCP proxy this asserts nothing, and that is a decision rather than a
+    // hole waiting to be filled.  inv_check_pair carries the argument in full:
+    // (1b) needs a runtime that can say an answer is no longer OWED, and a byte
+    // relay never can -- a backend silent for a minute may be finished or may be
+    // about to speak, and there is no framing with which to tell those apart, so
+    // claiming otherwise would abort the daemon on an ordinary quiet connection.
+    // What holds a TCP pair honest is invariant (1), reachability, which does
+    // cover it, plus the reachability test hold_tcp_half_close makes before
+    // taking the hold at all.
+    //
+    // The other thing it cannot see is a request that never STARTED.  This asks
+    // about the exchange in flight, so a whole request sitting unparsed in
+    // conn->partial is invisible to it -- measured on the 125-byte artefact of
+    // 2026-08-14: owed=0 with partial=57.  That is not a hole here either.  A
+    // pipelined request waiting on a boundary is bound_pipelined_hold's
+    // business, and the answer it ships is a 408 from the deadline sweep rather
+    // than an abort; asserting it here would fire on the shape that sweep
+    // exists to handle.
     if (reason == close_reason::normal &&
         m_protocol == protocol_http &&
         client_fd >= 0 && client_fd < MAX_FDS &&
