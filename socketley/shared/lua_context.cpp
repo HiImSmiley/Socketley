@@ -2294,13 +2294,24 @@ std::string worker_refusal(const std::string& call,
 // runtime map lives in the daemon, so the day the worker is handed that map
 // they stop being refused.  This one is not: a pipe hands an OPEN FILE
 // DESCRIPTOR from one runtime to another, and a descriptor does not travel in
-// a snapshot of anything.  Crossing a process with it needs SCM_RIGHTS on the
-// control socket, which is a separate piece of work and is not built — see
-// "Process Isolation" in the man page, which says in the same breath that the
-// port is bound in the worker and no descriptor is passed across the boundary.
+// a snapshot of anything.
 //
 // Told the generic message, an operator reads "the runtime map is elsewhere"
 // and waits for the map.  It will arrive and this call will still be refused.
+//
+// What is missing is stated as what it is, and NOT as "SCM_RIGHTS is not
+// built", which was the first draft of this and is false.  shared/
+// conn_transfer.h has the whole mechanism — send_handover/recv_handover over
+// SCM_RIGHTS, the withdraw/relinquish pair that stops the sender and the
+// receiver both holding a working descriptor, and a tagged relay framing for
+// the case where the middle has to keep seeing the bytes — with a unit test
+// behind it.  shared/conn_identity.h has the naming half: a conn_ref that means
+// the same thing in both processes, precisely because a descriptor number does
+// not.  What does not exist is a CHANNEL between two runtimes to carry either
+// of them: worker_protocol.h says in as many words that no descriptor crosses
+// the daemon-worker control socket, and points at conn_transfer.h as "a
+// different channel with a different rule" — a channel nothing has opened.  So
+// the message says there is no channel, which is the true and checkable thing.
 //
 // The way out named at the end is the real one and it is exact.  There are two
 // branches to pipe(): naming one runtime twice pairs two of THAT server's own
@@ -2311,12 +2322,14 @@ std::string worker_pipe_refusal()
 {
     return "socketley.pipe() is refused in a worker process: a pipe hands an "
            "open file descriptor from one runtime to another, and a descriptor "
-           "cannot be sent to a process the way a name or a port can — it needs "
-           "SCM_RIGHTS on the control socket, which is not built. This one is "
-           "not waiting on the runtime map and will not come back with it. To "
-           "pair two connections of this same server, call self.pipe(fd_a, "
-           "fd_b), which stays in this process and is not refused; to route a "
-           "connection to another runtime, create both with --daemon-process.";
+           "does not travel in a snapshot of the runtime map the way a name or "
+           "a port does — it has to be passed with SCM_RIGHTS over a channel "
+           "between the two processes, and there is no such channel between "
+           "runtimes yet. This one is therefore not waiting on the runtime map "
+           "and will not come back with it. To pair two connections of this "
+           "same server, call self.pipe(fd_a, fd_b), which stays in this "
+           "process and is not refused; to route a connection to another "
+           "runtime, create both with --daemon-process.";
 }
 
 // The raise itself.  Built by a Lua factory so that what a script sees is Lua's

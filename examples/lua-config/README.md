@@ -279,8 +279,11 @@ is the one to watch for.
 
 `socketley.pipe` is in that list for a different reason and its message says a
 different thing. A pipe hands an **open file descriptor** from one runtime to
-another, and a descriptor cannot be sent to another process the way a name or a
-port can — it needs `SCM_RIGHTS` on the control socket, which is not built. So
+another, and a descriptor does not travel in a snapshot of the runtime map the
+way a name or a port does — it has to be passed with `SCM_RIGHTS` over a channel
+between the two processes, and there is no such channel between runtimes yet.
+The mechanism exists and is tested (`shared/conn_transfer.h`); nothing is wired
+to it, and the daemon-worker control socket carries no descriptors by design. So
 it is the one call here that is not waiting on the runtime map. To pair two
 connections of the *same* server from inside a worker, use `self.pipe(fd_a,
 fd_b)`: it is the same operation on the same tables, it crosses nothing, and it

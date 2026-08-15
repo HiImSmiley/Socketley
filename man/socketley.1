@@ -3924,12 +3924,19 @@ operator could tell the two apart.
 .B socketley.pipe
 is refused there too, and its message is a different one because its reason is
 different. A pipe hands an open file descriptor from one runtime to another,
-and a descriptor cannot be sent to another process the way a name or a port can
-\(em it needs
+and a descriptor does not travel in a snapshot of the runtime map the way a
+name or a port does \(em it has to be passed with
 .B SCM_RIGHTS
-on the control socket, which is not built. So it is the one call in this list
-that is not waiting on the runtime map and will not come back with it. To pair
-two connections of the same server from inside a worker, use
+over a channel between the two processes, and there is no such channel between
+runtimes yet. The mechanism exists and is tested
+.RB ( shared/conn_transfer.h ,
+with
+.B shared/conn_identity.h
+for the reference that names a connection across a boundary); nothing is wired
+to it, and the daemon\(hyworker control socket carries no descriptors by
+design. So this is the one call in this list that is not waiting on the runtime
+map and will not come back with it. To pair two connections of the same server
+from inside a worker, use
 .B self.pipe(fd_a, fd_b)
 instead: that is the same operation on the same tables, it crosses nothing, and
 it is not refused there.
