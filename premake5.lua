@@ -579,6 +579,40 @@ project "test_sdk_control"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Benchmark: floor_server ───
+--
+-- The irreducible cost of the server benchmarks' traffic: accept, read, write.
+-- Built alongside socketley_bench because it is only meaningful when driven by
+-- it -- see the header of test/benchmark/floor_server.c.
+
+project "floor_server"
+    kind "ConsoleApp"
+    language "C"
+    cdialect "C17"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    buildoptions { "-pipe" }
+
+    files { "test/benchmark/floor_server.c" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Benchmark: socketley_bench ───
 
 project "socketley_bench"

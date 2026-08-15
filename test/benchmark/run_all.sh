@@ -110,6 +110,14 @@ run_benchmarks() {
     run_bench_script "$script_dir/bench_server.sh"
     restart_daemon
 
+    # The server numbers immediately above have no scale without this: the cache
+    # is measured against Redis and the proxy against haproxy, and until this
+    # existed the server runtime -- which has the most benchmarks of the three --
+    # had nothing underneath it.  It runs here rather than on request so that a
+    # server figure and the floor it sits on are always in the same report.
+    run_bench_script "$script_dir/bench_server_floor.sh"
+    restart_daemon
+
     run_bench_script "$script_dir/bench_cache.sh"
     restart_daemon
 
