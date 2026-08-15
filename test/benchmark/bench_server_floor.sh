@@ -142,13 +142,64 @@ run_pair() {
     log_info "floor=$(awk '{print $1}' <<< "$f")/s   socketley=$(awk '{print $1}' <<< "$s")/s"
 }
 
+# The floor, measured against itself in the two CPU placements.
+#
+# The ratio in the table is routinely read as "what socketley costs", and on its
+# own it is not that.  Both sides pay for waking a process, and on this machine
+# that one term is larger than everything socketley does: the same floor binary,
+# driven by the same client, runs at roughly 80k/s with both ends on one core
+# and 27k/s across two.  A constant shared by numerator and denominator drags
+# any ratio towards 1.00x, so a cross-core run flatters socketley and a
+# co-located run makes it look worse -- while the difference in microseconds per
+# round trip, which is what socketley actually adds, barely moves between them.
+#
+# Measuring it beats writing it down.  A reader who sees the floor itself move
+# threefold cannot mistake the ratio for a property of the code, and this also
+# says which placement today's run happened to get, which nothing else records.
+PLACE_SAME=""
+PLACE_DIFF=""
+PLACE_CPUS=""
+placement_probe() {
+    command -v taskset >/dev/null 2>&1 || {
+        log_info "taskset not available -- placement probe skipped"; return 0; }
+    local ncpu; ncpu=$(nproc 2>/dev/null || echo 1)
+    [[ $ncpu -ge 4 ]] || {
+        log_info "fewer than 4 cpus -- placement probe skipped"; return 0; }
+
+    local a=2 b=3
+    PLACE_CPUS="$a/$b"
+    log_section "placement probe  (floor against itself, 20k x 64B)"
+
+    local arm
+    for arm in same split; do
+        floor_stop
+        wait_for_port_free $FLOOR_PORT
+        taskset -c $a "$FLOOR_BIN" $FLOOR_PORT -m block &
+        FLOOR_PID=$!
+        wait_for_port $FLOOR_PORT || {
+            log_error "floor did not start for the placement probe"; floor_stop; return 1; }
+
+        local client=$a
+        [[ $arm == split ]] && client=$b
+        local out
+        out=$(taskset -c $client "$SOCKETLEY_BENCH" -j server msg \
+                  127.0.0.1 $FLOOR_PORT 20000 64 2>/dev/null | metrics_of) || {
+            log_error "placement probe produced no result ($arm)"; floor_stop; return 1; }
+        floor_stop
+
+        if [[ $arm == same ]]; then PLACE_SAME=$out; else PLACE_DIFF=$out; fi
+    done
+
+    log_info "co-located on cpu$a: $(awk '{print $1}' <<< "$PLACE_SAME")/s   split cpu$a/cpu$b: $(awk '{print $1}' <<< "$PLACE_DIFF")/s"
+}
+
 report() {
     {
         printf '\n## Server runtime vs floor\n\n'
         printf 'Floor = accept + read + write in C, no io_uring, no framing, no\n'
         printf 'statistics.  Same client (socketley_bench), same test, same metric.\n\n'
-        printf '| Test | Floor mode | Floor rate | Socketley rate | Ratio | Floor p50 us | Skl p50 us | Floor p99 us | Skl p99 us | Floor spread | Skl spread |\n'
-        printf '|------|-----------|-----------:|---------------:|------:|-------------:|-----------:|-------------:|-----------:|-------------:|-----------:|\n'
+        printf '| Test | Floor mode | Floor rate | Socketley rate | Ratio | Cost over floor | Floor p50 us | Skl p50 us | Floor p99 us | Skl p99 us | Floor spread | Skl spread |\n'
+        printf '|------|-----------|-----------:|---------------:|------:|----------------:|-------------:|-----------:|-------------:|-----------:|-------------:|-----------:|\n'
         local row
         for row in "${ROWS[@]}"; do
             IFS='|' read -r label mode f s <<< "$row"
@@ -157,20 +208,64 @@ report() {
             python3 -c "
 frate=$frate; srate=$srate
 ratio = srate/frate if frate else 0
-print('| $label | $mode | %.0f | %.0f | %.2fx | %.1f | %.1f | %.1f | %.1f | %.2fx | %.2fx |' % (
-    frate, srate, ratio, $fp50, $sp50, $fp99, $sp99, $fsp, $ssp))"
+cost  = (1e6/srate - 1e6/frate) if (frate and srate) else 0
+print('| $label | $mode | %.0f | %.0f | %.2fx | %+.2f us | %.1f | %.1f | %.1f | %.1f | %.2fx | %.2fx |' % (
+    frate, srate, ratio, cost, $fp50, $sp50, $fp99, $sp99, $fsp, $ssp))"
         done
         printf '\n'
-        printf 'Ratio is socketley / floor.  1.00x means socketley costs nothing beyond\n'
-        printf 'accept+read+write and there is no headroom on this path; a low ratio is\n'
-        printf 'where optimisation work could pay.  The floor is not a target to reach --\n'
-        printf 'it does no dispatch, keeps no runtime state and runs no Lua.\n\n'
-        printf 'A ratio above 1.00x does not mean socketley beat the floor.  The floor\n'
-        printf 'runs on the same machine and takes the same stalls -- its own spread\n'
-        printf 'column reaches 1.3-1.4x on the concurrent row, and one observed pass had\n'
-        printf 'the floor fall to 108,821/s against its usual 133-140k.  Read the two\n'
-        printf 'spread columns before reading the ratio; if either is wide, the ratio is\n'
-        printf 'a comparison of two noisy numbers and needs another pass.\n'
+        printf 'Read the "cost over floor" column, not the ratio.\n\n'
+        printf 'Cost over floor is the extra time one round trip takes through socketley\n'
+        printf 'rather than through accept+read+write: everything the runtime does that\n'
+        printf 'the floor does not -- the ring, the dispatch, a Lua callback per message.\n'
+        printf 'It is not a constant either, but it moves far less than the ratio does:\n'
+        printf 'on the 1-connection 64B row it has been measured at +5.6us co-located and\n'
+        printf '+6 to +8us across cores, while the ratio on those same runs swings from\n'
+        printf '0.70x to 0.90x.  Being a difference of two noisy reciprocals it also\n'
+        printf 'carries more relative noise than either rate, so read it with the spread\n'
+        printf 'columns and over more than one run.\n\n'
+        printf 'It is much smaller on the concurrent row than on the 1-connection rows,\n'
+        printf 'and both are real rather than one being wrong.  With one connection every\n'
+        printf 'request pays a full wakeup and a full trip through the runtime, nothing\n'
+        printf 'shares anything.  At 100 connections both sides amortise: one epoll_wait\n'
+        printf 'returns many ready sockets, one io_uring_enter carries many submissions,\n'
+        printf 'and the per-request cost of both collapses -- the floor itself drops from\n'
+        printf 'about 26us per round trip to about 7.5us.  So the 1-connection rows are\n'
+        printf 'the latency cost of an idle link and the concurrent row is the marginal\n'
+        printf 'cost under load.  Which one matters depends on the workload; they are not\n'
+        printf 'two attempts at the same measurement.\n\n'
+        printf 'The ratio does not stay put, and that is what the placement probe below\n'
+        printf 'is for.  Waking a process on another core costs more here than anything\n'
+        printf 'socketley does, both sides pay it, and a shared constant in both halves\n'
+        printf 'of a quotient pulls it towards 1.00x.  Measured on this tree, on the\n'
+        printf '1-connection shape: the same ~4us appears as 0.90x when the two processes\n'
+        printf 'sit on different cores and as 0.70x (worker) or 0.77x (in-daemon) when\n'
+        printf 'they share one.  Quoting the ratio without saying which placement it came\n'
+        printf 'from says almost nothing.\n\n'
+        printf 'The floor is not a target to reach -- it does no dispatch, keeps no\n'
+        printf 'runtime state and runs no Lua.  A ratio above 1.00x does not mean\n'
+        printf 'socketley beat it: the floor takes the same stalls, its spread reaches\n'
+        printf '1.3-1.4x on the concurrent row, and one observed pass had it fall to\n'
+        printf '108,821/s against its usual 133-140k.  Read both spread columns first;\n'
+        printf 'if either is wide, the row compares two noisy numbers and needs another\n'
+        printf 'pass.\n'
+
+        if [[ -n "$PLACE_SAME" && -n "$PLACE_DIFF" ]]; then
+            local sr sp50 x fr fp50 y
+            read -r sr sp50 x _ <<< "$PLACE_SAME"
+            read -r fr fp50 y _ <<< "$PLACE_DIFF"
+            printf '\n### Placement probe: the floor against itself\n\n'
+            printf 'Same binary, same client, same test (20k x 64B).  Only the cores differ.\n\n'
+            printf '| Placement | Rate | p50 us |\n'
+            printf '|-----------|-----:|-------:|\n'
+            printf '| both on cpu%s | %s | %s |\n' "${PLACE_CPUS%%/*}" "$sr" "$sp50"
+            printf '| split across cpu%s | %s | %s |\n' "$PLACE_CPUS" "$fr" "$fp50"
+            printf '\n'
+            python3 -c "
+sr=$sr; fr=$fr
+print('Co-location is worth %.2fx here, in code that does nothing but read and' % (sr/fr if fr else 0))
+print('write.  None of that belongs to socketley, and any figure from this suite')
+print('carries whichever placement the scheduler handed it that day.')" 2>/dev/null
+        fi
     } | tee "$REPORT_FILE"
 }
 
@@ -193,6 +288,11 @@ run_floor_comparison() {
     run_pair "msg 64B 1conn"      block msg        100000 64
     run_pair "msg 1024B 1conn"    block msg        100000 1024
     run_pair "concurrent 100x500" epoll concurrent 100    500
+
+    # After the pairs, not before: it is context for reading them, and running
+    # it first would put its own 5000 sockets into TIME_WAIT ahead of the
+    # measurement it is meant to explain.
+    placement_probe || log_warn "placement probe failed; the ratios above have no placement context"
 
     echo "]" >> "$RESULTS_FILE"
 

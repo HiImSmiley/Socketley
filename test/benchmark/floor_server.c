@@ -28,6 +28,36 @@
  * at all: it would be a number that looks like an answer.
  *
  *
+ * ── Read the difference, not the ratio ─────────────────────────────────────
+ *
+ * The first thing this program was used for was to explain why the server path
+ * now measures ~25,000/s where the tree quotes 74,038/s.  It is not a
+ * regression and it is not a different machine.  It is which cores the two
+ * processes were given, and it is measured with this binary on both sides:
+ *
+ *     both ends on one core     80,183/s   p50 12.4us
+ *     ends on adjacent cores    28,475/s   p50 25.6us
+ *     unpinned                  26,145/s   p50 26.1us
+ *
+ * 80,183/s at 12.4us is the 74,038/s at 12.7us in the tree, to within five
+ * percent.  Waking a process on another core costs more here than everything
+ * socketley does per request -- a bare pipe ping-pong, no TCP involved at all,
+ * shows the same split: 5.3us pinned against 27.1us unpinned.
+ *
+ * That has a consequence for how this floor is read.  Both sides pay the wakeup
+ * and a constant shared by numerator and denominator drags a ratio towards
+ * 1.00x, so the same socketley build measures
+ *
+ *     0.90x against the floor across cores,
+ *     0.70x (worker) / 0.77x (in-daemon) against it on one core,
+ *
+ * while the extra time per round trip -- +3.8us in-daemon, +5.6us out-of-process
+ * -- is the same in both.  The ratio flatters socketley exactly when the machine
+ * is at its slowest.  Quote the microseconds; if a ratio is quoted, the
+ * placement has to be quoted with it, which is why bench_server_floor.sh now
+ * measures this floor against itself in both placements on every run.
+ *
+ *
  * ── Why the two modes differ ───────────────────────────────────────────────
  *
  * -m block  (for the 1-connection benchmarks, `server msg`)
