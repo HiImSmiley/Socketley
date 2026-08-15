@@ -276,3 +276,12 @@ At a script's top level that fails the load and the `create` is refused, which
 is loud. Inside a callback it is caught and logged and the runtime carries on —
 `ls` green, connections accepted, and none of the work done. That second case
 is the one to watch for.
+
+`socketley.pipe` is in that list for a different reason and its message says a
+different thing. A pipe hands an **open file descriptor** from one runtime to
+another, and a descriptor cannot be sent to another process the way a name or a
+port can — it needs `SCM_RIGHTS` on the control socket, which is not built. So
+it is the one call here that is not waiting on the runtime map. To pair two
+connections of the *same* server from inside a worker, use `self.pipe(fd_a,
+fd_b)`: it is the same operation on the same tables, it crosses nothing, and it
+is not refused there.
