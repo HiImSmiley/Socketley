@@ -3921,6 +3921,19 @@ or an empty table is what a
 call returns on a daemon with nothing in it, so neither the script nor the
 operator could tell the two apart.
 .PP
+.B socketley.pipe
+is refused there too, and its message is a different one because its reason is
+different. A pipe hands an open file descriptor from one runtime to another,
+and a descriptor cannot be sent to another process the way a name or a port can
+\(em it needs
+.B SCM_RIGHTS
+on the control socket, which is not built. So it is the one call in this list
+that is not waiting on the runtime map and will not come back with it. To pair
+two connections of the same server from inside a worker, use
+.B self.pipe(fd_a, fd_b)
+instead: that is the same operation on the same tables, it crosses nothing, and
+it is not refused there.
+.PP
 Where the raise lands is the thing to plan for. At a script's top level it fails
 the load, and a worker whose script did not load does not serve: the
 .B create

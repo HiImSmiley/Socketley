@@ -218,11 +218,13 @@ local function report(what)
       local ok, why = socketley.send(PEER, "PARITY-" .. self.name .. "\n")
       return ok and "true" or ("false:" .. tostring(why))
     end))
-    -- Deliberately this runtime's own name at both ends: that branch of pipe()
-    -- needs no runtime map at all, only this server's own connections, so it
-    -- isolates the refusal from the thing the refusal is about.
+    -- The CROSS-RUNTIME branch, which is the one that would have to hand a
+    -- descriptor to another process.  Not the same-runtime branch — that one
+    -- pairs two of this server's own connections, needs neither a map nor a
+    -- descriptor crossing anything, and would make the refusal asserted below
+    -- read as being about something it is not.
     add("pipe", one(function()
-      local ok, why = socketley.pipe(self.name, 4242, self.name, 4243)
+      local ok, why = socketley.pipe("par_peer", 4242, "par_idle")
       return ok and "true" or ("false:" .. tostring(why))
     end))
     add("cdaemons", one(function()
@@ -432,9 +434,9 @@ par send "$OOP_send" "$IN_send"
 
 # ── pipe: refused for good, and it must say why ─────────────────────────────
 ctl "socketley.pipe()" "$IN_pipe" \
-    "false:one of those is not an open connection of this server" \
-    "in the daemon this branch reads this server's own connection table and" \
-    "answers about it; the two descriptors are deliberately not open"
+    "false:connection 4242 could not be routed to \"par_idle\" — it is not an open connection of \"par_peer\", or it was itself routed in from another runtime, or \"par_idle\" refused it" \
+    "in the daemon this reaches both runtimes and answers about the descriptor;" \
+    "4242 is deliberately not an open connection of either"
 # The one asymmetry that is not a defect.  fd passing across processes is a
 # separate project, so this stays a refusal — but sharing the other eleven's
 # text sends the reader after a runtime map, and a runtime map is not what is

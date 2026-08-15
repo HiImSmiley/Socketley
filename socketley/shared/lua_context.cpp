@@ -2287,6 +2287,38 @@ std::string worker_refusal(const std::string& call,
            "one that has it.";
 }
 
+// ── The one whose missing piece is not the map ──────────────────────────────
+//
+// socketley.pipe() shared the sentence above, and that sentence sends the
+// reader after the wrong thing.  The other eleven are refused because the
+// runtime map lives in the daemon, so the day the worker is handed that map
+// they stop being refused.  This one is not: a pipe hands an OPEN FILE
+// DESCRIPTOR from one runtime to another, and a descriptor does not travel in
+// a snapshot of anything.  Crossing a process with it needs SCM_RIGHTS on the
+// control socket, which is a separate piece of work and is not built — see
+// "Process Isolation" in the man page, which says in the same breath that the
+// port is bound in the worker and no descriptor is passed across the boundary.
+//
+// Told the generic message, an operator reads "the runtime map is elsewhere"
+// and waits for the map.  It will arrive and this call will still be refused.
+//
+// The way out named at the end is the real one and it is exact.  There are two
+// branches to pipe(): naming one runtime twice pairs two of THAT server's own
+// connections, which crosses nothing at all, and self.pipe(a, b) is the same
+// operation on the same tables — it is bound in a worker and it works there.
+// Only the two-runtime branch needs a boundary crossed.
+std::string worker_pipe_refusal()
+{
+    return "socketley.pipe() is refused in a worker process: a pipe hands an "
+           "open file descriptor from one runtime to another, and a descriptor "
+           "cannot be sent to a process the way a name or a port can — it needs "
+           "SCM_RIGHTS on the control socket, which is not built. This one is "
+           "not waiting on the runtime map and will not come back with it. To "
+           "pair two connections of this same server, call self.pipe(fd_a, "
+           "fd_b), which stays in this process and is not refused; to route a "
+           "connection to another runtime, create both with --daemon-process.";
+}
+
 // The raise itself.  Built by a Lua factory so that what a script sees is Lua's
 // own error() at the call site rather than a C++ exception thrown through
 // LuaJIT's frames — which is what lets every callback in this tree catch it and
@@ -2346,11 +2378,16 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // work in a worker exactly as they do in the daemon, and .subscribe in
     // particular is delivered to now — see runtime_manager::set_publish_sink.
     for (const char* call : {"create", "start", "stop", "remove", "send", "list",
-                             "get", "pipe"})
+                             "get"})
     {
         sol::function f = make(worker_refusal(std::string("socketley.") + call));
         sk[call] = f;
     }
+
+    // pipe is refused for a different reason and says so.  It was in the loop
+    // above, sharing a sentence that names the runtime map — and the map is not
+    // what it is short of.  See worker_pipe_refusal().
+    sk["pipe"] = make(worker_pipe_refusal());
 
     // The cluster view is the runtime map plus what discovery has heard, and a
     // worker has neither.
