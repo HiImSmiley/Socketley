@@ -193,14 +193,25 @@ EOF
         # that number cannot support.  The rate arrives under a key named for
         # its kind, so this reads whichever one is present rather than a shared
         # field that would let the two merge again.
-        printf '| Test | Size | Measures | Median | Bandwidth | p50 us | p99 us |\n' >> "$SUMMARY_FILE"
-        printf '|------|------|----------|--------|-----------|--------|--------|\n' >> "$SUMMARY_FILE"
+        # Spread is a column and not a footnote, and it is filled for every row.
+        # These medians move by 1.2-1.6x between repetitions of the same test on
+        # an otherwise idle machine, so a table of bare medians invites exactly
+        # the comparison they cannot support: someone reads two reports a week
+        # apart and sees a regression that is inside the noise.  A row whose
+        # spread exceeds the warning line is marked, so "safe to quote alone"
+        # and "quote only with its range" are distinguishable at a glance.  A
+        # file written before spread_ratio existed leaves the cell "-", which
+        # says the run was never checked rather than that it was steady.
+        printf '| Test | Size | Measures | Median | Range (min..max) | Spread | Bandwidth | p50 us | p99 us |\n' >> "$SUMMARY_FILE"
+        printf '|------|------|----------|--------|------------------|--------|-----------|--------|--------|\n' >> "$SUMMARY_FILE"
         jq -r '
             .[] | select(has("metric"))
             | "| \(.test)"
             + " | \(if .msg_size then "\(.msg_size) B" else "-" end)"
             + " | \(.metric)"
             + " | \(.median_round_trips_per_sec // .median_writes_per_sec // .median_connects_per_sec // "-")"
+            + " | \(if .min_per_sec then "\(.min_per_sec | floor) .. \(.max_per_sec | floor)" else "-" end)"
+            + " | \(if .spread_ratio then "\(.spread_ratio)x\(if .stable == 1 then "" else " (wide)" end)" else "-" end)"
             + " | \(if .median_MB_per_sec then "\(.median_MB_per_sec) MB/s" else "-" end)"
             + " | \(.rtt_p50_us // .write_p50_us // .connect_p50_us // "-")"
             + " | \(.rtt_p99_us // .write_p99_us // .connect_p99_us // "-") |"

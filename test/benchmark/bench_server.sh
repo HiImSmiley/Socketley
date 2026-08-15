@@ -46,6 +46,19 @@ test_connection_rate() {
 }
 
 # Test 2: Burst connections (open many simultaneously, hold, then close)
+#
+# This one declines monotonically across repetitions -- roughly 1.25 down to
+# 0.83 of the first run -- and that is not noise to be averaged away.  Each run
+# leaves 5000 sockets in TIME_WAIT, the next draws from a smaller ephemeral port
+# range, and record_throughput.sh carries the measurement: a clean table gives
+# +-9% where a table taken over ~10k lingering sockets spans 7x.
+#
+# Nothing in the harness can remove it -- a connection-rate benchmark that
+# avoided consuming ports would not be measuring connection rate -- so it is
+# stated here rather than quietly corrected.  The median now carries its range,
+# so the decline shows up in the output instead of being discovered later.
+# Before comparing a figure from this test against another, space the runs out
+# or check `ss -s` first.
 test_burst_connections() {
     local count=${1:-5000}
     local test_name="server_burst_connections"

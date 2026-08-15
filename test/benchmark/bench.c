@@ -55,6 +55,33 @@
 #define BUF_SIZE       65536
 #define DEFAULT_RUNS   5
 #define DEFAULT_WARMUP 10
+/* One whole run, executed and thrown away, before the measured ones.
+ *
+ * Three of the position effects in these benchmarks are first-run effects and
+ * nothing else: `proxy concurrent` run 1 was systematically 22% slow and the
+ * slowest of five 44 times in 98, because the first request on each connection
+ * is what opens the backend connection; `cache concurrent` run 1 was 31% fast
+ * and the slowest 57 times in 88.  A per-benchmark warmup would have to be
+ * remembered by each new benchmark, so it is done once here for all of them. */
+#define DEFAULT_WARMUP_RUNS 1
+
+/* Two thresholds, because two different things are being caught.
+ *
+ * SPREAD_WARN is the honest-reporting line: above it the median is not a number
+ * anyone should quote on its own, so the run says so and the spread is
+ * published beside every figure.  It does not fail the run -- on this machine
+ * `server concurrent` legitimately spans about 1.6x because the whole system
+ * enters brief stalls, and a benchmark that exits non-zero on a real property
+ * of the thing it measures would just be switched off.
+ *
+ * SPREAD_FATAL is the old UNSTABLE check, which is about breakage rather than
+ * noise: repetitions of one test do not differ by orders of magnitude unless a
+ * run measured something other than throughput.  It was set at 100x, which no
+ * observed spread has ever reached -- the 3-5x that prompted this work sailed
+ * under it -- so it has never once fired.  10x is still far outside anything
+ * this machine produces and inside the range where a run has plainly broken. */
+#define SPREAD_WARN    1.5
+#define SPREAD_FATAL  10.0
 
 struct bench_config {
     const char *host;
@@ -65,6 +92,7 @@ struct bench_config {
     int         num_clients;
     int         runs;
     int         warmup_pct;
+    int         warmup_runs;  /* whole runs executed and discarded before measuring */
     int         json;
 };
 
@@ -299,11 +327,111 @@ struct run_result {
      * result hides a defect as if it were slow hardware.  0 means "unknown",
      * which skips the check. */
     int    expected;
+    /* Threaded runs only: the fraction of the run during which every thread was
+     * working.  The aggregate rate of a threaded run is the sum of the
+     * per-thread rates, which is the total rate only while they overlap -- so
+     * the overlap travels with the number instead of being assumed.  0 means
+     * "not a threaded run", which skips the check. */
+    double overlap;
     struct latency_log latencies;
 };
 
 /* Set when any run finished short, so the process can exit non-zero. */
 static int g_incomplete_runs = 0;
+
+/* ── Threaded benchmarks: what "elapsed" may legitimately mean ──────────────
+ *
+ * A threaded run used to be scored as total_ops / (last thread finished -
+ * barrier released).  That charges every operation for the ramp before the
+ * threads are all working and for the tail after most have stopped, and it was
+ * the leading suspect for these numbers spreading several-fold run to run: with
+ * 100 threads on 10 cores, the theory went, the figure is bounded by the
+ * unluckiest thread's scheduling rather than by the server.
+ *
+ * Measured, it is not.  Per-thread timestamps over 25 runs of `server
+ * concurrent 100 500`: threads begin within 0.6-2.7 ms of one another and
+ * finish within 3.0-14.3 ms of a ~400 ms run, so the window in which all of
+ * them are working is 97-99% of the time being charged, and every thread's own
+ * rate rises and falls with the aggregate instead of one lagging.  The
+ * straggler was worth ruling out, and it is ruled out; the spread comes from
+ * stalls the whole system enters together, which no way of dividing by time
+ * will remove.  See the spread reporting in run_and_report().
+ *
+ * The ramp is still worth removing, because unlike the stalls it does not
+ * average out -- it is always in the same direction and it grows as the run
+ * gets shorter.  So each thread times its own counted phase, and the run is
+ * scored over the span from the first counted phase opening to the last one
+ * closing: the connect storm, the barrier and the join are outside it, the
+ * served work is inside it.
+ *
+ * Deliberately not the sum of the per-thread rates, which was the first version
+ * of this.  That sum is the aggregate only while the threads overlap -- and the
+ * overlap check below, written to justify the assumption, refuted it instead:
+ * `cache concurrent` runs 20 threads that each fire one long pipeline, they are
+ * all working for only 66-78% of the run, and summing their rates therefore
+ * described a machine that was never running.  It inflated that benchmark by
+ * about a third.  Completed operations divided by the span they completed in
+ * cannot overstate the total, whatever the threads did inside it.
+ *
+ * The overlap still travels with the result, because it says what concurrency
+ * was actually sustained: 0.95-0.99 on the per-request benchmarks means the
+ * figure really is a rate at N clients, while 0.66 means it is an average over
+ * a concurrency that fell away as threads finished. */
+struct conc_slot {
+    int     counted;   /* ops completed inside this thread's counted phase */
+    int64_t t_open;    /* when the counted phase opened */
+    int64_t t_close;   /* when its last counted op completed */
+    struct latency_log lat;  /* per-thread samples, merged by the parent */
+};
+
+struct conc_summary {
+    double rate;       /* counted operations over the span they completed in */
+    int    counted;
+    double overlap;    /* all-threads-working window / any-thread-working window */
+    int    active;     /* threads that contributed a measurable phase */
+};
+
+static struct conc_summary conc_finalize(const struct conc_slot *s, int n)
+{
+    struct conc_summary out = {0};
+    int64_t open_max = 0, open_min = 0, close_min = 0, close_max = 0;
+    int seeded = 0;
+
+    for (int i = 0; i < n; i++) {
+        /* t_open == 0 means the thread counted an operation without ever
+         * opening its phase, which is a bug in the worker rather than a slow
+         * thread; including it would divide by a span measured from the epoch
+         * and silently drag the total to nothing. */
+        if (s[i].counted <= 0 || s[i].t_open <= 0 ||
+            s[i].t_close <= s[i].t_open) continue;
+        if (!seeded) {
+            open_min = open_max = s[i].t_open;
+            close_min = close_max = s[i].t_close;
+            seeded = 1;
+        }
+        if (s[i].t_open  > open_max)  open_max  = s[i].t_open;
+        if (s[i].t_open  < open_min)  open_min  = s[i].t_open;
+        if (s[i].t_close < close_min) close_min = s[i].t_close;
+        if (s[i].t_close > close_max) close_max = s[i].t_close;
+
+        out.counted += s[i].counted;
+        out.active++;
+    }
+    if (!seeded) return out;
+
+    double all_working = ns_to_s(close_min - open_max);
+    double any_working = ns_to_s(close_max - open_min);
+    out.overlap = (any_working > 0 && all_working > 0) ? all_working / any_working : 0.0;
+    out.rate    = (any_working > 0) ? out.counted / any_working : 0.0;
+    return out;
+}
+
+/* Pool one thread's latency samples into the run's log. */
+static void lat_merge(struct latency_log *dst, const struct latency_log *src)
+{
+    for (int i = 0; i < src->count && dst->count < dst->capacity; i++)
+        dst->samples[dst->count++] = src->samples[i];
+}
 
 static int cmp_double(const void *a, const void *b)
 {
@@ -696,6 +824,7 @@ struct server_concurrent_args {
     struct bench_config *cfg;
     pthread_barrier_t   *barrier;
     int                  thread_success;
+    struct conc_slot    *slot;
 };
 
 static void *server_concurrent_worker(void *arg)
@@ -732,10 +861,23 @@ static void *server_concurrent_worker(void *arg)
      * (100 x 500 x 65B is ~32 KB per connection) fits inside socket buffers --
      * so a run could and did finish before the server had read most of it. */
     int local = 0;
+    int warmup = cfg->num_ops * cfg->warmup_pct / 100;
     for (int i = 0; i < cfg->num_ops; i++) {
+        int64_t t0 = time_ns();
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) break;
         if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) break;
+        int64_t t1 = time_ns();
         local++;
+        /* The counted phase opens at the first post-warmup send, not at the
+         * barrier: the first operations of a run pay for a cold accept path
+         * and a cold connection, and charging the rest of the run for them is
+         * the one part of the old figure that never averages out. */
+        if (i >= warmup) {
+            if (a->slot->counted == 0) a->slot->t_open = t0;
+            a->slot->counted++;
+            a->slot->t_close = t1;
+            lat_record(&a->slot->lat, t1 - t0);
+        }
     }
 
     close(fd);
@@ -748,13 +890,20 @@ static void *server_concurrent_worker(void *arg)
 static struct run_result bench_server_concurrent(struct bench_config *cfg)
 {
     struct run_result r = {0};
-    lat_init(&r.latencies, 1);
 
     int nc = cfg->num_clients;
+    int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
+    int cap = nc * (per_thread > 0 ? per_thread : 1);
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    lat_init(&r.latencies, cap);
 
     pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
     struct server_concurrent_args *args =
         (struct server_concurrent_args *)malloc(nc * sizeof(*args));
+    /* calloc, and owned here rather than embedded in args: the workers write
+     * through a pointer into this array, so it is zeroed once and read back
+     * after the join without a copy. */
+    struct conc_slot *slots = (struct conc_slot *)calloc(nc, sizeof(*slots));
 
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, nc + 1); /* nc workers + main thread */
@@ -763,30 +912,40 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
         args[i].cfg = cfg;
         args[i].barrier = &barrier;
         args[i].thread_success = 0;
+        args[i].slot = &slots[i];
+        lat_init(&slots[i].lat, per_thread > 0 ? per_thread : 1);
         pthread_create(&threads[i], NULL, server_concurrent_worker, &args[i]);
     }
 
-    /* Wait until all threads have connected, then start timing */
+    /* Wait until all threads have connected before letting them send. */
     pthread_barrier_wait(&barrier);
-    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
 
-    int64_t end = time_ns();
-
     int total = 0;
-    for (int i = 0; i < nc; i++)
+    for (int i = 0; i < nc; i++) {
         total += args[i].thread_success;
+        lat_merge(&r.latencies, &slots[i].lat);
+    }
+
+    struct conc_summary cs = conc_finalize(slots, nc);
+
+    for (int i = 0; i < nc; i++)
+        lat_free(&slots[i].lat);
+    free(slots);
 
     pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
-    double elapsed = ns_to_s(end - start);
+    /* success/expected stay the whole run — a short run is still a short run,
+     * and the completeness check must see every operation that was asked for,
+     * not only the counted ones. */
     r.success = total;
     r.expected = nc * cfg->num_ops;
-    r.throughput = total / elapsed;
+    r.throughput = cs.rate;
+    r.overlap = cs.overlap;
 
     return r;
 }
@@ -904,6 +1063,7 @@ struct cache_concurrent_args {
     pthread_barrier_t   *barrier;
     int                  client_id;
     int                  thread_success;
+    struct conc_slot    *slot;
 };
 
 static void *cache_concurrent_worker(void *arg)
@@ -935,7 +1095,15 @@ static void *cache_concurrent_worker(void *arg)
 
     if (fd < 0) { free(buf); return NULL; }
 
+    /* One pipelined write and its replies, so there is no per-operation timing
+     * to take here and no warmup to skip -- the thread's whole phase is the
+     * measurement.  Timing it per thread still drops the ramp before the last
+     * thread gets going and the tail after the first one stops, which is what
+     * the shared window is for. */
+    a->slot->t_open = time_ns();
     a->thread_success = pipeline_execute(fd, buf, off, ops);
+    a->slot->t_close = time_ns();
+    a->slot->counted = a->thread_success;
     close(fd);
     free(buf);
     return NULL;
@@ -950,6 +1118,7 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
     pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
     struct cache_concurrent_args *args =
         (struct cache_concurrent_args *)malloc(nc * sizeof(*args));
+    struct conc_slot *slots = (struct conc_slot *)calloc(nc, sizeof(*slots));
 
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, nc + 1);
@@ -959,29 +1128,34 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
         args[i].barrier = &barrier;
         args[i].client_id = i;
         args[i].thread_success = 0;
+        args[i].slot = &slots[i];
+        lat_init(&slots[i].lat, 1);
         pthread_create(&threads[i], NULL, cache_concurrent_worker, &args[i]);
     }
 
     pthread_barrier_wait(&barrier);
-    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
-
-    int64_t end = time_ns();
 
     int total = 0;
     for (int i = 0; i < nc; i++)
         total += args[i].thread_success;
 
+    struct conc_summary cs = conc_finalize(slots, nc);
+
+    for (int i = 0; i < nc; i++)
+        lat_free(&slots[i].lat);
+    free(slots);
+
     pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
-    double elapsed = ns_to_s(end - start);
     r.success = total;
     r.expected = nc * cfg->num_ops;
-    r.throughput = total / elapsed;
+    r.throughput = cs.rate;
+    r.overlap = cs.overlap;
 
     return r;
 }
@@ -1042,6 +1216,7 @@ struct proxy_concurrent_args {
     struct bench_config *cfg;
     pthread_barrier_t   *barrier;
     int                  thread_success;
+    struct conc_slot    *slot;
 };
 
 static void *proxy_concurrent_worker(void *arg)
@@ -1068,10 +1243,23 @@ static void *proxy_concurrent_worker(void *arg)
     /* Read the reply before sending the next — see server_concurrent_worker for
      * why the version without this measured socket buffers. */
     int local = 0;
+    int warmup = cfg->num_ops * cfg->warmup_pct / 100;
     for (int i = 0; i < cfg->num_ops; i++) {
+        int64_t t0 = time_ns();
         if (send_all(fd, msg, msize + 1) != msize + 1) break;
         if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
+        int64_t t1 = time_ns();
         local++;
+        /* Warmup matters more here than anywhere else: the proxy's first
+         * request per connection is what opens the backend connection, and
+         * `proxy concurrent` run 1 was systematically 22% slower than the rest
+         * for exactly that reason. */
+        if (i >= warmup) {
+            if (a->slot->counted == 0) a->slot->t_open = t0;
+            a->slot->counted++;
+            a->slot->t_close = t1;
+            lat_record(&a->slot->lat, t1 - t0);
+        }
     }
 
     close(fd);
@@ -1084,12 +1272,17 @@ static void *proxy_concurrent_worker(void *arg)
 static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
 {
     struct run_result r = {0};
-    lat_init(&r.latencies, 1);
 
     int nc = cfg->num_clients;
+    int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
+    int cap = nc * (per_thread > 0 ? per_thread : 1);
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    lat_init(&r.latencies, cap);
+
     pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
     struct proxy_concurrent_args *args =
         (struct proxy_concurrent_args *)malloc(nc * sizeof(*args));
+    struct conc_slot *slots = (struct conc_slot *)calloc(nc, sizeof(*slots));
 
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, nc + 1);
@@ -1098,29 +1291,36 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
         args[i].cfg = cfg;
         args[i].barrier = &barrier;
         args[i].thread_success = 0;
+        args[i].slot = &slots[i];
+        lat_init(&slots[i].lat, per_thread > 0 ? per_thread : 1);
         pthread_create(&threads[i], NULL, proxy_concurrent_worker, &args[i]);
     }
 
     pthread_barrier_wait(&barrier);
-    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
 
-    int64_t end = time_ns();
-
     int total = 0;
-    for (int i = 0; i < nc; i++)
+    for (int i = 0; i < nc; i++) {
         total += args[i].thread_success;
+        lat_merge(&r.latencies, &slots[i].lat);
+    }
+
+    struct conc_summary cs = conc_finalize(slots, nc);
+
+    for (int i = 0; i < nc; i++)
+        lat_free(&slots[i].lat);
+    free(slots);
 
     pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
-    double elapsed = ns_to_s(end - start);
     r.success = total;
     r.expected = nc * cfg->num_ops;
-    r.throughput = total / elapsed;
+    r.throughput = cs.rate;
+    r.overlap = cs.overlap;
 
     return r;
 }
@@ -1331,6 +1531,7 @@ struct ws_concurrent_args {
     struct bench_config *cfg;
     pthread_barrier_t   *barrier;
     int                  thread_success;
+    struct conc_slot    *slot;
 };
 
 static void *ws_concurrent_worker(void *arg)
@@ -1342,12 +1543,26 @@ static void *ws_concurrent_worker(void *arg)
     pthread_barrier_wait(a->barrier);
 
     int local = 0;
+    int warmup = cfg->num_ops * cfg->warmup_pct / 100;
     for (int i = 0; i < cfg->num_ops; i++) {
+        int64_t t0 = time_ns();
         int fd = tcp_connect(cfg->host, cfg->port);
         if (fd < 0) continue;
-        if (ws_upgrade(fd, cfg->host, cfg->port))
-            local++;
+        int ok = ws_upgrade(fd, cfg->host, cfg->port);
+        int64_t t1 = time_ns();
         close(fd);
+        if (!ok) continue;
+        local++;
+        if (i >= warmup) {
+            /* Keyed off the first counted operation, not off i == warmup: this
+             * loop skips failed connects, so an index-triggered open can be
+             * stepped over entirely, leaving t_open at 0 and the thread's rate
+             * computed against the epoch. */
+            if (a->slot->counted == 0) a->slot->t_open = t0;
+            a->slot->counted++;
+            a->slot->t_close = t1;
+            lat_record(&a->slot->lat, t1 - t0);
+        }
     }
 
     a->thread_success = local;
@@ -1357,12 +1572,17 @@ static void *ws_concurrent_worker(void *arg)
 static struct run_result bench_ws_concurrent(struct bench_config *cfg)
 {
     struct run_result r = {0};
-    lat_init(&r.latencies, 1);
 
     int nc = cfg->num_clients;
+    int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
+    int cap = nc * (per_thread > 0 ? per_thread : 1);
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    lat_init(&r.latencies, cap);
+
     pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
     struct ws_concurrent_args *args =
         (struct ws_concurrent_args *)malloc(nc * sizeof(*args));
+    struct conc_slot *slots = (struct conc_slot *)calloc(nc, sizeof(*slots));
 
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, nc + 1);
@@ -1371,29 +1591,36 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
         args[i].cfg = cfg;
         args[i].barrier = &barrier;
         args[i].thread_success = 0;
+        args[i].slot = &slots[i];
+        lat_init(&slots[i].lat, per_thread > 0 ? per_thread : 1);
         pthread_create(&threads[i], NULL, ws_concurrent_worker, &args[i]);
     }
 
     pthread_barrier_wait(&barrier);
-    int64_t start = time_ns();
 
     for (int i = 0; i < nc; i++)
         pthread_join(threads[i], NULL);
 
-    int64_t end = time_ns();
-
     int total = 0;
-    for (int i = 0; i < nc; i++)
+    for (int i = 0; i < nc; i++) {
         total += args[i].thread_success;
+        lat_merge(&r.latencies, &slots[i].lat);
+    }
+
+    struct conc_summary cs = conc_finalize(slots, nc);
+
+    for (int i = 0; i < nc; i++)
+        lat_free(&slots[i].lat);
+    free(slots);
 
     pthread_barrier_destroy(&barrier);
     free(threads);
     free(args);
 
-    double elapsed = ns_to_s(end - start);
     r.success = total;
     r.expected = nc * cfg->num_ops;
-    r.throughput = total / elapsed;
+    r.throughput = cs.rate;
+    r.overlap = cs.overlap;
 
     return r;
 }
@@ -1403,6 +1630,48 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct run_result (*bench_fn)(struct bench_config *);
+
+/* Does this test burn an ephemeral port for every operation it counts?
+ *
+ * Such a test must not be given a discarded warm-up run.  Warming helps where
+ * runs reuse state and hurts where what accumulates between them is
+ * exhaustion: every connection is new by definition, so there is nothing to
+ * warm, and the extra run only puts several thousand more sockets into
+ * TIME_WAIT before the measurement starts.  That is the mechanism behind
+ * `server burst`'s monotonic decline across repetitions (see bench_server.sh).
+ *
+ * METRIC_CONNECT catches `server conn` and `server burst`.  It does not catch
+ * the two WebSocket tests, which connect, upgrade and close once per operation
+ * and are published as round trips -- correctly, since an upgrade is a request
+ * with a reply, but the port cost is the same.  Naming them here was the
+ * alternative to relabelling them METRIC_CONNECT, which would have changed the
+ * JSON key their rate is published under to say something false about what they
+ * measure.
+ *
+ * Honestly, the WebSocket half of this is reasoning and not measurement.  `ws
+ * concurrent 20 25` opens 500 connections per run, which is a tenth of what
+ * `server burst` does, and at that size the effect does not surface: 14
+ * interleaved invocations per arm put the difference in within-invocation
+ * spread at 1.76x against 1.61x, which is 1.05 sigma and therefore nothing.  An
+ * earlier six-invocation pair appeared to show 2.23x against 1.21x, and that
+ * was this benchmark's own noise being read as a result -- it spreads 1.3-2.7x
+ * by itself.  What stands without the numbers is that a run which opens every
+ * connection fresh has no warm state to gain and pays ports either way, so it
+ * is skipped for the same reason as the others rather than on a measured win.
+ *
+ * A test added later that opens a connection per operation has to be listed
+ * here; nothing detects it automatically, which is why this is one function
+ * with its reasoning attached rather than a condition spelled out at the one
+ * place that needs it. */
+static int consumes_a_port_per_op(const char *category, const char *test,
+                                  enum metric_kind metric)
+{
+    if (metric == METRIC_CONNECT) return 1;
+    if (strcmp(category, "ws") == 0 &&
+        (strcmp(test, "handshake") == 0 || strcmp(test, "concurrent") == 0))
+        return 1;
+    return 0;
+}
 
 static void run_and_report(struct bench_config *cfg, bench_fn fn,
                            const char *category, const char *test,
@@ -1418,10 +1687,37 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
     struct run_result *all_results =
         (struct run_result *)malloc(runs * sizeof(struct run_result));
 
+    /* Discarded warm-up runs.  Their results are freed, not recorded: the point
+     * is to put the system into the state the measured runs will find it in. */
+    int warm = consumes_a_port_per_op(category, test, metric)
+                   ? 0 : cfg->warmup_runs;
+    for (int i = 0; i < warm; i++) {
+        struct run_result w = fn(cfg);
+        lat_free(&w.latencies);
+    }
+
     for (int i = 0; i < runs; i++) {
         all_results[i] = fn(cfg);
         throughputs[i] = all_results[i].throughput;
         throughputs_mb[i] = all_results[i].throughput_mb;
+    }
+
+    /* Kept before median_double sorts the array in place.
+     *
+     * A single run has no spread to report, and reporting one anyway is the
+     * failure this whole change is about: hi/lo of one sample is exactly 1.00,
+     * which would be published as spread_ratio 1.00 and stable=1 -- a claim of
+     * perfect repeatability derived from something that was never repeated.
+     * Below two runs the fields are omitted entirely, so a reader sees nothing
+     * rather than a reassuring number. */
+    double lo = 0, hi = 0, spread = 0.0;
+    if (runs >= 2) {
+        lo = hi = throughputs[0];
+        for (int i = 1; i < runs; i++) {
+            if (throughputs[i] < lo) lo = throughputs[i];
+            if (throughputs[i] > hi) hi = throughputs[i];
+        }
+        if (lo > 0) spread = hi / lo;
     }
 
     double med = median_double(throughputs, runs);
@@ -1445,18 +1741,37 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
      * Repetitions of one test on one machine do not legitimately differ by two
      * orders of magnitude, so such a spread means at least one run measured
      * something other than throughput. */
-    if (runs >= 2) {
-        double lo = throughputs[0], hi = throughputs[0];
-        for (int i = 1; i < runs; i++) {
-            if (throughputs[i] < lo) lo = throughputs[i];
-            if (throughputs[i] > hi) hi = throughputs[i];
-        }
-        if (lo > 0 && hi / lo > 100.0) {
+    if (runs >= 2 && spread > 0) {
+        if (spread > SPREAD_FATAL) {
             g_incomplete_runs++;
             fprintf(stderr,
-                "socketley-bench: UNSTABLE %s %s: runs span %.0f..%.0f (%.0fx) — "
-                "repetitions of one test should not differ this much\n",
-                category, test, lo, hi, hi / lo);
+                "socketley-bench: UNSTABLE %s %s: runs span %.0f..%.0f (%.1fx) — "
+                "repetitions of one test should not differ this much; at least "
+                "one run measured something other than throughput\n",
+                category, test, lo, hi, spread);
+        } else if (spread > SPREAD_WARN) {
+            fprintf(stderr,
+                "socketley-bench: SPREAD %s %s: runs span %.0f..%.0f (%.1fx) — "
+                "the median is not a number to quote on its own; report the "
+                "range\n",
+                category, test, lo, hi, spread);
+        }
+    }
+
+    /* How much of the run actually had every thread working.  The rate is
+     * honest either way -- it is completed operations over the span they
+     * completed in -- but what the rate is a rate *of* changes: at 0.98 it is
+     * throughput at N concurrent clients, at 0.66 it is an average over a
+     * concurrency that drained away as threads finished, and reading the second
+     * as the first overstates what the runtime sustains at N. */
+    for (int i = 0; i < runs; i++) {
+        if (all_results[i].overlap > 0 && all_results[i].overlap < 0.80) {
+            fprintf(stderr,
+                "socketley-bench: OVERLAP %s %s run %d/%d: every thread was "
+                "working for only %.0f%% of the run — this is an average over a "
+                "falling concurrency, not a rate at %d clients\n",
+                category, test, i + 1, runs, all_results[i].overlap * 100.0,
+                cfg->num_clients);
         }
     }
 
@@ -1493,6 +1808,17 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
          * not comparable, which is the truth. */
         json_kv_str(stdout, "metric", metric_name(metric));
         json_kv_dbl(stdout, metric_rate_key(metric), med);
+        /* The median never travels without its range.  A single figure lifted
+         * out of this file reads as a measurement; these three together read as
+         * a measurement with an error bar, which is what it is. */
+        if (spread > 0) {
+            json_kv_dbl(stdout, "min_per_sec", lo);
+            json_kv_dbl(stdout, "max_per_sec", hi);
+            json_kv_dbl(stdout, "spread_ratio", spread);
+            json_kv_int(stdout, "stable", spread <= SPREAD_WARN);
+        }
+        if (all_results[best_idx].overlap > 0)
+            json_kv_dbl(stdout, "thread_overlap", all_results[best_idx].overlap);
         if (med_mb > 0)
             json_kv_dbl(stdout, "median_MB_per_sec", med_mb);
         json_kv_int(stdout, "success", all_results[best_idx].success);
@@ -1537,6 +1863,17 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         if (med_mb > 0)
             printf("  (%.1f MB/s one way)", med_mb);
         printf("\n");
+        /* Printed for every test, not only unstable ones.  A spread that is
+         * only shown when it is bad teaches the reader that its absence means
+         * nothing was checked. */
+        if (spread > 0)
+            printf("  Spread: %12.0f .. %.0f  (%.2fx)%s\n", lo, hi, spread,
+                   spread > SPREAD_WARN ? "  — too wide to quote the median alone" : "");
+        else
+            printf("  Spread: not measured — a single run cannot have one\n");
+        if (all_results[best_idx].overlap > 0)
+            printf("  Threads all working for %.0f%% of the run\n",
+                   all_results[best_idx].overlap * 100.0);
         /* Beside the number, every time.  A figure copied out of this output
          * carries no context with it, so the context goes next to it. */
         printf("  Measures: %s\n", metric_meaning(metric));
@@ -1576,7 +1913,8 @@ static void usage(const char *prog)
         "Options:\n"
         "  -j          JSON output\n"
         "  -r N        Number of runs (default %d)\n"
-        "  -w N        Warm-up percentage (default %d)\n"
+        "  -w N        Warm-up percentage of operations per run (default %d)\n"
+        "  -W N        Whole runs executed and discarded first (default %d)\n"
         "\n"
         "Categories and tests:\n"
         "  server conn <count>                  Connection rate\n"
@@ -1597,7 +1935,7 @@ static void usage(const char *prog)
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
         "  ws concurrent <clients> <ops>         Multi-client WS\n",
-        prog, DEFAULT_RUNS, DEFAULT_WARMUP);
+        prog, DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_WARMUP_RUNS);
 }
 
 int main(int argc, char **argv)
@@ -1607,6 +1945,7 @@ int main(int argc, char **argv)
     struct bench_config cfg = {0};
     cfg.runs = DEFAULT_RUNS;
     cfg.warmup_pct = DEFAULT_WARMUP;
+    cfg.warmup_runs = DEFAULT_WARMUP_RUNS;
     cfg.msg_size = 64;
     cfg.num_clients = 20;
     cfg.num_ops = 10000;
@@ -1626,6 +1965,11 @@ int main(int argc, char **argv)
             cfg.warmup_pct = atoi(argv[optind_local + 1]);
             if (cfg.warmup_pct < 0) cfg.warmup_pct = 0;
             if (cfg.warmup_pct > 50) cfg.warmup_pct = 50;
+            optind_local += 2;
+        } else if (strcmp(opt, "-W") == 0 && optind_local + 1 < argc) {
+            cfg.warmup_runs = atoi(argv[optind_local + 1]);
+            if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
+            if (cfg.warmup_runs > 10) cfg.warmup_runs = 10;
             optind_local += 2;
         } else if (strcmp(opt, "--help") == 0 || strcmp(opt, "-h") == 0) {
             usage(argv[0]);
