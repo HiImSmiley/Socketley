@@ -239,7 +239,21 @@ public:
             else
                 wait_for_control(20);
 
-            if (!pump_control())
+            // Only when the ring is not already holding an unfired poll on this
+            // socket.  While m_ctl_armed is true a one-shot POLLIN is
+            // outstanding and has not completed, which is the kernel saying the
+            // fd is not readable — so the read this used to do unconditionally
+            // could only ever return EAGAIN.  It did: traced over 3000 round
+            // trips, the worker made 2.01 read() calls per round trip and every
+            // one of them failed with EAGAIN, against a bare C echo server that
+            // needs 2 syscalls per round trip in total.
+            //
+            // The arm is not an optimisation on top of this read, it is the
+            // notification, and on_cqe() clears the flag before the drain below
+            // ever runs.  m_ctl_armed is false in every case where nothing will
+            // tell us: before the ring exists, after a submit that failed, and
+            // while the worker is shutting down and no longer arming.
+            if (!m_ctl_armed && !pump_control())
                 break;
 
             // Whatever the socket would not take last turn.  A reply sitting
@@ -259,6 +273,24 @@ public:
             const auto now = std::chrono::steady_clock::now();
             if (now - last_stats >= stats_interval)
             {
+                // The skip above rests on "armed and unfired means not
+                // readable".  That is the poll contract, but a worker that
+                // silently stopped answering the daemon would be a bad way to
+                // find out it had been broken, so once every stats interval the
+                // socket is read whatever the flag says.  It bounds any such
+                // stall to one interval instead of forever, and because it
+                // reports rather than merely repairs, a build that breaks the
+                // invariant says so in the log instead of getting quietly
+                // slower.  This is 4 reads a second, not 2 per round trip.
+                if (m_ctl_armed)
+                {
+                    if (!pump_control())
+                        break;
+                    if (m_pump_took)
+                        LOG_WARN("proxy worker: a control frame was waiting while "
+                                 "the ring's poll on that socket had not fired");
+                }
+
                 push_stats();
                 last_stats = now;
             }
@@ -369,12 +401,14 @@ private:
     // report to and nobody to stop it.
     bool pump_control()
     {
+        m_pump_took = false;
         char buf[4096];
         for (;;)
         {
             const ssize_t n = ::read(m_fd, buf, sizeof(buf));
             if (n > 0)
             {
+                m_pump_took = true;
                 m_in.append(buf, static_cast<size_t>(n));
                 continue;
             }
@@ -866,6 +900,10 @@ private:
     std::string                            m_in;
     io_request                             m_ctl_req{};
     bool                                   m_ctl_armed{false};
+    // Whether the last pump_control() actually took bytes off the socket.  Read
+    // by one caller only — the periodic safety pump in run(), which uses it to
+    // tell "nothing was waiting" from "the arm missed a wakeup".
+    bool                                   m_pump_took{false};
     bool                                   m_done{false};
     int                                    m_exit_code{0};
 };
