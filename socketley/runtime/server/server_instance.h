@@ -411,6 +411,10 @@ public:
     server_instance(std::string_view name);
     ~server_instance() override;
 
+    // See runtime_instance::as_server().  The whole of the override: this class
+    // is what the question is asking for, and a class that is not says nothing.
+    server_instance* as_server() override { return this; }
+
     void set_mode(server_mode mode);
     server_mode get_mode() const;
 

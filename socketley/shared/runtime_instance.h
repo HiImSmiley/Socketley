@@ -26,6 +26,7 @@ class lua_context;
 class runtime_manager;
 class endpoint_table;
 class request_sink;
+class server_instance;
 
 class runtime_instance : public io_handler
 {
@@ -310,6 +311,20 @@ public:
     // coming back.  Not a transition any runtime makes to itself.
     void mark_failed() { m_state.store(runtime_failed, std::memory_order_release); }
 
+    // The state of a runtime that lives in ANOTHER process, copied from what
+    // that process last said it was.
+    //
+    // For replicas only — the copies a worker keeps of the daemon's map, see
+    // runtime_manager::install_replica.  The daemon's own placeholder for an
+    // out-of-process runtime must NOT use this and does not: the daemon owns
+    // that value, sets it from the command that caused the transition, and
+    // proxy_supervisor::ingest() is explicit that a `state` frame is remembered
+    // rather than adopted precisely so there is one writer for it.  Here there
+    // is still one writer — the daemon — and this is the other end of the wire
+    // it writes down, not a second opinion about the same runtime.
+    void set_replicated_state(runtime_state s)
+    { m_state.store(s, std::memory_order_release); }
+
     // Lua hot-reload
     bool reload_lua_script();
     std::string_view get_lua_script_path() const;
@@ -342,6 +357,31 @@ public:
     void mark_managed(std::string exec_path);
     bool is_managed() const;
     std::string_view get_exec_path() const;
+
+    // ── "Is the server behind this name one I may call into?" ───────────────
+    //
+    // Nine places resolve a name through the runtime manager and then reach for
+    // server_instance's own methods — routing a connection, releasing one,
+    // writing to one the origin still owns.  All nine asked the same two-part
+    // question: get_type() == runtime_server, then static_cast.
+    //
+    // That pairing is safe exactly while every instance of type `server` is a
+    // server_instance, and it stopped being.  A worker holds REPLICAS of the
+    // daemon's map — records of runtimes in other processes, carrying a type and
+    // five other fields and none of the storage — and a replica of a server
+    // answers `runtime_server` truthfully.  The cast then produces a pointer to
+    // an object that is not one, and write_to_ref() is not virtual: it would run
+    // server_instance's code over a much smaller object.
+    //
+    // So the type test and the cast become one question that cannot be answered
+    // wrongly.  Null is "not in this process, or not a server", which is what
+    // every one of those nine sites already treats as "do nothing".
+    //
+    // Nothing in the daemon changes: a placeholder for an out-of-process server
+    // IS a server_instance and still answers itself here, exactly as the cast
+    // did.  Whether calling into a placeholder is the right thing is a separate
+    // question this does not touch.
+    virtual server_instance* as_server() { return nullptr; }
 
     // Out-of-process — this instance is a placeholder for a runtime living in a
     // worker process the daemon supervises.  Distinct from external/managed on

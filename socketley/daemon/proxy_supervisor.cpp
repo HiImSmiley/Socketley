@@ -460,6 +460,15 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (!m_endpoints.empty())
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
 
+    // The map, for the same reason and with one difference: the map is pushed on
+    // the health tick too, so a child that missed it here would be no more than
+    // two seconds behind rather than indefinitely.  Sent anyway, because those
+    // two seconds are the window in which a script's on_start runs — and
+    // on_start is where a script is most likely to ask what else exists.
+    if (!m_runtime_map.empty())
+        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
+                                             m_runtime_map))) {}
+
     // Last, and only on the path that keeps the socket: an arm on a descriptor
     // a failed spawn is about to close is the completion-outliving-its-fd case
     // this file goes to some length to avoid.
@@ -610,6 +619,22 @@ void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
     m_endpoints = encoded_payload;
     if (m_control_fd >= 0)
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
+}
+
+void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
+{
+    // Nothing has moved since this child was last told.  The comparison is what
+    // makes the health tick's unconditional push free on a quiet daemon, and it
+    // is a comparison of the ENCODED payload rather than of anything smarter on
+    // purpose: it is exactly "would this frame say anything new", with no second
+    // idea of what counts as a change to drift from the first.
+    if (encoded_payload == m_runtime_map)
+        return;
+
+    m_runtime_map = encoded_payload;
+    if (m_control_fd >= 0)
+        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
+                                             m_runtime_map))) {}
 }
 
 void proxy_supervisor::send_publish(const std::string& encoded_payload)

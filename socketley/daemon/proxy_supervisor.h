@@ -151,6 +151,7 @@ public:
                                                std::string_view channel,
                                                std::string_view message)>;
     void set_publish_handler(publish_handler h) { m_on_publish = std::move(h); }
+
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -208,6 +209,20 @@ public:
     // daemon publishes only when a runtime is created, started, stopped,
     // removed or renamed, or when the cluster's view moves.
     void send_endpoints(const std::string& encoded_payload);
+
+    // A new copy of the runtime map, which is what the worker answers
+    // socketley.list() and socketley.get() from.
+    //
+    // Unlike the endpoint table this one is sent on the health tick as well as
+    // on membership changes, because it carries connection counts and those move
+    // with traffic rather than with events.  So it is the one push that has a
+    // reason to arrive unchanged, and it drops a payload byte-identical to the
+    // one this child already holds: an idle daemon then costs a string compare
+    // per worker per tick instead of a frame.
+    //
+    // Kept for the same reason the endpoint table is kept: a child forked after
+    // the last push would otherwise hold an empty map until something moved.
+    void send_runtime_map(const std::string& encoded_payload);
 
     // `socketley send <name> <message>`, on its way to the runtime that has the
     // connections.  Best-effort like every other frame going down: a false is a
@@ -336,6 +351,7 @@ private:
     std::string       m_exec_path;
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
+    std::string       m_runtime_map;      // last map, re-sent to a new child
     std::string       m_in;               // partial frames from the child
 
     // Frames written but not yet taken by the socket.  Bounded, because the

@@ -98,6 +98,7 @@ private:
     int cmd_ls(ipc_connection* conn, const parsed_args& pa);
     int cmd_ps(ipc_connection* conn, const parsed_args& pa);
     int cmd_send(const parsed_args& pa);
+
     int cmd_edit(ipc_connection* conn, const parsed_args& pa);
     int cmd_dump(ipc_connection* conn, const parsed_args& pa);
     int cmd_import(ipc_connection* conn, const parsed_args& pa);
@@ -302,6 +303,14 @@ private:
 
     // Encode the manager's endpoint table and push it to every worker.
     void publish_endpoints_to_workers(const endpoint_table& tbl);
+
+    // Encode the runtime map — what runtimes exist, in what state, on what port,
+    // with how many connections — and push it to every worker, where it becomes
+    // the replica socketley.list() and socketley.get() are answered from.
+    //
+    // Called on every membership change, beside the endpoint table and for the
+    // same reason, and once per health tick for the counts.
+    void publish_runtime_map_to_workers();
 
     // Encode one published message and push it to every worker, so a proxy's
     // subscribe callbacks fire in the process that is serving its traffic.

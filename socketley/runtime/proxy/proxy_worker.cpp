@@ -178,7 +178,14 @@ class worker : public io_handler
 {
 public:
     explicit worker(int control_fd)
-        : m_fd(control_fd), m_writer(control_fd), m_remote(&m_writer) {}
+        : m_fd(control_fd), m_writer(control_fd), m_remote(&m_writer)
+    {
+        // Before the first frame is read, because a runtime_map frame can be the
+        // first frame: the manager's map is the daemon's, copied, and writing to
+        // it here would build a runtime that exists in this process and nowhere
+        // else.  See runtime_manager::mark_replica().
+        m_manager.mark_replica();
+    }
 
     void on_cqe(struct io_uring_cqe* /*cqe*/) override
     {
@@ -443,6 +450,7 @@ private:
         {
             case worker_proto::frame_type::config:    on_config(payload);    break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
+            case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
@@ -550,11 +558,11 @@ private:
         //
         // A runtime asks through its manager, and a worker had none: every
         // `cache` command a server in a worker was given died at the
-        // `if (!mgr) return;` in post_cache_request(), unanswered.  The map
-        // stays empty on purpose — this process holds one runtime and the
-        // manager is here for the channel — and every call site that looks a
-        // name up in it already handles not finding one, which in a worker is
-        // the truth rather than a failure.
+        // `if (!mgr) return;` in post_cache_request(), unanswered.  The map was
+        // empty on purpose then — this process holds one runtime and the manager
+        // was here for the channel — and it is not any more: the daemon pushes a
+        // replica of it, and the sink table below is still built by hand from
+        // this worker's own runtime, because a replica answers no requests.
         //
         // Its own name is registered so a request for it is served here rather
         // than making a round trip through the daemon, which would route it
@@ -645,6 +653,88 @@ private:
         }
 
         send_state();
+    }
+
+    // What runtimes the daemon has, arriving as a table rather than as a
+    // question this process would have to ask.
+    //
+    // The whole of the worker's half: decode, hand it to the manager, and every
+    // reader of the map — socketley.list(), socketley.get(), and anything else
+    // that goes through mgr->get() — works out here exactly as it does in the
+    // daemon, with no idea that what it found is a copy.  That is the point of
+    // putting the replica in the map instead of answering the two calls
+    // specially: there is one place that knows, and it is not the Lua layer.
+    //
+    // Not stashed when there is no runtime yet, unlike the endpoint table.  The
+    // table has to be held because only a proxy can be handed one and the proxy
+    // does not exist before the config frame; the map goes into the manager,
+    // which exists from construction.
+    //
+    // ─── This worker's OWN runtime is in here, and as a replica ─────────────
+    //
+    // It has to be in the map at all, because socketley.list() called from a
+    // runtime includes that runtime everywhere else: a worker that left itself
+    // out would answer three where the daemon answers four, which is a wrong
+    // answer rather than a missing feature.
+    //
+    // It is the replica and not m_rt, and that is the load-bearing half.
+    // Putting the live object in the map would deliver every PUBLISH to it
+    // twice: dispatch_publish() walks the map and skips only what is out of
+    // process, and this worker's publish sink ALSO calls
+    // m_rt->on_publish_dispatch() by hand — because that call is the only
+    // delivery this process gets for a message it published itself.  A replica
+    // is out of process by construction and has no interpreter, so the walk
+    // skips it twice over and the hand-written delivery stays the only one.
+    //
+    // What it costs is that socketley.get(self.name).connections is the
+    // daemon's copy of this worker's own figure, up to a push interval old,
+    // while self.connections() is exact.  Two calls, two answers, and the
+    // second one is the one a script asking about itself should be using.
+    void on_runtime_map(const std::string& payload)
+    {
+        std::vector<worker_proto::runtime_wire> wire;
+        if (!worker_proto::decode_runtime_map(payload, wire))
+        {
+            LOG_WARN("proxy worker: malformed runtime map, keeping the previous one");
+            return;
+        }
+
+        std::vector<runtime_manager::replica_entry> entries;
+        entries.reserve(wire.size());
+        for (const auto& w : wire)
+        {
+            // A type or a state this build has no name for comes from a daemon
+            // newer than this worker — the case the version in every frame
+            // header exists for.  The entry is dropped rather than cast to
+            // whatever the number happens to land on: a runtime reported as the
+            // wrong kind is worse than one not reported at all, and the next
+            // upgrade of this binary makes it appear.
+            if (w.type > static_cast<uint8_t>(runtime_cache) ||
+                w.state > static_cast<uint8_t>(runtime_failed))
+            {
+                LOG_WARN("proxy worker: runtime map entry of an unknown kind, skipped");
+                continue;
+            }
+
+            runtime_manager::replica_entry e;
+            e.name        = w.name;
+            e.type        = static_cast<runtime_type>(w.type);
+            e.state       = static_cast<runtime_state>(w.state);
+            e.port        = w.port;
+            e.connections = w.connections;
+            e.owner       = w.owner;
+            e.group       = w.group;
+            entries.push_back(std::move(e));
+        }
+
+        m_manager.install_replica(entries);
+
+        if (logger::g_level <= log_debug)
+        {
+            std::string msg = "proxy worker: runtime map replica now holds "
+                            + std::to_string(entries.size()) + " runtime(s)";
+            LOG_DEBUG(msg.c_str());
+        }
     }
 
     void on_endpoints(const std::string& payload)
@@ -883,11 +973,18 @@ private:
     // Before m_remote, which holds a pointer to it.
     control_writer                         m_writer;
     remote_sink                            m_remote;
-    // Empty map, live channel.  See the wiring in on_config().  Declared before
-    // the runtime so it outlives it: a runtime revokes its origin as it is
-    // destroyed, and that call needs a channel that is still there — the same
-    // ordering runtime_manager itself documents, and the same UBSan report if
-    // it is got wrong.
+    // A replica of the daemon's map, and a live channel.  See the wiring in
+    // on_config() and the runtime_map frame that fills the map in.
+    //
+    // The map was empty on purpose until that frame existed, and everything that
+    // looked a name up in it got the truth for a process holding one runtime:
+    // nothing.  What that cost was the twelve management calls a worker refuses,
+    // all of which reach for this object.
+    //
+    // Declared before the runtime so it outlives it: a runtime revokes its
+    // origin as it is destroyed, and that call needs a channel that is still
+    // there — the same ordering runtime_manager itself documents, and the same
+    // UBSan report if it is got wrong.
     runtime_manager                        m_manager;
     std::unique_ptr<runtime_instance>       m_owned;
     // The runtime this worker owns, and the same pointer narrowed when it

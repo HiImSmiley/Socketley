@@ -11,8 +11,167 @@
 #include <mutex>
 #include <shared_mutex>
 
+namespace
+{
+
+// ─── What stands in for a runtime this process does not hold ────────────────
+//
+// The daemon's placeholder for an out-of-process runtime is a real instance of
+// the real type, and that is right there: it is persisted, inspected, cascaded
+// and started, so it has to answer everything a runtime answers.
+//
+// A replica in a worker is not that.  It answers six fields and is never
+// started, never persisted and never asked for a connection — and building it
+// out of the real type would cost what the real type costs.  proxy_instance
+// carries three fd-indexed tables of 65536 entries, about two megabytes before
+// it has taken a connection, and a worker would hold one per proxy in the
+// daemon, in every worker.  Ten workers and ten proxies is two hundred
+// megabytes of tables nothing will ever index into.
+//
+// So the replica is the base class and a type tag.  Deliberately file-local:
+// nothing outside this function can name the class, so nothing can be written
+// that reaches past runtime_instance's interface into it — which is the same
+// protection the daemon's placeholder gets from being a real instance, arrived
+// at from the other direction.
+//
+// The three pure virtuals are the whole of the implementation.  setup() answers
+// false because a replica cannot be started, and nothing calls it: start() on an
+// out-of-process instance returns before setup(), which is what
+// mark_out_of_process() is for.
+class replica_instance final : public runtime_instance
+{
+public:
+    replica_instance(runtime_type type, std::string_view name)
+        : runtime_instance(type, name)
+    {
+        // Every read that distinguishes a runtime elsewhere from one here goes
+        // through this flag — socketley.send routes on it, cmd_send routes on
+        // it, and start()/stop() return before touching a ring because of it.
+        // A replica is out of process by definition: it is the record of a
+        // runtime in another one.
+        mark_out_of_process();
+    }
+
+    void on_cqe(struct io_uring_cqe*) override {}
+    bool setup(event_loop&) override { return false; }
+    void teardown(event_loop&) override {}
+};
+
+} // namespace
+
+void runtime_manager::mark_replica()
+{
+    m_replica = true;
+}
+
+void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
+{
+    // Never under a script frame.  A replica the snapshot has dropped is freed
+    // below, and a Lua callback is entitled to be holding the pointer get()
+    // handed it — socketley.get and socketley.send both take one and use it
+    // unlocked, on the rule that removal happens on this same thread.
+    //
+    // True today by construction: the only caller is the worker's control pump,
+    // which runs between turns of its event loop with nothing of the script's on
+    // the stack.  This is the belt for the day something calls it from inside a
+    // callback instead, and the cost of taking it is that the replica is one
+    // push interval older than it could be — which is the contract anyway.
+    if (script_frame_live())
+        return;
+
+    // Freed with the lock released, like every other instance destruction in
+    // this file: the map's mutex does not nest, and a destructor is entitled to
+    // reach back in.  A replica holds no fds, no ring registration and no
+    // interpreter, so this is a deallocation and nothing more.
+    std::vector<std::unique_ptr<runtime_instance>> dropped;
+    {
+        std::unique_lock lock(mutex);
+
+        for (const auto& e : entries)
+        {
+            auto it = runtimes.find(e.name);
+
+            // A type change under one name means the daemon removed a runtime
+            // and created another with the same name between two pushes.  The
+            // object is rebuilt rather than re-tagged: get_type() is fixed at
+            // construction, and a replica reporting the old type would be the
+            // confidently-wrong answer this whole file is written against.
+            if (it != runtimes.end() && it->second->get_type() != e.type)
+            {
+                dropped.push_back(std::move(it->second));
+                runtimes.erase(it);
+                it = runtimes.end();
+            }
+
+            if (it == runtimes.end())
+            {
+                auto inst = std::make_unique<replica_instance>(e.type, e.name);
+                it = runtimes.emplace(e.name, std::move(inst)).first;
+            }
+
+            // Updated in place, so a pointer taken out of get() one statement
+            // ago still names this object.  The state is stored straight rather
+            // than through start()/stop(): those are transitions this process
+            // is not making, and this is a report of one somebody else made.
+            runtime_instance* inst = it->second.get();
+            inst->set_port(e.port);
+            inst->set_owner(e.owner);
+            inst->set_group(e.group);
+            inst->set_replicated_state(e.state);
+
+            // The same two fields the daemon writes into ITS placeholder from a
+            // stats frame, so reported_connection_count() answers the pushed
+            // figure here for the same reason it does there.  The detail text is
+            // empty because a replica has none: `stats` is a command the daemon
+            // serves, not something a script reads off the map.
+            inst->set_worker_stats({}, e.connections, 0);
+        }
+
+        // Whatever the daemon no longer has.  Collected first because erasing
+        // from a map while walking it is the one thing this loop must not get
+        // wrong, and because the frees happen outside the lock.
+        for (auto it = runtimes.begin(); it != runtimes.end();)
+        {
+            const bool still_there =
+                std::any_of(entries.begin(), entries.end(),
+                            [&](const replica_entry& e) { return e.name == it->first; });
+            if (still_there)
+            {
+                ++it;
+                continue;
+            }
+            dropped.push_back(std::move(it->second));
+            it = runtimes.erase(it);
+        }
+    }
+
+    dropped.clear();
+}
+
 bool runtime_manager::create(runtime_type type, std::string_view name)
 {
+    // ─── A replica's map is read-only, and this is where that is enforced ───
+    //
+    // A runtime built here would exist in this worker and in no other process:
+    // not persisted, not listed by `ls`, not reachable by name from anywhere
+    // else, and gone at the next snapshot.  Worse, it would be built against
+    // this worker's ring by a manager whose map the daemon overwrites every
+    // couple of seconds.
+    //
+    // Unreachable today — socketley.create is one of the twelve calls a worker
+    // refuses, and it stays refused until there is a way to carry the request to
+    // the daemon and bring an answer back.  This is the guard for the day
+    // somebody removes the refusal without building that: a call arriving here
+    // is a call site that has not been taught which side of the boundary it is
+    // on, and it gets a refusal and a line in the log rather than a phantom
+    // runtime.
+    if (m_replica)
+    {
+        LOG_WARN("runtime_manager::create in a worker process: the map here is a "
+                 "replica of the daemon's and cannot be written; nothing created");
+        return false;
+    }
+
     std::unique_lock lock(mutex);
 
     // Validate name: alphanumeric + -_. only, max 128 chars, no leading dot
@@ -41,6 +200,15 @@ bool runtime_manager::create(runtime_type type, std::string_view name)
 
 bool runtime_manager::start(std::string_view name, event_loop& loop)
 {
+    // See create().  Starting a replica would move a copy's state and bind
+    // nothing anywhere.
+    if (m_replica)
+    {
+        LOG_WARN("runtime_manager::start in a worker process: the map here is a "
+                 "replica of the daemon's; nothing started");
+        return false;
+    }
+
     // Before, because a proxy resolves its backends inside setup(): the table
     // has to be in its hands by the time start() below reaches that code.
     publish_endpoints();
@@ -89,6 +257,14 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
 
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
 {
+    // See create().
+    if (m_replica)
+    {
+        LOG_WARN("runtime_manager::stop in a worker process: the map here is a "
+                 "replica of the daemon's; nothing stopped");
+        return false;
+    }
+
     // The same shape as start(), for the same reason and with the same
     // reasoning: stop() runs the script's on_stop, which may call back in here.
     runtime_instance* inst = nullptr;
@@ -381,6 +557,16 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
 
 bool runtime_manager::remove(std::string_view name)
 {
+    // See create().  Removing a replica takes the copy out of this worker's map
+    // and leaves the runtime running in the daemon, until the next snapshot puts
+    // the copy back — an answer that is wrong twice.
+    if (m_replica)
+    {
+        LOG_WARN("runtime_manager::remove in a worker process: the map here is a "
+                 "replica of the daemon's; nothing removed");
+        return false;
+    }
+
     std::unique_ptr<runtime_instance> inst;
     {
         std::unique_lock lock(mutex);
@@ -423,6 +609,15 @@ size_t runtime_manager::retired_count() const
 
 bool runtime_manager::rename(std::string_view old_name, std::string_view new_name)
 {
+    // See create().  Nothing in the Lua API renames, so this is the guard for a
+    // call site that does not exist yet.
+    if (m_replica)
+    {
+        LOG_WARN("runtime_manager::rename in a worker process: the map here is a "
+                 "replica of the daemon's; nothing renamed");
+        return false;
+    }
+
     std::unique_lock lock(mutex);
 
     auto it = runtimes.find(old_name);
@@ -763,6 +958,19 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 
 void runtime_manager::publish_endpoints()
 {
+    // Never from a replica.  This function's whole job is to build the
+    // authoritative answer to "where is every runtime" out of the local map and
+    // push it into everything that routes — and in a worker the local map is a
+    // copy, the authoritative answer arrives as a frame, and the copy is missing
+    // the half of it that comes from the cluster.  See mark_replica().
+    //
+    // Guarded here rather than only at the five callers, because it is the
+    // callers that make it hard: create/start/stop/remove/rename each call this
+    // on their way out, and every one of them is already refused above — so this
+    // line is unreachable through them, and is here for the sixth caller.
+    if (m_replica)
+        return;
+
     auto tbl = std::make_shared<endpoint_table>();
 
     // Every running member of every group, and what it declares — null when it

@@ -84,6 +84,7 @@ enum class frame_type : uint16_t
     chan_req  = 22,  // payload: see encode_chan_request
     deliver   = 23,  // payload: raw message bytes; see below
     reload    = 24,  // payload: empty; re-run the script, then answer `routes`
+    runtime_map = 25,  // payload: see encode_runtime_map
 
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply
@@ -503,6 +504,107 @@ inline bool decode_endpoints(std::string_view payload,
         }
     }
 
+    return r.ok;
+}
+
+// ── The runtime map, replicated ─────────────────────────────────────────────
+//
+// The endpoint table above says where a runtime can be REACHED.  This says what
+// runtimes there are, which is a different question and the one the management
+// half of the Lua API asks: socketley.list() and socketley.get() read the map,
+// and a worker had none — so both were refused out here, along with everything
+// else that reaches for it.
+//
+// Six of the seven fields are a transcription rather than a design: they are
+// exactly what socketley.get() returns, read off lua_context.cpp.  The seventh
+// is the group, which socketley.get() does not report and the cluster calls
+// cannot be answered without — a group is the only thing `socketley.cluster.
+// group(name)` is about, and it is a property of the runtime rather than of the
+// cluster, so it belongs in this frame and not in whatever carries the cluster
+// view later.
+//
+// Nothing else crosses, because nothing else is answered from the map: a
+// runtime's stats text, its flags and its script are answered by `stats` and
+// `inspect`, which are commands the daemon serves and not calls a script makes.
+//
+// ─── WHY A REPLICA AND NOT A LOOKUP ─────────────────────────────────────────
+//
+// The other shape available was a request/reply per call, on the chan_req wire
+// that already exists.  It was not taken.  socketley.get() returns a value to a
+// script that is mid-expression, so a lookup would have to block the worker's
+// event loop on the daemon for the length of a round trip — on the DATA path, in
+// a callback, which is the synchronous cross-runtime call this design has said
+// no to everywhere else.  A pushed table costs the worker nothing at the moment
+// of the call and costs the daemon one frame per worker when the map moves.
+//
+// ─── WHAT IT COSTS IN TRUTH ─────────────────────────────────────────────────
+//
+// The replica is as old as the last push.  That is not a new compromise: the
+// daemon's own answer for a runtime in a worker is already a pushed figure —
+// reported_connection_count() reads what the stats frame last carried, up to a
+// publish interval old — so a script in the daemon and a script in a worker are
+// reading the same kind of number, one hop further apart.  Membership changes
+// are pushed as they happen; the counts ride the same frame on the health tick.
+// Nothing here invalidates and nothing refreshes on demand: see the note on
+// runtime_manager::install_replica for what that buys.
+//
+// The state and type travel as u8 for the same reason the `state` frame's do:
+// this header knows nothing about runtime_definitions.h, and both enums are
+// append-only, so a value from a newer sender reads as a number this build has
+// no name for rather than as a different runtime.
+
+struct runtime_wire
+{
+    std::string name;
+    uint8_t     type{0};    // runtime_type
+    uint8_t     state{0};   // runtime_state
+    uint16_t    port{0};
+    uint64_t    connections{0};
+    std::string owner;      // empty when the runtime has no parent
+    std::string group;      // empty when the runtime is in no group
+};
+
+inline std::string encode_runtime_map(const std::vector<runtime_wire>& rts)
+{
+    std::string out;
+    put_u32(out, static_cast<uint32_t>(rts.size()));
+    for (const auto& r : rts)
+    {
+        put_str(out, r.name);
+        out.push_back(static_cast<char>(r.type));
+        out.push_back(static_cast<char>(r.state));
+        put_u16(out, r.port);
+        put_u64(out, r.connections);
+        put_str(out, r.owner);
+        put_str(out, r.group);
+    }
+    return out;
+}
+
+inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wire>& rts)
+{
+    reader r(payload.data(), payload.size());
+    rts.clear();
+
+    const uint32_t n = r.u32();
+    if (!r.ok) return false;
+
+    // Not reserved on the count, for the reason decode_endpoints gives: the
+    // number arrives from another process and reserving on it would let a
+    // corrupt frame ask for an arbitrary allocation.
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        runtime_wire e;
+        e.name        = std::string(r.str());
+        e.type        = r.u8();
+        e.state       = r.u8();
+        e.port        = r.u16();
+        e.connections = r.u64();
+        e.owner       = std::string(r.str());
+        e.group       = std::string(r.str());
+        if (!r.ok) return false;
+        rts.push_back(std::move(e));
+    }
     return r.ok;
 }
 

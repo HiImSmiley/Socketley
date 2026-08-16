@@ -1768,8 +1768,8 @@ void server_instance::teardown(event_loop& loop)
         if (mgr)
         {
             auto* origin = mgr->get(fc.origin);
-            if (origin && origin->get_type() == runtime_server)
-                static_cast<server_instance*>(origin)->drop_route(fc.ref);
+            if (auto* srv = origin ? origin->as_server() : nullptr)
+                srv->drop_route(fc.ref);
         }
     }
     m_forwarded.clear();
@@ -1791,9 +1791,8 @@ void server_instance::teardown(event_loop& loop)
         {
             if (!mgr) break;
             auto* target = mgr->get(target_name);
-            if (target && target->get_type() == runtime_server)
-                static_cast<server_instance*>(target)->release_routed(
-                    conn_ref{owner_key(), serial});
+            if (auto* srv = target ? target->as_server() : nullptr)
+                srv->release_routed(conn_ref{owner_key(), serial});
         }
     }
 
@@ -3273,15 +3272,14 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             if (mgr)
             {
                 auto* target = mgr->get(rit->second);
-                if (target && target->get_type() == runtime_server &&
-                    target->get_state() == runtime_running)
+                if (target && target->get_state() == runtime_running)
                 {
                     // The name, not the descriptor.  In one process this is the
                     // same call it always was; the argument is what changed,
                     // and it is the argument that decides whether the same call
                     // still means anything once the target is elsewhere.
-                    auto* sub = static_cast<server_instance*>(target);
-                    sub->deliver_routed(conn_ref{owner_key(), sender->ref_serial}, msg);
+                    if (auto* sub = target->as_server())
+                        sub->deliver_routed(conn_ref{owner_key(), sender->ref_serial}, msg);
                 }
             }
             return;
@@ -3564,10 +3562,10 @@ void server_instance::lua_broadcast(std::string_view msg)
         if (mgr)
         {
             auto* origin = mgr->get(fc.origin);
-            if (origin && origin->get_type() == runtime_server &&
-                origin->get_state() == runtime_running)
+            if (origin && origin->get_state() == runtime_running)
             {
-                static_cast<server_instance*>(origin)->write_to_ref(fc.ref, msg);
+                if (auto* srv = origin->as_server())
+                    srv->write_to_ref(fc.ref, msg);
             }
         }
     }
@@ -4636,14 +4634,15 @@ bool server_instance::route_client(int client_id, std::string_view target_name)
     if (!mgr) return false;
 
     auto* target = mgr->get(target_name);
-    if (!target || target->get_type() != runtime_server) return false;
+    if (!target) return false;
 
     // Our own bookkeeping first, the notification second.  accept_routed runs
     // the target's on_connect, and a script is allowed to answer that by
     // closing the connection — which frees the struct m_conn_idx[client_id]
     // points at.  Touching that pointer afterwards would be a read of a pooled
     // connection at best.
-    auto* sub = static_cast<server_instance*>(target);
+    auto* sub = target->as_server();
+    if (!sub) return false;
     m_routes[ref.serial] = std::string(target_name);
     m_conn_idx[client_id]->routed = true;
 
@@ -4687,9 +4686,8 @@ bool server_instance::unroute_client(int client_id)
     if (mgr)
     {
         auto* target = mgr->get(target_name);
-        if (target && target->get_type() == runtime_server)
-            static_cast<server_instance*>(target)->release_routed(
-                conn_ref{owner_key(), serial});
+        if (auto* srv = target ? target->as_server() : nullptr)
+            srv->release_routed(conn_ref{owner_key(), serial});
     }
     return true;
 }
@@ -4724,10 +4722,11 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
         auto* mgr = get_runtime_manager();
         if (!mgr) return false;
         auto* origin = mgr->get(it->second.origin);
-        if (!origin || origin->get_type() != runtime_server ||
-            origin->get_state() != runtime_running) return false;
+        if (!origin || origin->get_state() != runtime_running) return false;
+        auto* srv = origin->as_server();
+        if (!srv) return false;
 
-        return static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
+        return srv->write_to_ref(it->second.ref, msg);
     }
 
     if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return false;
@@ -4763,10 +4762,11 @@ bool server_instance::owner_send(int client_id, std::string_view msg)
     if (!mgr) return false;
 
     auto* origin = mgr->get(it->second.origin);
-    if (!origin || origin->get_type() != runtime_server ||
-        origin->get_state() != runtime_running) return false;
+    if (!origin || origin->get_state() != runtime_running) return false;
+    auto* srv = origin->as_server();
+    if (!srv) return false;
 
-    return static_cast<server_instance*>(origin)->write_to_ref(it->second.ref, msg);
+    return srv->write_to_ref(it->second.ref, msg);
 }
 
 // ── The cross-runtime half ──────────────────────────────────────────────────
@@ -4903,11 +4903,17 @@ bool server_instance::owner_broadcast(std::string_view msg)
     auto* mgr = get_runtime_manager();
     if (!mgr) return false;
 
+    // The one site of the nine reachable in a worker without a routed
+    // connection: a runtime's owner is a name it was created with, and a worker
+    // now holds a replica of every name in the daemon.  Before as_server() this
+    // found nothing at all out there and answered false; with the replica map
+    // and the old cast it would have run server_instance's code over a replica.
     auto* parent = mgr->get(owner_name);
-    if (!parent || parent->get_type() != runtime_server ||
-        parent->get_state() != runtime_running) return false;
+    if (!parent || parent->get_state() != runtime_running) return false;
+    auto* srv = parent->as_server();
+    if (!srv) return false;
 
-    static_cast<server_instance*>(parent)->lua_broadcast(msg);
+    srv->lua_broadcast(msg);
     return true;
 }
 

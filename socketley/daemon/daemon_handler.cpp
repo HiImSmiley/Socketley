@@ -213,8 +213,21 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // Every republished table also goes to the workers.  Registered here rather
     // than in setup() because the manager can publish before the listener is
     // up — the boot-time restore does exactly that.
+    // And the map itself, on the same trigger.
+    //
+    // Two tables, one moment: the endpoint table says where a runtime can be
+    // reached and the map says what runtimes there are, and both are stale the
+    // instant a runtime is created, started, stopped, removed or renamed.
+    // publish_endpoints() is called at every one of those already — that is the
+    // whole reason it is a republish rather than an update — so the map rides it
+    // instead of growing a second list of call sites for the next one to be
+    // forgotten from.  The periodic push in check_managed_health() is the other
+    // half: it carries the connection counts, which move with no event at all.
     m_manager.set_endpoint_sink([this](const endpoint_table& tbl)
-                                { publish_endpoints_to_workers(tbl); });
+                                {
+                                    publish_endpoints_to_workers(tbl);
+                                    publish_runtime_map_to_workers();
+                                });
 
     // And every published message, for the same reason: a worker's subscribers
     // are not reachable by calling into an instance, so the manager hands them
@@ -3842,6 +3855,50 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
         sup->send_endpoints(payload);
 }
 
+// What runtimes there are, as the workers' replicas of the map.
+//
+// Built here and not in runtime_manager for the reason every other worker-facing
+// push is: the manager knows what it holds, this class knows where the sockets
+// are, and the sink between them is what keeps the manager from having to know
+// there are other processes at all.
+//
+// The connection count is reported_connection_count(), which is the figure the
+// CLI prints and the one socketley.get() already answers with — a live walk for
+// a runtime in this process, and the last pushed figure for one in a worker.
+// EVENT-LOOP THREAD ONLY, because of that walk; every caller is.
+void daemon_handler::publish_runtime_map_to_workers()
+{
+    if (m_proxy_workers.empty())
+        return;
+
+    std::vector<worker_proto::runtime_wire> rts;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        rts.reserve(m_manager.list().size());
+        for (const auto& [name, inst] : m_manager.list())
+        {
+            worker_proto::runtime_wire w;
+            w.name        = name;
+            w.type        = static_cast<uint8_t>(inst->get_type());
+            w.state       = static_cast<uint8_t>(inst->get_state());
+            w.port        = inst->get_port();
+            w.connections = static_cast<uint64_t>(inst->reported_connection_count());
+            w.owner       = std::string(inst->get_owner());
+            w.group       = std::string(inst->get_group());
+            rts.push_back(std::move(w));
+        }
+    }
+
+    // Encoded once for all of them, like the endpoint table above: the map is
+    // the same map whichever child is being told about it.  Each supervisor
+    // decides whether it is news — see send_runtime_map, which drops a payload
+    // identical to the one that child already has, so an idle daemon's health
+    // tick costs one string compare per worker and no frame at all.
+    const std::string payload = worker_proto::encode_runtime_map(rts);
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->send_runtime_map(payload);
+}
+
 void daemon_handler::publish_to_workers(std::string_view cache_name,
                                         std::string_view channel,
                                         std::string_view message)
@@ -4056,7 +4113,25 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     if (left < std::chrono::milliseconds(0))
         left = std::chrono::milliseconds(0);
 
-    switch (it->second->await_startup(left))
+    const auto verdict = it->second->await_startup(left);
+
+    // The iterator is re-taken rather than reused, and that is not tidiness.
+    //
+    // await_startup() drains the control socket, and what comes off it can reach
+    // back into this map: a `publish` runs the subscribe callbacks of every
+    // runtime in this daemon, a subscriber may call socketley.remove, and that
+    // reconciles — which erases from m_proxy_workers.  `it` then names a node
+    // that has been freed, and the two uses below would read it.
+    //
+    // Older than the map frame this commit adds and not reached by it: the way
+    // in is the publish path, which has existed since a cache in a worker could
+    // reach a subscriber in the daemon.  Fixed here because auditing what a new
+    // frame could reach is what found it.
+    it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end())
+        return 0;   // gone while we waited: nothing left to report on
+
+    switch (verdict)
     {
         case proxy_supervisor::startup::serving:
             // The child is listening, so it is a group member others may be
@@ -4222,6 +4297,22 @@ void daemon_handler::check_managed_health()
 
     if (routes_moved)
         m_manager.publish_endpoints();
+
+    // The workers' replica of the map, refreshed for what no event announces.
+    //
+    // Membership changes ride publish_endpoints() and arrive at once; two things
+    // do not.  A connection count moves with traffic and nothing republishes for
+    // it, and a runtime whose worker refused its configuration reaches `failed`
+    // through mark_failed(), which is not a transition the manager publishes
+    // either.  Both are collected above, so this is the point at which the tick
+    // has the freshest answer it is going to have.
+    //
+    // After reconcile_proxy_workers(), so a child forked on this tick is in
+    // m_proxy_workers and gets the map with everything else.  Unconditional
+    // because the decision belongs one level down: send_runtime_map() drops a
+    // payload the child already has, so a daemon where nothing moved sends
+    // nothing.
+    publish_runtime_map_to_workers();
 
 
     std::shared_lock lock(m_manager.mutex);

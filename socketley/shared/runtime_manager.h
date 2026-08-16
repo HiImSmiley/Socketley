@@ -25,6 +25,70 @@ public:
     using runtime_map = std::unordered_map<std::string, std::unique_ptr<runtime_instance>,
                                             runtime_string_hash, runtime_string_equal>;
 
+    // ── A manager that owns nothing ─────────────────────────────────────────
+    //
+    // A worker process holds one runtime and no map, which is what made the
+    // twelve cross-runtime Lua calls answer a refusal out there.  It holds a
+    // manager all the same — for the request channel — and the map inside it
+    // was left empty on purpose.
+    //
+    // This says the map is no longer empty and no longer this process's to
+    // change: it is a REPLICA of the daemon's, refreshed by install_replica()
+    // from a frame on the control socket.  Everything that reads it — get(),
+    // list(), and through them socketley.get and socketley.list — works
+    // unchanged.
+    //
+    // Three things are refused instead of applied, and each would be silent
+    // damage rather than a missing feature:
+    //
+    //   create/start/stop/remove/rename — a write to a copy.  The runtime would
+    //     exist in one worker and nowhere else, and the next snapshot would
+    //     erase it.  Those four Lua calls are refused out here for reasons of
+    //     their own; this is the guard under the refusal.
+    //
+    //   publish_endpoints() — it REBUILDS the endpoint table from this map and
+    //     pushes it into every runtime, which in a worker means overwriting the
+    //     authoritative table the daemon sent.  The daemon's copy folds in
+    //     remote cluster members, and a worker has no cluster_discovery to fold
+    //     them from, so one publish here silently drops every remote member of
+    //     every group a proxy routes to.  It also clears the request channel's
+    //     sink table, which in a worker was registered by hand for the one
+    //     runtime this process holds.
+    //
+    // Set once, when the worker wires its manager up, and never cleared.  A
+    // daemon never calls it, so nothing about the in-daemon path changes.
+    void mark_replica();
+    bool is_replica() const { return m_replica; }
+
+    // One runtime as the daemon last described it: the six fields
+    // socketley.get() answers with, plus the group the cluster calls are about.
+    // See worker_proto::runtime_wire, which is the same list on the wire.
+    struct replica_entry
+    {
+        std::string   name;
+        runtime_type  type{runtime_server};
+        runtime_state state{runtime_created};
+        uint16_t      port{0};
+        uint64_t      connections{0};
+        std::string   owner;
+        std::string   group;
+    };
+
+    // Make the map say exactly this.  REPLICA MANAGERS ONLY, and only from a
+    // point where no script frame is live — see the guard at the top of it.
+    //
+    // Entries already present are updated in place rather than replaced, so a
+    // pointer a caller took out of get() a statement ago still names the same
+    // object; entries the snapshot does not mention are dropped.
+    //
+    // No invalidation and no synchronous refresh, deliberately.  Both would
+    // mean the worker asking the daemon a question and waiting for the answer
+    // on its event-loop thread, which is the thing the split exists to avoid;
+    // the price is that a name created in the last few milliseconds may not be
+    // here yet, and that is the same price `stats` already pays for a worker's
+    // figures.
+    void install_replica(const std::vector<replica_entry>& entries);
+
     bool create(runtime_type type, std::string_view name);
     bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
@@ -220,6 +284,10 @@ private:
     // Set by a reader on another thread, read by the event-loop thread on every
     // sweep, so it has to be an atomic even though it only ever goes false→true.
     std::atomic<bool> m_offthread_stats{false};
+
+    // See mark_replica().  Plain bool: written once at wiring time, read on the
+    // one thread that ever touches this object in a worker.
+    bool m_replica = false;
 
     cluster_discovery* m_cluster = nullptr;
 };
