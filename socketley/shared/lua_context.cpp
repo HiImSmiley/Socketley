@@ -3515,21 +3515,27 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.runtimes() → array of {daemon, name, type, port, group, state, connections}
-    cluster_tbl["runtimes"] = [owner, this]() -> sol::table {
+    cluster_tbl["runtimes"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
-        // Local runtimes
+        // Local runtimes.
+        //
+        // This is the row that needs the most out of a pushed map, and it is
+        // the one that decides whether a name-and-port snapshot is enough: it
+        // reads get_group() as well as the six fields socketley.get() wants.
+        // A map carrying only what get() needs answers here with every group
+        // empty, which reads as a cluster where nobody is grouped.
         {
             std::shared_lock lock(mgr->mutex);
             for (const auto& [name, inst] : mgr->list())
             {
                 sol::table r = m_lua.create_table();
-                r["daemon"] = std::string(cd->get_daemon_name());
+                r["daemon"] = src.daemon_name;
                 r["name"] = std::string(name);
                 r["type"] = type_to_string(inst->get_type());
                 r["port"] = inst->get_port();
@@ -3540,8 +3546,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
         // Remote runtimes
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             for (const auto& rt : rd.runtimes)
             {
