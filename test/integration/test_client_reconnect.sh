@@ -111,9 +111,22 @@ done
 # on the same ports to end it.
 for s in s_inf s_cnt s_off s_dmn; do "$BIN" remove "$s" >/dev/null 2>&1 || true; done
 
+# The outage has to be real before anything is read from it, and "real" means
+# nothing is left listening on these ports.  A server sets SO_REUSEPORT
+# (server_instance.cpp:1307), so a listener that outlived some other test --
+# this suite has had that hazard before -- shares the port rather than colliding
+# with it: `create` succeeds, the client connects to the stranger, and removing
+# this file's own server changes nothing.  That produced three confusing reds
+# where the honest report is one named cause, so it is checked first.
+LEFT=$(ss -ltn 2>/dev/null | awk -v a=$S_INF -v b=$S_CNT -v c=$S_OFF -v d=$S_DMN \
+        '{n=split($4,x,":"); p=x[n]; if(p==a||p==b||p==c||p==d) printf "%s ",p}')
+if [ -z "$LEFT" ]; then ok
+else bad "the outage is real" \
+         "still listening after all four servers were removed: $LEFT — something outside this file shares these ports (SO_REUSEPORT), so nothing below is a statement about --reconnect"; fi
+
 for c in c_inf c_cnt c_off c_dmn; do
     if wait_conns "$c" 0 10; then ok
-    else bad "control: $c notices the outage" "still reports a connection after its server stopped"; fi
+    else bad "control: $c notices the outage" "still reports a connection 10s after every server was removed; if 'the outage is real' passed above, this is the client not noticing"; fi
 done
 
 "$BIN" create server s_inf -p "$S_INF" --mode inout -s >/dev/null 2>&1 || true
