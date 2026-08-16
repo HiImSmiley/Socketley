@@ -18,7 +18,7 @@ workspace "Socketley"
     -- say something before the threading work lands, it is a genuine finding —
     -- most likely a signal handler or a std::atomic used across the daemon's
     -- fork boundary — and not a false positive to be suppressed.
-    configurations { "Debug", "Dev", "Release", "Sanitize", "TSan" }
+    configurations { "Debug", "Dev", "Release", "Sanitize", "TSan", "Coverage" }
     platforms { "x64" }
     location "make"
 
@@ -112,6 +112,41 @@ workspace "Socketley"
         buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                        "-fno-sanitize-recover=all" }
         linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+    -- Workspace-wide coverage settings (applies to ALL projects).
+    --
+    -- Stated once here for the reason the Sanitize comment above gives: a
+    -- per-project copy is a list that goes stale silently, and the project it
+    -- forgets is the one whose coverage you wanted.
+    --
+    -- NDEBUG, not DEBUG.  Coverage is only worth reading against the semantics
+    -- that ship, and sol2's safety checks follow NDEBUG — a DEBUG-flavoured
+    -- report would measure branches Release never executes.
+    --
+    -- `optimize "Off"` because line attribution is what is being asked for; an
+    -- optimised build merges and reorders lines and answers a different
+    -- question.  `-fprofile-update=atomic` because the daemon forks workers and
+    -- non-atomic counters race across them, which silently undercounts.
+    --
+    -- gcov writes .gcda at process exit, so a process killed with SIGKILL
+    -- contributes nothing, and the suite does sweep daemons that way as a
+    -- fallback.  That was expected to gut the runtime numbers and does not:
+    -- measured over a full run, all of daemon.cpp, proxy_instance.cpp,
+    -- server_instance.cpp, lua_context.cpp, event_loop.cpp and
+    -- runtime_manager.cpp record data, because the tests shut their daemons
+    -- down cleanly and the sweep only ever catches stragglers.  Stated because
+    -- the fear is the obvious one and it is worth knowing it was checked.
+    --
+    -- Run it as `SOCKETLEY_CONFIG=Coverage bash test/run_all.sh`.  Running a
+    -- single test file directly will NOT use this build: the files default to
+    -- bin/Release/socketley and only run_all.sh exports BIN.
+    filter "configurations:Coverage"
+        defines { "NDEBUG" }
+        symbols "On"
+        optimize "Off"
+        buildoptions { "--coverage", "-fprofile-update=atomic" }
+        linkoptions { "--coverage" }
     filter {}
 
     -- Workspace-wide TSan settings (applies to ALL projects).
