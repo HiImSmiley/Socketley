@@ -284,6 +284,34 @@ TEST_CASE("a replica map refuses to be written")
     CHECK(mgr.get("api2") == nullptr);
 }
 
+TEST_CASE("a replica never republishes the endpoint table")
+{
+    // The destructive one.  publish_endpoints() REBUILDS that table out of the
+    // local map and pushes it everywhere, so in a worker it would overwrite the
+    // authoritative table the daemon sent — with a copy that is missing every
+    // remote cluster member, because a worker has no cluster_discovery to fold
+    // them in from.  A proxy's @group routing would quietly lose every member on
+    // another node.
+    //
+    // Observed through the endpoint sink, which is the last thing
+    // publish_endpoints() does and the only part of it visible from here.
+    runtime_manager daemon_side;
+    bool daemon_published = false;
+    daemon_side.set_endpoint_sink([&](const endpoint_table&) { daemon_published = true; });
+    daemon_side.publish_endpoints();
+    // The control: without this the check below passes on a build where
+    // publishing was broken for everybody.
+    CHECK(daemon_published);
+
+    runtime_manager replica;
+    bool replica_published = false;
+    replica.set_endpoint_sink([&](const endpoint_table&) { replica_published = true; });
+    replica.mark_replica();
+    replica.install_replica({ entry("api", runtime_server, runtime_running, 8080, 0) });
+    replica.publish_endpoints();
+    CHECK_FALSE(replica_published);
+}
+
 TEST_CASE("a manager that was never marked is still the daemon's")
 {
     // The guard is opt-in, so an unmarked manager — every one in the daemon —

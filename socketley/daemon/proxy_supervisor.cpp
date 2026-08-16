@@ -630,11 +630,18 @@ void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
     // idea of what counts as a change to drift from the first.
     if (encoded_payload == m_runtime_map)
         return;
+    if (m_control_fd < 0)
+        return;
 
-    m_runtime_map = encoded_payload;
-    if (m_control_fd >= 0)
-        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
-                                             m_runtime_map))) {}
+    // Remembered only once it has been queued, which is what makes the dedupe
+    // above safe.  Storing it either way would record a payload this child was
+    // never sent — write_frame refuses when the backlog is full, meaning the
+    // child has stopped reading — and every later push of the same map would
+    // then be dropped as a duplicate of a frame that never went.  On a daemon
+    // whose membership is settled that is a replica left stale for good.
+    if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
+                                        encoded_payload)))
+        m_runtime_map = encoded_payload;
 }
 
 void proxy_supervisor::send_publish(const std::string& encoded_payload)
