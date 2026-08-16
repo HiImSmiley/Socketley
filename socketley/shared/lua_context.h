@@ -98,6 +98,7 @@ namespace lua_tick
 #include <vector>
 
 #include "route_table.h"
+#include "cluster_view.h"
 
 class runtime_instance;
 
@@ -518,6 +519,26 @@ public:
     static void set_worker_process(bool on);
     static bool in_worker_process();
 
+    // ── The cluster, as seen by a process that cannot run discovery ─────────
+    //
+    // Set by the worker when the daemon pushes a view; never set in the daemon,
+    // which reads its own cluster_discovery instead.  A process fact like
+    // set_worker_process() above, and stored the same way — but replaced rather
+    // than written once, because the cluster changes and the view is
+    // republished.
+    //
+    // Held by shared_ptr and swapped wholesale: a binding takes one reference
+    // at the top of the call and iterates that, so a view arriving mid-call
+    // cannot move the vector underneath it.  Reads and writes are both on the
+    // event-loop thread, so the pointer needs no atomic.
+    //
+    // While this is null the four socketley.cluster.* calls stay refused in a
+    // worker.  That is deliberate and it is the whole point of routing them
+    // through here: with no view they would answer an empty table, which is
+    // what a successful call returns on a daemon alone in its cluster.
+    static void set_cluster_view(cluster_view_ptr view);
+    static cluster_view_ptr cluster_view_snapshot();
+
 private:
     // Put the count hook on this state, or take it off when m_deadline_ms is 0.
     // Called once at construction and again after the script's top level has
@@ -671,6 +692,10 @@ private:
     // no lock, and a plain bool is what it means.
     static bool s_worker_process;
 
+    // See set_cluster_view().  Null in the daemon and in a worker whose daemon
+    // has not published one.
+    static cluster_view_ptr s_cluster_view;
+
     // Timer lifetime guard — set to false in destructor; timers check before firing
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
 
@@ -753,6 +778,7 @@ private:
 #include <cstdint>
 
 #include "route_table.h"
+#include "cluster_view.h"
 
 class runtime_instance;
 
@@ -811,6 +837,8 @@ public:
     // The worker calls this before it builds anything; without Lua there is no
     // management API to refuse, so it records nothing.
     static void set_worker_process(bool) {}
+    static void set_cluster_view(cluster_view_ptr) {}
+    static cluster_view_ptr cluster_view_snapshot() { return {}; }
     static bool in_worker_process() { return false; }
     // on_*() callbacks omitted — only called when has_*() returns true,
     // and guarded by #ifndef SOCKETLEY_NO_LUA at each call site.

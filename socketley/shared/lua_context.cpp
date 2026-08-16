@@ -2470,6 +2470,14 @@ bool lua_context::in_worker_process() { return s_worker_process; }
 
 bool lua_context::s_worker_process = false;
 
+void lua_context::set_cluster_view(cluster_view_ptr view)
+{
+    s_cluster_view = std::move(view);
+}
+cluster_view_ptr lua_context::cluster_view_snapshot() { return s_cluster_view; }
+
+cluster_view_ptr lua_context::s_cluster_view;
+
 // Replace the cross-runtime half of the management API with something that says
 // why it is not there.
 //
@@ -2513,12 +2521,17 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // and .subscribe in particular is delivered to — see
     // runtime_manager::set_publish_sink.
 
-    // READ.  These come back when the worker is handed the runtime map.
-    for (const char* call : {"send", "list", "get"})
-    {
-        sol::function f = make(worker_refusal(std::string("socketley.") + call));
-        sk[call] = f;
-    }
+    // READ.  Empty now: list, get and send all answer in a worker, because the
+    // worker is handed the runtime map.  Kept as a group rather than deleted,
+    // because the three families below are the shape of this function and a
+    // reader who finds only two of them has to work out whether the third was
+    // never there or was emptied on purpose.
+    //
+    // What each of the three needed, for whoever adds a fourth read:
+    //   list   the map keys, and the worker's OWN row among them.
+    //   get    six fields per row, and a refreshed connections figure.
+    //   send   the map for the pre-checks, plus a deliver sink out of this
+    //          process — see below.
 
     // MUTATE.  These do not come back with it: being told what the map holds is
     // not permission to alter it.  See worker_mutation_refusal() for what each
@@ -3025,7 +3038,23 @@ void lua_context::register_bindings(runtime_instance* owner)
             // Named as the transport it is.  A script told only `false` would
             // look at its own runtime for a fault that is in the pipe to
             // somebody else's process.
-            return api_why(L, q(name) + " runs in a worker process, and the "
+            //
+            // This is the branch that runs for EVERY peer when the caller is
+            // itself in a worker, including peers that live in the daemon:
+            // from out here every other runtime is in another process, and the
+            // map marks them so.  Without that mark this falls through to
+            // lua_broadcast() on a row with no connections in it, which
+            // succeeds, returns true and delivers nothing — the defect this
+            // branch was added for, reintroduced from the other side.
+            //
+            // What `true` means is one hop weaker here than in the daemon.
+            // There it means the message reached the process holding the
+            // connections; here it means it reached the daemon, which then
+            // routes it in-process or on to another worker.  That is the
+            // honest reading of the sink's return and it is not worth a
+            // synchronous round trip to narrow — the thing a script actually
+            // wants to know is checked by the receiver, not by this bool.
+            return api_why(L, q(name) + " runs in another process, and the "
                                         "message could not be handed to it");
         }
         if (inst->get_type() == runtime_server)
@@ -3395,22 +3424,76 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // ─── socketley.cluster.* — cluster introspection API ───
+    //
+    // ── WHERE THE CLUSTER HALF OF THE ANSWER COMES FROM ─────────────────────
+    //
+    // Each of the four below needs three things the runtime map does not carry:
+    // this daemon's cluster NAME, the address it advertises, and every remote
+    // daemon with its runtimes.  In the daemon those come off
+    // cluster_discovery.  In a worker there is no cluster_discovery and there
+    // must not be one — it would claim this node's name in the shared cluster
+    // directory and read as a second daemon to every other member — so the
+    // daemon pushes a snapshot instead.  See shared/cluster_view.h.
+    //
+    // Resolved once, here, rather than four times: the four differ in what they
+    // do with the answer, not in where it comes from, and a fifth cluster call
+    // added later should not have to rediscover this.
+    //
+    // `ok` false means this process has neither source, which is what a daemon
+    // started without --cluster looks like.  Every caller returns an empty
+    // table for that, unchanged: it is the honest answer for a runtime that is
+    // not in a cluster at all.  It is NOT the honest answer for a worker whose
+    // view has not arrived, and that case never reaches here — the refusal is
+    // still installed over these bindings until a view exists.
+    struct cluster_source
+    {
+        std::string                daemon_name;
+        std::string                host;
+        std::vector<remote_daemon> remote;
+        bool                       ok = false;
+    };
+    auto resolve_cluster = [](runtime_manager* mgr) -> cluster_source {
+        cluster_source src;
+        if (!mgr) return src;
+        if (auto* cd = mgr->get_cluster_discovery())
+        {
+            src.daemon_name = std::string(cd->get_daemon_name());
+            src.host        = std::string(cd->get_cluster_addr());
+            src.remote      = cd->get_all_daemons();
+            src.ok          = true;
+            return src;
+        }
+        if (auto view = lua_context::cluster_view_snapshot())
+        {
+            src.daemon_name = view->daemon_name;
+            src.host        = view->host;
+            src.remote      = view->remote;
+            src.ok          = true;
+        }
+        return src;
+    };
+
     sol::table cluster_tbl = m_lua.create_table();
 
     // socketley.cluster.daemons() → array of {name, host, runtimes}
-    cluster_tbl["daemons"] = [owner, this]() -> sol::table {
+    cluster_tbl["daemons"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
-        // Local daemon entry
+        // Local daemon entry.
+        //
+        // `runtimes` is the size of the LOCAL map, so in a worker this is the
+        // pushed runtime map and it has to be the whole of it — a snapshot
+        // filtered to peers, or one missing the worker's own row, reports a
+        // daemon smaller than it is.
         {
             sol::table d = m_lua.create_table();
-            d["name"] = std::string(cd->get_daemon_name());
-            d["host"] = std::string(cd->get_cluster_addr());
+            d["name"] = src.daemon_name;
+            d["host"] = src.host;
             size_t count = 0;
             {
                 std::shared_lock lock(mgr->mutex);
@@ -3420,8 +3503,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             result[i++] = d;
         }
         // Remote daemons
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             sol::table d = m_lua.create_table();
             d["name"] = rd.name;
@@ -3433,21 +3515,27 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.runtimes() → array of {daemon, name, type, port, group, state, connections}
-    cluster_tbl["runtimes"] = [owner, this]() -> sol::table {
+    cluster_tbl["runtimes"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
-        // Local runtimes
+        // Local runtimes.
+        //
+        // This is the row that needs the most out of a pushed map, and it is
+        // the one that decides whether a name-and-port snapshot is enough: it
+        // reads get_group() as well as the six fields socketley.get() wants.
+        // A map carrying only what get() needs answers here with every group
+        // empty, which reads as a cluster where nobody is grouped.
         {
             std::shared_lock lock(mgr->mutex);
             for (const auto& [name, inst] : mgr->list())
             {
                 sol::table r = m_lua.create_table();
-                r["daemon"] = std::string(cd->get_daemon_name());
+                r["daemon"] = src.daemon_name;
                 r["name"] = std::string(name);
                 r["type"] = type_to_string(inst->get_type());
                 r["port"] = inst->get_port();
@@ -3458,8 +3546,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
         // Remote runtimes
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             for (const auto& rt : rd.runtimes)
             {
@@ -3478,12 +3565,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.group(name) → array of {daemon, host, port, connections}
-    cluster_tbl["group"] = [owner, this](std::string group_name) -> sol::table {
+    cluster_tbl["group"] = [owner, this, resolve_cluster](std::string group_name) -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
         // Local group members
@@ -3496,8 +3583,12 @@ void lua_context::register_bindings(runtime_instance* owner)
                     inst->get_port() > 0)
                 {
                     sol::table m = m_lua.create_table();
-                    m["daemon"] = std::string(cd->get_daemon_name());
-                    m["host"] = std::string(cd->get_cluster_addr());
+                    m["daemon"] = src.daemon_name;
+                    // The ADVERTISED address, not 127.0.0.1.  A worker has no
+                    // way to derive this and guessing loopback would hand a
+                    // script an address no other node can reach — which is why
+                    // the view carries it rather than being rebuilt locally.
+                    m["host"] = src.host;
                     m["port"] = inst->get_port();
                     // The figure a least-connections choice is made on.  A local
                     // member in a worker reported 0 here beside a remote
@@ -3509,8 +3600,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
         // Remote group members
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             for (const auto& rt : rd.runtimes)
             {
@@ -3529,12 +3619,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.stats() → {daemons, runtimes, running, groups={name=count}}
-    cluster_tbl["stats"] = [owner, this]() -> sol::table {
+    cluster_tbl["stats"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int daemon_count = 1;  // include local
         int rt_total = 0;
@@ -3554,8 +3644,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         }
 
         // Remote daemons
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             ++daemon_count;
             for (const auto& rt : rd.runtimes)
