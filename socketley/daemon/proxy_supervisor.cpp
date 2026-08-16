@@ -135,11 +135,19 @@ uint32_t proxy_supervisor::retire()
         m_channel = nullptr;
     }
 
-    // Nothing may be delivered to this object once it is retired, and the
-    // publish handler is the one holder that is not a pointer somebody else
-    // keeps — it is a std::function this object owns, capturing the handler
-    // that is about to put it in the quarantine.
+    // Nothing may be delivered to this object once it is retired, and these are
+    // the holders that are not a pointer somebody else keeps — they are
+    // std::functions this object owns, capturing the handler that is about to
+    // put it in the quarantine.
+    //
+    // All three, not just the publish.  A retired supervisor still has whatever
+    // its child sent before the socket closed sitting in m_in, and ingest() can
+    // still walk it: a `deliver_to` would route a send for a runtime that is on
+    // its way out, and a stats frame would ask the daemon to rebuild and
+    // republish the runtime map on behalf of a child it no longer supervises.
     m_on_publish = nullptr;
+    m_on_deliver = nullptr;
+    m_on_stats   = nullptr;
 
     if (!m_loop)
         return 0;
@@ -634,11 +642,11 @@ void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
         return;
 
     // Remembered only once it has been queued, which is what makes the dedupe
-    // above safe.  Storing it either way would record a payload this child was
-    // never sent — write_frame refuses when the backlog is full, meaning the
-    // child has stopped reading — and every later push of the same map would
-    // then be dropped as a duplicate of a frame that never went.  On a daemon
-    // whose membership is settled that is a replica left stale for good.
+    // above safe.  Storing it either way would record a payload this
+    // child was never sent — write_frame refuses when the backlog is full,
+    // meaning the child has stopped reading — and every later push of the same
+    // map would then be dropped as a duplicate of a frame that never went.  On a
+    // daemon whose membership is settled that is a replica left stale for good.
     if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
                                         encoded_payload)))
         m_runtime_map = encoded_payload;
@@ -865,6 +873,12 @@ void proxy_supervisor::ingest(const std::string&)
         {
             case worker_proto::frame_type::stats:
                 apply_stats(payload);
+                // After the figures are in the placeholder and never before:
+                // the handler rebuilds the runtime map out of what every
+                // runtime reports, and this child's row has to be the one that
+                // has just arrived rather than the one before it.
+                if (m_on_stats)
+                    m_on_stats();
                 break;
 
             case worker_proto::frame_type::hello:

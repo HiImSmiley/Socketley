@@ -318,8 +318,21 @@ private:
     // the replica socketley.list() and socketley.get() are answered from.
     //
     // Called on every membership change, beside the endpoint table and for the
-    // same reason, and once per health tick for the counts.
+    // same reason; on every stats frame, coalesced, for the counts; and on the
+    // health tick as the backstop for both.
     void publish_runtime_map_to_workers();
+
+    // A worker has published its figures.  Pushes the map on, at most once per
+    // stats interval however many children report inside one — the counts are
+    // the one thing in the map that moves with no event behind it, and a stats
+    // frame is the only clock in this daemon that ticks when they do.  See the
+    // note above the definition for why it is coalesced rather than per frame.
+    void on_worker_stats();
+
+    // When the last map push went out, for that floor.  Set by every push, so a
+    // membership change resets the window instead of being followed a moment
+    // later by a round carrying the same rows.
+    std::chrono::steady_clock::time_point m_last_map_push{};
 
     // Encode one published message and push it to every worker, so a proxy's
     // subscribe callbacks fire in the process that is serving its traffic.

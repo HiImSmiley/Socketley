@@ -164,6 +164,20 @@ public:
                                                std::string_view message)>;
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
 
+    // This child has just published its figures.
+    //
+    // Not "here they are" — apply_stats() has already written them into the
+    // placeholder, which is where every reader in this process looks.  What the
+    // handler is told is the MOMENT, and that matters because it is the only
+    // clock in the daemon that ticks when a connection count moves: nothing
+    // else happens here when a client connects to a runtime in a worker.
+    //
+    // The runtime map carries those counts on to the OTHER workers, and this is
+    // what tells it there is something new to carry.  See
+    // daemon_handler::on_worker_stats().
+    using stats_handler = std::function<void()>;
+    void set_stats_handler(stats_handler h) { m_on_stats = std::move(h); }
+
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -393,6 +407,7 @@ private:
 
     publish_handler m_on_publish;
     deliver_handler m_on_deliver;
+    stats_handler   m_on_stats;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};

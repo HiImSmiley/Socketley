@@ -33,7 +33,12 @@ namespace
 // the metrics endpoint are answering about the present, long enough that a busy
 // proxy is not spending its event loop building strings: the detail text is
 // produced by get_stats(), which walks the connection tables.
-constexpr auto stats_interval = std::chrono::milliseconds(250);
+//
+// The number itself is in worker_protocol.h now, because the daemon needs it
+// too: these frames are where the connection counts in the runtime map come
+// from, and the daemon coalesces its map pushes to the same period.
+constexpr auto stats_interval =
+    std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
 // SIGTERM asked for, and not yet acted on.
 //

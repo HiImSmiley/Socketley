@@ -652,6 +652,18 @@ inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wir
     return r.ok;
 }
 
+// ── How often a worker publishes, and why the daemon needs the number ───────
+//
+// The worker's own publish timer, and the floor the daemon coalesces its
+// runtime-map pushes to.  One constant, because the two have to agree: the map
+// carries the connection counts, the counts arrive in these frames, and a
+// daemon coalescing on a different period than the one new figures arrive at is
+// either sending the same numbers twice or holding new ones back.
+//
+// It lived in proxy_worker.cpp, which is the one file the daemon cannot read it
+// from.
+inline constexpr int stats_interval_ms = 250;
+
 // ── Stats payload ───────────────────────────────────────────────────────────
 //
 // The four counters plus the active-connection count and the detail text —
