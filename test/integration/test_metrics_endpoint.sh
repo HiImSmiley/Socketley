@@ -35,6 +35,18 @@ daemon_isolate metrics
 # rest of the file.  Put back.  Fixed on fix/p0-crashes as b72a776, not on main.
 exec 2>&1
 
+# The collision described above, disarmed for this file's own daemon.  It is not
+# hypothetical: with SOCKETLEY_CONFIG=Coverage in the environment -- which is how
+# `SOCKETLEY_CONFIG=Coverage bash test/run_all.sh` and the nightly Sanitize job
+# both run -- the daemon takes "Coverage" as the path to its config file, finds
+# nothing there, never reads metrics_port, and never opens the port.  Every
+# assertion below then reports an empty response.  Measured: 11/11 without the
+# variable, 4/11 with it.
+#
+# Safe to unset here: run_all.sh has already resolved it into BIN_DIR and
+# exported BIN, so nothing downstream needs it.
+unset SOCKETLEY_CONFIG
+
 MPORT=$((SL_PORT_BASE+340))
 S1=$((SL_PORT_BASE+341))
 S2=$((SL_PORT_BASE+342))
