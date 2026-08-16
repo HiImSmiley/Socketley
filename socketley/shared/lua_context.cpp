@@ -2513,17 +2513,17 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // and .subscribe in particular is delivered to — see
     // runtime_manager::set_publish_sink.
 
-    // READ.  These come back when the worker is handed the runtime map.
+    // READ.  Empty now: list, get and send all answer in a worker, because the
+    // worker is handed the runtime map.  Kept as a group rather than deleted,
+    // because the three families below are the shape of this function and a
+    // reader who finds only two of them has to work out whether the third was
+    // never there or was emptied on purpose.
     //
-    // `list` is off this list: the map has landed, and list() reads nothing but
-    // its keys.  Nothing else in the binding changes — it walks mgr->list()
-    // under the shared lock exactly as it does in the daemon, and in a worker
-    // that map is now the pushed snapshot with this runtime's own row in it.
-    for (const char* call : {"send"})
-    {
-        sol::function f = make(worker_refusal(std::string("socketley.") + call));
-        sk[call] = f;
-    }
+    // What each of the three needed, for whoever adds a fourth read:
+    //   list   the map keys, and the worker's OWN row among them.
+    //   get    six fields per row, and a refreshed connections figure.
+    //   send   the map for the pre-checks, plus a deliver sink out of this
+    //          process — see below.
 
     // MUTATE.  These do not come back with it: being told what the map holds is
     // not permission to alter it.  See worker_mutation_refusal() for what each
@@ -3030,7 +3030,23 @@ void lua_context::register_bindings(runtime_instance* owner)
             // Named as the transport it is.  A script told only `false` would
             // look at its own runtime for a fault that is in the pipe to
             // somebody else's process.
-            return api_why(L, q(name) + " runs in a worker process, and the "
+            //
+            // This is the branch that runs for EVERY peer when the caller is
+            // itself in a worker, including peers that live in the daemon:
+            // from out here every other runtime is in another process, and the
+            // map marks them so.  Without that mark this falls through to
+            // lua_broadcast() on a row with no connections in it, which
+            // succeeds, returns true and delivers nothing — the defect this
+            // branch was added for, reintroduced from the other side.
+            //
+            // What `true` means is one hop weaker here than in the daemon.
+            // There it means the message reached the process holding the
+            // connections; here it means it reached the daemon, which then
+            // routes it in-process or on to another worker.  That is the
+            // honest reading of the sink's return and it is not worth a
+            // synchronous round trip to narrow — the thing a script actually
+            // wants to know is checked by the receiver, not by this bool.
+            return api_why(L, q(name) + " runs in another process, and the "
                                         "message could not be handed to it");
         }
         if (inst->get_type() == runtime_server)
