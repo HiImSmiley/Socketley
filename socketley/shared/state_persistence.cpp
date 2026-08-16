@@ -426,6 +426,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
     cfg.out_of_process = instance->is_out_of_process();
+    cfg.shards = instance->get_shards();
     // Only a request that was actually made is written.  Storing the default
     // value of a flag nobody typed would turn every plain `create` into an
     // explicit --no-sqpoll on the next restart, and a runtime that asked for
@@ -606,6 +607,11 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_int_field("child_policy", cfg.child_policy);
     if (cfg.out_of_process)
         append_bool_field("out_of_process", true);
+    // Written only when it is not the default, on the rule this function states
+    // above: a `create` nobody typed --shards on must not start producing a
+    // state file that differs from the one the previous build wrote for it.
+    if (cfg.shards > 1)
+        append_int_field("shards", static_cast<int>(cfg.shards));
     if (!cfg.cpus.empty())
         append_str_field("cpus", cfg.cpus);
     // Written for both values and omitted only when nothing was asked for, so
@@ -757,6 +763,12 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
     cfg.out_of_process = json_get_bool(json, "out_of_process");
+    // Absent means one, not zero: the field is omitted for every runtime that
+    // did not ask for shards, which is every runtime written by a build older
+    // than this one.  Reading a missing key as zero would restore them all with
+    // no worker at all.
+    if (const uint32_t s = json_get_uint32(json, "shards"); s > 0)
+        cfg.shards = s;
     cfg.cpus = json_get_string(json, "cpus");
     // Read through json_get_string rather than json_get_bool: the question here
     // is whether the key is there at all, and json_get_bool answers false to

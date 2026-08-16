@@ -164,13 +164,48 @@ public:
                                                std::string_view message)>;
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
 
+    // ── The figures this child last published ───────────────────────────────
+    //
+    // Held here rather than written straight into the placeholder, which is
+    // what apply_stats() used to do.  A placeholder can stand for N worker
+    // processes now — see --shards — and each publishes its own counters on its
+    // own timer, so N supervisors writing the same fields meant the last frame
+    // to arrive won: four shards serving 25 connections each reported 25, and
+    // which shard's 25 it was changed every 250 ms.
+    //
+    // The reader is daemon_handler::aggregate_worker_stats(), which adds these
+    // up across a runtime's shards and writes the total where every reader in
+    // this process already looks.  For a runtime with one shard the sum IS that
+    // shard, so nothing about the unsharded case changes.
+    struct published_stats
+    {
+        uint64_t    total_connections{0};
+        uint64_t    total_messages{0};
+        uint64_t    bytes_in{0};
+        uint64_t    bytes_out{0};
+        uint64_t    active_connections{0};
+        std::string detail;
+
+        // The child's own steady_clock reading at the instant it took the
+        // counters above, or 0 from a child that predates the field.  See the
+        // note above stats_wire for why the age has to be measured from when
+        // they were read rather than from when this process drained them.
+        int64_t     taken_ns{0};
+
+        // Whether this child has published at all.  A shard forked one turn ago
+        // has no figures, and letting its zeros into the sum would report a
+        // runtime as losing connections for the length of every restart.
+        bool        seen{false};
+    };
+    const published_stats& last_stats() const { return m_last_stats; }
+
     // This child has just published its figures.
     //
-    // Not "here they are" — apply_stats() has already written them into the
-    // placeholder, which is where every reader in this process looks.  What the
-    // handler is told is the MOMENT, and that matters because it is the only
-    // clock in the daemon that ticks when a connection count moves: nothing
-    // else happens here when a client connects to a runtime in a worker.
+    // Not "here they are" — those are in last_stats() above, and the handler is
+    // what adds them to its siblings'.  What the handler is told is the MOMENT,
+    // and that matters because it is the only clock in the daemon that ticks
+    // when a connection count moves: nothing else happens here when a client
+    // connects to a runtime in a worker.
     //
     // The runtime map carries those counts on to the OTHER workers, and this is
     // what tells it there is something new to carry.  See
@@ -426,6 +461,9 @@ private:
     // Why the last `reload` this child was sent did not load.  Empty when it
     // did, because a worker that reloaded cleanly sends no frame at all.
     std::string  m_reload_error;
+
+    // See published_stats above.
+    published_stats m_last_stats;
 
     // Why this child's on_start raised when it was started.  Empty when it did
     // not, for the same reason: the frame is only sent on a raise.  Held apart

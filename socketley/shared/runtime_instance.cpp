@@ -863,6 +863,17 @@ bool runtime_instance::is_managed() const { return m_managed; }
 std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }
 void runtime_instance::mark_out_of_process() { m_out_of_process = true; }
 bool runtime_instance::is_out_of_process() const { return m_out_of_process; }
+
+// Clamped here rather than trusted, because this is reached from two places
+// that validate differently: the flag parser, which refuses a bad value with a
+// message, and the state file, which is read at startup from a document that
+// may have been written by another build or edited by hand.  A zero would mean
+// a runtime that is `running` and has no process serving it.
+void runtime_instance::set_shards(uint32_t n)
+{
+    m_shards = n < 1 ? 1 : (n > max_shards ? max_shards : n);
+}
+uint32_t runtime_instance::get_shards() const { return m_shards; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
 void runtime_instance::set_cpus(const cpu_set_spec& cpus) { m_cpus = cpus; m_cpus_set = true; }

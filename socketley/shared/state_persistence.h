@@ -51,6 +51,14 @@ struct runtime_config
     // runtime back where it was running, not merely bring it back.
     bool out_of_process = false;
 
+    // How many worker processes serve this one runtime; see
+    // runtime_instance::set_shards().  Persisted for the same reason the flag
+    // above it is, and the cost of not doing so is sharper: a proxy restored
+    // with one shard where the operator asked for four is a quarter of the
+    // throughput they configured, reported by `ls` as running and by nothing at
+    // all as wrong.
+    uint32_t shards = 1;
+
     // Ring policy: what this runtime's --cpus / --sqpoll asked its I/O to run
     // as.  See runtime_instance.h — these are a request, not a result, and the
     // daemon refuses one its ring cannot meet.

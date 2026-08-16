@@ -396,6 +396,30 @@ public:
     void mark_out_of_process();
     bool is_out_of_process() const;
 
+    // ── How many worker processes serve this one runtime ────────────────────
+    //
+    // One by default, which is what every runtime in this tree was before
+    // --shards existed and is still what one gets unless it asks otherwise.
+    // More than one means N processes share the listening socket through
+    // SO_REUSEPORT and the kernel gives each incoming connection to one of
+    // them — the only way a single runtime uses more than the single core its
+    // event loop runs on.
+    //
+    // A DECLARATION, never inferred.  Sharding is correct exactly when nothing
+    // is shared between connections, and nothing can detect that: not the
+    // configuration, and not the script, because a Lua table at file scope is
+    // indistinguishable from one that happens never to be read twice.  So the
+    // operator asks for it and owns the consequence — and the types where the
+    // consequence is certainly wrong refuse the flag outright rather than let
+    // the declaration be made at all.  See parse_common_flags.
+    //
+    // Kept on the placeholder rather than inside the supervisor because it is
+    // configuration and is read as configuration: `inspect` prints it, the
+    // state file carries it, and was_running has to bring a runtime back with
+    // the shard count it had rather than merely bring it back.
+    void     set_shards(uint32_t n);
+    uint32_t get_shards() const;
+
     // ── Ring policy ─────────────────────────────────────────────────────────
     // What this runtime's I/O was asked to run as: which CPUs, and whether its
     // ring carries a submission poller.
@@ -722,6 +746,11 @@ private:
     bool m_external = false;
     bool m_managed = false;
     bool m_out_of_process = false;
+
+    // One, and not zero, so that every reader can multiply or loop by it
+    // without first asking whether it was ever set.  See set_shards().
+    uint32_t m_shards = 1;
+
     std::shared_ptr<const route_table> m_worker_routes;
 
     // See endpoint_live().  True by default: a runtime that binds in this

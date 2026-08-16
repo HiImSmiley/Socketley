@@ -68,6 +68,12 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (!cfg.ca_path.empty())        rt.set_ca_path(cfg.ca_path);
     if (!cfg.target.empty())         rt.set_target(cfg.target);
     if (!cfg.cache_name.empty())     rt.set_cache_name(cfg.cache_name);
+    // Read by the daemon, which forks this many workers.  Carried into the
+    // worker too, so `inspect` describes the same runtime whichever side is
+    // asked — a shard itself does nothing with the number: it is one process
+    // serving one listening socket, and which of N it happens to be changes
+    // nothing about what it does.
+    if (cfg.shards > 1)              rt.set_shards(cfg.shards);
 
     // The ring request, recorded on the runtime so `stats` answers about what
     // was asked for and not only about what the ring happens to be.  Applying

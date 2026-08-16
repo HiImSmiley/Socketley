@@ -37,6 +37,93 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--daemon-process"):
             return 0;
 
+        // ─── How many processes serve this one runtime ──────────────────────
+        //
+        // N workers sharing one listening socket through SO_REUSEPORT.  It
+        // exists for one measured reason: a runtime is one process and
+        // therefore one core, and at `concurrent 100x500` the worker sits at
+        // 100% of one core with the rest of the machine idle.  Below that
+        // ceiling there is nothing here to win — a single connection is
+        // platform-latency-bound — so this is a flag for the saturated case and
+        // for no other.
+        //
+        // ─── WHY IT IS ASKED FOR AND NEVER INFERRED ─────────────────────────
+        //
+        // Sharding is correct exactly when nothing is shared between
+        // connections, and that cannot be detected.  Not from the flags, and
+        // not from the script: a Lua table at file scope is the same object
+        // whether the operator meant it as per-connection scratch or as the
+        // room every connection publishes into, and the interpreter cannot tell
+        // those apart either.  So the operator declares it and owns what
+        // follows.
+        //
+        // ─── WHY THE OTHER THREE TYPES REFUSE IT ────────────────────────────
+        //
+        // Because for them the declaration is not one an operator is in a
+        // position to make, and the failure is silent.
+        //
+        // A cache: N shards are N separate stores behind one port.  A SET lands
+        // in whichever process the kernel gave that connection to and a later
+        // GET on a new connection asks a different one, so the answer is a miss
+        // for data that was stored — 1/N of the time, without an error
+        // anywhere.
+        //
+        // A client: there is no listening socket to share.  A client dials out;
+        // N of them would be N connections to the peer, which is a different
+        // feature wearing this flag's name.
+        //
+        // A server: this is the one worth arguing, and the answer is still no.
+        // The proxy's declaration is safe because "nothing is shared between
+        // connections" is a property of THIS tree's proxy — audited, fixed, and
+        // true by construction — so the operator is really asserting something
+        // about code they can read here.  A server's is a property of their own
+        // script, where cross-connection state is the common case rather than
+        // the exception: a chat room, a presence table, a counter.  Sharded, a
+        // message from a client on shard 1 never reaches a client on shard 2,
+        // and nothing reports it — the operator finds out from a user, under
+        // exactly the load the flag was bought for.  Refusing first and
+        // widening later is the direction that cannot break anybody: a
+        // checkable rule (no --lua at all, or an explicit opt-in inside the
+        // script's own declaration) can be added on top of this, and until one
+        // exists the flag is not offered for a judgement nobody can make.
+        case fnv1a("--shards"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--shards requires a count\n";
+                return 1;
+            }
+
+            if (instance->get_type() != runtime_proxy)
+            {
+                std::cout << "--shards is only available on a proxy; "
+                             "see the man page for why a "
+                          << type_to_string(instance->get_type())
+                          << " does not shard\n";
+                return 1;
+            }
+
+            uint32_t n = 0;
+            if (!parse_uint32(pa.args[++i], n) || n < 1)
+            {
+                std::cout << "invalid shard count\n";
+                return 1;
+            }
+
+            // Bounded rather than trusted.  Past the core count every extra
+            // shard is a process competing for the same cores plus its own
+            // idle cost, so a large number is never what the operator wanted;
+            // this refuses the typo instead of forking it.
+            if (n > max_shards)
+            {
+                std::cout << "--shards must be between 1 and " << max_shards << "\n";
+                return 1;
+            }
+
+            instance->set_shards(n);
+            return 0;
+        }
+
         case fnv1a("-p"):
         {
             if (i + 1 >= pa.count)
@@ -884,6 +971,54 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--daemon-process"):
             std::cout << "where a runtime runs can only be set when it is created\n";
             return 1;
+
+        // Editable, unlike --daemon-process above, and refused while running
+        // like -p below.  The two are not the same request: --daemon-process
+        // would move a configured runtime between address spaces underneath
+        // whatever already points at it, whereas the shard count is read once,
+        // when the workers are forked, so changing it on a stopped runtime is
+        // exactly as safe as changing its port and takes effect the same way —
+        // at the next start.
+        //
+        // Refused while running rather than applied, because applying it means
+        // forking or retiring workers under live connections, and there is no
+        // answer yet for what happens to the connections a retired shard is
+        // holding.  Whatever that answer turns out to be, it is a decision and
+        // not a side effect of an `edit`.
+        case fnv1a("--shards"):
+        {
+            if (is_running)
+            {
+                std::cout << "cannot change the shard count while running\n";
+                return 1;
+            }
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--shards requires a count\n";
+                return 1;
+            }
+            if (instance->get_type() != runtime_proxy)
+            {
+                std::cout << "--shards is only available on a proxy; "
+                             "see the man page for why a "
+                          << type_to_string(instance->get_type())
+                          << " does not shard\n";
+                return 1;
+            }
+            uint32_t n = 0;
+            if (!parse_uint32(pa.args[++i], n) || n < 1)
+            {
+                std::cout << "invalid shard count\n";
+                return 1;
+            }
+            if (n > max_shards)
+            {
+                std::cout << "--shards must be between 1 and " << max_shards << "\n";
+                return 1;
+            }
+            instance->set_shards(n);
+            return 0;
+        }
 
         case fnv1a("-p"):
         {

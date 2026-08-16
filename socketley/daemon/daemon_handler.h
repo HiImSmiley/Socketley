@@ -198,11 +198,43 @@ private:
     void check_managed_health();
 
     // ── Out-of-process proxies ──────────────────────────────────────────────
-    // One supervisor per runtime that runs in a worker, keyed by runtime
-    // name.  Owned here rather than by the instance because the supervisor
+    // The supervisors for one runtime that runs in workers, keyed by runtime
+    // name.  Owned here rather than by the instance because a supervisor
     // outlives a stop: `stop` takes the child down but the runtime stays in the
     // map, and `start` must bring a new one up against the same record.
-    std::unordered_map<std::string, std::unique_ptr<proxy_supervisor>> m_proxy_workers;
+    //
+    // ─── WHY THE VALUE IS A VECTOR AND NOT A POINTER ────────────────────────
+    //
+    // --shards N gives one runtime N worker processes sharing its listening
+    // socket, so "the supervisor for this name" stopped being a thing there is
+    // one of.  The alternative was to keep this map as it was, with the first
+    // shard in it, and put the extra ones in a second container beside it.
+    // That shape was rejected on the rule this tree already states about the
+    // half-close hold: an invariant every path has to REMEMBER is one that new
+    // paths will not know about.  Thirteen functions here reach into this map
+    // across 30 sites, and a second container would have meant thirteen chances
+    // to publish a frame to shard 0 and silently not to shards 1..N-1 — where
+    // the symptom is not a failure but 1/N of the work quietly going undone.
+    //
+    // Changing the TYPE is what makes that impossible rather than merely
+    // discouraged: the compiler names every one of the 30 sites, and each was
+    // read and answered on its own terms — fan out to all shards, ask any one
+    // shard, or sum across them.  Which of those three a site wanted was not
+    // uniform, which is exactly why a mechanical sweep would have been wrong.
+    using worker_shards = std::vector<std::unique_ptr<proxy_supervisor>>;
+    std::unordered_map<std::string, worker_shards> m_proxy_workers;
+
+    // What every shard of one runtime last reported, added up and written into
+    // the placeholder that stands for it.
+    //
+    // A shard is an implementation detail of a runtime and not a runtime, so
+    // `ls` shows one line, `inspect` shows one record, and the connection count
+    // on it is the number of connections the runtime is serving — which is the
+    // sum over its shards and not whichever one published most recently.
+    // apply_stats() used to write the placeholder directly, and with N shards
+    // that made the figure a race between siblings: four shards with 25
+    // connections each reported 25.
+    void aggregate_worker_stats(const std::string& name);
 
     // Bring the children into line with what the runtime map says.  Called from
     // the health timer and straight after any command that moves a runtime's
@@ -356,7 +388,15 @@ private:
     // the one thing in the map that moves with no event behind it, and a stats
     // frame is the only clock in this daemon that ticks when they do.  See the
     // note above the definition for why it is coalesced rather than per frame.
-    void on_worker_stats();
+    //
+    // Takes the runtime the reporting child serves, because the first thing it
+    // has to do is re-total that runtime's shards into its placeholder — and
+    // that part is NOT coalesced.  The map push below it is a frame to every
+    // other worker and is worth a floor; rewriting one placeholder from figures
+    // already in hand is not, and skipping it would leave `stats` reading the
+    // total from before this frame arrived for up to a full health tick, which
+    // is the two-second staleness that arming the control socket removed.
+    void on_worker_stats(const std::string& name);
 
     // When the last map push went out, for that floor.  Set by every push, so a
     // membership change resets the window instead of being followed a moment

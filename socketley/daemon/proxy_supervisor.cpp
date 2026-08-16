@@ -1108,25 +1108,32 @@ void proxy_supervisor::apply_stats(const std::string& payload)
     worker_proto::stats_wire s;
     if (!worker_proto::decode_stats(payload, s))
         return;
-    if (!m_placeholder)
-        return;
 
-    m_placeholder->m_stat_total_connections.store(s.total_connections, std::memory_order_relaxed);
-    m_placeholder->m_stat_total_messages.store(s.total_messages, std::memory_order_relaxed);
-    m_placeholder->m_stat_bytes_in.store(s.bytes_in, std::memory_order_relaxed);
-    m_placeholder->m_stat_bytes_out.store(s.bytes_out, std::memory_order_relaxed);
-
-    // The detail text and the connection count are stored where an in-process
-    // runtime's would be, so stat_detail_snapshot() — which the metrics
-    // endpoint already calls — is answered identically whichever side the
-    // proxy is running on.
+    // Kept, not applied.  This used to write the six figures straight into the
+    // placeholder, which was right while a placeholder stood for exactly one
+    // process.  With --shards it stands for N, and N writers of one field means
+    // a reader sees whichever shard published most recently instead of the
+    // runtime: four shards serving 25 connections each reported 25.
     //
-    // The moment goes with them.  This function runs when the daemon gets round
-    // to draining, which is a poor answer to "how old are these": frames wait in
-    // the socket for however long nothing polls, and the age was being measured
-    // from the wait's end rather than its start.
-    m_placeholder->set_worker_stats(s.detail, s.active_connections,
-                                    static_cast<int64_t>(s.taken_ns));
+    // The sum is daemon_handler::aggregate_worker_stats()'s to make, and that
+    // is where it belongs rather than here: this object cannot reach its
+    // siblings and should not be given a way to, because the map that knows
+    // which supervisors serve one name is the daemon's.  The stats handler
+    // fires immediately after this returns, so the total is rewritten before
+    // anything gets the chance to read a stale one.
+    //
+    // The moment is kept with the figures for the reason it crosses the wire at
+    // all: this runs when the daemon gets round to draining, and measuring the
+    // age from there rather than from when the counters were read made a frame
+    // that had sat unread for a second look new.
+    m_last_stats.total_connections  = s.total_connections;
+    m_last_stats.total_messages     = s.total_messages;
+    m_last_stats.bytes_in           = s.bytes_in;
+    m_last_stats.bytes_out          = s.bytes_out;
+    m_last_stats.active_connections = s.active_connections;
+    m_last_stats.detail             = std::move(s.detail);
+    m_last_stats.taken_ns           = static_cast<int64_t>(s.taken_ns);
+    m_last_stats.seen               = true;
 }
 
 bool proxy_supervisor::check_liveness()

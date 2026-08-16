@@ -1672,6 +1672,72 @@ work through a proxy in http mode. See
 under
 .BR LIMITATIONS
 for what the proxy does and does not do with such a connection.
+.SS Sharding
+.TP
+.BI "\-\-shards " "N"
+Serve this proxy from
+.I N
+worker processes instead of one, sharing the listening socket through
+.BR SO_REUSEPORT .
+The kernel gives each incoming connection to one of them. 1 to 64; the default
+is 1, which is what every proxy was before this flag existed.
+.PP
+A runtime is one process and therefore one event loop on one core. This is the
+only way to give a single runtime more than that. It is worth reaching for only
+when a proxy is saturated \(em below saturation a single connection is bound by
+the cost of a cross-core wakeup, and another process cannot help with that.
+.PP
+A shard is an implementation detail of a runtime, not a runtime.
+.B ls
+shows one entry,
+.B stats
+reports the connection count summed across the shards and labels each shard's
+detail text,
+.B stop
+and
+.B remove
+take all of them down, and the count is persisted so a restart brings back the
+number that was asked for.
+.PP
+.B "It is a declaration, and every other type refuses it."
+Sharding is correct exactly when nothing is shared between connections, and
+nothing can detect that \(em not the flags, and not the script, because a table
+at file scope is indistinguishable from one that happens never to be read
+twice. A
+.B cache
+refuses it because
+.I N
+shards are
+.I N
+separate stores behind one port: a
+.B SET
+lands in one process and a later
+.B GET
+on a new connection asks another, so the answer is a miss for data that was
+stored, with no error anywhere. A
+.B client
+refuses it because it has no listening socket to share. A
+.B server
+refuses it because the property being declared would be a property of the
+operator's own script, where cross-connection state \(em a room, a presence
+table, a counter \(em is the common case rather than the exception, and the
+failure is silent: a message from a client on one shard never reaches a client
+on another, and that shows up under exactly the load the flag was bought for.
+.PP
+.B "The load is balanced per connection, not per request."
+.B SO_REUSEPORT
+picks a shard when the connection is accepted and never revisits it, so one
+heavy long-lived connection makes one shard hot while the others idle, and the
+spread over a small number of connections is uneven \(em eight connections over
+four shards were measured landing 3/2/2/1. Sharding helps a proxy carrying many
+comparable connections; it does nothing for a proxy carrying one big one.
+.PP
+The shard count may be changed with
+.B edit
+only while the runtime is stopped, for the same reason
+.B \-p
+may: applying it to a running proxy would mean retiring workers out from under
+live connections.
 .SS Health Check Flags
 .TP
 .BI "\-\-health\-check " "[tcp|http]"

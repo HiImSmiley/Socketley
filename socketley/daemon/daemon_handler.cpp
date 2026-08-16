@@ -494,7 +494,11 @@ void daemon_handler::teardown()
     // of its own to cancel into.  Left to the destructor these would be orphans
     // reparented to init, still bound to their ports, and the next daemon would
     // fail to bind.
-    for (auto& [_, sup] : m_proxy_workers)
+    // Every shard of every runtime, and not one per name: a runtime with four
+    // workers has four members of the REUSEPORT group to give back, and three
+    // left bound is what the next daemon fails to bind against.
+    for (auto& [_, shards] : m_proxy_workers)
+    for (auto& sup : shards)
     {
         sup->shutdown();
         if (const pid_t p = sup->release_pid(); p > 0)
@@ -519,10 +523,9 @@ void daemon_handler::teardown()
     // not have to: a signalled worker unwound as an orphan after this process
     // was gone, which was untidy but harmless.  It is no longer harmless.  The
     // parent-death signal is SIGKILL — see the note above claim_current_daemon()
-    // in proxy_worker.cpp for why it cannot be anything softer — so exiting
-    // while a worker is still unwinding would turn a graceful shutdown into a
-    // kill, and on_stop would stop running for out-of-process runtimes whenever
-    // the daemon itself went down.
+    // for why it cannot be anything softer — so exiting while a worker is still
+    // unwinding turns the graceful shutdown into a kill, and on_stop stops
+    // running for out-of-process runtimes whenever the daemon itself goes down.
     //
     // A worker unwinds in single-digit milliseconds: cancel the ring, close the
     // connections, run on_stop.  So this costs nothing in the normal case and
@@ -2155,8 +2158,11 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
     // success and delivers nothing is worse than one that fails.
     if (instance->is_out_of_process())
     {
-        auto it = m_proxy_workers.find(std::string(name));
-        if (it == m_proxy_workers.end() || !it->second->send_deliver(message))
+        // deliver_to_worker() fans the message out across every shard of this
+        // runtime and answers true if any of them took it; see the note there
+        // for why delivering to one is not an option once there is more than
+        // one.
+        if (!deliver_to_worker(name, message))
         {
             why = "could not reach the worker holding " + std::string(name);
             return false;
@@ -3392,7 +3398,36 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
             // Emitted only when there is a process to name, so an in-process
             // runtime's output is unchanged.  Managed external runtimes set the
             // same field and get the same line, which is the same question.
-            if (const pid_t rpid = inst->get_pid(); rpid > 0)
+            // ─── With shards there is more than one process to name ─────────
+            //
+            // set_pid() is called by every supervisor against the one
+            // placeholder, so `pid:` alone answers with whichever shard was
+            // forked last — a true pid for a real process, and the wrong answer
+            // to "which process is this runtime in", because there are four and
+            // it names one of them arbitrarily.
+            //
+            // So a sharded runtime gets the count and the whole list, and an
+            // unsharded one gets exactly the line it got before: `shards:` is
+            // omitted at 1, and `pid:` still prints the single pid.  Nothing
+            // that reads `stats` today sees a field appear.
+            if (auto it = m_proxy_workers.find(n);
+                it != m_proxy_workers.end() && it->second.size() > 1)
+            {
+                conn->write_buf += "shards:";
+                conn->write_buf += std::to_string(it->second.size());
+                conn->write_buf += "\nshard_pids:";
+                bool first = true;
+                for (const auto& sup : it->second)
+                {
+                    if (!first)
+                        conn->write_buf += ',';
+                    first = false;
+                    conn->write_buf +=
+                        std::to_string(static_cast<long long>(sup->pid()));
+                }
+                conn->write_buf += '\n';
+            }
+            else if (const pid_t rpid = inst->get_pid(); rpid > 0)
             {
                 conn->write_buf += "pid:";
                 conn->write_buf += std::to_string(static_cast<long long>(rpid));
@@ -3569,13 +3604,28 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         // reloading here would re-read the file into an interpreter that does
         // not serve anything, and would still leave the process that does
         // serving running the old one.
-        if (auto it = m_proxy_workers.find(n); it != m_proxy_workers.end())
+        if (auto it = m_proxy_workers.find(n); it != m_proxy_workers.end() &&
+                                               !it->second.empty())
         {
             // Read before the ask, so the answer cannot be missed for having
             // arrived between the two.
             const void* prev = inst ? inst->worker_routes().get() : nullptr;
-            pending.emplace_back(it->second.get(), prev, n);
-            it->second->send_reload();
+
+            // Every shard re-runs the script, because every shard IS running
+            // it: reloading one would leave the other three serving the file
+            // the operator has just replaced, which is the exact failure this
+            // command was given a worker path to avoid.
+            for (auto& sup : it->second)
+                sup->send_reload();
+
+            // Waited on through shard 0 alone, and that is a statement about
+            // the declaration rather than about the reload.  Every shard reads
+            // the same file and produces the same `routes` frame into the same
+            // placeholder, so waiting for a second one would be waiting for a
+            // value already written.  Whether each shard's reload SUCCEEDED is
+            // a different question and is asked of all of them — see the error
+            // collection at the end of this command.
+            pending.emplace_back(it->second.front().get(), prev, n);
             continue;
         }
 
@@ -3628,7 +3678,24 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         // Read after the wait, never before: the child writes reload_err ahead
         // of the routes frame the wait ends on, so by here it has been ingested
         // if it was sent at all.  Empty means the reload loaded.
-        if (std::string why = sup->take_reload_error(); !why.empty())
+        //
+        // Asked of every shard and not only the one waited on.  `sup` is shard
+        // 0 — see where `pending` is filled, and why waiting on one is right for
+        // the DECLARATION — but whether a reload succeeded is per process: a
+        // file that loads in one and raises in another is unlikely and is
+        // exactly the case a report is for.  Reported once, from the first
+        // shard that has a reason, because four copies of one diagnostic is not
+        // four pieces of information; taken from all of them regardless,
+        // because take_ is destructive and a reason left behind would be handed
+        // to the next reload as its own answer.
+        std::string why = sup->take_reload_error();
+        if (auto it = m_proxy_workers.find(name); it != m_proxy_workers.end())
+            for (auto& other : it->second)
+                if (other.get() != sup)
+                    if (std::string w = other->take_reload_error();
+                        !w.empty() && why.empty())
+                        why = std::move(w);
+        if (!why.empty())
             note_failure(name, why);
     }
 
@@ -3918,8 +3985,13 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
 
     const std::string payload =
         worker_proto::encode_endpoints(names, groups, name_routes, group_routes);
-    for (auto& [_, sup] : m_proxy_workers)
-        sup->send_endpoints(payload);
+    // Every shard, because every shard resolves its own backends: a table that
+    // reached three of four workers leaves the fourth refusing to start on a
+    // backend written as a name, which reads from outside as an intermittently
+    // broken proxy.
+    for (auto& [_, shards] : m_proxy_workers)
+        for (auto& sup : shards)
+            sup->send_endpoints(payload);
 }
 
 // What runtimes there are, as the workers' replicas of the map.
@@ -3966,8 +4038,9 @@ void daemon_handler::publish_runtime_map_to_workers()
     // identical to the one that child already has, so an idle daemon's health
     // tick costs one string compare per worker and no frame at all.
     const std::string payload = build_runtime_map_payload();
-    for (auto& [_, sup] : m_proxy_workers)
-        sup->send_runtime_map(payload);
+    for (auto& [_, shards] : m_proxy_workers)
+        for (auto& sup : shards)
+            sup->send_runtime_map(payload);
 
     m_last_map_push = std::chrono::steady_clock::now();
 }
@@ -4017,8 +4090,9 @@ void daemon_handler::publish_cluster_view_to_workers()
     if (payload.empty())
         return;
 
-    for (auto& [_, sup] : m_proxy_workers)
-        sup->send_cluster_view(payload);
+    for (auto& [_, shards] : m_proxy_workers)
+        for (auto& sup : shards)
+            sup->send_cluster_view(payload);
 
     m_cluster_view_pushed = true;
 }
@@ -4060,8 +4134,16 @@ void daemon_handler::publish_cluster_view_to_workers()
 // the worst case.  Both are the stats cadence rather than the health tick,
 // which is what parity here means; the floor is one constant if it has to come
 // down.
-void daemon_handler::on_worker_stats()
+void daemon_handler::on_worker_stats(const std::string& name)
 {
+    // First, and outside the floor below: the placeholder every reader in this
+    // process looks at holds the sum over this runtime's shards, and the frame
+    // that has just arrived changed one of the terms.  Coalescing this the way
+    // the map push is coalesced would answer `stats` from figures one interval
+    // old for no saving — the numbers are already in hand and the work is an
+    // addition over at most max_shards terms.
+    aggregate_worker_stats(name);
+
     // Half the publish interval, and strictly below it on purpose.  A floor
     // equal to the arrival period is a floor that ordinary jitter trips over:
     // a frame landing a millisecond early is dropped, and the figure it carried
@@ -4088,12 +4170,19 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
     // a way an endpoint republish is not, and the payload does not depend on
     // which worker it is going to.
     const std::string payload = worker_proto::encode_publish(cache_name, channel, message);
-    for (auto& [_, sup] : m_proxy_workers)
+    for (auto& [_, shards] : m_proxy_workers)
+    for (auto& sup : shards)
     {
         // Everyone but whoever sent it up.  A worker that published has already
         // run its own subscribers — it cannot wait for a round trip to do that,
         // and it should not have to — so echoing the frame back would run every
         // subscriber in that process a second time for one PUBLISH.
+        //
+        // The exclusion is per PROCESS and not per runtime, which is what makes
+        // it still right with shards: only the one shard that published has
+        // already run its own subscribers, and its siblings are separate
+        // processes holding separate interpreters that have not.  Excluding the
+        // whole shard set would silently stop delivering to N-1 of them.
         if (sup.get() == m_publish_origin)
             continue;
         sup->send_publish(payload);
@@ -4101,14 +4190,30 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
 }
 
 // One runtime, not every worker: this message is addressed to a name, and the
-// connections it is meant for are held by exactly one child.
+// connections it is meant for belong to that runtime and no other.
+//
+// But "that runtime" is now every shard of it.  `send` broadcasts to the
+// connections a runtime is holding, and with --shards those are spread across N
+// processes by the kernel's own choice — so delivering to one shard delivers to
+// the fraction of the clients that happened to land there, and reports success
+// for the rest.  Which fraction is not even stable between two sends.
+//
+// So the frame goes to all of them and each broadcasts to what it holds.  True
+// if any shard took it: a partial delivery is still worth reporting as one,
+// because the alternative is telling the operator nothing was sent when most of
+// it was.  A shard that would not take the frame has already logged why.
 bool daemon_handler::deliver_to_worker(std::string_view name,
                                        std::string_view message)
 {
     auto it = m_proxy_workers.find(std::string(name));
     if (it == m_proxy_workers.end())
         return false;
-    return it->second->send_deliver(message);
+
+    bool any = false;
+    for (auto& sup : it->second)
+        if (sup->send_deliver(message))
+            any = true;
+    return any;
 }
 
 void daemon_handler::on_worker_publish(proxy_supervisor* from,
@@ -4127,14 +4232,106 @@ void daemon_handler::on_worker_publish(proxy_supervisor* from,
 
 void daemon_handler::poll_proxy_workers()
 {
-    for (auto& [_, sup] : m_proxy_workers)
-        sup->poll();
+    for (auto& [name, shards] : m_proxy_workers)
+    {
+        for (auto& sup : shards)
+            sup->poll();
+
+        // Once per runtime and after its whole shard set has been drained, not
+        // once per shard: the placeholder holds the SUM, so writing it while
+        // half the shards still carry figures from the previous interval would
+        // publish a total that never existed.
+        aggregate_worker_stats(name);
+    }
+}
+
+// ─── One runtime's figures, out of N processes' ─────────────────────────────
+//
+// A shard is an implementation detail of a runtime and not a runtime: `ls`
+// prints one line, `inspect` prints one record, and the connection count on it
+// is what the runtime is serving.  With N workers that is the sum over them,
+// which is why apply_stats() stopped writing the placeholder — see the note
+// there.
+//
+// The four lifetime counters add up because each shard has only ever counted
+// its own connections, and the active count adds up for the same reason.  The
+// timestamp does NOT: it is a moment, and the honest answer to "how old is this
+// figure" for a total is the age of its OLDEST part, because that is the last
+// instant the whole of it was true.  Taking the newest would let one busy shard
+// make three stale siblings look current.
+//
+// A shard that has not published yet contributes nothing at all rather than
+// zeros.  Otherwise every restart — and every `create -s`, for the moments
+// between the forks — would report a runtime as having lost the connections its
+// unstarted shards have not yet claimed.
+void daemon_handler::aggregate_worker_stats(const std::string& name)
+{
+    auto it = m_proxy_workers.find(name);
+    if (it == m_proxy_workers.end())
+        return;
+
+    auto* inst = m_manager.get(name);
+    if (!inst)
+        return;
+
+    uint64_t total_conn = 0, total_msg = 0, in = 0, out = 0, active = 0;
+    int64_t  oldest     = 0;
+    bool     any        = false;
+    std::string detail;
+
+    for (const auto& sup : it->second)
+    {
+        const auto& s = sup->last_stats();
+        if (!s.seen)
+            continue;
+
+        any          = true;
+        total_conn  += s.total_connections;
+        total_msg   += s.total_messages;
+        in          += s.bytes_in;
+        out         += s.bytes_out;
+        active      += s.active_connections;
+
+        if (s.taken_ns != 0 && (oldest == 0 || s.taken_ns < oldest))
+            oldest = s.taken_ns;
+
+        // One shard's detail text is passed through unchanged, which is the
+        // whole of the unsharded case and keeps `stats` byte-identical to what
+        // it printed before this existed.  Several are labelled, because the
+        // text is a walk of ONE process's connection tables and concatenating
+        // them unlabelled would read as one runtime with the same connection
+        // listed several times.
+        if (it->second.size() > 1)
+        {
+            detail += "[shard ";
+            detail += std::to_string(&sup - it->second.data());
+            detail += "]\n";
+        }
+        detail += s.detail;
+    }
+
+    if (!any)
+        return;
+
+    inst->m_stat_total_connections.store(total_conn, std::memory_order_relaxed);
+    inst->m_stat_total_messages.store(total_msg, std::memory_order_relaxed);
+    inst->m_stat_bytes_in.store(in, std::memory_order_relaxed);
+    inst->m_stat_bytes_out.store(out, std::memory_order_relaxed);
+
+    // Where an in-process runtime's would be, so stat_detail_snapshot() — which
+    // the metrics endpoint already calls — is answered identically whichever
+    // side the runtime is running on, and whether it is one process or four.
+    inst->set_worker_stats(std::move(detail), active, oldest);
 }
 
 void daemon_handler::reconcile_proxy_workers()
 {
-    // What the runtime map says should be running out of process.
-    std::vector<std::string> wanted;
+    // What the runtime map says should be running out of process, and HOW MANY
+    // processes each of them wants.  The count is part of what is being
+    // reconciled now, not just the presence: `--shards 4` on a runtime that
+    // currently has one worker is three forks, and a restore that brings a
+    // four-shard proxy back has to bring back four.
+    std::vector<std::pair<std::string, size_t>> wanted;
     {
         std::shared_lock lock(m_manager.mutex);
         for (const auto& [name, inst] : m_manager.list())
@@ -4146,63 +4343,105 @@ void daemon_handler::reconcile_proxy_workers()
             if (!inst->is_out_of_process())
                 continue;
             if (inst->get_state() == runtime_running)
-                wanted.push_back(name);
+                wanted.emplace_back(name, static_cast<size_t>(inst->get_shards()));
         }
     }
 
-    // Children whose runtime has stopped, been removed or renamed.  Taken down
-    // before anything is started, so a rename that reuses a port does not have
-    // two children bound to it at once.
-    for (auto it = m_proxy_workers.begin(); it != m_proxy_workers.end();)
+    // Retire one shard: the whole of what used to happen to the single
+    // supervisor for a name, unchanged, and now reached from two places — a
+    // runtime that is going away entirely, and one that is merely going from
+    // four shards to two.
+    //
+    // Its own function because getting this wrong is not a visible failure.
+    // The erase must NOT destroy: the erase used to run the destructor, and the
+    // supervisor's control-socket poll had been cancelled rather than
+    // completed, so its completion arrived on a later turn and the loop read
+    // the owner token out of an io_request living inside the freed object.
+    // Removing or stopping an out-of-process runtime was enough; no traffic was
+    // needed.  retire() gives the ring back, drops every pointer to this
+    // supervisor while the things holding them are still alive, and hands over
+    // the identity to wait on; drain_retired_handlers() destroys it once the
+    // loop says nothing more will name it.
+    const auto retire_one = [this](std::unique_ptr<proxy_supervisor> sup)
     {
-        const bool still_wanted =
-            std::find(wanted.begin(), wanted.end(), it->first) != wanted.end();
-        if (still_wanted)
-        {
-            ++it;
-            continue;
-        }
-        it->second->shutdown();
+        sup->shutdown();
         // shutdown() reaps only a child that was already gone, and one that has
-        // just been asked to unwind its ring never is.  The supervisor leaves
-        // the map on the next line, so this is the last moment anything knows
-        // the pid.
-        if (const pid_t p = it->second->release_pid(); p > 0)
+        // just been asked to unwind its ring never is.  This is the last moment
+        // anything knows the pid.
+        if (const pid_t p = sup->release_pid(); p > 0)
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
 
-        // Erased from the map but NOT destroyed.  The erase used to run the
-        // destructor here, and the supervisor's control-socket poll had just
-        // been cancelled rather than completed — so its completion arrived on a
-        // later turn, and the loop read the owner token out of an io_request
-        // living inside the object this statement had freed.  Removing or
-        // stopping an out-of-process runtime was enough; no traffic was needed.
-        //
-        // retire() gives the ring back, drops every pointer to this supervisor
-        // while the things holding them are still alive, and hands over the
-        // identity to wait on.  drain_retired_handlers() destroys it once the
-        // loop says nothing more will name it.
-        auto           sup = std::move(it->second);
         const uint32_t tok = sup->retire();
         m_retired_handlers.push_back({std::move(sup), tok});
-        it = m_proxy_workers.erase(it);
+    };
+
+    // Children whose runtime has stopped, been removed or renamed — and shards
+    // of a runtime that is still wanted with fewer of them than it has.  Taken
+    // down before anything is started, so a rename that reuses a port does not
+    // have two children bound to it at once.
+    for (auto it = m_proxy_workers.begin(); it != m_proxy_workers.end();)
+    {
+        const auto w = std::find_if(wanted.begin(), wanted.end(),
+                                    [&](const auto& p) { return p.first == it->first; });
+
+        if (w == wanted.end())
+        {
+            for (auto& sup : it->second)
+                retire_one(std::move(sup));
+            it = m_proxy_workers.erase(it);
+            continue;
+        }
+
+        // Wanted, but with fewer processes than it currently has.  Reached when
+        // a stopped runtime was edited to a smaller --shards and started again;
+        // the shrink itself is refused while running, see parse_common_edit_flags.
+        //
+        // From the back, so the shards that survive keep their index — the
+        // index is what `stats` labels a shard's detail text with, and having
+        // it renumber underneath a reader for no reason is a worse answer than
+        // leaving a gap that cannot occur.
+        while (it->second.size() > w->second)
+        {
+            retire_one(std::move(it->second.back()));
+            it->second.pop_back();
+        }
+        ++it;
     }
 
-    // Children that should exist and do not.
-    for (const auto& name : wanted)
+    // Children that should exist and do not — including the second, third and
+    // fourth process of a runtime that already has its first.
+    for (const auto& [name, want_count] : wanted)
     {
-        if (m_proxy_workers.count(name))
+        auto& shards = m_proxy_workers[name];
+        if (shards.size() >= want_count)
             continue;
 
         auto* inst = m_manager.get(name);
         if (!inst)
+        {
+            if (shards.empty())
+                m_proxy_workers.erase(name);
             continue;
+        }
 
         runtime_config cfg;
         if (m_persistence)
             cfg = m_persistence->read_from_instance(inst);
         else
+        {
+            if (shards.empty())
+                m_proxy_workers.erase(name);
             continue;   // nothing to describe the runtime with
+        }
 
+        // The shards forked in this pass, so `start` can be sent to all of them
+        // AFTER the endpoint table has been published once — see the note below
+        // the spawn for why the table has to arrive before the start, and why
+        // publishing it once for N children beats publishing it N times.
+        std::vector<proxy_supervisor*> forked;
+
+        while (shards.size() < want_count)
+        {
         auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
 
         // The supervisor answers for the runtime it supervises.  Set before the
@@ -4217,8 +4456,23 @@ void daemon_handler::reconcile_proxy_workers()
                                  { on_worker_publish(from, c, ch, m); });
         sup->set_deliver_handler([this](std::string_view n, std::string_view m)
                                  { on_worker_deliver(n, m); });
-        sup->set_stats_handler([this] { on_worker_stats(); });
-        inst->set_request_sink_override(sup.get());
+        sup->set_stats_handler([this, name] { on_worker_stats(name); });
+
+        // ─── Only the first shard is the request sink ───────────────────────
+        //
+        // A cross-runtime request names a runtime and expects ONE answer.  The
+        // override is a single pointer because that is the shape of the
+        // question, not a limitation to route around: sending `cache get k` to
+        // four shards would produce four replies to a channel holding one
+        // ticket.
+        //
+        // Shard 0 rather than a rotation, because a request must be answerable
+        // and any shard can answer one — a request is served from the runtime's
+        // configuration and its script, both of which every shard has, and not
+        // from the connections, which is the one thing they do not share.  The
+        // types where that is untrue are exactly the types --shards refuses.
+        if (shards.empty())
+            inst->set_request_sink_override(sup.get());
 
         // ─── What this child must know before it reads its config ───────────
         //
@@ -4246,44 +4500,70 @@ void daemon_handler::reconcile_proxy_workers()
         if (!sup->spawn(cfg))
         {
             LOG_ERROR("could not start out-of-process proxy worker");
-            // The override must not outlive the supervisor it points at.
-            inst->set_request_sink_override(nullptr);
+            // The override must not outlive the supervisor it points at.  Only
+            // when this IS the supervisor it points at: with shards, a fork
+            // that fails on the third child must not unhook the first, which is
+            // alive, serving, and the one answering requests.
+            if (shards.empty())
+                inst->set_request_sink_override(nullptr);
             inst->mark_failed();
-            continue;
+
+            // Stop adding to a runtime that has just been marked failed rather
+            // than trying the remaining shards.  Whatever stopped this fork —
+            // memory, a descriptor limit, a process limit — is not going to be
+            // any different one line later, and the shards that DID come up are
+            // retired by the loop above on the next reconcile, because a
+            // `failed` runtime is no longer in `wanted`.
+            break;
         }
         // Three frames have to reach this child, in this order: config, the
-        // endpoint table, then start.  The comment that used to sit here named
-        // the reason but sat one line too late to act on it.
-        //
-        // A backend written as a bare runtime name is turned into host:port by
-        // resolve_backend(), and that runs inside start() -- before the listener
-        // is bound, and it fails the start outright when there is no table to
-        // look the name up in.  A supervisor forked in this loop has an empty
-        // endpoint cache, so the send inside spawn() had nothing to send yet;
-        // the table's only other way to a worker is publish_endpoints(), which
-        // reaches one only by walking m_proxy_workers.  So the emplace has to
-        // come before the publish, and the start after it.
-        //
-        // With start sent first, an out-of-process proxy whose backend was a
-        // name never came up at all: the worker resolved nothing, refused to
-        // bind, and every client got a connection refused on a port `ls` showed
-        // as running.  A literal address was unaffected -- it needs no table --
-        // which is what made this look like a proxy bug rather than an ordering
-        // one.  A restart already worked, because by then spawn() had a cached
-        // table to re-send; only the first child was ever broken.
+        // endpoint table, then start.  The first went with spawn(); the other
+        // two are sent below, once the whole shard set is in the map — the
+        // table's only way to a worker is publish_endpoints(), which reaches
+        // one by walking m_proxy_workers, so every shard has to be IN the map
+        // before the publish and started after it.
         //
         // The table travels as its own frame rather than riding on `start`,
         // because that is the frame spawn() already re-sends to a restarted
         // child from its cache: one path into the worker, not two.
         //
         // sup is moved into the map, so the start goes through the supervisor
-        // itself.  A pointer rather than the emplace iterator: unordered_map
-        // never invalidates a pointer to an element, so this does not rest on
-        // publish_endpoints() leaving the map alone.
-        proxy_supervisor* const started = sup.get();
-        m_proxy_workers.emplace(name, std::move(sup));
-        m_manager.publish_endpoints();
-        started->send_start();
+        // itself.  A pointer rather than an iterator: a vector reallocates as
+        // shards are appended, so the pointer is taken from the element after
+        // the push and the ones collected earlier would dangle if they were
+        // element addresses.  They are not — proxy_supervisor is held by
+        // unique_ptr, so the OBJECT does not move when the vector grows, only
+        // the pointers to the pointers do.
+        shards.push_back(std::move(sup));
+        forked.push_back(shards.back().get());
+        }
+
+        // Once for however many were forked, and before any of them is started.
+        //
+        // A backend written as a bare runtime name is turned into host:port by
+        // resolve_backend(), which runs inside start() — before the listener is
+        // bound, and it fails the start outright when there is no table to look
+        // the name up in.  A supervisor forked in this loop has an empty
+        // endpoint cache, so the send inside spawn() had nothing to send yet.
+        //
+        // With start sent first, an out-of-process proxy whose backend was a
+        // name never came up at all: the worker resolved nothing, refused to
+        // bind, and every client got a connection refused on a port `ls` showed
+        // as running.  A literal address was unaffected — it needs no table —
+        // which is what made this look like a proxy bug rather than an ordering
+        // one.
+        if (!forked.empty())
+        {
+            m_manager.publish_endpoints();
+            for (auto* s : forked)
+                s->send_start();
+        }
+
+        // A name whose every fork failed must not be left in the map as an
+        // empty vector: `m_proxy_workers.find(name)` succeeding with nothing in
+        // it would answer "this runtime has workers" to every site that asks.
+        if (shards.empty())
+            m_proxy_workers.erase(name);
     }
 }
 
@@ -4295,8 +4575,22 @@ std::string daemon_handler::on_start_error(std::string_view name)
     // Nothing on the instance means either that on_start ran, or that it ran
     // somewhere else: for a runtime in a worker the placeholder never touches
     // the script, and the reason came up the control socket instead.
+    // The first shard that has one.  Taken from every shard and not only the
+    // first, because on_start runs in each of them and the one that raised may
+    // be any: reading shard 0 alone would report success for a runtime three
+    // quarters of whose processes never finished their set-up.
+    //
+    // Taken from ALL of them even after one is found, because take_ is
+    // destructive — leaving a sibling's error in place would hand it to the
+    // next command that asked, as the answer to a start it was not about.
     if (auto it = m_proxy_workers.find(std::string(name)); it != m_proxy_workers.end())
-        return it->second->take_start_error();
+    {
+        std::string first;
+        for (auto& sup : it->second)
+            if (std::string e = sup->take_start_error(); !e.empty() && first.empty())
+                first = std::move(e);
+        return first;
+    }
 
     return {};
 }
@@ -4317,7 +4611,46 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     if (left < std::chrono::milliseconds(0))
         left = std::chrono::milliseconds(0);
 
-    const auto verdict = it->second->await_startup(left);
+    // ─── Every shard, and the worst verdict any of them gave ────────────────
+    //
+    // A `create -s` on a four-shard proxy that waits only for the first one is
+    // a command that returns before three quarters of the runtime exists, and —
+    // worse — returns 0 for a configuration the other three are about to
+    // refuse.  The refusal that matters is usually the SAME on every shard,
+    // because they are handed the same config; the one that is not is the port,
+    // and that is exactly the case where waiting for one is silently wrong.
+    //
+    // Worst-of, in the order refused > pending > serving: a shard that refused
+    // is the answer whatever its siblings did, and a shard that never reported
+    // outranks a shard that came up.  They share one deadline rather than
+    // getting one each, which is what the `deadline` parameter is already for —
+    // see the note above it: a caller waiting on several children spends the
+    // budget on the ones ahead.
+    auto verdict = proxy_supervisor::startup::serving;
+    {
+        const size_t n = it->second.size();
+        for (size_t k = 0; k < n; ++k)
+        {
+            // Re-found on every turn for the reason the re-take below gives:
+            // await_startup() drains the control socket, and a publish coming
+            // off it can run a subscriber that removes this very runtime.
+            auto sit = m_proxy_workers.find(std::string(name));
+            if (sit == m_proxy_workers.end() || k >= sit->second.size())
+                break;
+
+            auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now());
+            if (rem < std::chrono::milliseconds(0))
+                rem = std::chrono::milliseconds(0);
+
+            const auto v = sit->second[k]->await_startup(rem);
+            if (v == proxy_supervisor::startup::refused)
+                verdict = v;
+            else if (v == proxy_supervisor::startup::pending &&
+                     verdict != proxy_supervisor::startup::refused)
+                verdict = v;
+        }
+    }
 
     // The iterator is re-taken rather than reused, and that is not tidiness.
     //
@@ -4345,8 +4678,19 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             // seconds later; a create that returns has already published.
             // take_reachability_change() is consumed here so the tick does not
             // publish a second time for the same transition.
-            if (it->second->take_reachability_change())
-                m_manager.publish_endpoints();
+            //
+            // Consumed from every shard, and one publish for however many
+            // reported it: the table is rebuilt whole, so N calls would send N
+            // identical tables — and a flag left unconsumed on a sibling makes
+            // the health tick republish for a transition already announced.
+            {
+                bool moved = false;
+                for (auto& sup : it->second)
+                    if (sup->take_reachability_change())
+                        moved = true;
+                if (moved)
+                    m_manager.publish_endpoints();
+            }
             return 0;
 
         case proxy_supervisor::startup::refused:
@@ -4460,7 +4804,8 @@ void daemon_handler::check_managed_health()
     // The children first: liveness, then whatever they have reported.  Both
     // before the managed-runtime sweep below, which can return early.
     bool routes_moved = false;
-    for (auto& [worker_name, sup] : m_proxy_workers)
+    for (auto& [worker_name, shards] : m_proxy_workers)
+    for (auto& sup : shards)
     {
         // The child's own report, drained before liveness so a runtime that
         // failed to start reaches the state file on the same tick it was heard
