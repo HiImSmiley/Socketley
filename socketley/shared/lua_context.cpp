@@ -2514,7 +2514,12 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // runtime_manager::set_publish_sink.
 
     // READ.  These come back when the worker is handed the runtime map.
-    for (const char* call : {"send", "list", "get"})
+    //
+    // `list` is off this list: the map has landed, and list() reads nothing but
+    // its keys.  Nothing else in the binding changes — it walks mgr->list()
+    // under the shared lock exactly as it does in the daemon, and in a worker
+    // that map is now the pushed snapshot with this runtime's own row in it.
+    for (const char* call : {"send", "get"})
     {
         sol::function f = make(worker_refusal(std::string("socketley.") + call));
         sk[call] = f;
