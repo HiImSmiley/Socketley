@@ -3180,6 +3180,15 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "cannot change port while running\n";
             return 1;
         }
+        // The same rule as the port above, and as `edit --shards`: applying it
+        // to a running proxy would mean retiring workers out from under live
+        // connections.  Refused rather than quietly dropped — see the note
+        // where the field is applied below for what quietly dropping it cost.
+        if (cfg.shards != instance->get_shards())
+        {
+            conn->write_buf = "cannot change the shard count while running\n";
+            return 1;
+        }
         if (cfg.tls != instance->get_tls())
         {
             conn->write_buf = "cannot change TLS while running\n";
@@ -3246,6 +3255,22 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     instance->set_ca_path(cfg.ca_path);
     instance->set_target(cfg.target);
     instance->set_cache_name(cfg.cache_name);
+
+    // ─── Applied, because `show` emits it and a round trip must not lose it ─
+    //
+    // This block assigns every field from the parsed document unconditionally,
+    // which is what makes `show | import` a round trip rather than a partial
+    // one.  A field that `show` writes and `import` does not read back is a
+    // field the round trip silently resets — and for this one the reset is a
+    // sharded proxy quietly coming back with a quarter of the processes it had,
+    // reported by `ls` as Up and by nothing at all as wrong.
+    //
+    // set_shards() clamps, so a hand-edited document asking for 0 or 900 gets
+    // 1 or 64 rather than a runtime with no worker.  A document that never
+    // mentions shards parses as 1, which is the default and is correct: the
+    // field is omitted by format_json for every unsharded runtime, including
+    // every document written by a build older than this one.
+    instance->set_shards(cfg.shards);
     instance->set_group(cfg.group);
 
     // Lua script: reload if changed

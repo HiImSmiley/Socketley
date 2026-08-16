@@ -225,6 +225,22 @@ int cli_config(int argc, char** argv)
         if (daemon_process)
             command += " --daemon-process";
 
+        // How many worker processes serve this runtime; see --shards.
+        //
+        // Here for the same reason daemon_process above it is: a configuration
+        // file is a way of describing a runtime, and a property it cannot
+        // express is one that has to be set by hand afterwards — which for this
+        // one is not possible, because a configuration file starts what it
+        // creates and `--shards` may only be edited on a stopped runtime.
+        //
+        // Emitted only when it was asked for, so a table that says nothing
+        // about shards produces exactly the command line it produced before.
+        // Not validated here: the daemon refuses a bad count, and one refused
+        // in two places with two wordings is how the two come to disagree.
+        const int shards = t["shards"].get_or(0);
+        if (shards > 0)
+            command += " --shards " + std::to_string(shards);
+
         bool start = t["start"].get_or(false);
         if (start)
             command += " -s";

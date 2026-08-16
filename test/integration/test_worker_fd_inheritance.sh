@@ -290,12 +290,32 @@ fi
 
 # ── 3. THE TWO CONSEQUENCES ─────────────────────────────────────────────────
 #
-# SIGSTOP first.  A worker whose daemon dies sees EOF on its control socket and
-# exits, which closes the window this is about within milliseconds — so a test
-# that raced it would be measuring how fast the machine is.  Stopped, the window
-# is held open for as long as the assertions need, and a wedged worker is a real
-# state anyway: it is what a worker looks like while it is finishing a shutdown,
-# and the reason the daemon does not block waiting for one.
+# ─── WHY THIS SECTION CHANGED SHAPE ─────────────────────────────────────────
+#
+# It used to freeze the worker with SIGSTOP so that it OUTLIVED the kill -9 on
+# its daemon, and then read the two consequences off the survivor: a survivor
+# holding the daemon's listener is one that answers "yes, a daemon is here", and
+# a survivor holding an unrelated runtime's port is one that keeps that port
+# bound.  The setup guard below insisted the survivor existed, and said so
+# plainly: without it "nothing below discriminates".
+#
+# A worker cannot outlive its daemon any more.  It asks the kernel for
+# PR_SET_PDEATHSIG(SIGKILL) before it does anything else, precisely because
+# SO_REUSEPORT lets a survivor go on serving its share of a port from a build
+# nobody believes is running — see the note above claim_current_daemon() in
+# proxy_worker.cpp.  SIGKILL and not SIGTERM for the reason this test's own
+# SIGSTOP demonstrates: a stopped process runs no handler.
+#
+# So the survivor is gone, and with it the discriminating power of (e) and (f).
+# That is not a loss of coverage, because it is not where the coverage was: the
+# fd table in section 1 asserts each of the three leaks DIRECTLY, on a live
+# worker, by what each descriptor is — and those assertions are untouched and
+# still fail on a broken build.  (e) and (f) were always the consequences of
+# what (a)-(d) measure.
+#
+# What replaces the old setup guard is the assertion that the new guarantee
+# holds, which is the one thing here that a regression could now break: freeze
+# the worker, kill the daemon, and require the worker to be gone anyway.
 kill -STOP "$WPID" 2>/dev/null || true
 kill -9 "$DPID" 2>/dev/null || true
 SOCKETLEY_DPID=""
@@ -305,17 +325,33 @@ TOTAL=$((TOTAL+1))
 if kill -0 "$DPID" 2>/dev/null; then
     FAIL=$((FAIL+1))
     echo "  FAIL [setup]: the daemon survived kill -9; the two assertions below are void"
-elif kill -0 "$WPID" 2>/dev/null; then
-    PASS=$((PASS+1))
 else
+    PASS=$((PASS+1))
+fi
+
+# A frozen worker cannot act on the EOF its control socket just got, so nothing
+# it could DO would end it.  Only the kernel can, and this asserts that it did.
+for _ in $(seq 1 60); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.25; done
+TOTAL=$((TOTAL+1))
+if kill -0 "$WPID" 2>/dev/null; then
     FAIL=$((FAIL+1))
-    echo "  FAIL [setup]: the stopped worker is gone too, so nothing below discriminates"
+    echo "  FAIL: a SIGSTOPped worker outlived its daemon (pid $WPID)"
+    echo "        PR_SET_PDEATHSIG is not set, or is set to a signal a stopped"
+    echo "        process can ignore; it is holding $PX_PORT for as long as it lives"
+else
+    PASS=$((PASS+1))
 fi
 
 # (e) no daemon exists, so nothing may claim to be serving its socket.
+#
+# Weaker than it was, and deliberately kept: with the worker killed alongside
+# its daemon this can no longer fail by the route it was written for, and (a)
+# above is what catches that leak now.  It still answers a question worth
+# asking — that a killed daemon leaves nothing behind claiming to serve its
+# socket — and it costs one connect().
 if daemon_alive "$DSOCK"; then
-    fail "a surviving worker is not mistaken for a daemon" \
-         "daemon_alive says a daemon is serving $DSOCK; the only survivor is worker $WPID" \
+    fail "nothing is left claiming to serve the dead daemon's socket" \
+         "daemon_alive says a daemon is serving $DSOCK after kill -9 on $DPID" \
          "this is the false report c1875e3 removed, arriving by a second route"
 else
     pass
@@ -323,7 +359,8 @@ fi
 
 # (f) the unrelated runtime's port comes back.  The daemon was killed, so
 #     nothing ran teardown()'s shutdown() — a leaked duplicate is the only thing
-#     that can still be holding this.
+#     that can still be holding this.  Same caveat as (e): (c)/(d) above are
+#     what discriminate now, and this is the consequence they imply.
 BINDMSG=$(python3 - "$SRV_PORT" <<'PY'
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -338,7 +375,7 @@ if [ "$BINDMSG" = "free" ]; then
 else
     fail "a stopped runtime's port is not held by an unrelated worker" \
          "binding $SRV_PORT said '$BINDMSG'" \
-         "$SRV_NAME is gone with its daemon; worker $WPID is holding its port"
+         "$SRV_NAME is gone with its daemon; something is still holding its port"
 fi
 
 kill -CONT "$WPID" 2>/dev/null || true

@@ -203,6 +203,42 @@ check "no worker processes after stop" "$n" "0"
 n=$(ss -ltn 2>/dev/null | grep -c ":$P_PROXY ")
 check "nothing bound to the port after stop" "$n" "0"
 
+echo "== show | import is a round trip, not a quiet reset =="
+# `show` emits shards and `import` used to parse it and never apply it, so a
+# round trip brought a four-shard proxy back with one -- Up in `ls`, and wrong
+# nowhere.  Asserted while STOPPED, because the same field is refused while
+# running; both halves are checked.
+DOC=$("$BIN" show shp 2>/dev/null)
+[[ "$DOC" == *'"shards"'* ]] && ok "show emits the shard count" \
+                             || bad "show dropped the shard count: $DOC"
+out=$(printf '%s' "$DOC" | "$BIN" import shp 2>&1); rc=$?
+check "import of a stopped sharded runtime is accepted" "$rc" "0"
+"$BIN" start shp >/dev/null 2>&1
+sleep 1.0
+n=$(shard_pids | grep -c .)
+check "four shards survive show|import" "$n" "4"
+
+# Refused only when it would CHANGE the count: re-importing the same document
+# into a running runtime asks for nothing and is allowed, which is what makes
+# the round trip above legal in the first place.  So the refusal has to be
+# provoked with a different number, or the assertion passes on a build that
+# refuses nothing.
+out=$(printf '%s' "$DOC" | "$BIN" import shp 2>&1); rc=$?
+check "an unchanged import is accepted while running" "$rc" "0"
+
+CHANGED=$(printf '%s' "$DOC" | sed 's/"shards"[[:space:]]*:[[:space:]]*4/"shards": 2/')
+[[ "$CHANGED" != "$DOC" ]] && ok "the probe document really differs" \
+                           || bad "could not rewrite shards in the document"
+out=$(printf '%s' "$CHANGED" | "$BIN" import shp 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"shard count while running"* ]] \
+    && ok "changing the shard count is refused while running" \
+    || bad "running shard change: rc=$rc out=$out"
+n=$(shard_pids | grep -c .)
+check "the refused import changed nothing" "$n" "4"
+
+"$BIN" stop shp >/dev/null 2>&1
+sleep 0.8
+
 echo "== the shard count survives a restart =="
 "$BIN" start shp >/dev/null 2>&1
 sleep 1.0

@@ -286,7 +286,7 @@ cli_commands() {
     echo "  With no <json> argument the document is read from stdin, so 'show'"
     echo "  pipes straight into 'import' with no command-line length limit."
     echo "  Same fields as the interactive editor. Read-only fields are ignored."
-    echo "  Port/protocol/UDP cannot be changed while running."
+    echo "  Port/protocol/UDP/shards cannot be changed while running."
     echo "  tls/cert_path/key_path/ca_path are honoured on every runtime type;"
     echo "  client_ca/client_cert/client_key belong to a proxy alone. An incomplete"
     echo "  set is rejected, as is tls beside replicate_target on a CACHE. Omitting"
