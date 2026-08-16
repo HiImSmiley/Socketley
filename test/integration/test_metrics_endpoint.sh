@@ -71,7 +71,21 @@ metric() {  # name -> value, or empty
 echo "=== Integration: the metrics endpoint reports its own daemon ==="
 
 daemon_start "$BIN"
-sleep 0.5
+
+# Wait for the listener, do not sleep at it.  A fixed 0.5s passed against the
+# Release build and failed against Coverage, which is unoptimised and slower to
+# reach the bind -- four assertions went red reporting an empty response, and
+# the honest report is "the port never opened", which is a different sentence.
+# 20s because the slowest build here is the instrumented one, and a deadline
+# that only fits the fastest is a deadline that tests the machine.
+LISTENING=0
+for _ in $(seq 200); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$MPORT") 2>/dev/null; then exec 3<&- 3>&-; LISTENING=1; break; fi
+    sleep 0.1
+done
+if [ "$LISTENING" = "1" ]; then ok
+else bad "the daemon opens the metrics port" \
+         "nothing accepted on $MPORT within 20s; config.lua was written before daemon_start, so either it was not read or the bind failed — every assertion below would report an empty response and none of them would say this"; fi
 
 # ── It is there at all ──────────────────────────────────────────────────────
 RESP=$(get /metrics)
