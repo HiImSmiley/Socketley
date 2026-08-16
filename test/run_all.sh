@@ -195,6 +195,77 @@ if [ "$unit_found" -eq 0 ]; then
     exit 1
 fi
 
+# ─── Fuzz corpora, replayed ─────────────────────────────────────────────────
+#
+# Not a fuzz run: no mutation, no coverage feedback, no time budget.  Each
+# target is handed its committed corpus once, deterministically, and every
+# FUZZ_CHECK in it has to hold.  47 seconds for all ten, against a suite that
+# takes ten minutes.
+#
+# It is here because these targets assert properties nothing a developer runs
+# was asserting: two parsers over one grammar must agree, a returned view must
+# point inside the bytes the parse claims to have consumed, a rewritten request
+# must not gain a header.  Until now those were reachable only from CI.
+#
+# What was measured, stated exactly, because the first version of this comment
+# overstated it and had to be corrected.  Making the two RESP parsers disagree
+# by one byte — the defect fuzz_resp.cpp names as its purpose — is caught by
+# fuzz_resp in 289ms.  It is ALSO caught by five integration files (RESP2
+# protocol, cache with --lua, the RESP relay ordering test, cache-in-a-worker,
+# and a worker asks the daemon).  So that mutation does not on its own prove
+# the fuzz targets catch anything the suite could not; what it proves is that
+# `test_resp_parser`, the unit test named for this parser, passes 42 of 42 on a
+# build where the two parsers describe different wire formats.
+#
+# The case for running them here is therefore cost and reach, not a single
+# uncaught defect: 47 seconds, and the property assertions above have no other
+# local reader.  A subtler divergence — one the integration fixtures happen not
+# to send — is exactly what a corpus is for, and nobody had a way to find out
+# locally whether they had written one.
+#
+# Globbed, with the corpus derived from the target's own name, for the reason
+# the unit section above gives: a hand-kept list of ten goes stale silently and
+# the entry it loses is the one that mattered.  A target with no mapping, or a
+# mapping to a corpus that is not there, is an ERROR rather than a skip — the
+# replay driver already refuses to run without input, on the grounds that a
+# fuzzer with no input is a green check mark attached to nothing, and skipping
+# quietly here would put that back.
+echo "--- Fuzz Corpus Replay ---"
+echo ""
+FUZZ_CORPUS_DIR="$SCRIPT_DIR/fuzz/corpus"
+fuzz_found=0
+for f in "$BIN_DIR"/fuzz_*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    fname=$(basename "$f")
+    case "$fname" in
+        fuzz_resp)           corpus=resp ;;
+        fuzz_ws_frame)       corpus=ws ;;
+        fuzz_http_request)   corpus=http ;;
+        fuzz_http_response)  corpus=httpresp ;;
+        fuzz_cache_ops)      corpus=cache ;;
+        fuzz_client_ops)     corpus=client ;;
+        fuzz_server_ops)     corpus=server ;;
+        fuzz_proxy_ops)      corpus=proxy ;;
+        fuzz_proxy_tunnel)   corpus=proxytunnel ;;
+        fuzz_event_loop)     corpus=eventloop ;;
+        *)
+            echo "ERROR: $fname has no corpus mapping in run_all.sh."
+            echo "       A target nothing replays is a target that does not run."
+            exit 1 ;;
+    esac
+    if [ ! -d "$FUZZ_CORPUS_DIR/$corpus" ]; then
+        echo "ERROR: $fname maps to corpus '$corpus', which is not in $FUZZ_CORPUS_DIR"
+        exit 1
+    fi
+    fuzz_found=$((fuzz_found + 1))
+    run_test "${fname#fuzz_} corpus" timeout 300 "$f" "$FUZZ_CORPUS_DIR/$corpus"
+done
+
+if [ "$fuzz_found" -eq 0 ]; then
+    echo "ERROR: no fuzz targets found in $BIN_DIR"
+    exit 1
+fi
+
 # Integration tests — each file brings up its own daemon
 echo "--- Integration Tests ---"
 echo ""
