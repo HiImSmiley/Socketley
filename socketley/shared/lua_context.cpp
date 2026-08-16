@@ -2866,9 +2866,35 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!cfg_group.empty()) inst->set_group(cfg_group);
         if (cfg_remove_with_parent)
             inst->set_child_policy(runtime_instance::child_policy::remove);
+        // as_server(), not static_cast.  `inst` came out of the manager, and
+        // since a worker got a runtime map "out of the manager" no longer
+        // implies "a real server_instance": a replica answers runtime_server
+        // truthfully from get_type() and is a bare runtime_instance underneath,
+        // deliberately so — building replicas out of the real type would cost a
+        // proxy's three 65536-entry tables per runtime per worker.  A
+        // static_cast onto one writes past the end of the object, and the type
+        // check above cannot catch it; it is the thing that looks like it
+        // already has.
+        //
+        // Nothing reaches here with a replica today, and the reason is worth
+        // stating rather than leaving to be rediscovered: socketley.create() is
+        // refused in a worker PERMANENTLY, so this runs only in the daemon,
+        // where mgr->create() has just built the real thing.  That refusal is
+        // what made the old raw cast survivable — this call and socketley.pipe
+        // are the two most likely to be revisited, and a reader who changes the
+        // refusal needs to find this coupling written down.
         if (type == runtime_server)
         {
-            auto* srv = static_cast<server_instance*>(inst);
+            auto* srv = inst->as_server();
+            // Null means the manager handed back something that calls itself a
+            // server and is not one.  Refused rather than written into, and the
+            // half-built runtime goes with it — the same unwind the two
+            // failures below take, for the same reason.
+            if (!srv)
+            {
+                mgr->remove(name);
+                return refuse("the runtime could not be built as a server");
+            }
             if (have_mode) srv->set_mode(cfg_mode);
             if (!cfg_http.empty()) srv->set_http_dir(cfg_http);
             if (cfg_http_cache) srv->set_http_cache(true);
@@ -3411,7 +3437,25 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!dst_rt) return refuse("there is no runtime called \"" + dst_name + "\"");
         if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server)
             return refuse("both ends must be servers");
-        auto* src_srv = static_cast<server_instance*>(src_rt);
+
+        // as_server(), not static_cast — and this is the sharper of the two
+        // sites, because `src_rt` is an ARBITRARY name out of the map rather
+        // than something this call just built.  In a worker every row in that
+        // map is a replica: it answers runtime_server from get_type() and is a
+        // bare runtime_instance underneath, so the check on the line above is
+        // satisfied by an object that a static_cast then writes past the end
+        // of.  route_client() is not a read, either — it writes m_routes and
+        // m_conn_idx.
+        //
+        // Nothing reaches here with a replica today because socketley.pipe() is
+        // refused in a worker PERMANENTLY: it moves a connection, and no map
+        // supplies a descriptor.  That refusal is what made the old raw cast
+        // survivable, and it is the coupling to know about before relaxing it.
+        auto* src_srv = src_rt->as_server();
+        if (!src_srv)
+            return refuse("\"" + src_name + "\" says it is a server but this "
+                          "process holds no server object for it — it lives "
+                          "somewhere else");
         if (src_srv->route_client(src_fd, dst_name))
             return api_yes(L);
         // route_client refuses three different things, and the bare false told
