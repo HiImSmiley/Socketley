@@ -45,6 +45,7 @@ bin/Debug/
 bin/Dev/
 bin/Release/
 bin/Sanitize/
+bin/Coverage/
 bin/TSan/
 make/
 
@@ -97,3 +98,9 @@ CONTRIBUTING.md
 .idea/
 .vs/
 .DS_Store
+
+# gcov writes these beside the objects (make/ is ignored) and .gcov files into
+# whatever directory it is run from, which is not always make/.
+*.gcda
+*.gcno
+*.gcov
