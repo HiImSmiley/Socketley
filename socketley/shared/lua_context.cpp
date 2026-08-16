@@ -2470,6 +2470,14 @@ bool lua_context::in_worker_process() { return s_worker_process; }
 
 bool lua_context::s_worker_process = false;
 
+void lua_context::set_cluster_view(cluster_view_ptr view)
+{
+    s_cluster_view = std::move(view);
+}
+cluster_view_ptr lua_context::cluster_view_snapshot() { return s_cluster_view; }
+
+cluster_view_ptr lua_context::s_cluster_view;
+
 // Replace the cross-runtime half of the management API with something that says
 // why it is not there.
 //
@@ -3416,22 +3424,76 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // ─── socketley.cluster.* — cluster introspection API ───
+    //
+    // ── WHERE THE CLUSTER HALF OF THE ANSWER COMES FROM ─────────────────────
+    //
+    // Each of the four below needs three things the runtime map does not carry:
+    // this daemon's cluster NAME, the address it advertises, and every remote
+    // daemon with its runtimes.  In the daemon those come off
+    // cluster_discovery.  In a worker there is no cluster_discovery and there
+    // must not be one — it would claim this node's name in the shared cluster
+    // directory and read as a second daemon to every other member — so the
+    // daemon pushes a snapshot instead.  See shared/cluster_view.h.
+    //
+    // Resolved once, here, rather than four times: the four differ in what they
+    // do with the answer, not in where it comes from, and a fifth cluster call
+    // added later should not have to rediscover this.
+    //
+    // `ok` false means this process has neither source, which is what a daemon
+    // started without --cluster looks like.  Every caller returns an empty
+    // table for that, unchanged: it is the honest answer for a runtime that is
+    // not in a cluster at all.  It is NOT the honest answer for a worker whose
+    // view has not arrived, and that case never reaches here — the refusal is
+    // still installed over these bindings until a view exists.
+    struct cluster_source
+    {
+        std::string                daemon_name;
+        std::string                host;
+        std::vector<remote_daemon> remote;
+        bool                       ok = false;
+    };
+    auto resolve_cluster = [](runtime_manager* mgr) -> cluster_source {
+        cluster_source src;
+        if (!mgr) return src;
+        if (auto* cd = mgr->get_cluster_discovery())
+        {
+            src.daemon_name = std::string(cd->get_daemon_name());
+            src.host        = std::string(cd->get_cluster_addr());
+            src.remote      = cd->get_all_daemons();
+            src.ok          = true;
+            return src;
+        }
+        if (auto view = lua_context::cluster_view_snapshot())
+        {
+            src.daemon_name = view->daemon_name;
+            src.host        = view->host;
+            src.remote      = view->remote;
+            src.ok          = true;
+        }
+        return src;
+    };
+
     sol::table cluster_tbl = m_lua.create_table();
 
     // socketley.cluster.daemons() → array of {name, host, runtimes}
-    cluster_tbl["daemons"] = [owner, this]() -> sol::table {
+    cluster_tbl["daemons"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
-        // Local daemon entry
+        // Local daemon entry.
+        //
+        // `runtimes` is the size of the LOCAL map, so in a worker this is the
+        // pushed runtime map and it has to be the whole of it — a snapshot
+        // filtered to peers, or one missing the worker's own row, reports a
+        // daemon smaller than it is.
         {
             sol::table d = m_lua.create_table();
-            d["name"] = std::string(cd->get_daemon_name());
-            d["host"] = std::string(cd->get_cluster_addr());
+            d["name"] = src.daemon_name;
+            d["host"] = src.host;
             size_t count = 0;
             {
                 std::shared_lock lock(mgr->mutex);
@@ -3441,8 +3503,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             result[i++] = d;
         }
         // Remote daemons
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             sol::table d = m_lua.create_table();
             d["name"] = rd.name;
