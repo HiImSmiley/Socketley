@@ -93,15 +93,28 @@ daemon_start "$BIN"
 # start fails and leaves nothing behind, and a runtime that does not exist is
 # not the case under test.
 #
-# Two earlier triggers stopped working, and why is worth keeping.  `--tls` on a
-# UDP client was a question about two flags, so it moved to where every other
+# THREE earlier triggers stopped working, and why is worth keeping.  `--tls` on
+# a UDP client was a question about two flags, so it moved to where every other
 # impossible TLS combination is answered and is now refused at create.  A port
 # conflict is not a failure at all here: the listener sets SO_REUSEPORT, so a
-# second runtime binds the same port and both come up.  What is left is a
-# failure that genuinely cannot be known until the process that will serve the
-# runtime tries, which is the only honest kind for this file.
+# second runtime binds the same port and both come up.  And socketley.list(),
+# which is what stood on this line, stopped raising the day a worker was handed
+# the runtime map — it answers out there now, the script loads, brokencli comes
+# up `running`, and five assertions below go red about `ps` output that was
+# never the subject.  Watched, not predicted: 7/12.
+#
+# So the trigger has to come from the half of the API that is refused
+# PERMANENTLY, not the half that is waiting on a transport.  socketley.create
+# changes the runtime map, and a worker being handed a copy of that map is not
+# permission to alter it — there is no build in which this call starts working
+# from out here, which is exactly the property this line needs.  It raises
+# before it builds anything, so no runtime is created on either path.
+#
+# What is left is a failure that genuinely cannot be known until the process
+# that will serve the runtime tries, which is the only honest kind for this
+# file.
 BROKEN_LUA="$(mktemp "${TMPDIR:-/tmp}/psfailed-XXXXXX.lua")"
-printf 'local names = socketley.list()\n' > "$BROKEN_LUA"
+printf 'socketley.create("server", "psfailed_never_built", { port = 0 })\n' > "$BROKEN_LUA"
 "$BIN" create server brokencli -p "$BROKEN_PORT" --lua "$BROKEN_LUA" >/dev/null 2>&1 || true
 "$BIN" start brokencli >/dev/null 2>&1 || true
 sleep 3
