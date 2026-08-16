@@ -347,7 +347,16 @@ H_BEFORE=$((HA + HB))
 "$BIN" stop tpool2 >/dev/null 2>&1
 sleep 0.4
 "$BIN" start tpool2 >/dev/null 2>&1
-wait_port "$PX_TWO" || true
+# Recorded rather than swallowed.  This file failed once inside a sweep under
+# load and has not been reproduced since: 64 further runs, 58 of them under six
+# or nine busy cores, all green.  Ruled out along the way -- test order (four
+# orderings, no per-test disagreement), port exhaustion (peak 4,875 TIME_WAIT
+# against ~28,000 ephemeral ports), and the stop-wait above, which was removed
+# entirely and still passed 5 of 5.  The cause is unknown, so the useful change
+# is not a guess at a fix but making the next occurrence explain itself:
+# `served=0` on its own cannot tell "the port never came back" from "it came
+# back and answered wrongly", and those two want different investigations.
+PORT_BACK=1; wait_port "$PX_TWO" || PORT_BACK=0
 got=$(timeout 8 curl -s -m 6 "http://127.0.0.1:$PX_TWO/tpool2/after-restart" 2>/dev/null)
 HA2=$(field "$TMPD/a.state" handshakes); HB2=$(field "$TMPD/b.state" handshakes)
 HA2=${HA2:-0}; HB2=${HB2:-0}
@@ -360,7 +369,7 @@ case "$got" in
     *) SERVED=0 ;;
 esac
 if [ "$SERVED" = "1" ] && [ "$H_AFTER" -gt "$H_BEFORE" ]; then ok
-else bad "phase3-restart" "the first request after a restart must handshake again and be served; served=$SERVED $H_BEFORE -> $H_AFTER"; fi
+else bad "phase3-restart" "the first request after a restart must handshake again and be served; served=$SERVED port_back=$PORT_BACK $H_BEFORE -> $H_AFTER"; fi
 
 "$BIN" stop tpool2 >/dev/null 2>&1; "$BIN" remove tpool2 >/dev/null 2>&1
 
