@@ -164,6 +164,20 @@ public:
                                                std::string_view message)>;
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
 
+    // This child has just published its figures.
+    //
+    // Not "here they are" — apply_stats() has already written them into the
+    // placeholder, which is where every reader in this process looks.  What the
+    // handler is told is the MOMENT, and that matters because it is the only
+    // clock in the daemon that ticks when a connection count moves: nothing
+    // else happens here when a client connects to a runtime in a worker.
+    //
+    // The runtime map carries those counts on to the OTHER workers, and this is
+    // what tells it there is something new to carry.  See
+    // daemon_handler::on_worker_stats().
+    using stats_handler = std::function<void()>;
+    void set_stats_handler(stats_handler h) { m_on_stats = std::move(h); }
+
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -235,6 +249,15 @@ public:
     // Kept for the same reason the endpoint table is kept: a child forked after
     // the last push would otherwise hold an empty map until something moved.
     void send_runtime_map(const std::string& encoded_payload);
+
+    // What the cluster looks like, for the four socketley.cluster.* calls.
+    //
+    // Same discipline as the map — cached, deduped, re-sent to a new child —
+    // with one difference that is not this function's doing: the payload
+    // carries a heartbeat per remote daemon, so on a clustered daemon it
+    // differs on every scan and the dedupe rarely fires.  A daemon that is not
+    // in a cluster sends this frame once, empty, and then never again.
+    void send_cluster_view(const std::string& encoded_payload);
 
     // `socketley send <name> <message>`, on its way to the runtime that has the
     // connections.  Best-effort like every other frame going down: a false is a
@@ -364,6 +387,7 @@ private:
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
     std::string       m_runtime_map;      // last map, re-sent to a new child
+    std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
 
     // Frames written but not yet taken by the socket.  Bounded, because the
@@ -393,6 +417,7 @@ private:
 
     publish_handler m_on_publish;
     deliver_handler m_on_deliver;
+    stats_handler   m_on_stats;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};

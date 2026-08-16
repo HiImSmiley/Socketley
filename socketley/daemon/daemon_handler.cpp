@@ -3901,11 +3901,8 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
 // CLI prints and the one socketley.get() already answers with — a live walk for
 // a runtime in this process, and the last pushed figure for one in a worker.
 // EVENT-LOOP THREAD ONLY, because of that walk; every caller is.
-void daemon_handler::publish_runtime_map_to_workers()
+std::string daemon_handler::build_runtime_map_payload()
 {
-    if (m_proxy_workers.empty())
-        return;
-
     std::vector<worker_proto::runtime_wire> rts;
     {
         std::shared_lock lock(m_manager.mutex);
@@ -3923,15 +3920,129 @@ void daemon_handler::publish_runtime_map_to_workers()
             rts.push_back(std::move(w));
         }
     }
+    return worker_proto::encode_runtime_map(rts);
+}
+
+void daemon_handler::publish_runtime_map_to_workers()
+{
+    if (m_proxy_workers.empty())
+        return;
 
     // Encoded once for all of them, like the endpoint table above: the map is
     // the same map whichever child is being told about it.  Each supervisor
     // decides whether it is news — see send_runtime_map, which drops a payload
     // identical to the one that child already has, so an idle daemon's health
     // tick costs one string compare per worker and no frame at all.
-    const std::string payload = worker_proto::encode_runtime_map(rts);
+    const std::string payload = build_runtime_map_payload();
     for (auto& [_, sup] : m_proxy_workers)
         sup->send_runtime_map(payload);
+
+    m_last_map_push = std::chrono::steady_clock::now();
+}
+
+// What the cluster looks like, for the workers that cannot look.
+//
+// Built from this daemon's cluster_discovery, which is the only object that has
+// any of it and which a worker may not have one of: it publishes into the
+// shared directory and claims this node's name there, so a worker running one
+// would read as a second daemon to every other member.  See
+// shared/cluster_view.h.
+//
+// An empty view is sent when there is no cluster_discovery — but only once this
+// daemon has ever had one.  That is the withdrawal, and it is needed because
+// clustering can be restarted under a new name or a new directory: a worker
+// left holding the old view would answer the four cluster calls out of a
+// cluster this daemon has left.  A daemon that was never clustered sends
+// nothing at all, which keeps the ordinary case free of a frame that says
+// nothing and keeps those four calls refused out there, which is the honest
+// answer for a worker whose daemon is in no cluster.
+std::string daemon_handler::build_cluster_view_payload()
+{
+    // Empty means "there is nothing to say and nothing to withdraw": a daemon
+    // that has never been in a cluster.  The callers send no frame at all for
+    // it, which is what keeps those four calls refused in its workers — the
+    // honest answer, rather than the empty table a successful call returns on a
+    // daemon that IS in a cluster and alone in it.
+    if (!m_cluster && !m_cluster_view_pushed)
+        return {};
+
+    cluster_view view;
+    if (m_cluster)
+    {
+        view.daemon_name = std::string(m_cluster->get_daemon_name());
+        view.host        = std::string(m_cluster->get_cluster_addr());
+        view.remote      = m_cluster->get_all_daemons();
+    }
+    return worker_proto::encode_cluster_view(view);
+}
+
+void daemon_handler::publish_cluster_view_to_workers()
+{
+    if (m_proxy_workers.empty())
+        return;
+
+    const std::string payload = build_cluster_view_payload();
+    if (payload.empty())
+        return;
+
+    for (auto& [_, sup] : m_proxy_workers)
+        sup->send_cluster_view(payload);
+
+    m_cluster_view_pushed = true;
+}
+
+// ─── A connection count is news, and nothing else announces it ──────────────
+//
+// Membership changes republish the map through publish_endpoints(), which is
+// right for a create or a stop and answers nothing for the field that moves on
+// its own.  A client connecting to a runtime in a worker changes that runtime's
+// count and moves nothing in the daemon: the figure arrives in a stats frame,
+// lands in the placeholder, and until now waited for the two-second health tick
+// to reach any other worker.
+//
+// What that cost was measurable and was the point of the exercise.  The
+// daemon's own answer for a worker-backed runtime is as old as the last stats
+// frame — 250 ms — and a script in a worker asking about the same runtime was
+// reading a figure up to 2 s old.  The parity harness caught it as the one
+// field of socketley.get() that differed between the two arms: 0 against 1.
+//
+// So the counts ride the cadence they arrive on.  Each worker publishes every
+// stats_interval_ms, so any worker's frame is a tick of that clock, and this
+// pushes the map when one arrives.
+//
+// ─── COALESCED, AND WHY THAT IS THE WHOLE DESIGN ────────────────────────────
+//
+// Pushing per arrival is quadratic: N workers publish N frames per interval,
+// and each one changes the payload — a count moved — so the per-child dedupe
+// cannot drop any of them, and every one of the N arrivals sends to all N
+// children.  Sixteen workers is 256 frames per 250 ms.
+//
+// One round per interval instead, whoever's frame started it: 16 frames per
+// 250 ms, four rounds a second, linear in the number of workers.  A delta frame
+// carrying only the counts was considered and not built — the full row set at
+// this rate is under a kilobyte per worker per round, and a second encoding of
+// what a runtime is, kept in step with the first, costs more than it saves.
+//
+// The price of coalescing is that a figure can wait out the remainder of the
+// window before it goes: the daemon is ≤250 ms stale and a worker is ≤500 ms in
+// the worst case.  Both are the stats cadence rather than the health tick,
+// which is what parity here means; the floor is one constant if it has to come
+// down.
+void daemon_handler::on_worker_stats()
+{
+    // Half the publish interval, and strictly below it on purpose.  A floor
+    // equal to the arrival period is a floor that ordinary jitter trips over:
+    // a frame landing a millisecond early is dropped, and the figure it carried
+    // then waits for the NEXT one, so the worst case is two intervals rather
+    // than one.  Below the period, every arrival gets through and the floor
+    // only does what it is for — bounding the rounds when many children report
+    // inside one interval.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - m_last_map_push <
+        std::chrono::milliseconds(worker_proto::stats_interval_ms / 2))
+        return;
+
+    publish_runtime_map_to_workers();
 }
 
 void daemon_handler::publish_to_workers(std::string_view cache_name,
@@ -4074,7 +4185,31 @@ void daemon_handler::reconcile_proxy_workers()
                                  { on_worker_publish(from, c, ch, m); });
         sup->set_deliver_handler([this](std::string_view n, std::string_view m)
                                  { on_worker_deliver(n, m); });
+        sup->set_stats_handler([this] { on_worker_stats(); });
         inst->set_request_sink_override(sup.get());
+
+        // ─── What this child must know before it reads its config ───────────
+        //
+        // Handed over before the fork, not published after it.  There is no
+        // socket yet, so these only fill the supervisor's caches — and those
+        // caches are exactly what spawn() writes ahead of the config frame,
+        // which is the frame that makes the worker load its script.
+        //
+        // Publishing after the spawn, which is what the map used to rely on,
+        // puts both frames BEHIND the config: fine for the map, which is read
+        // when a callback runs, and not fine for the cluster view, whose
+        // bindings are refused or not at the moment the script is loaded.  A
+        // script's top level asking socketley.cluster.daemons() was answered by
+        // a refusal installed a few microseconds before the view arrived.
+        //
+        // The map is primed the same way for the smaller version of the same
+        // problem: a top-level socketley.list() saw an empty map.
+        sup->send_runtime_map(build_runtime_map_payload());
+        if (const std::string cv = build_cluster_view_payload(); !cv.empty())
+        {
+            sup->send_cluster_view(cv);
+            m_cluster_view_pushed = true;
+        }
 
         if (!sup->spawn(cfg))
         {
@@ -4351,6 +4486,16 @@ void daemon_handler::check_managed_health()
     // nothing.
     publish_runtime_map_to_workers();
 
+    // And what the cluster looks like, on the same tick.
+    //
+    // That is not a convenience: cluster_discovery scans the shared directory
+    // every PUBLISH_INTERVAL_SEC, which is the two seconds this tick already
+    // runs at, so a view pushed here is exactly as old as the one a script in
+    // the daemon reads off get_all_daemons().  Pushing it more often would
+    // resend a snapshot that has not been re-scanned; less often — only when
+    // local membership moved — would freeze it, because a remote daemon joining
+    // or leaving changes nothing in the local map.
+    publish_cluster_view_to_workers();
 
     std::shared_lock lock(m_manager.mutex);
     for (auto& [name, inst] : m_manager.list())
@@ -4450,6 +4595,13 @@ bool daemon_handler::start_cluster(const std::string& name, const std::string& d
     auto cd = std::make_unique<cluster_discovery>(name, dir, socket_path, m_manager);
     cd->set_event_callback([this](const std::vector<cluster_event>& events) {
         m_manager.dispatch_cluster_events(events);
+
+        // A daemon joining or leaving moves nothing in the local map, so
+        // nothing else would carry it to a worker before the next tick.  The
+        // tick is the backstop; this is the moment the daemon itself learned,
+        // and a script out there should not hear about it later than one in
+        // here does.
+        publish_cluster_view_to_workers();
     });
 
     if (!cd->start(m_loop))

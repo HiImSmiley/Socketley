@@ -33,7 +33,12 @@ namespace
 // the metrics endpoint are answering about the present, long enough that a busy
 // proxy is not spending its event loop building strings: the detail text is
 // produced by get_stats(), which walks the connection tables.
-constexpr auto stats_interval = std::chrono::milliseconds(250);
+//
+// The number itself is in worker_protocol.h now, because the daemon needs it
+// too: these frames are where the connection counts in the runtime map come
+// from, and the daemon coalesces its map pushes to the same period.
+constexpr auto stats_interval =
+    std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
 // SIGTERM asked for, and not yet acted on.
 //
@@ -451,6 +456,7 @@ private:
             case worker_proto::frame_type::config:    on_config(payload);    break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
+            case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
@@ -760,6 +766,47 @@ private:
         {
             std::string msg = "proxy worker: runtime map replica now holds "
                             + std::to_string(entries.size()) + " runtime(s)";
+            LOG_DEBUG(msg.c_str());
+        }
+    }
+
+    // What the cluster looks like, as the daemon last scanned it.
+    //
+    // Installed on lua_context rather than on this runtime, because it is a
+    // property of the PROCESS: every interpreter in this worker is looking at
+    // the same cluster, and there is exactly one worker per runtime anyway.
+    // Held by shared_ptr and never mutated after publication, so a cluster call
+    // that is mid-iteration keeps the view it started with instead of watching
+    // daemons appear underneath it — the same arrangement the endpoint table
+    // uses, for the same reason.
+    //
+    // An empty daemon name is a WITHDRAWAL, not a cluster of one with no name:
+    // it is what the daemon sends when it no longer has a cluster_discovery, and
+    // taking it as a view would leave the four cluster calls answering out of a
+    // cluster this daemon has left.  Cleared, so they refuse again.
+    void on_cluster_view(const std::string& payload)
+    {
+        auto view = std::make_shared<cluster_view>();
+        if (!worker_proto::decode_cluster_view(payload, *view))
+        {
+            LOG_WARN("proxy worker: malformed cluster view, keeping the previous one");
+            return;
+        }
+
+        if (view->daemon_name.empty())
+        {
+            lua_context::set_cluster_view(nullptr);
+            LOG_DEBUG("proxy worker: cluster view withdrawn");
+            return;
+        }
+
+        const size_t remote = view->remote.size();
+        lua_context::set_cluster_view(std::move(view));
+
+        if (logger::g_level <= log_debug)
+        {
+            std::string msg = "proxy worker: cluster view installed, "
+                            + std::to_string(remote) + " remote daemon(s)";
             LOG_DEBUG(msg.c_str());
         }
     }

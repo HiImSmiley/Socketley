@@ -135,11 +135,19 @@ uint32_t proxy_supervisor::retire()
         m_channel = nullptr;
     }
 
-    // Nothing may be delivered to this object once it is retired, and the
-    // publish handler is the one holder that is not a pointer somebody else
-    // keeps — it is a std::function this object owns, capturing the handler
-    // that is about to put it in the quarantine.
+    // Nothing may be delivered to this object once it is retired, and these are
+    // the holders that are not a pointer somebody else keeps — they are
+    // std::functions this object owns, capturing the handler that is about to
+    // put it in the quarantine.
+    //
+    // All three, not just the publish.  A retired supervisor still has whatever
+    // its child sent before the socket closed sitting in m_in, and ingest() can
+    // still walk it: a `deliver_to` would route a send for a runtime that is on
+    // its way out, and a stats frame would ask the daemon to rebuild and
+    // republish the runtime map on behalf of a child it no longer supervises.
     m_on_publish = nullptr;
+    m_on_deliver = nullptr;
+    m_on_stats   = nullptr;
 
     if (!m_loop)
         return 0;
@@ -447,6 +455,34 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         m_placeholder->set_endpoint_live(false);
     }
 
+    // ─── What the child has to know BEFORE it reads its config ──────────────
+    //
+    // The config frame is what makes the worker load its script, and a script's
+    // top level runs inside that load.  Everything the top level can ask about
+    // therefore has to be in the worker's hands before the config frame is, and
+    // these two are the whole of what that means: the runtime map, which
+    // socketley.list() and socketley.get() are answered from, and the cluster
+    // view, which the four socketley.cluster.* calls are answered from.
+    //
+    // The cluster view is the one where the order is load-bearing rather than
+    // merely better.  Its bindings are refused unless a view is installed, and
+    // that decision is taken once, while the bindings are being built — so a
+    // view arriving one frame later than the config leaves the four calls
+    // refused for the life of that script, and the refusal says the worker
+    // cannot answer when it can.  One stream, delivered in order, so writing
+    // them first is all it takes.
+    //
+    // Both are also re-sent here rather than only on the next tick, which is
+    // what covers a RESTARTED child: it has a script to run immediately and
+    // nothing else would carry these to it until something moved.
+    if (!m_cluster_view.empty())
+        if (!write_frame(worker_proto::frame(worker_proto::frame_type::cluster,
+                                             m_cluster_view))) {}
+
+    if (!m_runtime_map.empty())
+        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
+                                             m_runtime_map))) {}
+
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, m_config_json)))
     {
         LOG_ERROR("proxy supervisor: could not send config to worker");
@@ -457,17 +493,14 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // A child forked after the last publish would otherwise route from an empty
     // table until the next membership change, which for a stable daemon may
     // never come.
+    //
+    // After the config and not before it, unlike the two above: only a proxy is
+    // handed an endpoint table and the proxy does not exist until the config has
+    // been read, so a table arriving early is stashed rather than applied — see
+    // on_endpoints().  The map and the view go into objects that exist from the
+    // worker's construction, which is what lets them go first.
     if (!m_endpoints.empty())
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
-
-    // The map, for the same reason and with one difference: the map is pushed on
-    // the health tick too, so a child that missed it here would be no more than
-    // two seconds behind rather than indefinitely.  Sent anyway, because those
-    // two seconds are the window in which a script's on_start runs — and
-    // on_start is where a script is most likely to ask what else exists.
-    if (!m_runtime_map.empty())
-        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
-                                             m_runtime_map))) {}
 
     // Last, and only on the path that keeps the socket: an arm on a descriptor
     // a failed spawn is about to close is the completion-outliving-its-fd case
@@ -630,18 +663,49 @@ void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
     // idea of what counts as a change to drift from the first.
     if (encoded_payload == m_runtime_map)
         return;
-    if (m_control_fd < 0)
-        return;
 
-    // Remembered only once it has been queued, which is what makes the dedupe
-    // above safe.  Storing it either way would record a payload this child was
-    // never sent — write_frame refuses when the backlog is full, meaning the
-    // child has stopped reading — and every later push of the same map would
-    // then be dropped as a duplicate of a frame that never went.  On a daemon
-    // whose membership is settled that is a replica left stale for good.
+    // No child to write to, so this is what the next one will be handed: spawn()
+    // writes the cache before the config frame.  Reached in two ways and right
+    // in both — a supervisor that has not forked yet, and one whose child has
+    // died and is about to be replaced.
+    if (m_control_fd < 0)
+    {
+        m_runtime_map = encoded_payload;
+        return;
+    }
+
+    // Otherwise remembered only once it has been queued, which is what makes the
+    // dedupe above safe.  Storing it either way would record a payload this
+    // child was never sent — write_frame refuses when the backlog is full,
+    // meaning the child has stopped reading — and every later push of the same
+    // map would then be dropped as a duplicate of a frame that never went.  On a
+    // daemon whose membership is settled that is a replica left stale for good.
     if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
                                         encoded_payload)))
         m_runtime_map = encoded_payload;
+}
+
+void proxy_supervisor::send_cluster_view(const std::string& encoded_payload)
+{
+    // The same three rules as the map above, and for the same reasons: nothing
+    // that this child already holds, a cache rather than a write when there is
+    // no child yet, and otherwise remembered only once it has been queued.
+    //
+    // The middle rule is what makes the four cluster calls answerable at all in
+    // a script's top level: the cache is what spawn() writes ahead of the config
+    // frame, and the config frame is what runs the script.
+    if (encoded_payload == m_cluster_view)
+        return;
+
+    if (m_control_fd < 0)
+    {
+        m_cluster_view = encoded_payload;
+        return;
+    }
+
+    if (write_frame(worker_proto::frame(worker_proto::frame_type::cluster,
+                                        encoded_payload)))
+        m_cluster_view = encoded_payload;
 }
 
 void proxy_supervisor::send_publish(const std::string& encoded_payload)
@@ -865,6 +929,12 @@ void proxy_supervisor::ingest(const std::string&)
         {
             case worker_proto::frame_type::stats:
                 apply_stats(payload);
+                // After the figures are in the placeholder and never before:
+                // the handler rebuilds the runtime map out of what every
+                // runtime reports, and this child's row has to be the one that
+                // has just arrived rather than the one before it.
+                if (m_on_stats)
+                    m_on_stats();
                 break;
 
             case worker_proto::frame_type::hello:

@@ -318,8 +318,50 @@ private:
     // the replica socketley.list() and socketley.get() are answered from.
     //
     // Called on every membership change, beside the endpoint table and for the
-    // same reason, and once per health tick for the counts.
+    // same reason; on every stats frame, coalesced, for the counts; and on the
+    // health tick as the backstop for both.
     void publish_runtime_map_to_workers();
+
+    // Encode what the cluster looks like — this daemon's cluster name, the
+    // address it advertises, and every remote daemon with its runtimes — and
+    // push it to every worker, where it becomes the snapshot the four
+    // socketley.cluster.* calls are answered from.  See shared/cluster_view.h.
+    //
+    // Pushed on the cluster's own scan cadence, which is the health tick's, and
+    // again the moment discovery reports an event.  A daemon that is in no
+    // cluster pushes nothing and those four calls stay refused out there, which
+    // is the honest answer rather than an empty table.
+    void publish_cluster_view_to_workers();
+
+    // The two payloads, built without being sent.
+    //
+    // Split out because a supervisor has to be handed both BEFORE it forks: it
+    // writes them ahead of the config frame, and the config frame is what loads
+    // the child's script.  See the priming in reconcile_proxy_workers().
+    //
+    // build_cluster_view_payload() answers empty for a daemon that has never
+    // been in a cluster — nothing to say and nothing to withdraw — and the
+    // callers send no frame for that.
+    std::string build_runtime_map_payload();
+    std::string build_cluster_view_payload();
+
+    // Whether a cluster view has ever gone out.  What makes "this daemon has
+    // left its cluster" expressible at all: an empty view is the withdrawal,
+    // and without this flag it would also be what every never-clustered daemon
+    // sent to every worker it forked.
+    bool m_cluster_view_pushed{false};
+
+    // A worker has published its figures.  Pushes the map on, at most once per
+    // stats interval however many children report inside one — the counts are
+    // the one thing in the map that moves with no event behind it, and a stats
+    // frame is the only clock in this daemon that ticks when they do.  See the
+    // note above the definition for why it is coalesced rather than per frame.
+    void on_worker_stats();
+
+    // When the last map push went out, for that floor.  Set by every push, so a
+    // membership change resets the window instead of being followed a moment
+    // later by a round carrying the same rows.
+    std::chrono::steady_clock::time_point m_last_map_push{};
 
     // Encode one published message and push it to every worker, so a proxy's
     // subscribe callbacks fire in the process that is serving its traffic.
