@@ -116,7 +116,20 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             auto& cli = static_cast<client_instance&>(rt);
             cli.set_mode(static_cast<client_mode>(cfg.mode));
             cli.set_udp(cfg.udp);
-            if (cfg.reconnect != 0) cli.set_reconnect(cfg.reconnect);
+            // `>= 0`, not `!= 0`.  The field has three states — -1 disabled,
+            // 0 infinite attempts, N a limit — so 0 is a value, not an absence,
+            // and it is the one `--reconnect` produces when written without a
+            // number, which the man page gives as the default form.  Guarding
+            // on `!= 0` skipped exactly the spelling the flag is usually typed
+            // as, leaving m_reconnect at its -1 default: accepted by the CLI,
+            // stored, reported by `show`, and inert.
+            //
+            // state_persistence.cpp writes the field under `if (cfg.reconnect
+            // >= 0)`.  Writer and reader disagreed about what 0 meant, and only
+            // the worker path reads it back — which is why an in-daemon client
+            // reconnected in about a second and a worker one, the default since
+            // 2313c26, never did.
+            if (cfg.reconnect >= 0) cli.set_reconnect(cfg.reconnect);
             break;
         }
         case runtime_proxy:
