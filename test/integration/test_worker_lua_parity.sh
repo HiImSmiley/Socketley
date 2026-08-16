@@ -124,12 +124,44 @@ ctl() {
 #
 # The worker arm against the in-daemon arm.  These are the calls that MUST go
 # green when the worker is handed the runtime map — the definition of done.
+#
+# ─── TWO WAYS TO BE RED, AND ONLY ONE OF THEM IS PROGRESS ───────────────────
+#
+# Found by running the prepared un-refusal queue against a build with no map in
+# it, which is the state somebody will eventually land by mistake: the score
+# did not move.  Both of these are one failed assertion —
+#
+#     worker arm: REFUSED:...   the call is honestly refused.  Waiting.
+#     worker arm: 0/0           the refusal was removed and the call now
+#                               answers an empty table.
+#
+# — and the second is strictly worse than doing nothing, because an empty list
+# is what a SUCCESSFUL call returns on a daemon with nothing in it.  A script
+# cannot tell them apart, which is the entire reason the refusals were written.
+# A file that reports the same 35/43 for both is no use for catching it: the
+# number is what gets read, and a reviewer who sees the count unchanged
+# concludes nothing changed.
+#
+# So the two are named differently and the second says what it is.
 par() {
     local call=$1 oop=$2 in=$3
     if [ "$oop" = "$in" ]; then pass; return; fi
-    fail "parity: socketley.$call" \
-         "worker arm: $oop" \
-         "daemon arm: $in"
+    case "$oop" in
+        REFUSED:*)
+            fail "parity: socketley.$call" \
+                 "worker arm: $oop" \
+                 "daemon arm: $in" \
+                 "still refused — this is the expected red until the map lands" ;;
+        *)
+            fail "REGRESSION: socketley.$call answers nothing instead of refusing" \
+                 "worker arm: $oop" \
+                 "daemon arm: $in" \
+                 "the refusal has been removed and the call did NOT start" \
+                 "working — it now returns what a successful call returns on a" \
+                 "daemon with nothing in it, which no script can tell apart" \
+                 "from the truth. This is worse than the refusal it replaced." \
+                 "Either finish the transport or put the refusal back." ;;
+    esac
 }
 
 # refused CALL OOP NEEDLE WHY...
