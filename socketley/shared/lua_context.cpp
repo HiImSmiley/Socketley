@@ -3619,12 +3619,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.stats() → {daemons, runtimes, running, groups={name=count}}
-    cluster_tbl["stats"] = [owner, this]() -> sol::table {
+    cluster_tbl["stats"] = [owner, this, resolve_cluster]() -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int daemon_count = 1;  // include local
         int rt_total = 0;
@@ -3644,8 +3644,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         }
 
         // Remote daemons
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             ++daemon_count;
             for (const auto& rt : rd.runtimes)
