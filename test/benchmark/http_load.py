@@ -42,11 +42,13 @@ REQUEST = (
 lock = threading.Lock()
 latencies = []
 successes = 0
+non2xx = []
 
 
 def worker(count):
     global successes
     mine = []
+    mine_bad = []
     ok = 0
     for _ in range(count):
         t0 = time.perf_counter()
@@ -61,12 +63,39 @@ def worker(count):
         # A status line, not merely bytes: a proxy that closes on us returns
         # b"" here, and counting that as a served request is how a broken
         # backend turns into a throughput record.
+        #
+        # And the CODE, not merely a status line.  An http proxy routes on a
+        # "/<proxy-name>/" prefix and answers everything else 404 -- itself,
+        # without opening a backend connection at all -- so a request that has
+        # lost the prefix is served several times faster than the thing being
+        # measured, and to a check that stops at b"HTTP/1." it is indis-
+        # tinguishable from a successful proxy hop.  The figure published would
+        # be the rate at which this proxy can refuse to proxy.
+        #
+        # Nothing is mis-routed today: bench_proxy.sh asks for /bench_proxy/test
+        # against a proxy named bench_proxy, and that was measured returning 200
+        # with the backend contacted, while / and /test on the same proxy
+        # returned 404.  It is one rename away from not being, and the failure
+        # is silent and reads as a speed-up -- which is the combination that
+        # wants an oracle rather than a comment.
         if data.startswith(b"HTTP/1."):
-            mine.append((time.perf_counter() - t0) * 1000.0)
-            ok += 1
+            rtt = (time.perf_counter() - t0) * 1000.0
+            try:
+                code = int(data.split(None, 2)[1])
+            except (IndexError, ValueError):
+                code = 0
+            if 200 <= code < 300:
+                mine.append(rtt)
+                ok += 1
+            else:
+                # Deliberately not counted and deliberately not timed: the
+                # latency of a refusal is not the latency of a proxy hop, and
+                # averaging the two describes neither.
+                mine_bad.append(code)
     with lock:
         latencies.extend(mine)
         successes += ok
+        non2xx.extend(mine_bad)
 
 
 # Split the work so the last thread absorbs the remainder rather than a thread
@@ -90,5 +119,16 @@ latencies.sort()
 avg = sum(latencies) / len(latencies) if latencies else 0.0
 p99 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.99))] if latencies else 0.0
 
-print("success=%d elapsed_ms=%.0f avg_ms=%.3f p99_ms=%.3f"
-      % (successes, elapsed_ms, avg, p99))
+# non2xx is appended rather than folded into success, so a caller that greps
+# success= is unaffected and a caller that wants the oracle has it.  A run with
+# a non-zero count here is not a slow run, it is a run measuring the wrong
+# thing -- and saying so on the same line is what makes that visible without
+# anyone having to go looking.
+line = ("success=%d elapsed_ms=%.0f avg_ms=%.3f p99_ms=%.3f non2xx=%d"
+        % (successes, elapsed_ms, avg, p99, len(non2xx)))
+if non2xx:
+    codes = {}
+    for c in non2xx:
+        codes[c] = codes.get(c, 0) + 1
+    line += " codes=" + ",".join("%d:%d" % (c, n) for c, n in sorted(codes.items()))
+print(line)

@@ -1724,6 +1724,65 @@ table, a counter \(em is the common case rather than the exception, and the
 failure is silent: a message from a client on one shard never reaches a client
 on another, and that shows up under exactly the load the flag was bought for.
 .PP
+.B "What it bought, measured."
+An
+.B http
+proxy in front of four
+.B \-\-http
+backends, driven by
+.BR wrk :
+.PP
+.RS
+.TS
+l r r.
+shards	throughput	CPU per shard
+_
+1	40,285 req/s	1.00 cores
+2	94,401 req/s	0.99 cores
+4	150,175 req/s	0.91 cores
+8	142,775 req/s	0.47 cores
+.TE
+.RE
+.PP
+3.73x at four shards, and close to linear: each shard stays at a full core until
+the machine runs out of them. Eight shards on a ten-core box is past that point
+and buys nothing \(em the per-shard figure halving is what running out looks
+like. Do not set more shards than the machine has cores to give them.
+.PP
+.B "The backend tier saturates first."
+That is the first thing anyone will hit, and it is not a property of this flag.
+The same proxy in front of a
+.I single
+backend stops at 2.14x however many shards it is given, with the backend pinned
+at exactly 1.00 cores \(em the shards were idle and waiting on it. A sharded
+proxy needs something behind it that is not one process, whether that is several
+backends, a
+.B \-\-strategy
+across a group, or a backend that is itself sharded. Measure what saturated
+before reading a number as this flag's ceiling.
+.PP
+.B "It does nothing for \-\-protocol tcp, for a different reason."
+A
+.B tcp
+proxy moves bytes with
+.BR IORING_OP_SPLICE ,
+which io_uring preps
+.B REQ_F_FORCE_ASYNC
+\(em so that data path never runs on the shard's event loop at all. It runs on
+io-wq kernel threads, and it was therefore never bounded by the number of
+processes: at
+.I one
+shard, a tcp proxy under 100 connections was measured holding 11 threads, 10 of
+them
+.BR iou\-* ,
+and burning 1.85 cores. Sharding such a proxy adds processes to a path that is
+already parallel, and throughput does not move. If you shard a tcp proxy and see
+no change, this is why. The ceiling
+.B \-\-shards
+exists to lift is the
+.B http
+one above, where the runtime really is one event loop on one core.
+.PP
 .B "The load is balanced per connection, not per request."
 .B SO_REUSEPORT
 picks a shard when the connection is accepted and never revisits it, so one

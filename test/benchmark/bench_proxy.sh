@@ -35,6 +35,35 @@ ensure_clean() {
     socketley_cmd remove named_backend 2>/dev/null
 }
 
+# ─── A number produced by the wrong request is not a slow number ────────────
+#
+# An http proxy routes on a "/<proxy-name>/" prefix and answers everything else
+# 404 by itself, without ever opening a backend connection.  That refusal is
+# several times faster than the hop these tests exist to measure, and
+# http_load.py used to count any status line as a success -- so a request that
+# had lost its prefix would have been published as a throughput record for the
+# proxy, and the only visible sign would have been the proxy getting faster.
+#
+# http_load.py counts only 2xx now and reports the rest.  This prints it, because
+# a figure nobody reads is not an oracle: the count belongs beside the
+# throughput it invalidates, not three lines further down in the JSON.
+#
+# Measured while adding this: /bench_proxy/test against a proxy named
+# bench_proxy returns 200 with the backend contacted, while / and /test on that
+# same proxy return 404.  Both tests here ask for the first, so both are
+# measuring the hop and neither was affected.
+report_non2xx() {
+    local out=$1
+    local n
+    n=$(echo "$out" | grep -oP 'non2xx=\K[0-9]+')
+    n=${n:-0}
+    [[ "$n" -eq 0 ]] && return 0
+    log_error "$n non-2xx replies ($(echo "$out" | grep -oP 'codes=\K[0-9:,]+'))"
+    log_error "the throughput above is NOT a proxy hop: an http proxy answers"
+    log_error "anything outside /<proxy-name>/ with its own 404 and never"
+    log_error "contacts the backend. Check the path this test requests."
+}
+
 # Simple HTTP request via bash /dev/tcp
 http_request() {
     local port=$1
@@ -100,6 +129,7 @@ test_http_single_backend() {
     log_success "Successful requests: $success / $num_requests"
     log_success "Throughput: $rps req/sec"
     log_info "Latency: avg=${avg_lat}ms p99=${p99_lat}ms (${HTTP_CONCURRENCY} concurrent)"
+    report_non2xx "$out"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
@@ -164,6 +194,7 @@ test_http_load_balancing() {
     log_success "Successful requests: $success / $num_requests"
     log_success "Throughput: $rps req/sec"
     log_info "Latency: avg=${avg_lat}ms p99=${p99_lat}ms (${HTTP_CONCURRENCY} concurrent)"
+    report_non2xx "$out"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
