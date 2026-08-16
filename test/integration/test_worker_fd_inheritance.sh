@@ -68,8 +68,20 @@ BEPID=""
 WPID=""
 
 cleanup() {
-    [ -n "$WPID" ] && kill -CONT "$WPID" 2>/dev/null
-    [ -n "$WPID" ] && kill -9 "$WPID" 2>/dev/null
+    # `|| true` on both, like every other line in this function.
+    #
+    # It was not needed while the worker was guaranteed to still be there: the
+    # test SIGSTOPped it precisely so that it would outlive its daemon, so both
+    # kills found a live process and returned 0.  A worker cannot outlive its
+    # daemon any more, so both now fail -- and under `set -euo pipefail` a
+    # failing command in an EXIT trap replaces the script's exit status.
+    #
+    # The symptom was a test that printed "12/12 passed, 0 failed" and exited 1,
+    # which the runner counts as a failure and the report denies.  Worth the
+    # comment because that shape is invisible from the log: every assertion the
+    # file makes was green.
+    [ -n "$WPID" ] && kill -CONT "$WPID" 2>/dev/null || true
+    [ -n "$WPID" ] && kill -9 "$WPID" 2>/dev/null || true
     for n in "$PX_NAME" "$SRV_NAME"; do
         "$BIN" stop "$n" 2>/dev/null || true
         "$BIN" remove "$n" 2>/dev/null || true

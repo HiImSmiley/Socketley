@@ -4257,15 +4257,45 @@ void daemon_handler::on_worker_publish(proxy_supervisor* from,
 
 void daemon_handler::poll_proxy_workers()
 {
-    for (auto& [name, shards] : m_proxy_workers)
+    // ─── Nothing here may hold into the map across a poll() ─────────────────
+    //
+    // poll() drains a control socket, and what comes off one reaches back here:
+    // a `publish` runs the subscribe callbacks of every runtime in this daemon,
+    // a subscriber may call socketley.remove, and that reconciles — which
+    // erases from m_proxy_workers.  await_worker_startup() documents the same
+    // path and re-takes its iterator for the same reason.
+    //
+    // A range-for over the map was already resting on that not happening.  It
+    // became worth fixing rather than noting when the aggregate below started
+    // using the KEY after the drain: a structured binding's `name` is a
+    // reference into the node, so an erase during poll() would leave this
+    // reading a freed string, not merely a stale iterator.
+    //
+    // So: the names are copied first, and every element is re-found by name
+    // between drains.  One string copy per runtime per tick, against a
+    // use-after-free that needs a Lua subscriber and a removal to reach.
+    std::vector<std::string> names;
+    names.reserve(m_proxy_workers.size());
+    for (const auto& [name, _] : m_proxy_workers)
+        names.push_back(name);
+
+    for (const auto& name : names)
     {
-        for (auto& sup : shards)
-            sup->poll();
+        size_t k = 0;
+        for (;;)
+        {
+            auto it = m_proxy_workers.find(name);
+            if (it == m_proxy_workers.end() || k >= it->second.size())
+                break;
+            it->second[k]->poll();
+            ++k;
+        }
 
         // Once per runtime and after its whole shard set has been drained, not
         // once per shard: the placeholder holds the SUM, so writing it while
         // half the shards still carry figures from the previous interval would
-        // publish a total that never existed.
+        // publish a total that never existed.  It re-finds the name itself and
+        // does nothing when the runtime has gone.
         aggregate_worker_stats(name);
     }
 }
