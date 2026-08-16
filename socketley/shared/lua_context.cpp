@@ -3565,12 +3565,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // socketley.cluster.group(name) → array of {daemon, host, port, connections}
-    cluster_tbl["group"] = [owner, this](std::string group_name) -> sol::table {
+    cluster_tbl["group"] = [owner, this, resolve_cluster](std::string group_name) -> sol::table {
         sol::table result = m_lua.create_table();
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return result;
-        auto* cd = mgr->get_cluster_discovery();
-        if (!cd) return result;
+        const cluster_source src = resolve_cluster(mgr);
+        if (!src.ok) return result;
 
         int i = 1;
         // Local group members
@@ -3583,8 +3583,12 @@ void lua_context::register_bindings(runtime_instance* owner)
                     inst->get_port() > 0)
                 {
                     sol::table m = m_lua.create_table();
-                    m["daemon"] = std::string(cd->get_daemon_name());
-                    m["host"] = std::string(cd->get_cluster_addr());
+                    m["daemon"] = src.daemon_name;
+                    // The ADVERTISED address, not 127.0.0.1.  A worker has no
+                    // way to derive this and guessing loopback would hand a
+                    // script an address no other node can reach — which is why
+                    // the view carries it rather than being rebuilt locally.
+                    m["host"] = src.host;
                     m["port"] = inst->get_port();
                     // The figure a least-connections choice is made on.  A local
                     // member in a worker reported 0 here beside a remote
@@ -3596,8 +3600,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
         // Remote group members
-        auto daemons = cd->get_all_daemons();
-        for (const auto& rd : daemons)
+        for (const auto& rd : src.remote)
         {
             for (const auto& rt : rd.runtimes)
             {
