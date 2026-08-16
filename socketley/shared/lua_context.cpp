@@ -2519,7 +2519,7 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // its keys.  Nothing else in the binding changes — it walks mgr->list()
     // under the shared lock exactly as it does in the daemon, and in a worker
     // that map is now the pushed snapshot with this runtime's own row in it.
-    for (const char* call : {"send", "get"})
+    for (const char* call : {"send"})
     {
         sol::function f = make(worker_refusal(std::string("socketley.") + call));
         sk[call] = f;
