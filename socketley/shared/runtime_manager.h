@@ -196,8 +196,12 @@ public:
     //
     // Returns whether the message was handed to the process holding the
     // connections, so the binding can answer false rather than repeat the lie
-    // in a quieter voice.  Unset — a manager inside a worker, or one with no
-    // daemon around it — is false for the same reason: nothing was delivered.
+    // in a quieter voice.  Unset — a manager with no daemon around it — is
+    // false for the same reason: nothing was delivered.
+    //
+    // A worker installs one too, and there it means one hop less: handed to the
+    // daemon, which holds the map and knows which process the name is in.  See
+    // worker_proto's deliver_to for why that hop is not waited on.
     void set_deliver_sink(
         std::function<bool(std::string_view name, std::string_view message)> sink);
     bool deliver_out_of_process(std::string_view name, std::string_view message) const;

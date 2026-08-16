@@ -932,6 +932,19 @@ void proxy_supervisor::ingest(const std::string&)
                 on_chan_req(payload);
                 break;
 
+            case worker_proto::frame_type::deliver_to:
+            {
+                // `socketley.send(name, msg)` from the worker's script, for a
+                // name that is not its own runtime.  Routed by the handler,
+                // which is the daemon and holds the map; nothing is answered,
+                // because nothing is waiting — see the frame's own note.
+                std::string name, message;
+                if (m_on_deliver &&
+                    worker_proto::decode_deliver_to(payload, name, message))
+                    m_on_deliver(name, message);
+                break;
+            }
+
             case worker_proto::frame_type::state:
                 // created / running / stopped are still not acted on, and for
                 // the reason that was always given: the daemon's own record is

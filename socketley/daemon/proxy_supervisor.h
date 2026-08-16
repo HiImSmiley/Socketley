@@ -152,6 +152,18 @@ public:
                                                std::string_view message)>;
     void set_publish_handler(publish_handler h) { m_on_publish = std::move(h); }
 
+    // What to do with a `send` coming UP from the child.  A script in a worker
+    // names a runtime it cannot see; the daemon holds the map, so it is the only
+    // process that can decide whether that name is one of its own runtimes, one
+    // in another worker, or nothing at all.
+    //
+    // No `from` argument and no exclusion, unlike the publish above: a send is
+    // addressed, not broadcast, and a worker sending to its OWN runtime never
+    // reaches this — the worker's deliver sink answers that one where it stands.
+    using deliver_handler = std::function<void(std::string_view name,
+                                               std::string_view message)>;
+    void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
+
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -380,6 +392,7 @@ private:
     bool         m_poll_armed{false};
 
     publish_handler m_on_publish;
+    deliver_handler m_on_deliver;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};

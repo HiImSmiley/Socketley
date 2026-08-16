@@ -576,6 +576,33 @@ private:
         m_manager.requests().set_default_sink(&m_remote);
         m_rt->set_runtime_manager(&m_manager);
 
+        // ── and a send on its way out ───────────────────────────────────────
+        //
+        // The mirror of the daemon's own deliver sink, which is what
+        // socketley.send reaches for a runtime whose connections are in another
+        // process.  In a worker EVERY other runtime is in another process, and
+        // the daemon is the only one that knows where — so the message goes up
+        // and is routed there, by the same code that routes a `send` typed at
+        // the CLI.
+        //
+        // Its own runtime is answered here rather than on the wire.  The round
+        // trip would work — the daemon would route the name straight back to
+        // this socket — but it would make the commonest send in a worker's
+        // script the slowest one, and it would be delivered a turn of two event
+        // loops later than the call that asked for it.
+        m_manager.set_deliver_sink(
+            [this](std::string_view name, std::string_view message) -> bool
+            {
+                if (m_rt && name == m_rt->get_name())
+                {
+                    deliver_local(message);
+                    return true;
+                }
+                return m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::deliver_to,
+                    worker_proto::encode_deliver_to(name, message)));
+            });
+
         // ── and a publish on its way out ────────────────────────────────────
         //
         // The mirror of the frame this worker already receives.  A cache calls
@@ -833,6 +860,21 @@ private:
     // mode test: a server in `in` mode and a client in `in` mode both read only,
     // so a broadcast to one is a message with nowhere to go.
     void on_deliver(const std::string& message)
+    {
+        deliver_local(message);
+    }
+
+    // The two calls cmd_send() makes on an in-process runtime, against the one
+    // runtime this process holds.
+    //
+    // Reached from two directions now.  A `deliver` frame is the daemon routing
+    // somebody else's send here, and a `socketley.send(self, ...)` from this
+    // worker's own script is the same delivery with no wire between the ask and
+    // the answer — so it is short-circuited in the deliver sink rather than sent
+    // up for the daemon to send straight back down.  One body, because the two
+    // must not be able to disagree about what `send` does to a runtime in `in`
+    // mode.
+    void deliver_local(std::string_view message)
     {
         if (!m_rt || m_rt->get_state() != runtime_running)
             return;

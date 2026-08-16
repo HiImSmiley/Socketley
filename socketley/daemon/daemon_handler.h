@@ -99,6 +99,15 @@ private:
     int cmd_ps(ipc_connection* conn, const parsed_args& pa);
     int cmd_send(const parsed_args& pa);
 
+    // Where a message addressed to a runtime name goes: to the connections in
+    // this process, or on to the one worker that holds them.  False with `why`
+    // filled in when there is nowhere for it to go.
+    //
+    // Shared by `send` at the CLI and by a worker's socketley.send arriving as a
+    // frame, so the two cannot come to different conclusions about whether a
+    // message was delivered.
+    bool deliver_to_runtime(std::string_view name, std::string_view message,
+                            std::string& why);
     int cmd_edit(ipc_connection* conn, const parsed_args& pa);
     int cmd_dump(ipc_connection* conn, const parsed_args& pa);
     int cmd_import(ipc_connection* conn, const parsed_args& pa);
@@ -321,6 +330,12 @@ private:
     // connections.  False when there is no such worker or its control socket
     // would not take the frame — the caller has to be able to say so.
     bool deliver_to_worker(std::string_view name, std::string_view message);
+
+    // A `send` that came UP from a worker's script, addressed to a runtime that
+    // worker cannot see.  Routed exactly as cmd_send() routes the same verb
+    // typed at the CLI: to the connections in this process, or on to the one
+    // worker that holds them.
+    void on_worker_deliver(std::string_view name, std::string_view message);
 
     // A publish that came UP from a worker's cache, fanned out to everything
     // this daemon can reach — its own runtimes and every OTHER worker.  The

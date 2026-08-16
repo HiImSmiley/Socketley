@@ -2081,34 +2081,37 @@ int daemon_handler::cmd_owner(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-int daemon_handler::cmd_send(const parsed_args& pa)
+// ─── Where a message addressed to a name goes ───────────────────────────────
+//
+// One rule, two callers.  `send` typed at the CLI reaches it through cmd_send()
+// below and reports `why` to the terminal; `socketley.send` called in a worker's
+// script reaches it through on_worker_deliver() and reports `why` to the log.
+//
+// Written as one function because the interesting half is the routing — is this
+// runtime in this process, in a worker, or nowhere — and two copies of that
+// would be two answers to "is a send delivered", which is the question this
+// tree has already got wrong once in exactly this place.
+bool daemon_handler::deliver_to_runtime(std::string_view name,
+                                        std::string_view message,
+                                        std::string& why)
 {
-    if (pa.count < 3)
-    {
-        std::cout << "usage: send <name> <message>\n";
-        return 1;
-    }
-
-    std::string_view name = pa.args[1];
-    std::string_view message = pa.rest_from(2);
-
     auto* instance = m_manager.get(name);
     if (!instance)
     {
-        std::cout << "runtime not found: " << name << "\n";
-        return 1;
+        why = "runtime not found: " + std::string(name);
+        return false;
     }
 
     if (instance->get_state() != runtime_running)
     {
-        std::cout << "runtime is not running: " << name << "\n";
-        return 1;
+        why = "runtime is not running: " + std::string(name);
+        return false;
     }
 
     if (instance->get_type() != runtime_server && instance->get_type() != runtime_client)
     {
-        std::cout << "send is only supported for server and client runtimes\n";
-        return 1;
+        why = "send is only supported for server and client runtimes";
+        return false;
     }
 
     // The connections are wherever the runtime is.
@@ -2123,18 +2126,17 @@ int daemon_handler::cmd_send(const parsed_args& pa)
         auto it = m_proxy_workers.find(std::string(name));
         if (it == m_proxy_workers.end() || !it->second->send_deliver(message))
         {
-            std::cout << "could not reach the worker holding " << name << "\n";
-            return 1;
+            why = "could not reach the worker holding " + std::string(name);
+            return false;
         }
-        return 0;
+        return true;
     }
 
     switch (instance->get_type())
     {
         case runtime_server:
         {
-            auto* srv = static_cast<server_instance*>(instance);
-            if (srv->get_mode() != mode_in)
+            if (auto* srv = instance->as_server(); srv && srv->get_mode() != mode_in)
                 srv->lua_broadcast(message);
             break;
         }
@@ -2149,7 +2151,40 @@ int daemon_handler::cmd_send(const parsed_args& pa)
             break;
     }
 
+    return true;
+}
+
+int daemon_handler::cmd_send(const parsed_args& pa)
+{
+    if (pa.count < 3)
+    {
+        std::cout << "usage: send <name> <message>\n";
+        return 1;
+    }
+
+    std::string why;
+    if (!deliver_to_runtime(pa.args[1], pa.rest_from(2), why))
+    {
+        std::cout << why << "\n";
+        return 1;
+    }
     return 0;
+}
+
+// The same verb arriving from a worker's script instead of from a terminal.
+//
+// Nothing is answered: the frame is one-way, and the caller's own error cases
+// were decided out there against the replica of this map — see the note on
+// deliver_to in worker_protocol.h.  What can still go wrong here is what the
+// replica was too old to know, so it is said in the log rather than dropped:
+// the window is one push interval wide, and a send into it is a message the
+// script believes it made.
+void daemon_handler::on_worker_deliver(std::string_view name,
+                                       std::string_view message)
+{
+    std::string why;
+    if (!deliver_to_runtime(name, message, why))
+        LOG_WARN(("a worker's send could not be delivered: " + why).c_str());
 }
 
 int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
@@ -4037,6 +4072,8 @@ void daemon_handler::reconcile_proxy_workers()
                                         std::string_view c, std::string_view ch,
                                         std::string_view m)
                                  { on_worker_publish(from, c, ch, m); });
+        sup->set_deliver_handler([this](std::string_view n, std::string_view m)
+                                 { on_worker_deliver(n, m); });
         inst->set_request_sink_override(sup.get());
 
         if (!sup->spawn(cfg))

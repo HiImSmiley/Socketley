@@ -91,6 +91,7 @@ enum class frame_type : uint16_t
     routes    = 5,   // payload: see encode_routes
     reload_err = 6,  // payload: why a `reload` failed; see below
     start_err  = 7,  // payload: why `start`'s on_start raised; see below
+    deliver_to = 8,  // payload: see encode_deliver_to
 };
 
 // ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
@@ -504,6 +505,49 @@ inline bool decode_endpoints(std::string_view payload,
         }
     }
 
+    return r.ok;
+}
+
+// ── deliver_to: the same verb, going the other way ──────────────────────────
+//
+// `deliver` above is the daemon telling one worker to write a message to its
+// connections, and the payload IS the message because the socket says which
+// runtime is meant.  Going up, it does not: a script in a worker names the
+// runtime it is sending to, and that runtime is any of them.
+//
+// So the name travels, and the frame is a separate type rather than the same
+// one with a second reading.  One type meaning two things depending on which
+// end read it is the sort of economy that survives until somebody loops a
+// socket back on itself.
+//
+// Fire and forget, like `deliver` and like every other message frame here.  The
+// caller's error cases — no such runtime, not running, not a kind of runtime
+// that has connections — are answered on the asking side out of the replica the
+// map frame installs, so what crosses is only the cases that cannot be:
+// delivery to a runtime in a THIRD process, and delivery to one in the daemon.
+//
+// What `true` means degrades by exactly one hop, and it is worth saying which.
+// In the daemon it means "handed to the process that holds the connections";
+// out here it means "handed to the daemon, which knows which process that is".
+// Neither is an acknowledgement — the daemon's own send has never waited for
+// one — and the alternative to the extra hop is a round trip on the data path,
+// which is the thing this design says no to everywhere else.
+
+inline std::string encode_deliver_to(std::string_view name, std::string_view message)
+{
+    std::string out;
+    out.reserve(8 + name.size() + message.size());
+    put_str(out, name);
+    put_str(out, message);
+    return out;
+}
+
+inline bool decode_deliver_to(std::string_view payload, std::string& name,
+                              std::string& message)
+{
+    reader r(payload.data(), payload.size());
+    name    = std::string(r.str());
+    message = std::string(r.str());
     return r.ok;
 }
 
