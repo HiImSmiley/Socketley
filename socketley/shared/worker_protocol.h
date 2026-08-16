@@ -49,6 +49,11 @@
 #include <memory>
 #include <utility>
 #include "route_table.h"
+// The cluster snapshot travels whole, in the structs the daemon already has it
+// in — see the note above encode_cluster_view.  This is the same reason
+// route_table.h is included above rather than a flat copy of a declaration
+// being made here.
+#include "cluster_view.h"
 #include <string_view>
 #include <vector>
 
@@ -85,6 +90,7 @@ enum class frame_type : uint16_t
     deliver   = 23,  // payload: raw message bytes; see below
     reload    = 24,  // payload: empty; re-run the script, then answer `routes`
     runtime_map = 25,  // payload: see encode_runtime_map
+    cluster     = 26,  // payload: see encode_cluster_view
 
     // worker → daemon, again
     chan_rep  = 4,   // payload: see encode_chan_reply
@@ -648,6 +654,117 @@ inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wir
         e.group       = std::string(r.str());
         if (!r.ok) return false;
         rts.push_back(std::move(e));
+    }
+    return r.ok;
+}
+
+// ── The cluster, as a worker is allowed to see it ───────────────────────────
+//
+// The runtime map above answers what this daemon holds.  This answers what the
+// CLUSTER holds, and it is a separate frame because it is a separate fact with
+// a separate clock: a remote daemon joining or leaving moves nothing in the
+// local map, and a worker holding a map that is perfectly current can still be
+// describing a cluster that no longer exists.
+//
+// Three fields, and none of them is derivable from anything a worker already
+// has: this daemon's cluster NAME, the address it advertises — which is the
+// `host` of every LOCAL member, so a worker guessing 127.0.0.1 would hand a
+// script an address no other node can reach — and get_all_daemons() verbatim.
+// See shared/cluster_view.h, which is where the reasoning for the shape lives
+// and which the daemon and the worker both build against.
+//
+// ─── WHY NOT A cluster_discovery IN THE WORKER ──────────────────────────────
+//
+// Because it publishes.  A cluster_discovery claims this node's name in the
+// shared directory, and claim_is_ours() is what tells "me, restarted" from
+// "somebody else with my name" — so a worker running one would read as a second
+// daemon to every other member of the cluster.  A worker is a reader and gets a
+// reader's object.
+//
+// ─── WHAT TRAVELS AND WHAT DOES NOT ─────────────────────────────────────────
+//
+// The structs are cluster_discovery's own, not a flat copy: the daemon builds
+// this straight out of get_all_daemons(), and a second pair of structs with the
+// same fields is a conversion nobody would keep correct.  Every field of them
+// crosses, heartbeat included — it is read by nothing in the Lua surface today,
+// and leaving it at zero would be a field that is silently wrong rather than
+// merely absent, which is the trade this tree makes the other way round.
+//
+// The cost of carrying it is that the payload changes on every scan even when
+// the cluster has not, so the per-child dedupe cannot suppress this frame the
+// way it suppresses an unchanged runtime map.  That is one frame per worker per
+// scan interval on a CLUSTERED daemon and none at all on the ordinary one,
+// which is the shape worth paying: a daemon that is not in a cluster never
+// sends this frame at all.
+//
+// An EMPTY view — no daemon name — is how "this daemon is not in a cluster any
+// more" crosses.  The worker takes it as a withdrawal rather than as a cluster
+// of one with no name, and its four cluster calls go back to refusing.
+
+inline std::string encode_cluster_view(const cluster_view& v)
+{
+    std::string out;
+    put_str(out, v.daemon_name);
+    put_str(out, v.host);
+    put_u32(out, static_cast<uint32_t>(v.remote.size()));
+    for (const auto& d : v.remote)
+    {
+        put_str(out, d.name);
+        put_str(out, d.host);
+        put_u64(out, static_cast<uint64_t>(d.heartbeat));
+        put_u32(out, static_cast<uint32_t>(d.runtimes.size()));
+        for (const auto& r : d.runtimes)
+        {
+            put_str(out, r.daemon_name);
+            put_str(out, r.host);
+            put_str(out, r.name);
+            put_str(out, r.type);
+            put_str(out, r.group);
+            put_u16(out, r.port);
+            put_str(out, r.state);
+            put_u64(out, static_cast<uint64_t>(r.connections));
+        }
+    }
+    return out;
+}
+
+inline bool decode_cluster_view(std::string_view payload, cluster_view& v)
+{
+    reader r(payload.data(), payload.size());
+    v.daemon_name = std::string(r.str());
+    v.host        = std::string(r.str());
+    v.remote.clear();
+
+    const uint32_t nd = r.u32();
+    if (!r.ok) return false;
+
+    // Not reserved on either count, for the reason decode_endpoints gives: both
+    // arrive from another process, and reserving on them would let a corrupt
+    // frame ask for an arbitrary allocation.
+    for (uint32_t i = 0; i < nd && r.ok; ++i)
+    {
+        remote_daemon d;
+        d.name      = std::string(r.str());
+        d.host      = std::string(r.str());
+        d.heartbeat = static_cast<time_t>(r.u64());
+        const uint32_t nr = r.u32();
+        if (!r.ok) return false;
+        for (uint32_t j = 0; j < nr && r.ok; ++j)
+        {
+            remote_runtime rt;
+            rt.daemon_name = std::string(r.str());
+            rt.host        = std::string(r.str());
+            rt.name        = std::string(r.str());
+            rt.type        = std::string(r.str());
+            rt.group       = std::string(r.str());
+            rt.port        = r.u16();
+            rt.state       = std::string(r.str());
+            rt.connections = static_cast<size_t>(r.u64());
+            if (!r.ok) return false;
+            d.runtimes.push_back(std::move(rt));
+        }
+        if (!r.ok) return false;
+        v.remote.push_back(std::move(d));
     }
     return r.ok;
 }

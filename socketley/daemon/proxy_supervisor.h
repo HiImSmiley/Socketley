@@ -250,6 +250,15 @@ public:
     // the last push would otherwise hold an empty map until something moved.
     void send_runtime_map(const std::string& encoded_payload);
 
+    // What the cluster looks like, for the four socketley.cluster.* calls.
+    //
+    // Same discipline as the map — cached, deduped, re-sent to a new child —
+    // with one difference that is not this function's doing: the payload
+    // carries a heartbeat per remote daemon, so on a clustered daemon it
+    // differs on every scan and the dedupe rarely fires.  A daemon that is not
+    // in a cluster sends this frame once, empty, and then never again.
+    void send_cluster_view(const std::string& encoded_payload);
+
     // `socketley send <name> <message>`, on its way to the runtime that has the
     // connections.  Best-effort like every other frame going down: a false is a
     // child that is not reading, and cmd_send reports it rather than returning
@@ -378,6 +387,7 @@ private:
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
     std::string       m_runtime_map;      // last map, re-sent to a new child
+    std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
 
     // Frames written but not yet taken by the socket.  Bounded, because the
