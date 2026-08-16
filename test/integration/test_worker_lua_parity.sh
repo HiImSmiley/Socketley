@@ -69,6 +69,32 @@
 # the test waits for CONN to reach 1 before probing — otherwise `get.connections`
 # would read 0 for a reason that has nothing to do with the process boundary.
 #
+# ─── ONE ASSERTION IS POLLED, AND IT IS NOT AN OVERSIGHT ────────────────────
+#
+# Forty-two of the forty-three compare a value that is either right or wrong the
+# moment it is read.  socketley.get()'s connection count is the exception, and
+# the asymmetry that makes it one is worth stating here because it is invisible
+# at the assertion:
+#
+#     the daemon arm's figure is EXACT.      par_peer is --daemon-process, so
+#                                            the daemon holds its connections
+#                                            and reads them off live tables.
+#     the worker arm's figure is REPLICATED. It arrives in a pushed runtime map
+#                                            on the stats cadence.
+#
+# Those two cannot agree in the same instant, and no transport would make them:
+# the design offers convergence, not simultaneity.  So that one assertion polls
+# to a deadline derived from the push interval, and every other one samples
+# once.  See the block at the `get` assertion for where the deadline comes from
+# and why a longer sleep is not the fix.
+#
+# DO NOT collapse it back into a single sample to match its neighbours.  It was
+# one, and it passed inside run_all.sh while failing 5 runs out of 5 standalone
+# — green in CI, red for anyone running the file alone, because the suite puts
+# ~180 ms of other work between the connection and the read.  A test that is
+# green because the machine is busy is telling you nothing on the machine where
+# it matters.
+#
 # ─── PIPE IS THE ONE THAT STAYS REFUSED ─────────────────────────────────────
 #
 # socketley.pipe() hands a file descriptor from one runtime to another.  Across
@@ -257,6 +283,16 @@ local function one(f)
   return a
 end
 
+-- socketley.get(PEER), formatted.  Its own function because `getpeer` below
+-- re-asks it while `probe` asks it once, and two copies of this expression
+-- would be two things to keep in step for no reason.
+local function get_peer()
+  local g = socketley.get(PEER)
+  if g == nil then return "nil" end
+  return g.type .. "/" .. g.state .. "/" .. g.port .. "/" .. g.connections
+         .. "/" .. tostring(g.owner)
+end
+
 local function report(what)
   local out = {}
   local function add(k, v) out[#out+1] = k .. " " .. tostring(v) end
@@ -267,12 +303,7 @@ local function report(what)
       for _, n in ipairs(l) do if WANTED[n] then k = k + 1 end end
       return k .. "/" .. #l
     end))
-    add("get", one(function()
-      local g = socketley.get(PEER)
-      if g == nil then return "nil" end
-      return g.type .. "/" .. g.state .. "/" .. g.port .. "/" .. g.connections
-             .. "/" .. tostring(g.owner)
-    end))
+    add("get", one(get_peer))
     -- The same call, asked about a name that is not there.  Without it, a
     -- build that answered every get() with an invented row would pass the line
     -- above.
@@ -312,6 +343,12 @@ local function report(what)
       return s.daemons .. "/" .. s.runtimes .. "/" .. s.running .. "/"
              .. tostring(s.groups and s.groups.parity)
     end))
+
+  elseif what == "getpeer" then
+    -- Just the one field, so the convergence poll can re-ask cheaply without
+    -- re-running send() — which delivers to a real client — or pipe(), or the
+    -- four cluster calls, on every iteration.
+    add("get", one(get_peer))
 
   elseif what == "make" then
     add("create", one(function()
@@ -504,7 +541,104 @@ par list "$OOP_list" "$IN_list"
 # says .../0 here beside a CONN column that says 1.
 ctl "socketley.get()" "$IN_get" "server/running/$PEER_PORT/1/nil" \
     "a build with no connection figure in the map would say .../0/nil"
-par get "$OOP_get" "$IN_get"
+
+# ── and the one field that is a CONVERGING figure, not an instantaneous one ──
+#
+# The forty-two assertions around this one compare a value that is either right
+# or wrong the moment it is read.  This one cannot be, and no amount of care in
+# the transport would make it so — see the header: par_peer lives in the daemon,
+# so the daemon's own answer for it is exact, while a worker's is a replica that
+# arrives on a push.  Demanding they agree in the same instant is demanding
+# something the design does not offer and should not be made to.
+#
+# What the map does promise is CONVERGENCE, so that is what is asserted: poll
+# until the two arms agree, and fail if they never do.
+#
+# ─── WHY THIS IS A POLL AND NOT A LONGER SLEEP ──────────────────────────────
+#
+# It was a single sample, and it passed inside run_all.sh and failed 5 runs out
+# of 5 standalone — 42/43 alone, green in the suite.  Not a flake in either
+# direction: under the suite there is ~180 ms of other test work between the
+# connection and the read, so more push intervals elapse and the figure arrives
+# in time.  The test was passing because the machine was busy, which is the
+# wrong way round — green in CI and red for whoever runs it alone to check
+# something, and the lone run is the honest one.  A fixed sleep would only move
+# the threshold; it would still be a race, just one that loses less often.
+#
+# ─── WHERE THE DEADLINE COMES FROM, AND WHY IT IS NOT A ROUND NUMBER ────────
+#
+# Read out of the source rather than written here, so that changing the cadence
+# moves this bound with it instead of silently leaving it behind.
+#
+# The mechanism bounds it from BOTH sides, which is what makes 4x the right
+# multiple rather than a number that happened to pass:
+#
+#   FLOOR   daemon_handler::on_worker_stats() coalesces one map round per
+#           interval, and a figure that changes just after a round waits out
+#           the remainder before the next one carries it.  The daemon side
+#           documents the result as: the daemon is <=1 interval stale, a worker
+#           <=2.  So anything at or under 2x is asserting something the design
+#           does not promise, and would be red on a correct build.
+#   CEILING The behaviour this replaced was the two-second health tick, which is
+#           8x.  A deadline at or above that passes on the very regression the
+#           assertion exists to catch, and 38e343d is one revert away.
+#
+# 4x sits between them: twice the worst case the design promises, half the
+# interval of the bug it guards against.  Measured on this tree it converges far
+# inside that -- see the wait time the failure text prints, which is there so
+# the next reader can tell a real breakage from a margin that got tight.
+STATS_MS=$(grep -oE 'stats_interval_ms *= *[0-9]+' \
+           "$(dirname "$0")/../../socketley/shared/worker_protocol.h" 2>/dev/null \
+           | grep -oE '[0-9]+$' | head -1)
+case "$STATS_MS" in
+    ''|*[!0-9]*)
+        # Not fatal, but not silent either: the bound below is then a guess, and
+        # a guess that has stopped tracking the code is how a deadline ends up
+        # meaningless.
+        STATS_MS=250
+        STATS_SRC="ASSUMED — could not read stats_interval_ms from worker_protocol.h" ;;
+    *)
+        STATS_SRC="read from worker_protocol.h" ;;
+esac
+CONVERGE_MS=$((STATS_MS * 4))
+
+now_ms() { date +%s%3N; }
+GET_T0=$(now_ms)
+GET_WAITED=0
+while [ "$OOP_get" != "$IN_get" ]; do
+    GET_WAITED=$(( $(now_ms) - GET_T0 ))
+    [ "$GET_WAITED" -ge "$CONVERGE_MS" ] && break
+    sleep 0.05
+    OOP_get=$(field "$(ask "$OOP_PORT" getpeer)" get)
+done
+GET_WAITED=$(( $(now_ms) - GET_T0 ))
+
+if [ "$OOP_get" = "$IN_get" ]; then
+    pass
+else
+    case "$OOP_get" in
+        REFUSED:*)
+            fail "parity: socketley.get" \
+                 "worker arm: $OOP_get" \
+                 "daemon arm: $IN_get" \
+                 "still refused — this is the expected red until the map lands" ;;
+        *)
+            fail "parity: socketley.get — connections never converged" \
+                 "worker arm: $OOP_get" \
+                 "daemon arm: $IN_get" \
+                 "polled for ${GET_WAITED}ms, deadline ${CONVERGE_MS}ms" \
+                 "(4 x stats_interval_ms=${STATS_MS}, $STATS_SRC)" \
+                 "THIS FIELD IS A CONVERGING FIGURE, NOT AN INSTANTANEOUS ONE." \
+                 "par_peer lives in the daemon, so the daemon's count is exact" \
+                 "and the worker's is a replica arriving on a push — they are" \
+                 "not supposed to agree in the same instant, only before this" \
+                 "deadline. Waiting longer is NOT the fix: the deadline is twice" \
+                 "the worst case the push design documents, and already only" \
+                 "half the two-second health tick this replaced. Exceeding it" \
+                 "means the coalescing floor in on_worker_stats() has broken or" \
+                 "the counts are back on the health tick." ;;
+    esac
+fi
 
 ctl "socketley.get() on a name that is not there" "$IN_gabs" "nil" \
     "a build that invented a row for any name would say nonnil"
