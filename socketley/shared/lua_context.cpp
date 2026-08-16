@@ -2275,6 +2275,19 @@ namespace
 // names what was typed.  `mistaken_for` completes the sentence, because the lie
 // differs by call: an empty list reads as a daemon with nothing in it, while a
 // false from self.route() reads as a target that is not there.
+//
+// THIS ONE IS FOR THE CALLS THAT READ.  It says "answering from here would
+// return nothing", which is true of a lookup and false of a mutation, and it
+// ends by promising the map — which is a promise only a read can keep.  The
+// three families are split below because a refusal that names the wrong
+// missing thing sends its reader to wait for the wrong delivery:
+//
+//   read       list, get, send, and the four cluster calls — this function.
+//              They come back when the worker is handed the runtime map.
+//   mutate     create, start, stop, remove — worker_mutation_refusal().
+//              They do not come back with it; see there.
+//   carry a    pipe, self.route — worker_transfer_refusal().  What is missing
+//   connection is a channel between two runtimes, not a map at all.
 std::string worker_refusal(const std::string& call,
                            const char* mistaken_for =
                                "a successful call on a daemon with nothing in it")
@@ -2287,49 +2300,149 @@ std::string worker_refusal(const std::string& call,
            "one that has it.";
 }
 
-// ── The one whose missing piece is not the map ──────────────────────────────
+// ── The four that change the map rather than read it ────────────────────────
 //
-// socketley.pipe() shared the sentence above, and that sentence sends the
-// reader after the wrong thing.  The other eleven are refused because the
+// create, start, stop and remove shared the sentence above, and it is wrong
+// about them twice over.
+//
+// It says answering here "would return nothing".  It would not: it would
+// return TRUE, having done something, and the something is the problem.  Read
+// against the worker's own manager — which is not null; the runtime's manager
+// is set in the worker's on_config — each of these acts on this process's
+// private copy of a map with one runtime in it:
+//
+//   create   mgr->create(), then set_event_loop() with THIS WORKER'S ring and
+//            mgr->start() on it.  A second live runtime, bound and serving,
+//            inside a process that is supposed to hold one — invisible to the
+//            daemon, absent from the state file, gone at the next restart.
+//   start    runtime_instance::start() returns early for an out-of-process
+//            placeholder: it stores `running` and returns true without binding
+//            anything.  In the daemon that is harmless because the health tick
+//            reconciles and forks the child; a worker has neither.
+//   stop     the mirror of it — stores `stopped`, returns true, does nothing.
+//   remove   drops the local copy.  The daemon still has the runtime.
+//
+// And it ends by promising --daemon-process as though the map were the thing
+// in the way.  The map is coming; these still will not work when it arrives,
+// because being told what the map holds is not permission to alter it.  Doing
+// that from here needs a synchronous round trip to the daemon inside a Lua
+// callback, and this project settled that question the other way: a runtime
+// does not make a synchronous request of another process, because the only way
+// to implement one is to block the loop that is serving every connection this
+// worker holds.  See shared/request_channel.h, which is the asynchronous shape
+// that decision produced.
+//
+// So the message says the true reason and does not promise a delivery.  The
+// way out is real and unchanged: the call works in the daemon.
+std::string worker_mutation_refusal(const std::string& call)
+{
+    return call +
+           "() is refused in a worker process: this call CHANGES the runtime "
+           "map, and the map lives in the daemon. A worker can be told what "
+           "the map holds and still not be allowed to alter it, so this one is "
+           "not waiting on the map arriving — answering it here would act on "
+           "this process's own copy: a runtime built inside this worker that "
+           "the daemon never hears about, or a start and a stop that flip a "
+           "placeholder and bind nothing. Create this runtime with "
+           "--daemon-process, or move the call to one that has it.";
+}
+
+// ── The two whose missing piece is not the map at all ───────────────────────
+//
+// socketley.pipe() and self.route() shared the generic sentence, and it sends
+// their reader after the wrong thing.  The read calls are refused because the
 // runtime map lives in the daemon, so the day the worker is handed that map
-// they stop being refused.  This one is not: a pipe hands an OPEN FILE
-// DESCRIPTOR from one runtime to another, and a descriptor does not travel in
-// a snapshot of anything.
+// they stop being refused.  These two do not: what they move is a CONNECTION,
+// and a connection does not travel in a snapshot of anything.
 //
 // Told the generic message, an operator reads "the runtime map is elsewhere"
-// and waits for the map.  It will arrive and this call will still be refused.
+// and waits for the map.  It will arrive and both will still be refused.
 //
-// What is missing is stated as what it is, and NOT as "SCM_RIGHTS is not
-// built", which was the first draft of this and is false.  shared/
-// conn_transfer.h has the whole mechanism — send_handover/recv_handover over
-// SCM_RIGHTS, the withdraw/relinquish pair that stops the sender and the
-// receiver both holding a working descriptor, and a tagged relay framing for
-// the case where the middle has to keep seeing the bytes — with a unit test
-// behind it.  shared/conn_identity.h has the naming half: a conn_ref that means
-// the same thing in both processes, precisely because a descriptor number does
-// not.  What does not exist is a CHANNEL between two runtimes to carry either
-// of them: worker_protocol.h says in as many words that no descriptor crosses
-// the daemon-worker control socket, and points at conn_transfer.h as "a
-// different channel with a different rule" — a channel nothing has opened.  So
-// the message says there is no channel, which is the true and checkable thing.
+// ─── WHAT IS ACTUALLY MISSING, STATED AS WHAT IT IS ─────────────────────────
 //
-// The way out named at the end is the real one and it is exact.  There are two
-// branches to pipe(): naming one runtime twice pairs two of THAT server's own
-// connections, which crosses nothing at all, and self.pipe(a, b) is the same
-// operation on the same tables — it is bound in a worker and it works there.
-// Only the two-runtime branch needs a boundary crossed.
+// NOT "SCM_RIGHTS is not built", which was the first draft of this and is
+// false.  Checked, and the mechanism is in the tree with a test on it:
+//
+//   shared/conn_transfer.h   send_handover/recv_handover over SCM_RIGHTS for
+//                            the case where the far runtime becomes the
+//                            endpoint; withdraw/relinquish, which is what
+//                            stops the sender and the receiver both holding a
+//                            working descriptor for one socket; and a tagged
+//                            relay framing for the case where the middle has
+//                            to keep seeing the bytes.
+//   shared/conn_identity.h   the naming half — a conn_ref that means the same
+//                            thing in both processes, written precisely
+//                            because a descriptor number does not.
+//   test/unit/test_conn_transfer.cpp   exercises all of it.
+//
+// What does not exist is a CHANNEL between two runtimes to carry either.
+// worker_protocol.h says in as many words that no descriptor crosses the
+// daemon-worker control socket, and points at conn_transfer.h as "a different
+// channel with a different rule" — a channel nothing has opened.  Grepped: no
+// conn_transfer:: call site anywhere outside that unit test.
+//
+// The message says so, and says the mechanism exists, because the distinction
+// is the whole cost estimate.  Whoever picks these up next should find a
+// component to wire, not conclude they have to write SCM_RIGHTS from scratch.
+//
+// `moves` completes the first sentence, because the two move a connection in
+// different directions and a reader has to recognise their own call in it.
+// `way_out` is separate for the same reason and is exact per call — see the
+// two callers.
+std::string worker_transfer_refusal(const std::string& call, const char* moves,
+                                    const std::string& way_out)
+{
+    return call + "() is refused in a worker process: " + moves +
+           ", and a connection cannot be handed to another process the way a "
+           "name or a port can — the descriptor has to be passed with "
+           "SCM_RIGHTS, or its bytes relayed under a reference that means the "
+           "same thing at both ends, and there is no channel between two "
+           "runtimes to carry either. The mechanism for both is in the tree "
+           "and tested; nothing is wired to it yet. So this one is not waiting "
+           "on the runtime map and will not come back with it. " + way_out;
+}
+
+// pipe has two branches and only one of them crosses anything.  Naming one
+// runtime twice pairs two of THAT server's own connections — and self.pipe(a,
+// b) is the same operation on the same tables, bound in a worker and working
+// there.  So the way out names it, rather than sending somebody to
+// --daemon-process for a call that needs no boundary crossed.
 std::string worker_pipe_refusal()
 {
-    return "socketley.pipe() is refused in a worker process: a pipe hands an "
-           "open file descriptor from one runtime to another, and a descriptor "
-           "does not travel in a snapshot of the runtime map the way a name or "
-           "a port does — it has to be passed with SCM_RIGHTS over a channel "
-           "between the two processes, and there is no such channel between "
-           "runtimes yet. This one is therefore not waiting on the runtime map "
-           "and will not come back with it. To pair two connections of this "
-           "same server, call self.pipe(fd_a, fd_b), which stays in this "
-           "process and is not refused; to route a connection to another "
-           "runtime, create both with --daemon-process.";
+    return worker_transfer_refusal(
+        "socketley.pipe",
+        "a pipe hands an open file descriptor from one runtime to another",
+        "To pair two connections of this same server, call self.pipe(fd_a, "
+        "fd_b), which stays in this process and is not refused; to route a "
+        "connection to another runtime, create both with --daemon-process.");
+}
+
+// self.route() has no local branch: it always names another runtime, so there
+// is no self.* equivalent to point at and --daemon-process is the whole answer.
+//
+// It is the heavier of the two, and the message says which mechanism it wants
+// rather than leaving "a channel" to be guessed at.  server_instance::
+// route_client() does not hand the descriptor over at all — it writes into the
+// TARGET's private maps and calls the target's on_connect on the caller's
+// stack, while this server keeps the connection and relays the bytes.  That is
+// conn_transfer.h's RELAY shape, not its HANDOVER shape, and the two want
+// opposite things: a handover leaves the middle out of the data path, a relay
+// keeps it in.  Naming the relay here is not decoration — it is the difference
+// between one wiring job and the other.
+//
+// The conn_ref half is already done and this call already uses it:
+// route_client() takes ref_for_fd(client_id) and passes it to
+// accept_routed(ref, get_name()).  Only the channel is missing.
+std::string worker_route_refusal()
+{
+    return worker_transfer_refusal(
+        "self.route",
+        "routing hands a live client to another runtime, which answers it "
+        "while this server keeps the socket and relays the bytes",
+        "Create both runtimes with --daemon-process. unroute(), get_route() "
+        "and owner_send() are not refused here: they read this runtime's own "
+        "tables, which in a worker are empty because nothing was ever routed "
+        "in, and that is the truth rather than a substitute for it.");
 }
 
 // The raise itself.  Built by a Lua factory so that what a script sees is Lua's
@@ -2386,20 +2499,40 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
         return;
     }
 
-    // Everything that reaches for the runtime map, and nothing that does not.
-    // socketley.log, .http, .json_*, the timers and .subscribe/.unsubscribe all
-    // work in a worker exactly as they do in the daemon, and .subscribe in
-    // particular is delivered to now — see runtime_manager::set_publish_sink.
-    for (const char* call : {"create", "start", "stop", "remove", "send", "list",
-                             "get"})
+    // ── Grouped by what is missing, not by which table they sit on ──────────
+    //
+    // These were one loop over eight names sharing one sentence, and three of
+    // the four groups below were being told the wrong reason.  Grouped rather
+    // than written out per call so the list of what is refused is still
+    // readable in one place — which was the point of doing this here at all —
+    // but a group is now a claim about WHY, and each group's claim is checked
+    // in the function that writes its message.
+    //
+    // socketley.log, .http, .json_*, the timers and .subscribe/.unsubscribe are
+    // in none of them: they work in a worker exactly as they do in the daemon,
+    // and .subscribe in particular is delivered to — see
+    // runtime_manager::set_publish_sink.
+
+    // READ.  These come back when the worker is handed the runtime map.
+    for (const char* call : {"send", "list", "get"})
     {
         sol::function f = make(worker_refusal(std::string("socketley.") + call));
         sk[call] = f;
     }
 
-    // pipe is refused for a different reason and says so.  It was in the loop
-    // above, sharing a sentence that names the runtime map — and the map is not
-    // what it is short of.  See worker_pipe_refusal().
+    // MUTATE.  These do not come back with it: being told what the map holds is
+    // not permission to alter it.  See worker_mutation_refusal() for what each
+    // of the four would actually do if it were answered here, which is worse
+    // than returning nothing.
+    for (const char* call : {"create", "start", "stop", "remove"})
+    {
+        sol::function f = make(worker_mutation_refusal(std::string("socketley.") + call));
+        sk[call] = f;
+    }
+
+    // CARRY A CONNECTION.  Not a map problem at all.  See
+    // worker_transfer_refusal(); self.route() is the other one and is installed
+    // on the server table, at the bottom of this file.
     sk["pipe"] = make(worker_pipe_refusal());
 
     // The cluster view is the runtime map plus what discovery has heard, and a
@@ -3719,23 +3852,39 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // absent from one that is merely in another process, and the accepted-but-
     // not-applied call is the shape this tree refuses everywhere else.
     //
-    // What this does NOT say is how routing a connection between processes
-    // should eventually work.  It says only that it cannot happen in a worker
-    // today, which is true and is all that is known: when a connection can be
-    // handed to another process, this is the binding that stops being refused,
-    // and nothing here decides what that mechanism looks like.
+    // ─── IT IS NOT WAITING ON THE MAP, AND THE MESSAGE USED TO SAY IT WAS ───
+    //
+    // The paragraph that stood here said the mechanism was undecided and that
+    // this binding "stops being refused" when a connection can be handed to
+    // another process.  The first half is no longer true and the second half
+    // was pointing at the wrong delivery: the message it installed was the map
+    // one, so a script author read "the runtime map is elsewhere" and waited
+    // for a map that will not help.
+    //
+    // Read route_client() for why.  It does not hand the descriptor over: it
+    // takes ref_for_fd(client_id), writes m_routes and m_conn_idx, and calls
+    // sub->accept_routed(ref, get_name()) — the TARGET's on_connect, on this
+    // thread's stack — after which this server keeps the socket and relays the
+    // bytes through itself.  Two of those three steps are reaching into another
+    // runtime's object, and a map of names cannot supply either.  What it wants
+    // is conn_transfer.h's RELAY shape over a channel between the two
+    // processes, and worker_route_refusal() says exactly that.
+    //
+    // So it is grouped with socketley.pipe() rather than with the reads, and
+    // the day the map lands it stays refused.
     //
     // Only route().  unroute(), get_route() and owner_send() answer from this
     // runtime's own tables, and in a worker those are empty because nothing was
     // ever routed — so their false is the truth rather than a substitute for
-    // it, and refusing them would replace a correct answer with an error.
+    // it, and refusing them would replace a correct answer with an error.  The
+    // refusal says that too, because a script author who has just been refused
+    // route() is the person most likely to try the other three next.
     if (in_worker_process())
     {
         sol::function make = refusal_factory(m_lua);
         if (make.valid())
         {
-            sol::function f = make(
-                worker_refusal("self.route", "a target that does not exist"));
+            sol::function f = make(worker_route_refusal());
             self["route"] = f;
         }
         else

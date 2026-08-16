@@ -226,7 +226,8 @@ self.clients(), self.multicast(ids, msg), self.disconnect(id)
 self.peer_ip(id), self.ws_headers(id)
 self.set_data(id, k, v), self.get_data(id, k)
 self.join_group(id, g), self.leave_group(id, g), self.group_send(g, msg)
-self.route(id, target)      -- refused in a worker: needs --daemon-process
+self.route(id, target)      -- refused in a worker, permanently: it moves a
+                            -- connection, not a name.  See below.
 self.unroute(id), self.get_route(id)
 self.owner_send(id, msg), self.owner_broadcast(msg)
 
@@ -277,14 +278,44 @@ is loud. Inside a callback it is caught and logged and the runtime carries on �
 `ls` green, connections accepted, and none of the work done. That second case
 is the one to watch for.
 
-`socketley.pipe` is in that list for a different reason and its message says a
-different thing. A pipe hands an **open file descriptor** from one runtime to
-another, and a descriptor does not travel in a snapshot of the runtime map the
-way a name or a port does — it has to be passed with `SCM_RIGHTS` over a channel
-between the two processes, and there is no such channel between runtimes yet.
-The mechanism exists and is tested (`shared/conn_transfer.h`); nothing is wired
-to it, and the daemon-worker control socket carries no descriptors by design. So
-it is the one call here that is not waiting on the runtime map. To pair two
-connections of the *same* server from inside a worker, use `self.pipe(fd_a,
-fd_b)`: it is the same operation on the same tables, it crosses nothing, and it
-is not refused there.
+**Read the message you got — there are three of them, and they mean different
+things.** Only the first group is waiting on something.
+
+| group | calls | comes back when a worker has the map? |
+|---|---|---|
+| read the map | `.send` `.list` `.get`, all of `socketley.cluster` | yes |
+| change the map | `.create` `.start` `.stop` `.remove` | **no** |
+| move a connection | `.pipe`, `self.route()` | **no** |
+
+The four that **change** the map are refused permanently. Being told what the
+map holds is not permission to alter it, and answering them inside a worker
+would act on that process's private copy: `create` would build a runtime inside
+the worker — bound, serving, and unknown to the daemon, the state file and `ls`
+— while `start` and `stop` would store a state on a placeholder and return
+`true` having bound and signalled nothing. Doing it properly needs a synchronous
+round trip inside a Lua callback, which would block the loop serving every
+connection that worker holds; this project settled that question the other way
+when it built the asynchronous request channel.
+
+The two that **move a connection** are not a map problem at all. `socketley.pipe`
+hands an **open file descriptor** from one runtime to another, and a descriptor
+does not travel in a snapshot the way a name or a port does — it has to be passed
+with `SCM_RIGHTS`, or its bytes relayed under a reference that means the same
+thing at both ends, over a channel between the two processes. There is no such
+channel between runtimes yet. The mechanism exists and is tested
+(`shared/conn_transfer.h`, with `shared/conn_identity.h` for the reference);
+nothing is wired to it, and the daemon-worker control socket carries no
+descriptors by design.
+
+`self.route()` is the same family, and easy to misread as a lookup because it
+names another runtime. It is not: `route_client()` writes into the *target's*
+private maps and runs the target's `on_connect` on the caller's stack, after
+which the routing server keeps the socket and relays the bytes through itself —
+the relay shape rather than the handover one. `unroute()`, `get_route()` and
+`owner_send()` are *not* refused: they read this runtime's own tables, which in
+a worker are empty because nothing was ever routed in, and that is the truth
+rather than a substitute for it.
+
+To pair two connections of the *same* server from inside a worker, use
+`self.pipe(fd_a, fd_b)`: it is the same operation on the same tables, it crosses
+nothing, and it is not refused there.

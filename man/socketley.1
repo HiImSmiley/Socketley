@@ -1830,22 +1830,46 @@ kept level in four places; neither is kept as a synonym, because a flag that no
 longer changes anything is a flag whose meaning has to be looked up to discover
 that it has none.
 .IP
-What this buys back is what only shared memory can give. The cross\-runtime Lua
-management API \(em
+What this buys back is what only shared memory can give. Thirteen calls are
+refused inside a worker, and they fall into three groups that are refused for
+three different reasons \(em which matters, because only the first group comes
+back when a worker is handed the runtime map:
+.RS
+.TP
+.B Reads of the map
+.BR socketley.send ,
+.BR .list ,
+.B .get
+and all four of
+.BR socketley.cluster .
+The map lives in the daemon and a worker has none, so answering here would
+return nothing \(em which is what a
+.I successful
+call returns on a daemon with nothing in it.
+.TP
+.B Changes to the map
 .BR socketley.create ,
 .BR .start ,
 .BR .stop ,
-.BR .remove ,
-.BR .send ,
-.BR .list ,
-.BR .get ,
-.B .pipe
-and all of
-.B socketley.cluster
-\(em is refused inside a worker, and so is
-.BR self.route() ,
-which names another runtime and so reaches for the same map. At a script's top
-level that refusal leaves the runtime
+.BR .remove .
+Being told what the map holds is not permission to alter it, so these do
+.I not
+come back with it. Answered inside a worker they would act on that process's
+private copy: a runtime built inside the worker that the daemon never hears
+about, or a
+.B start
+and a
+.B stop
+that flip a placeholder and bind nothing.
+.TP
+.B Moving a connection
+.B socketley.pipe
+and
+.BR self.route() .
+Not a map problem at all \(em see the note under the Lua API below.
+.RE
+.IP
+At a script's top level any of those refusals leaves the runtime
 .BR failed .
 And a cross\-runtime request costs about 50 microseconds more, measured, which a
 server doing
@@ -3907,7 +3931,7 @@ with them, is replaced there by a function that raises a Lua error naming the
 call, the reason and the way out:
 .PP
 .nf
-[lua lobby] on_start error: lobby.lua:13: socketley.create() is refused in a
+[lua lobby] on_start error: lobby.lua:13: socketley.list() is refused in a
 worker process: this call reaches for the runtime map, which lives in the
 daemon ... Create this runtime with \-\-daemon\-process, or move the call to
 one that has it.
@@ -3920,6 +3944,48 @@ or an empty table is what a
 .I successful
 call returns on a daemon with nothing in it, so neither the script nor the
 operator could tell the two apart.
+.PP
+.B The message differs by why, and the difference is not cosmetic.
+Read the sentence you got rather than assuming it is the one above: it says
+whether your call is waiting on something or is refused for good.
+.RS
+.PP
+.BR socketley.create ,
+.BR .start ,
+.BR .stop
+and
+.B .remove
+say they
+.I change
+the runtime map. A worker can be told what the map holds and still not be
+allowed to alter it, so these are not waiting on anything \(em they are refused
+out here permanently. Answered inside a worker they would act on that process's
+own copy:
+.B create
+would build a runtime inside the worker, bound and serving, that never reaches
+the daemon, the state file or
+.BR ls ;
+.B start
+and
+.B stop
+would store
+.B running
+or
+.B stopped
+on a placeholder and return
+.B true
+having bound and signalled nothing;
+.B remove
+would drop the local copy and leave the runtime in the daemon. Making them work
+from a worker means a synchronous round trip inside a Lua callback, which would
+block the loop serving every connection that worker holds \(em and this project
+settled that question the other way when it built the asynchronous request
+channel.
+.PP
+.B socketley.pipe
+and
+.B self.route()
+say something else again; see below.
 .PP
 .B socketley.pipe
 is refused there too, and its message is a different one because its reason is
@@ -3934,12 +4000,39 @@ with
 .B shared/conn_identity.h
 for the reference that names a connection across a boundary); nothing is wired
 to it, and the daemon\(hyworker control socket carries no descriptors by
-design. So this is the one call in this list that is not waiting on the runtime
-map and will not come back with it. To pair two connections of the same server
-from inside a worker, use
+design. So this is not waiting on the runtime map and will not come back with
+it. To pair two connections of the same server from inside a worker, use
 .B self.pipe(fd_a, fd_b)
 instead: that is the same operation on the same tables, it crosses nothing, and
 it is not refused there.
+.PP
+.B self.route()
+is the other one, for the same reason and with a heavier version of it. It is
+easy to read as a lookup \(em it names another runtime \(em but that is not what
+it does.
+.B route_client()
+writes into the
+.I target's
+private connection maps and runs the target's
+.B on_connect
+on the caller's stack, after which the routing server keeps the socket and
+relays the bytes through itself. So it wants
+.BR conn_transfer.h 's
+.I relay
+shape rather than its
+.IR handover :
+the middle stays in the data path. The reference that names the connection at
+both ends already exists and this call already uses it \(em only the channel is
+missing. It stays refused in a worker.
+.B unroute() ,
+.B get_route()
+and
+.B owner_send()
+are
+.I not
+refused: they read the runtime's own tables, which in a worker are empty
+because nothing was ever routed in, and that is the truth rather than a
+substitute for it.
 .PP
 Where the raise lands is the thing to plan for. At a script's top level it fails
 the load, and a worker whose script did not load does not serve: the

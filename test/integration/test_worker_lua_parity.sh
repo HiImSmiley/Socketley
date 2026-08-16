@@ -122,13 +122,46 @@ ctl() {
 
 # par CALL OOP IN
 #
-# The worker arm against the in-daemon arm.  These are the twelve.
+# The worker arm against the in-daemon arm.  These are the calls that MUST go
+# green when the worker is handed the runtime map — the definition of done.
 par() {
     local call=$1 oop=$2 in=$3
     if [ "$oop" = "$in" ]; then pass; return; fi
     fail "parity: socketley.$call" \
          "worker arm: $oop" \
          "daemon arm: $in"
+}
+
+# refused CALL OOP NEEDLE WHY...
+#
+# The other kind, for the calls that are refused FOR GOOD.  Not parity — parity
+# for these is unreachable by design, and an assertion that can never pass is
+# not a target, it is a permanent red that teaches everyone to ignore the file.
+# What is asserted instead is that the refusal names the right missing thing.
+#
+# Three families end up here and they are refused for two different reasons:
+#
+#   create/start/stop/remove   they CHANGE the map.  Being handed a copy of it
+#                              is not permission to alter it, and answering
+#                              them against the worker's own copy is worse than
+#                              refusing — see the negative oracle further down,
+#                              which checks that nothing was built out there.
+#   pipe, self.route           they move a CONNECTION.  Not a map problem at
+#                              all; what is missing is a channel between two
+#                              runtimes, and the mechanism for it already
+#                              exists unwired in shared/conn_transfer.h.
+#
+# A refusal that names the wrong one is not a cosmetic fault: it tells its
+# reader to wait for a delivery that will not fix their call.
+refused() {
+    local call=$1 oop=$2 needle=$3; shift 3
+    case "$oop" in
+        REFUSED:*"$needle"*) pass; return ;;
+    esac
+    fail "refused by name: $call" \
+         "worker arm: $oop" \
+         "wanted a refusal saying: $needle" \
+         "$@"
 }
 
 CLUSTER_DIR="$SOCKETLEY_TMPD/cluster"
@@ -273,8 +306,46 @@ local function report(what)
   return table.concat(out, "\n") .. "\n"
 end
 
+-- ── self.route(), the thirteenth refusal ───────────────────────────────────
+--
+-- It gets its own word rather than a line in `probe`, because it is the one
+-- call here that cannot report down the connection it is about: a route that
+-- SUCCEEDS gives this client to par_peer, and there is then nobody on this end
+-- to answer with.  So the verdict goes to the log, under a marker carrying
+-- this runtime's own name — that tells the two arms apart without depending on
+-- how the log happens to tag a line.  socketley.log is in no refusal group and
+-- works in a worker.
+local function do_route(client_id)
+  local ok, a = pcall(function()
+    return self.route(client_id, PEER) and "true" or "false"
+  end)
+  if ok then
+    socketley.log("ROUTE-" .. self.name .. " " .. tostring(a))
+  else
+    socketley.log("ROUTE-" .. self.name .. " REFUSED:" ..
+                  tostring(a):gsub("%s+", " "))
+  end
+end
+
 function on_client_message(client_id, msg)
-  self.send(client_id, report(msg:match("^%a+") or "?"))
+  local what = msg:match("^%a+") or "?"
+  if what == "route" then return do_route(client_id) end
+  self.send(client_id, report(what))
+end
+LUAEOF
+
+# par_peer's own script, and it exists for one assertion: that a route in the
+# daemon arm really moved a connection.  Without it "the worker refused" also
+# passes on a build where self.route() is broken everywhere, which would be a
+# feature that does not work rather than a boundary that cannot be crossed.
+#
+# The id is logged rather than a bare marker so the lines can be counted: the
+# holder's connection produces one before any routing happens, and each routed
+# connection produces one more.
+PEER_LUA="$SOCKETLEY_TMPD/peer.lua"
+cat > "$PEER_LUA" <<'LUAEOF'
+function on_connect(client_id)
+  socketley.log("PEER_CONN " .. tostring(client_id))
 end
 LUAEOF
 
@@ -339,7 +410,7 @@ conn() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print $5 }'; }
 # `get.connections` has one unambiguous right answer for both arms to be
 # compared against.
 create_ok "target server created" "$BIN" create server par_peer \
-    -p "$PEER_PORT" --group parity --daemon-process -s
+    -p "$PEER_PORT" --group parity --lua "$PEER_LUA" --daemon-process -s
 create_ok "unstarted group member created" "$BIN" create server par_idle \
     -p "$IDLE_PORT" --group parity --daemon-process
 create_ok "in-daemon probe created" "$BIN" create server par_in \
@@ -481,11 +552,13 @@ IN_start=$(field "$IN_MAKE" start);   OOP_start=$(field "$OOP_MAKE" start)
 
 ctl "socketley.create()" "$IN_create" "true" \
     "a name that is free and a port that is free is a create that succeeds"
-par create "$OOP_create" "$IN_create"
+refused "socketley.create()" "$OOP_create" "CHANGES the runtime map" \
+    "create/start/stop/remove are refused for good: the map is coming, and" \
+    "being told what it holds is not permission to alter it"
 
 ctl "socketley.start()" "$IN_start" "true" \
     "a runtime that exists and is not running is a start that succeeds"
-par start "$OOP_start" "$IN_start"
+refused "socketley.start()" "$OOP_start" "CHANGES the runtime map"
 
 for _ in $(seq 1 30); do [ -n "$(row par_in_kid)" ] && break; sleep 0.1; done
 IN_ROW=$(row par_in_kid)
@@ -494,13 +567,42 @@ OOP_ROW=$(row par_oop_kid)
 ctl "the child the in-daemon arm made is really there" \
     "$IN_ROW" "$IN_KID_PORT/up" \
     "the script's own 'true' is not evidence that anything was built; this is"
-if [ "$OOP_ROW" = "$IN_KID_PORT/up" ] || [ "$OOP_ROW" = "$OOP_KID_PORT/up" ]; then
+
+# ── The negative oracle, and `ls` alone cannot make it ──────────────────────
+#
+# The worker arm must have built NOTHING.  The obvious check is that `ls` does
+# not list par_oop_kid — and on its own it is worthless here, because the
+# failure it is supposed to catch is invisible to `ls` by construction.
+#
+# Un-refuse create in a worker and it runs against the worker's own manager:
+# mgr->create(), set_event_loop() with THIS WORKER'S ring, mgr->start() on it.
+# That builds a real runtime, bound and serving, inside the worker process —
+# and the daemon never hears about it, so `ls` shows nothing whether the call
+# was refused or whether it silently succeeded behind the daemon's back.  The
+# two states are identical in the CLI.
+#
+# The port is what tells them apart.  A child built out there is LISTENING on
+# self.port + 10, so the kernel can be asked directly.  The in-daemon arm is
+# the control for the check itself: its own child must be listening, or a
+# probe that can see nothing anywhere would pass this vacuously.
+listening() { ss -ltnH 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { f=1 } END { print f?"yes":"no" }'; }
+
+if [ "$(listening "$IN_KID_PORT")" = "yes" ]; then pass; else
+    fail "control: the in-daemon arm's child is actually listening" \
+         "nothing is bound on $IN_KID_PORT" \
+         "the port probe below is the only thing that can see a runtime built" \
+         "inside a worker, and if it cannot see this one it can see nothing"
+fi
+
+if [ -z "$OOP_ROW" ] && [ "$(listening "$OOP_KID_PORT")" = "no" ]; then
     pass
 else
-    fail "the child the worker arm made is really there" \
-         "ls says '${OOP_ROW:-<no such runtime>}', wanted '$OOP_KID_PORT/up'" \
-         "the port is self.port + 10 read inside the worker, so a wrong port" \
-         "here is self.port being wrong out there rather than create being wrong"
+    fail "the worker arm built nothing, in the map or behind the daemon's back" \
+         "ls says '${OOP_ROW:-<nothing>}', and $OOP_KID_PORT is $(listening "$OOP_KID_PORT") bound" \
+         "a create answered inside a worker builds a runtime in that process:" \
+         "serving, unpersisted, absent from ls, and gone at the next restart." \
+         "That is the state this refusal exists to prevent, and the port is the" \
+         "only place it is visible from out here"
 fi
 
 # ─── unmake: stop + remove, same treatment ──────────────────────────────────
@@ -511,11 +613,15 @@ IN_remove=$(field "$IN_UNMAKE" remove); OOP_remove=$(field "$OOP_UNMAKE" remove)
 
 ctl "socketley.stop()" "$IN_stop" "true" \
     "a runtime that is running is a stop that succeeds"
-par stop "$OOP_stop" "$IN_stop"
+refused "socketley.stop()" "$OOP_stop" "CHANGES the runtime map" \
+    "answered against a placeholder, stop() stores 'stopped' and returns true" \
+    "having signalled nobody — see runtime_instance.cpp's out-of-process branch"
 
 ctl "socketley.remove()" "$IN_remove" "true" \
     "a runtime that exists is a remove that succeeds"
-par remove "$OOP_remove" "$IN_remove"
+refused "socketley.remove()" "$OOP_remove" "CHANGES the runtime map" \
+    "answered in a worker it would drop that process's own copy and leave the" \
+    "runtime in the daemon, which is a divergence nothing would report"
 
 for _ in $(seq 1 30); do [ -z "$(row par_in_kid)" ] && break; sleep 0.1; done
 
@@ -542,8 +648,11 @@ gone_after() {
 }
 gone_after "the child the in-daemon arm removed is really gone" \
            "$IN_ROW" "$(row par_in_kid)"
-gone_after "the child the worker arm removed is really gone" \
-           "$OOP_ROW" "$(row par_oop_kid)"
+
+# No worker counterpart, and its absence is the point.  The worker arm never
+# made a child — that is asserted above, by the port probe — so there is
+# nothing here to remove and an assertion about removing it would be green
+# because nothing happened, which this file does not count as coverage.
 
 # ─── the send oracle: bytes on a real connection ────────────────────────────
 #
@@ -563,6 +672,67 @@ if grep -q "PARITY-par_oop" "$PEER_OUT" 2>/dev/null; then pass; else
          "the client holding a connection to par_peer never received it" \
          "got: $(tr -d '\0' < "$PEER_OUT" 2>/dev/null | tr '\n' '|')"
 fi
+
+# ─── self.route(): the thirteenth refusal ───────────────────────────────────
+#
+# LAST, and that is not tidiness.  A route that works moves a connection onto
+# par_peer, which changes the CONN column and the `get.connections` figure the
+# probe asserted was exactly 1.  Run earlier it would make that assertion
+# depend on the order two unrelated things happened in.
+#
+# It is on the server table rather than the socketley one, which is the only
+# reason it was missed when the other twelve were refused — and a thirteenth
+# refusal that nothing measures is how this whole gap survived in the first
+# place.  It belongs with pipe, not with the eleven: route_client() does not
+# look a name up and stop there, it writes into the TARGET's private maps and
+# runs the target's on_connect on the caller's stack, after which this server
+# keeps the socket and relays the bytes through itself.  A map of names cannot
+# supply any of that.
+PEER_CONN_BEFORE=$(grep -ac "PEER_CONN " "$SOCKETLEY_DLOG" 2>/dev/null) || PEER_CONN_BEFORE=0
+
+# poke PORT — connect, ask to be routed, and hold the connection open long
+# enough for accept_routed() to run the target's on_connect.
+poke() { python3 -c "
+import socket,time,sys
+s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=5);s.settimeout(3)
+s.sendall(b'route\n');time.sleep(1.0);s.close()" "$1" 2>/dev/null || true; }
+
+poke "$IN_PORT"
+poke "$OOP_PORT"
+sleep 1.0
+
+IN_ROUTE=$(grep -ao "ROUTE-par_in [^ ]*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
+OOP_ROUTE=$(grep -ao "ROUTE-par_oop REFUSED:.*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
+[ -n "$OOP_ROUTE" ] || OOP_ROUTE=$(grep -ao "ROUTE-par_oop [^ ]*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
+PEER_CONN_AFTER=$(grep -ac "PEER_CONN " "$SOCKETLEY_DLOG" 2>/dev/null) || PEER_CONN_AFTER=0
+
+ctl "self.route()" "$IN_ROUTE" "ROUTE-par_in true" \
+    "an open connection and a server to give it to is a route that succeeds"
+
+# What makes the line above mean something.  par_peer logs every connection it
+# accepts, so a route that really happened is one more of them than before.
+if [ "$PEER_CONN_AFTER" -gt "$PEER_CONN_BEFORE" ]; then pass; else
+    fail "control: the in-daemon route really moved a connection" \
+         "par_peer logged $PEER_CONN_BEFORE connections before and $PEER_CONN_AFTER after" \
+         "self.route() answering true is not evidence the target got anything;" \
+         "without this, 'the worker refused' also passes on a build where" \
+         "routing is broken on both sides of the boundary"
+fi
+
+# The refusal itself, and it must name the right missing thing.  Refused for
+# good — but a message that says "the runtime map lives in the daemon" sends
+# its reader to wait for the map, and the map will not help this call.
+case "$OOP_ROUTE" in
+    *REFUSED:*relay*|*REFUSED:*SCM_RIGHTS*)
+        pass ;;
+    *)
+        fail "self.route() in a worker is refused as a connection handoff, by name" \
+             "worker arm: ${OOP_ROUTE:-<no ROUTE line at all>}" \
+             "wanted a refusal naming the channel a connection would need —" \
+             "not the generic 'reaches for the runtime map' text, which for" \
+             "this call names the wrong missing thing and promises a delivery" \
+             "that will not fix it" ;;
+esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
