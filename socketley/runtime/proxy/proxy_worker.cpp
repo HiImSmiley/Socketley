@@ -10,6 +10,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include "proxy_instance.h"
 #include "../server/server_instance.h"
@@ -56,7 +59,100 @@ constexpr auto stats_interval =
 // to SIGKILL five seconds after the SIGTERM.
 volatile sig_atomic_t g_term_requested = 0;
 
-extern "C" void worker_on_term(int) { g_term_requested = 1; }
+// How long an unwind may take before this process stops waiting for itself.
+//
+// Five seconds because that is already the bound: reap_orphan_workers()
+// escalates a SIGTERM to SIGKILL five seconds later, so a worker that has not
+// finished by then is killed today.  What the alarm changes is who enforces it
+// — the daemon cannot, when the daemon is what died — and the note above
+// claim_current_daemon() is where the reason for needing that lives.
+constexpr unsigned worker_term_grace_sec = 5;
+
+extern "C" void worker_on_term(int)
+{
+    g_term_requested = 1;
+
+    // The flag above is read at the top of run()'s loop, so it only ends a
+    // worker that reaches the top of its loop.  One that does not — wedged in a
+    // callback, or blocked — keeps its share of the listening socket, and after
+    // PR_SET_PDEATHSIG below that is precisely the case this signal is being
+    // used to answer: the daemon is gone and there is nobody left to escalate.
+    //
+    // alarm(2) is async-signal-safe and SIGALRM's default action terminates, so
+    // this needs no second handler and cannot itself wedge.  Re-arming on a
+    // repeated SIGTERM is deliberate: each ask restarts the grace period, which
+    // is what the supervisor's own escalation does.
+    ::alarm(worker_term_grace_sec);
+}
+
+// ─── Whose worker is this ───────────────────────────────────────────────────
+//
+// SO_REUSEPORT shares a port between any number of sockets and does not ask
+// where they came from.  A worker that outlived the daemon which forked it
+// therefore goes on taking its share of the connections arriving at that port,
+// served by a build nobody believes is running.  With one worker per runtime
+// that shows up as "the proxy is serving the wrong thing"; with --shards N it
+// becomes "one request in N+1 is served by the wrong thing", which is the same
+// defect made quiet.
+//
+// The proof of ownership is the kernel's rather than the wire's.  SO_PEERCRED
+// on a socketpair reports the pid of the process that CREATED it — the daemon,
+// at the instant of the fork — and that is a credential this process cannot
+// forge, cannot inherit from anyone else's socket, and a dead daemon cannot
+// renew.  So the rule is: the creator of my control socket must still be my
+// parent.  A worker whose daemon has gone has been reparented, getppid() stops
+// matching, and it refuses to serve.
+//
+// Checked at two moments, for two different failures:
+//
+//   * at startup, immediately after the PR_SET_PDEATHSIG in worker_claim(),
+//     which is what makes that pair race-free — if the daemon died before the
+//     prctl the kernel will never signal us, and this is what notices;
+//   * immediately before the listening socket is bound, in on_start().  A fork
+//     that has not bound yet is harmless; the instant it binds it is in the
+//     REUSEPORT group and taking traffic, so that instant is the one worth
+//     gating, and everything between the fork and it is time the daemon can
+//     die in.
+//
+// PR_SET_PDEATHSIG then makes the rule hold for the rest of the worker's life
+// instead of only at those two instants.
+//
+// ─── WHY THE SIGNAL IS SIGKILL, WHICH IT WAS NOT AT FIRST ───────────────────
+//
+// It was SIGTERM, on the argument that the handler above turns one into a clean
+// unwind, so a daemon that crashed would still get on_stop run.  That argument
+// is wrong about the only case the guarantee exists FOR, and the test said so:
+// freeze one shard with SIGSTOP, SIGKILL its daemon, and fifteen seconds later
+// the shard is still there — state T, still bound, still in the REUSEPORT
+// group.  A stopped process runs no handler; the SIGTERM just queues behind the
+// stop.  The alarm above cannot save it either, because the alarm is armed BY
+// the handler that never ran.  Every mechanism that needs the target to execute
+// something fails on exactly the target that has stopped executing.  SIGKILL
+// asks nothing of it.
+//
+// What that would cost if nothing else changed is the graceful path: teardown()
+// signals its workers and the daemon exits, and a SIGKILL arriving as it goes
+// would end them mid-unwind.  So two things make it safe rather than one.  This
+// process clears the setting at the single point where it has ALREADY decided
+// to exit — see the end of run() — and teardown() waits for the children it
+// signalled instead of exiting out from under them.  Between them the kill can
+// only reach a worker that was never told to go, which is the case it is for.
+pid_t control_socket_creator(int fd)
+{
+    struct ucred cr{};
+    socklen_t    len = sizeof(cr);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) < 0)
+        return -1;
+    return static_cast<pid_t>(cr.pid);
+}
+
+bool claim_current_daemon(int control_fd)
+{
+    const pid_t creator = control_socket_creator(control_fd);
+    if (creator <= 0)
+        return false;
+    return ::getppid() == creator;
+}
 
 // Frames on their way to the daemon, and what happens when it is not reading.
 //
@@ -307,6 +403,25 @@ public:
                 last_stats = now;
             }
         }
+
+        // ─── Past this line the guarantee has already done its job ──────────
+        //
+        // Every way out of the loop above arrives here: the shutdown frame, the
+        // SIGTERM flag, an EOF on the control socket, a dead writer.  That is
+        // what makes this the one place to give the parent-death kill back —
+        // this process is leaving, and the only thing PR_SET_PDEATHSIG could
+        // still do is interrupt the leaving.
+        //
+        // Putting it here rather than at each exit is the same rule this tree
+        // states about close_pair() and the half-close hold: a check every path
+        // has to remember is one a new path will not.  There are four ways out
+        // of that loop today and the unwind below is common to all four.
+        //
+        // What it costs to be wrong in the safe direction is nothing: a worker
+        // that clears this and then wedges during teardown is reaped by the
+        // daemon's own escalation, which is alive on every path that gets here
+        // deliberately.
+        if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
 
         // Same order the daemon uses on its way down: stop the runtime while
         // there is still a ring for teardown() to cancel into, and only then
@@ -972,6 +1087,26 @@ private:
         // closed for a configuration it had already refused.
         if (m_done || !m_rt || m_rt->get_state() == runtime_running)
             return;
+
+        // The second of the two checks the note above claim_current_daemon()
+        // describes, and the one it exists for: start() is what binds, and a
+        // bind is what joins the SO_REUSEPORT group.  Everything between the
+        // fork and this line — the config frame, the script's top level, the
+        // ring being built — is time in which the daemon can die, and a worker
+        // that binds afterwards is the stale shard that goes on serving 1/N of
+        // the traffic from a build nobody thinks is running.
+        //
+        // Refused rather than deferred: there is no daemon left to tell, and a
+        // worker that cannot name its owner has nothing to wait for.
+        if (!claim_current_daemon(m_fd))
+        {
+            LOG_ERROR("proxy worker: the daemon that forked this worker is gone; "
+                      "refusing to bind");
+            m_done      = true;
+            m_exit_code = 2;
+            return;
+        }
+
         if (!m_rt->start(m_loop))
             LOG_ERROR("proxy worker: proxy failed to start");
 
@@ -1099,6 +1234,22 @@ private:
 int proxy_worker_main(int control_fd)
 {
     if (control_fd < 0)
+        return 2;
+
+    // ─── Before anything else this process could go on to do ────────────────
+    //
+    // The order of these two is the whole of what makes them race-free, and it
+    // is the reverse of the intuitive one.  Ask the kernel to signal us on our
+    // parent's death FIRST, then ask whether that parent is still there: a
+    // daemon that died before the prctl will never produce the signal, and the
+    // getppid() check is what catches exactly that window.  Doing it the other
+    // way round leaves the window open instead of closing it.
+    //
+    // See the note above claim_current_daemon() for why a worker has to be able
+    // to prove this at all, and why the signal is SIGTERM.
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {}
+
+    if (!claim_current_daemon(control_fd))
         return 2;
 
     // Before the first line this process might want to log.  A worker reads no

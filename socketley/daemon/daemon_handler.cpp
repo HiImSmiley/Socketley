@@ -513,6 +513,38 @@ void daemon_handler::teardown()
     }
     m_proxy_workers.clear();
 
+    // ─── Wait for the children that were just told to go ────────────────────
+    //
+    // This did not wait, and until the workers acquired PR_SET_PDEATHSIG it did
+    // not have to: a signalled worker unwound as an orphan after this process
+    // was gone, which was untidy but harmless.  It is no longer harmless.  The
+    // parent-death signal is SIGKILL — see the note above claim_current_daemon()
+    // in proxy_worker.cpp for why it cannot be anything softer — so exiting
+    // while a worker is still unwinding would turn a graceful shutdown into a
+    // kill, and on_stop would stop running for out-of-process runtimes whenever
+    // the daemon itself went down.
+    //
+    // A worker unwinds in single-digit milliseconds: cancel the ring, close the
+    // connections, run on_stop.  So this costs nothing in the normal case and
+    // is bounded for the case that is not normal.  The bound is deliberately
+    // shorter than reap_orphan_workers()' own five-second escalation, because
+    // that escalation is what handles a worker that will not leave and this is
+    // only here to let the ordinary one finish.
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            bool any_left = false;
+            for (auto& o : m_orphan_workers)
+                if (o.pid > 0 && ::waitpid(o.pid, nullptr, WNOHANG) == 0)
+                    any_left = true;
+            if (!any_left)
+                break;
+            ::usleep(2000);
+        }
+    }
+
     // The children are on their way out and this process is too, so init would
     // adopt whatever is left.  Reaped here anyway for the case teardown() does
     // not end in exit(): a daemon that is torn down and set up again would
