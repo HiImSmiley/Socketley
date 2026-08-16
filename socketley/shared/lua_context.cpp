@@ -2548,12 +2548,42 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // on the server table, at the bottom of this file.
     sk["pipe"] = make(worker_pipe_refusal());
 
-    // The cluster view is the runtime map plus what discovery has heard, and a
-    // worker has neither.
-    for (const char* call : {"daemons", "runtimes", "group", "stats"})
+    // ASK THE CLUSTER.  Refused only while this process has no view of one.
+    //
+    // The four need three things no runtime map carries — this daemon's cluster
+    // name, the address it advertises, and every remote daemon — and until the
+    // daemon began pushing a snapshot of those there was nothing out here they
+    // could be answered from.  Now there may be, so the refusal is a question
+    // rather than a fact about being in a worker.
+    //
+    // Two states, and the second is the reason this is not simply unrefused:
+    //
+    //   a view is installed   the bindings answer from it, exactly as the
+    //                         daemon's answer from cluster_discovery.
+    //   no view               this daemon is in no cluster, or has left one.
+    //                         Refused rather than answered, because the answer
+    //                         would be an empty table — which is what a
+    //                         SUCCESSFUL call returns on a daemon alone in its
+    //                         cluster, and no script can tell the two apart.
+    //
+    // Asked here, once, while the bindings are being built.  What makes that
+    // safe is the order the daemon writes its frames in: the cluster view goes
+    // out BEFORE the config frame, and the config frame is what loads the
+    // script this table is being built for.  See proxy_supervisor::spawn().
+    //
+    // The case that order does not cover is a daemon that joins a cluster after
+    // a worker's script has already loaded: that script keeps the refusal until
+    // it is reloaded.  Wrong in the safe direction — a refusal that names itself
+    // rather than an empty table — and the fix if it ever matters is to move
+    // this question inside the four bindings, where `!src.ok` is already the
+    // branch that would carry it.
+    if (!lua_context::cluster_view_snapshot())
     {
-        sol::function f = make(worker_refusal(std::string("socketley.cluster.") + call));
-        cluster_tbl[call] = f;
+        for (const char* call : {"daemons", "runtimes", "group", "stats"})
+        {
+            sol::function f = make(worker_refusal(std::string("socketley.cluster.") + call));
+            cluster_tbl[call] = f;
+        }
     }
 }
 
