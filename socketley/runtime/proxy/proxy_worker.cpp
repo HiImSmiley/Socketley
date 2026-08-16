@@ -915,6 +915,12 @@ int proxy_worker_main(int control_fd)
     if (control_fd < 0)
         return 2;
 
+    // Before the first line this process might want to log.  A worker reads no
+    // configuration file, so without this its level is the built-in default and
+    // every LOG_DEBUG out here — including the ones in the runtime it is about
+    // to build — is unreachable however the daemon was configured.
+    inherit_log_level();
+
     // Before any interpreter exists, because it decides what one is built with.
     // This process holds one runtime and no map of runtimes, so the cross-runtime
     // half of the Lua management API has nothing here to answer from and says so

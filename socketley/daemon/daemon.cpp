@@ -35,18 +35,6 @@ static void signal_handler(int)
     }
 }
 
-static bool parse_log_level(std::string_view str, log_level& level)
-{
-    switch (fnv1a(str))
-    {
-        case fnv1a("debug"): level = log_debug; return true;
-        case fnv1a("info"):  level = log_info;  return true;
-        case fnv1a("warn"):  level = log_warn;  return true;
-        case fnv1a("error"): level = log_error; return true;
-        default: return false;
-    }
-}
-
 static uint16_t load_daemon_config(const std::string& config_path)
 {
     uint16_t metrics_port = 0;
@@ -103,7 +91,7 @@ static uint16_t load_daemon_config(const std::string& config_path)
     if (ll)
     {
         log_level level;
-        if (parse_log_level(*ll, level))
+        if (log_level_from_string(ll->c_str(), level))
             logger::g_level = level;
     }
 
@@ -594,6 +582,16 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Load config file (sets log level, metrics port, etc.) before anything else
     uint16_t metrics_port = load_daemon_config(paths.config_path.string());
+
+    // And on to whatever this daemon forks.  A worker reads no configuration
+    // file, so until this line every LOG_DEBUG in a worker — and in the runtime
+    // it holds — was unreachable whatever the operator asked for.  Exported
+    // unconditionally, including the default: the rule is that a worker logs at
+    // its daemon's level, and an unset variable would leave the level of a child
+    // depending on what the shell that started the daemon happened to hold.
+    // Here, in the parent and at startup, because a setenv() between the fork
+    // and the exec would allocate in a child that must not.
+    export_log_level(logger::g_level);
 
     // If another daemon is already running on this socket, exit gracefully
     if (daemon_handler::is_running())
