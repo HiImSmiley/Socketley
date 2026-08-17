@@ -260,6 +260,46 @@ else fail "a restored proxy keeps its shard count" \
           "show no longer reports 4 shards after a daemon restart" \
           "measured before the fix: 4 workers became 1, reported Up throughout"; fi
 
+# ─── 6b. show | import round-trips the listener, and a bad one is refused ───
+#
+# `show name | socketley import name` is a documented round trip, and the field
+# has to survive it -- an import that dropped `listen` would move a server off
+# its socket and onto a TCP port, silently.  And the value has to be judged on
+# the way in: parse_json_string strips the `unix:` prefix and cannot report a
+# value that never had one, so a document saying `"listen": "/run/x.sock"` would
+# otherwise import as "no unix listener at all".
+"$BIN" stop ul_srv >/dev/null 2>&1 || true
+sleep 0.4
+DOC=$("$BIN" show ul_srv 2>/dev/null)
+if grep -q '"listen": "unix:' <<<"$DOC"; then pass
+else fail "show reports the listen socket" "the document has no listen field"; fi
+
+set +e
+"$BIN" import ul_srv "$DOC" >/dev/null 2>&1
+IMP_RC=$?
+set -e
+AFTER_IMPORT=$("$BIN" show ul_srv 2>/dev/null | grep '"listen"' || true)
+if [ "$IMP_RC" -eq 0 ] && grep -q "unix:$SOCK" <<<"$AFTER_IMPORT"; then pass
+else fail "the listen socket survives show | import" \
+          "import exited $IMP_RC and show now says '${AFTER_IMPORT:-<nothing>}'"; fi
+
+BAD_DOC=$(python3 -c "
+import sys
+d = sys.stdin.read()
+sys.stdout.write(d.replace('\"unix:$SOCK\"', '\"$SOCK\"'))
+" <<<"$DOC")
+set +e
+IMP_OUT=$("$BIN" import ul_srv "$BAD_DOC" 2>&1)
+BAD_RC=$?
+set -e
+if [ "$BAD_RC" -ne 0 ] && grep -q "unix:" <<<"$IMP_OUT"; then pass
+else fail "import refuses a listen value with no unix: prefix" \
+          "exit $BAD_RC saying: ${IMP_OUT:-<nothing>}" \
+          "accepted, it would move the server onto a TCP port and say nothing"; fi
+
+"$BIN" start ul_srv >/dev/null 2>&1 || true
+sleep 0.8
+
 # ─── 7. The refusals, each at the point the flag is read ────────────────────
 refuse_cli() {
     local name=$1 needle=$2; shift 2

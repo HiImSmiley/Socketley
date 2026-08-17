@@ -1224,6 +1224,12 @@ state_persistence::~state_persistence()
         m_writer.join();
 }
 
+std::string state_persistence::raw_field(const std::string& json,
+                                         std::string_view key) const
+{
+    return sp_detail::json_get_string(json, key);
+}
+
 void state_persistence::set_was_running(std::string_view name, bool running)
 {
     job j;

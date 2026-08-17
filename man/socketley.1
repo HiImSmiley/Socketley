@@ -827,6 +827,18 @@ List all runtimes (all states). Docker-style output with columns:
 ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED, GROUP.
 With \fB\-\-json\fR or \fB\-\-format json\fR, outputs a JSON array of runtime objects.
 With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
+.IP
+The JSON form carries a
+.B listen
+field beside
+.BR port :
+empty for an ordinary runtime, and
+.BI unix: /path/to.sock
+for a server started with
+.BR \-\-listen .
+The PORT column shows
+.B \-
+for one of those, since it has none.
 .RS
 .PP
 .B Column selectors

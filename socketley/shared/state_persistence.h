@@ -187,6 +187,17 @@ public:
     std::string format_json_pretty(const runtime_config& cfg) const;
     bool parse_json_string(const std::string& json, runtime_config& cfg) const;
 
+    // One field's value, exactly as the document wrote it.
+    //
+    // parse_json_string has no error channel for a single field -- it returns
+    // false only for a document with no name -- so a field whose value is
+    // syntactically fine and semantically wrong is silently normalised away.
+    // `listen` is one of those: the `unix:` prefix is stripped on the way in,
+    // and a value that never had one is indistinguishable afterwards from a
+    // document that cleared the field.  `import` re-reads it through this and
+    // judges it with the same function the flag parser uses.
+    std::string raw_field(const std::string& json, std::string_view key) const;
+
     // Block until everything queued has reached disk.  For a caller that is
     // about to read the files back — a test, a shutdown that will be followed
     // by a restart — and for nothing else: taking this on the event loop

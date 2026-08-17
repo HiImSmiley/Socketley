@@ -525,6 +525,30 @@ bool parse_cache_mode(uint32_t hash, cache_mode& mode)
 // names a different socket — very possibly a real one that something else is
 // serving — so this is the last point at which the operator can be told which
 // socket they actually asked for.
+std::string validate_listen_value(std::string_view value, std::string& out)
+{
+    if (!value.starts_with("unix:"))
+        return "takes unix:/path/to.sock; a TCP port is -p";
+
+    const std::string_view path = value.substr(5);
+    if (path.empty())
+        return "no socket path after the unix: prefix";
+    if (path[0] != '/')
+        return "the socket path must be absolute (got \"" + std::string(path) + "\")";
+
+    struct sockaddr_un probe{};
+    if (path.size() >= sizeof(probe.sun_path))
+        return "the socket path is " + std::to_string(path.size()) +
+               " bytes and the kernel's limit is " +
+               std::to_string(sizeof(probe.sun_path) - 1) +
+               " -- it would be truncated to a different socket";
+    if (path.find('\0') != std::string_view::npos)
+        return "the socket path contains a NUL byte";
+
+    out.assign(path);
+    return {};
+}
+
 static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i)
 {
     if (i + 1 >= pa.count)
@@ -532,39 +556,13 @@ static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t
         std::cout << "--listen requires an address (unix:/path/to.sock)\n";
         return 1;
     }
-    const std::string_view value = pa.args[++i];
-
-    if (!value.starts_with("unix:"))
+    std::string path;
+    const std::string why = validate_listen_value(pa.args[++i], path);
+    if (!why.empty())
     {
-        std::cout << "--listen takes unix:/path/to.sock; a TCP port is -p\n";
+        std::cout << "--listen: " << why << "\n";
         return 1;
     }
-    const std::string_view path = value.substr(5);
-
-    if (path.empty())
-    {
-        std::cout << "--listen unix: has no socket path after the prefix\n";
-        return 1;
-    }
-    if (path[0] != '/')
-    {
-        std::cout << "--listen: the socket path must be absolute (got \"" << path << "\")\n";
-        return 1;
-    }
-    struct sockaddr_un probe{};
-    if (path.size() >= sizeof(probe.sun_path))
-    {
-        std::cout << "--listen: the socket path is " << path.size()
-                  << " bytes and the kernel's limit is " << (sizeof(probe.sun_path) - 1)
-                  << " -- it would be truncated to a different socket\n";
-        return 1;
-    }
-    if (path.find('\0') != std::string_view::npos)
-    {
-        std::cout << "--listen: the socket path contains a NUL byte\n";
-        return 1;
-    }
-
     rt->set_listen_path(path);
     return 0;
 }

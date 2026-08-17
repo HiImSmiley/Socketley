@@ -1231,23 +1231,32 @@ bool server_instance::setup_unix_listener(const std::string& path)
         static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + path.size() + 1);
 
     {
-        const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // SOCK_NONBLOCK, and that matters rather than being tidy.  A blocking
+        // connect() to a unix socket whose listener has a FULL backlog waits
+        // for room -- and this runs on the daemon's event loop thread, the one
+        // thread that serves every runtime in the process.  A busy server on
+        // that path would have stalled the whole daemon for as long as it
+        // stayed busy.  Non-blocking, the same case answers EAGAIN, which is
+        // still "somebody is serving this" and is read as such.
+        const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe >= 0)
         {
             const int rc = connect(probe, reinterpret_cast<const struct sockaddr*>(&addr),
                                    addr_len);
-            close(probe);
-            if (rc == 0)
+            const int err = errno;
+            close(probe);   // never registered with the ring; a plain close is its own
+            if (rc == 0 || err == EAGAIN || err == EWOULDBLOCK)
             {
                 LOG_ERROR(("server: --listen " + path +
                            " is already being served by something -- refusing rather "
                            "than taking the path away from it").c_str());
                 return false;
             }
-            // ENOENT is nothing to remove; anything else is a node with nobody
-            // behind it.  unlink's own failure is left to bind() to report,
-            // which says which path and why in one message rather than two.
-            if (errno != ENOENT)
+            // ENOENT is nothing to remove; anything else -- ECONNREFUSED above
+            // all, which is what a node with nobody behind it answers -- is a
+            // leftover.  unlink's own failure is left to bind() to report, which
+            // says which path and why in one message rather than two.
+            if (err != ENOENT)
                 if (unlink(path.c_str()) < 0) {}
         }
     }
@@ -1450,7 +1459,6 @@ bool server_instance::setup(event_loop& loop)
                        std::to_string(sizeof(probe.sun_path)) + " bytes").c_str());
             return false;
         }
-
     }
 
     // Internal-only server (port=0, used for Lua-managed sub-servers).  A

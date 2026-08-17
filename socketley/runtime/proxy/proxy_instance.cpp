@@ -105,11 +105,11 @@ static bool backend_connect_addr(const backend_info& b,
 {
     if (b.is_unix)
     {
-        // resolve_backend has already refused a path that would not fit, so
-        // this cannot truncate.  It copies size()+1 bytes so the terminator
-        // goes with it: sun_path is a C string to the kernel, and `out` is
-        // zeroed by its caller rather than by this — which is why the assert
-        // below is on the length and not on the trailing byte.
+        // configure_unix_backend has already refused a path that would not
+        // fit, so this cannot truncate.  size() + 1 bytes, so the terminator
+        // goes with it: sun_path is a C string to the kernel, and copying the
+        // NUL is what makes this correct whether or not the caller's buffer
+        // arrived zeroed.
         auto* un = reinterpret_cast<struct sockaddr_un*>(&out);
         un->sun_family = AF_UNIX;
         std::memcpy(un->sun_path, b.unix_path.c_str(), b.unix_path.size() + 1);
