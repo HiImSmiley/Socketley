@@ -17,6 +17,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/tcp.h>
 #include <algorithm>
 #include <type_traits>
@@ -65,6 +66,32 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
         port = b.resolved_port;
     }
     return !host.empty() && port != 0;
+}
+
+// The address a connect to this backend has to use, and how many bytes of it
+// the kernel is to read.
+//
+// One function because there are two connects — the request path and the health
+// sweep — and they have to agree about where a backend is.  Each had its own
+// copy, each with a hardcoded AF_INET, so a second address family would have
+// had to be taught to both and any later one to three.  This tree has the
+// worked example already: client_answer_owed() is consulted at 2 places while
+// close_pair() is called at 86, and the hold it guards was fixed four times
+// because of it.  Two is how three starts.
+//
+// False means "this backend has no address yet" — a hostname whose lookup has
+// not come back.  What to do about that is the one thing the two callers still
+// decide for themselves: the request path arms the idle sweep that re-resolves,
+// the health sweep skips the probe and leaves the backend's health untouched.
+static bool backend_connect_addr(const backend_info& b,
+                                 struct sockaddr_storage& out, socklen_t& len)
+{
+    if (!b.has_cached_addr)
+        return false;
+
+    std::memcpy(&out, &b.cached_addr, sizeof(struct sockaddr_in));
+    len = sizeof(struct sockaddr_in);
+    return true;
 }
 
 // "The ring still owes this half a completion."
@@ -369,7 +396,6 @@ void proxy_client_connection::reset(int new_fd)
     response_deadline = {};
     awaiting_headers = false;
     header_deadline = {};
-    std::memset(&connect_addr, 0, sizeof(connect_addr));
 }
 
 void proxy_backend_connection::reset(int new_fd)
@@ -6289,13 +6315,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return true;  // connect_pending stays false
     }
 
-    // No pooled connection — resolve address and submit async connect
-    struct sockaddr_in addr{};
-    if (target->has_cached_addr)
-    {
-        addr = target->cached_addr;
-    }
-    else
+    // No pooled connection — take the address and submit async connect
+    struct sockaddr_storage addr{};
+    socklen_t addr_len = 0;
+    if (!backend_connect_addr(*target, addr, addr_len))
     {
         // ─── THE REQUEST PATH DOES NOT RESOLVE ──────────────────────────────
         //
@@ -6322,7 +6345,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    bfd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (bfd < 0)
     {
         // Out of descriptors is our shortage, not the backend's.
@@ -6340,12 +6363,18 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    tune_socket(bfd);
+    // Everything tune_socket sets is a TCP-level option or a TCP keepalive
+    // timer, so it has nothing to say to a socket in another family.  Asked of
+    // one, the calls would fail rather than do harm — none of them is checked —
+    // but four failing setsockopts per connect is four syscalls per connect
+    // spent on nothing.
+    if (addr.ss_family == AF_INET)
+        tune_socket(bfd);
 
     // Try synchronous connect first — on loopback this often succeeds instantly
     // (returns 0), avoiding a full io_uring round-trip. If EINPROGRESS, fall back
     // to async io_uring connect where handle_connect() finishes the setup.
-    int cr = ::connect(bfd, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
+    int cr = ::connect(bfd, reinterpret_cast<const struct sockaddr*>(&addr), addr_len);
     if (cr == 0)
     {
         // Instant connect success — set up backend inline (same as handle_connect)
@@ -6469,9 +6498,15 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // writability, not issuing a second connect: io_uring runs that against an
     // fd that is already connected and answers EISCONN, and that completion was
     // then dropped rather than acted on, leaving the connection wedged.
+    //
+    // Nothing keeps the address past this point, and connect_addr — which used
+    // to be assigned here — was never read by anything: the kernel has already
+    // taken it inside the ::connect() above, and what is armed on the socket
+    // afterwards is a poll, which names no address.  Removed rather than
+    // widened to hold a second family, because a field written and never read
+    // is a fact about the connection that nothing maintains.
     conn->connect_pending = true;
     conn->connect_fd = bfd;
-    conn->connect_addr = addr;
     conn->connect_req = { this, nullptr, conn->fd, 0, op_poll, conn->generation };
 
     if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(bfd, POLLOUT, &conn->connect_req)))
@@ -8191,7 +8226,26 @@ void proxy_instance::health_check_sweep()
         if (b.is_group)
             continue;
 
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        // Where this backend is, from the same function the request path asks.
+        //
+        // Asked before the socket, which is the reverse of how this ran: the
+        // family the address turns out to be in is what the socket has to be
+        // opened in, and a probe with no address to aim at should not cost a
+        // descriptor to find that out.
+        //
+        // False means an unresolved hostname, and this is the one caller that
+        // does nothing about it.  The old code reached the same conclusion the
+        // long way round — it built an AF_INET address and ran inet_pton over a
+        // hostname, which cannot parse one and leaves sin_addr zeroed, so the
+        // probe would have connected to 0.0.0.0 and recorded an unrelated local
+        // service's answer as this backend's health.  Skipping leaves the health
+        // state untouched; the idle sweep is what re-resolves.
+        struct sockaddr_storage addr{};
+        socklen_t addr_len = 0;
+        if (!backend_connect_addr(b, addr, addr_len))
+            continue;
+
+        int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
         {
             if (i < m_backend_health.size())
@@ -8212,38 +8266,13 @@ void proxy_instance::health_check_sweep()
         hc.current = async_health_check::connecting;
         hc.req = { this, nullptr, fd, 0, op_health_check };
 
-        struct sockaddr_in addr{};
-        if (b.has_cached_addr)
-        {
-            addr = b.cached_addr;
-        }
-        else
-        {
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(b.resolved_port);
-
-            // has_cached_addr is only false for a hostname that failed to
-            // resolve at setup.  inet_pton cannot parse a hostname and leaves
-            // sin_addr zeroed — connecting to 0.0.0.0 reaches localhost, so the
-            // check would probe an unrelated local service and record the
-            // result as this backend's health.  Skip the check instead and
-            // leave the health state untouched; the data path still retries DNS
-            // on each connect.
-            if (inet_pton(AF_INET, b.resolved_host.c_str(), &addr.sin_addr) != 1)
-            {
-                close_tracked(fd);
-                hc.fd = -1;
-                m_health_checks[i].reset();
-                continue;
-            }
-        }
-
         // The kernel reads the address asynchronously, so it lives in the probe
         // for the duration of the connect.  It used to share `buf` with the HTTP
         // response, which meant a late read from an abandoned probe rewrote the
         // address the next connect was about to use.
         hc.write_buf.clear();
         hc.addr = addr;
+        hc.addr_len = addr_len;
 
         // A refused submission is our problem, not the backend's: recording it
         // as a failure would take a healthy backend out of rotation whenever the
@@ -8251,7 +8280,7 @@ void proxy_instance::health_check_sweep()
         hc.op_pending = true;
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_connect(fd,
                 reinterpret_cast<const struct sockaddr*>(&hc.addr),
-                sizeof(struct sockaddr_in), &hc.req)))
+                hc.addr_len, &hc.req)))
         {
             close_tracked(fd);
             hc.fd = -1;
