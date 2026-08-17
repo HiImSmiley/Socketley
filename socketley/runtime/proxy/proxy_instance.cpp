@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstddef>
 #include <charconv>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -35,10 +36,26 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
                                           bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
 
 
+// Is this (host, port) pair something a backend socket may be filed under?
+//
+// A pooled connection is handed to whoever asks for the same key next, so a key
+// that is a guess is a crossed delivery waiting to happen.  Two shapes are
+// real: (host, port) with a port on it is a network endpoint, and (path, 0) is
+// a unix backend.  The two spaces cannot overlap, because resolve_backend
+// refuses a socket path that is not absolute and no hostname or dotted quad
+// begins with '/' — so a unix backend can never be handed a TCP socket whatever
+// port the TCP one is on.
+//
+// One predicate rather than the same test written at each of the three places
+// that need it, for the reason backend_connect_addr gives just below.
+static inline bool pool_key_ok(std::string_view host, uint16_t port)
+{
+    return !host.empty() && (port != 0 || host.front() == '/');
+}
+
 // Which endpoint a client's current backend socket is connected to.  Returns
 // false when that cannot be established, and then the socket must not be
-// pooled: a pooled connection is handed to whoever asks for the same endpoint
-// next, so a key that is a guess is a crossed delivery waiting to happen.
+// pooled.
 //
 // backend_idx answers this only for a plain backend.  A group-routed request
 // picks one member per request and leaves the index pointing at the group
@@ -65,7 +82,7 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
         host = b.resolved_host;
         port = b.resolved_port;
     }
-    return !host.empty() && port != 0;
+    return pool_key_ok(host, port);
 }
 
 // The address a connect to this backend has to use, and how many bytes of it
@@ -86,6 +103,25 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
 static bool backend_connect_addr(const backend_info& b,
                                  struct sockaddr_storage& out, socklen_t& len)
 {
+    if (b.is_unix)
+    {
+        // resolve_backend has already refused a path that would not fit, so
+        // this cannot truncate.  It copies size()+1 bytes so the terminator
+        // goes with it: sun_path is a C string to the kernel, and `out` is
+        // zeroed by its caller rather than by this — which is why the assert
+        // below is on the length and not on the trailing byte.
+        auto* un = reinterpret_cast<struct sockaddr_un*>(&out);
+        un->sun_family = AF_UNIX;
+        std::memcpy(un->sun_path, b.unix_path.c_str(), b.unix_path.size() + 1);
+        // offsetof rather than sizeof: passing the whole 110-byte structure
+        // works, but the kernel then compares the full sun_path against a bound
+        // socket's, and a length that stops at the terminator is what makes the
+        // address say exactly what was configured.
+        len = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) +
+                                     b.unix_path.size() + 1);
+        return true;
+    }
+
     if (!b.has_cached_addr)
         return false;
 
@@ -948,6 +984,88 @@ bool proxy_instance::resolve_backend(backend_info& b)
     if (b.address.size() > 1 && b.address[0] == '@')
     {
         b.is_group = true;
+        return true;
+    }
+
+    // ─── unix:/path/to.sock ─────────────────────────────────────────────────
+    //
+    // Checked here and nowhere else, and every one of these refuses the whole
+    // start rather than letting the proxy come up and answer 502 to its first
+    // request.  A backend that provably cannot work is known at configuration
+    // time; reporting it at traffic time is reporting it to the wrong person.
+    if (std::string_view(b.address).starts_with("unix:"))
+    {
+        const std::string_view path = std::string_view(b.address).substr(5);
+
+        if (path.empty())
+        {
+            LOG_ERROR("proxy backend \"unix:\": no socket path after the prefix");
+            return false;
+        }
+
+        // Absolute, and this is not tidiness.  Two things rest on it: a
+        // relative path is resolved against the daemon's working directory,
+        // which is not something an operator writing a flag can see, and the
+        // connection pool keys a unix backend as (path, 0) — a leading '/' is
+        // what makes that key unable to collide with a hostname's.  A leading
+        // NUL, which is how Linux spells an abstract socket, is refused by the
+        // same test and deliberately: an abstract name is in no filesystem and
+        // so is bounded by nothing but the network namespace.
+        if (path[0] != '/')
+        {
+            LOG_ERROR(("proxy backend \"" + b.address +
+                       "\": the socket path must be absolute").c_str());
+            return false;
+        }
+
+        // sun_path is 108 bytes including its terminator, and the kernel
+        // truncates silently.  A trimmed path names a different socket — very
+        // possibly one that exists — so this refuses rather than binds the
+        // proxy to whatever the first 107 bytes happen to reach.
+        struct sockaddr_un probe{};
+        if (path.size() >= sizeof(probe.sun_path))
+        {
+            LOG_ERROR(("proxy backend \"" + b.address + "\": the socket path is " +
+                       std::to_string(path.size()) + " bytes, and the kernel's limit is " +
+                       std::to_string(sizeof(probe.sun_path) - 1) +
+                       " -- it would be truncated to a different socket").c_str());
+            return false;
+        }
+
+        // A NUL inside the path would end it early for the kernel and not for
+        // us, which is the truncation above wearing a different hat.
+        if (path.find('\0') != std::string_view::npos)
+        {
+            LOG_ERROR("proxy backend: the socket path contains a NUL byte");
+            return false;
+        }
+
+        // TLS to a unix socket is refused, not ignored.  b.tls is already set
+        // from the backend-TLS options by the time this runs, so this catches
+        // --ca / --client-cert / --client-key applied to a proxy that has a
+        // unix backend, and an `https://` scheme cannot reach here at all.
+        // Encrypting a socket the kernel never puts on a wire buys nothing that
+        // the filesystem permissions on the node do not already give; quietly
+        // dropping the flags would be the fail-open answer, and this project
+        // has the rule that none of the three means anything against a
+        // cleartext peer.
+        if (b.tls)
+        {
+            LOG_ERROR(("proxy backend \"" + b.address +
+                       "\": --ca, --client-cert and --client-key encrypt every backend "
+                       "leg, and there is no TLS to a unix socket").c_str());
+            return false;
+        }
+
+        b.is_unix = true;
+        b.unix_path = std::string(path);
+        // The path is the endpoint, and resolved_port stays 0 — see
+        // backend_info.  has_cached_addr says "this backend has somewhere to
+        // connect to", which a path always does; there is no lookup to fail and
+        // so nothing for the idle sweep to retry.
+        b.resolved_host = b.unix_path;
+        b.resolved_port = 0;
+        b.has_cached_addr = true;
         return true;
     }
 
@@ -5819,7 +5937,7 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
 {
     if (out_ssl)
         *out_ssl = nullptr;
-    if (backend_idx >= m_backend_pool.size() || host.empty() || port == 0)
+    if (backend_idx >= m_backend_pool.size() || !pool_key_ok(host, port))
         return -1;
     // A TLS request with no context to have built the session against cannot
     // be matched to anything: tls_owner would have nothing to equal.  This is
@@ -6019,7 +6137,7 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
     // A socket with no endpoint on it cannot be given back to one.  Callers
     // establish the key through backend_endpoint_of and only pool when it
     // answered; this is the backstop, and it closes rather than files.
-    if (host.empty() || port == 0)
+    if (!pool_key_ok(host, port))
     {
         shutdown(backend_fd, SHUT_RDWR);
         close_tracked(backend_fd);
@@ -6168,7 +6286,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 {
     // Local helper: mark this as our own shortage rather than the backend's fault.
     const auto ours = [resource_failure]() { if (resource_failure) *resource_failure = true; };
-    if (SOCKETLEY_UNLIKELY(!target || target->resolved_port == 0))
+    // A backend with no port is a backend with nowhere to go — unless it is a
+    // unix one, where the path is the whole address and the port is 0 by
+    // definition.  See backend_info.
+    if (SOCKETLEY_UNLIKELY(!target || (target->resolved_port == 0 && !target->is_unix)))
         return false;
 
     // The wait for this backend's answer starts here rather than at the first
@@ -7791,9 +7912,17 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
     // release_to_pool returns without taking the fd when the index is out of
     // range, so asking it to pool one it will refuse leaks the descriptor
     // silently — this is the last owner the fd has.
+    //
+    // pool_key_ok rather than the test written out again.  This was the fourth
+    // copy of "a host and a non-zero port", and it is the copy that decides the
+    // ordinary keep-alive case — the one reached whenever the backend's read is
+    // still armed, which under multishot recv is every response.  A unix
+    // backend, whose key is a path and no port, was filed by the other three
+    // and closed by this one, so every request through one paid for a fresh
+    // connect while the pool looked healthy from outside.
     if (SOCKETLEY_LIKELY(!conn->pool_abandoned &&
                          conn->pool_backend_idx < m_backend_pool.size() &&
-                         !conn->pool_host.empty() && conn->pool_port != 0))
+                         pool_key_ok(conn->pool_host, conn->pool_port)))
     {
         release_to_pool(fd, conn->pool_backend_idx, conn->pool_host, conn->pool_port, conn);
     }
@@ -8450,8 +8579,15 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
             return;
         }
 
+        // A unix backend's resolved_host is a filesystem path, and a path is not
+        // a Host field-value: a strict backend answers 400 to it, 400 is not
+        // 2xx, and this probe would then take a perfectly healthy backend out of
+        // rotation for the shape of a header it was sent itself.  There is
+        // nothing else to name — the peer is a socket node, not a name in any
+        // namespace — so it is asked as "localhost", which is where it is.
         hc->write_buf = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
-                        b.resolved_host + "\r\nConnection: close\r\n\r\n";
+                        (b.is_unix ? std::string("localhost") : b.resolved_host) +
+                        "\r\nConnection: close\r\n\r\n";
         hc->write_off = 0;
         hc->current = async_health_check::writing;
         // Our shortage, not the backend's: no verdict is recorded.
