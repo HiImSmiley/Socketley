@@ -13,17 +13,25 @@
 # and the proxy can also name the server by its runtime name, which resolves to
 # the same socket.  Both spellings are shown below.
 #
-# WHAT IT IS WORTH.  Measured with test/benchmark/floor_relay.c and
-# floor_server -u on a quiet machine, 64-byte round trips:
+# WHAT IT IS WORTH.  Measured on a quiet machine, 64-byte round trips through
+# this proxy to a backend that only echoes:
 #
-#                                        TCP backend  UNIX backend  saved
-#   one core   bench -> proxy -> floor      24.3 us      23.9 us     0.4 us
-#   unpinned   bench -> proxy -> floor      40.2 us      37.8 us     2.3 us
+#                                    TCP backend  UNIX backend
+#   1 conn, unpinned  latency p50       41.4 us      37.0 us     -4.5 us
+#   8 conns, unpinned throughput      66,620/s     85,217/s      +28 %
+#   1 conn, one core  latency p50       21.5 us      20.7 us     -0.8 us
 #
-# A few percent, not an order of magnitude.  The kernel-only floor for the same
-# swap is 0.97 us / 2.95 us, so the proxy takes most of what is on offer - the
-# rest of a proxied round trip is the two extra handoffs, which this does not
-# remove.
+# Quote the throughput one.  What the swap removes is CPU -- 17.5 us of it per
+# round trip across proxy and backend over TCP against 14.5 over AF_UNIX, which
+# is to the tenth what a two-process ping-pong predicts for that leg.  On one
+# core with a single connection almost none of that reaches the clock, because
+# a serial round trip there is waiting on wakeups rather than on work and freed
+# CPU has nothing to do; the third row is what that looks like and it is the
+# least interesting regime a proxy runs in.  Under load the same change is
+# worth a fifth of the throughput.
+#
+# What it does NOT remove is the two extra handoffs a proxy adds, which are 59%
+# of what proxying costs.  This is the cheaper half of the bill.
 #
 # THINGS TO KNOW BEFORE USING IT:
 #

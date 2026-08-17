@@ -1815,12 +1815,21 @@ for what verifies such a connection.
 reaches a backend over an AF_UNIX socket instead of loopback TCP. A sidecar
 proxy and the process it fronts are on one host, and loopback TCP charges that
 pair for a whole stack \(em sequence numbers, checksums, windows \(em on a
-connection that never sees a wire. Measured on a quiet machine with
-.BR floor_relay ,
-64\-byte round trips, the backend leg alone: 37.6 us over TCP against 34.6 us
-over AF_UNIX unpinned, 21.4 against 20.5 with everything on one core. Through
-this proxy the same comparison is 40.2 us against 37.8 unpinned and 24.3
-against 23.9 on one core \(em a few percent, not a different order of magnitude.
+connection that never sees a wire. Measured on a quiet machine, 64\-byte round
+trips through this proxy: one connection unpinned, 41.4 us over TCP against
+37.0 us over AF_UNIX; eight connections unpinned, 66,620 round trips a second
+against 85,217 \(em 16 to 28% depending on where the scheduler puts the three
+processes.
+.IP
+The throughput figure is the one to plan with, and why is worth stating. What
+the swap removes is CPU: 17.5 us of it per round trip across proxy and backend
+over TCP against 14.5 over AF_UNIX, which is to the tenth what a two\-process
+ping\-pong predicts for that leg. On one core with a single connection almost
+none of it shows up as latency \(em 21.5 us against 20.7 \(em because a serial
+round trip there is waiting on wakeups rather than on work, so freed CPU has
+nothing to do. A proxy under load is short of exactly that CPU, which is why
+the same change is worth under a microsecond in the first measurement and a
+fifth of the throughput in the second.
 .IP
 The path must be absolute, and shorter than 108 bytes, which is what the
 kernel's
