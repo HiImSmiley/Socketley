@@ -370,25 +370,41 @@ static void restore_runtimes(state_persistence& persistence,
                 instance->set_pid(static_cast<pid_t>(cfg.pid));
         }
 
-        // Common fields
-        if (cfg.port > 0) instance->set_port(cfg.port);
-        if (!cfg.log_file.empty()) instance->set_log_file(cfg.log_file);
-        if (!cfg.write_file.empty()) instance->set_write_file(cfg.write_file);
-        if (cfg.bash_output) instance->set_bash_output(true);
-        if (cfg.bash_prefix) instance->set_bash_prefix(true);
-        if (cfg.bash_timestamp) instance->set_bash_timestamp(true);
-        if (cfg.max_connections > 0) instance->set_max_connections(cfg.max_connections);
-        if (cfg.rate_limit > 0.0) instance->set_rate_limit(cfg.rate_limit);
-        if (cfg.global_rate_limit > 0.0) instance->set_global_rate_limit(cfg.global_rate_limit);
-        if (cfg.idle_timeout > 0) instance->set_idle_timeout(cfg.idle_timeout);
-        if (cfg.drain) instance->set_drain(true);
+        // ─── THE COMMON FIELDS, FROM THE ONE LIST ───────────────────────────
+        //
+        // This was a second copy of apply_common_config's list, written out
+        // here.  runtime_config_apply.h opens by saying why there must not be
+        // one — "a second copy of this list would drift, and the failure when
+        // it drifts is a runtime that behaves differently depending on which
+        // side of the process boundary it happens to be running on" — and then
+        // this copy stayed behind, so the file that says the list lives in one
+        // place was wrong about the daemon.
+        //
+        // It had drifted, in both directions:
+        //
+        //   * `shards` was in apply_common_config and NOT here, so a proxy
+        //     created with --shards 4 came back from a daemon restart with one
+        //     worker.  Measured: 6 processes before the restart (daemon, four
+        //     shards, one server worker), 3 after, with `show` no longer
+        //     reporting the field at all.  A quarter of the throughput the
+        //     operator configured, reported by `ls` as running and by nothing
+        //     as wrong — which is word for word what runtime_config's own
+        //     comment on the field predicted.
+        //
+        //   * `listen_path` would have been the next one: it is applied in a
+        //     worker and would have been dropped here, so a server restored
+        //     with --listen unix:... bound nothing and still read as Up.
+        //
+        // `group`, `cpus` and `sqpoll` are set above with restore-specific
+        // handling and are re-applied here identically; that is idempotent and
+        // is cheaper than a rule about which of the two places owns them.
+        apply_common_config(*instance, cfg);
+
+        // Not part of the common list: it belongs to a client, where
+        // apply_typed_config sets it.  This restore still has its own typed
+        // switch below rather than calling that, so the field is applied here.
+        // See the note there.
         if (cfg.reconnect >= 0) instance->set_reconnect(cfg.reconnect);
-        if (cfg.tls) instance->set_tls(true);
-        if (!cfg.cert_path.empty()) instance->set_cert_path(cfg.cert_path);
-        if (!cfg.key_path.empty()) instance->set_key_path(cfg.key_path);
-        if (!cfg.ca_path.empty()) instance->set_ca_path(cfg.ca_path);
-        if (!cfg.target.empty()) instance->set_target(cfg.target);
-        if (!cfg.cache_name.empty()) instance->set_cache_name(cfg.cache_name);
 
         if (!cfg.lua_script.empty())
         {
@@ -396,7 +412,14 @@ static void restore_runtimes(state_persistence& persistence,
                 LOG_WARN("restore: could not load lua script");
         }
 
-        // Type-specific
+        // Type-specific.
+        //
+        // Still a second copy, and knowingly: apply_typed_config deliberately
+        // touches nothing that needs a runtime_manager, and three of the four
+        // cases here wire exactly that.  Untangling it is a change to what a
+        // worker is handed, not to what a restore applies, so it is left where
+        // it is rather than folded in on the way past.  The common list above
+        // is the one that had drifted.
         switch (cfg.type)
         {
             case runtime_server:

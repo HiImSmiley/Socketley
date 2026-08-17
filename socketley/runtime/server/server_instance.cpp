@@ -22,6 +22,9 @@
 #include <charconv>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <cstddef>
+#include <cerrno>
 #include <netinet/tcp.h>
 #include <netdb.h>
 #include <liburing.h>
@@ -1134,6 +1137,175 @@ size_t server_instance::get_connection_count() const
     return m_active_fds.size() + m_forwarded.size() + upstream_connected;
 }
 
+// The TCP listener, lifted out of setup() unchanged so that the address family
+// is one branch there rather than a second copy of everything after it.
+//
+// SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
+// daemon forks a worker for every runtime that does not ask for
+// --daemon-process.  Without the flag every such worker inherits this port —
+// measured, as fd 6 of a worker whose own port was a different one — and holds
+// it after this runtime is stopped and after the daemon exits.  The shutdown()
+// in teardown() unhashes the socket for every dup at once and so hides it on
+// the ordinary stop path; a daemon that is killed rather than stopped never
+// reaches that line, and then the port is bound by a process with no runtime
+// and no daemon to account for it.
+bool server_instance::setup_tcp_listener(uint16_t port)
+{
+    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (m_listen_fd < 0)
+        return false;
+
+    int opt = 1;
+    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data,
+    // eliminating the empty-accept + read round-trip on the hot path
+    int defer_secs = 1;
+    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+
+    if (listen(m_listen_fd, 4096) < 0)
+    {
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    return true;
+}
+
+// The AF_UNIX listener, for `--listen unix:/path/to.sock`.
+//
+// ─── THE NODE THAT IS ALREADY THERE ─────────────────────────────────────────
+//
+// bind() on a path that exists fails EADDRINUSE whether or not anything is
+// serving it, and a unix socket node outlives the process that made it: a
+// daemon killed with SIGKILL, a machine that lost power, a container image
+// with a socket committed into it all leave one behind.  Unlinking
+// unconditionally would answer that — and would also let a second copy of this
+// runtime take the path away from the first while it is serving traffic, with
+// the first left holding a socket no client can reach and no error anywhere.
+//
+// So the node is asked whether anyone is home, by connecting to it.  A refusal
+// means the node is stale and it is removed; a connection that succeeds means
+// somebody is serving this path and this start is refused, which is the answer
+// a second bind to a live TCP port would get.  There is a race in that — a
+// server could bind between the probe and ours — and it is the same race
+// `unlink` before `bind` has always had; the probe converts the common case
+// (nobody there) from a failure into a start, and the dangerous case
+// (somebody there) from a silent theft into a refusal.
+//
+// ─── WHO MAY CONNECT ────────────────────────────────────────────────────────
+//
+// The node is chmod'ed 0600 rather than left to the umask.  Connecting to a
+// unix socket needs write permission on the node, so the umask normally
+// decides who may — and a daemon running under `umask 0` publishes a listener
+// anybody on the machine can talk to, which is the same defect this tree
+// already has recorded against its 0666 control socket and its 0644 state
+// files.  0600 is the conservative end of that: the sidecar case this flag
+// exists for is a proxy and a backend under one daemon, which is one uid.
+//
+// NOT DONE, and worth saying rather than discovering: there is no flag to
+// widen it.  A peer running as another user cannot connect, and the way round
+// it today is a parent directory the operator owns and controls.
+bool server_instance::setup_unix_listener(const std::string& path)
+{
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    // The caller has already refused a path that would not fit; this cannot
+    // truncate.
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    const socklen_t addr_len =
+        static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + path.size() + 1);
+
+    {
+        // SOCK_NONBLOCK, and that matters rather than being tidy.  A blocking
+        // connect() to a unix socket whose listener has a FULL backlog waits
+        // for room -- and this runs on the daemon's event loop thread, the one
+        // thread that serves every runtime in the process.  A busy server on
+        // that path would have stalled the whole daemon for as long as it
+        // stayed busy.  Non-blocking, the same case answers EAGAIN, which is
+        // still "somebody is serving this" and is read as such.
+        const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (probe >= 0)
+        {
+            const int rc = connect(probe, reinterpret_cast<const struct sockaddr*>(&addr),
+                                   addr_len);
+            const int err = errno;
+            close(probe);   // never registered with the ring; a plain close is its own
+            if (rc == 0 || err == EAGAIN || err == EWOULDBLOCK)
+            {
+                LOG_ERROR(("server: --listen " + path +
+                           " is already being served by something -- refusing rather "
+                           "than taking the path away from it").c_str());
+                return false;
+            }
+            // ENOENT is nothing to remove; anything else -- ECONNREFUSED above
+            // all, which is what a node with nobody behind it answers -- is a
+            // leftover.  unlink's own failure is left to bind() to report, which
+            // says which path and why in one message rather than two.
+            if (err != ENOENT)
+                if (unlink(path.c_str()) < 0) {}
+        }
+    }
+
+    m_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (m_listen_fd < 0)
+        return false;
+
+    // Deliberately no SO_REUSEADDR, no SO_REUSEPORT, no TCP_NODELAY and no
+    // TCP_DEFER_ACCEPT.  The first two mean nothing for a path the bind above
+    // has just made exclusive, and the last two are TCP-level options that
+    // would fail on this socket and buy nothing if they did not.
+    if (bind(m_listen_fd, reinterpret_cast<const struct sockaddr*>(&addr), addr_len) < 0)
+    {
+        LOG_ERROR(("server: --listen " + path + " could not be bound: " +
+                   std::strerror(errno)).c_str());
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+
+    // Before listen(), so there is no instant at which the node both accepts
+    // connections and carries whatever the umask made of it.
+    if (chmod(path.c_str(), S_IRUSR | S_IWUSR) < 0)
+    {
+        LOG_ERROR(("server: --listen " + path + " was bound but its mode could not be "
+                   "set to 0600 -- refusing rather than serving on a node whose "
+                   "permissions are whatever the umask left").c_str());
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        if (unlink(path.c_str()) < 0) {}
+        return false;
+    }
+
+    if (listen(m_listen_fd, 4096) < 0)
+    {
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        if (unlink(path.c_str()) < 0) {}
+        return false;
+    }
+
+    // Remembered so teardown() removes exactly the node this bind created, and
+    // not whatever the configuration happens to say by then.  A runtime edited
+    // between start and stop would otherwise unlink a path it never bound.
+    m_bound_listen_path = path;
+    return true;
+}
+
 bool server_instance::setup(event_loop& loop)
 {
     // Nothing is freed here.  teardown() emptied m_clients into the pool and the
@@ -1246,8 +1418,53 @@ bool server_instance::setup(event_loop& loop)
         m_tls = std::move(ctx);
     }
 
-    // Internal-only server (port=0, used for Lua-managed sub-servers)
-    if (get_port() == 0 && !get_owner().empty())
+    // ─── --listen unix:/path/to.sock ────────────────────────────────────────
+    //
+    // Checked here rather than only in the flag parser because this is the one
+    // function every route to a listening socket passes through: create, the
+    // daemon's restore of a persisted runtime, a worker rebuilding from its
+    // config frame, `import`, and a restart after `edit`.  A rule kept in the
+    // flag parser alone is one that import and restore never hear about.
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        if (get_port() != 0)
+        {
+            LOG_ERROR("server: --listen and -p are two different listeners, and this "
+                      "runtime asks for both -- say which one it is");
+            return false;
+        }
+        if (m_udp)
+        {
+            LOG_ERROR("server: --listen names a stream socket and --udp asks for "
+                      "datagrams -- a unix datagram listener is a different thing "
+                      "and this is not it");
+            return false;
+        }
+        if (get_tls())
+        {
+            LOG_ERROR("server: --tls encrypts a listener against the network, and a "
+                      "unix socket is not on one -- the permissions on the socket "
+                      "node are what restrict it.  Refusing rather than spending a "
+                      "handshake on a peer that cannot be anywhere else");
+            return false;
+        }
+        // Re-checked here for the same reason as above: the flag parser is not
+        // on the restore path.  sun_path truncates silently.
+        struct sockaddr_un probe{};
+        if (listen_path.size() >= sizeof(probe.sun_path) || listen_path[0] != '/')
+        {
+            LOG_ERROR(("server: --listen \"" + listen_path +
+                       "\" is not an absolute path shorter than " +
+                       std::to_string(sizeof(probe.sun_path)) + " bytes").c_str());
+            return false;
+        }
+    }
+
+    // Internal-only server (port=0, used for Lua-managed sub-servers).  A
+    // listen path is a listener, so a runtime that has one is not this case
+    // however its owner is set.
+    if (listen_path.empty() && get_port() == 0 && !get_owner().empty())
         return true;
 
     uint16_t port = get_port();
@@ -1312,49 +1529,12 @@ bool server_instance::setup(event_loop& loop)
         return true;
     }
 
-    // TCP mode
-    //
-    // SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
-    // daemon forks a worker for every runtime that does not ask for
-    // --daemon-process.  Without the flag every such worker inherits this port
-    // — measured, as fd 6 of a worker whose own port was a different one — and
-    // holds it after this runtime is stopped and after the daemon exits.  The
-    // shutdown() in teardown() unhashes the socket for every dup at once and so
-    // hides it on the ordinary stop path; a daemon that is killed rather than
-    // stopped never reaches that line, and then the port is bound by a process
-    // with no runtime and no daemon to account for it.
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
+    // The listener itself, in whichever family this runtime was configured for.
+    // Everything below this line is the same for both: one accept chain, one
+    // buffer ring, one set of connection tables.
+    if (!(listen_path.empty() ? setup_tcp_listener(port)
+                              : setup_unix_listener(listen_path)))
         return false;
-
-    int opt = 1;
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data,
-    // eliminating the empty-accept + read round-trip on the hot path
-    int defer_secs = 1;
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
-    {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
-    }
-
-    if (listen(m_listen_fd, 4096) < 0)
-    {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
-    }
 
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
@@ -1549,6 +1729,22 @@ void server_instance::teardown(event_loop& loop)
         shutdown(m_listen_fd, SHUT_RDWR);
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
+    }
+
+    // And the socket node, for a unix listener.  Closing the descriptor does
+    // not remove it — the path is a filesystem entry, not a socket state — so
+    // without this every stopped server leaves one behind, and the next start
+    // meets its own leftovers.  setup_unix_listener probes those and recovers,
+    // so the cost of missing this is not a failure to start; it is a directory
+    // filling up with dead nodes that nothing ever accounts for.
+    //
+    // After the close, deliberately.  Unlinking first would leave a live
+    // listener bound to a path no longer in the filesystem, which is a
+    // perfectly legal state and an invisible one.
+    if (!m_bound_listen_path.empty())
+    {
+        if (unlink(m_bound_listen_path.c_str()) < 0) {}
+        m_bound_listen_path.clear();
     }
 
     // Drain: flush pending write queues with blocking writes before closing

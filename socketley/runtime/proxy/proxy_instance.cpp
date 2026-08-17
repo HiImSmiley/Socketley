@@ -11,12 +11,14 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstddef>
 #include <charconv>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/tcp.h>
 #include <algorithm>
 #include <type_traits>
@@ -34,10 +36,26 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
                                           bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
 
 
+// Is this (host, port) pair something a backend socket may be filed under?
+//
+// A pooled connection is handed to whoever asks for the same key next, so a key
+// that is a guess is a crossed delivery waiting to happen.  Two shapes are
+// real: (host, port) with a port on it is a network endpoint, and (path, 0) is
+// a unix backend.  The two spaces cannot overlap, because resolve_backend
+// refuses a socket path that is not absolute and no hostname or dotted quad
+// begins with '/' — so a unix backend can never be handed a TCP socket whatever
+// port the TCP one is on.
+//
+// One predicate rather than the same test written at each of the three places
+// that need it, for the reason backend_connect_addr gives just below.
+static inline bool pool_key_ok(std::string_view host, uint16_t port)
+{
+    return !host.empty() && (port != 0 || host.front() == '/');
+}
+
 // Which endpoint a client's current backend socket is connected to.  Returns
 // false when that cannot be established, and then the socket must not be
-// pooled: a pooled connection is handed to whoever asks for the same endpoint
-// next, so a key that is a guess is a crossed delivery waiting to happen.
+// pooled.
 //
 // backend_idx answers this only for a plain backend.  A group-routed request
 // picks one member per request and leaves the index pointing at the group
@@ -64,7 +82,52 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
         host = b.resolved_host;
         port = b.resolved_port;
     }
-    return !host.empty() && port != 0;
+    return pool_key_ok(host, port);
+}
+
+// The address a connect to this backend has to use, and how many bytes of it
+// the kernel is to read.
+//
+// One function because there are two connects — the request path and the health
+// sweep — and they have to agree about where a backend is.  Each had its own
+// copy, each with a hardcoded AF_INET, so a second address family would have
+// had to be taught to both and any later one to three.  This tree has the
+// worked example already: client_answer_owed() is consulted at 2 places while
+// close_pair() is called at 86, and the hold it guards was fixed four times
+// because of it.  Two is how three starts.
+//
+// False means "this backend has no address yet" — a hostname whose lookup has
+// not come back.  What to do about that is the one thing the two callers still
+// decide for themselves: the request path arms the idle sweep that re-resolves,
+// the health sweep skips the probe and leaves the backend's health untouched.
+static bool backend_connect_addr(const backend_info& b,
+                                 struct sockaddr_storage& out, socklen_t& len)
+{
+    if (b.is_unix)
+    {
+        // configure_unix_backend has already refused a path that would not
+        // fit, so this cannot truncate.  size() + 1 bytes, so the terminator
+        // goes with it: sun_path is a C string to the kernel, and copying the
+        // NUL is what makes this correct whether or not the caller's buffer
+        // arrived zeroed.
+        auto* un = reinterpret_cast<struct sockaddr_un*>(&out);
+        un->sun_family = AF_UNIX;
+        std::memcpy(un->sun_path, b.unix_path.c_str(), b.unix_path.size() + 1);
+        // offsetof rather than sizeof: passing the whole 110-byte structure
+        // works, but the kernel then compares the full sun_path against a bound
+        // socket's, and a length that stops at the terminator is what makes the
+        // address say exactly what was configured.
+        len = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) +
+                                     b.unix_path.size() + 1);
+        return true;
+    }
+
+    if (!b.has_cached_addr)
+        return false;
+
+    std::memcpy(&out, &b.cached_addr, sizeof(struct sockaddr_in));
+    len = sizeof(struct sockaddr_in);
+    return true;
 }
 
 // "The ring still owes this half a completion."
@@ -369,7 +432,6 @@ void proxy_client_connection::reset(int new_fd)
     response_deadline = {};
     awaiting_headers = false;
     header_deadline = {};
-    std::memset(&connect_addr, 0, sizeof(connect_addr));
 }
 
 void proxy_backend_connection::reset(int new_fd)
@@ -916,6 +978,97 @@ inline void proxy_instance::tune_socket(int fd)
     if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {}
 }
 
+// Make `b` a unix-socket backend at `path`, or refuse and say why.
+//
+// TWO callers, which is why it is a function: `--backend unix:/path` writes the
+// path on the command line, and `--backend <runtime-name>` gets one out of the
+// endpoint table when that runtime listens with `--listen unix:...`.  They are
+// the same backend and have to be refused for the same reasons; the second one
+// is exactly where a rule kept at the first would have been missed.
+//
+// Every refusal here fails the whole start rather than letting the proxy come
+// up and answer 502 to its first request.  A backend that provably cannot work
+// is known at configuration time, and reporting it at traffic time is reporting
+// it to the wrong person.
+//
+// `where` names the thing the operator wrote, so the message points at the flag
+// rather than at the path it produced.
+static bool configure_unix_backend(backend_info& b, std::string_view path,
+                                   std::string_view where)
+{
+    if (path.empty())
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": no socket path").c_str());
+        return false;
+    }
+
+    // Absolute, and this is not tidiness.  Two things rest on it: a relative
+    // path is resolved against the daemon's working directory, which is not
+    // something an operator writing a flag can see, and the connection pool
+    // keys a unix backend as (path, 0) — a leading '/' is what makes that key
+    // unable to collide with a hostname's.  A leading NUL, which is how Linux
+    // spells an abstract socket, is refused by the same test and deliberately:
+    // an abstract name is in no filesystem and so is bounded by nothing but the
+    // network namespace.
+    if (path[0] != '/')
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": the socket path must be absolute").c_str());
+        return false;
+    }
+
+    // sun_path is 108 bytes including its terminator, and the kernel truncates
+    // silently.  A trimmed path names a different socket — very possibly one
+    // that exists — so this refuses rather than pointing the proxy at whatever
+    // the first 107 bytes happen to reach.
+    struct sockaddr_un probe{};
+    if (path.size() >= sizeof(probe.sun_path))
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) + ": the socket path is " +
+                   std::to_string(path.size()) + " bytes, and the kernel's limit is " +
+                   std::to_string(sizeof(probe.sun_path) - 1) +
+                   " -- it would be truncated to a different socket").c_str());
+        return false;
+    }
+
+    // A NUL inside the path would end it early for the kernel and not for us,
+    // which is the truncation above wearing a different hat.
+    if (path.find('\0') != std::string_view::npos)
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": the socket path contains a NUL byte").c_str());
+        return false;
+    }
+
+    // TLS to a unix socket is refused, not ignored.  b.tls is already set from
+    // the backend-TLS options by the time this runs, so this catches --ca /
+    // --client-cert / --client-key applied to a proxy that has a unix backend;
+    // an `https://` scheme cannot reach here at all.  Encrypting a socket the
+    // kernel never puts on a wire buys nothing the filesystem permissions on
+    // the node do not already give, and quietly dropping the flags would be the
+    // fail-open answer to a set this project treats as meaning nothing against
+    // a cleartext peer.
+    if (b.tls)
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": --ca, --client-cert and --client-key encrypt every backend "
+                   "leg, and there is no TLS to a unix socket").c_str());
+        return false;
+    }
+
+    b.is_unix = true;
+    b.unix_path = std::string(path);
+    // The path is the endpoint, and resolved_port stays 0 — see backend_info.
+    // has_cached_addr says "this backend has somewhere to connect to", which a
+    // path always does: there is no lookup to fail and so nothing for the idle
+    // sweep to retry.
+    b.resolved_host = b.unix_path;
+    b.resolved_port = 0;
+    b.has_cached_addr = true;
+    return true;
+}
+
 bool proxy_instance::resolve_backend(backend_info& b)
 {
     // Group references (@groupname) are resolved dynamically at connection time
@@ -924,6 +1077,11 @@ bool proxy_instance::resolve_backend(backend_info& b)
         b.is_group = true;
         return true;
     }
+
+    // ─── unix:/path/to.sock ─────────────────────────────────────────────────
+    if (std::string_view(b.address).starts_with("unix:"))
+        return configure_unix_backend(b, std::string_view(b.address).substr(5),
+                                      "\"" + b.address + "\"");
 
     // A scheme says how to reach this backend, not only where.  "https://" is
     // how one backend is asked for over TLS while its neighbours stay
@@ -1025,8 +1183,21 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return false;
 
     const runtime_endpoint* ep = m_endpoints->find_name(b.address);
-    if (!ep || ep->port == 0)
+    if (!ep)
         return false;
+
+    // A runtime that listens with `--listen unix:...` publishes its socket path
+    // here with the port left at 0 — the same (path, 0) shape used everywhere
+    // else a unix endpoint has to be named.  It reaches the same validation the
+    // written-out `unix:` form does, which is the point of that being a
+    // function: a proxy pointed at such a runtime by name must be refused for
+    // the same reasons and told so in the same words.
+    if (ep->port == 0)
+    {
+        if (ep->host.empty() || ep->host[0] != '/')
+            return false;
+        return configure_unix_backend(b, ep->host, "\"" + b.address + "\"");
+    }
 
     b.resolved_host = ep->host;
     const uint16_t port = ep->port;
@@ -5793,7 +5964,7 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
 {
     if (out_ssl)
         *out_ssl = nullptr;
-    if (backend_idx >= m_backend_pool.size() || host.empty() || port == 0)
+    if (backend_idx >= m_backend_pool.size() || !pool_key_ok(host, port))
         return -1;
     // A TLS request with no context to have built the session against cannot
     // be matched to anything: tls_owner would have nothing to equal.  This is
@@ -5993,7 +6164,7 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
     // A socket with no endpoint on it cannot be given back to one.  Callers
     // establish the key through backend_endpoint_of and only pool when it
     // answered; this is the backstop, and it closes rather than files.
-    if (host.empty() || port == 0)
+    if (!pool_key_ok(host, port))
     {
         shutdown(backend_fd, SHUT_RDWR);
         close_tracked(backend_fd);
@@ -6142,7 +6313,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 {
     // Local helper: mark this as our own shortage rather than the backend's fault.
     const auto ours = [resource_failure]() { if (resource_failure) *resource_failure = true; };
-    if (SOCKETLEY_UNLIKELY(!target || target->resolved_port == 0))
+    // A backend with no port is a backend with nowhere to go — unless it is a
+    // unix one, where the path is the whole address and the port is 0 by
+    // definition.  See backend_info.
+    if (SOCKETLEY_UNLIKELY(!target || (target->resolved_port == 0 && !target->is_unix)))
         return false;
 
     // The wait for this backend's answer starts here rather than at the first
@@ -6289,13 +6463,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return true;  // connect_pending stays false
     }
 
-    // No pooled connection — resolve address and submit async connect
-    struct sockaddr_in addr{};
-    if (target->has_cached_addr)
-    {
-        addr = target->cached_addr;
-    }
-    else
+    // No pooled connection — take the address and submit async connect
+    struct sockaddr_storage addr{};
+    socklen_t addr_len = 0;
+    if (!backend_connect_addr(*target, addr, addr_len))
     {
         // ─── THE REQUEST PATH DOES NOT RESOLVE ──────────────────────────────
         //
@@ -6322,7 +6493,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    bfd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (bfd < 0)
     {
         // Out of descriptors is our shortage, not the backend's.
@@ -6340,12 +6511,18 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    tune_socket(bfd);
+    // Everything tune_socket sets is a TCP-level option or a TCP keepalive
+    // timer, so it has nothing to say to a socket in another family.  Asked of
+    // one, the calls would fail rather than do harm — none of them is checked —
+    // but four failing setsockopts per connect is four syscalls per connect
+    // spent on nothing.
+    if (addr.ss_family == AF_INET)
+        tune_socket(bfd);
 
     // Try synchronous connect first — on loopback this often succeeds instantly
     // (returns 0), avoiding a full io_uring round-trip. If EINPROGRESS, fall back
     // to async io_uring connect where handle_connect() finishes the setup.
-    int cr = ::connect(bfd, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
+    int cr = ::connect(bfd, reinterpret_cast<const struct sockaddr*>(&addr), addr_len);
     if (cr == 0)
     {
         // Instant connect success — set up backend inline (same as handle_connect)
@@ -6469,9 +6646,15 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // writability, not issuing a second connect: io_uring runs that against an
     // fd that is already connected and answers EISCONN, and that completion was
     // then dropped rather than acted on, leaving the connection wedged.
+    //
+    // Nothing keeps the address past this point, and connect_addr — which used
+    // to be assigned here — was never read by anything: the kernel has already
+    // taken it inside the ::connect() above, and what is armed on the socket
+    // afterwards is a poll, which names no address.  Removed rather than
+    // widened to hold a second family, because a field written and never read
+    // is a fact about the connection that nothing maintains.
     conn->connect_pending = true;
     conn->connect_fd = bfd;
-    conn->connect_addr = addr;
     conn->connect_req = { this, nullptr, conn->fd, 0, op_poll, conn->generation };
 
     if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(bfd, POLLOUT, &conn->connect_req)))
@@ -7756,9 +7939,17 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
     // release_to_pool returns without taking the fd when the index is out of
     // range, so asking it to pool one it will refuse leaks the descriptor
     // silently — this is the last owner the fd has.
+    //
+    // pool_key_ok rather than the test written out again.  This was the fourth
+    // copy of "a host and a non-zero port", and it is the copy that decides the
+    // ordinary keep-alive case — the one reached whenever the backend's read is
+    // still armed, which under multishot recv is every response.  A unix
+    // backend, whose key is a path and no port, was filed by the other three
+    // and closed by this one, so every request through one paid for a fresh
+    // connect while the pool looked healthy from outside.
     if (SOCKETLEY_LIKELY(!conn->pool_abandoned &&
                          conn->pool_backend_idx < m_backend_pool.size() &&
-                         !conn->pool_host.empty() && conn->pool_port != 0))
+                         pool_key_ok(conn->pool_host, conn->pool_port)))
     {
         release_to_pool(fd, conn->pool_backend_idx, conn->pool_host, conn->pool_port, conn);
     }
@@ -8191,7 +8382,26 @@ void proxy_instance::health_check_sweep()
         if (b.is_group)
             continue;
 
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        // Where this backend is, from the same function the request path asks.
+        //
+        // Asked before the socket, which is the reverse of how this ran: the
+        // family the address turns out to be in is what the socket has to be
+        // opened in, and a probe with no address to aim at should not cost a
+        // descriptor to find that out.
+        //
+        // False means an unresolved hostname, and this is the one caller that
+        // does nothing about it.  The old code reached the same conclusion the
+        // long way round — it built an AF_INET address and ran inet_pton over a
+        // hostname, which cannot parse one and leaves sin_addr zeroed, so the
+        // probe would have connected to 0.0.0.0 and recorded an unrelated local
+        // service's answer as this backend's health.  Skipping leaves the health
+        // state untouched; the idle sweep is what re-resolves.
+        struct sockaddr_storage addr{};
+        socklen_t addr_len = 0;
+        if (!backend_connect_addr(b, addr, addr_len))
+            continue;
+
+        int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
         {
             if (i < m_backend_health.size())
@@ -8212,38 +8422,13 @@ void proxy_instance::health_check_sweep()
         hc.current = async_health_check::connecting;
         hc.req = { this, nullptr, fd, 0, op_health_check };
 
-        struct sockaddr_in addr{};
-        if (b.has_cached_addr)
-        {
-            addr = b.cached_addr;
-        }
-        else
-        {
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(b.resolved_port);
-
-            // has_cached_addr is only false for a hostname that failed to
-            // resolve at setup.  inet_pton cannot parse a hostname and leaves
-            // sin_addr zeroed — connecting to 0.0.0.0 reaches localhost, so the
-            // check would probe an unrelated local service and record the
-            // result as this backend's health.  Skip the check instead and
-            // leave the health state untouched; the data path still retries DNS
-            // on each connect.
-            if (inet_pton(AF_INET, b.resolved_host.c_str(), &addr.sin_addr) != 1)
-            {
-                close_tracked(fd);
-                hc.fd = -1;
-                m_health_checks[i].reset();
-                continue;
-            }
-        }
-
         // The kernel reads the address asynchronously, so it lives in the probe
         // for the duration of the connect.  It used to share `buf` with the HTTP
         // response, which meant a late read from an abandoned probe rewrote the
         // address the next connect was about to use.
         hc.write_buf.clear();
         hc.addr = addr;
+        hc.addr_len = addr_len;
 
         // A refused submission is our problem, not the backend's: recording it
         // as a failure would take a healthy backend out of rotation whenever the
@@ -8251,7 +8436,7 @@ void proxy_instance::health_check_sweep()
         hc.op_pending = true;
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_connect(fd,
                 reinterpret_cast<const struct sockaddr*>(&hc.addr),
-                sizeof(struct sockaddr_in), &hc.req)))
+                hc.addr_len, &hc.req)))
         {
             close_tracked(fd);
             hc.fd = -1;
@@ -8421,8 +8606,15 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
             return;
         }
 
+        // A unix backend's resolved_host is a filesystem path, and a path is not
+        // a Host field-value: a strict backend answers 400 to it, 400 is not
+        // 2xx, and this probe would then take a perfectly healthy backend out of
+        // rotation for the shape of a header it was sent itself.  There is
+        // nothing else to name — the peer is a socket node, not a name in any
+        // namespace — so it is asked as "localhost", which is where it is.
         hc->write_buf = "GET " + m_mesh.health_path + " HTTP/1.0\r\nHost: " +
-                        b.resolved_host + "\r\nConnection: close\r\n\r\n";
+                        (b.is_unix ? std::string("localhost") : b.resolved_host) +
+                        "\r\nConnection: close\r\n\r\n";
         hc->write_off = 0;
         hc->current = async_health_check::writing;
         // Our shortage, not the backend's: no verdict is recorded.

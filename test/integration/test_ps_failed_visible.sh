@@ -152,8 +152,29 @@ fi
 # The JSON writer emitted the literal string "running" for every row it printed,
 # because every row it could print was running.  A row for a failed runtime that
 # still claims "running" is worse than no row.
+#
+# Read as JSON rather than matched as a substring.  This asserted a contiguous
+# `"name":...,"type":...,"port":...,"status":...` run, which makes it a test of
+# the field ORDER and of which fields exist between them -- neither of which is
+# what it is for.  Adding `listen` between `port` and `status`, so that a server
+# on a unix socket has somewhere to report its address, broke both of these and
+# neither for a reason a reader of the failure could act on.  What it means is
+# "the row named brokencli says failed", so that is what it now asks.
+row_status() {   # row_status <json> <name>
+    printf '%s' "$1" | python3 -c "
+import json, sys
+try:    rows = json.load(sys.stdin)
+except Exception: sys.stdout.write('NOT-JSON'); raise SystemExit
+for r in rows:
+    if r.get('name') == '$2':
+        sys.stdout.write(str(r.get('status')))
+        raise SystemExit
+sys.stdout.write('NO-SUCH-ROW')
+" 2>/dev/null || printf 'ERROR'
+}
+
 PSAJ=$("$BIN" ps -a --json 2>&1 || true)
-if has "$PSAJ" "\"name\":\"brokencli\",\"type\":\"server\",\"port\":$BROKEN_PORT,\"status\":\"failed\""; then
+if [ "$(row_status "$PSAJ" brokencli)" = "failed" ]; then
     ok
 else
     bad "ps -a --json reports the real state" \
@@ -197,7 +218,7 @@ fi
 # Asked of the same snapshot as the brokencli row above, and in the same shape,
 # so that "one row went to its real state" and "the other stayed running" are
 # two readings of one listing rather than two listings taken a moment apart.
-if has "$PSAJ" "\"name\":\"upsrv\",\"type\":\"server\",\"port\":$SRV_PORT,\"status\":\"running\""; then
+if [ "$(row_status "$PSAJ" upsrv)" = "running" ]; then
     ok
 else
     bad "ps -a --json still reports a running runtime as running" \

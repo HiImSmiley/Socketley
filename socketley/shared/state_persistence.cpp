@@ -573,6 +573,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.key_path = instance->get_key_path();
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
+    cfg.listen_path = instance->get_listen_path();
     cfg.cache_name = instance->get_cache_name();
     cfg.group = instance->get_group();
     cfg.owner = instance->get_owner();
@@ -712,6 +713,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     append_str_field("id", cfg.id);
     append_str_field("type", type_str(cfg.type));
     append_int_field("port", cfg.port);
+    // Written only when there is one, so every state file that ever existed
+    // reads back as the TCP listener it is.  The `unix:` prefix stays on it:
+    // this is the field an operator edits and re-imports, and it has to say
+    // the same thing the flag said.
+    if (!cfg.listen_path.empty())
+        append_str_field("listen", "unix:" + cfg.listen_path);
     append_bool_field("was_running", cfg.was_running);
 
     // Common fields (only write non-default)
@@ -898,6 +905,16 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.id = json_get_string(json, "id");
     cfg.type = str_to_type(json_get_string(json, "type"));
     cfg.port = static_cast<uint16_t>(json_get_int(json, "port"));
+    {
+        // The prefix is stripped here and stored bare, so nothing downstream
+        // has to know that "listen" is a family plus an address rather than an
+        // address.  A value without it is refused by the flag reader and by
+        // import alike; accepting it here would let a document say
+        // `"listen": "/run/x.sock"` and mean something the flag cannot.
+        const std::string listen = json_get_string(json, "listen");
+        if (listen.rfind("unix:", 0) == 0)
+            cfg.listen_path = listen.substr(5);
+    }
     cfg.was_running = json_get_bool(json, "was_running");
 
     // Common
@@ -1207,6 +1224,12 @@ state_persistence::~state_persistence()
         m_writer.join();
 }
 
+std::string state_persistence::raw_field(const std::string& json,
+                                         std::string_view key) const
+{
+    return sp_detail::json_get_string(json, key);
+}
+
 void state_persistence::set_was_running(std::string_view name, bool running)
 {
     job j;
@@ -1234,16 +1257,79 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
     f.close();
     std::string json = ss.str();
 
-    std::string_view old_val = running ? "false" : "true";
-    std::string_view new_val = running ? "true" : "false";
-    std::string needle = "\"was_running\": ";
-    needle += old_val;
+    // ─── THE VALUE IS FOUND, NOT COUNTED ────────────────────────────────────
+    //
+    // This searched for `"was_running": <old>` and then wrote the new literal
+    // at `pos + 16`.  `"was_running": ` is FIFTEEN characters, so every flip
+    // landed one byte into the value and one byte past its end:
+    //
+    //     "was_running": true,    ->    "was_running": tfalse
+    //     "was_running": false,   ->    "was_running": ftrue
+    //
+    // — the first character of the old value kept, the trailing comma eaten.
+    // And it was self-sealing: the next flip searched for `": true` or
+    // `": false`, found neither in `tfalse`, and returned having changed
+    // nothing.  So one `stop` corrupted the field permanently and every later
+    // start and stop was a silent no-op on it.
+    //
+    // What that cost is the whole was_running feature, which the man page
+    // states as "Runtimes that were running when the daemon last stopped are
+    // auto-started".  Measured on a plain TCP server with nothing unusual about
+    // it: create -s, stop, start, restart the daemon — and `ls` reports
+    // Created.  Any runtime ever stopped once stopped coming back, for the rest
+    // of that install, with nothing anywhere saying so.  Reproduced on `main`,
+    // which has the same line.
+    //
+    // Rewritten to find the value rather than to count to it, which also heals
+    // a record an older build corrupted: the whole alphabetic token after the
+    // key is replaced, so `tfalse` and `ftrue` become the literal they should
+    // have been.  The comma that flip ate does not come back here — this
+    // parser looks up keys by name and does not need one — and the next full
+    // write of the record restores it.
+    static constexpr std::string_view key = "\"was_running\":";
+    const auto kpos = json.find(key);
+    if (kpos == std::string::npos)
+        return;   // no such field; nothing to flip
 
-    auto pos = json.find(needle);
-    if (pos == std::string::npos)
-        return; // Already set or key missing
+    size_t vpos = kpos + key.size();
+    while (vpos < json.size() && (json[vpos] == ' ' || json[vpos] == '\t'))
+        ++vpos;
+    size_t vend = vpos;
+    while (vend < json.size() &&
+           ((json[vend] >= 'a' && json[vend] <= 'z') ||
+            (json[vend] >= 'A' && json[vend] <= 'Z')))
+        ++vend;
 
-    json.replace(pos + 16, old_val.size(), new_val);
+    const std::string_view cur = std::string_view(json).substr(vpos, vend - vpos);
+    const std::string_view new_val = running ? "true" : "false";
+    if (cur == new_val)
+        return;   // already what it should be — no rewrite, no fsync
+
+    if (cur == "true" || cur == "false")
+    {
+        json.replace(vpos, vend - vpos, new_val);
+    }
+    else
+    {
+        // A record an older build damaged.  Patching the value alone is not
+        // enough to recover one: the comma the off-by-one ate is load-bearing,
+        // because json_get_string reads a non-string value up to the next `,`,
+        // `]` or `}` — so `"was_running": true` with no comma is read as
+        // `true\n    "out_of_process": true`, which is not "true", and the
+        // whole field silently reverts to its default of false.  Every
+        // auto-restart stayed broken with the value looking right in the file.
+        //
+        // So a damaged record is parsed and written out whole rather than
+        // patched.  It costs a full serialization exactly once per damaged
+        // file: the record that comes out of it takes the fast path from then
+        // on.  Every other field survives the damage, because each of them
+        // still has the comma that ends it.
+        runtime_config cfg;
+        if (!parse_json_string(json, cfg))
+            return;
+        cfg.was_running = running;
+        json = format_json_pretty(cfg);
+    }
 
     // Through the same writer as write_json, and that is the point rather than
     // tidiness.  This path rewrites the whole record — master_pw and all — on

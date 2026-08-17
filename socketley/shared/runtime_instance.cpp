@@ -433,6 +433,16 @@ uint16_t runtime_instance::get_port() const
     return m_port;
 }
 
+void runtime_instance::set_listen_path(std::string_view path)
+{
+    m_listen_path = path;
+}
+
+std::string_view runtime_instance::get_listen_path() const
+{
+    return m_listen_path;
+}
+
 void runtime_instance::set_log_file(std::string_view path)
 {
     m_log_file = path;

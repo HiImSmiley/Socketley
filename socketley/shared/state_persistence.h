@@ -30,6 +30,10 @@ struct runtime_config
     std::string id;
     runtime_type type = runtime_server;
     uint16_t port = 0;
+    // `--listen unix:/path` — an AF_UNIX listener instead of a port.  See
+    // runtime_instance::set_listen_path.  Mutually exclusive with `port`; the
+    // refusal is where the flag is read, not here.
+    std::string listen_path;
     bool was_running = false;
 
     // Common
@@ -182,6 +186,17 @@ public:
     runtime_config read_from_instance(const runtime_instance* instance) const;
     std::string format_json_pretty(const runtime_config& cfg) const;
     bool parse_json_string(const std::string& json, runtime_config& cfg) const;
+
+    // One field's value, exactly as the document wrote it.
+    //
+    // parse_json_string has no error channel for a single field -- it returns
+    // false only for a document with no name -- so a field whose value is
+    // syntactically fine and semantically wrong is silently normalised away.
+    // `listen` is one of those: the `unix:` prefix is stripped on the way in,
+    // and a value that never had one is indistinguishable afterwards from a
+    // document that cleared the field.  `import` re-reads it through this and
+    // judges it with the same function the flag parser uses.
+    std::string raw_field(const std::string& json, std::string_view key) const;
 
     // Block until everything queued has reached disk.  For a caller that is
     // about to read the files back — a test, a shutdown that will be followed

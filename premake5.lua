@@ -768,6 +768,40 @@ project "floor_relay"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Benchmark: floor_pingpong ───
+--
+-- One duplex exchange, AF_UNIX against loopback TCP, interleaved -- the number
+-- that sizes any change moving a leg between families, and the one that shows
+-- CPU and latency coming apart.  See the header of test/benchmark/floor_pingpong.c.
+
+project "floor_pingpong"
+    kind "ConsoleApp"
+    language "C"
+    cdialect "C17"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    buildoptions { "-pipe" }
+
+    files { "test/benchmark/floor_pingpong.c" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Benchmark: floor_server ───
 --
 -- The irreducible cost of the server benchmarks' traffic: accept, read, write.

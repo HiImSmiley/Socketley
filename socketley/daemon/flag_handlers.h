@@ -142,6 +142,20 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
 int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                       std::string_view name);
 
+// A `--listen` value -- "unix:/abs/path.sock" and nothing else, today.
+//
+// One function because two things read the same value and must judge it the
+// same way: the flag, and the "listen" field of an `import` document.  The
+// second is where a rule kept only in the flag parser would have been missed,
+// and the field is one where being wrong is silent -- an unprefixed path is
+// simply not a unix listener, so a document saying `"listen": "/run/x.sock"`
+// would have configured a server with no listener at all.
+//
+// Returns an empty string when the value is acceptable, and writes the bare
+// path (prefix stripped) to `out`.  Otherwise returns the reason to report and
+// leaves `out` untouched.
+std::string validate_listen_value(std::string_view value, std::string& out);
+
 // Mode parsing helpers
 bool parse_server_mode(uint32_t hash, server_mode& mode);
 bool parse_client_mode(uint32_t hash, client_mode& mode);

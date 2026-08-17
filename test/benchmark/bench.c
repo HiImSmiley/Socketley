@@ -2435,7 +2435,7 @@ static void usage(const char *prog)
         "              milliseconds measures the scheduler.  Worth most on the\n"
         "              concurrent tests, where without it a run ends at the\n"
         "              SLOWEST of its threads and the rate reported is that one's.\n"
-        "  -W N        Run and discard N runs before the measured ones\n"
+        "  -W N        Run and discard N runs before the measured ones (default %d)\n"
         "  -u PATH     Request target for the HTTP tests (default /)\n"
         "\n"
         "Categories and tests:\n"

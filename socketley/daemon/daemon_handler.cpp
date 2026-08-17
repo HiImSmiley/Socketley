@@ -1925,11 +1925,20 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             // Escaped, all of them.  A name is validated now, but a group and
             // an owner are arbitrary operator strings, and a quote in either
             // used to produce a document no JSON parser would accept.
+            // Where a runtime with no port listens.  Empty for every other
+            // runtime, so a consumer reading `port` alone sees exactly what it
+            // saw before -- but a server on a unix socket reports `"port":0`
+            // and nothing else, and a caller reading this document has no other
+            // way to find out where it is.
+            const std::string_view listen_path = instance->get_listen_path();
             out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
                 << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
-                << ",\"status\":\"" << state_str
+                << ",\"listen\":\""
+                << (listen_path.empty() ? std::string()
+                                        : "unix:" + sp_detail::json_escape(listen_path))
+                << "\",\"status\":\"" << state_str
                 << "\",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << sp_detail::json_escape(owner)
                 << "\",\"group\":\"" << sp_detail::json_escape(group)
@@ -2139,11 +2148,16 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             // failed runtime claiming to be up, which is worse than no row.
             // uptime goes empty for the same reason: a runtime that never
             // started has no start time to measure from.
+            // See the note in `ls --json` above.
+            const std::string_view listen_path = instance->get_listen_path();
             out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
                 << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
-                << ",\"status\":\"" << state_json(instance->get_state())
+                << ",\"listen\":\""
+                << (listen_path.empty() ? std::string()
+                                        : "unix:" + sp_detail::json_escape(listen_path))
+                << "\",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
                 << "\",\"connections\":" << instance->reported_connection_count()
@@ -3339,6 +3353,29 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
+    // The listener field, judged by the same function the flag is.  It has to
+    // be re-read from the document rather than taken from cfg, because
+    // parse_json_string has no error channel for a single field: it strips the
+    // `unix:` prefix and leaves the field empty when there is none, which is
+    // indistinguishable from a document that clears it on purpose.  Without
+    // this, `"listen": "/run/x.sock"` -- the same value with the prefix
+    // forgotten -- imported as "no unix listener at all" and the server came
+    // back on a TCP port, reported by nothing.
+    if (cfg.has("listen"))
+    {
+        const std::string raw = m_persistence->raw_field(json_str, "listen");
+        if (!raw.empty())
+        {
+            std::string parsed;
+            const std::string why = validate_listen_value(raw, parsed);
+            if (!why.empty())
+            {
+                conn->write_buf = "listen: " + why + "\n";
+                return 1;
+            }
+        }
+    }
+
     bool is_running = instance->get_state() == runtime_running;
     runtime_type type = instance->get_type();
 
@@ -3436,6 +3473,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "cannot change port while running\n";
             return 1;
         }
+        // The listener's other spelling, under the same rule.  A running
+        // server is bound to the socket node it has; moving it would mean
+        // unbinding one path and binding another underneath whatever is already
+        // connected, and the node the old listener owns would be left for the
+        // teardown that never came.
+        if (cfg.listen_path != std::string(instance->get_listen_path()))
+        {
+            conn->write_buf = "cannot change the listen socket while running\n";
+            return 1;
+        }
         // The same rule as the port above, and as `edit --shards`: applying it
         // to a running proxy would mean retiring workers out from under live
         // connections.  Refused rather than quietly dropped — see the note
@@ -3518,6 +3565,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     const auto has = [&cfg](const char* key) { return cfg.has(key); };
 
     if (has("port"))              instance->set_port(cfg.port);
+    if (has("listen"))            instance->set_listen_path(cfg.listen_path);
     if (has("log_file"))          instance->set_log_file(cfg.log_file);
     if (has("write_file"))        instance->set_write_file(cfg.write_file);
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);

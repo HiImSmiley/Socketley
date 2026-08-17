@@ -425,6 +425,17 @@ public:
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
 
+private:
+    // The two listeners setup() chooses between.  Each opens m_listen_fd, binds
+    // it and puts it in the listen state, or leaves it -1 and returns false.
+    // Everything after that point in setup() — the buffer ring, the accept
+    // chain, the connection tables — is the same for both, which is the whole
+    // reason they are two functions and not two copies of setup().
+    bool setup_tcp_listener(uint16_t port);
+    bool setup_unix_listener(const std::string& path);
+
+public:
+
     size_t get_connection_count() const override;
 
     // Lua actions
@@ -888,6 +899,12 @@ private:
     bool m_master_forward{false};
     std::string m_master_pw;
     int m_listen_fd;
+    // The socket node this run's listener is actually bound to, when it is an
+    // AF_UNIX one.  Deliberately not get_listen_path(): teardown() has to
+    // remove the node THIS bind created, and a runtime edited between its start
+    // and its stop would otherwise unlink a path it never bound.  Empty for a
+    // TCP listener, which is what says there is nothing to unlink.
+    std::string m_bound_listen_path;
     struct sockaddr_in m_accept_addr;
     socklen_t m_accept_addrlen;
     // The request the current accept chain was armed with, and the ones earlier

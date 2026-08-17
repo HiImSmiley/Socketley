@@ -718,6 +718,7 @@ l l l.
 Field	Type	Description
 _
 port	number	Listener/connection port \fB(requires restart)\fR
+listen	string	"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server; requires restart)\fR
 log_file	string	State transition log file path
 write_file	string	Message write file path
 lua_script	string	Lua script path (absolute)
@@ -826,6 +827,18 @@ List all runtimes (all states). Docker-style output with columns:
 ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED, GROUP.
 With \fB\-\-json\fR or \fB\-\-format json\fR, outputs a JSON array of runtime objects.
 With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
+.IP
+The JSON form carries a
+.B listen
+field beside
+.BR port :
+empty for an ordinary runtime, and
+.BI unix: /path/to.sock
+for a server started with
+.BR \-\-listen .
+The PORT column shows
+.B \-
+for one of those, since it has none.
 .RS
 .PP
 .B Column selectors
@@ -1347,6 +1360,59 @@ address that is not accepting yet would trip the routing proxy's circuit breaker
 against a member that is merely young.
 .SH SERVER FLAGS
 .TP
+.BI "\-\-listen unix:" "/path/to.sock"
+Listen on an AF_UNIX socket instead of a TCP port. The other half of
+.BI \-\-backend " unix:" /path/to.sock
+under
+.BR "PROXY FLAGS" ,
+so a proxy and the server it fronts can talk on one host without a loopback TCP
+stack between them.
+.RS
+.PP
+Mutually exclusive with
+.BR \-p ,
+with
+.B \-\-udp
+(that would be a unix datagram socket, which is a different thing and is not
+this) and with
+.B \-\-tls
+(a unix socket is not on a network; the permissions on the node are what
+restrict it). Each combination is refused at start with the reason in the daemon
+log, rather than one of the two winning quietly.
+.PP
+The path must be absolute and shorter than 108 bytes, which is what the kernel's
+.I sun_path
+holds. Both are refused when the flag is read \(em the kernel truncates a long
+path silently, and a trimmed path names a different socket, very possibly a real
+one belonging to something else.
+.PP
+.B The socket node is created 0600.
+Connecting to a unix socket needs write permission on the node, so leaving that
+to the umask means a daemon running under
+.B umask 0
+publishes a listener anybody on the machine can talk to. There is deliberately
+no flag to widen it: a peer running as another user cannot connect, and the way
+round that today is a parent directory the operator owns and controls.
+.PP
+The node is removed when the runtime stops. One left behind by a daemon that was
+killed, or by a machine that lost power, is taken over on the next start \(em but
+only after connecting to it to check that nobody is serving it. A path that
+something IS serving is refused, so a second runtime cannot take a live socket
+away from the first.
+.PP
+A server listening this way is reachable as a proxy backend both by its path and
+by its runtime name. It is deliberately NOT offered as an
+.BI @ group
+member: a group's members are resolved to network addresses per request, and an
+entry the group path cannot dial would take a turn of the round\-robin and answer
+503 with it.
+.PP
+.nf
+socketley create server app --listen unix:/run/app.sock --http /srv/www -s
+socketley create proxy  gw  -p 8080 --backend app -s
+.fi
+.RE
+.TP
 .BI "\-\-mode " "mode"
 Message flow direction:
 .B inout
@@ -1717,13 +1783,18 @@ is that a name which starts resolving is picked up within one sweep instead of
 immediately.
 .IP
 .B IPv4 only.
-Every address this daemon resolves or binds is AF_INET: a backend, an upstream,
-a client target and every listener. A hostname that has only a AAAA record
-resolves to nothing and the backend is reported unreachable, with no line
-anywhere saying why. This is a property of the whole daemon and not of this
-flag; it is written here because this is where an operator meets it first.
+Every address this daemon resolves is AF_INET: a backend, an upstream, a client
+target and every listener. A hostname that has only a AAAA record resolves to
+nothing and the backend is reported unreachable, with no line anywhere saying
+why. This is a property of the whole daemon and not of this flag; it is written
+here because this is where an operator meets it first. The one address that is
+not an internet address at all is
+.BI unix: /path/to.sock
+below, which resolves nothing because there is nothing to resolve.
 .IP
-Add backend server. Can be ip:port, runtime name, or
+Add backend server. Can be ip:port,
+.BI unix: /path/to.sock ,
+a runtime name, or
 .BI @ groupname
 to dynamically target all running members of that group. Repeatable or comma-separated.
 Group backends are resolved at connection time, so new group members are picked up
@@ -1739,6 +1810,53 @@ follows whatever the backend-TLS options below say. The port may be omitted
 after a scheme, in which case it is 443 or 80. See
 .B "mTLS Flags"
 for what verifies such a connection.
+.IP
+.BI unix: /path/to.sock
+reaches a backend over an AF_UNIX socket instead of loopback TCP. A sidecar
+proxy and the process it fronts are on one host, and loopback TCP charges that
+pair for a whole stack \(em sequence numbers, checksums, windows \(em on a
+connection that never sees a wire. Measured on a quiet machine, 64\-byte round
+trips through this proxy: one connection unpinned, 41.4 us over TCP against
+37.0 us over AF_UNIX; eight connections unpinned, 66,620 round trips a second
+against 85,217 \(em 16 to 28% depending on where the scheduler puts the three
+processes.
+.IP
+The throughput figure is the one to plan with, and why is worth stating. What
+the swap removes is CPU: 17.5 us of it per round trip across proxy and backend
+over TCP against 14.5 over AF_UNIX, which is to the tenth what a two\-process
+ping\-pong predicts for that leg. On one core with a single connection almost
+none of it shows up as latency \(em 21.5 us against 20.7 \(em because a serial
+round trip there is waiting on wakeups rather than on work, so freed CPU has
+nothing to do. A proxy under load is short of exactly that CPU, which is why
+the same change is worth under a microsecond in the first measurement and a
+fifth of the throughput in the second.
+.IP
+The path must be absolute, and shorter than 108 bytes, which is what the
+kernel's
+.I sun_path
+holds. Both are refused at
+.BR create / start
+rather than at traffic time: the kernel truncates a long path silently, and a
+trimmed path names a different socket \(em quite possibly a real one belonging
+to something else. A relative path is refused because it would be resolved
+against the daemon's working directory, which is not something the operator
+writing the flag can see.
+.IP
+A unix backend is never reached over TLS.
+.BR \-\-ca ,
+.B \-\-client\-cert
+and
+.B \-\-client\-key
+encrypt every backend leg at once, so a proxy given both them and a
+.B unix:
+backend is refused at start rather than quietly connecting in the clear.
+Filesystem permissions on the socket node are what restrict access to it.
+.IP
+A socket path that is not there, and a stale socket node left behind by a
+process that has gone, both answer the client
+.B 502
+\(em the same answer an unreachable TCP backend gets, and for the same reason:
+that is the far end failing, not this one.
 .TP
 .BI "\-\-strategy " "strategy"
 Load balancing strategy:
