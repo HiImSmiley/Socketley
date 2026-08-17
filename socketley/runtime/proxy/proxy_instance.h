@@ -199,10 +199,32 @@ struct alignas(64) proxy_client_connection
     // not a refusal by the backend, and it must not cost the client its
     // connection.  Bounded so a persistent problem still surfaces.
     bool connect_reattempted{false};
+    // The client has shut its write side.  It will send nothing more; it is
+    // still reading, and whatever it already asked for still has somewhere to
+    // go.  Set on the EOF completion and nowhere else, on both the copy path
+    // and the splice path.
     bool client_eof{false};
+    // …and that half-close has been passed on to the backend socket with
+    // shutdown(SHUT_WR).  TCP mode only: there is no framing to tell a backend
+    // where the request ended, so the FIN is the only thing that can, and a
+    // backend waiting for one will not answer until it arrives.
+    //
+    // A flag rather than "just call shutdown again": the call has to happen
+    // exactly once, at the moment the last byte the client sent has actually
+    // reached the socket, and every path that could reach that moment asks
+    // forward_client_half_close() rather than deciding for itself.
+    bool backend_half_closed{false};
     bool backend_from_group{false};
     std::string backend_host;
     uint16_t backend_port{0};
+
+    // Rate limiting (token bucket), per connection.  Same three fields and the
+    // same names the server and the cache carry, so the three are recognisably
+    // one mechanism.  rl_max of 0 means no limit and is the common case, which
+    // is why the check is written to leave on that first.
+    double rl_tokens{0.0};
+    double rl_max{0.0};
+    std::chrono::steady_clock::time_point rl_last{};
 
     // Async connect state
     bool connect_pending{false};
@@ -285,6 +307,12 @@ struct alignas(64) proxy_backend_connection
     // but the read that was armed on it has been cancelled and its completion
     // is still owed.  Nothing may touch the fd until that completion lands.
     bool pool_draining{false};
+    // Application bytes came off this backend socket and went to the client.
+    // The plain fact behind "did the backend answer", stated so a --protocol
+    // tcp proxy can ask it: response_started, which HTTP uses for the same
+    // purpose, is never set outside HTTP mode.  See the circuit breaker in
+    // handle_backend_read.
+    bool sent_to_client{false};
     int client_fd;
     uint32_t write_batch_count{0};
     // Bumped on every reuse from the struct pool and stamped into read_req.
@@ -768,11 +796,28 @@ private:
     // likely to be holding something.
     void close_tracked(int fd);
 
-    void close_pair(int client_fd, int backend_fd);
+    // close_reason::force is a caller stating that no answer can arrive on this
+    // pair any more -- the runtime is stopping, the backend is gone, the client
+    // aborted.  5 of the 86 calls say it; the other 81 leave the default, and
+    // the default is checked.
+    //
+    // It does not change what close_pair does.  The answer-owed invariant is an
+    // assertion, not a gate: holding here was tried and could not work, because
+    // by the time this function runs a polite half-close and a connection torn
+    // out from under its client are the same pair.  So `force` withdraws a
+    // claim rather than a guard, and a path added later inherits the check
+    // instead of having to remember it.
+    enum class close_reason { normal, force };
+    void close_pair(int client_fd, int backend_fd,
+                    close_reason reason = close_reason::normal);
     inline void close_pair_close_backend(int backend_fd,
                                           proxy_backend_connection* bconn,
                                           proxy_client_connection* cconn);
     void reset_client_for_next_request(proxy_client_connection* cconn);
+    // TCP mode: take the hold on a client that has shut its write side, and
+    // pass that half-close on to the backend.  See the definitions.
+    bool hold_tcp_half_close(proxy_client_connection* conn);
+    void forward_client_half_close(proxy_client_connection* conn);
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
@@ -830,6 +875,18 @@ private:
     // only thing that can make a pooled socket unreachable while it is still
     // healthy, so this runs where membership arrives and nowhere else.
     void drop_departed_endpoints();
+    // Resolve the group members whose advertised address is a NAME.
+    //
+    // A cluster member advertises gethostname(2), so an @group backend routes to
+    // hostnames, and the address a request needs is not in m_backends at all —
+    // it is built per request from the membership snapshot.  The idle sweep
+    // walks m_backends and therefore never sees one.
+    //
+    // This is the group's equivalent of what setup() does for a configured
+    // backend: resolve where the address ARRIVES, which for a group member is
+    // the membership snapshot, not the request.  Runs from set_endpoints() and
+    // as a retry from the idle sweep; never from the request path.
+    void resolve_group_hosts();
 
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
@@ -1139,7 +1196,12 @@ private:
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_send_zc{false};
+    // The kernel can do IORING_OP_SPLICE.  Says nothing about whether this
+    // proxy uses it — see m_splice_enabled and splice_opt_in().
     bool m_splice_supported{false};
+    // …and it is switched on for this instance.  Off by default; see
+    // splice_opt_in() for the measurements that decided that.
+    bool m_splice_enabled{false};
 
     // Connection pool for backend reuse (avoids connect() per request)
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;
@@ -1197,6 +1259,16 @@ private:
     };
     std::unordered_map<std::string, circuit_breaker, endpoint_key_hash,
                        std::equal_to<>> m_group_breakers;
+
+    // Addresses for group members advertised by name.  Keyed by the host as the
+    // snapshot spells it; the port is the member's and is applied at selection,
+    // so one entry serves a host that appears in several groups or on several
+    // ports.  Kept to the size of the membership rather than of its history —
+    // pruned in resolve_group_hosts(), the same discipline as m_group_breakers.
+    std::unordered_map<std::string, in_addr> m_group_addr;
+    // Some member did not resolve, so the idle sweep has a reason to run and to
+    // keep running.  Set by resolve_group_hosts(), cleared by it too.
+    bool m_group_unresolved = false;
     std::unique_ptr<timer_op> m_health_check_timer;
 
     // Async health checks.  One probe object per backend per sweep, held by
@@ -1245,6 +1317,10 @@ private:
     // Cached config to avoid virtual calls on hot path
     uint32_t m_idle_timeout_cached{0};
     uint32_t m_max_conns_cached{0};
+    // --rate-limit, read once at setup like the two above.  Read at all, which
+    // it was not: this proxy stored the value, reported it from `show`, and
+    // never looked at it again.  See the check in handle_client_read.
+    double m_rate_limit_cached{0.0};
 
     // Peak connections high-water mark
     size_t m_peak_connections{0};

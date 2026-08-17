@@ -47,12 +47,16 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 daemon_isolate importrt
 SVR_PORT=$((SL_PORT_BASE+820))
 CACHE_PORT=$((SL_PORT_BASE+821))
+PARTIAL_PORT=$((SL_PORT_BASE+822))
+BS_PORT=$((SL_PORT_BASE+823))
 PASS=0; FAIL=0; TOTAL=0
 WORK="/tmp/test-import-$$"
 
 cleanup() {
     "$BIN" remove rt_svr 2>/dev/null || true
     "$BIN" remove rt_cache 2>/dev/null || true
+    "$BIN" remove rt_partial 2>/dev/null || true
+    "$BIN" remove rt_bs 2>/dev/null || true
     rm -rf "$WORK"
     daemon_stop
 }
@@ -132,8 +136,14 @@ assert_same "server took the edit and nothing else" "$WORK/svr-edited.json" "$WO
 
 # ── CACHE ────────────────────────────────────────────────────────────────────
 # A different document: persistent_path, cache_mode, max_memory, eviction.
+# 4M, not 4mb.  It was written "4mb" here, and parse_size_suffix took the
+# digits and dropped the rest — so this cache was configured to FOUR BYTES and
+# the line read as four megabytes to everyone since.  Nothing caught it because
+# this file asserts that the round trip preserves the value, never what the
+# value is.  The parser refuses an unknown suffix now, which is what turned a
+# silent misreading into a failing create and brought the typo up.
 "$BIN" create cache rt_cache -p "$CACHE_PORT" \
-    --maxmemory 4mb --eviction allkeys-lru --mode admin \
+    --maxmemory 4M --eviction allkeys-lru --mode admin \
     --persistent "$WORK/cache.aof" >/dev/null 2>&1
 
 "$BIN" show rt_cache > "$WORK/cache.json"
@@ -167,6 +177,119 @@ fi
 # An empty document is refused rather than applied as "clear every field".
 RC=0; OUT=$(printf '' | "$BIN" import rt_svr 2>&1) || RC=$?
 assert_rc "empty stdin document exits 1" 1 "$RC"
+
+# ── A NUMBER THAT IS ONLY PARTLY A NUMBER ────────────────────────────────────
+#
+# json_get_int and its three siblings wrapped std::sto* in a try/catch, which
+# caught "abc" and did nothing for "55abc": sto* stops at the first character it
+# cannot use and returns what it read.  So a field with a typo in its tail was
+# applied as the digits in front of it, and the document the operator edited did
+# not mean what it said.
+#
+# The default is what an ABSENT key already gives, so a malformed value now
+# behaves exactly like a missing one.  That is also no change for a value that
+# will not parse at all — sto*("abc") already threw and already landed here.
+"$BIN" import rt_svr \
+    '{"name":"rt_svr","type":"server","port":'"$SVR_PORT"',"max_connections":"55abc"}' \
+    >/dev/null 2>&1 || true
+if "$BIN" show rt_svr | grep -q '"max_connections": 55'; then
+    bad "a half-numeric value was applied as its prefix (max_connections became 55)"
+else
+    ok
+fi
+
+# Paired with it: a clean value still lands, or the assertion above would pass
+# on a build that stopped reading numbers altogether.
+"$BIN" import rt_svr \
+    '{"name":"rt_svr","type":"server","port":'"$SVR_PORT"',"max_connections":42}' \
+    >/dev/null 2>&1 || true
+if "$BIN" show rt_svr | grep -q '"max_connections": 42'; then ok
+else bad "a clean numeric value no longer imports (max_connections is not 42)"; fi
+
+# ── A FIELD THE DOCUMENT DOES NOT MENTION IS NOT A FIELD BEING CLEARED ───────
+#
+# Every field in runtime_config has a default and import applied all of them,
+# so a partial document cleared everything it left out.  Measured against a
+# runtime with a port, a log path, two limits and a full TLS set:
+#
+#     socketley import c '{"name":"c"}'   -> exit 0, no output
+#     ... and seven fields were gone, TLS among them.
+#
+# A runtime configured to speak TLS answered in cleartext afterwards, and the
+# command that did it reported success.
+"$BIN" remove rt_partial >/dev/null 2>&1 || true
+"$BIN" create server rt_partial -p "$PARTIAL_PORT" \
+    --max-conn 77 --idle-timeout 45 --log /tmp/rt_partial.log \
+    --tls --cert /tmp/rt.pem --key /tmp/rt.key >/dev/null 2>&1
+"$BIN" show rt_partial > "$WORK/partial-before.json"
+"$BIN" import rt_partial '{"name":"rt_partial"}' >/dev/null 2>&1 || true
+"$BIN" show rt_partial > "$WORK/partial-after.json"
+assert_same "a document naming only the name changes nothing else" \
+    "$WORK/partial-before.json" "$WORK/partial-after.json"
+
+# And the escape hatch it replaces: clearing is still possible, written out.
+# Without this the assertion above passes on a build where import stopped
+# applying anything at all.
+"$BIN" import rt_partial \
+    '{"name":"rt_partial","tls":false,"cert_path":"","key_path":""}' >/dev/null 2>&1 || true
+if "$BIN" show rt_partial | grep -q '"tls": true'; then
+    bad "an explicit \"tls\": false no longer clears TLS"
+else
+    ok
+fi
+
+# ── A VALUE ENDING IN A BACKSLASH ────────────────────────────────────────────
+#
+# compact_json in the CLI decided a quote was a delimiter unless the character
+# before it was a backslash — right for \" and wrong for \\", where the
+# backslash is itself escaped and the quote really does close the string.  From
+# there in_string stayed true, every newline survived, and IPC frames one
+# command per line: the daemon got the first fragment as the whole import and
+# the rest as commands of its own.  The fragment is truncated JSON, which
+# parse_json_string accepted, so this exact round trip dropped every field after
+# the backslash and reported success.
+# A runtime of its own, and not the one above.  Written first against
+# rt_partial, this assertion did not go red on the broken build at all: the
+# partial-import case just before it had already cleared that runtime, so there
+# was nothing left after log_file for the truncation to lose.  The fields have
+# to sit AFTER the backslash in the document for their loss to be visible, and
+# `show` emits log_file before max_connections and idle_timeout.
+"$BIN" remove rt_bs >/dev/null 2>&1 || true
+"$BIN" create server rt_bs -p "$BS_PORT" --max-conn 66 --idle-timeout 34 >/dev/null 2>&1
+"$BIN" edit rt_bs --log 'C:\' >/dev/null 2>&1 || true
+"$BIN" show rt_bs > "$WORK/bs-before.json"
+
+# The document really does contain the escaped backslash, and the two fields
+# that have to survive it really are behind it.  Without these the round-trip
+# assertion below is about a case that never happened.  assert_contains greps
+# -F, so the needle is the two literal characters the file holds.
+assert_contains "the document carries an escaped backslash" \
+    "$(cat "$WORK/bs-before.json")" 'C:\\'
+assert_contains "a field sits behind the backslash to be lost" \
+    "$(cat "$WORK/bs-before.json")" '"idle_timeout": 34'
+
+"$BIN" show rt_bs | "$BIN" import rt_bs >/dev/null 2>&1 || true
+"$BIN" show rt_bs > "$WORK/bs-after.json"
+assert_same "a value ending in a backslash survives the round trip" \
+    "$WORK/bs-before.json" "$WORK/bs-after.json"
+
+# ── A NAME import MAY NOT GIVE ───────────────────────────────────────────────
+#
+# create() validated names and rename() — the door import comes through — did
+# not, so import could produce a runtime whose name broke `ls --json` and whose
+# state file collided with every other invalidly-named runtime in one shared
+# invalid.json.
+RC=0
+OUT=$("$BIN" import rt_partial '{"name":"q\"uote/../x"}' 2>&1) || RC=$?
+assert_rc "import refuses a name create would refuse" 1 "$RC"
+assert_contains "the refusal names the rule, not 'already taken'" "$OUT" "invalid runtime name"
+
+# The consequence, asserted directly: the listing has to stay parseable.
+if "$BIN" ls --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok
+else
+    bad "ls --json is not valid JSON"
+fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

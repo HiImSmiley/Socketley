@@ -51,7 +51,20 @@ public:
     server& udp()                          { srv()->set_udp(true); return *this; }
     server& http_dir(std::string_view p)   { srv()->set_http_dir(p); return *this; }
     server& http_cache()                   { srv()->set_http_cache(true); return *this; }
-    server& upstream(std::string_view a)   { srv()->add_upstream_target(a); return *this; }
+    // Chainable, so it has no way to answer — and every setter in this header
+    // is the same, because the SDK has no error channel at all: no throw, no
+    // last_error, nothing.  A refused upstream is therefore logged rather than
+    // dropped in silence.  The address is a literal a programmer wrote, so the
+    // daemon log is where it will be looked for, and a builder that quietly
+    // configured fewer upstreams than the chain names is the defect this
+    // refusal exists to stop.
+    server& upstream(std::string_view a)
+    {
+        if (!srv()->add_upstream_target(a))
+            LOG_WARN((std::string("upstream(\"") + std::string(a) +
+                      "\") ignored: the port must be a number between 1 and 65535").c_str());
+        return *this;
+    }
     server& clear_upstreams()              { srv()->clear_upstream_targets(); return *this; }
     server& master_pw(std::string_view pw) { srv()->set_master_pw(pw); return *this; }
     server& master_forward(bool fwd)       { srv()->set_master_forward(fwd); return *this; }

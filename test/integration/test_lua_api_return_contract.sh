@@ -308,8 +308,19 @@ assert_has "...and says so, naming the runtime" "there is no open connection 999
     "it returned nothing at all before: the message vanished and the script" \
     "had no way to learn that it had" "got: $R"
 
+# 4.0 rather than ask()'s 2.5 s default, which is what its neighbours in this
+# file already pass.  This case is the slowest in the group because it is the
+# only one that writes to the connection TWICE — `self.send(id, "SELFSEND-OK")`
+# is the thing under test, and the reply carrying its return value follows it —
+# so the reader has an extra message to take off the socket before it sees the
+# answer it is waiting for.
+#
+# On a contended box that ran past 2.5 s, the comparison then ran against an
+# empty string, and the failure read as "self.send answered the wrong thing": a
+# product defect, reported by a stopwatch.  Measured, it passes 34/34 standalone
+# on the same build that failed it under load.
 assert_eq "self.send to a live connection answers a bare true" \
-          "true|nil" "$(grep -o 'true|nil' <<<"$(ask "$RPC_PORT" self_send_live)" | head -1)" \
+          "true|nil" "$(grep -o 'true|nil' <<<"$(ask "$RPC_PORT" self_send_live 4.0)" | head -1)" \
     "the control for every self.* refusal below"
 
 R=$(ask "$RPC_PORT" self_disconnect_dead)

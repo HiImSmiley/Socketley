@@ -181,7 +181,7 @@ SDK_INC=(-I"$ROOT" -I"$ROOT/socketley" -I"$ROOT/include/linux" -I"$ROOT/test/fuz
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit")
 SDK_DEF=(-DSOCKETLEY_LINUX -DDEBUG -DSOCKETLEY_INVARIANTS)
 
-# The cache below is keyed on mtime alone, which says nothing about the flags an
+# The cache below is keyed on mtime, which says nothing about the flags an
 # object was built with.  Adding SOCKETLEY_INVARIANTS to the set would therefore
 # have been silently ignored for every source that had not changed since — the
 # targets would link objects with the invariant calls compiled out and report a
@@ -190,9 +190,48 @@ SDK_DEF=(-DSOCKETLEY_LINUX -DDEBUG -DSOCKETLEY_INVARIANTS)
 SDK_STAMP="$SDK_OBJ/.flags"
 SDK_KEY="$CLANG|${SDK_DEF[*]}|c++23"
 if [ "$(cat "$SDK_STAMP" 2>/dev/null)" != "$SDK_KEY" ]; then
-    rm -f "$SDK_OBJ"/*.o
+    rm -f "$SDK_OBJ"/*.o "$SDK_OBJ"/*.d
     printf '%s' "$SDK_KEY" > "$SDK_STAMP"
 fi
+
+# Is a cached object still usable, or does it have to be built again?
+#
+# Comparing it against its own .cpp is not enough, and the way that fails is
+# silent.  A layout-changing edit to a *header* leaves every .cpp that includes
+# it untouched, so the old check kept the object — while the fuzz target's own
+# translation unit, which is recompiled on every run, picked the new header up.
+# One binary then carried two disagreeing pictures of the same class.
+#
+# Measured here on 2026-08-13: client_instance.cpp.o was eight days older than
+# client_instance.h.  sizeof(client_instance) had gone 1192 → 1352 and
+# m_connected 1024 → 1136 across that gap, so the cached constructor initialised
+# the field at the offset its header gave it and the target's check_instance()
+# read the byte the new one names.  The nightly reported that as a UBSan failure
+# in the client runtime, with a 7-byte reproducer that replays perfectly clean
+# against a correctly built binary.  ASan cannot see it: the older class was the
+# smaller of the two, so every write landed inside the allocation.
+#
+# It had happened before and was not recognised as a cause — 75afc3a adopted a
+# seed literally named stale_binary_artifact-f57f22fc, "produced by a libFuzzer
+# binary built five proxy commits before it was replayed", and left the build
+# that produced it alone.
+#
+# So the compiler records what it actually opened and that record decides.  A
+# prerequisite newer than the object rebuilds it; so does one that has since
+# been deleted, and so does a missing record — an object that cannot show what
+# went into it is not one to reuse.
+sdk_object_current() {
+    local obj=$1 src=$2 dep="${obj%.o}.d" p
+    [ -f "$obj" ]      || return 1
+    [ "$obj" -nt "$src" ] || return 1
+    [ -f "$dep" ]      || return 1
+    while read -r p; do
+        [ -n "$p" ] || continue
+        [ -e "$p" ] || return 1
+        [ "$obj" -nt "$p" ] || return 1
+    done < <(sed -e 's/^[^:]*://' -e 's/\\$//' "$dep" | tr -s ' \t' '\n' | grep -v '^$')
+    return 0
+}
 
 # The source list is read out of premake's generated makefile rather than
 # duplicated here, so a file added to the SDK cannot silently go un-fuzzed.
@@ -212,12 +251,17 @@ else
         for src in "${SDK_SRCS[@]}"; do
             obj="$SDK_OBJ/$(echo "${src#"$ROOT/"}" | tr '/' '_').o"
             sdk_objs+=("$obj")
-            if [ -f "$obj" ] && [ "$obj" -nt "$src" ]; then
+            if sdk_object_current "$obj" "$src"; then
                 continue
             fi
+            # -MD, not -MMD: the record has to name every header the compiler
+            # opened, system ones included.  sol2 and luajit arrive through
+            # -isystem and a bump to either changes the layout of what the
+            # objects hold just as surely as one of ours does.
             if ! "$CLANG" -std=c++23 -g -O1 \
                     -fsanitize=fuzzer-no-link,address,undefined \
                     -fno-sanitize-recover=all -fno-omit-frame-pointer \
+                    -MD -MF "${obj%.o}.d" \
                     "${SDK_DEF[@]}" "${SDK_INC[@]}" \
                     -c "$src" -o "$obj" 2>"$probe/sdk.err"; then
                 echo "  FAILED (SDK): ${src#"$ROOT/"}"

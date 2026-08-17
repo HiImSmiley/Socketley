@@ -362,7 +362,51 @@ public:
     // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
     // Buffer must stay alive until NOTIF CQE arrives.
     bool submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
+
+    // Whether the kernel has the opcode.  Says nothing about whether using it
+    // is a good idea here — see send_zc_enabled().
     bool send_zc_supported() const;
+
+    // Whether a runtime should use it.  Off unless SOCKETLEY_SEND_ZC=1.
+    //
+    // A NOTIFICATION IS NOT A REQUEST, AND NOTHING LOCAL CAN MAKE IT ARRIVE.
+    //
+    // The notification is posted when the kernel has released the pages it
+    // borrowed, which for TCP means when the socket's write queue is freed.
+    // That is the peer's decision, not ours.  Measured directly against this
+    // kernel (test program in the commit message), on a loopback pair with a
+    // 544 KB zero-copy send and a receiver that does not read:
+    //
+    //     300 rounds of ring activity      no notification
+    //     close() the sender's descriptor  no notification
+    //     receiver reads the bytes         notification, immediately
+    //     SO_LINGER 0 + close (RST)        notification, immediately
+    //
+    // So the only two things that release it are the peer reading and an
+    // abortive close.  The second is not available to a graceful teardown: it
+    // would reset precisely those connections that have a large response in
+    // flight and have not read it yet, which turns "stop" into guaranteed
+    // truncation for the biggest responses.
+    //
+    // A plain write does not have this shape.  It is a request, so the cancel
+    // that free_fixed_file_slot() and close_fd() already submit withdraws it
+    // and it reports -ECANCELED.  A pending notification cannot be cancelled —
+    // there is no request left to name; the send has already completed.
+    // Observed on the seed that found this: the fixed-index cancel withdrew the
+    // multishot recv on the same index and left the notification standing.
+    //
+    // What that costs is a runtime that can never be freed.  retire()'s
+    // graveyard holds a stopped instance until owner_inflight() reaches zero,
+    // so one client that stops reading a >= 512 KB response pins the whole
+    // instance — its buffer rings, its connection table, all of it — for as
+    // long as it likes.  `socketley stop` returns, the runtime reports stopped,
+    // and the memory never comes back.
+    //
+    // The gain being given up is narrow by the callers' own rule: zero-copy is
+    // only ever reached for a single write of 512 KB or more, because below
+    // that the notification round trip costs more than the copy saves.  A
+    // deployment whose readers are known to drain can set SOCKETLEY_SEND_ZC=1.
+    bool send_zc_enabled() const;
 
     // Registered files: pre-register fds to avoid fget/fput per op
     bool register_files(const int* fds, uint32_t count);
@@ -391,6 +435,44 @@ public:
 
     // Splice: zero-copy data transfer between two fds through a pipe.
     // fd_in -> fd_out, len bytes, off_in/off_out = -1 for pipes/sockets.
+    //
+    // This is the one submission here that never runs on the loop thread.
+    // IORING_OP_SPLICE has no non-blocking fast path: the kernel hands every
+    // one of them to an io-wq worker before it looks at whether the data is
+    // there, so the completion costs a worker round trip even when the
+    // operation could not possibly have blocked.  Measured directly, with the
+    // bytes already in the pipe and room at the far end (p50 over 3000
+    // submissions on 7.0.0-28):
+    //
+    //   read() from that same ready pipe        0.72 us
+    //   send() to that same ready socket        1.20 us
+    //   send() forced async with IOSQE_ASYNC   17.32 us
+    //   splice                                 17.19 us
+    //   splice + SPLICE_F_NONBLOCK             17.18 us
+    //   splice + SPLICE_F_FD_IN_FIXED          17.78 us
+    //
+    // Splice is indistinguishable from a submission deliberately forced onto a
+    // worker, and neither flag moves it.  There is no variant that stays on the
+    // fast path — registered pipes do not help, because the cost is the punt and
+    // not the descriptor lookup.
+    //
+    // What follows from that is a size rule, since the punt is a fixed cost per
+    // operation and a relay needs two of them per direction.  Over 16
+    // connections, 7 runs each:
+    //
+    //   128 B payload   splice 3037-83914 req/s   copy path 126673-152614 req/s
+    //   128 KB payload  splice 22286 req/s median, 5.06 us of loop-thread CPU
+    //                   copy   16014 req/s median, 55.89 us
+    //
+    // At small payloads splice is not merely slower, it is unstable: that 28x
+    // spread is one io-wq pool being contended by every connection at once, and
+    // the pool grew to 128 workers at 64 connections while throughput fell to
+    // 2676 req/s.  At large payloads the punt amortises and splice wins on both
+    // throughput and, by an order of magnitude, on loop-thread CPU.
+    //
+    // So: right for server_instance's file serving, wrong for a proxy relaying
+    // small messages.  A caller that cannot say which regime it is in should use
+    // the copy path, which is never catastrophic.
     bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
 
     // Async file read: uses io_uring_prep_read (not recv) for regular files.

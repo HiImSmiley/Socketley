@@ -135,7 +135,45 @@ daemon_stop() {
         wait "$SOCKETLEY_DPID" 2>/dev/null || true
     fi
     daemon_sweep "${SOCKETLEY_SOCKET:-}"
-    [ -n "${SOCKETLEY_TMPD:-}" ] && rm -rf "$SOCKETLEY_TMPD"
+
+    # ── surface what the daemon said before deleting where it said it ───────
+    #
+    # An invariant violation is reported by skl_inv::fail on the PROCESS's
+    # stderr, which for every test here is the daemon's, which daemon_start
+    # sends to $SOCKETLEY_DLOG.  A test's own stdout never carries it: with the
+    # half-close hold deliberately broken, test_proxy_half_close_hold.sh printed
+    # six FAILs and daemon.log held 43 `[invariant]` lines, none of which
+    # appeared in the suite output.
+    #
+    # That matters beyond debugging.  The nightly's invariants job greps its
+    # suite log for `[invariant]` and fails the job on a hit — and under
+    # -DSOCKETLEY_INVARIANTS_WARN_ONLY a violation only prints, so the grep was
+    # the whole enforcement.  Against a stream the line cannot reach, that step
+    # could not fail, and the deletion below is what put it out of reach.
+    #
+    # Sited here rather than in each test for the reason the proxy's answer-owed
+    # check is sited in close_pair: 102 of the 128 files in this directory reach
+    # this function, and none of them has to know about it.  The 26 that do not
+    # call daemon_isolate at all are the ones that never start a daemon.
+    #
+    # Printed, not asserted.  What a violation means is the job's decision --
+    # the nightly fails on it, an interactive run wants to see it and carry on --
+    # and turning 102 tests red from one library function is the kind of change
+    # that gets a useful check switched off within the week.
+    if [ -n "${SOCKETLEY_DLOG:-}" ] && [ -f "$SOCKETLEY_DLOG" ]; then
+        if grep -F '[invariant]' "$SOCKETLEY_DLOG" >/dev/null 2>&1; then
+            echo "  --- invariant violations from this test's daemon ---"
+            grep -F '[invariant]' "$SOCKETLEY_DLOG" | sort | uniq -c | head -20
+        fi
+    fi
+
+    # SOCKETLEY_KEEP_TMPD keeps the run's socket, state directory and daemon.log
+    # instead of deleting them, for when the summary above is not enough.
+    if [ -n "${SOCKETLEY_KEEP_TMPD:-}" ]; then
+        echo "  kept: ${SOCKETLEY_TMPD:-}" >&2
+    else
+        [ -n "${SOCKETLEY_TMPD:-}" ] && rm -rf "$SOCKETLEY_TMPD"
+    fi
     return 0
 }
 

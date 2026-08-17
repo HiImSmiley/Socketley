@@ -4,6 +4,7 @@
 #include <string_view>
 #include <string>
 #include <sstream>
+#include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -425,15 +426,52 @@ int cli_dispatch(int argc, char** argv)
                     return cli_interactive(argc, argv);
             return cli_forward(argc, argv);
         }
+        // ─── restart = stop, then start.  Nothing else. ─────────────────────
+        //
+        // The comment here used to say "preserving all flags" and the loop below
+        // forwarded every argument to `start`.  `start` reads one flag, `-i`, and
+        // hands the rest to resolve_names(), which skips anything beginning with
+        // '-' and treats what follows as a RUNTIME NAME.  So a flag's value was
+        // looked up as a runtime — and when it happened to name one, that runtime
+        // was started:
+        //
+        //     $ socketley ls --name --status
+        //     r1      Up 15 seconds
+        //     victim  Stopped
+        //     $ socketley restart r1 --some-flag victim
+        //     $ socketley ls --name --status
+        //     r1      Up 0 seconds
+        //     victim  Up 0 seconds        <- nothing asked for this
+        //
+        // Exit 0 throughout, and the unknown flag accepted in silence.
+        //
+        // Configuration is `edit`'s job, and `import`'s.  A restart that pretended
+        // to take flags could only ever be the half of that which `start` happens
+        // to understand, so it takes the name and -i and refuses the rest by name.
         case fnv1a("restart"):
         {
-            // restart = stop + start (preserving all flags)
             if (argc < 3)
             {
-                std::cerr << "usage: restart <name> [flags]\n";
+                std::cerr << "usage: restart <name> [-i]\n";
                 return 1;
             }
-            // Stop the runtime
+
+            for (int i = 3; i < argc; ++i)
+            {
+                std::string_view arg = argv[i];
+                if (arg == "-i")
+                    continue;
+                std::cerr << "restart does not take " << arg << "\n"
+                          << "  It stops the runtime and starts it again with the "
+                             "configuration it already has.\n"
+                          << "  To change that configuration: socketley edit "
+                          << argv[2] << " " << arg << " ...\n";
+                return 1;
+            }
+
+            // The stop's answer is read now.  It was discarded, so `restart
+            // nosuchruntime` ran a start against a name the stop had already
+            // reported as missing — two refusals, one of them printed.
             std::string stop_cmd = std::string("stop ") + argv[2];
             std::string stop_data;
             int rc = ipc_send(stop_cmd, stop_data);
@@ -442,9 +480,13 @@ int cli_dispatch(int argc, char** argv)
                 std::cerr << "failed to connect to daemon\n";
                 return 2;
             }
-            // Build start command with all original flags
-            std::string start_cmd;
-            start_cmd = "start";
+            if (rc != 0)
+            {
+                if (!stop_data.empty()) std::cerr << stop_data;
+                return rc;
+            }
+
+            std::string start_cmd = "start";
             for (int i = 2; i < argc; ++i)
             {
                 start_cmd += ' ';
@@ -564,6 +606,13 @@ int cli_send(int argc, char** argv)
         ss << std::cin.rdbuf();
         message = ss.str();
 
+        // Only the trailing newline goes, and only the trailing one.
+        //
+        // `echo hi | socketley send x` should not deliver "hi\n", which is what
+        // this strip is for.  Newlines INSIDE the message are the message: they
+        // used to end the command and turn everything after them into commands
+        // of their own (see ipc_framing.h), and ipc_send frames the command now
+        // rather than the CLI mangling it.
         while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
             message.pop_back();
     }
@@ -605,6 +654,7 @@ int cli_stdin_send(int /*argc*/, char** argv)
     ss << std::cin.rdbuf();
     std::string message = ss.str();
 
+    // The trailing newline only — see cli_send() above.
     while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
         message.pop_back();
 
@@ -644,25 +694,55 @@ int cli_stdin_send(int /*argc*/, char** argv)
     return exit_code;
 }
 
+// Strip the whitespace `show` pretty-prints with, leaving string literals alone.
+//
+// ─── LOOKING BACK ONE CHARACTER IS NOT ENOUGH ───────────────────────────────
+//
+// The test was `c == '"' && pretty[i-1] != '\\'` — a quote is a delimiter
+// unless the character before it is a backslash.  That is right for `\"` and
+// wrong for `\\"`, where the backslash is itself escaped and the quote really
+// does close the string.  A value ending in a backslash is all it takes:
+//
+//     "log_file": "C:\\",
+//
+// From that quote onwards in_string stayed true for the rest of the document,
+// so every newline was preserved — and IPC frames one command per line, so the
+// daemon received the first fragment as the whole `import` and the remaining
+// lines as commands of their own.  The fragment is truncated JSON, which
+// parse_json_string accepted, so the round trip `show | import` silently
+// dropped every field after the backslash and reported success.  Measured: two
+// fields lost, exit 0 on both sides.
+//
+// The state is carried forward now instead of being reconstructed by looking
+// back: inside a string, a backslash makes the next character literal whatever
+// it is, and that is the whole rule.
 static std::string compact_json(const std::string& pretty)
 {
     std::string result;
     result.reserve(pretty.size());
     bool in_string = false;
-    for (size_t i = 0; i < pretty.size(); ++i)
-    {
-        char c = pretty[i];
-        if (c == '"' && (i == 0 || pretty[i-1] != '\\'))
-            in_string = !in_string;
+    bool escaped   = false;
 
+    for (char c : pretty)
+    {
         if (in_string)
         {
             result += c;
+            if (escaped)        escaped = false;      // consumed, whatever it was
+            else if (c == '\\') escaped = true;
+            else if (c == '"')  in_string = false;
+            continue;
         }
-        else if (c != '\n' && c != '\r' && c != '\t' && c != ' ')
+
+        if (c == '"')
         {
+            in_string = true;
             result += c;
+            continue;
         }
+
+        if (c != '\n' && c != '\r' && c != '\t' && c != ' ')
+            result += c;
     }
     return result;
 }
@@ -819,20 +899,38 @@ int cli_edit(int argc, char** argv)
     }
 
     // 2. Write to tmpfile
-    char tmpl[] = "/tmp/socketley-edit-XXXXXX";
-    int tmpfd = mkstemp(tmpl);
+    //
+    // TMPDIR, then /tmp.  The file holds the runtime's whole configuration —
+    // which for a cache with a master password holds that too — so where it
+    // lands is the operator's decision to make, and an operator who points
+    // TMPDIR at a private directory is making exactly this one.  Hard-coding
+    // /tmp ignored them.  mkstemp opens it 0600 either way; a private TMPDIR
+    // additionally keeps the NAME out of a world-readable directory listing.
+    const char* tmpdir = std::getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+
+    std::string tmpl_s = std::string(tmpdir);
+    if (tmpl_s.back() != '/')
+        tmpl_s += '/';
+    tmpl_s += "socketley-edit-XXXXXX";
+
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+
+    int tmpfd = mkstemp(tmpl.data());
     if (tmpfd < 0)
     {
-        std::cerr << "failed to create temporary file\n";
+        std::cerr << "failed to create temporary file in " << tmpdir << "\n";
         return 2;
     }
 
-    std::string tmp_file = std::string(tmpl) + ".json";
+    std::string tmp_file = std::string(tmpl.data()) + ".json";
     close(tmpfd);
-    if (rename(tmpl, tmp_file.c_str()) < 0)
+    if (rename(tmpl.data(), tmp_file.c_str()) < 0)
     {
         std::cerr << "failed to rename temporary file\n";
-        unlink(tmpl);
+        unlink(tmpl.data());
         return 2;
     }
 
@@ -840,8 +938,12 @@ int cli_edit(int argc, char** argv)
         std::ofstream f(tmp_file, std::ios::trunc);
         if (!f.is_open())
         {
+            // tmp_file, not tmpl.  The rename above succeeded, so the name in
+            // tmpl no longer exists and this unlinked nothing — leaving the
+            // real file behind with the runtime's whole configuration in it,
+            // master_pw included.
             std::cerr << "failed to write temporary file\n";
-            unlink(tmpl);
+            unlink(tmp_file.c_str());
             return 2;
         }
         f << dump_data;

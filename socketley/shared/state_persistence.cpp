@@ -37,7 +37,22 @@ std::string json_escape(std::string_view s)
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                // Everything below 0x20 has to go as \u00xx or the document is
+                // not JSON.  Three of them were named above and the other
+                // twenty-six were emitted raw — reachable through any path
+                // field, which is operator text nothing validates.  The Lua
+                // encoder in lua_context.cpp has had this for longer.
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char hex[8];
+                    std::snprintf(hex, sizeof(hex), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += hex;
+                }
+                else
+                    out += c;
+                break;
         }
     }
     return out;
@@ -54,7 +69,22 @@ void json_escape_into(std::string& out, std::string_view s)
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                // Everything below 0x20 has to go as \u00xx or the document is
+                // not JSON.  Three of them were named above and the other
+                // twenty-six were emitted raw — reachable through any path
+                // field, which is operator text nothing validates.  The Lua
+                // encoder in lua_context.cpp has had this for longer.
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char hex[8];
+                    std::snprintf(hex, sizeof(hex), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += hex;
+                }
+                else
+                    out += c;
+                break;
         }
     }
 }
@@ -203,6 +233,79 @@ uint8_t str_to_eviction(std::string_view s)
     }
 }
 
+// Is this key named anywhere in the document.
+//
+// The same scan as json_get_string below, stopping at the question it is asked
+// rather than going on to read a value — because "the key is there" and "the
+// value is non-empty" are different things, and `import` needs the first to
+// tell a field that was set to its default from one that was left out.
+//
+// Deliberately a second walk rather than a flag threaded through the getters:
+// the getters are called forty times from one function and each one already
+// walks the document, so a second walk per key is the same order of work and
+// keeps both functions doing one thing.
+bool json_has_key(const std::string& json, std::string_view key)
+{
+    size_t pos = 0;
+    while (pos < json.size())
+    {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) break;
+
+        if (pos + 1 + key.size() + 1 <= json.size() &&
+            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
+            json[pos + 1 + key.size()] == '"')
+        {
+            // A key is followed by a colon.  Without this check the scan also
+            // matches a VALUE that happens to read like a key name — `"mode":
+            // "port"` would answer yes to "port".
+            const size_t after = pos + 1 + key.size() + 1;
+            const size_t colon = json.find_first_not_of(" \t\n\r", after);
+            if (colon != std::string::npos && json[colon] == ':')
+                return true;
+        }
+        pos++;
+    }
+    return false;
+}
+
+// Every key the document names, collected in one walk.
+//
+// Enumerated rather than asked field by field, because parse_json_string reads
+// sixty-one of them: a hand-written list is a list that goes stale the first
+// time somebody adds a field, and the failure mode would be that the new field
+// is silently cleared by every partial import — which is the defect this is
+// being added to fix.
+//
+// A key is a quoted token followed by a colon.  That is enough for this schema:
+// it is flat apart from arrays of plain strings, and an array element is
+// followed by a comma or a bracket, never a colon.
+void json_collect_keys(const std::string& json, std::set<std::string, std::less<>>& out)
+{
+    size_t pos = 0;
+    while (pos < json.size())
+    {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) break;
+
+        size_t end = pos + 1;
+        while (end < json.size() && json[end] != '"')
+        {
+            if (json[end] == '\\' && end + 1 < json.size()) ++end;   // \" is not the end
+            ++end;
+        }
+        if (end >= json.size()) break;
+
+        const size_t after = json.find_first_not_of(" \t\n\r", end + 1);
+        if (after != std::string::npos && json[after] == ':')
+            out.insert(json.substr(pos + 1, end - pos - 1));
+
+        // Past this token whether it was a key or a value, so a value is never
+        // examined as if it were a key of its own.
+        pos = end + 1;
+    }
+}
+
 // Simple JSON value parser: extract string value for a key from JSON text
 std::string json_get_string(const std::string& json, std::string_view key)
 {
@@ -271,32 +374,66 @@ bool json_get_bool(const std::string& json, std::string_view key, bool default_v
     return default_val;
 }
 
-int json_get_int(const std::string& json, std::string_view key, int default_val = 0)
+// ─── A VALUE THAT IS ONLY PARTLY A NUMBER IS NOT A NUMBER ───────────────────
+//
+// The four below all wrapped a std::sto* in a try/catch and returned the
+// default when it threw — which covered "abc" and did nothing at all for
+// "80abc", because stoi stops at the first character it cannot use and returns
+// what it read.  A field whose value had a typo in the tail was silently taken
+// as the digits in front of it:
+//
+//     "port": "80abc"          ->  80
+//     "max_memory": "4mb"      ->  4
+//
+// The same defect the flag parsers had, one layer in.  parse_uint16 and
+// parse_uint32 in flag_handlers.h are the shape this follows: the whole of the
+// token, or nothing.
+//
+// "Or nothing" means the default, which is what an ABSENT key already gives —
+// so a malformed value now behaves exactly like a missing one, and that is the
+// point.  It is also no change at all for a value that will not parse in any
+// part: `stoi("abc")` already threw and already fell back here.  What changes is
+// only the half-parsed case, and there the default is the honest answer.
+//
+// These read files this daemon wrote, so in practice the input is clean.  They
+// also read whatever `import` was handed, which is a document a person edited.
+template <typename T, typename Fn>
+T json_get_number(const std::string& json, std::string_view key, T default_val, Fn convert)
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
-    try { return std::stoi(v); } catch (...) { return default_val; }
+    try
+    {
+        size_t consumed = 0;
+        const T out = convert(v, consumed);
+        if (consumed != v.size()) return default_val;   // trailing anything
+        return out;
+    }
+    catch (...) { return default_val; }
+}
+
+int json_get_int(const std::string& json, std::string_view key, int default_val = 0)
+{
+    return json_get_number<int>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return std::stoi(s, &n); });
 }
 
 uint32_t json_get_uint32(const std::string& json, std::string_view key, uint32_t default_val = 0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return static_cast<uint32_t>(std::stoul(v)); } catch (...) { return default_val; }
+    return json_get_number<uint32_t>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return static_cast<uint32_t>(std::stoul(s, &n)); });
 }
 
 double json_get_double(const std::string& json, std::string_view key, double default_val = 0.0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return std::stod(v); } catch (...) { return default_val; }
+    return json_get_number<double>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return std::stod(s, &n); });
 }
 
 size_t json_get_size(const std::string& json, std::string_view key, size_t default_val = 0)
 {
-    std::string v = json_get_string(json, key);
-    if (v.empty()) return default_val;
-    try { return static_cast<size_t>(std::stoull(v)); } catch (...) { return default_val; }
+    return json_get_number<size_t>(json, key, default_val,
+        [](const std::string& s, size_t& n) { return static_cast<size_t>(std::stoull(s, &n)); });
 }
 
 std::vector<std::string> json_get_array(const std::string& json, std::string_view key)
@@ -379,16 +516,31 @@ state_persistence::state_persistence(const fs::path& state_dir)
     m_writer = std::thread(&state_persistence::writer_loop, this);
 }
 
+// Where this runtime's state file goes, or an empty path if it may not have one.
+//
+// ─── A SHARED BIN IS NOT A REFUSAL ──────────────────────────────────────────
+//
+// The traversal guard was here and it worked — but it answered by routing every
+// rejected name to one `invalid.json`, so two runtimes with unusable names
+// overwrote each other's state.  Measured: a daemon holding `q"uote/../x` and
+// `second/../bad` had one file, with the second name in it, and the first
+// runtime did not come back after a restart.  Nothing said so.
+//
+// Names are validated at both doors now — create() and rename() share
+// runtime_manager::valid_name() — so nothing that reaches this function should
+// fail it.  It stays as the second line, because it guards the filesystem and a
+// state directory can hold files an older daemon wrote.  What changes is the
+// answer: an empty path, which every caller reports rather than silently
+// sharing one file.
 fs::path state_persistence::config_path(std::string_view name) const
 {
-    // Reject path traversal characters in name
     for (char c : name)
     {
         if (c == '/' || c == '\\' || c == '\0')
-            return m_state_dir / "invalid.json";
+            return {};
     }
-    if (name.find("..") != std::string_view::npos)
-        return m_state_dir / "invalid.json";
+    if (name.empty() || name.find("..") != std::string_view::npos)
+        return {};
 
     return m_state_dir / (std::string(name) + ".json");
 }
@@ -734,6 +886,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
 bool state_persistence::parse_json_string(const std::string& json, runtime_config& cfg) const
 {
     using namespace sp_detail;
+
+    // Before any value is read: which keys the document actually names.  Every
+    // field below has a default, so without this a document that omitted a
+    // field was indistinguishable from one that set it to that default — and
+    // `import` applied all of them either way.  See runtime_config::present.
+    cfg.present.clear();
+    json_collect_keys(json, cfg.present);
+
     cfg.name = json_get_string(json, "name");
     cfg.id = json_get_string(json, "id");
     cfg.type = str_to_type(json_get_string(json, "type"));
@@ -925,7 +1085,17 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
 
 bool state_persistence::write_json(const runtime_config& cfg) const
 {
-    return write_state_file(config_path(cfg.name), format_json_pretty(cfg));
+    // An empty path is config_path() refusing the name — see there.  Reported
+    // rather than written somewhere shared: a runtime whose state cannot be
+    // stored is a runtime that will not come back, and that is worth a line.
+    const fs::path path = config_path(cfg.name);
+    if (path.empty())
+    {
+        LOG_ERROR(("state: refusing to write a file for runtime \"" + cfg.name +
+                   "\": the name cannot be part of a path").c_str());
+        return false;
+    }
+    return write_state_file(path, format_json_pretty(cfg));
 }
 
 bool state_persistence::read_json(const fs::path& path, runtime_config& cfg) const
@@ -991,7 +1161,10 @@ void state_persistence::writer_loop()
         {
             case job::write_cfg:    write_json(j.cfg); break;
             case job::remove_file:  { std::error_code ec;
-                                      fs::remove(config_path(j.name), ec); } break;
+                                      // An empty path removes nothing, which is
+                                      // right: nothing was ever written for it.
+                                      if (const fs::path p = config_path(j.name); !p.empty())
+                                          fs::remove(p, ec); } break;
             case job::flip_running: flip_was_running(j.name, j.running); break;
         }
 
@@ -1047,6 +1220,8 @@ void state_persistence::set_was_running(std::string_view name, bool running)
 void state_persistence::flip_was_running(std::string_view name, bool running)
 {
     fs::path path = config_path(name);
+    if (path.empty())
+        return;   // no file was ever written for this name; see config_path()
 
     // Fast path: read file, find "was_running" key, flip in-place, atomic rewrite.
     // Avoids full JSON parse + re-serialization for a single boolean toggle.

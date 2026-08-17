@@ -124,6 +124,139 @@ TEST_CASE("RESP parsing")
     }
 }
 
+// The parser the product actually runs.
+//
+// Everything above exercises parse_message(), which no runtime calls: the only
+// two call sites in socketley/ are cache_instance.cpp and server_instance.cpp,
+// and both call parse_message_views().  parse_message() is the differential
+// reference fuzz_resp.cpp measures against and the subject of every assertion
+// in this file — so the eight checks above could all pass while the parser that
+// reads unauthenticated bytes off a socket was broken in any way they describe.
+//
+// Same cases, same expectations, against the one that runs.  MAX_RESP_ARGS is
+// 64 in both call sites; 8 here is enough for these messages and small enough
+// that the ceiling case below is cheap to state.
+TEST_CASE("RESP parsing — parse_message_views, the parser the runtimes call")
+{
+    static constexpr int MAX_ARGS = 8;
+    std::string_view views[MAX_ARGS];
+    int    argc     = 0;
+    size_t consumed = 0;
+
+    SUBCASE("simple SET command")
+    {
+        std::string buf = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        CHECK(consumed == buf.size());
+        REQUIRE(argc == 3);
+        CHECK(views[0] == "SET");
+        CHECK(views[1] == "key");
+        CHECK(views[2] == "value");
+    }
+
+    SUBCASE("GET command")
+    {
+        std::string buf = "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 2);
+        CHECK(views[0] == "GET");
+        CHECK(views[1] == "key");
+    }
+
+    SUBCASE("incomplete message")
+    {
+        std::string buf = "*2\r\n$3\r\nGET\r\n$3\r\nke";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::incomplete);
+    }
+
+    SUBCASE("empty buffer")
+    {
+        std::string buf = "";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::incomplete);
+    }
+
+    SUBCASE("PING command")
+    {
+        std::string buf = "*1\r\n$4\r\nPING\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 1);
+        CHECK(views[0] == "PING");
+    }
+
+    SUBCASE("multiple messages in buffer")
+    {
+        std::string buf = "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 1);
+        CHECK(views[0] == "PING");
+        CHECK(consumed < buf.size());
+
+        std::string_view remaining(buf.data() + consumed, buf.size() - consumed);
+        result = resp::parse_message_views(remaining, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 2);
+        CHECK(views[0] == "GET");
+        CHECK(views[1] == "key");
+    }
+
+    SUBCASE("inline command input")
+    {
+        std::string buf = "set key value\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 3);
+        CHECK(views[0] == "set");
+        CHECK(views[1] == "key");
+        CHECK(views[2] == "value");
+        CHECK(consumed == buf.size());
+    }
+
+    // The array ceiling, which is this parser's and not the reference's: an
+    // array declaring more elements than the caller offered room for is refused
+    // rather than truncated.  fuzz_resp.cpp skips its differential comparison
+    // whenever the reference produced more arguments than this allows, so the
+    // behaviour is asserted here or nowhere.
+    SUBCASE("more elements than the caller has room for")
+    {
+        std::string buf = "*9\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n"
+                          "$1\r\ne\r\n$1\r\nf\r\n$1\r\ng\r\n$1\r\nh\r\n$1\r\ni\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result != resp::parse_result::ok);
+    }
+
+    // The one shape the two parsers are known to read differently, recorded
+    // here rather than only as a nightly observation nobody reads.
+    //
+    // fuzz_resp.cpp names it: parse_message calls "*1\r\nX" an error, because it
+    // checks for '$' before checking the length, and this one calls it
+    // incomplete, because it wants four bytes of element header first.  Neither
+    // is wrong — the bytes are not a valid message either way — and the
+    // consequence of the difference is bounded only because a runtime calls one
+    // of them.  Written down so that a change to either is a decision somebody
+    // makes rather than a nightly line that starts appearing.
+    SUBCASE("the shape the two parsers read differently")
+    {
+        std::string buf = "*1\r\nX";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::incomplete);
+
+        std::vector<std::string> ref_args;
+        size_t ref_consumed = 0;
+        auto ref = resp::parse_message(buf, ref_args, ref_consumed);
+        CHECK(ref == resp::parse_result::error);
+
+        // The point of recording it: whatever they each say, neither accepts it.
+        CHECK(result != resp::parse_result::ok);
+        CHECK(ref    != resp::parse_result::ok);
+    }
+}
+
 TEST_CASE("RESP to_lower")
 {
     SUBCASE("uppercase")

@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <string_view>
 #include <vector>
@@ -10,6 +11,18 @@
 #include <cstdint>
 
 #include "runtime_definitions.h"
+
+namespace sp_detail
+{
+// Quote-and-backslash escaping for a JSON string body, without the quotes.
+//
+// Declared here because this file is no longer the only place that writes JSON:
+// `ls --json` and `ps --json` build their documents by hand, and a runtime's
+// group or owner is an arbitrary operator string that nothing validates.  A
+// quote in one of those produced a document no parser would accept — measured,
+// json.load() failing at column 27 of `ls --json`.
+std::string json_escape(std::string_view s);
+}
 
 struct runtime_config
 {
@@ -131,6 +144,25 @@ struct runtime_config
     std::string replicate_target;
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
+
+    // ─── WHICH KEYS THE DOCUMENT ACTUALLY NAMED ─────────────────────────────
+    //
+    // Every field above has a default, and until this set existed there was no
+    // way to tell a document that SET a field to its default from one that did
+    // not mention it at all.  `import` applied all of them either way, so a
+    // partial document cleared everything it left out.  Measured, against a
+    // runtime with a port, a log path, two limits and a full TLS set:
+    //
+    //     socketley import c '{"name":"c"}'   ->  exit 0, no output
+    //     ... and seven fields were gone, TLS among them.
+    //
+    // Filled by parse_json_string.  Empty after any other way of building a
+    // runtime_config — read_from_instance() describes a live runtime, where
+    // every field is present by construction and nothing is deciding whether
+    // to apply it.
+    std::set<std::string, std::less<>> present;
+
+    bool has(std::string_view key) const { return present.find(key) != present.end(); }
 };
 
 class runtime_instance;

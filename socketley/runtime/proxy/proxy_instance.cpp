@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <cstdlib>
 #include <charconv>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -97,6 +98,85 @@ static inline bool backend_op_in_flight(const proxy_backend_connection* b)
            b->splice_in_pending || b->splice_out_pending;
 }
 
+// Whether a --protocol tcp proxy forwards with splice.  OFF unless
+// SOCKETLEY_PROXY_SPLICE is set to something other than 0.
+//
+// ─── WHY IT IS OFF ──────────────────────────────────────────────────────────
+//
+// io_uring cannot run IORING_OP_SPLICE cheaply and there is no version of this
+// code that makes it.  The opcode is prepped REQ_F_FORCE_ASYNC in the kernel:
+// every splice is handed to an io-wq worker and executed there, so each one
+// costs a thread hand-off in each direction whatever the proxy does with it.
+// That is a kernel property of the opcode, not a mistake in how it is
+// submitted, which is why "repair the io_uring usage" was not one of the
+// available outcomes here.  What this tree could fix, it already has: arming a
+// readiness poll before the splice (see arm_splice_in_poll) took the idle cost
+// of an unused connection from a parked kernel thread each to nothing at all.
+// The per-transfer hand-off is what is left, and it is not removable.
+//
+// Measured on this machine: one connection, serial round trips through a
+// --protocol tcp proxy in front of a socketley server running
+// test/benchmark/echo.lua.  Both variants live at once — the switch is read per
+// process, so each needs a daemon of its own — and the benchmark ALTERNATES
+// between them.  That is not fussiness: sixteen consecutive runs against one
+// unchanged proxy have been seen to drift from ~77k to ~59k rt/s inside a
+// minute and stay there, so all-A-then-all-B measures the drift and calls it
+// the change.  Median of three or four interleaved rounds:
+//
+//                  splice              copy path            direct backend
+//    size      p50    rt/s  cores    p50    rt/s  cores    p50    rt/s  cores
+//    128 B   47.9   19000   0.86    26.3   34019   0.53   13.0   71500   0.62
+//      1 KB  47.2   18685   0.81    27.3   33261   0.53   13.4   70900   0.60
+//     16 KB  57.3   15349   0.76    38.4   23598   0.52   19.4   49256   0.64
+//     64 KB 110.2    8322   0.83    80.8   11212   0.61   40.1   23704   0.70
+//    256 KB 394.5    2327   0.59   350.5    2653   0.45  237.5    3791   1.00
+//
+// The copy path wins at every size measured and never loses: 1.79x the rate at
+// 128 B, still 1.14x at 256 KB.  The margin narrows with size, which is the
+// shape the mechanism predicts — the hand-off is a fixed cost per transfer, so
+// it hurts most where transfers are cheapest — but 256 KB, four times the pipe,
+// has not closed it.
+//
+// `cores` is utime+stime of the runtime's process over the run divided by wall
+// time, and it is the figure that matters rather than a thread count: io_uring
+// workers are created and reaped inside a run, so counting threads afterwards
+// sees none of them.  Per request it reads 45 us-core spliced against 15.6
+// copied at 128 B — splice costs this proxy 2.9x the CPU to do the same work.
+//
+// For scale, from the same box: haproxy 2.8.16 with nbthread 1 serves this
+// exchange at 29253 rt/s using 0.23 cores.  The copy path at 34019 is 1.16x
+// haproxy's rate; the splice path at 19000 was 0.65x.  The whole of the
+// measured deficit against haproxy was splice, and what is left is CPU rather
+// than throughput.
+//
+// The complexity splice carries is not free either: two pipes per connection,
+// two more request slots in every teardown path, the graveyard, and a history
+// of crossed deliveries between connections that reused a descriptor number.
+// Two circuit-breaker faults in this file (see handle_backend_read) had also
+// been sitting unreachable behind it for as long as splice was the default.
+//
+// ─── WHY IT IS KEPT AT ALL ──────────────────────────────────────────────────
+//
+// Because what was measured is one loopback machine and one shape of traffic —
+// serial request/response against a fast backend.  Zero copy is a claim about
+// memory bandwidth, and this box has plenty; the case it could still win is
+// bulk streaming across a real NIC on a machine where it does not.  Nobody has
+// measured that here, so the code stays and the default reflects what IS
+// measured.  An operator with the other machine can turn it back on with
+// SOCKETLEY_PROXY_SPLICE=1 and, one hopes, come back with numbers.
+//
+// Read once per process: this decides which forwarding path a connection takes,
+// and a value that could change between two connections of the same proxy would
+// be a configuration nobody could reproduce.
+static bool splice_opt_in()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("SOCKETLEY_PROXY_SPLICE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 // Socket buffer sizes: 256KB gives good throughput for bulk transfers
 static constexpr int SOCK_BUF_SIZE = 256 * 1024;
 
@@ -121,6 +201,23 @@ void proxy_instance::retire(std::shared_ptr<void> storage, io_request* const* ow
     retired_op op;
     op.storage = std::move(storage);
     constexpr size_t max_waiting = sizeof(op.waiting) / sizeof(op.waiting[0]);
+
+    // ─── The truncation this cannot afford to be silent about ───────────────
+    //
+    // waiting[] holds the requests the ring still owes this storage, and the
+    // storage is freed once every one of them has reported.  An entry that does
+    // not fit is a completion nobody is waiting for — which is the use-after-
+    // free this whole retire/absorb machinery exists to prevent, reopened
+    // quietly.
+    //
+    // Unreachable today: a connection struct carries at most six io_requests,
+    // which is exactly the size of the array.  It is a seventh request type
+    // that would reach it, added by someone who had no reason to look here.
+    // The bound is one comparison on a path that runs per connection teardown.
+    if (SOCKETLEY_UNLIKELY(count > max_waiting))
+        LOG_ERROR("proxy: a retired connection owes the ring more requests than "
+                  "the graveyard can track; its storage may be freed early");
+
     for (size_t i = 0; i < count && op.count < max_waiting; i++)
         op.waiting[op.count++] = owed[i];
     m_retired.push_back(std::move(op));
@@ -253,9 +350,16 @@ void proxy_client_connection::reset(int new_fd)
     SKL_TRACE_RESET(*this);
     SKL_INV_RESET(*this);
     client_eof = false;
+    backend_half_closed = false;
     backend_from_group = false;
     backend_host.clear();
     backend_port = 0;
+    // A struct out of the pool must not carry the previous connection's
+    // allowance — neither the tokens it had left nor, worse, a limit the
+    // current proxy is not configured with.  handle_accept fills these in.
+    rl_tokens = 0.0;
+    rl_max = 0.0;
+    rl_last = {};
     connect_pending = false;
     connect_fd = -1;
     connect_req = {};
@@ -294,6 +398,7 @@ void proxy_backend_connection::reset(int new_fd)
     splice_in_pending = false;
     splice_out_pending = false;
     pool_draining = false;
+    sent_to_client = false;
     pool_abandoned = false;
     pool_backend_idx = 0;
     pool_host.clear();
@@ -552,6 +657,10 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // left to say, and dropping it here is what keeps that map the size of the
     // group rather than the size of its history.
     drop_departed_endpoints();
+
+    // And the addresses for whatever the new snapshot added.  After the pruning
+    // above, so a member that just left is not looked up on its way out.
+    resolve_group_hosts();
 }
 
 // The declarations of the backends this proxy forwards to, folded into one
@@ -600,6 +709,100 @@ void proxy_instance::rebuild_route_view()
             m_routes.merge_alternative(*rt);
         }
     }
+}
+
+// ─── The group's half of "the request path does not resolve" ────────────────
+//
+// connect_to_backend stopped calling getaddrinfo, and for a configured backend
+// that is complete: setup() resolves it when the address is configured, and the
+// idle sweep retries it if that failed.  A GROUP member has neither.  Its
+// address arrives in the membership snapshot, it is written into a per-request
+// scratch backend, and the sweep — which walks m_backends — never sees it.  So
+// deferring its resolution to the sweep did not defer it; it removed it, and an
+// @group backend whose members advertise names stopped routing entirely.
+//
+// That is not hypothetical: a cluster member advertises gethostname(2), so
+// every @group backend across a real cluster is exactly this case.  Measured,
+// the payload through an @api gateway went from arriving to 0 bytes.
+//
+// Resolution belongs where the address arrives.  For a configured backend that
+// is setup(); for a group member it is here, on the membership change, which is
+// a control action and not traffic.  The property the change was made for is
+// intact — no request waits on a resolver — and the exposure that remains is a
+// membership change blocking for a lookup, which happens when a runtime starts,
+// stops or is renamed, rather than on every request through the proxy.
+void proxy_instance::resolve_group_hosts()
+{
+    if (!m_endpoints || m_backends.empty())
+    {
+        m_group_addr.clear();
+        m_group_unresolved = false;
+        return;
+    }
+
+    std::unordered_map<std::string, in_addr> kept;
+    bool unresolved = false;
+
+    for (const auto& b : m_backends)
+    {
+        if (!b.is_group)
+            continue;
+
+        const std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+        const auto* members = m_endpoints->find_group(group_name);
+        if (!members)
+            continue;
+
+        for (const auto& ep : *members)
+        {
+            // A literal address needs nothing: the selection path reads it with
+            // inet_pton and never asks this map.
+            in_addr literal{};
+            if (inet_pton(AF_INET, ep.host.c_str(), &literal) == 1)
+                continue;
+
+            if (kept.find(ep.host) != kept.end())
+                continue;
+
+            // Carried over rather than looked up again.  A membership change is
+            // a member joining or leaving, not every other member's address
+            // changing, so re-resolving the whole group on each one would make
+            // the cost of a change proportional to the size of the cluster.
+            if (const auto prev = m_group_addr.find(ep.host); prev != m_group_addr.end())
+            {
+                kept.emplace(ep.host, prev->second);
+                continue;
+            }
+
+            struct addrinfo hints{};
+            hints.ai_family   = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            struct addrinfo* res = nullptr;
+            if (getaddrinfo(ep.host.c_str(), nullptr, &hints, &res) == 0 && res)
+            {
+                if (res->ai_family == AF_INET &&
+                    res->ai_addrlen == sizeof(struct sockaddr_in))
+                {
+                    const auto* sin = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
+                    kept.emplace(ep.host, sin->sin_addr);
+                }
+                freeaddrinfo(res);
+            }
+
+            if (kept.find(ep.host) == kept.end())
+                unresolved = true;
+        }
+    }
+
+    m_group_addr.swap(kept);
+    m_group_unresolved = unresolved;
+
+    // A name that did not resolve is work for the sweep, the same way an
+    // unresolved configured backend is: without arming it, a member whose DNS
+    // was down when it joined would never be looked up again.
+    if (m_group_unresolved)
+        arm_idle_sweep();
 }
 
 // Called only when the membership snapshot changes, which is per control
@@ -757,7 +960,26 @@ bool proxy_instance::resolve_backend(backend_info& b)
             b.resolved_host = std::string(addr.substr(0, colon));
             const char* pstart = addr.data() + colon + 1;
             const char* pend   = addr.data() + addr.size();
-            std::from_chars(pstart, pend, b.resolved_port);
+
+            // Checked, and a failure fails the whole setup.
+            //
+            // The result was discarded, so `--backend host:abc`, `--backend
+            // host:` and any port above 65535 all left resolved_port at 0 —
+            // an address that provably cannot work.  Nothing said so at
+            // `create`: the proxy came up, `ls` showed it running, and the
+            // first request through it answered 503.  The daemon knew at
+            // configuration time and reported it at traffic time.
+            //
+            // Refusing here reaches both paths that build a backend, because
+            // setup() returns false the moment this does — the same answer an
+            // unresolvable runtime name already gets four lines down.
+            const auto [pptr, pec] = std::from_chars(pstart, pend, b.resolved_port);
+            if (pec != std::errc{} || pptr != pend || b.resolved_port == 0)
+            {
+                LOG_ERROR(("proxy backend \"" + b.address +
+                           "\": the port is not a number between 1 and 65535").c_str());
+                return false;
+            }
         }
         else
         {
@@ -1120,9 +1342,16 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    m_send_zc = loop.send_zc_supported();
+    // Not send_zc_supported(): the kernel having the opcode is not the
+    // question.  A pending zero-copy notification is not a cancellable request
+    // and only the peer can release it, so it would hold this instance in
+    // retire()'s graveyard for as long as one client declines to read.  See
+    // event_loop::send_zc_enabled().
+    m_send_zc = loop.send_zc_enabled();
 
-    // Probe for splice support (available on Linux 5.7+)
+    // Probe for splice support (available on Linux 5.7+).  Asked even when the
+    // opt-in below is off, so that `stats` can still say whether this kernel
+    // could do it, and so the probe is exercised on every build.
     {
         struct io_uring_probe* probe = io_uring_get_probe_ring(loop.get_ring());
         if (probe)
@@ -1131,6 +1360,7 @@ bool proxy_instance::setup(event_loop& loop)
             io_uring_free_probe(probe);
         }
     }
+    m_splice_enabled = m_splice_supported && splice_opt_in();
 
     // Pre-build prefix once to avoid per-request allocation
     m_prefix = "/" + std::string(get_name()) + "/";
@@ -1198,6 +1428,7 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
+    m_rate_limit_cached = get_rate_limit();
 
     // Fresh timer for this run, for the reason spelled out on timer_op.  It is
     // built whether or not it is armed here, because the backend pool arms it on
@@ -1606,11 +1837,62 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     pooled_left = pooled_left || !pool.empty();
                 }
 
+                // ─── And the DNS the request path no longer does ────────
+                //
+                // A backend named by hostname whose lookup failed at setup has
+                // no cached address, and connect_to_backend refuses rather than
+                // blocking for it.  This is where it gets another chance: once
+                // per sweep, off the request path, where a resolver that hangs
+                // costs one tick instead of one request.
+                bool unresolved_left = false;
+                for (auto& b : m_backends)
+                {
+                    if (b.has_cached_addr || b.resolved_host.empty() ||
+                        b.resolved_port == 0)
+                        continue;
+
+                    char port_str[8];
+                    auto [pend, pec] = std::to_chars(port_str,
+                                                     port_str + sizeof(port_str),
+                                                     b.resolved_port);
+                    *pend = '\0';
+
+                    struct addrinfo hints{};
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_STREAM;
+
+                    struct addrinfo* res = nullptr;
+                    if (getaddrinfo(b.resolved_host.c_str(), port_str, &hints, &res) == 0 && res)
+                    {
+                        if (res->ai_family == AF_INET &&
+                            res->ai_addrlen == sizeof(struct sockaddr_in))
+                        {
+                            std::memcpy(&b.cached_addr, res->ai_addr, sizeof(struct sockaddr_in));
+                            b.has_cached_addr = true;
+                        }
+                        freeaddrinfo(res);
+                    }
+
+                    if (!b.has_cached_addr)
+                        unresolved_left = true;
+                }
+
+                // The group members too, for the same reason and on the same
+                // tick.  resolve_group_hosts() carries over what it already
+                // has, so this retries only the names that failed.
+                if (m_group_unresolved)
+                {
+                    resolve_group_hosts();
+                    unresolved_left = unresolved_left || m_group_unresolved;
+                }
+
                 // Keep the chain going only while it still has work.  An armed
                 // timeout is attached to no descriptor and cannot be cancelled,
                 // so one that runs for ever holds a removed proxy in the
-                // manager's graveyard for ever with it.
-                if (m_idle_timeout_cached > 0 || pooled_left)
+                // manager's graveyard for ever with it.  An unresolved backend
+                // is work: without it the sweep stops and the name is never
+                // looked up again.
+                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left)
                     arm_idle_sweep();
             }
             // Backend response deadline sweep.  As above: this link has spoken,
@@ -1770,9 +2052,15 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     // is taken.  The invariant is the specification and the hold is the
     // implementation; when they disagree, the hold is the one that is wrong.
     //
-    // Stated only in HTTP mode.  A TCP pair has no request and no response, so
-    // "an answer is owed" is not a question that can be asked about it — and it
-    // is never held on a half-close either, for the same reason.
+    // Stated only in HTTP mode, and this is deliberately NOT extended to TCP
+    // now that a TCP pair is held on a half-close too (hold_tcp_half_close).
+    // (1b) needs a runtime that can say an answer is no longer owed, and a byte
+    // relay never can: a backend that has said nothing for a minute may be
+    // finished, or may be about to speak, and this proxy has no framing with
+    // which to tell those apart.  Claiming otherwise would abort the daemon on
+    // a perfectly ordinary quiet connection.  What holds a TCP pair honest is
+    // invariant (1) alone, and the reachability test hold_tcp_half_close makes
+    // before it takes the hold at all.
     skl_inv::exchange x{};
     if (cconn && m_protocol == protocol_http)
     {
@@ -1849,6 +2137,7 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     f |= uint64_t(c->awaiting_response)     << 18;
     f |= uint64_t(c->awaiting_headers)      << 19;
     f |= uint64_t(c->ssl != nullptr)        << 20;
+    f |= uint64_t(c->backend_half_closed)   << 21;
     return inv_mix(h, f);
 }
 
@@ -1892,6 +2181,12 @@ uint64_t proxy_instance::inv_digest(const proxy_backend_connection* b)
     f |= uint64_t(b->http_frame.response_bytes_seen) << 16;
     f |= uint64_t(b->http_frame.unknown)             << 17;
     f |= uint64_t(b->ssl != nullptr)                 << 18;
+    f |= uint64_t(b->sent_to_client)                 << 19;
+    // Here because it is a state change like the rest, and the progress ledger
+    // reports a connection whose state stops changing.  `unknown` sits two
+    // lines up and this used to be spelled as it; leaving it out would make the
+    // one transition that now travels separately invisible to that check.
+    f |= uint64_t(b->http_frame.overrun)             << 20;
     return inv_mix(h, f);
 }
 
@@ -2050,6 +2345,18 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
 
         if (m_idle_timeout_cached > 0)
             ptr->last_activity = std::chrono::steady_clock::now();
+
+        // The bucket starts full, so a connection may spend its whole second's
+        // allowance at once and then has to wait for it to refill.  Same shape
+        // as the server's, deliberately: a burst up to the configured rate is
+        // what a token bucket is for, and a limiter that started empty would
+        // delay every first request on every connection.
+        if (m_rate_limit_cached > 0)
+        {
+            ptr->rl_max = m_rate_limit_cached;
+            ptr->rl_tokens = m_rate_limit_cached;
+            ptr->rl_last = std::chrono::steady_clock::now();
+        }
 
         SKL_TRACE_SET(ptr, opened_ms, ::skl_trace::now_ms());
         invoke_on_connect(client_fd);
@@ -2420,9 +2727,16 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         //     and the only one it needs: a half-closed client is held no longer
         //     than one that did not half-close, whatever the timeout is set to.
         //
-        // TCP mode is deliberately not held: it has no request and no response
-        // to be owed one, and a byte pipe whose client has finished writing has
-        // nothing left to be told.
+        // TCP mode is held too, on a different question and by a different
+        // route — see hold_tcp_half_close, just below.  It used to be excused
+        // here on the grounds that "a byte pipe whose client has finished
+        // writing has nothing left to be told", and that is the mistake: the
+        // client is still READING.  The direction that had nothing left to
+        // carry was taken for the connection.
+        if (cqe->res == 0 && !conn->closing && m_protocol == protocol_tcp &&
+            hold_tcp_half_close(conn))
+            return;
+
         if (cqe->res == 0 && !conn->closing && m_protocol == protocol_http)
         {
             const proxy_backend_connection* b = nullptr;
@@ -2450,7 +2764,20 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             }
         }
 
-        close_pair(fd, conn->backend_fd);
+        // Everything that reaches here has already been offered the hold and
+        // declined it: res == 0 is a clean half-close and was answered above,
+        // so what is left is res < 0 — a read that FAILED.  ECONNRESET is the
+        // common one, and a socket the kernel has reset cannot carry an answer
+        // however much is owed on it.
+        //
+        // Stated with force rather than left to the gate, because the gate
+        // cannot see the difference: by the time it runs, the only thing it has
+        // is the pair, and the pair looks identical whether the client shut its
+        // write side politely or the connection was torn out from under it.
+        // This is where the 389 connections the gate held on its second run
+        // were coming from.
+        close_pair(fd, conn->backend_fd,
+                   cqe->res < 0 ? close_reason::force : close_reason::normal);
         return;
     }
 
@@ -2463,6 +2790,57 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // Track bytes in
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+
+    // ── rate limiting, per connection and across the runtime ────────────────
+    //
+    // --rate-limit is documented under COMMON FLAGS as working with all runtime
+    // types, and this proxy did not implement it AT ALL.  The value was parsed,
+    // stored on the instance and reported back by `show` — so a proxy created
+    // with `--rate-limit 2` looked configured in every way a caller can check —
+    // and nothing ever read it.  Measured before this: 40 requests on one
+    // connection through such a proxy were all answered, at 5497/sec against a
+    // configured 2/sec.  The same flag on a server answers 2 of 40.  An
+    // operator who set it to protect a backend had no protection and no
+    // indication that there was none.
+    //
+    // WHAT A TOKEN COSTS.  One read completion, which is what "message" already
+    // means everywhere else in this runtime — m_stat_total_messages counts the
+    // same event one line above, and the global limiter below has always been
+    // charged on it.  It is deliberately NOT one HTTP request: a client that
+    // pipelines four requests into one segment pays one token.  The two
+    // limiters agreeing with each other matters more here than either matching
+    // the server's per-message notion, because on a proxy they are read
+    // together and a caller comparing them would otherwise be comparing
+    // different units.
+    //
+    // WHAT EXCEEDING IT COSTS.  The connection, exactly as for the global limit
+    // beside it — and that is a deliberate difference from the server, which
+    // drops the message and reads on.  A proxy that silently dropped a request
+    // would leave the client waiting for a response that is never coming, which
+    // is a hang rather than a refusal; a close is the one signal a client can
+    // act on without a timeout of its own.  Stated in the man page, next to the
+    // per-runtime differences --global-rate-limit already documents.
+    if (SOCKETLEY_UNLIKELY(conn->rl_max > 0))
+    {
+        const auto rl_now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(rl_now - conn->rl_last).count();
+        conn->rl_last = rl_now;
+        conn->rl_tokens += elapsed * conn->rl_max;
+        if (conn->rl_tokens > conn->rl_max)
+            conn->rl_tokens = conn->rl_max;
+
+        if (conn->rl_tokens < 1.0)
+        {
+            if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
+            {
+                uint16_t buf_id_rl = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+                m_loop->return_buf(BUF_GROUP_ID, buf_id_rl);
+            }
+            close_pair(fd, conn->backend_fd);
+            return;
+        }
+        conn->rl_tokens -= 1.0;
+    }
 
     // Global rate limiting
     if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
@@ -2747,7 +3125,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE))
     {
         answer_request_too_large(conn);
-        close_pair(fd, conn->backend_fd);
+        // force: the refusal IS the answer.  Nothing further is owed on a
+        // request that has just been refused, and holding here would leave the
+        // multishot recv armed and go on accepting the very bytes the ceiling
+        // exists to stop — measured, the payload then arrived whole where the
+        // test asks for it truncated.
+        close_pair(fd, conn->backend_fd, close_reason::force);
         return;
     }
 
@@ -3175,6 +3558,38 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         // perfectly healthy backend out of rotation after circuit_threshold
         // requests — five by default.  A close is only a failure if it arrived
         // before any of the response did, which response_started already tracks.
+        //
+        // …and not at all when the teardown is OURS.  close_pair sets closing
+        // and then calls shutdown(fd, SHUT_RD) precisely so that a read still
+        // armed on this socket completes now rather than whenever TCP gets
+        // round to it — and SHUT_RD makes that read return 0.  Every one of
+        // those completions arrived here looking exactly like a backend that
+        // hung up, and was charged as one.
+        //
+        // What that costs is not subtle.  A client that aborts mid-exchange is
+        // the ordinary way to reach it, so a proxy in front of a perfectly
+        // healthy backend opened its breaker after five aborting clients and
+        // then answered EVERY later client with an instant EOF.  Measured on
+        // this tree with a 2.5 s storm of RSTing connections against a threaded
+        // echo backend: 7067 connections, 84 messages delivered, 7060 clients
+        // given EPIPE, `backend_0_circuit:open` — and with the same load and
+        // --circuit-threshold 100000, 29 connections, 348 of 348 messages
+        // delivered and not one error.  The breaker was the whole of it.
+        //
+        // Same family as the term below, and the same shape: this counter is
+        // for what the BACKEND did, and it was being fed events the backend had
+        // no part in.  Older than the splice default changing — the shutdown
+        // and this charge are both unchanged for a long time — but unreachable
+        // in TCP mode while splice was the default, because the splice legs are
+        // torn down without a backend read ever completing.
+        //
+        // Only the CHARGE is skipped, deliberately.  Everything else in this
+        // block — the 502, the retry, the detach — is about what the client is
+        // owed, and a teardown already under way does not change that; taking
+        // an early exit here instead would be a second behaviour change riding
+        // on a breaker fix.
+        const bool teardown_is_ours = conn->closing;
+
         if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
         {
             auto& ce = m_conn_idx[conn->client_fd];
@@ -3219,9 +3634,35 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     conn->http_frame.response_bytes_seen &&
                     !conn->http_frame.headers_parsed &&
                     !conn->http_frame.unknown;
+                // "Did this backend answer at all before it went away."
+                //
+                // response_started is only ever assigned on the HTTP path, so
+                // for a --protocol tcp proxy this term read `!false` — a
+                // CONSTANT TRUE — and every clean backend close was charged to
+                // the breaker as a failure.  circuit_threshold is 5, so five
+                // ordinary exchanges against a backend that hangs up after
+                // answering (a one-shot server, `nc -l`, anything that closes
+                // to frame its reply) took the only backend out of rotation,
+                // and from then on every client was answered with an instant
+                // EOF by a proxy whose backend was perfectly healthy.  Nothing
+                // recovers it while the breaker refuses the requests that would
+                // prove the backend well.
+                //
+                // Reproduced on 8affb1f, so it predates the splice default
+                // changing: it wedged on the 13th connection there.  It was
+                // invisible because splice was the only TCP path anybody took
+                // and the splice teardown does not consult the breaker at all —
+                // the copy path needed a Lua hook to reach.
+                //
+                // sent_to_client is the same question stated where a byte relay
+                // can answer it: bytes came off this backend socket and went to
+                // the client.  Framing is not part of it, because TCP has none.
+                const bool backend_answered = (m_protocol == protocol_http)
+                                                  ? ce.client->response_started
+                                                  : conn->sent_to_client;
                 const bool backend_failed =
-                    (cqe->res < 0) || !ce.client->response_started || never_framed;
-                if (backend_failed)
+                    (cqe->res < 0) || !backend_answered || never_framed;
+                if (backend_failed && !teardown_is_ours)
                     note_backend_failure(ce.client);
 
                 // The backend went away before one byte of the answer did, and
@@ -3269,7 +3710,22 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             }
         }
 
-        close_pair(conn->client_fd, fd);
+        // force: the backend's read completed with EOF or an error, so this
+        // pair has no source of further bytes.  Everything that could still be
+        // answered was answered above -- the branch that retries or sends 502
+        // takes every client that has not seen a byte yet -- so what reaches
+        // here has either got what there was or is already closing.
+        //
+        // The answer-owed invariant found this site rather than the other way
+        // round: it was 5 of the 5 remaining violations in a suite run, all
+        // from test_proxy_circuit_breaker.sh, whose truncating backend stops
+        // mid-header-block.  Those bytes are on the wire and RFC 9112 6.3 makes
+        // a header block ended by a close a complete response, so the client
+        // has its answer; what is not complete is the FRAMING, which is what
+        // backend_response_complete() reads and why the check fired.  The
+        // finding was accurate and the close is right -- what was missing was
+        // this line saying so.
+        close_pair(conn->client_fd, fd, close_reason::force);
         return;
     }
 
@@ -3385,6 +3841,13 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // carry a handshake, and counting one of those as "the backend answered"
     // would clear the response deadline and bar a retry before the request had
     // even gone out.
+    //
+    // The plain fact — "this backend has delivered application bytes" — is
+    // recorded for both protocols, because the breaker below needs it in both
+    // and only the HTTP path has response_started to read it off.  It says
+    // nothing about framing and nothing about retries; those stay HTTP's.
+    conn->sent_to_client = true;
+
     if (m_protocol == protocol_http && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];
@@ -3401,27 +3864,56 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         }
     }
 
+    // ── the scan runs BEFORE the forward, because it decides its length ─────
+    //
+    // It used to run after, and the note below still explains why that was
+    // thought harmless: "every byte is forwarded either way".  That is the
+    // sentence this change is about.  A backend that flushes a complete answer
+    // and the head of another in one write puts bytes on the client's wire that
+    // answer no request the client has outstanding, and the client reads them
+    // as the beginning of the answer to the one it is waiting for.
+    //
+    // The scan already noticed -- http_response_consume_body has always tested
+    // `avail > left` -- and only recorded it for the pool.  It now reports how
+    // many bytes at the end of this chunk are past the answer, and those are
+    // dropped.  Nothing legitimate is lost: this proxy sends one request down a
+    // backend socket and waits for its answer, so there is no second response
+    // it could be waiting for.
+    //
+    // Moving it up is safe by inspection: everything downstream reads the scan's
+    // RESULT (headers_parsed, switched_protocols, the pooling predicate) and
+    // framed_before / tunnel_before are both captured above either way.
+    const bool framed_before  = conn->http_frame.headers_parsed;
+    const bool tunnel_before  = conn->http_frame.switched_protocols;
+    size_t forward_len = data_len;
+    if (m_protocol == protocol_http)
+    {
+        http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
+        const size_t excess = conn->http_frame.excess_in_chunk;
+        if (SOCKETLEY_UNLIKELY(excess > 0 && excess <= data_len))
+            forward_len = data_len - excess;
+    }
+
     // Forward to client
-    forward_to_client(conn, {data_ptr, data_len});
+    forward_to_client(conn, {data_ptr, forward_len});
 
     // HTTP response tracking for connection pooling.
     //
-    // The mirror image of request smuggling lives here.  What this decides is
-    // not what the client sees — every byte is forwarded either way, just
-    // above — but whether the backend socket may be handed to the pool once the
-    // response is judged finished.  Judge it finished early and the socket is
-    // pooled with the rest of the answer still coming, and the next request to
-    // borrow it reads the tail of a stranger's response as the head of its own.
+    // The mirror image of request smuggling lives here.  What it decides is
+    // whether the backend socket may be handed to the pool once the response is
+    // judged finished: judge it finished early and the socket is pooled with the
+    // rest of the answer still coming, and the next request to borrow it reads
+    // the tail of a stranger's response as the head of its own.
+    //
+    // It also decides, since the scan moved above the forward, how much of this
+    // chunk the client is allowed to see.  Those were one question all along and
+    // only one of them was being asked.
     //
     // The scan itself is in runtime/proxy/http_response_framing.h.  It used to
     // be a hundred and twenty lines here, in the middle of a completion
     // handler, which meant nothing short of a running daemon could call it and
     // it was the last parser in the tree with no fuzz target.  It is the same
     // code, in a form test/fuzz/fuzz_http_response.cpp can drive directly.
-    const bool framed_before  = conn->http_frame.headers_parsed;
-    const bool tunnel_before  = conn->http_frame.switched_protocols;
-    if (m_protocol == protocol_http)
-        http_response_scan_chunk(conn->http_frame, {data_ptr, data_len});
 
     // And here, not above the forward, is where the breaker hears that this
     // backend answered.
@@ -5053,6 +5545,25 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         m_scratch_backend.cached_addr.sin_port = htons(m_scratch_backend.resolved_port);
         m_scratch_backend.has_cached_addr = true;
     }
+    else if (const auto it = m_group_addr.find(m_scratch_backend.resolved_host);
+             it != m_group_addr.end())
+    {
+        // A name, resolved when the membership arrived.  The port is the
+        // member's rather than the entry's: one host can appear in several
+        // groups and on several ports, and the map is keyed by host alone.
+        m_scratch_backend.cached_addr.sin_family = AF_INET;
+        m_scratch_backend.cached_addr.sin_addr   = it->second;
+        m_scratch_backend.cached_addr.sin_port   = htons(m_scratch_backend.resolved_port);
+        m_scratch_backend.has_cached_addr = true;
+    }
+    else
+    {
+        // A member advertising a name that has not resolved yet.  Refusing this
+        // one request is the whole of the cost, and the sweep is what makes it
+        // temporary — resolving here is the thing that froze the daemon.
+        m_group_unresolved = true;
+        arm_idle_sweep();
+    }
     return &m_scratch_backend;
 }
 
@@ -5726,7 +6237,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         m_conn_idx[bfd].backend = ptr;
 
         // Set up splice for TCP mode
-        if (m_protocol == protocol_tcp && m_splice_supported &&
+        if (m_protocol == protocol_tcp && m_splice_enabled &&
             !m_cb_on_proxy_request && !m_cb_on_proxy_response)
         {
 #ifndef SOCKETLEY_NO_LUA
@@ -5786,31 +6297,29 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     }
     else
     {
-        // Slow path: getaddrinfo for hostname resolution (Docker DNS, etc.)
-        char port_str[8];
-        auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), target->resolved_port);
-        *pend = '\0';
-
-        struct addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        struct addrinfo* result = nullptr;
-        if (getaddrinfo(target->resolved_host.c_str(), port_str, &hints, &result) != 0 || !result)
-            return false;
-
-        if (result->ai_family == AF_INET && result->ai_addrlen == sizeof(struct sockaddr_in))
-            std::memcpy(&addr, result->ai_addr, sizeof(addr));
-
-        // Cache for future connections
-        auto* mutable_target = const_cast<backend_info*>(target);
-        std::memcpy(&mutable_target->cached_addr, result->ai_addr, sizeof(struct sockaddr_in));
-        mutable_target->has_cached_addr = true;
-
-        freeaddrinfo(result);
-
-        if (addr.sin_family == 0)
-            return false;
+        // ─── THE REQUEST PATH DOES NOT RESOLVE ──────────────────────────────
+        //
+        // This called getaddrinfo, per request, on the event loop thread — the
+        // one thread that serves every runtime in the daemon.  A backend whose
+        // DNS was slow or hanging therefore froze the whole daemon for the
+        // resolver's timeout, typically five seconds, on EVERY request through
+        // it: not only this proxy's clients but every server, cache and client
+        // runtime the daemon holds.  The comment that stood here called it the
+        // "slow path" and left it at that.
+        //
+        // Resolution happens on the idle sweep now, which is a timer.  The
+        // trade is deliberate and worth stating: a backend whose name starts
+        // resolving is picked up within one sweep rather than on the very next
+        // request, so recovery is bounded by the sweep interval instead of
+        // being immediate.  In exchange nothing the daemon serves can be
+        // stopped by somebody else's DNS.  For a proxy that is the right way
+        // round — a request that fails fast is a 503, a daemon that stops
+        // answering is every runtime at once.
+        //
+        // The sweep is armed here rather than assumed: it only keeps itself
+        // going while it has work, and an unresolved backend is work.
+        const_cast<proxy_instance*>(this)->arm_idle_sweep();
+        return false;
     }
 
     bfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -5857,7 +6366,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         m_conn_idx[bfd].backend = ptr;
 
         // Set up splice for TCP mode
-        if (m_protocol == protocol_tcp && m_splice_supported &&
+        if (m_protocol == protocol_tcp && m_splice_enabled &&
             !m_cb_on_proxy_request && !m_cb_on_proxy_response)
         {
 #ifndef SOCKETLEY_NO_LUA
@@ -5880,6 +6389,8 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
                     // Only queued, not written yet — see handle_connect.
                     if (!ptr->write_pending && ptr->write_queue.empty())
                         start_splice_forwarding(conn, ptr);
+                    // And the same for a half-close taken during the connect.
+                    forward_client_half_close(conn);
                     return true;  // connect_pending stays false, splice handles data flow
                 }
             }
@@ -6105,7 +6616,15 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     // to the same socket at the same time.  Two independent writers on one
     // connection is exactly how later data ends up ahead of earlier data.
     // handle_client_read starts the pipeline once the read has been consumed.
-    if (!conn->splice_in_pending && !conn->read_pending)
+    //
+    // And never once the client has reported end of stream.  There is nothing
+    // left on that socket to move, the poll on it would be readable for ever,
+    // and each splice behind it answers res=0 — the half-close is held instead,
+    // and the backend leg below is what keeps the pair reachable.  Stated here
+    // rather than at the call sites because all four of them can reach this
+    // with client_eof already set: the client can half-close during the backend
+    // connect, and both connect paths start the pipeline afterwards.
+    if (!conn->splice_in_pending && !conn->read_pending && !conn->client_eof)
     {
         conn->splice_in_pending = true;
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
@@ -6212,6 +6731,18 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     }
                     return;
                 }
+
+                // res == 0 on this leg is the client's half-close and not a
+                // failure: splice reports end of stream exactly as read() does.
+                // Held rather than closed, for the reasons in
+                // hold_tcp_half_close — this leg carried the losing half of the
+                // bug, the response the backend was about to send.  Nothing is
+                // re-armed here on purpose; the backend's own splice leg is what
+                // keeps the pair reachable, and hold_tcp_half_close refuses the
+                // hold when it is not armed.
+                if (cqe->res == 0 && !conn->closing && hold_tcp_half_close(conn))
+                    return;
+
                 close_pair(conn->fd, conn->backend_fd);
                 return;
             }
@@ -6281,6 +6812,35 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     close_pair(conn->fd, conn->backend_fd);
                     return;
                 }
+                return;
+            }
+
+            // The pipe is empty and this leg is idle — which is the moment the
+            // held half-close is allowed to go out, and the moment it can no
+            // longer overtake anything the client sent.  Reachable when the
+            // FIN arrived on the copy path (or during the connect) and the
+            // pipeline was carrying the last of the payload behind it.
+            if (SOCKETLEY_UNLIKELY(conn->client_eof))
+            {
+                forward_client_half_close(conn);
+
+                // Deliberately not re-armed: the client has said it will send
+                // no more, and a splice armed on a socket at end of stream is
+                // answered res=0 for ever.  So the pair now rests entirely on
+                // the peer, and that has to be asked again here rather than
+                // assumed from the answer hold_tcp_half_close gave earlier —
+                // the backend may have finished in between.
+                const int hbfd = conn->backend_fd;
+                bool reachable = client_op_in_flight(conn);
+                if (!conn->closing && !reachable && hbfd >= 0 && hbfd < MAX_FDS &&
+                    m_conn_idx[hbfd].side == conn_backend)
+                {
+                    auto* hb = m_conn_idx[hbfd].backend;
+                    reachable = backend_op_in_flight(hb) || !hb->write_queue.empty();
+                }
+                if (reachable)
+                    return;
+                close_pair(conn->fd, conn->backend_fd);
                 return;
             }
 
@@ -6521,7 +7081,16 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // http_response_frame_complete() says so as its first act rather than
     // failing to find the end of a response that does not exist.  Handing one
     // to the pool would give the next request a live WebSocket session.
-    if (!backend_response_complete(bconn))
+    //
+    // http_response_pool_safe() and not backend_response_complete(), because the
+    // two are different questions and were one predicate until an overrun made
+    // the difference cost something.  "Finished" is about the message; poolable
+    // is about the stream position, and a response can be complete to the last
+    // byte of its Content-Length while the socket behind it already holds bytes
+    // nobody asked for.  The `unknown` refusal above is subsumed by this call --
+    // it is kept as its own line because the reason for it is not the reason for
+    // this one.
+    if (!http_response_pool_safe(bconn->http_frame))
         return false;
     if (!cconn)
         return false;
@@ -6582,8 +7151,84 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
     }
 }
 
-void proxy_instance::close_pair(int client_fd, int backend_fd)
+void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reason)
 {
+    // ── the answer-owed invariant, asked once for every path ───────────────    //
+    // A client that has shut its write side is still owed the answer to the
+    // request it already sent.  handle_client_read knows that and holds;
+    // nothing else does.  The count is the argument: client_answer_owed() is
+    // consulted at 2 places while this function is called at 86, across 15
+    // functions, and this defect has been fixed four times at four different
+    // call sites -- 6de09db, 19d6003, 2ab585a, 9aa8e96 -- with the fuzzer
+    // finding a fifth.
+    //
+    // This CHECKS rather than decides, and the difference is the whole point.
+    // Holding here was tried and measured: 1484 connections held after an abort
+    // storm, then 389 with three callers told to force, then 294 with a fourth.
+    // Each force covered one more path, which is the four point fixes again
+    // with the sign reversed -- before, every path had to remember to hold;
+    // after, every path had to remember to force.  Inverting the default moved
+    // the per-path knowledge, it did not remove it.
+    //
+    // The reason is structural.  close_pair cannot tell a polite half-close
+    // from a connection torn out from under its client: by the time it runs,
+    // both are just a pair.  What decides it -- whether an answer can still be
+    // DELIVERED -- lives at the caller and does not survive the call.  A gate
+    // sited where that knowledge is absent can only ever be told, one caller at
+    // a time.
+    //
+    // So the invariant fires where the decision cannot be made.  It changes no
+    // behaviour: the hold stays where the knowledge is, and this turns 86 call
+    // sites into 86 places the fuzzer and the sanitized suite can catch rather
+    // than 86 places to edit.  close_reason::force is how a caller states that
+    // no answer can arrive on this pair -- and it is now a claim recorded for
+    // the invariant, not a bypass of a gate.
+    // HTTP only, for the same reason the hold is.  client_answer_owed() rests on
+    // response_started, and that flag is set at exactly one place -- the
+    // `m_protocol == protocol_http` branch in handle_backend_read -- so on a TCP
+    // proxy it is false for the life of every connection and the predicate reads
+    // "an answer is owed" for every client that has a backend at all, for ever.
+    //
+    // Measured before this line existed: a full suite run against the invariants
+    // build reported 468 violations across 7 tests, of which 426 came from one
+    // --protocol tcp test and 458 from the four tcp tests together.  Every one
+    // was a healthy close.  The hold carries this same gate and so was never
+    // wrong; the invariant without it was not the specification for the hold but
+    // a different claim sharing its predicate.
+    //
+    // On a TCP proxy this asserts nothing, and that is a decision rather than a
+    // hole waiting to be filled.  inv_check_pair carries the argument in full:
+    // (1b) needs a runtime that can say an answer is no longer OWED, and a byte
+    // relay never can -- a backend silent for a minute may be finished or may be
+    // about to speak, and there is no framing with which to tell those apart, so
+    // claiming otherwise would abort the daemon on an ordinary quiet connection.
+    // What holds a TCP pair honest is invariant (1), reachability, which does
+    // cover it, plus the reachability test hold_tcp_half_close makes before
+    // taking the hold at all.
+    //
+    // The other thing it cannot see is a request that never STARTED.  This asks
+    // about the exchange in flight, so a whole request sitting unparsed in
+    // conn->partial is invisible to it -- measured on the 125-byte artefact of
+    // 2026-08-14: owed=0 with partial=57.  That is not a hole here either.  A
+    // pipelined request waiting on a boundary is bound_pipelined_hold's
+    // business, and the answer it ships is a 408 from the deadline sweep rather
+    // than an abort; asserting it here would fire on the shape that sweep
+    // exists to handle.
+    if (reason == close_reason::normal &&
+        m_protocol == protocol_http &&
+        client_fd >= 0 && client_fd < MAX_FDS &&
+        m_conn_idx[client_fd].side == conn_client)
+    {
+        proxy_client_connection* c = m_conn_idx[client_fd].client;
+        const proxy_backend_connection* b = nullptr;
+        if (backend_fd >= 0 && backend_fd < MAX_FDS &&
+            m_conn_idx[backend_fd].side == conn_backend)
+            b = m_conn_idx[backend_fd].backend;
+
+        if (!c->closing && !conn_tunnelled(c) && client_answer_owed(c, b))
+            SKL_INV_FAIL("answer-owed-close", "proxy::close_pair");
+    }
+
     // Find client conn for pool-eligibility checks
     proxy_client_connection* client_for_pool = nullptr;
     if (client_fd >= 0 && client_fd < MAX_FDS && m_conn_idx[client_fd].side == conn_client)
@@ -7207,6 +7852,166 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
         drive_client_request(cconn, cconn->fd);
 }
 
+// A TCP client has shut its write side.  Hold the pair open for the answer, or
+// say that it cannot be held.
+//
+// ─── WHAT WAS WRONG ─────────────────────────────────────────────────────────
+//
+// Both forwarding paths tore the whole pair down on that FIN — the copy path in
+// handle_client_read, the splice path in handle_splice — and the answer the
+// client was waiting for was thrown away with it.  Measured against a cache
+// backend on this tree: the request arrived and was executed (the key is set
+// afterwards) and the client read a clean EOF instead of `+OK`.  A clean EOF is
+// the one failure a client cannot act on: nothing distinguishes it from a
+// backend that legitimately had nothing to say, so the exchange is silently
+// lost rather than retried.  Talking to the same backend directly answers, and
+// so does haproxy in front of it.
+//
+// shutdown(SHUT_WR) is a request, not a hang-up.  It says "I will send no more"
+// and nothing whatever about reading; the peer is expected to finish what it
+// was asked and close in its own time.  It is how every request/response client
+// that does not want to parse the reply frames its request — `nc -N`, curl on a
+// non-keep-alive connection, redis-cli in one shot — and how a shell pipeline
+// into a TCP proxy ends.
+//
+// ─── WHAT IS DONE INSTEAD ───────────────────────────────────────────────────
+//
+// The half-close is passed on to the backend and the return direction is left
+// running until the backend itself ends it.  Passing it on is not optional and
+// not cosmetic: a TCP proxy has no framing, so the FIN is the ONLY thing that
+// can tell a backend the request is over, and a backend waiting for one — a
+// cache reading to end of stream, a line protocol that answers on EOF — never
+// answers at all if it is swallowed.  It is also what ends the hold in the
+// ordinary case: the backend answers, sees end of stream, and closes, and that
+// close reaches handle_backend_read (or the backend's splice leg) which tears
+// the pair down through close_pair, which defers on the client's write queue so
+// the answer goes out ahead of the descriptor.
+//
+// ─── WHAT BOUNDS THE HOLD ───────────────────────────────────────────────────
+//
+//   * the backend's own close, above — the common case, and the only one that
+//     happens on a working exchange;
+//   * a client that resets: the abort watch armed below is a poll for
+//     POLLERR|POLLHUP, which on Linux means "reset, or shut down in both
+//     directions".  Measured on this kernel: a peer that half-closes and then
+//     merely close()s its descriptor raises neither, which is exactly right —
+//     that connection is still readable by us and is still owed its answer —
+//     and a peer that resets raises both within the poll's first turn;
+//   * --idle-timeout, where the operator set one;
+//   * and nothing else.  With no idle timeout and a backend that never speaks
+//     again, the pair is held — which is the SAME unbounded wait a TCP pair
+//     whose client did not half-close already has on such a proxy, because a
+//     TCP relay has no request, no response and therefore no deadline sweep.
+//     The hold costs no descriptor and no wait that this proxy did not already
+//     accept for every other connection.
+//
+// ─── AND WHAT IS REFUSED ────────────────────────────────────────────────────
+//
+// The hold is only honest while something can still finish the pair.  Nothing
+// is armed on the client after this — no read, no splice, deliberately, so a
+// client cannot buy time with a FIN and so an EOF completion cannot be re-armed
+// into the endless res=0 loop handle_client_read documents — so the whole of
+// invariant (1) rests on the peer.  Asked as invariant (1) asks it, over both
+// halves, and asked BEFORE the abort watch is armed so that the watch cannot
+// vouch for a pair it is the only thing holding.
+bool proxy_instance::hold_tcp_half_close(proxy_client_connection* conn)
+{
+    if (m_protocol != protocol_tcp || conn->closing)
+        return false;
+
+    // The backend handshake is still in flight and the client's payload is
+    // sitting in saved_request waiting for it.  This is the worst version of
+    // the loss, because the request has not even been SENT yet, and it is the
+    // easiest to hit: a client that connects, writes and half-closes in one
+    // breath does exactly this whenever the backend is not already pooled.
+    // handle_connect forwards the saved bytes and forward_client_half_close is
+    // called behind them there; the connect completion is what keeps the pair
+    // reachable until then.
+    const bool connecting = conn->connect_pending;
+
+    const int bfd = conn->backend_fd;
+    proxy_backend_connection* bconn = nullptr;
+    if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
+        bconn = m_conn_idx[bfd].backend;
+
+    if (!connecting && !bconn)
+        return false;
+    if (bconn && bconn->closing)
+        return false;
+
+    // Reachability, before anything is changed.
+    const bool peer_alive = bconn && (backend_op_in_flight(bconn) ||
+                                      !bconn->write_queue.empty());
+    if (!connecting && !peer_alive &&
+        !client_op_in_flight(conn) && conn->write_queue.empty())
+        return false;
+
+    conn->client_eof = true;
+
+    // See the bound above.  A failure to arm is not fatal — it costs this
+    // connection the early notice of a reset, nothing else — so nothing is
+    // unwound on refusal, exactly as at the connect site that also arms it.
+    if (!conn->abort_watch_pending)
+    {
+        conn->abort_req = { this, nullptr, conn->fd, 0, op_poll_abort, conn->generation };
+        if (SOCKETLEY_LIKELY(m_loop && m_loop->submit_poll_add(conn->fd, POLLERR | POLLHUP,
+                                                              &conn->abort_req)))
+            conn->abort_watch_pending = true;
+    }
+
+    forward_client_half_close(conn);
+    return true;
+}
+
+// Pass a held client's half-close on to the backend socket — once, and not one
+// completion round too early.
+//
+// THE ORDERING IS THE WHOLE FUNCTION.  shutdown() is a syscall and reaches the
+// kernel the moment it is called; everything this proxy sends is an io_uring
+// submission that reaches the kernel when the loop submits at the end of the
+// completion round.  A FIN issued while a write is still queued therefore
+// OVERTAKES the bytes it is supposed to terminate: the backend sees an empty or
+// truncated stream and the send that follows fails EPIPE.  handle_connect
+// carries the same warning about the same syscall, and it is the reason the
+// half-close is a deferred action here rather than a line beside the EOF.
+//
+// So this is called from every place a client's outbound bytes can finish —
+// the EOF itself, the backend's write completion, the outbound splice's
+// completion — and each time it asks whether they have.
+void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
+{
+    if (m_protocol != protocol_tcp || !conn->client_eof || conn->backend_half_closed)
+        return;
+
+    const int bfd = conn->backend_fd;
+    if (bfd < 0 || bfd >= MAX_FDS || m_conn_idx[bfd].side != conn_backend)
+        return;
+    auto* bconn = m_conn_idx[bfd].backend;
+
+    // Anything the copy path still owes this socket.  zc_notif_pending is in
+    // the list because a zero-copy send clears write_pending on its first
+    // completion while the kernel is still reading out of the buffer.
+    if (bconn->write_pending || bconn->zc_notif_pending || !bconn->write_queue.empty())
+        return;
+
+    // And anything the splice path still owes it.  The two pending flags are
+    // sufficient to say the pipe is empty as well as idle: a splice that moves
+    // fewer bytes than the pipe holds is resubmitted immediately from
+    // handle_splice, so a non-empty pipe_to_backend always has
+    // splice_out_pending set.  The pipe is deliberately not asked with FIONREAD
+    // — see trace_splice_sweep on why an ioctl on a pipe can park this thread.
+    if (conn->splice_in_pending || conn->splice_out_pending)
+        return;
+
+    // A TLS backend leg is not reachable from here: setup_splice_pipes refuses
+    // a session on either leg, and a record layer that still owes the wire
+    // output has that output in its queue, which was tested above.  The FIN is
+    // the transport's, not the session's — a close_notify would be, and TCP
+    // mode never sends one.
+    if (shutdown(bfd, SHUT_WR) < 0) {}
+    conn->backend_half_closed = true;
+}
+
 bool proxy_instance::is_backend_available(size_t idx) const
 {
     if (SOCKETLEY_UNLIKELY(idx >= m_backends.size()))
@@ -7478,6 +8283,24 @@ void proxy_instance::health_check_sweep()
     }
 }
 
+// Is this an HTTP response with a 2xx status.
+//
+// The test was `buf[9] == '2'` on a length above twelve — the byte where the
+// status code starts IF the response begins with "HTTP/1.x ".  Nothing checked
+// that it did, so any service answering something with a '2' at offset nine was
+// marked healthy: a TLS alert, a Redis error, a line of JSON.  A backend that
+// speaks the wrong protocol entirely would stay in rotation.
+//
+// The version digit is deliberately not pinned: HTTP/1.0 and HTTP/1.1 both
+// answer health checks, and pinning it would fail the ones that reply 1.0.
+static bool health_is_2xx(const char* buf, size_t len)
+{
+    if (len < 13) return false;
+    if (std::memcmp(buf, "HTTP/1.", 7) != 0) return false;
+    if (buf[8] != ' ') return false;
+    return buf[9] == '2';
+}
+
 void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req)
 {
     // Find which health check this belongs to
@@ -7734,13 +8557,12 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
                     drop_health_check(slot);
                 return;
             }
-            got_2xx = (hc->plain_len > 12 && hc->buf[9] == '2');
+            got_2xx = health_is_2xx(hc->buf, hc->plain_len);
         }
         else if (cqe->res > 12)
         {
             hc->buf[cqe->res] = '\0';
-            if (hc->buf[9] == '2')
-                got_2xx = true;
+            got_2xx = health_is_2xx(hc->buf, static_cast<size_t>(cqe->res));
         }
 
         record(got_2xx);
@@ -7890,7 +8712,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     m_conn_idx[bfd].backend = ptr;
 
     // Set up splice for TCP mode
-    if (m_protocol == protocol_tcp && m_splice_supported &&
+    if (m_protocol == protocol_tcp && m_splice_enabled &&
         !m_cb_on_proxy_request && !m_cb_on_proxy_response)
     {
 #ifndef SOCKETLEY_NO_LUA
@@ -7919,6 +8741,8 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
                 // once the queue has actually drained.
                 if (!ptr->write_pending && ptr->write_queue.empty())
                     start_splice_forwarding(conn, ptr);
+                // And the same for a half-close taken during the connect.
+                forward_client_half_close(conn);
                 return;
             }
         }
@@ -7974,8 +8798,11 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
 
     // The client read was deliberately left unarmed until a backend existed;
     // now that one does, start taking data.  (The splice path returns earlier —
-    // there the pipeline does the reading.)
+    // there the pipeline does the reading.)  Not onto a socket that reported
+    // end of stream while this connect was in flight: there is nothing more to
+    // take from it, and a read armed there completes res=0 immediately.
     if (!conn->closing && !conn->read_pending && !conn->splice_active &&
+        !conn->client_eof &&
         SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->fd, conn, m_recv_multishot,
                                            m_use_provided_bufs, BUF_GROUP_ID)))
     {
@@ -7983,6 +8810,14 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         close_pair(conn->fd, bfd);
         return;
     }
+
+    // A TCP client that half-closed while this connect was in flight: its
+    // payload has just been queued above, so the FIN goes out behind it — from
+    // handle_backend_write when that queue drains, or from here if there was
+    // nothing to queue at all.  See forward_client_half_close on why it cannot
+    // simply be a shutdown() on the next line, which is what the paragraph
+    // below is about.
+    forward_client_half_close(conn);
 
     // The client had already half-closed while this connect was in flight, and
     // its payload has just been queued for the backend above.  What used to
@@ -8052,7 +8887,11 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     // still running for it is work nobody will ever collect.
     SKL_TRACE_LOG("client-abort cfd=%d revents=0x%x connect_pending=%d clients=%u",
                   client_fd, revents, (int)conn->connect_pending, (unsigned)m_client_count);
-    close_pair(client_fd, conn->backend_fd);
+    // force: POLLERR/POLLHUP on the client means the peer is gone.  Whatever
+    // answer is owed cannot be delivered to a socket in that state, so holding
+    // would keep the pair — and its descriptors — for a reply nobody will read.
+    // This is the 1484 connections the gate held on its first run.
+    close_pair(client_fd, conn->backend_fd, close_reason::force);
 }
 
 void proxy_instance::arm_response_deadline(proxy_client_connection* conn)
@@ -8436,11 +9275,25 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     if (conn->closing)
         return false;
 
-    // Only retry idempotent methods unless retry_all is set
+    // Only retry idempotent methods unless retry_all is set.
+    //
+    // OPTIONS belongs in this list and was missing from it.  The man page has
+    // named it as one of the retried methods for as long as --retry has been
+    // documented — "Only idempotent HTTP methods (GET, HEAD, PUT, DELETE,
+    // OPTIONS) are retried" — and RFC 7231 §4.2.2 agrees, so the code was the
+    // half that was wrong: a backend that died mid-exchange answered an OPTIONS
+    // with 502 while the identical GET beside it was retried and served.
+    //
+    // Safe by the same test as the other four, which is the only test that
+    // matters here: replaying it cannot change anything at the backend.  POST
+    // and PATCH stay out, and TRACE is left out too — it is idempotent, but
+    // nothing in this tree has ever claimed to retry it and adding it would be
+    // a behaviour change nobody asked for rather than a contract being kept.
     if (!m_mesh.retry_all)
     {
         if (conn->method != "GET" && conn->method != "HEAD" &&
-            conn->method != "PUT" && conn->method != "DELETE")
+            conn->method != "PUT" && conn->method != "DELETE" &&
+            conn->method != "OPTIONS")
             return false;
     }
 
@@ -8667,7 +9520,11 @@ bool proxy_instance::lua_close_client(int client_fd)
     if (ce.side != conn_client) return false;
     auto* conn = ce.client;
     if (conn->closing) return false;
-    close_pair(client_fd, conn->backend_fd);
+    // force: the script asked for this connection to be closed.  That is an
+    // instruction and not an error condition, and self.close_client() promising
+    // to close is the whole of its contract — a hold would make it silently
+    // mean "close later, if the exchange happens to finish".
+    close_pair(client_fd, conn->backend_fd, close_reason::force);
     return true;
 }
 
@@ -9836,17 +10693,35 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& se = m_conn_idx[conn->client_fd];
-        if (se.side == conn_client && se.client->splice_active && conn->splice_active)
+        if (se.side == conn_client && se.client->splice_active && conn->splice_active &&
+            !se.client->client_eof)
             start_splice_forwarding(se.client, conn);
     }
 
+    // The client's half-close, held back for exactly the same reason and let go
+    // at exactly the same moment: the last of what it sent has now reached this
+    // socket, so the FIN that terminates it can no longer overtake anything.
+    if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& he = m_conn_idx[conn->client_fd];
+        if (he.side == conn_client && he.client->backend_fd == conn->fd)
+            forward_client_half_close(he.client);
+    }
+
     // Backpressure resume: if write queue drained below threshold, restart client reads
+    //
+    // Never onto a socket that has already reported end of stream.  A read armed
+    // there completes res=0 at once and comes straight back to the EOF branch of
+    // handle_client_read, which is the loop that branch documents in full — and
+    // on the HTTP side, where the hold has existed all along, this resume was
+    // the one path that could re-arm it.
     if (conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes &&
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];
         if (ce.side == conn_client && !ce.client->read_pending &&
-            !ce.client->closing && !ce.client->splice_active)
+            !ce.client->closing && !ce.client->splice_active &&
+            !ce.client->client_eof)
         {
             if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->client_fd, ce.client,
                                                    m_recv_multishot, m_use_provided_bufs,

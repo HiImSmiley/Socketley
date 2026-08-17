@@ -24,7 +24,23 @@ NC='\033[0m' # No Color
 
 # Clear screen and show header
 show_header() {
-    clear
+    # ─── Clearing the screen is cosmetic and must not be fatal ──────────────
+    #
+    # This script runs under `set -e`, and `clear` fails on a TERM the machine's
+    # terminfo database does not carry — which is the ordinary case for anyone
+    # on kitty, whose xterm-kitty entry ships with the terminal rather than with
+    # ncurses.  So the failure took the whole help with it: measured,
+    #
+    #     $ socketley --help          # on a terminal, TERM=xterm-kitty
+    #     'xterm-kitty': unknown terminal type.
+    #     $ echo $?
+    #     1
+    #
+    # One line of diagnostics for a command that cannot be misused, exit 1 for a
+    # request that was not bad input, and no help at all.  Piping it into
+    # anything hid the problem — with no tty the interactive path is never
+    # entered — so it only ever appeared for the person reading it.
+    clear 2>/dev/null || true
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
     echo "║                                                                               ║"
@@ -40,6 +56,19 @@ show_header() {
     echo "╚═══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
+
+# ─── EOF at a prompt is a person leaving, not a failure ─────────────────────
+#
+# Under `set -e` a `read` that reaches EOF ends the script, and the CLI hands
+# the shell that status — so `--help` on a terminal exited 1 the moment stdin
+# closed, which is what pressing Ctrl-D at the menu does.  Exit 1 is this
+# project's code for bad input, and asking for help is not bad input.  The pipe
+# case was already answered by plain_help() below; this is the same wrong answer
+# on the other side of the same test.
+#
+# Two contracts, and they differ.  A "Press Enter" pause is cosmetic: EOF means
+# carry on.  A menu prompt is the whole interaction: EOF means quit, which is
+# what `q` does, and continuing the loop with no input would spin.
 
 # Show main menu
 main_menu() {
@@ -58,7 +87,7 @@ main_menu() {
     echo ""
     echo -e "  ${RED}q)${NC} Quit"
     echo ""
-    read -p "Enter choice: " choice
+    read -p "Enter choice: " choice || exit 0
     case $choice in
         1) quick_start ;;
         2) cli_commands ;;
@@ -107,7 +136,7 @@ quick_start() {
     echo -e "  ${CYAN}socketley remove myserver myclient${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -145,12 +174,16 @@ cli_commands() {
     echo -e "  ${CYAN}socketley create server api -p 9000 -s${NC}"
     echo ""
 
-    echo -e "${BOLD}attach <type> <name> <port> [--owner <name>]${NC}"
+    echo -e "${BOLD}attach <type> <name> <port> [--owner <name>] [--pid <pid>]${NC}"
     echo "  Register an external process as a runtime visible in ls/ps."
     echo "  The daemon does NOT bind the port or manage I/O — the external"
     echo "  process owns its connections. Useful for SDK-embedded runtimes."
+    echo "  --pid names the process behind it: 'stop' then sends it SIGTERM."
+    echo "  The pid must be one you own; the daemon will not signal another"
+    echo "  user's process on your behalf."
     echo -e "  ${CYAN}socketley attach server my-app 8080${NC}"
     echo -e "  ${CYAN}socketley attach server my-app 8080 --owner api${NC}"
+    echo -e "  ${CYAN}socketley attach server my-app 8080 --pid \$!${NC}"
     echo ""
 
     echo -e "${BOLD}add <path> [--name <name>] [-s]${NC}"
@@ -332,7 +365,7 @@ cli_commands() {
     echo -e "  ${CYAN}/api/runtime/<name>${NC}    # single runtime details"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -433,7 +466,7 @@ runtime_types() {
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -461,6 +494,9 @@ flags_options() {
     echo "│ --global-rate-limit│ Messages/sec across all connections   │"
     echo "│ --idle-timeout <s>│ Close idle connections after N seconds │"
     echo "│ --drain          │ Graceful shutdown (flush pending writes)│"
+    echo "│                  │ The three above are NOT accepted on a   │"
+    echo "│                  │ client: it accepts no connections, so   │"
+    echo "│                  │ there is nothing to limit or time out.  │"
     echo "│ --cpus <set>     │ CPUs for this runtime's I/O:            │"
     echo "│                  │ max | 0-3 | 0,1,2,3   (default max)     │"
     echo "│ --sqpoll         │ io_uring submission poller: one kernel  │"
@@ -553,6 +589,8 @@ flags_options() {
     echo "│ --strategy <strategy>    │ round-robin, random, lua              │"
     echo "│ --protocol <protocol>    │ http (default), tcp                   │"
     echo "│                          │ http relays ws:// upgrades verbatim   │"
+    echo "│                          │ tcp passes a client half-close on to  │"
+    echo "│                          │ the backend, holds the reply open     │"
     echo "├──────────────────────────┼───────────────────────────────────────┤"
     echo "│ Service Mesh / Sidecar:  │                                       │"
     echo "│ --health-check [tcp|http]│ Enable backend health checks          │"
@@ -758,7 +796,7 @@ flags_options() {
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -1096,6 +1134,20 @@ lua_config() {
     echo "  socketley.json_encode(value)               - Lua value -> JSON string"
     echo "  socketley.json_decode(str)                 - JSON string -> Lua value"
     echo ""
+    echo "  json_decode also refuses input that is not a complete document, and"
+    echo "  trailing data after it.  '[1,2' - a body cut short - used to decode"
+    echo "  to an ordinary two-element table, so a handler could not tell it"
+    echo "  from a whole one.  json_encode sorts object keys, so equal data"
+    echo "  always encodes to the same string (ETags, cache keys, signatures)."
+    echo ""
+    echo "  Both answer false + a reason instead of a value when they cannot"
+    echo "  finish: a table that contains itself, or nesting deeper than 128"
+    echo "  levels on either side.  Test it with 'if not s then' - a string is"
+    echo "  truthy and false is not, so the success path reads unchanged."
+    echo ""
+    echo "  The depth limit matters most on decode: that call is meant for data"
+    echo "  off the network, so the nesting is chosen by whoever sent it."
+    echo ""
     echo -e "${BOLD}Module Loading:${NC}"
     echo "  require() resolves modules relative to the script's directory."
     echo "  e.g. require(\"utils\") loads utils.lua from the same directory."
@@ -1139,7 +1191,7 @@ lua_config() {
     echo "                   load rather than silently run at another rate."
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -1169,7 +1221,7 @@ examples_menu() {
     echo ""
     echo -e "  ${RED}b)${NC} Back to main menu"
     echo ""
-    read -p "Enter choice: " choice
+    read -p "Enter choice: " choice || exit 0
     case $choice in
         1) example_basic_server ;;
         2) example_server_client ;;
@@ -1208,7 +1260,7 @@ example_basic_server() {
     echo "socketley stop myserver"
     echo -e "socketley remove myserver${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1228,7 +1280,7 @@ example_server_client() {
     echo "socketley stop cli api"
     echo -e "socketley remove cli api${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1255,7 +1307,7 @@ example_http_proxy() {
     echo "socketley stop gateway backend"
     echo -e "socketley remove gateway backend${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1279,7 +1331,7 @@ example_load_balancer() {
     echo "socketley stop lb api1 api2 api3"
     echo -e "socketley remove lb api1 api2 api3${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1298,7 +1350,7 @@ example_persistent_cache() {
     echo "socketley remove store"
     echo -e "rm /tmp/cache.bin${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1336,7 +1388,7 @@ example_lua_config() {
     echo "  Put on_start in config.lua instead and it is never loaded and never"
     echo "  called: the CLI reads only 'daemon' and 'runtimes', then exits."
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1357,7 +1409,7 @@ example_udp_server() {
     echo "socketley stop metrics udpcli"
     echo -e "socketley remove metrics udpcli${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1382,7 +1434,7 @@ example_pubsub() {
     echo "socketley stop store"
     echo -e "socketley remove store${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1408,7 +1460,7 @@ example_resp() {
     echo "socketley stop myredis auto"
     echo -e "socketley remove myredis auto${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1435,7 +1487,7 @@ example_replication() {
     echo "socketley stop follower leader"
     echo -e "socketley remove follower leader${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1470,7 +1522,7 @@ example_stats_reload() {
     echo "#   max_memory:268435456"
     echo -e "#   eviction:allkeys-lru${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1499,7 +1551,7 @@ example_interactive() {
     echo "# Type messages to send to server"
     echo -e "# Received messages from server appear on stdout${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1535,7 +1587,7 @@ example_master_mode() {
     echo "socketley stop broadcast"
     echo -e "socketley remove broadcast${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1564,7 +1616,7 @@ example_websocket() {
     echo "socketley stop ws"
     echo -e "socketley remove ws${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1614,7 +1666,7 @@ example_cache_access() {
     echo "socketley stop api db"
     echo -e "socketley remove api db${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1646,7 +1698,7 @@ example_upstream_hub() {
     echo "socketley stop hub"
     echo -e "socketley remove hub${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1685,7 +1737,7 @@ example_lua_http_worker() {
     echo "socketley stop api"
     echo -e "socketley remove api${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1717,7 +1769,7 @@ example_dashboard() {
     echo "curl http://localhost:9100/api/runtime/api"
     echo -e "# => {\"name\":\"api\", \"connections\":42, \"bytes_in\":..., ...}${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1769,7 +1821,7 @@ example_sidecar() {
     echo "socketley stop svc"
     echo -e "socketley remove svc${NC}"
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     examples_menu
 }
 
@@ -1860,8 +1912,34 @@ architecture() {
     echo "    SOCKETLEY_CPUS would have chosen. Only needed for the arrangement"
     echo "    SOCKETLEY_CPUS cannot express: a poller outside its loop's set."
     echo ""
+    echo -e "  ${CYAN}SOCKETLEY_PROXY_SPLICE${NC}        unset (off)"
+    echo "    Forward --protocol tcp traffic with splice(2) instead of copying"
+    echo "    it through userspace. Off because it is slower here, and not by a"
+    echo "    little: IORING_OP_SPLICE is FORCE_ASYNC in the kernel, so every"
+    echo "    splice costs an io-wq worker hand-off that no way of submitting it"
+    echo "    avoids. Measured round-trip p50, one connection: 47.9us spliced"
+    echo "    against 26.3us copied at 128 B, and 394.5 against 350.5 at 256 KB,"
+    echo "    at 0.86 CPU cores against 0.53 - 2.9x the CPU per request."
+    echo "    Kept for the case nobody has measured — bulk streaming across a"
+    echo "    real NIC, where zero copy could still pay. Never used on a TLS leg"
+    echo "    or with an on_proxy_request/on_proxy_response hook."
+    echo ""
+    echo -e "  ${CYAN}SOCKETLEY_SEND_ZC${NC}             unset (off)"
+    echo "    Send a single response of 512 KB or more with IORING_OP_SEND_ZC"
+    echo "    instead of copying it. Off because the peer releases it, not us:"
+    echo "    the kernel posts the notification that frees the buffer only once"
+    echo "    the socket's write queue drains, and a client that stops reading"
+    echo "    never lets that happen. Measured with a 544 KB send to a receiver"
+    echo "    that does not read: no notification after 300 rounds of ring"
+    echo "    activity, none after closing the sender's own descriptor, one"
+    echo "    immediately on the receiver reading. Unlike a write, it cannot be"
+    echo "    cancelled - a notification is not a request. While it is on, one"
+    echo "    client that declines to read pins a stopped runtime's whole"
+    echo "    storage indefinitely. Turn on only where readers are known to"
+    echo "    drain. Server, cache and proxy write paths alike."
+    echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -1910,7 +1988,7 @@ troubleshooting() {
     echo -e "  ${CYAN}tail -f /tmp/api.log${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -2020,7 +2098,7 @@ installation_help() {
     echo -e "  ${CYAN}sudo bash packaging/uninstall.sh${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     main_menu
 }
 
@@ -2041,7 +2119,7 @@ sdk_help() {
     echo ""
     echo -e "  ${RED}b)${NC} Back"
     echo ""
-    read -p "Enter choice: " choice
+    read -p "Enter choice: " choice || exit 0
     case $choice in
         1) sdk_overview ;;
         2) sdk_tier1 ;;
@@ -2098,7 +2176,7 @@ sdk_overview() {
     echo -e "  ${CYAN}sdk/examples/standalone_server_lua.cpp${NC} — Tier 2 with Lua"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 
@@ -2213,7 +2291,7 @@ sdk_tier1() {
     echo -e "  ${CYAN}socketley::ctl::command(\"stop api_*\");${NC}      // stop all"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 
@@ -2360,7 +2438,7 @@ sdk_tier2() {
     echo -e "  ${CYAN}srv->set_port(9000); srv->set_cache_name(\"store\");${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 
@@ -2406,7 +2484,7 @@ sdk_tier3() {
     echo -e "  ${CYAN}}${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 
@@ -2451,7 +2529,7 @@ sdk_mixed() {
     echo -e "  ${CYAN}echo 'set k v' | nc -q1 127.0.0.1 6379${NC}  — talk to embedded cache"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 
@@ -2495,7 +2573,7 @@ sdk_cross() {
     echo -e "  g++ -std=c++17 -I include/windows app.cpp -o app${NC}"
     echo ""
 
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." || true
     sdk_help
 }
 

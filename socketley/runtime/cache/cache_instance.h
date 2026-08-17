@@ -236,6 +236,13 @@ public:
     // runs inside a completion the channel owns, so nothing here is on anybody
     // else's message path.  See shared/request_channel.h.
     void serve_request(std::string_view payload, std::string& out) override;
+    // The same interpreter over a payload that is exactly one command, newlines
+    // included.  A replication frame is framed BECAUSE the command contains a
+    // newline, so running it through the line splitter would apply half of it —
+    // which is the truncation the framing exists to stop.
+    void serve_one_command(std::string_view line, std::string& out);
+    // Shared body of the two above; `split` picks which one it is.
+    void serve_payload(std::string_view payload, std::string& out, bool split);
     // Itself when it is here, and the daemon's override when it is not: the
     // placeholder for an out-of-process cache has an empty store, so answering
     // from it would be confidently wrong rather than merely absent.

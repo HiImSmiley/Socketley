@@ -1,4 +1,9 @@
 #include "server_instance.h"
+
+// http_whole_decimal: the checked Content-Length parser the proxy already
+// uses.  Shared rather than copied — a second implementation of "is this a
+// whole decimal" is a second place for the answer to differ.
+#include "../proxy/http_response_framing.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
@@ -487,7 +492,22 @@ bool server_instance::get_http_cache() const
     return m_http_cache_enabled;
 }
 
-void server_instance::add_upstream_target(std::string_view addr)
+// ─── AN UPSTREAM WITHOUT A USABLE PORT IS NOT AN UPSTREAM ───────────────────
+//
+// The from_chars result was discarded, so `--upstream host:abc`, `--upstream
+// host:` and any port above 65535 all left resolved_port at 0 and were stored
+// anyway.  A target that can never be connected to sat in the list looking
+// exactly like one that could, and `upstream_try_connect` discovered it at
+// traffic time — the same shape as the proxy's backend, one runtime over.
+//
+// The address with no colon at all is a different thing and stays: it is the
+// documented spelling for a target whose port comes from elsewhere, and it has
+// always stored 0 deliberately.  Only an address that ASKED for a port and gave
+// an unusable one is refused.
+//
+// Returns false without storing anything, so a caller that can refuse has a
+// list it did not half-fill.
+bool server_instance::add_upstream_target(std::string_view addr)
 {
     upstream_target t;
     t.address = std::string(addr);
@@ -496,7 +516,11 @@ void server_instance::add_upstream_target(std::string_view addr)
     {
         t.resolved_host = std::string(addr.substr(0, colon));
         auto port_sv = addr.substr(colon + 1);
-        std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), t.resolved_port);
+        const auto [ptr, ec] = std::from_chars(
+            port_sv.data(), port_sv.data() + port_sv.size(), t.resolved_port);
+        if (ec != std::errc{} || ptr != port_sv.data() + port_sv.size() ||
+            t.resolved_port == 0)
+            return false;
     }
     else
     {
@@ -504,6 +528,7 @@ void server_instance::add_upstream_target(std::string_view addr)
         t.resolved_port = 0;
     }
     m_upstream_targets.push_back(std::move(t));
+    return true;
 }
 
 void server_instance::clear_upstream_targets()
@@ -1334,7 +1359,12 @@ bool server_instance::setup(event_loop& loop)
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    m_send_zc = loop.send_zc_supported();
+    // Not send_zc_supported(): the kernel having the opcode is not the
+    // question.  A pending zero-copy notification is not a cancellable request
+    // and only the peer can release it, so it would hold this instance in
+    // retire()'s graveyard for as long as one client declines to read.  See
+    // event_loop::send_zc_enabled().
+    m_send_zc = loop.send_zc_enabled();
 
     // Use multishot accept if supported (kernel 5.19+)
     // Note: direct-descriptor accept (kernel 6.0+) is NOT used because
@@ -2897,8 +2927,37 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                     std::string_view value = line.substr(vs);
                     hreq.headers.emplace_back(name, value);
 
+                    // ─── Checked, and a bad one ends the request ─────────
+                    //
+                    // The result was discarded, so a Content-Length that is not
+                    // a whole decimal left this at 0 and the body was treated
+                    // as empty — with everything after it read as the NEXT
+                    // request on the same keep-alive connection.  The two ways
+                    // in are a value with a non-digit in it, which from_chars
+                    // stops at, and one large enough to overflow, which it
+                    // refuses outright:
+                    //
+                    //     Content-Length: abc                     -> 0
+                    //     Content-Length: 99999999999999999999    -> 0
+                    //
+                    // There is no second framing party here the way there is in
+                    // the proxy, so this is not request smuggling — but the
+                    // boundaries between pipelined requests move, which is the
+                    // same class of defect one runtime along and is what
+                    // http_whole_decimal was written for.  The proxy has used
+                    // it for exactly this since it was added; the server was
+                    // still on the bare call.
                     if (fnv1a_lower(name) == fnv1a("content-length"))
-                        std::from_chars(value.data(), value.data() + value.size(), content_length);
+                    {
+                        if (!http_whole_decimal(value, content_length))
+                        {
+                            // Nothing about the rest of this connection can be
+                            // framed once the length is unreadable, so it goes
+                            // rather than being guessed at.
+                            conn->closing = true;
+                            return;
+                        }
+                    }
                 }
                 line_start = line_end + 2;
             }

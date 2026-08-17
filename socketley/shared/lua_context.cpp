@@ -1,4 +1,5 @@
 #include "lua_context.h"
+#include "lua_json.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -1944,315 +1945,12 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     return result;
 }
 
-// ─── JSON encode/decode for Lua ───────────────────────────────────────────────
+// The JSON pair lives in lua_json.h now — see the header for why it had to
+// leave this file (it was unreachable from any test).
+using socketley::lua_json::json_encode_value;
+using socketley::lua_json::json_decode_value;
+using socketley::lua_json::json_max_depth;
 
-static void json_encode_value(std::string& out, const sol::object& val);
-
-static void json_encode_string(std::string& out, const std::string& s)
-{
-    out += '"';
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char hex[8];
-                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
-                    out += hex;
-                }
-                else
-                    out += c;
-        }
-    }
-    out += '"';
-}
-
-static bool is_array_table(const sol::table& t)
-{
-    int expected = 1;
-    for (const auto& kv : t)
-    {
-        if (kv.first.get_type() != sol::type::number)
-            return false;
-        double d = kv.first.as<double>();
-        if (d != expected)
-            return false;
-        ++expected;
-    }
-    return expected > 1;
-}
-
-static void json_encode_value(std::string& out, const sol::object& val)
-{
-    switch (val.get_type())
-    {
-        case sol::type::nil:
-        case sol::type::none:
-            out += "null";
-            break;
-        case sol::type::boolean:
-            out += val.as<bool>() ? "true" : "false";
-            break;
-        case sol::type::number:
-        {
-            double d = val.as<double>();
-            auto i = static_cast<int64_t>(d);
-            if (d == i && d >= -1e15 && d <= 1e15)
-            {
-                char buf[24];
-                auto r = std::to_chars(buf, buf + sizeof(buf), i);
-                out.append(buf, static_cast<size_t>(r.ptr - buf));
-            }
-            else
-            {
-                char buf[32];
-                int n = snprintf(buf, sizeof(buf), "%.14g", d);
-                out.append(buf, static_cast<size_t>(n));
-            }
-            break;
-        }
-        case sol::type::string:
-            json_encode_string(out, val.as<std::string>());
-            break;
-        case sol::type::table:
-        {
-            sol::table t = val.as<sol::table>();
-            if (is_array_table(t))
-            {
-                out += '[';
-                bool first = true;
-                for (const auto& kv : t)
-                {
-                    if (!first) out += ',';
-                    first = false;
-                    json_encode_value(out, kv.second);
-                }
-                out += ']';
-            }
-            else
-            {
-                out += '{';
-                bool first = true;
-                for (const auto& kv : t)
-                {
-                    if (!first) out += ',';
-                    first = false;
-
-                    // ─── The key is not necessarily a string ────────────────
-                    //
-                    // This branch takes every table that is not a dense array,
-                    // and the commonest of those is a SPARSE one — {[1]=1,
-                    // [3]=3} — whose keys are numbers.  `as<std::string>()` on
-                    // a number was two bugs at once.
-                    //
-                    // sol2's safety checks follow NDEBUG, so they are off in
-                    // Release and on in every Debug and Sanitize build.  With
-                    // them on, this does not convert: it throws, the throw
-                    // leaves through sol2's handler as "[sol2] An exception
-                    // occurred: caught (...) exception", and the callback that
-                    // called json_encode never returns.  Measured, one script
-                    // encoding {[1]=1,[3]=3} and replying with the result:
-                    //
-                    //     Release   ->  j={"3":3,"1":1}
-                    //     Sanitize  ->  (no reply at all; connection times out)
-                    //
-                    // With them off it is worse than an error.  as<std::string>
-                    // on a number is lua_tolstring, which does not read the
-                    // value — it REPLACES it, in the table, in the middle of a
-                    // lua_next traversal.  The Lua manual forbids exactly that:
-                    // modifying a key during traversal is undefined, and the
-                    // Release build has been doing it on every sparse table.
-                    //
-                    // So the key is formatted here and the table is not
-                    // touched.  A JSON object's keys are strings, so a
-                    // non-string key is rendered and then quoted, which is the
-                    // same text Release produced by coercion.
-                    if (kv.first.get_type() == sol::type::string)
-                    {
-                        json_encode_string(out, kv.first.as<std::string>());
-                    }
-                    else
-                    {
-                        std::string key_text;
-                        json_encode_value(key_text, kv.first);
-                        json_encode_string(out, key_text);
-                    }
-
-                    out += ':';
-                    json_encode_value(out, kv.second);
-                }
-                out += '}';
-            }
-            break;
-        }
-        default:
-            out += "null";
-            break;
-    }
-}
-
-static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end);
-
-static void json_skip_ws(const char*& p, const char* end)
-{
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-        ++p;
-}
-
-static std::string json_decode_string(const char*& p, const char* end)
-{
-    if (p >= end || *p != '"') return {};
-    ++p;
-    std::string result;
-    while (p < end && *p != '"')
-    {
-        if (*p == '\\' && p + 1 < end)
-        {
-            ++p;
-            switch (*p)
-            {
-                case '"':  result += '"';  break;
-                case '\\': result += '\\'; break;
-                case '/':  result += '/';  break;
-                case 'n':  result += '\n'; break;
-                case 'r':  result += '\r'; break;
-                case 't':  result += '\t'; break;
-                case 'b':  result += '\b'; break;
-                case 'f':  result += '\f'; break;
-                case 'u':
-                {
-                    if (p + 4 < end)
-                    {
-                        unsigned cp = 0;
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            ++p;
-                            cp <<= 4;
-                            if (*p >= '0' && *p <= '9')      cp |= static_cast<unsigned>(*p - '0');
-                            else if (*p >= 'a' && *p <= 'f') cp |= static_cast<unsigned>(*p - 'a' + 10);
-                            else if (*p >= 'A' && *p <= 'F') cp |= static_cast<unsigned>(*p - 'A' + 10);
-                        }
-                        if (cp < 0x80)
-                            result += static_cast<char>(cp);
-                        else if (cp < 0x800)
-                        {
-                            result += static_cast<char>(0xC0 | (cp >> 6));
-                            result += static_cast<char>(0x80 | (cp & 0x3F));
-                        }
-                        else
-                        {
-                            result += static_cast<char>(0xE0 | (cp >> 12));
-                            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                            result += static_cast<char>(0x80 | (cp & 0x3F));
-                        }
-                    }
-                    break;
-                }
-                default: result += *p; break;
-            }
-        }
-        else
-            result += *p;
-        ++p;
-    }
-    if (p < end) ++p;
-    return result;
-}
-
-static sol::object json_decode_value(sol::state& lua, const char*& p, const char* end)
-{
-    json_skip_ws(p, end);
-    if (p >= end) return sol::nil;
-
-    switch (*p)
-    {
-        case '"':
-            return sol::make_object(lua, json_decode_string(p, end));
-        case '{':
-        {
-            ++p;
-            sol::table t = lua.create_table();
-            json_skip_ws(p, end);
-            if (p < end && *p == '}') { ++p; return t; }
-            while (p < end)
-            {
-                json_skip_ws(p, end);
-                auto key = json_decode_string(p, end);
-                json_skip_ws(p, end);
-                if (p < end && *p == ':') ++p;
-                auto val = json_decode_value(lua, p, end);
-                t[key] = val;
-                json_skip_ws(p, end);
-                if (p < end && *p == ',') ++p;
-                else break;
-            }
-            if (p < end && *p == '}') ++p;
-            return t;
-        }
-        case '[':
-        {
-            ++p;
-            sol::table t = lua.create_table();
-            json_skip_ws(p, end);
-            if (p < end && *p == ']') { ++p; return t; }
-            int idx = 1;
-            while (p < end)
-            {
-                t[idx++] = json_decode_value(lua, p, end);
-                json_skip_ws(p, end);
-                if (p < end && *p == ',') ++p;
-                else break;
-            }
-            if (p < end && *p == ']') ++p;
-            return t;
-        }
-        case 't':
-            if (end - p >= 4 && p[1] == 'r' && p[2] == 'u' && p[3] == 'e')
-            { p += 4; return sol::make_object(lua, true); }
-            return sol::nil;
-        case 'f':
-            if (end - p >= 5 && p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e')
-            { p += 5; return sol::make_object(lua, false); }
-            return sol::nil;
-        case 'n':
-            if (end - p >= 4 && p[1] == 'u' && p[2] == 'l' && p[3] == 'l')
-            { p += 4; return sol::nil; }
-            return sol::nil;
-        default:
-        {
-            const char* start = p;
-            if (*p == '-') ++p;
-            while (p < end && *p >= '0' && *p <= '9') ++p;
-            bool is_float = false;
-            if (p < end && *p == '.')
-            { is_float = true; ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
-            if (p < end && (*p == 'e' || *p == 'E'))
-            { is_float = true; ++p; if (p < end && (*p == '+' || *p == '-')) ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
-            if (p == start) return sol::nil;
-
-            if (is_float)
-            {
-                std::string num_str(start, static_cast<size_t>(p - start));
-                double d = 0;
-                try { d = std::stod(num_str); } catch (...) {}
-                return sol::make_object(lua, d);
-            }
-            else
-            {
-                int64_t n = 0;
-                std::from_chars(start, p, n);
-                return sol::make_object(lua, static_cast<double>(n));
-            }
-        }
-    }
-}
 
 namespace
 {
@@ -3294,19 +2992,64 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.clear_interval(id) — cancel a repeating interval
     sk["clear_interval"] = cancel_timer_by_id;
 
-    // socketley.json_encode(value) → JSON string
-    sk["json_encode"] = [](sol::object val) -> std::string {
+    // socketley.json_encode(value) → JSON string, or false + why
+    //
+    // The refusal follows this file's return contract rather than raising: a
+    // string is truthy and false is not, so `local s = socketley.json_encode(t)`
+    // reads the same, and `if not s then` is how the two callers that care
+    // already test everything else here.  Both refusals used to be a crash of
+    // the whole daemon — see json_max_depth.
+    sk["json_encode"] = [](sol::this_state L, sol::object val)
+                        -> sol::variadic_results {
         std::string out;
         out.reserve(256);
-        json_encode_value(out, val);
-        return out;
+        std::vector<const void*> path;
+        std::string err;
+        if (!json_encode_value(out, val, 0, path, err))
+            return api_why(L, "socketley.json_encode(): " + err);
+
+        sol::variadic_results r;
+        r.push_back({ L, sol::in_place_type<std::string>, std::move(out) });
+        return r;
     };
 
-    // socketley.json_decode(str) → Lua value
-    sk["json_decode"] = [this](std::string str) -> sol::object {
+    // socketley.json_decode(str) → Lua value, or false + why
+    //
+    // The depth refusal is the one that matters here: this call is written to be
+    // pointed at a request body, so the nesting is chosen by whoever sent it.
+    // Answering nil would be indistinguishable from a document that really did
+    // decode to nil, which is the ambiguity this file's whole return contract
+    // exists to remove.
+    sk["json_decode"] = [this](sol::this_state L, std::string str)
+                        -> sol::variadic_results {
         const char* p = str.data();
         const char* end = p + str.size();
-        return json_decode_value(m_lua, p, end);
+        auto st = socketley::lua_json::json_status::ok;
+        sol::object v = json_decode_value(m_lua, p, end, 0, st);
+        if (st == socketley::lua_json::json_status::too_deep)
+            return api_why(L, "socketley.json_decode(): the document is nested "
+                              "deeper than " + std::to_string(json_max_depth) +
+                              " levels");
+        if (st != socketley::lua_json::json_status::ok)
+            return api_why(L, "socketley.json_decode(): not a JSON document, at "
+                              "byte " + std::to_string(
+                                  static_cast<size_t>(p - str.data())));
+
+        // Trailing bytes are a failure too, and this is where they are caught:
+        // json_decode_value stops at the end of the first complete value and
+        // says nothing about what follows.  Without this, `{"a":1} DROP TABLE`
+        // decoded to {a=1} and the rest went unmentioned — the caller cannot
+        // notice what it is never told, and a body with something appended to it
+        // is exactly the case worth noticing.
+        socketley::lua_json::json_skip_ws(p, end);
+        if (p != end)
+            return api_why(L, "socketley.json_decode(): " +
+                              std::to_string(static_cast<size_t>(end - p)) +
+                              " byte(s) of trailing data after the document");
+
+        sol::variadic_results r;
+        r.push_back({ L, std::move(v) });
+        return r;
     };
 
     // socketley.subscribe(cache_name, channel, fn) → subscription_id

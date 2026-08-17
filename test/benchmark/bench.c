@@ -94,7 +94,38 @@ struct bench_config {
     int         warmup_pct;
     int         warmup_runs;  /* whole runs executed and discarded before measuring */
     int         json;
+    /* Time-box a run instead of counting it out (-d).  num_ops becomes an upper
+     * bound and the measured window is duration_ms wide, whatever rate the
+     * server turns out to have.
+     *
+     * This exists because the count-based form set the window from a guess.
+     * `proxy concurrent 8 200` is 1600 round trips, which on this machine is
+     * eighteen milliseconds — short enough that one scheduling delay is the
+     * whole measurement.  Repeated seven times it spanned 3.2x; the same case at
+     * 128000 round trips spanned 1.29x.  A guess that was right when it was
+     * written also stops being right the moment the thing under test gets
+     * faster, and nothing announces that.
+     *
+     * It also squares the finish line for the threaded tests.  With a count
+     * each thread stops when it personally is done, so the tail of the window
+     * has fewer connections in flight than the head, and the elapsed time
+     * charged to every thread is the slowest one's.  A deadline stops them all
+     * within one round trip of each other. */
+    int         duration_ms;
+    /* Runs executed and thrown away before the measured ones.  The first run
+     * against a freshly started process pays for its page faults, its accept
+     * path and its allocator; folding that into a median is how a harness
+     * reports a slower number for a faster program. */
+    /* Request target for the HTTP tests (-u).  Both proxies are pointed at the
+     * same one, so it has to be a path the shared backend really serves: a 404
+     * is cheaper to produce than a file and would be measured as if it were a
+     * file. */
+    const char *path;
 };
+
+/* Deadline for the current run, or 0 when the run is counted out rather than
+ * timed.  Set by run_and_report before each call; read by every worker. */
+static int64_t g_run_deadline_ns = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * B. Timing
@@ -111,6 +142,33 @@ static inline double ns_to_us(int64_t ns) { return ns / 1000.0; }
 static inline double ns_to_ms(int64_t ns) { return ns / 1000000.0; }
 static inline double ns_to_s(int64_t ns)  { return ns / 1000000000.0; }
 
+/* True once a time-boxed run's window has closed.  Costs one clock_gettime per
+ * round trip, beside a send and a recv that each cost more than that. */
+static inline int deadline_passed(void)
+{
+    return g_run_deadline_ns != 0 && time_ns() >= g_run_deadline_ns;
+}
+
+/* The loop condition for a worker that counts operations.  Both terms, in one
+ * place, because the comment on g_run_deadline_ns above says it is "read by
+ * every worker" and that was not true of any of them but one.
+ *
+ * deadline_passed() was consulted at 3 sites against 11 measurements, of which
+ * 5 are concurrent.  The concurrent ones are where it matters: with no deadline
+ * a worker runs a fixed num_ops and the run ends at pthread_join over all of
+ * them, so `elapsed` is the MAXIMUM over nc threads while the numerator is
+ * fixed at nc*num_ops.  At 100 threads on 10 cores that is a straggler
+ * measurement wearing a throughput label, and the spread of a maximum over 100
+ * samples is what the 3-5x run-to-run variance on these tests was.
+ *
+ * Writing the condition rather than the test is the point: a worker added later
+ * gets both terms by using the loop form its neighbours use, instead of having
+ * to know that a global exists. */
+static inline int bench_op_continue(int i, const struct bench_config *cfg)
+{
+    return i < cfg->num_ops && !deadline_passed();
+}
+
 struct latency_log {
     int64_t *samples;
     int      count;
@@ -119,9 +177,16 @@ struct latency_log {
 
 static void lat_init(struct latency_log *l, int cap)
 {
+    /* Clamped, because callers pass the operation count and a time-boxed run's
+     * count is an upper bound rather than an estimate: `-d 1500` with a cap of
+     * a hundred million would ask for 800 MB to hold samples for round trips
+     * that will never happen.  MAX_LATENCIES is already the number of samples
+     * the percentiles are willing to look at. */
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    if (cap < 1) cap = 1;
     l->capacity = cap;
     l->count = 0;
-    l->samples = (int64_t *)malloc(cap * sizeof(int64_t));
+    l->samples = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
 }
 
 static void lat_free(struct latency_log *l)
@@ -544,8 +609,21 @@ static char *build_mixed_pipeline(int count, const char *value, int value_len,
 
 /* Send a full pipeline buffer and drain responses (count newlines until we
  * have `expected` responses). Returns number of responses received. */
-static int pipeline_execute(int fd, const char *cmd_buf, size_t cmd_len,
-                            int expected_responses)
+/* `bounded` stops draining when a time-boxed run's window closes.
+ *
+ * It is a parameter and not a check inside, because the six callers want
+ * opposite things and the difference is not visible from here.  Three of them
+ * are measuring, and a measured drain must end with the window or the run's
+ * elapsed time is the slowest connection's rather than the window's.  The other
+ * three are PRE-POPULATING -- bench_cache_get and bench_cache_mixed fill the
+ * store before they measure reads against it -- and a fill cut short by a
+ * deadline leaves a half-populated store that the measurement afterwards then
+ * reports a throughput for.  That number would look entirely reasonable.
+ *
+ * The wrappers below carry the choice in their names, so a call site states
+ * which it is instead of passing a bare 1. */
+static int pipeline_drain(int fd, const char *cmd_buf, size_t cmd_len,
+                          int expected_responses, int bounded)
 {
     if (send_all(fd, cmd_buf, cmd_len) < 0)
         return 0;
@@ -554,11 +632,24 @@ static int pipeline_execute(int fd, const char *cmd_buf, size_t cmd_len,
     char rbuf[BUF_SIZE];
     int got = 0;
     while (got < expected_responses) {
+        if (bounded && deadline_passed()) break;
         ssize_t n = read(fd, rbuf, sizeof(rbuf));
         if (n <= 0) break;
         got += count_newlines(rbuf, n);
     }
     return got;
+}
+
+/* Setup: must complete, whatever the clock says. */
+static inline int pipeline_execute(int fd, const char *b, size_t n, int e)
+{
+    return pipeline_drain(fd, b, n, e, 0);
+}
+
+/* Measured: ends with the run's window when there is one. */
+static inline int pipeline_measure(int fd, const char *b, size_t n, int e)
+{
+    return pipeline_drain(fd, b, n, e, 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -740,11 +831,11 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
     char *rep = (char *)malloc(cfg->msg_size + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
 
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
         if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) { r.failed++; break; }
@@ -861,8 +952,11 @@ static void *server_concurrent_worker(void *arg)
      * (100 x 500 x 65B is ~32 KB per connection) fits inside socket buffers --
      * so a run could and did finish before the server had read most of it. */
     int local = 0;
+    /* bench_op_continue, so -d ends the run on the clock; the warmup count and
+     * the per-operation timestamp are what the counted phase needs.  Both sides
+     * of this were separate improvements to the same loop. */
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) break;
         if (recv_exact(fd, rep, cfg->msg_size + 1) != cfg->msg_size + 1) break;
@@ -943,7 +1037,11 @@ static struct run_result bench_server_concurrent(struct bench_config *cfg)
      * and the completeness check must see every operation that was asked for,
      * not only the counted ones. */
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    /* The counted span, not total/elapsed: the wall includes the connect storm,
+     * the barrier and the join, and that bias never averages out. */
     r.throughput = cs.rate;
     r.overlap = cs.overlap;
 
@@ -972,8 +1070,10 @@ static struct run_result bench_cache_set(struct bench_config *cfg)
     char *cmd_buf = build_set_pipeline(cfg->num_ops, value, vlen, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -1007,8 +1107,10 @@ static struct run_result bench_cache_get(struct bench_config *cfg)
     char *cmd_buf = build_get_pipeline(cfg->num_ops, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -1044,8 +1146,10 @@ static struct run_result bench_cache_mixed(struct bench_config *cfg)
     char *cmd_buf = build_mixed_pipeline(cfg->num_ops, value, 64, &cmd_len);
 
     int64_t start = time_ns();
-    r.success = pipeline_execute(fd, cmd_buf, cmd_len, cfg->num_ops);
-    r.expected = cfg->num_ops;
+    r.success = pipeline_measure(fd, cmd_buf, cmd_len, cfg->num_ops);
+    /* Timed: pipeline_measure ends the drain with the window, so a short
+     * count is the design.  Counted: the whole pipeline was owed. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
     int64_t end = time_ns();
 
     close(fd);
@@ -1099,9 +1203,12 @@ static void *cache_concurrent_worker(void *arg)
      * to take here and no warmup to skip -- the thread's whole phase is the
      * measurement.  Timing it per thread still drops the ramp before the last
      * thread gets going and the tail after the first one stops, which is what
-     * the shared window is for. */
+     * the shared window is for.
+     *
+     * pipeline_measure rather than pipeline_execute: it ends the drain with the
+     * window, which is what -d needs. */
     a->slot->t_open = time_ns();
-    a->thread_success = pipeline_execute(fd, buf, off, ops);
+    a->thread_success = pipeline_measure(fd, buf, off, ops);
     a->slot->t_close = time_ns();
     a->slot->counted = a->thread_success;
     close(fd);
@@ -1153,7 +1260,11 @@ static struct run_result bench_cache_concurrent(struct bench_config *cfg)
     free(args);
 
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    /* The counted span, not total/elapsed: the wall includes the connect storm,
+     * the barrier and the join, and that bias never averages out. */
     r.throughput = cs.rate;
     r.overlap = cs.overlap;
 
@@ -1184,18 +1295,28 @@ static struct run_result bench_proxy_tcp(struct bench_config *cfg)
     char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    /* A timed run stops at the clock, not at a count, so falling short of
+     * num_ops is the normal outcome and must not be reported as a defect. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
+    /* The warm-up has to be measured in whatever unit ends the run.  A timed
+     * run is given an operation cap, not an estimate, so "the first 10% of
+     * num_ops" is ten million round trips that never happen — and the
+     * percentiles below would come out of an empty log. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? start + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
 
     for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
         int64_t t0 = time_ns();
         if (send_all(fd, msg, msize + 1) != msize + 1) { r.failed++; break; }
         if (recv_exact(fd, rep, msize + 1) != msize + 1) { r.failed++; break; }
         int64_t t1 = time_ns();
 
         r.success++;
-        if (i >= warmup)
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup))
             lat_record(&r.latencies, t1 - t0);
     }
 
@@ -1245,6 +1366,7 @@ static void *proxy_concurrent_worker(void *arg)
     int local = 0;
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
     for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
         int64_t t0 = time_ns();
         if (send_all(fd, msg, msize + 1) != msize + 1) break;
         if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
@@ -1318,14 +1440,93 @@ static struct run_result bench_proxy_concurrent(struct bench_config *cfg)
     free(args);
 
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    /* The counted span, not total/elapsed: the wall includes the connect storm,
+     * the barrier and the join, a bias that never averages out. */
     r.throughput = cs.rate;
     r.overlap = cs.overlap;
 
     return r;
 }
 
-/* Proxy overhead: measure direct vs proxied throughput on same message pattern */
+/* ─── Proxy overhead ─────────────────────────────────────────────────────────
+ *
+ * What one proxy hop costs, as a percentage of the direct rate.
+ *
+ * The measurement is paired and interleaved, which is the whole of the repair.
+ * The version before this ran each leg exactly once, 500 round trips long — a
+ * seventeen-millisecond window — direct first and proxied second.  Over seven
+ * repetitions its direct leg alone came out anywhere between 15712 and 46364
+ * round trips a second, so the quotient of the two legs was free to land almost
+ * anywhere, and one recorded run reported an overhead of -106%.  A proxy hop
+ * cannot make a request faster than not taking it; that impossibility was the
+ * only thing that gave the number away, and a number that is merely wrong
+ * rather than impossible would have been believed.
+ *
+ * Three things are different here.  Each leg is timed rather than counted, so
+ * the window does not shrink as the code gets faster.  The legs alternate which
+ * one goes first, so whatever the first leg pays for — a cold path, a page not
+ * yet faulted — is charged to each of them equally instead of always to
+ * `direct`.  And the overhead is computed per pair and only then aggregated, so
+ * a machine that is slow for one pair slows both of its legs and leaves their
+ * ratio alone; the spread that survives that is reported next to the answer as
+ * a confidence interval.  When that interval is too wide to support the number,
+ * this says so rather than printing it.
+ */
+
+/* Half-width of the 95% confidence interval of the mean of `v`, expressed the
+ * same way `v` is.  Student's t for the small n a benchmark actually runs; the
+ * asymptotic 1.96 understates the interval at n = 5 by a third. */
+static double ci95_half_width(const double *v, int n)
+{
+    static const double t95[] = {
+        0,     0,     12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365,
+        2.306, 2.262, 2.228,  2.201, 2.179, 2.160, 2.145, 2.131, 2.120,
+        2.110, 2.101, 2.093,  2.086
+    };
+    if (n < 2) return 0;
+    double m = 0;
+    for (int i = 0; i < n; i++) m += v[i];
+    m /= n;
+    double ss = 0;
+    for (int i = 0; i < n; i++) ss += (v[i] - m) * (v[i] - m);
+    double sd = sqrt(ss / (n - 1));
+    double t  = (n <= 21) ? t95[n] : 1.96;
+    return t * sd / sqrt((double)n);
+}
+
+/* One leg: a timed round-trip loop against `port`.  Returns the rate, or 0 when
+ * the connection could not carry the whole window. */
+static double overhead_leg(struct bench_config *cfg, int port,
+                           const char *msg, char *rep, int msize, int *ops_out)
+{
+    *ops_out = 0;
+    int fd = tcp_connect(cfg->host, port);
+    if (fd < 0) return 0;
+    set_recv_timeout(fd, 2000);
+
+    int64_t window = (int64_t)cfg->duration_ms * 1000000LL;
+    int64_t start  = time_ns();
+    int64_t stop   = start + window;
+    int     success = 0;
+    int     broke   = 0;
+
+    for (int i = 0; i < cfg->num_ops; i++) {
+        if (window > 0 && time_ns() >= stop) break;
+        if (send_all(fd, msg, msize + 1) != msize + 1) { broke = 1; break; }
+        if (recv_exact(fd, rep, msize + 1) != msize + 1) { broke = 1; break; }
+        success++;
+    }
+    int64_t end = time_ns();
+    close(fd);
+
+    *ops_out = success;
+    if (broke || success == 0) return 0;
+    return success / ns_to_s(end - start);
+}
+
 static void bench_proxy_overhead(struct bench_config *cfg)
 {
     int msize = cfg->msg_size > 0 ? cfg->msg_size : 128;
@@ -1335,82 +1536,356 @@ static void bench_proxy_overhead(struct bench_config *cfg)
 
     char *rep = (char *)malloc(msize + 1);
 
-    /* Both legs, same loop: the only difference between them is the port, and
-     * writing it once is what keeps that true.  Each request is sent and its
-     * reply read before the next goes out, so the rate is completed round trips
-     * per second and the two legs are comparable by construction.
-     *
-     * They were not.  Each leg used to time a loop of sends with nothing read
-     * back, against a backend that answers nothing at all -- so neither number
-     * described serving a request, and the quotient of two such numbers could
-     * fall anywhere.  It fell at -106%: the proxied leg "beat" the direct one,
-     * which is how a measurement says it is not measuring what its name claims.
-     * Overhead cannot be negative, and that impossibility was the only reason
-     * anyone looked. */
-    double rate[2] = {0, 0};
-    int    done[2] = {0, 0};
-    const int port[2] = { cfg->port2, cfg->port };
+    /* A leg that is not timed is a leg whose window is a guess.  Without -d the
+     * count still governs, so an explicit `proxy overhead 500 <port>` behaves as
+     * it always did — but the pairing below still applies, and 500 round trips
+     * is short enough that the interval will say so. */
+    int pairs = cfg->runs > 0 ? cfg->runs : 1;
+    int warm  = cfg->warmup_runs;
 
-    for (int leg = 0; leg < 2; leg++) {
-        int fd = tcp_connect(cfg->host, port[leg]);
-        if (fd < 0) continue;
-        set_recv_timeout(fd, 2000);
+    double *ratio  = (double *)malloc((size_t)pairs * sizeof(double));
+    double *direct = (double *)malloc((size_t)pairs * sizeof(double));
+    double *proxied = (double *)malloc((size_t)pairs * sizeof(double));
+    int kept = 0, short_legs = 0;
+    int min_direct_ops = 0, min_proxied_ops = 0;
 
-        int success = 0;
-        int64_t start = time_ns();
-        for (int i = 0; i < cfg->num_ops; i++) {
-            if (send_all(fd, msg, msize + 1) != msize + 1) break;
-            if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
-            success++;
+    for (int p = -warm; p < pairs; p++) {
+        double d, x;
+        int dops = 0, xops = 0;
+        /* Alternate which leg goes first.  Whatever the first leg of a pair
+         * pays that the second does not is then charged to `direct` and
+         * `proxied` in equal numbers instead of always to the same one. */
+        if ((p & 1) == 0) {
+            d = overhead_leg(cfg, cfg->port2, msg, rep, msize, &dops);
+            x = overhead_leg(cfg, cfg->port,  msg, rep, msize, &xops);
+        } else {
+            x = overhead_leg(cfg, cfg->port,  msg, rep, msize, &xops);
+            d = overhead_leg(cfg, cfg->port2, msg, rep, msize, &dops);
         }
-        int64_t end = time_ns();
-        close(fd);
+        if (p < 0) continue;                       /* warm-up pair, discarded */
 
-        done[leg] = success;
-        if (success > 0)
-            rate[leg] = success / ns_to_s(end - start);
+        if (d <= 0 || x <= 0) { short_legs++; continue; }
+        if (kept == 0 || dops < min_direct_ops)  min_direct_ops  = dops;
+        if (kept == 0 || xops < min_proxied_ops) min_proxied_ops = xops;
+        direct[kept]  = d;
+        proxied[kept] = x;
+        ratio[kept]   = x / d;
+        kept++;
     }
 
     free(msg);
     free(rep);
 
-    /* Only when both legs actually ran the whole thing.  A leg that stopped
-     * early -- a backend that does not answer, a proxy that dropped the
-     * connection -- makes the quotient meaningless, and reporting it anyway is
-     * what produced a number nobody could act on.  The counts travel with it so
-     * a short run says so instead of hiding inside an average. */
-    int    complete     = (done[0] == cfg->num_ops && done[1] == cfg->num_ops);
-    double overhead_pct = 0;
-    if (complete && rate[0] > 0)
-        overhead_pct = (1.0 - rate[1] / rate[0]) * 100.0;
+    /* The answer, and the width of the ground it stands on.  Both come from the
+     * per-pair ratios: a pair measured while the machine was busy has both of
+     * its legs slowed and its ratio survives, which is the point of pairing. */
+    double med_ratio = 0, half = 0, overhead_pct = 0, half_pct = 0;
+    double med_direct = 0, med_proxied = 0;
+    if (kept > 0) {
+        double *tmp = (double *)malloc((size_t)kept * sizeof(double));
+        memcpy(tmp, ratio, (size_t)kept * sizeof(double));
+        med_ratio = median_double(tmp, kept);
+        memcpy(tmp, direct, (size_t)kept * sizeof(double));
+        med_direct = median_double(tmp, kept);
+        memcpy(tmp, proxied, (size_t)kept * sizeof(double));
+        med_proxied = median_double(tmp, kept);
+        free(tmp);
+        half         = ci95_half_width(ratio, kept);
+        overhead_pct = (1.0 - med_ratio) * 100.0;
+        half_pct     = half * 100.0;
+    }
+
+    /* Two ways this refuses to answer, and they are different questions.
+     * `complete` asks whether both legs ever carried a request to completion;
+     * `resolved` asks whether the pairs agreed closely enough for the number to
+     * mean anything.  A run can be complete and unresolved — that is precisely
+     * the state the old single-shot version was in every time, with nothing in
+     * its output to say so. */
+    int complete = (kept > 0 && short_legs == 0);
+    int resolved = (complete && kept >= 3 && half_pct <= 5.0);
 
     if (cfg->json) {
         json_reset();
         json_start(stdout);
         json_kv_str(stdout, "test", "proxy_overhead");
-        json_kv_int(stdout, "operations", cfg->num_ops);
-        json_kv_int(stdout, "direct_completed", done[0]);
-        json_kv_int(stdout, "proxied_completed", done[1]);
-        json_kv_dbl(stdout, "direct_msg_per_sec", rate[0]);
-        json_kv_dbl(stdout, "proxied_msg_per_sec", rate[1]);
-        if (complete)
+        json_kv_int(stdout, "pairs", kept);
+        json_kv_int(stdout, "pairs_discarded_short", short_legs);
+        json_kv_int(stdout, "duration_ms_per_leg", cfg->duration_ms);
+        json_kv_int(stdout, "direct_min_round_trips", min_direct_ops);
+        json_kv_int(stdout, "proxied_min_round_trips", min_proxied_ops);
+        json_kv_dbl(stdout, "direct_msg_per_sec", med_direct);
+        json_kv_dbl(stdout, "proxied_msg_per_sec", med_proxied);
+        json_kv_dbl(stdout, "overhead_ci95_half_width_pct", half_pct);
+        if (resolved)
             json_kv_dbl(stdout, "overhead_percent", overhead_pct);
         else
-            json_kv_str(stdout, "overhead_percent", "not measurable");
+            json_kv_str(stdout, "overhead_percent",
+                        complete ? "not resolved" : "not measurable");
+        fprintf(stdout, ",\"per_pair_ratio\":[");
+        for (int i = 0; i < kept; i++)
+            fprintf(stdout, "%s%.4f", i ? "," : "", ratio[i]);
+        fprintf(stdout, "]");
         json_end(stdout);
     } else {
-        printf("socketley-bench: proxy overhead  %s  %d ops  direct=%d  proxied=%d\n\n",
-               cfg->host, cfg->num_ops, cfg->port2, cfg->port);
-        printf("  Direct:   %12.0f msg/sec  (%d/%d round trips)\n",
-               rate[0], done[0], cfg->num_ops);
-        printf("  Proxied:  %12.0f msg/sec  (%d/%d round trips)\n",
-               rate[1], done[1], cfg->num_ops);
-        if (complete)
-            printf("  Overhead: %11.1f%%\n", overhead_pct);
-        else
-            printf("  Overhead:  not measurable — a leg did not complete\n");
+        printf("socketley-bench: proxy overhead  %s  direct=%d  proxied=%d  "
+               "%d pairs", cfg->host, cfg->port2, cfg->port, kept);
+        if (cfg->duration_ms > 0) printf("  %d ms/leg", cfg->duration_ms);
+        printf("\n\n");
+        printf("  Direct:   %12.0f round trips/sec  (median of %d)\n", med_direct, kept);
+        printf("  Proxied:  %12.0f round trips/sec  (median of %d)\n", med_proxied, kept);
+        if (resolved) {
+            printf("  Overhead: %11.1f%%  ±%.1f (95%% CI over the pairs)\n",
+                   overhead_pct, half_pct);
+        } else if (complete) {
+            printf("  Overhead:  not resolved — the pairs span ±%.1f%%, which is "
+                   "wider than the answer\n", half_pct);
+            printf("             Give it more pairs (-r) or a longer window (-d) "
+                   "before believing a figure here.\n");
+        } else {
+            printf("  Overhead:  not measurable — %d pair(s) had a leg that did "
+                   "not carry the window\n", short_legs);
+        }
     }
+
+    free(ratio);
+    free(direct);
+    free(proxied);
+
+    /* A run that could not answer is a failed run.  Silence here is what let a
+     * -106%% into a results file. */
+    if (!resolved) g_incomplete_runs++;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * J2. HTTP through a proxy
+ *
+ * The TCP path measures forwarding and nothing else, which is the narrowest
+ * slice of what a proxy does and the one where an HTTP proxy is least itself.
+ * These two tests measure the mode haproxy is written for.
+ *
+ * They come in a pair on purpose.  Keep-alive and connection-per-request are
+ * not two settings of one benchmark, they are the two halves of the thing that
+ * separates proxies: with keep-alive the connection is set up once and the
+ * proxy's per-request cost is all that is left; without it every request pays
+ * an accept, a backend connect (or a pooled one, which is exactly the
+ * difference being looked for), and a teardown.  A proxy can be good at one and
+ * ordinary at the other, and a suite that measures only the first will say so
+ * with a straight face.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Read one HTTP response and say how many bytes of it belonged to this reply.
+ *
+ * Framing is the whole difficulty of a keep-alive client.  Reading "some bytes"
+ * and calling it a response works exactly once per connection: the next reply
+ * starts inside whatever is left in the buffer, and from then on the client is
+ * counting boundaries that are no longer where it thinks they are.  A run like
+ * that still produces a number, and the number is larger than the truth.
+ *
+ * Returns 1 on a complete, well-formed response; 0 otherwise.  `carry` holds
+ * bytes already read that belong to the next response, so the caller can pass
+ * them back in.  *keep is set to 0 when the server said it is closing. */
+struct http_reader {
+    char buf[BUF_SIZE];
+    int  len;          /* bytes currently in buf */
+};
+
+static int hr_fill(struct http_reader *r, int fd)
+{
+    if (r->len >= (int)sizeof(r->buf)) return 0;   /* header larger than buffer */
+    ssize_t n = read(fd, r->buf + r->len, sizeof(r->buf) - r->len);
+    if (n <= 0) return 0;
+    r->len += (int)n;
+    return 1;
+}
+
+/* Case-insensitive search for a header value in a NUL-free byte range. */
+static const char *hdr_find(const char *h, int hlen, const char *name)
+{
+    int nlen = (int)strlen(name);
+    for (int i = 0; i + nlen <= hlen; i++) {
+        if (strncasecmp(h + i, name, nlen) == 0 &&
+            (i == 0 || h[i - 1] == '\n'))
+            return h + i + nlen;
+    }
+    return NULL;
+}
+
+static int http_read_response(struct http_reader *r, int fd, int *keep)
+{
+    int hdr_end = -1;
+    for (;;) {
+        for (int i = 0; i + 3 < r->len; i++) {
+            if (r->buf[i] == '\r' && r->buf[i + 1] == '\n' &&
+                r->buf[i + 2] == '\r' && r->buf[i + 3] == '\n') {
+                hdr_end = i + 4;
+                break;
+            }
+        }
+        if (hdr_end >= 0) break;
+        if (!hr_fill(r, fd)) return 0;
+    }
+
+    /* A status line, not merely bytes.  A proxy that closes on us delivers zero
+     * bytes, and counting that as a served request is how a broken backend
+     * turns into a throughput record. */
+    if (r->len < 7 || strncmp(r->buf, "HTTP/1.", 7) != 0) return 0;
+
+    long body = 0;
+    int  chunked = 0;
+    const char *v;
+    if ((v = hdr_find(r->buf, hdr_end, "Content-Length:")) != NULL)
+        body = strtol(v, NULL, 10);
+    else if ((v = hdr_find(r->buf, hdr_end, "Transfer-Encoding:")) != NULL &&
+             strncasecmp(v, " chunked", 8) == 0)
+        chunked = 1;
+
+    if ((v = hdr_find(r->buf, hdr_end, "Connection:")) != NULL &&
+        strncasecmp(v, " close", 6) == 0)
+        *keep = 0;
+
+    if (chunked) {
+        /* Only what a static file server actually emits is handled: the
+         * terminating zero-length chunk.  Anything else is refused rather than
+         * guessed at, because a client that mis-frames a body reports a rate
+         * for responses it never finished reading. */
+        for (;;) {
+            for (int i = 0; i + 4 < r->len; i++)
+                if (memcmp(r->buf + i, "0\r\n\r\n", 5) == 0) {
+                    int end = i + 5;
+                    memmove(r->buf, r->buf + end, r->len - end);
+                    r->len -= end;
+                    return 1;
+                }
+            if (!hr_fill(r, fd)) return 0;
+        }
+    }
+
+    /* The whole response has to fit in one buffer, headers included, because
+     * the leftover bytes after it are the start of the next one and there is
+     * nowhere else to keep them.  A body larger than BUF_SIZE therefore fails
+     * the request rather than being streamed — deliberately, because the other
+     * option is a client that loses framing on large files and reports a rate
+     * for responses it never finished reading.  Serve a smaller file; this is a
+     * proxy benchmark, not a download. */
+    long want = hdr_end + body;
+    if (want > (long)sizeof(r->buf)) return 0;
+    while (r->len < want) {
+        if (!hr_fill(r, fd)) return 0;
+    }
+    memmove(r->buf, r->buf + want, r->len - want);
+    r->len -= (int)want;
+    return 1;
+}
+
+struct http_args {
+    struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
+    const char          *request;
+    int                  req_len;
+    int                  keepalive;
+    int                  thread_success;
+    int                  thread_failed;
+};
+
+static void *http_worker(void *arg)
+{
+    struct http_args *a = (struct http_args *)arg;
+    struct bench_config *cfg = a->cfg;
+    struct http_reader r;
+    int fd = -1;
+
+    if (a->keepalive) {
+        fd = tcp_connect(cfg->host, cfg->port);
+        if (fd >= 0) { set_recv_timeout(fd, 5000); r.len = 0; }
+    }
+
+    pthread_barrier_wait(a->barrier);
+    if (a->keepalive && fd < 0) return NULL;
+
+    int local = 0;
+    for (int i = 0; i < cfg->num_ops; i++) {
+        if (deadline_passed()) break;
+
+        if (!a->keepalive) {
+            fd = tcp_connect(cfg->host, cfg->port);
+            if (fd < 0) { a->thread_failed++; break; }
+            set_recv_timeout(fd, 5000);
+            r.len = 0;
+        }
+
+        int keep = 1;
+        if (send_all(fd, a->request, a->req_len) != a->req_len) { a->thread_failed++; break; }
+        if (!http_read_response(&r, fd, &keep))                 { a->thread_failed++; break; }
+        local++;
+
+        if (!a->keepalive) {
+            close(fd); fd = -1;
+        } else if (!keep) {
+            /* The server ended the connection on a run that asked it not to.
+             * Reconnecting silently would turn a keep-alive measurement into a
+             * connection-per-request one and report it under the wrong name. */
+            close(fd); fd = -1;
+            a->thread_failed++;
+            break;
+        }
+    }
+
+    if (fd >= 0) close(fd);
+    a->thread_success = local;
+    return NULL;
+}
+
+static struct run_result bench_http(struct bench_config *cfg, int keepalive)
+{
+    struct run_result r = {0};
+    lat_init(&r.latencies, 1);
+
+    int nc = cfg->num_clients > 0 ? cfg->num_clients : 1;
+    char request[512];
+    int req_len = snprintf(request, sizeof request,
+        "GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n",
+        cfg->path ? cfg->path : "/", cfg->host,
+        keepalive ? "" : "Connection: close\r\n");
+
+    pthread_t *threads = (pthread_t *)malloc((size_t)nc * sizeof(pthread_t));
+    struct http_args *args = (struct http_args *)malloc((size_t)nc * sizeof(*args));
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
+
+    for (int i = 0; i < nc; i++) {
+        args[i].cfg = cfg;
+        args[i].barrier = &barrier;
+        args[i].request = request;
+        args[i].req_len = req_len;
+        args[i].keepalive = keepalive;
+        args[i].thread_success = 0;
+        args[i].thread_failed = 0;
+        pthread_create(&threads[i], NULL, http_worker, &args[i]);
+    }
+
+    pthread_barrier_wait(&barrier);
+    int64_t start = time_ns();
+    for (int i = 0; i < nc; i++) pthread_join(threads[i], NULL);
+    int64_t end = time_ns();
+
+    int total = 0, failed = 0;
+    for (int i = 0; i < nc; i++) { total += args[i].thread_success; failed += args[i].thread_failed; }
+
+    pthread_barrier_destroy(&barrier);
+    free(threads);
+    free(args);
+
+    r.success  = total;
+    r.failed   = failed;
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    r.throughput = total / ns_to_s(end - start);
+    return r;
+}
+
+static struct run_result bench_http_keepalive(struct bench_config *cfg)
+{ return bench_http(cfg, 1); }
+static struct run_result bench_http_close(struct bench_config *cfg)
+{ return bench_http(cfg, 0); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * K. WebSocket benchmarks
@@ -1490,11 +1965,11 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     char *rep = (char *)malloc(msize + 1);
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    r.expected = cfg->num_ops;
+    r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
 
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
 
         if (send_all(fd, frame, frame_len) < 0) { r.failed++; break; }
@@ -1543,8 +2018,11 @@ static void *ws_concurrent_worker(void *arg)
     pthread_barrier_wait(a->barrier);
 
     int local = 0;
+    /* bench_op_continue, so -d ends the run on the clock; the warmup count and
+     * the per-operation timestamp are what the counted phase needs.  Both sides
+     * of this were separate improvements to the same loop. */
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
-    for (int i = 0; i < cfg->num_ops; i++) {
+    for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         int fd = tcp_connect(cfg->host, cfg->port);
         if (fd < 0) continue;
@@ -1618,7 +2096,11 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
     free(args);
 
     r.success = total;
-    r.expected = nc * cfg->num_ops;
+    /* Timed: the clock ends the run, so a short count is the design and not a
+     * failure.  Counted: every connection owed num_ops. */
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    /* The counted span, not total/elapsed: the wall includes the connect storm,
+     * the barrier and the join, and that bias never averages out. */
     r.throughput = cs.rate;
     r.overlap = cs.overlap;
 
@@ -1687,20 +2169,33 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
     struct run_result *all_results =
         (struct run_result *)malloc(runs * sizeof(struct run_result));
 
-    /* Discarded warm-up runs.  Their results are freed, not recorded: the point
-     * is to put the system into the state the measured runs will find it in. */
+    /* Warm-up runs are executed and dropped.  The first run against a freshly
+     * started runtime pays for its page faults and its first pass through every
+     * branch; averaged in, that cost is reported as the program being slower
+     * than it is, and it lands on whichever side of a comparison happens to go
+     * first.
+     *
+     * Skipped entirely for the tests that consume a port per operation: they
+     * have no warm state to gain and would burn another run's worth of
+     * ephemeral ports ahead of the measurement. */
     int warm = consumes_a_port_per_op(category, test, metric)
                    ? 0 : cfg->warmup_runs;
     for (int i = 0; i < warm; i++) {
+        if (cfg->duration_ms > 0)
+            g_run_deadline_ns = time_ns() + (int64_t)cfg->duration_ms * 1000000LL;
         struct run_result w = fn(cfg);
         lat_free(&w.latencies);
     }
 
     for (int i = 0; i < runs; i++) {
+        /* Set per run, not once: each run gets its own full window. */
+        if (cfg->duration_ms > 0)
+            g_run_deadline_ns = time_ns() + (int64_t)cfg->duration_ms * 1000000LL;
         all_results[i] = fn(cfg);
         throughputs[i] = all_results[i].throughput;
         throughputs_mb[i] = all_results[i].throughput_mb;
     }
+    g_run_deadline_ns = 0;
 
     /* Kept before median_double sorts the array in place.
      *
@@ -1790,6 +2285,17 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
     struct latency_log *lat = &all_results[best_idx].latencies;
     lat_sort(lat);
 
+    /* The smallest difference this invocation could have told from its own
+     * noise, as a percentage of the median.  Computed from the runs as they
+     * came out, before the sort that median_double left behind. */
+    double ci_pct = 0;
+    if (runs >= 2 && med > 0) {
+        double *raw = (double *)malloc((size_t)runs * sizeof(double));
+        for (int i = 0; i < runs; i++) raw[i] = all_results[i].throughput;
+        ci_pct = 100.0 * ci95_half_width(raw, runs) / med;
+        free(raw);
+    }
+
     if (cfg->json) {
         json_reset();
         json_start(stdout);
@@ -1808,9 +2314,11 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
          * not comparable, which is the truth. */
         json_kv_str(stdout, "metric", metric_name(metric));
         json_kv_dbl(stdout, metric_rate_key(metric), med);
-        /* The median never travels without its range.  A single figure lifted
-         * out of this file reads as a measurement; these three together read as
-         * a measurement with an error bar, which is what it is. */
+        /* How much of that figure is the measurement and how much is the
+         * machine.  A median with no width beside it invites a reader to treat
+         * a 10% move between two files as a result; these say whether it can
+         * be one, from two directions: the observed spread, and the CI the run
+         * count supports. */
         if (spread > 0) {
             json_kv_dbl(stdout, "min_per_sec", lo);
             json_kv_dbl(stdout, "max_per_sec", hi);
@@ -1819,6 +2327,9 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         }
         if (all_results[best_idx].overlap > 0)
             json_kv_dbl(stdout, "thread_overlap", all_results[best_idx].overlap);
+        json_kv_int(stdout, "duration_ms", cfg->duration_ms);
+        json_kv_int(stdout, "warmup_runs", cfg->warmup_runs);
+        json_kv_dbl(stdout, "ci95_half_width_pct", ci_pct);
         if (med_mb > 0)
             json_kv_dbl(stdout, "median_MB_per_sec", med_mb);
         json_kv_int(stdout, "success", all_results[best_idx].success);
@@ -1874,6 +2385,9 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
         if (all_results[best_idx].overlap > 0)
             printf("  Threads all working for %.0f%% of the run\n",
                    all_results[best_idx].overlap * 100.0);
+        if (runs >= 2)
+            printf("  Resolves: differences above %.1f%% (95%% CI over %d runs); "
+                   "anything smaller is this machine\n", ci_pct, runs);
         /* Beside the number, every time.  A figure copied out of this output
          * carries no context with it, so the context goes next to it. */
         printf("  Measures: %s\n", metric_meaning(metric));
@@ -1913,8 +2427,16 @@ static void usage(const char *prog)
         "Options:\n"
         "  -j          JSON output\n"
         "  -r N        Number of runs (default %d)\n"
-        "  -w N        Warm-up percentage of operations per run (default %d)\n"
-        "  -W N        Whole runs executed and discarded first (default %d)\n"
+        "  -w N        Warm-up percentage of a run's operations (default %d)\n"
+        "  -d MS       Time-box each run to MS milliseconds; the operation count\n"
+        "              becomes an upper bound.  Use this rather than guessing a\n"
+        "              count: a count picked for today's speed shrinks the window\n"
+        "              as the code gets faster, and a window of a few tens of\n"
+        "              milliseconds measures the scheduler.  Worth most on the\n"
+        "              concurrent tests, where without it a run ends at the\n"
+        "              SLOWEST of its threads and the rate reported is that one's.\n"
+        "  -W N        Run and discard N runs before the measured ones\n"
+        "  -u PATH     Request target for the HTTP tests (default /)\n"
         "\n"
         "Categories and tests:\n"
         "  server conn <count>                  Connection rate\n"
@@ -1930,7 +2452,9 @@ static void usage(const char *prog)
         "\n"
         "  proxy tcp <count> [msg_size]          TCP forwarding\n"
         "  proxy concurrent <clients> <msgs>     Multi-client\n"
-        "  proxy overhead <count> <backend_port> Direct vs proxied\n"
+        "  proxy overhead <count> <backend_port> Direct vs proxied, paired (-r pairs)\n"
+        "  proxy http-keepalive <clients> <reqs> HTTP on a reused connection\n"
+        "  proxy http-close <clients> <reqs>     HTTP, one connection per request\n"
         "\n"
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
@@ -1966,10 +2490,20 @@ int main(int argc, char **argv)
             if (cfg.warmup_pct < 0) cfg.warmup_pct = 0;
             if (cfg.warmup_pct > 50) cfg.warmup_pct = 50;
             optind_local += 2;
+        } else if (strcmp(opt, "-d") == 0 && optind_local + 1 < argc) {
+            cfg.duration_ms = atoi(argv[optind_local + 1]);
+            if (cfg.duration_ms < 0) cfg.duration_ms = 0;
+            optind_local += 2;
         } else if (strcmp(opt, "-W") == 0 && optind_local + 1 < argc) {
             cfg.warmup_runs = atoi(argv[optind_local + 1]);
             if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
+            /* Upper clamp kept from the other side of this merge: -W is runs
+             * discarded before the measured ones, so a typo of 1000 is an hour
+             * of warm-up and no result. */
             if (cfg.warmup_runs > 10) cfg.warmup_runs = 10;
+            optind_local += 2;
+        } else if (strcmp(opt, "-u") == 0 && optind_local + 1 < argc) {
+            cfg.path = argv[optind_local + 1];
             optind_local += 2;
         } else if (strcmp(opt, "--help") == 0 || strcmp(opt, "-h") == 0) {
             usage(argv[0]);
@@ -2068,6 +2602,18 @@ int main(int argc, char **argv)
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.port2 = atoi(argv[pstart + 1]);
             bench_proxy_overhead(&cfg);
+        }
+        else if (strcmp(test, "http-keepalive") == 0) {
+            if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
+            run_and_report(&cfg, bench_http_keepalive, "proxy", "http-keepalive",
+                           "request/sec", METRIC_ROUND_TRIP);
+        }
+        else if (strcmp(test, "http-close") == 0) {
+            if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
+            run_and_report(&cfg, bench_http_close, "proxy", "http-close",
+                           "request/sec", METRIC_ROUND_TRIP);
         }
         else {
             fprintf(stderr, "Unknown proxy test: %s\n", test);

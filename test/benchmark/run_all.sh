@@ -134,6 +134,34 @@ run_benchmarks() {
     run_bench_script "$script_dir/bench_proxy.sh"
     restart_daemon
 
+    # The proxy's scale, the same arrangement bench_cache_resp.sh gives the
+    # cache: one shared backend, one client, and both proxies measured in
+    # interleaved pairs.  Three pairs inside the standard run: that is the
+    # fewest that yields a confidence interval at all, and the file's own output
+    # is built around printing one.  This used to be 1, which the script now
+    # refuses — a single pair produces a ratio with no error bar, which is the
+    # form the concurrent cases were unreadable in.  Raise BENCH_HAPROXY_RUNS
+    # when the numbers matter: the interval narrows as 1/sqrt(pairs), and on a
+    # ten-core box the 8-connection case needed about twenty pairs to get under
+    # 15%.  Exits cleanly when haproxy is not installed.
+    export BENCH_HAPROXY_RUNS=3
+    run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
+    unset BENCH_HAPROXY_RUNS
+    restart_daemon
+
+    # The same comparison in HTTP, which is the mode haproxy is written for and
+    # the one nothing in this suite had ever compared.  Two cases, because
+    # keep-alive and connection-per-request disagree about which proxy is
+    # faster and reporting only one of them would be picking a winner.
+    #
+    # Its own timeout: seven cases at three seconds a run is minutes, not the
+    # tens of seconds the shared BENCH_TIMEOUT_SCRIPT allows, and a benchmark
+    # killed mid-write leaves JSON that no longer parses.
+    export BENCH_HTTP_RUNS=3
+    BENCH_TIMEOUT_SCRIPT=900 run_bench_script "$script_dir/bench_proxy_http_vs_haproxy.sh"
+    unset BENCH_HTTP_RUNS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_websocket.sh"
     restart_daemon
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -89,7 +90,30 @@ public:
     // figures.
     void install_replica(const std::vector<replica_entry>& entries);
 
-    bool create(runtime_type type, std::string_view name);
+    // Declared below as a wrapper over try_create(), which p0-crashes added
+    // so a refused create can say WHY.  The old bare declaration is gone.
+    // What a runtime may be called.  Enforced by create() and rename(), which
+    // are the only two ways a name is acquired; see the definition for the four
+    // places a name has to survive.
+    static bool valid_name(std::string_view name);
+
+    // Why a create did not happen.
+    //
+    // create() answered a bare bool, and cmd_create reported every false as
+    // "runtime already exists" — measured on a daemon with NO runtimes at all:
+    //
+    //     $ socketley create server 'q"uote' -p 18722
+    //     runtime already exists: q"uote
+    //
+    // which sends the operator looking for a runtime that does not exist while
+    // the actual problem is a character in the name.
+    enum class create_result { ok, invalid_name, name_taken, internal };
+
+    create_result try_create(runtime_type type, std::string_view name);
+
+    // The old spelling, for callers that only need to know whether it worked.
+    bool create(runtime_type type, std::string_view name)
+    { return try_create(type, name) == create_result::ok; }
     bool start(std::string_view name, event_loop& loop);
     bool stop(std::string_view name, event_loop& loop);
     // Takes the runtime out of the map.  The object itself may outlive the call
@@ -140,7 +164,16 @@ public:
     // Cluster event dispatch: forward topology changes to all runtimes with Lua callbacks
     void dispatch_cluster_events(const std::vector<cluster_event>& events);
 
-    // Ownership cascading
+    // ── Ownership cascading ─────────────────────────────────────────────────
+    //
+    // Stopping a runtime applies each child's on_parent_stop policy to it, and
+    // to that child's own descendants.  The walk is over a graph, not a tree:
+    // `owner` is a plain string that nothing validates, so it can name a
+    // runtime already on the path — including the runtime itself.
+    //
+    // Every entry point below therefore carries a set of the names it has
+    // already descended into.  See the note on cascade_seen in the .cpp for the
+    // crash that arrives without it.
     std::vector<std::string> get_children(std::string_view parent_name) const;
     void stop_children(std::string_view parent_name, event_loop& loop);
     void remove_children(std::string_view parent_name, event_loop& loop);
@@ -243,6 +276,20 @@ public:
     mutable std::shared_mutex mutex;
 
 private:
+    // The names one cascade has already descended into.
+    //
+    // Not a member: a cascade is a single call tree, and two of them must not
+    // share state.  It is threaded through the three functions below instead,
+    // which is also what keeps the public entry points re-entrant — a script's
+    // on_stop may call socketley.stop from inside one of these.
+    using cascade_seen = std::unordered_set<std::string>;
+
+    // The recursive halves of stop()/stop_children()/remove_children().  The
+    // public spellings create an empty set and call these.
+    bool stop_cascading(std::string_view name, event_loop& loop, cascade_seen& seen);
+    void stop_children_cascading(std::string_view parent, event_loop& loop, cascade_seen& seen);
+    void remove_children_cascading(std::string_view parent, event_loop& loop, cascade_seen& seen);
+
     // Takes over an instance that has just left the map.  Called with the map
     // lock released.
     void retire(std::unique_ptr<runtime_instance> inst);

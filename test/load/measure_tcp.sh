@@ -30,7 +30,7 @@ require_bench
 
 ROUNDS="${ROUNDS:-40}"
 PASSES="${PASSES:-3}"
-PORTBASE="${PORTBASE:-21100}"
+PORTBASE="${PORTBASE:-$((SL_PORT_BASE + 1500))}"
 WARMUPS="${WARMUPS:-3}"
 MAX_BAD="${LOAD_MAX_BAD:-0}"
 
@@ -55,7 +55,20 @@ one_pass() {
         return 2
     fi
 
-    "$BIN" create server sink -p "$port" --mode in -s >/dev/null 2>&1
+    # An echoing backend, because `proxy concurrent` measures round trips.
+    #
+    # This was `--mode in`, which answers nothing — no --mode does, they say
+    # which directions the runtime accepts, not that it replies.  That was fine
+    # while the harness timed sends; since bench.c was changed to read a reply
+    # per request, every client here waited for something that could not come
+    # and every round reported 0 of 2000 completed.  120 of 120, which is what
+    # a missing fixture looks like next to a race.
+    #
+    # The benchmark scripts were moved to this file when bench.c changed; this
+    # harness reaches the same target through a different path and was missed.
+    "$BIN" create server sink -p "$port" \
+        --lua "$(cd "$(dirname "${BASH_SOURCE[0]}")/../benchmark" && pwd)/echo.lua" \
+        -s >/dev/null 2>&1
     "$BIN" create proxy px -p "$((port + 1))" --backend "127.0.0.1:$port" --protocol tcp -s >/dev/null 2>&1
     sleep 1.5
 

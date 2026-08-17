@@ -10,6 +10,41 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 
+// ─── Flags that describe inbound traffic, on a runtime that has none ────────
+//
+// The common flags are applied through a runtime_instance*, which does not know
+// what it is, so every one of them reached every runtime type.  Three of them
+// only mean something for a runtime that ACCEPTS connections, and a client does
+// not: it opens one connection outward and listens on nothing.
+//
+// They were taken, stored and reported.  `create client c -t host:port
+// --rate-limit 5` exited 0 and `show` answered `"rate_limit": 5`, while
+// client_instance.cpp contains no rate-limiting code at all — the same for
+// --max-connections and --idle-timeout.  An operator reading `show` was told a
+// control was in force that did not exist, which is worse than not having it.
+//
+// --maxmemory and --eviction were already refused here, so the shape of the
+// answer is the established one; these three simply escaped it.
+//
+// Refused rather than implemented, deliberately.  Each of them CAN be given a
+// meaning on a client, and each meaning is a decision rather than a
+// translation: an outbound throttle has to say what becomes of a message that
+// may not go yet — queue it (and report success for something that leaves in
+// ten seconds), fail the send, or drop it — and an idle timeout has to say what
+// happens next, since every connection loss in this runtime goes through
+// drop_connection() into schedule_reconnect(), so closing on idle reconnects
+// immediately and is churn rather than a saving.  Those are features to design,
+// not gaps to plug, and until one exists the honest answer is no.
+static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
+                                          const char* flag, const char* why)
+{
+    if (!instance || instance->get_type() != runtime_client)
+        return false;
+
+    std::cout << flag << " does not apply to a client: " << why << "\n";
+    return true;
+}
+
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script)
 {
@@ -238,6 +273,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid max-connections value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--max-connections",
+                                              "it opens one connection outward and "
+                                              "accepts none"))
+                return 1;
             instance->set_max_connections(max);
             return 0;
         }
@@ -255,6 +294,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid rate-limit value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--rate-limit",
+                                              "it limits what a peer may send to a "
+                                              "runtime, and nothing connects to a client"))
+                return 1;
             instance->set_rate_limit(rate);
             return 0;
         }
@@ -289,6 +332,11 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid idle-timeout value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
+                                              "it reaps idle inbound connections, and "
+                                              "a client's own connection is reconnected "
+                                              "the moment it is dropped"))
+                return 1;
             instance->set_idle_timeout(secs);
             return 0;
         }
@@ -537,17 +585,35 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
             }
             std::string_view upstream_str = pa.args[++i];
             // Parse semicolon-separated: "host1:port1;host2:port2"
+            //
+            // A refused address fails the whole flag rather than being skipped:
+            // `--upstream a:8080;b:abc` asked for two targets, and coming up
+            // with one of them is the silent half-configuration this refusal
+            // exists to stop.  The instance is discarded by the caller on a
+            // non-zero return, so the partly-filled list goes with it.
             size_t start = 0;
             size_t semi;
             while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
             {
                 auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty())
-                    srv->add_upstream_target(addr);
+                if (!addr.empty() && !srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
                 start = semi + 1;
             }
             if (start < upstream_str.size())
-                srv->add_upstream_target(upstream_str.substr(start));
+            {
+                auto addr = upstream_str.substr(start);
+                if (!srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             return 0;
         }
         default:
@@ -713,6 +779,28 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             {
                 std::cout << "--health-path requires a value\n";
                 return 1;
+            }
+            {
+                // The value is written into a GET request line as it stands, so
+                // anything that is not a path produces a request the backend
+                // cannot parse — which comes back as a failed health check, and
+                // every backend goes down for a reason that is a typo in a flag
+                // nobody thinks to re-read.
+                //
+                // Only the leading slash is checked, and that is deliberate:
+                // parsed_args splits the command line on whitespace before this
+                // runs, so `--health-path "/a b"` never arrives here as one
+                // argument — it arrives as `/a` followed by an unknown flag `b`,
+                // which is already refused one layer up.  A whitespace check
+                // here would be unreachable code with a comment claiming it
+                // guarded something.  Measured: the daemon answers
+                // "unknown flag: b".
+                const std::string_view hp = pa.args[i + 1];
+                if (hp.empty() || hp.front() != '/')
+                {
+                    std::cout << "--health-path must begin with '/'\n";
+                    return 1;
+                }
             }
             proxy->set_health_path(pa.args[++i]);
             return 0;
@@ -1094,6 +1182,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid max-connections value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--max-connections",
+                                              "it opens one connection outward and "
+                                              "accepts none"))
+                return 1;
             instance->set_max_connections(max);
             return 0;
         }
@@ -1111,6 +1203,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid rate-limit value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--rate-limit",
+                                              "it limits what a peer may send to a "
+                                              "runtime, and nothing connects to a client"))
+                return 1;
             instance->set_rate_limit(rate);
             return 0;
         }
@@ -1145,6 +1241,11 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid idle-timeout value\n";
                 return 1;
             }
+            if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
+                                              "it reaps idle inbound connections, and "
+                                              "a client's own connection is reconnected "
+                                              "the moment it is dropped"))
+                return 1;
             instance->set_idle_timeout(secs);
             return 0;
         }
@@ -1310,17 +1411,34 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
                 return 1;
             }
             std::string_view upstream_str = pa.args[++i];
+            // Same contract as the create path above.  On `edit` the list has
+            // already been cleared by the time this runs, so a refusal here
+            // leaves the runtime with fewer upstreams than it started with —
+            // which is why it is reported rather than skipped, and why the
+            // message names the address that could not be read.
             size_t start = 0;
             size_t semi;
             while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
             {
                 auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty())
-                    srv->add_upstream_target(addr);
+                if (!addr.empty() && !srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
                 start = semi + 1;
             }
             if (start < upstream_str.size())
-                srv->add_upstream_target(upstream_str.substr(start));
+            {
+                auto addr = upstream_str.substr(start);
+                if (!srv->add_upstream_target(addr))
+                {
+                    std::cout << "invalid upstream address: " << addr
+                              << " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             return 0;
         }
         default:
@@ -1455,6 +1573,28 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
             {
                 std::cout << "--health-path requires a value\n";
                 return 1;
+            }
+            {
+                // The value is written into a GET request line as it stands, so
+                // anything that is not a path produces a request the backend
+                // cannot parse — which comes back as a failed health check, and
+                // every backend goes down for a reason that is a typo in a flag
+                // nobody thinks to re-read.
+                //
+                // Only the leading slash is checked, and that is deliberate:
+                // parsed_args splits the command line on whitespace before this
+                // runs, so `--health-path "/a b"` never arrives here as one
+                // argument — it arrives as `/a` followed by an unknown flag `b`,
+                // which is already refused one layer up.  A whitespace check
+                // here would be unreachable code with a comment claiming it
+                // guarded something.  Measured: the daemon answers
+                // "unknown flag: b".
+                const std::string_view hp = pa.args[i + 1];
+                if (hp.empty() || hp.front() != '/')
+                {
+                    std::cout << "--health-path must begin with '/'\n";
+                    return 1;
+                }
             }
             proxy->set_health_path(pa.args[++i]);
             return 0;

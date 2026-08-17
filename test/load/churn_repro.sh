@@ -42,9 +42,9 @@ PAY="${4:-256}"
 WARM="${5:-0}"
 KIND="${6:-all}"
 
-BEP="${BE_PORT:-19599}"
-BASEP="${BASE_PORT:-19600}"
-WARMP="${WARM_PORT:-19700}"
+BEP="${BE_PORT:-$((SL_PORT_BASE + 599))}"
+BASEP="${BASE_PORT:-$((SL_PORT_BASE + 600))}"
+WARMP="${WARM_PORT:-$((SL_PORT_BASE + 700))}"
 
 echo "=== Churn reproducer — $REP daemons x $CYC cycles, kind=$KIND, warmup=$WARM ==="
 announce_environment

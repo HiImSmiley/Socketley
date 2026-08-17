@@ -103,16 +103,61 @@ fi
 # The fix must not have replaced the interactive help, only added a path around
 # it.  script(1) supplies a pty; stdin is closed behind it so the menu's `read`
 # reaches EOF instead of hanging, and timeout is the backstop if it does not.
-if command -v script >/dev/null 2>&1; then
-    TTY_OUT=$(timeout 20 script -qec "$BIN --help" /dev/null </dev/null 2>&1 || true)
+#
+# TERM is pinned rather than inherited.  This assertion read the ambient one and
+# therefore reported on the machine's terminfo database as much as on socketley:
+# run from a kitty terminal it failed here, and the message blamed the plain
+# path.  `xterm` is the entry every ncurses install carries; if even that is
+# missing there is nothing to measure and the check says so instead of failing.
+if command -v script >/dev/null 2>&1 && infocmp xterm >/dev/null 2>&1; then
+    TTY_OUT=$(TERM=xterm timeout 20 script -qec "$BIN --help" /dev/null </dev/null 2>&1 || true)
     if printf '%s' "$TTY_OUT" | grep -qiE 'What would you like to learn|Interactive Help'; then
         pass
     else
         fail "a real terminal still gets the interactive help" \
              "the menu did not appear on a pty — the plain path may have swallowed both cases"
     fi
+
+    # ─── And a TERM the machine has never heard of ──────────────────────────
+    #
+    # The help script runs under `set -e` and opened its header with a bare
+    # `clear`, which fails on a TERM that is not in terminfo — the ordinary case
+    # on kitty, whose xterm-kitty entry ships with the terminal rather than with
+    # ncurses.  The failure took the whole help with it:
+    #
+    #     $ socketley --help          # TERM=xterm-kitty
+    #     'xterm-kitty': unknown terminal type.
+    #     $ echo $?
+    #     1
+    #
+    # Exit 1 for a command that cannot be misused, and no help at all.  Only the
+    # person reading it ever saw this — piping the output away removes the tty,
+    # and without a tty the interactive path is never entered, which is why
+    # every other assertion in this file passed throughout.
+    #
+    # The name is invented on purpose: a real one would start passing the day
+    # somebody installs its terminfo entry.
+    BAD_OUT=$(TERM=xterm timeout 20 script -qec \
+        "TERM=socketley-no-such-term $BIN --help; echo RC=\$?" /dev/null </dev/null 2>&1 || true)
+
+    if printf '%s' "$BAD_OUT" | grep -qiE 'What would you like to learn|Interactive Help'; then
+        pass
+    else
+        fail "an unknown TERM still gets the help" \
+             "$(printf '%s' "$BAD_OUT" | head -1)" \
+             "a screen clear is cosmetic; failing it must not take the help with it."
+    fi
+
+    # Exit code separately: a build that printed the menu and still exited 1
+    # would satisfy the check above, and `--help` is not bad input.
+    if printf '%s' "$BAD_OUT" | grep -q 'RC=0'; then
+        pass
+    else
+        fail "an unknown TERM still exits 0" \
+             "got $(printf '%s' "$BAD_OUT" | grep -o 'RC=[0-9]*' | head -1)"
+    fi
 else
-    echo "  (script(1) absent — the pty control did not run)"
+    echo "  (script(1) or terminfo absent — the pty controls did not run)"
 fi
 
 # ─── No daemon was started ──────────────────────────────────────────────────

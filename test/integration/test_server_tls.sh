@@ -409,18 +409,32 @@ PYEOF
 # Connections has to fall back to zero.  A session or a connection struct left
 # behind by an aborted handshake keeps this above zero for the rest of the
 # runtime's life, which is the sharpest assertion in this file.
+#
+# ─── AND IT WAS BEING ANSWERED BY A FIGURE OLDER THAN THE ABORTS ────────────
+#
+# This runtime is in a worker, so `connections` is a sample it takes every
+# 250 ms and pushes, not a number read when it is printed.  What stood here was
+# a loop that broke the moment the figure read 0 — and the figure read 0
+# immediately, from the sample taken BEFORE the aborts, so the loop exited on a
+# state of the world that predates the thing under test.  Measured on this
+# build: the first read was accepted with a sample instant 14 ms after the abort
+# script was launched, which is before python had finished starting, let alone
+# aborted a handshake.  A build that leaked a struct per aborted handshake would
+# have passed here just as fast.
+#
+# ready_conns is the same wait with the age of the sample checked, so what is
+# accepted is a zero the runtime saw after the aborts rather than before them.
+# The read below is left as it was: if the wait timed out, the figure it could
+# not settle is exactly what assert_eq should print.
+ready_conns "$BIN" tls_srv 0 15 || true
 CONNS=""
-for _ in $(seq 1 60); do
-    # `|| true`: grep exits 1 when the field is absent, `pipefail` promotes it,
-    # and a lone `VAR=$(…)` takes its status from the substitution — so a runtime
-    # that is not there ended the file inside this poll loop, with the sharpest
-    # assertion in the file and everything after it unreported.  CONNS is
-    # pre-set to "" above precisely so an unreadable counter falls through to
-    # assert_eq, which fails on "" and says what it wanted.
-    CONNS=$("$BIN" stats tls_srv 2>/dev/null | grep '^connections:' | cut -d: -f2 | tr -d ' ') || true
-    [ "$CONNS" = "0" ] && break
-    sleep 0.1
-done
+# `|| true`: grep exits 1 when the field is absent, `pipefail` promotes it,
+# and a lone `VAR=$(…)` takes its status from the substitution — so a runtime
+# that is not there ended the file here, with the sharpest assertion in the
+# file and everything after it unreported.  CONNS is pre-set to "" above
+# precisely so an unreadable counter falls through to assert_eq, which fails on
+# "" and says what it wanted.
+CONNS=$("$BIN" stats tls_srv 2>/dev/null | grep '^connections:' | cut -d: -f2 | tr -d ' ') || true
 assert_eq "$CONNS" "0" "aborted handshakes leave no connections behind"
 
 # And the listener still works afterwards.

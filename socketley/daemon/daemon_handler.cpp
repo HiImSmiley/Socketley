@@ -17,6 +17,7 @@
 #include "../shared/tls_context.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
+#include "../shared/ipc_framing.h"
 #include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
@@ -106,6 +107,79 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
                               inst->get_key_path(), inst->get_ca_path(),
                               mesh_ca, mesh_cert, mesh_key,
                               inst->get_replication_target());
+}
+
+// ─── MAY THIS CALLER HAND THE DAEMON THIS PID ───────────────────────────────
+//
+// `attach --pid` is how an embedded process registers a runtime it is serving
+// itself, and it is meant to be its own: the SDK example passes getpid().  The
+// daemon remembers it and sends it SIGTERM when the runtime is stopped, which
+// is the feature — `socketley stop app_cache` stops the process behind it.
+//
+// Nothing checked whose pid it was.  Measured on the parent commit, against a
+// process the daemon had nothing to do with:
+//
+//     $ sleep 300 &                       # pid 1328283
+//     $ socketley attach server bystander 18790 --pid 1328283
+//     $ socketley stop bystander
+//     [2]+  Terminated              sleep 300
+//
+// On a single-user daemon that is not a boundary — whoever may open the socket
+// could signal the process themselves.  On the packaged one it is: the socket
+// is 0660 socketley:socketley precisely so operators can reach a daemon that
+// runs as its own user (as root, in the container image), and any member of
+// that group could make it signal anything that uid can signal.  That is the
+// one line the whole threat model rests on; see setup() below.
+//
+// So the pid has to belong to the caller.  SO_PEERCRED gives the uid on the
+// other end of this connection — the kernel's answer, not the client's — and
+// /proc/<pid> is owned by the uid running that process.  Equal, and the caller
+// could have signalled it without the daemon's help; different, and the daemon
+// would be lending out a privilege it was never asked to lend.
+//
+// Deliberately NOT a check that the pid is the peer itself.  Both documented
+// spellings are legitimate and neither is the peer: the SDK's own connection
+// carries the process's pid, and a shell that starts a program and attaches it
+// with `--pid $!` names a sibling of the CLI, not the CLI.  Ownership is the
+// property that separates those from the escalation.
+//
+// A root peer passes everything, because root can signal everything anyway and
+// refusing would only break the container image's own arrangement.
+//
+// Returns an empty string when the pid may be used.
+static std::string attach_pid_refusal(int conn_fd, pid_t pid)
+{
+    if (pid <= 0)
+        return {};
+
+    struct ucred cred{};
+    socklen_t    len = sizeof(cred);
+    if (conn_fd < 0 ||
+        ::getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0)
+    {
+        // No credentials means no way to judge, and this runs on the path that
+        // decides who may be signalled.  Refusing is the answer that cannot be
+        // wrong in the direction that matters.
+        return "could not establish who is asking, so --pid was not accepted\n";
+    }
+
+    if (cred.uid == 0)
+        return {};
+
+    struct stat st{};
+    const std::string proc = "/proc/" + std::to_string(static_cast<long long>(pid));
+    if (::stat(proc.c_str(), &st) < 0)
+        return "no process " + std::to_string(static_cast<long long>(pid)) +
+               " to attach to\n";
+
+    if (st.st_uid != cred.uid)
+        return "process " + std::to_string(static_cast<long long>(pid)) +
+               " belongs to another user, so --pid was refused\n"
+               "  The daemon signals this pid when the runtime is stopped, and "
+               "it will not do that\n"
+               "  on behalf of a caller who could not signal it themselves.\n";
+
+    return {};
 }
 
 // Why this runtime's --cpus / --sqpoll request cannot be honoured, or an empty
@@ -974,18 +1048,55 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    size_t pos;
+    // ─── TWO FRAMINGS ON ONE CONNECTION ─────────────────────────────────────
+    //
+    // A command is a line, unless it begins with the frame marker — see
+    // ipc_framing.h for the whole of it and for why a marker rather than a
+    // negotiation.  The short version: a payload with a newline in it cannot
+    // travel on a line protocol, and every command that has no newline is sent
+    // exactly as it always was, so nothing about the ordinary path changes.
+    //
+    // Both are handled in one loop because both can arrive in one packet: a CLI
+    // is free to pipeline, and the `send` that needs a frame may follow a `ls`
+    // that does not.
     bool queued = false;
-    while ((pos = conn->partial.find('\n')) != std::string::npos)
+    while (!conn->partial.empty())
     {
-        std::string line = conn->partial.substr(0, pos);
-        conn->partial.erase(0, pos + 1);
+        std::string command;
 
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
+        if (conn->partial[0] == ipc_frame::marker)
+        {
+            std::string payload;
+            const auto r = ipc_frame::take_frame(conn->partial, payload);
+            if (r == ipc_frame::take::need_more)
+                break;
+            if (r == ipc_frame::take::fatal)
+            {
+                // A length past the cap means this stream's framing is wrong,
+                // and there is no point in the buffer that is provably the
+                // start of the next frame.  Closing is the only answer that
+                // cannot make it worse.
+                LOG_ERROR("daemon: a CLI connection sent a frame longer than the "
+                          "limit; closing it rather than guessing where the next "
+                          "one starts");
+                close_client(it);
+                return;
+            }
+            command = std::move(payload);
+        }
+        else
+        {
+            const size_t pos = conn->partial.find('\n');
+            if (pos == std::string::npos)
+                break;
+            command = conn->partial.substr(0, pos);
+            conn->partial.erase(0, pos + 1);
+            if (!command.empty() && command.back() == '\r')
+                command.pop_back();
+        }
 
         conn->write_buf.clear();
-        int exit_code = process_command(conn, line);
+        int exit_code = process_command(conn, command);
         append_response(conn, exit_code);
         queued = true;
     }
@@ -1069,6 +1180,42 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         return 1;
     }
 
+    // ─── A COMMAND WITH MORE ARGUMENTS THAN THE PARSER HAS SLOTS ────────────
+    //
+    // parsed_args puts the whole remainder in its last slot, so a command whose
+    // final argument is free text is complete and correct: `send`, `action` and
+    // `import` all read their payload with rest_from(), which spans to the end
+    // of the line.  That is the case worth keeping — a message, a cache value
+    // or a configuration document has no business having a word limit.
+    //
+    // Every other command reads its arguments as a LIST, and for those the
+    // merged tail is not the request that was made.  `start a b c ...` past the
+    // limit would look up one impossible name made of the rest; `create` would
+    // lose flags and build a runtime nobody asked for.  Both used to happen
+    // silently, which is what this refuses.
+    //
+    // The allowlist is here rather than in parsed_args because this is where
+    // the commands are known, and it is three entries rather than a rule
+    // because there are three: everything else would be guessing.
+    if (pa.overflowed)
+    {
+        switch (pa.hashes[0])
+        {
+            case fnv1a("send"):
+            case fnv1a("action"):
+            case fnv1a("import"):
+                break;   // the tail is the payload, and it is all there
+
+            default:
+                std::cout << "too many arguments for " << pa.args[0]
+                          << " (at most " << (MAX_ARGS - 1) << ")\n"
+                             "  Everything past that used to be dropped without a word; "
+                             "it is refused now\n"
+                             "  rather than acted on in part.\n";
+                return 1;
+        }
+    }
+
     switch (pa.hashes[0])
     {
         case fnv1a("create"):     return cmd_create(conn, pa);
@@ -1124,10 +1271,29 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     std::string_view name = pa.args[2];
 
-    if (!m_manager.create(type, name))
+    // The reason, not a guess at it.  This reported "runtime already exists"
+    // for a name that was refused for its characters, on a daemon holding
+    // nothing — see runtime_manager::create_result.
+    switch (m_manager.try_create(type, name))
     {
-        std::cout << "runtime already exists: " << name << "\n";
-        return 1;
+        case runtime_manager::create_result::ok:
+            break;
+
+        case runtime_manager::create_result::name_taken:
+            std::cout << "runtime already exists: " << name << "\n";
+            return 1;
+
+        case runtime_manager::create_result::invalid_name:
+            std::cout << "invalid runtime name: " << name << "\n"
+                         "  A name may contain letters, digits, '-', '_' and "
+                         "'.', may not begin with '.',\n"
+                         "  and may be at most 128 characters.\n";
+            return 1;
+
+        case runtime_manager::create_result::internal:
+            std::cout << "could not build a runtime of type "
+                      << type_to_string(type) << "\n";
+            return 2;
     }
 
     auto* instance = m_manager.get(name);
@@ -1703,10 +1869,20 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--group"):   col_group   = true; break;
         }
         // Handle --format json
+        // `--format json` is the only spelling there is.  Anything else was
+        // consumed and ignored, so `--format xml` produced the default table
+        // and said nothing — an operator asking for a format they do not have
+        // deserves to be told, not answered in a different one.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
                 json_format = true;
+            else
+            {
+                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
+                                  " (the only one is json)\n";
+                return 1;
+            }
             ++i;
         }
     }
@@ -1746,14 +1922,17 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
-            out << "{\"id\":\"" << instance->get_id()
-                << "\",\"name\":\"" << name
+            // Escaped, all of them.  A name is validated now, but a group and
+            // an owner are arbitrary operator strings, and a quote in either
+            // used to produce a document no JSON parser would accept.
+            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
+                << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"status\":\"" << state_str
                 << "\",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
-                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << ",\"owner\":\"" << sp_detail::json_escape(owner)
+                << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
         }
         out << "]\n";
@@ -1903,10 +2082,20 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
         }
+        // `--format json` is the only spelling there is.  Anything else was
+        // consumed and ignored, so `--format xml` produced the default table
+        // and said nothing — an operator asking for a format they do not have
+        // deserves to be told, not answered in a different one.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
                 json_format = true;
+            else
+            {
+                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
+                                  " (the only one is json)\n";
+                return 1;
+            }
             ++i;
         }
     }
@@ -1950,16 +2139,16 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             // failed runtime claiming to be up, which is worse than no row.
             // uptime goes empty for the same reason: a runtime that never
             // started has no start time to measure from.
-            out << "{\"id\":\"" << instance->get_id()
-                << "\",\"name\":\"" << name
+            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
+                << "\",\"name\":\"" << sp_detail::json_escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
                 << "\",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << (owner.empty() ? "" : std::string(owner))
-                << "\",\"group\":\"" << (group.empty() ? "" : std::string(group))
+                << ",\"owner\":\"" << sp_detail::json_escape(owner)
+                << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
         }
         out << "]\n";
@@ -3022,6 +3211,14 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                         static_cast<proxy_instance*>(instance), pa, i);
                     break;
                 case runtime_cache:
+                    // There is no parse_cache_edit_flags, so every
+                    // cache-specific flag falls through to the refusal below.
+                    // That is a decision rather than an omission — `import` is
+                    // the fuller of the two ways to reconfigure a runtime and
+                    // applies all of these — but "unknown flag" was the wrong
+                    // sentence for it: the flag exists, spelling it differently
+                    // will not help, and the operator needs to be sent to the
+                    // command that does take it.
                     result = -1;
                     break;
             }
@@ -3029,6 +3226,24 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
         if (result == -1)
         {
+            static constexpr uint32_t cache_only[] = {
+                fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
+                fnv1a("--replicate"), fnv1a("--resp"),
+            };
+            bool is_cache_flag = false;
+            for (uint32_t h : cache_only)
+                if (pa.hashes[i] == h) { is_cache_flag = true; break; }
+
+            if (is_cache_flag && type == runtime_cache)
+            {
+                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
+                             "  A cache's own settings are applied by `import`:\n"
+                             "    socketley show " << name
+                          << " > cfg.json   # edit the field, then\n"
+                             "    socketley import " << name << " < cfg.json\n";
+                return 1;
+            }
+
             std::cout << "unknown flag: " << pa.args[i] << "\n";
             return 1;
         }
@@ -3129,23 +3344,52 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 
     // Same gate as the create path: a config carrying TLS this build cannot
     // honour is rejected before anything is applied or written back to the
-    // state file.  Note the check is on what the incoming JSON *sets* — a
-    // config that omits the TLS fields is accepted, which is how an operator
-    // clears them from a runtime restored out of an older state file (dump,
-    // drop the fields, import).
+    // state file.
     //
-    // The replication target comes from the same document, not from the live
-    // instance: this is the configuration that is about to take effect, and an
-    // import is exactly how a cleartext replicating cache would otherwise be
-    // handed a certificate one field at a time.  A document that drops
-    // replicate_target drops the replication with it (set_replicate_target
-    // below is called unconditionally), so the pair being judged here is the
-    // pair that will exist afterwards.
+    // ─── JUDGED ON THE RESULT, NOT ON THE DOCUMENT ──────────────────────────
+    //
+    // This used to read cfg directly, on the reasoning that a document which
+    // omits the TLS fields is clearing them — which was true when every field
+    // was applied unconditionally.  It is not any more: an omitted field now
+    // leaves the runtime's own value in place (see the apply block below), so
+    // reading cfg would judge a configuration that is not the one about to
+    // exist.
+    //
+    // Concretely, and this is the hole it would have opened: a TLS cache with
+    // no replication, handed a document that names only replicate_target.  cfg
+    // says tls=false, the gate passes, and the apply gives it a replication
+    // leg — the exact cleartext-replication pair tls_config_refusal exists to
+    // refuse.  So each value is taken from the document where the document
+    // names it and from the instance where it does not, which is what the
+    // runtime will be carrying a few lines from now.
+    std::string_view inst_mca, inst_mcert, inst_mkey;
+    instance->get_mesh_tls_paths(inst_mca, inst_mcert, inst_mkey);
+
+    const auto merged = [&cfg](const char* key, auto from_doc, auto from_inst) {
+        return cfg.has(key) ? from_doc : from_inst;
+    };
+
+    const bool        eff_tls  = merged("tls", cfg.tls, instance->get_tls());
+    const bool        eff_udp  = merged("udp", cfg.udp, instance->is_udp());
+    const std::string eff_cert = merged("cert_path", cfg.cert_path,
+                                        std::string(instance->get_cert_path()));
+    const std::string eff_key  = merged("key_path", cfg.key_path,
+                                        std::string(instance->get_key_path()));
+    const std::string eff_ca   = merged("ca_path", cfg.ca_path,
+                                        std::string(instance->get_ca_path()));
+    const std::string eff_mca  = merged("mesh_client_ca", cfg.mesh_client_ca,
+                                        std::string(inst_mca));
+    const std::string eff_mcrt = merged("mesh_client_cert", cfg.mesh_client_cert,
+                                        std::string(inst_mcert));
+    const std::string eff_mkey = merged("mesh_client_key", cfg.mesh_client_key,
+                                        std::string(inst_mkey));
+    const std::string eff_repl = merged("replicate_target", cfg.replicate_target,
+                                        std::string(instance->get_replication_target()));
+
     if (const std::string msg = tls_config_refusal(type,
-                                                   cfg.tls, cfg.udp, cfg.cert_path, cfg.key_path,
-                                                   cfg.ca_path, cfg.mesh_client_ca,
-                                                   cfg.mesh_client_cert, cfg.mesh_client_key,
-                                                   cfg.replicate_target);
+                                                   eff_tls, eff_udp, eff_cert, eff_key,
+                                                   eff_ca, eff_mca, eff_mcrt, eff_mkey,
+                                                   eff_repl);
         !msg.empty())
     {
         conn->write_buf = msg;
@@ -3160,6 +3404,18 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (is_running)
         {
             conn->write_buf = "cannot rename while running\n";
+            return 1;
+        }
+        // Two reasons, said apart.  rename() refuses a taken name and an
+        // invalid one, and "already taken" for a name with a slash in it sends
+        // the operator looking for a runtime that does not exist — the same
+        // defect cmd_create still has one command over.
+        if (!runtime_manager::valid_name(cfg.name))
+        {
+            conn->write_buf = "invalid runtime name: " + cfg.name + "\n"
+                "  A name may contain letters, digits, '-', '_' and '.', "
+                "may not begin with '.',\n"
+                "  and may be at most 128 characters.\n";
             return 1;
         }
         if (!m_manager.rename(old_name, cfg.name))
@@ -3236,46 +3492,96 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Apply common fields
-    instance->set_port(cfg.port);
-    instance->set_log_file(cfg.log_file);
-    instance->set_write_file(cfg.write_file);
-    instance->set_bash_output(cfg.bash_output);
-    instance->set_bash_prefix(cfg.bash_prefix);
-    instance->set_bash_timestamp(cfg.bash_timestamp);
-    instance->set_max_connections(cfg.max_connections);
-    instance->set_rate_limit(cfg.rate_limit);
-    instance->set_global_rate_limit(cfg.global_rate_limit);
-    instance->set_idle_timeout(cfg.idle_timeout);
-    instance->set_drain(cfg.drain);
-    instance->set_reconnect(cfg.reconnect);
-    instance->set_tls(cfg.tls);
-    instance->set_cert_path(cfg.cert_path);
-    instance->set_key_path(cfg.key_path);
-    instance->set_ca_path(cfg.ca_path);
-    instance->set_target(cfg.target);
-    instance->set_cache_name(cfg.cache_name);
-
-    // ─── Applied, because `show` emits it and a round trip must not lose it ─
+    // ─── ONLY WHAT THE DOCUMENT NAMES ───────────────────────────────────────
     //
-    // This block assigns every field from the parsed document unconditionally,
-    // which is what makes `show | import` a round trip rather than a partial
-    // one.  A field that `show` writes and `import` does not read back is a
-    // field the round trip silently resets — and for this one the reset is a
-    // sharded proxy quietly coming back with a quarter of the processes it had,
-    // reported by `ls` as Up and by nothing at all as wrong.
+    // Every field in runtime_config has a default, and this used to apply all
+    // of them unconditionally — so a document that left a field out cleared it.
+    // Measured, against a runtime with a port, a log path, two limits and a
+    // complete TLS set:
     //
-    // set_shards() clamps, so a hand-edited document asking for 0 or 900 gets
-    // 1 or 64 rather than a runtime with no worker.  A document that never
-    // mentions shards parses as 1, which is the default and is correct: the
-    // field is omitted by format_json for every unsharded runtime, including
-    // every document written by a build older than this one.
-    instance->set_shards(cfg.shards);
-    instance->set_group(cfg.group);
+    //     socketley import c '{"name":"c"}'
+    //     exit 0, no output
+    //     ... and port, log_file, max_connections, idle_timeout, tls,
+    //         cert_path and key_path were all gone.
+    //
+    // A runtime configured to speak TLS answered in cleartext afterwards, and
+    // the command that did it reported success.  The whole tls_config_refusal
+    // apparatus misses it, because it judges the INCOMING document and that
+    // document no longer has any TLS in it to be incomplete.
+    //
+    // ─── CLEARING IS STILL POSSIBLE, AND IS NOW SAID OUT LOUD ───────────────
+    //
+    // Emptying a field was the documented escape hatch — dump, delete the
+    // lines, import — and it stays available: `"tls": false`, `"cert_path": ""`.
+    // What changes is that it has to be written rather than implied.  The
+    // ordinary round trip is unaffected, because `show` emits every field.
+    const auto has = [&cfg](const char* key) { return cfg.has(key); };
 
-    // Lua script: reload if changed
+    if (has("port"))              instance->set_port(cfg.port);
+    if (has("log_file"))          instance->set_log_file(cfg.log_file);
+    if (has("write_file"))        instance->set_write_file(cfg.write_file);
+    if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
+    if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
+    if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
+    // ─── The three flags a client does not have, refused here too ───────────
+    //
+    // create and edit refuse --rate-limit, --max-connections and --idle-timeout
+    // on a client, because it accepts no connections and there is nothing for
+    // any of them to limit.  import writes the same fields through a different
+    // door: it does not go through the flag parser at all, so the refusal did
+    // not exist here.  Measured, on a build where create already said no:
+    //
+    //     socketley show c | jq '.rate_limit = 5' | socketley import c   -> 0
+    //     socketley show c                          -> "rate_limit": 5
+    //
+    // which is the same shape as 4af38f0, where import could give a runtime a
+    // name create would have refused.  A validation that only guards one entrance
+    // is a validation that is not there.
+    //
+    // Refused rather than ignored: silently dropping a field the caller wrote
+    // makes `show | import` stop being a round trip, and the caller is told
+    // nothing.  The whole document is rejected, so nothing half-applies.
+    if (type == runtime_client)
+    {
+        const char* offender = has("rate_limit")      ? "rate_limit"
+                             : has("max_connections") ? "max_connections"
+                             : has("idle_timeout")    ? "idle_timeout"
+                             : nullptr;
+        if (offender)
+        {
+            conn->write_buf = std::string("\"") + offender +
+                  "\" does not apply to a client: it accepts no connections, so "
+                  "there is nothing to limit or to time out. Remove the field and "
+                  "import again.\n";
+            return 1;
+        }
+    }
+
+    if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);
+    if (has("rate_limit"))        instance->set_rate_limit(cfg.rate_limit);
+    if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);
+    if (has("idle_timeout"))      instance->set_idle_timeout(cfg.idle_timeout);
+    if (has("drain"))             instance->set_drain(cfg.drain);
+    if (has("reconnect"))         instance->set_reconnect(cfg.reconnect);
+    if (has("tls"))               instance->set_tls(cfg.tls);
+    if (has("cert_path"))         instance->set_cert_path(cfg.cert_path);
+    if (has("key_path"))          instance->set_key_path(cfg.key_path);
+    if (has("ca_path"))           instance->set_ca_path(cfg.ca_path);
+    if (has("target"))            instance->set_target(cfg.target);
+    if (has("cache_name"))        instance->set_cache_name(cfg.cache_name);
+    if (has("group"))             instance->set_group(cfg.group);
+    // Carried into this form from the block it replaced.  `show` emits shards,
+    // so a round trip that did not read it back would return a sharded proxy
+    // with one worker -- reported Up by `ls` and wrong by nothing.  set_shards
+    // clamps, so a hand-edited 0 or 900 becomes 1 or 64 rather than a runtime
+    // with no worker at all.
+    if (has("shards"))            instance->set_shards(cfg.shards);
+
+    // Lua script: reload if changed — and only when the document says which
+    // script it wants.  Without the guard, a partial document reads as
+    // lua_script="" and detaches the runtime's handler.
     std::string cur_lua(instance->get_lua_script_path());
-    if (cfg.lua_script != cur_lua)
+    if (has("lua_script") && cfg.lua_script != cur_lua)
     {
         if (!cfg.lua_script.empty())
         {
@@ -3298,53 +3604,75 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         case runtime_server:
         {
             auto* srv = static_cast<server_instance*>(instance);
-            srv->set_mode(static_cast<server_mode>(cfg.mode));
-            srv->set_udp(cfg.udp);
+            if (has("mode")) srv->set_mode(static_cast<server_mode>(cfg.mode));
+            if (has("udp"))  srv->set_udp(cfg.udp);
             if (!cfg.cache_name.empty())
                 srv->set_runtime_manager(&m_manager);
             if (!cfg.master_pw.empty())
                 srv->set_master_pw(cfg.master_pw);
             if (cfg.master_forward)
                 srv->set_master_forward(true);
+
+            // The list is replaced only when the document names it.  Clearing
+            // it on a document that never mentioned upstreams is the same
+            // silent loss as the common fields above, and the loudest version
+            // of it: a server whose upstream leg simply stops existing.
+            if (!has("upstreams")) break;
             srv->clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
-                srv->add_upstream_target(u);
+            {
+                // Reported rather than dropped.  This is a document a person
+                // edited, and the list was cleared a line ago — silently
+                // storing fewer upstreams than the document names is the
+                // half-applied import this command already refuses elsewhere.
+                if (!srv->add_upstream_target(u))
+                {
+                    conn->write_buf = "invalid upstream address: " + u +
+                                      " (the port must be a number between 1 and 65535)\n";
+                    return 1;
+                }
+            }
             break;
         }
         case runtime_client:
         {
             auto* cli = static_cast<client_instance*>(instance);
-            cli->set_mode(static_cast<client_mode>(cfg.mode));
-            cli->set_udp(cfg.udp);
+            if (has("mode")) cli->set_mode(static_cast<client_mode>(cfg.mode));
+            if (has("udp"))  cli->set_udp(cfg.udp);
             break;
         }
         case runtime_proxy:
         {
             auto* prx = static_cast<proxy_instance*>(instance);
-            prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
-            prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
-            prx->clear_backends();
-            for (const auto& b : cfg.backends)
-                prx->add_backend(b);
+            if (has("protocol")) prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
+            if (has("strategy")) prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
+            if (has("backends"))
+            {
+                prx->clear_backends();
+                for (const auto& b : cfg.backends)
+                    prx->add_backend(b);
+            }
             prx->set_runtime_manager(&m_manager);
-            // The gate above guarantees these three are empty, so this is the
-            // clearing half of the escape hatch: without it a proxy restored
-            // from a state file with mesh mTLS paths could never be emptied,
-            // and would refuse to start forever.
-            prx->set_mesh_client_ca(cfg.mesh_client_ca);
-            prx->set_mesh_client_cert(cfg.mesh_client_cert);
-            prx->set_mesh_client_key(cfg.mesh_client_key);
+            // The clearing half of the escape hatch: without it a proxy
+            // restored from a state file with mesh mTLS paths could never be
+            // emptied, and would refuse to start forever.  Each is applied only
+            // when the document names it, so emptying is now written as
+            // `"mesh_client_ca": ""` rather than by leaving the key out — the
+            // gate above judged whatever this is about to produce.
+            if (has("mesh_client_ca"))   prx->set_mesh_client_ca(cfg.mesh_client_ca);
+            if (has("mesh_client_cert")) prx->set_mesh_client_cert(cfg.mesh_client_cert);
+            if (has("mesh_client_key"))  prx->set_mesh_client_key(cfg.mesh_client_key);
             break;
         }
         case runtime_cache:
         {
             auto* cache = static_cast<cache_instance*>(instance);
-            cache->set_persistent(cfg.persistent_path);
-            cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
-            cache->set_resp_forced(cfg.resp_forced);
-            cache->set_replicate_target(cfg.replicate_target);
-            cache->set_max_memory(cfg.max_memory);
-            cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
+            if (has("persistent_path"))  cache->set_persistent(cfg.persistent_path);
+            if (has("cache_mode"))       cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
+            if (has("resp_forced"))      cache->set_resp_forced(cfg.resp_forced);
+            if (has("replicate_target")) cache->set_replicate_target(cfg.replicate_target);
+            if (has("max_memory"))       cache->set_max_memory(cfg.max_memory);
+            if (has("eviction"))         cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
             break;
         }
     }
@@ -3887,8 +4215,21 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     {
         if (pa.args[i] == "--pid" && i + 1 < pa.count)
         {
+            // Checked, like the port six lines up and unlike this call before
+            // it: `--pid abc` left pid at 0 and was silently ignored, so a
+            // mistyped pid produced a runtime the daemon could never stop.
             auto sv = pa.args[++i];
-            std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), pid);
+            if (e != std::errc{} || p != sv.data() + sv.size() || pid <= 0)
+            {
+                conn->write_buf = "invalid pid: " + std::string(sv) + "\n";
+                return 1;
+            }
+            if (const std::string msg = attach_pid_refusal(conn->fd, pid); !msg.empty())
+            {
+                conn->write_buf = msg;
+                return 1;
+            }
         }
         else if (pa.args[i] == "--managed")
         {

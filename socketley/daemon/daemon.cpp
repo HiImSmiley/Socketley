@@ -415,7 +415,17 @@ static void restore_runtimes(state_persistence& persistence,
                 if (cfg.http_cache)
                     srv->set_http_cache(true);
                 for (const auto& u : cfg.upstreams)
-                    srv->add_upstream_target(u);
+                {
+                    // The boot restore has nobody to refuse to — there is no
+                    // command in flight and refusing the runtime outright would
+                    // take a serving listener down over one bad entry in a file
+                    // an older daemon wrote.  So it is logged and skipped, which
+                    // is the same thing that used to happen without the log.
+                    if (!srv->add_upstream_target(u))
+                        LOG_WARN(("restore: dropping upstream \"" + u +
+                                  "\" of " + cfg.name +
+                                  ": the port is not a number between 1 and 65535").c_str());
+                }
                 break;
             }
             case runtime_client:

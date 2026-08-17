@@ -205,3 +205,80 @@ if last:
 sys.exit(1)
 PY
 }
+
+# ready_conns BIN NAME COUNT [TIMEOUT_S]
+#
+# The runtime's published connection count is COUNT, in a figure the runtime
+# sampled after this call began.
+#
+# ─── WHY THE SECOND HALF OF THAT SENTENCE IS THE WHOLE POINT ────────────────
+#
+# Since the process split a runtime's connection count is not read when it is
+# printed.  The worker samples its own counters every 250 ms and pushes them;
+# `stats`, `ls` and every Lua binding report the last sample that arrived.  So
+# the figure lags the truth by up to a quarter second, which `stats` says out
+# loud in figures:pushed / figures_age_ms and which is invisible in the number
+# itself.
+#
+# For a count that is RISING that lag is harmless: a test waiting for 3 cannot
+# be handed 3 by a sample taken before the third client connected.  For a count
+# that has just fallen it is not, and the direction that matters most is the
+# fall to zero, because "nothing is connected" is the precondition every busy
+# assertion is read against.  Concretely, and this is a measured failure and not
+# a hypothetical: ready_tcp's `nc -z` opens and closes a connection, and the
+# worker goes on counting it until the ring reports the hangup after it reported
+# the accept.  A sample landing inside that window puts a 1 into the daemon for
+# the quarter second that follows — during which a test that asks "0
+# connections, yes?" is told 1 about a runtime nothing is connected to.
+#
+# How wide that window is was measured rather than reasoned about, by reading
+# the figure straight after an isolated `nc -z`: 7 stale reads in 164 on an idle
+# machine, so a few percent of the 250 ms period.  That is the rate at which a
+# test doing this once per run fails for no reason — rare enough to pass alone
+# and to be called flaky, common enough to turn up in a nightly.
+#
+# Polling until the number reads 0 does not fix that, and is the trap worth
+# naming: the first read can be answered from a sample taken BEFORE the probe
+# connected, so the loop exits on a stale zero having proved nothing at all.
+# That is a false pass in the same place, and it is the harder one to notice.
+#
+# So the test is on the sample's age rather than on repetition.  figures_age_ms
+# is the interval between the worker reading its own counters and the daemon
+# printing them, on a clock both processes share; subtracting it from the moment
+# of the call gives the instant the figure describes, and requiring that instant
+# to be later than the moment ready_conns was entered is exactly the claim a
+# caller wants: the runtime looked, after you asked, and saw COUNT.
+#
+# `now` is read BEFORE the stats round-trip on purpose.  Reading it after would
+# add the round-trip to the computed sample instant and could date a figure into
+# the window this function exists to exclude; taken before, the arithmetic can
+# only ever place the sample earlier than it really was, and the error is on the
+# side of waiting one more turn.
+#
+# A runtime with no figures_age_ms line is in the daemon, where the counters are
+# read at the instant they are printed — that figure postdates the call by
+# construction, so it is accepted as it stands.
+ready_conns() {
+    local bin=$1 name=$2 want=$3 timeout=${4:-15}
+    local start deadline now out conn age sampled
+    start=$(date +%s%3N)
+    deadline=$(( start + timeout * 1000 ))
+    while [ "$(date +%s%3N)" -le "$deadline" ]; do
+        now=$(date +%s%3N)
+        out=$("$bin" stats "$name" 2>/dev/null) || true
+        conn=$(printf '%s\n' "$out" | awk -F: '$1 == "connections" { print $2; exit }')
+        age=$(printf '%s\n'  "$out" | awk -F: '$1 == "figures_age_ms" { print $2; exit }')
+        # Absent, or anything that is not a count of milliseconds, means there is
+        # no pushed figure to date — the in-daemon case above.  Guarded rather
+        # than trusted, because the alternative is arithmetic on whatever `stats`
+        # happened to print, which fails as a shell error in the middle of a wait
+        # and takes the caller's whole file with it.
+        case "$age" in ''|*[!0-9]*) age=0 ;; esac
+        sampled=$(( now - age ))
+        if [ "$conn" = "$want" ] && [ "$sampled" -ge "$start" ]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}

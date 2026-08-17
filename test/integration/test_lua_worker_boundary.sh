@@ -260,6 +260,29 @@ ready_tcp 127.0.0.1 "$CTL_PORT" 8  || echo "  NOTE: controller never accepted"
 ready_tcp 127.0.0.1 "$PEER_PORT" 8 || echo "  NOTE: peer never accepted"
 
 # ── 1. The figures with nothing connected ───────────────────────────────────
+#
+# The probe on the line above is a connection.  `nc -z` opens one and drops it,
+# and the worker goes on counting it until the ring reports the hangup after it
+# reported the accept.  Its own sample of its own counters comes round every
+# 250 ms, so when the two coincide the daemon is handed a 1 for a connection
+# that is already gone and holds it until the next sample.  Read inside that
+# window, all three of the assertions below say 1 about a runtime nothing is
+# connected to — which is exactly the failure this file produced in a nightly,
+# down to the reported value.
+#
+# Measured here, by reading the figure straight after the probe: 7 stale reads
+# in 164 on an idle machine.  The `stats` oracle on the line below escapes it
+# only by being read later — after `said` has waited for the log line and a
+# fresh sample has landed — not by being any more accurate.
+#
+# It is not a figure that settles by being asked again, so polling until it
+# reads 0 would not fix it: the first read can be answered from the sample taken
+# BEFORE the probe connected, and the loop would exit on a stale zero having
+# proved nothing.  What is waited for is a sample taken after the probe was
+# gone.  See ready_conns in lib_ready.sh for the arithmetic.
+ready_conns "$BIN" peer 0 15 \
+    || echo "  NOTE: peer never published an idle connection count"
+
 poke idle
 said 'CTL idle group=' 8 || true
 

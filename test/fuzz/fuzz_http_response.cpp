@@ -474,6 +474,22 @@ void check_frame_invariants(const http_response_framing& st,
                "said the response was complete — a socket whose stream position "
                "nobody can name would be handed to the pool");
 
+    // The other half of that contract, and the half that had to be stated
+    // separately once an overrun stopped being spelled `unknown`.
+    //
+    // An overrun response IS complete — its Content-Length ran out, and saying
+    // otherwise is what lost a pipelined request (see the `overrun` field).  So
+    // http_response_frame_complete() answers yes for one and must; what may not
+    // happen is the socket being pooled, and http_response_pool_safe() is the
+    // predicate carrying that now.  Without this line, moving the verdict off
+    // `unknown` would have removed a guarantee this target was making and put
+    // nothing in its place.
+    FUZZ_CHECK(!(st.overrun && http_response_pool_safe(st)),
+               "bytes arrived past the end of the response and the pooling "
+               "predicate still said the socket was safe to hand on — the next "
+               "request to borrow it reads those bytes as the head of its own "
+               "answer");
+
     // No wrap.  body_remaining is a size_t counting down; an underflow turns
     // "one byte left" into "eighteen exabytes left", which never completes, and
     // the reverse arithmetic mistake completes immediately.

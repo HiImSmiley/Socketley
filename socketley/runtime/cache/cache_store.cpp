@@ -1,4 +1,5 @@
 #include "cache_store.h"
+#include "../../shared/ipc_framing.h"
 #include "../../shared/logging.h"
 #include <fstream>
 #include <cstring>
@@ -713,6 +714,47 @@ bool cache_store::setnx(std::string_view key, std::string_view value)
     return set(key, value);
 }
 
+// ─── A CURSOR OVER BUCKETS, NOT OVER AN OFFSET ──────────────────────────────
+//
+// This was an offset: every call walked all four maps from the beginning and
+// skipped `cursor` keys before it started collecting.  Two things were wrong
+// with that, and the second is the one nobody had written down.
+//
+// IT SKIPPED AND DUPLICATED.  An offset only means something if the traversal
+// order is stable, and an unordered_map's is not: inserting a key can move
+// every later key to a different position, so a key already returned comes back
+// and a key never returned is stepped over.  For a cache, whose whole purpose is
+// concurrent reads and writes, that is not a corner case — it is the ordinary
+// one.
+//
+// AND IT WAS QUADRATIC.  Resuming at offset N costs N steps, so a full scan of a
+// keyspace of N keys in pages of `count` costs O(N^2/count) — a million keys at
+// the default page size is on the order of 10^10 iterations, on the event loop
+// thread that serves every other runtime in the daemon.  Nothing in the review
+// caught this; it showed up on reading the resume path.
+//
+// A bucket index fixes both.  Resuming is O(1), and a key stays in its bucket
+// for as long as the table is not rehashed, so an insert that does not trigger
+// a rehash cannot disturb what has already been visited.
+//
+// ─── WHAT IS STILL NOT GUARANTEED, PRECISELY ────────────────────────────────
+//
+// A rehash — which unordered_map does when the load factor is exceeded — moves
+// keys between buckets, and a key that moves to a bucket this scan has already
+// passed will not be returned by it.  Redis avoids that with reverse-binary
+// iteration, which needs a power-of-two bucket count and control over the
+// table; libstdc++ uses prime counts and does not offer one.
+//
+// So the guarantee this makes, and the man page states, is:
+//
+//   * a key present for the whole iteration is returned at least once, PROVIDED
+//     the table was not rehashed during it;
+//   * a key may be returned more than once;
+//   * a key added or removed during the iteration may or may not appear.
+//
+// The bucket count is carried in the cursor so a rehash is at least VISIBLE
+// rather than silent: it restarts the map being walked, which trades duplicates
+// — allowed above — for the skip, which is not.
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out) const
 {
@@ -722,17 +764,76 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         return fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
     };
 
-    uint64_t pos = 0;
-    auto try_add = [&](std::string_view k) -> bool {
-        if (pos++ < cursor) return true;  // skip already-seen
-        if (match(k)) out.push_back(k);
-        return out.size() < count;        // stop when count reached
+    // cursor layout: [ map index : 8 ][ bucket count : 24 ][ bucket index : 32 ]
+    //
+    // The bucket count rides along so the next call can tell whether the table
+    // it is resuming into is the one it left.  Truncated to 24 bits, which is
+    // sixteen million buckets — far past anything this store holds, and a
+    // truncation that collides only makes the check miss a rehash, which is the
+    // behaviour without the field at all.
+    const uint8_t  in_map     = static_cast<uint8_t>(cursor >> 56);
+    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFF);
+    uint64_t       in_bucket  = cursor & 0xFFFFFFFFu;
+
+    auto pack = [](uint8_t map, size_t buckets, size_t bucket) -> uint64_t {
+        return (static_cast<uint64_t>(map) << 56)
+             | ((static_cast<uint64_t>(buckets) & 0xFFFFFF) << 32)
+             | (static_cast<uint64_t>(bucket) & 0xFFFFFFFFu);
     };
 
-    for (const auto& [k, _] : m_data)   if (!try_add(k)) return pos;
-    for (const auto& [k, _] : m_lists)  if (!try_add(k)) return pos;
-    for (const auto& [k, _] : m_sets)   if (!try_add(k)) return pos;
-    for (const auto& [k, _] : m_hashes) if (!try_add(k)) return pos;
+    // One map, from `first_bucket` on.  Returns the cursor to resume with, or 0
+    // when this map is exhausted.
+    auto walk = [&](const auto& map, uint8_t idx, size_t first_bucket) -> uint64_t {
+        const size_t nbuckets = map.bucket_count();
+        for (size_t b = first_bucket; b < nbuckets; ++b)
+        {
+            for (auto it = map.begin(b); it != map.end(b); ++it)
+                if (match(it->first))
+                    out.push_back(it->first);
+
+            // Whole buckets, never half of one: a page boundary inside a bucket
+            // would need an element index, and an element index is the offset
+            // this is replacing.  `count` is a hint, exactly as Redis's COUNT is.
+            if (out.size() >= count && b + 1 < nbuckets)
+                return pack(idx, nbuckets, b + 1);
+        }
+        return 0;
+    };
+
+    // The four in a fixed order, so a cursor names the same map on every call.
+    const uint8_t last_map = 3;
+    for (uint8_t idx = in_map; idx <= last_map; ++idx)
+    {
+        size_t start = 0;
+        if (idx == in_map && cursor != 0)
+        {
+            // A rehash between calls invalidates the bucket index.  Restarting
+            // this map is the answer that cannot skip; it may repeat, which the
+            // contract allows.
+            const size_t now = (idx == 0 ? m_data.bucket_count()
+                              : idx == 1 ? m_lists.bucket_count()
+                              : idx == 2 ? m_sets.bucket_count()
+                                         : m_hashes.bucket_count());
+            start = (in_buckets == (now & 0xFFFFFF)) ? in_bucket : 0;
+        }
+
+        uint64_t next = 0;
+        switch (idx)
+        {
+            case 0:  next = walk(m_data,   0, start); break;
+            case 1:  next = walk(m_lists,  1, start); break;
+            case 2:  next = walk(m_sets,   2, start); break;
+            default: next = walk(m_hashes, 3, start); break;
+        }
+        if (next != 0)
+            return next;
+
+        // This map is done.  If the page is already full, resume at the next
+        // map rather than walking into it now.
+        if (out.size() >= count && idx < last_map)
+            return pack(static_cast<uint8_t>(idx + 1), 0, 0);
+    }
+
     return 0;  // exhausted all keys
 }
 
@@ -952,14 +1053,39 @@ bool cache_store::exists(std::string_view key) const
 
 void cache_store::dump_commands(std::string& buf) const
 {
+    // ─── A VALUE MAY CONTAIN THE SEPARATOR ──────────────────────────────────
+    //
+    // This stream is one command per line and a cache value is arbitrary bytes,
+    // so a value with a newline in it ended the command here just as it did on
+    // the live replication path — the follower stored the part before the break
+    // and ran the rest as a command of its own.  The initial full sync is the
+    // same defect on the same link, and fixing only the live half would have
+    // left every value that was already stored broken while every value written
+    // afterwards was fine.
+    //
+    // Framed by the same rule and the same code: a frame only when the line
+    // cannot carry the command, so a dataset without newlines produces a stream
+    // that is byte-for-byte what it always was.
+    std::string cmd;
+    const auto emit = [&buf, &cmd]() {
+        if (ipc_frame::needs_frame(cmd))
+            buf += ipc_frame::encode(cmd);
+        else
+        {
+            buf.append(cmd);
+            buf.push_back('\n');
+        }
+        cmd.clear();
+    };
+
     // Strings
     for (const auto& [key, val] : m_data)
     {
-        buf.append("set ");
-        buf.append(key);
-        buf.push_back(' ');
-        buf.append(val);
-        buf.push_back('\n');
+        cmd.append("set ");
+        cmd.append(key);
+        cmd.push_back(' ');
+        cmd.append(val);
+        emit();
     }
 
     // Lists (emit rpush to preserve order)
@@ -967,11 +1093,11 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& val : deq)
         {
-            buf.append("rpush ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(val);
-            buf.push_back('\n');
+            cmd.append("rpush ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(val);
+            emit();
         }
     }
 
@@ -980,11 +1106,11 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& member : members)
         {
-            buf.append("sadd ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(member);
-            buf.push_back('\n');
+            cmd.append("sadd ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(member);
+            emit();
         }
     }
 
@@ -993,28 +1119,39 @@ void cache_store::dump_commands(std::string& buf) const
     {
         for (const auto& [field, val] : fields)
         {
-            buf.append("hset ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(field);
-            buf.push_back(' ');
-            buf.append(val);
-            buf.push_back('\n');
+            cmd.append("hset ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(field);
+            cmd.push_back(' ');
+            cmd.append(val);
+            emit();
         }
     }
 
-    // TTLs (emit as expire commands)
+    // ─── TTLs, in milliseconds ──────────────────────────────────────────────
+    //
+    // These were emitted as `expire key <seconds>`, truncated by the cast: a
+    // key with 500 ms left became `expire key 0`, which the `> 0` test then
+    // dropped entirely — so it came back from the dump with NO expiry at all
+    // and lived forever.  Every key under a second was immortalised by being
+    // written down.
+    //
+    // pexpire is the same command one unit finer, and the receiving side has
+    // had it as long as expire has.  The `> 0` test stays: a key whose deadline
+    // has already passed is expiring, not being given a new lease, and the
+    // sweep will take it.
     auto now = std::chrono::steady_clock::now();
     for (const auto& [key, tp] : m_expiry)
     {
-        auto secs = std::chrono::duration_cast<std::chrono::seconds>(tp - now).count();
-        if (secs > 0)
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
+        if (ms > 0)
         {
-            buf.append("expire ");
-            buf.append(key);
-            buf.push_back(' ');
-            buf.append(std::to_string(secs));
-            buf.push_back('\n');
+            cmd.append("pexpire ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            cmd.append(std::to_string(ms));
+            emit();
         }
     }
 }

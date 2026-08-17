@@ -70,6 +70,27 @@ workspace "Socketley"
         linkoptions { dev_linker, "-Wl,--as-needed" }
     filter {}
 
+    -- ─── Release is the configuration that gets PACKAGED ────────────────────
+    --
+    -- packaging/build-deb.sh refuses to run without `make config=release_x64`,
+    -- so whatever is set here ends up in socketley_*_amd64.deb — and a .deb
+    -- tagged amd64 promises to run on any x86-64.
+    --
+    -- It was built with -march=native, which lets the compiler use every
+    -- instruction the BUILD machine happens to have.  A package built on a
+    -- recent host then dies with SIGILL on an older one, not at the feature
+    -- that needed the instruction but wherever the code path is first reached.
+    --
+    -- x86-64-v2 is the floor: SSE4.2 and POPCNT, which is every x86-64 CPU
+    -- since about 2009.  v3 (AVX2, ~2013) is a defensible choice too and is
+    -- measurably faster for the masking in ws_protocol.h — but it is a decision
+    -- about which machines the package supports, not a compiler detail, so it
+    -- is written here as one line to change rather than inferred from whoever
+    -- ran the build.
+    --
+    -- -mtune stays native: it only reorders for the local CPU and emits nothing
+    -- an older one cannot execute.  For a package it is a no-op worth keeping
+    -- because Dev and Release then schedule alike.
     filter "configurations:Release"
         optimize "Full"
         buildoptions {
@@ -77,9 +98,33 @@ workspace "Socketley"
             "-fstack-protector-strong",
             "-D_FORTIFY_SOURCE=2",
             "-fvisibility=hidden",
-            "-march=native",
+            "-march=x86-64-v2",
             "-mtune=native"
         }
+        -- ─── HOW TO CHECK THIS, IF IT IS EVER CHANGED AGAIN ─────────────────
+        --
+        -- Two things made the first attempt at this report the wrong answer,
+        -- and both are worth knowing before touching the line above.
+        --
+        -- `make` does not rebuild on a flag change.  Editing this file and
+        -- running make recompiles nothing, because no source moved — so the
+        -- binary still carries whatever the previous flags produced and
+        -- measuring it measures the old build.  `make config=release_x64 clean`
+        -- first, or the number is meaningless.  That is what made -march look
+        -- as though it were being ignored.
+        --
+        -- And the object files cannot answer the question.  With -flto they
+        -- hold GIMPLE, not machine code, so `objdump -d` over them reports no
+        -- AVX2 whatever the flags say — including when there is AVX2 in the
+        -- final binary.  The linked binary is the only thing worth
+        -- disassembling in an LTO build:
+        --
+        --     objdump -d bin/Release/socketley | grep -cw vinserti128
+        --
+        -- Measured after a clean rebuild: 26 before this change, 0 after, with
+        -- -march on the compile line alone.  gcc carries each translation
+        -- unit's options into the LTO backend, so repeating it here buys
+        -- nothing and is left out.
         linkoptions {
             "-flto=auto",
             "-Wl,-z,relro,-z,now",
@@ -472,6 +517,42 @@ project "test_name_resolver"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: flag value parsers ───
+--
+-- Header-only, so nothing links against the daemon: the four parsers are
+-- inline in flag_handlers.h and that is the whole dependency.
+
+project "test_flag_parsers"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_flag_parsers.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: managed runtime ───
 
 project "test_request_channel"
@@ -843,6 +924,31 @@ project "fuzz_resp"
 
     files {
         "test/fuzz/fuzz_resp.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: the JSON pair behind socketley.json_decode / json_encode ─────────
+--
+-- The one binding written to be pointed at data from the network, and the one
+-- that had no depth limit: a few hundred kilobytes of nesting was a SIGSEGV.
+-- It became fuzzable when the pair moved out of lua_context.cpp into
+-- lua_json.h — see the header for why it had to.  Needs LuaJIT, because the
+-- decoder builds Lua values.
+
+project "fuzz_lua_json"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit" }
+    links { "luajit" }
+
+    files {
+        "test/fuzz/fuzz_lua_json.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h"
     }

@@ -802,11 +802,42 @@ uint16_t next_port()
     // listener nor a harness backend can collide with a socket the kernel
     // handed out, and rotated so a port left in an odd state by one input does
     // not decide the next one.
-    static uint16_t p = 0;
-    if (p == 0)
-        p = static_cast<uint16_t>(20000 + (::getpid() % 4000));
-    if (++p >= 30000)
-        p = 20000;
+    static uint16_t base = 0, top = 0, p = 0;
+    if (base == 0)
+    {
+        // Where to stay, when something else on this machine has claimed
+        // ports of its own.
+        //
+        // 20000-29999 is below the ephemeral range, which is what this was
+        // chosen for -- but it is also exactly where test/integration's
+        // lib_ports.sh hands out its 2000-wide windows (21000, 23000, 25000,
+        // 27000, 29000), and that claim is made under an flock this harness
+        // does not take.  A fuzz target squatting in a claimed window makes a
+        // suite fail on a port it was promised: measured, a Sanitize run in
+        // window 21000 came back 139/2 with fuzz targets live and 141/0 on a
+        // quiet machine.
+        //
+        // So the range is overridable, and test/nightly.sh points the fuzz job
+        // at 31000-32767 -- still below ephemeral, and the one stretch no
+        // window reaches.  Unset, this is what it always was.
+        base = 20000;
+        top  = 30000;
+        if (const char* env = ::getenv("SOCKETLEY_FUZZ_PORT_BASE"))
+        {
+            const long v = ::strtol(env, nullptr, 10);
+            if (v >= 1024 && v < 32000)
+            {
+                base = static_cast<uint16_t>(v);
+                const char* env_top = ::getenv("SOCKETLEY_FUZZ_PORT_TOP");
+                const long  t       = env_top ? ::strtol(env_top, nullptr, 10) : 0;
+                top = (t > v && t <= 32768) ? static_cast<uint16_t>(t)
+                                            : static_cast<uint16_t>(32768);
+            }
+        }
+        p = static_cast<uint16_t>(base + (::getpid() % (top - base)));
+    }
+    if (++p >= top)
+        p = base;
     return p;
 }
 
@@ -1719,7 +1750,34 @@ void client_send(world& w, int idx, int shape)
     if (w.rt && c.proxy_fd >= 0 && c.proxy_fd < proxy_instance::MAX_FDS)
     {
         const auto* cc = w.rt->m_client_slots[c.proxy_fd].get();
-        proxy_ending = (cc == nullptr) || cc->closing;
+        // client_conn_close as well as closing, because `closing` is the
+        // teardown and the undertaking comes before it.
+        //
+        // A request carrying "Connection: close" is the CLIENT ending the
+        // connection.  The proxy records that while parsing the request and
+        // closes after answering it, which is what RFC 9112 Section 9.6
+        // requires -- and the same section forbids the client from sending
+        // another request on it.  But `closing` only becomes true at the
+        // teardown, so between the two there is a window where the proxy has
+        // undertaken to close, has not yet done it, and a request written into
+        // that window was counted as one deserving an answer.
+        //
+        // Measured on the 125-byte artefact the nightly of 2026-08-14 aborted
+        // on, at the second send:
+        //
+        //     closing=0  conn_close=1  announced=0  ->  counted=1
+        //
+        // The proxy then closed the pair with 57 bytes of that request still in
+        // its buffer, which is correct, and the oracle called it
+        // answer-lost-to-a-half-close.  Nothing was lost that had been promised.
+        //
+        // peer_announced_close does not cover it: that reads the proxy's own
+        // words, and here there are none to read.  The proxy forwards the
+        // backend's response verbatim -- which is what makes responses stream --
+        // so it has no rewriter with which to add the "close" connection option
+        // Section 9.6 says a server SHOULD send back.  The undertaking is real
+        // and only the connection state records it.
+        proxy_ending = (cc == nullptr) || cc->closing || cc->client_conn_close;
     }
 
     if (static_cast<size_t>(n) == buf.size() && whole > 0 &&
