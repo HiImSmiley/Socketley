@@ -24,9 +24,13 @@
 # server be removed inside it: four clients reporting a live connection to a
 # server that had been deleted, for as long as anyone watched.
 #
-# The option bought nothing measurable.  Interleaved A/B, five passes each:
-# connection rate 17,064/s with against 16,842/s without (0.987x), round trip
-# p50 21.36us against 20.78us -- both inside the run-to-run spread.
+# It is not free to remove, and the first measurement of that was wrong.  A
+# `server conn` at 20,000 connections said 0.987x -- but 20,000 is past the
+# 28,231 ephemeral ports this box has, so both arms were bottlenecked on
+# TIME-WAIT.  At 2,000 with the pool drained between runs, twelve passes:
+# main 104,488/s, main-with-this-option-removed 86,870/s, this tree 88,156/s.
+# About a sixth of the connection-establishment rate, and both builds do accept
+# all of them -- 9.7us per connection against 13.0.
 #
 # ─── WHAT THESE ASSERTIONS WOULD CATCH ──────────────────────────────────────
 #

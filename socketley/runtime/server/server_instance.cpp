@@ -1190,20 +1190,38 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     // inside it: four clients reporting a live connection to a server that was
     // deleted, indefinitely.
     //
-    // What it bought, measured, interleaved A/B, five passes each:
+    // WHAT IT COSTS TO REMOVE IT, and this number was got wrong once.
     //
-    //     connection rate   17,064/s with   16,842/s without   0.987x
-    //     round trip p50     21.36 us with   20.78 us without
+    // The first measurement said "nothing": 17,064/s with the option against
+    // 16,842/s without.  That was `server conn` at 20,000 connections a run,
+    // which on this box is past the 28,231 ephemeral ports it has -- both arms
+    // were bottlenecked on TIME-WAIT and the figure was the port pool, not the
+    // listener.  The same test at 2,000 connections with the pool drained
+    // between runs, twelve interleaved passes, three builds:
     //
-    // Nothing.  Both differences are inside the run-to-run spread, and the two
-    // 39,000/s outliers in the "with" arm are the tell rather than noise: with
-    // the option the server never accepts a data-less connection at all, so
-    // what that benchmark sometimes measured was the client's connect() rate
-    // against a listener that was not answering.
+    //     server burst   main                       104,488/s
+    //                    main, this line removed     86,870/s   -17%
+    //                    this tree                   88,156/s   -16%
     //
-    // Not kept for HTTP mode either, where the client does speak first: a
-    // mode-dependent branch in listener setup is surface to maintain, and the
-    // measurement above says there is nothing on the other side of it.
+    // main-minus-this-line lands on this tree, so the whole difference is this
+    // option and nothing else in the branch regressed.  Checked further, 800
+    // connections opened and held: both builds accept all 800, so the loss is
+    // real establishment cost and not a listener declining to answer -- 9.7 us
+    // per connection with the option, 13.0 without.  The deferral lets connect()
+    // return before the server is involved, so the client can fire the next one
+    // sooner.
+    //
+    // Removed anyway, and the trade is worth stating plainly rather than hiding
+    // behind a wrong number: about a sixth of the connection-establishment rate
+    // on a connection-storm workload, against a connection that is visible to
+    // the server when it happens instead of up to five seconds later, an
+    // on_connect that fires, a server that can speak first, and a client that is
+    // told when its connection dies instead of holding it forever.
+    //
+    // Not kept for HTTP mode either, where the client does speak first: the
+    // deferral would be free there, but a mode-dependent branch in listener
+    // setup is a second configuration of the accept path to keep correct, and
+    // the failure it would reintroduce is the silent one above.
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
