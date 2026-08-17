@@ -735,6 +735,39 @@ project "test_sdk_control"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Benchmark: floor_relay ───
+--
+-- The same idea as floor_server one hop further out: what four handoffs cost
+-- when nothing between them is ours.  See the header of test/benchmark/floor_relay.c.
+
+project "floor_relay"
+    kind "ConsoleApp"
+    language "C"
+    cdialect "C17"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    buildoptions { "-pipe" }
+
+    files { "test/benchmark/floor_relay.c" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Benchmark: floor_server ───
 --
 -- The irreducible cost of the server benchmarks' traffic: accept, read, write.
