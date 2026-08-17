@@ -1160,10 +1160,50 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data,
-    // eliminating the empty-accept + read round-trip on the hot path
-    int defer_secs = 1;
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
+    // ─── NO TCP_DEFER_ACCEPT, AND THAT IS THE POINT ─────────────────────────
+    //
+    // This set it with a one-second timeout, "eliminating the empty-accept +
+    // read round-trip on the hot path".  What it actually does is tell the
+    // kernel not to complete a connection until the CLIENT sends data — so a
+    // connection that has not spoken yet is not a connection this server has,
+    // and everything downstream of accept() is simply not running for it.
+    //
+    // Measured on Release, one idle client against a --mode inout server:
+    //
+    //     t=0.5s   server side SYN-RECV,  `ls` says CONN=0, client connected
+    //     t=2.0s   server side ESTAB,     `ls` says CONN=0
+    //     t=5.0s                          `ls` says CONN=1
+    //
+    // Five seconds during which the client believes it is connected and the
+    // server does not know it exists.  on_connect has not fired, the connection
+    // is in no count and no listing, and a server whose protocol speaks first —
+    // a greeting, a banner, a push — cannot, because there is nobody to speak
+    // to yet.  Without the option the same connection is CONN=1 at 0.5s.
+    //
+    // And the failure mode is worse than the delay.  A connection still in
+    // SYN-RECV is a request sock, not a socket; when the listener closes, the
+    // kernel drops it SILENTLY — no FIN, no RST.  The client is left
+    // ESTABLISHED against a peer that no longer exists, with nothing to notice:
+    // there is no SO_KEEPALIVE on either end, so it holds that dead connection
+    // until it next tries to write.  That is how test_client_reconnect.sh fails
+    // on a Sanitize build, where the window is wide enough to remove a server
+    // inside it: four clients reporting a live connection to a server that was
+    // deleted, indefinitely.
+    //
+    // What it bought, measured, interleaved A/B, five passes each:
+    //
+    //     connection rate   17,064/s with   16,842/s without   0.987x
+    //     round trip p50     21.36 us with   20.78 us without
+    //
+    // Nothing.  Both differences are inside the run-to-run spread, and the two
+    // 39,000/s outliers in the "with" arm are the tell rather than noise: with
+    // the option the server never accepts a data-less connection at all, so
+    // what that benchmark sometimes measured was the client's connect() rate
+    // against a listener that was not answering.
+    //
+    // Not kept for HTTP mode either, where the client does speak first: a
+    // mode-dependent branch in listener setup is surface to maintain, and the
+    // measurement above says there is nothing on the other side of it.
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
