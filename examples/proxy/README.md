@@ -31,6 +31,17 @@ separate stores behind one port, and a sharded server would split whatever
 cross-connection state its script holds — both silently, which is why both
 refuse the flag. `SO_REUSEPORT` balances per connection, not per request.
 
+### Unix Socket Sidecar
+`--backend unix:/path/to.sock` on the proxy and `--listen unix:/path/to.sock` on
+the server, so a sidecar and the process it fronts talk without a loopback TCP
+stack between them. Measured on a quiet machine, 64-byte round trips through the
+proxy: 40.2 us over TCP against 37.8 us over AF_UNIX unpinned, 24.3 against 23.9
+on one core — a few percent, and about as much of the kernel-only difference
+(2.95 us / 0.97 us for the same swap with no socketley in the path) as there is
+to take. The backend can be named by path or by runtime name. The socket node is
+created `0600`, so both ends must run as the same user; there is no flag to
+widen it, and TLS to a unix backend is refused rather than ignored.
+
 ### TLS Proxy
 TLS on the proxy's own listener, on the leg to an `https://` backend, or both,
 with mutual TLS in either direction. The backend leg always verifies the chain

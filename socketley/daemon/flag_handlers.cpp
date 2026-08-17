@@ -4,6 +4,7 @@
 #include "../shared/tls_context.h"
 #include <iostream>
 #include <charconv>
+#include <sys/un.h>
 #include "../shared/runtime_manager.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
@@ -513,11 +514,69 @@ bool parse_cache_mode(uint32_t hash, cache_mode& mode)
     }
 }
 
+// `--listen unix:/path/to.sock` — an AF_UNIX listener instead of a port.
+//
+// Shared by create and edit so the two cannot disagree about what the flag
+// accepts; the difference between them is only when it takes effect.  Returns
+// 0 on success, 1 with a message on refusal, and advances `i` past the value.
+//
+// Every refusal here is a configuration-time one on purpose.  The kernel
+// truncates a path of 108 bytes or more without saying so, and a trimmed path
+// names a different socket — very possibly a real one that something else is
+// serving — so this is the last point at which the operator can be told which
+// socket they actually asked for.
+static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i)
+{
+    if (i + 1 >= pa.count)
+    {
+        std::cout << "--listen requires an address (unix:/path/to.sock)\n";
+        return 1;
+    }
+    const std::string_view value = pa.args[++i];
+
+    if (!value.starts_with("unix:"))
+    {
+        std::cout << "--listen takes unix:/path/to.sock; a TCP port is -p\n";
+        return 1;
+    }
+    const std::string_view path = value.substr(5);
+
+    if (path.empty())
+    {
+        std::cout << "--listen unix: has no socket path after the prefix\n";
+        return 1;
+    }
+    if (path[0] != '/')
+    {
+        std::cout << "--listen: the socket path must be absolute (got \"" << path << "\")\n";
+        return 1;
+    }
+    struct sockaddr_un probe{};
+    if (path.size() >= sizeof(probe.sun_path))
+    {
+        std::cout << "--listen: the socket path is " << path.size()
+                  << " bytes and the kernel's limit is " << (sizeof(probe.sun_path) - 1)
+                  << " -- it would be truncated to a different socket\n";
+        return 1;
+    }
+    if (path.find('\0') != std::string_view::npos)
+    {
+        std::cout << "--listen: the socket path contains a NUL byte\n";
+        return 1;
+    }
+
+    rt->set_listen_path(path);
+    return 0;
+}
+
 int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                        runtime_manager* mgr, std::string_view /*name*/)
 {
     switch (pa.hashes[i])
     {
+        case fnv1a("--listen"):
+            return parse_listen_flag(srv, pa, i);
+
         case fnv1a("--mode"):
         {
             if (i + 1 >= pa.count)
@@ -1333,6 +1392,18 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
 {
     switch (pa.hashes[i])
     {
+        // Same rule as `-p` above it, and for a sharper reason: a running
+        // server is bound to the socket node it has, so moving it would mean
+        // binding a second path underneath whatever is already connected and
+        // leaving the first node for a teardown that never comes.
+        case fnv1a("--listen"):
+            if (is_running)
+            {
+                std::cout << "cannot change the listen socket while running\n";
+                return 1;
+            }
+            return parse_listen_flag(srv, pa, i);
+
         case fnv1a("--mode"):
         {
             if (i + 1 >= pa.count)

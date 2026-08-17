@@ -3436,6 +3436,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "cannot change port while running\n";
             return 1;
         }
+        // The listener's other spelling, under the same rule.  A running
+        // server is bound to the socket node it has; moving it would mean
+        // unbinding one path and binding another underneath whatever is already
+        // connected, and the node the old listener owns would be left for the
+        // teardown that never came.
+        if (cfg.listen_path != std::string(instance->get_listen_path()))
+        {
+            conn->write_buf = "cannot change the listen socket while running\n";
+            return 1;
+        }
         // The same rule as the port above, and as `edit --shards`: applying it
         // to a running proxy would mean retiring workers out from under live
         // connections.  Refused rather than quietly dropped — see the note
@@ -3518,6 +3528,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     const auto has = [&cfg](const char* key) { return cfg.has(key); };
 
     if (has("port"))              instance->set_port(cfg.port);
+    if (has("listen"))            instance->set_listen_path(cfg.listen_path);
     if (has("log_file"))          instance->set_log_file(cfg.log_file);
     if (has("write_file"))        instance->set_write_file(cfg.write_file);
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);

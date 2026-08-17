@@ -30,6 +30,10 @@ struct runtime_config
     std::string id;
     runtime_type type = runtime_server;
     uint16_t port = 0;
+    // `--listen unix:/path` — an AF_UNIX listener instead of a port.  See
+    // runtime_instance::set_listen_path.  Mutually exclusive with `port`; the
+    // refusal is where the flag is read, not here.
+    std::string listen_path;
     bool was_running = false;
 
     // Common

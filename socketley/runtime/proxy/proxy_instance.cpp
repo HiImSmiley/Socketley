@@ -978,6 +978,97 @@ inline void proxy_instance::tune_socket(int fd)
     if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {}
 }
 
+// Make `b` a unix-socket backend at `path`, or refuse and say why.
+//
+// TWO callers, which is why it is a function: `--backend unix:/path` writes the
+// path on the command line, and `--backend <runtime-name>` gets one out of the
+// endpoint table when that runtime listens with `--listen unix:...`.  They are
+// the same backend and have to be refused for the same reasons; the second one
+// is exactly where a rule kept at the first would have been missed.
+//
+// Every refusal here fails the whole start rather than letting the proxy come
+// up and answer 502 to its first request.  A backend that provably cannot work
+// is known at configuration time, and reporting it at traffic time is reporting
+// it to the wrong person.
+//
+// `where` names the thing the operator wrote, so the message points at the flag
+// rather than at the path it produced.
+static bool configure_unix_backend(backend_info& b, std::string_view path,
+                                   std::string_view where)
+{
+    if (path.empty())
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": no socket path").c_str());
+        return false;
+    }
+
+    // Absolute, and this is not tidiness.  Two things rest on it: a relative
+    // path is resolved against the daemon's working directory, which is not
+    // something an operator writing a flag can see, and the connection pool
+    // keys a unix backend as (path, 0) — a leading '/' is what makes that key
+    // unable to collide with a hostname's.  A leading NUL, which is how Linux
+    // spells an abstract socket, is refused by the same test and deliberately:
+    // an abstract name is in no filesystem and so is bounded by nothing but the
+    // network namespace.
+    if (path[0] != '/')
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": the socket path must be absolute").c_str());
+        return false;
+    }
+
+    // sun_path is 108 bytes including its terminator, and the kernel truncates
+    // silently.  A trimmed path names a different socket — very possibly one
+    // that exists — so this refuses rather than pointing the proxy at whatever
+    // the first 107 bytes happen to reach.
+    struct sockaddr_un probe{};
+    if (path.size() >= sizeof(probe.sun_path))
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) + ": the socket path is " +
+                   std::to_string(path.size()) + " bytes, and the kernel's limit is " +
+                   std::to_string(sizeof(probe.sun_path) - 1) +
+                   " -- it would be truncated to a different socket").c_str());
+        return false;
+    }
+
+    // A NUL inside the path would end it early for the kernel and not for us,
+    // which is the truncation above wearing a different hat.
+    if (path.find('\0') != std::string_view::npos)
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": the socket path contains a NUL byte").c_str());
+        return false;
+    }
+
+    // TLS to a unix socket is refused, not ignored.  b.tls is already set from
+    // the backend-TLS options by the time this runs, so this catches --ca /
+    // --client-cert / --client-key applied to a proxy that has a unix backend;
+    // an `https://` scheme cannot reach here at all.  Encrypting a socket the
+    // kernel never puts on a wire buys nothing the filesystem permissions on
+    // the node do not already give, and quietly dropping the flags would be the
+    // fail-open answer to a set this project treats as meaning nothing against
+    // a cleartext peer.
+    if (b.tls)
+    {
+        LOG_ERROR(("proxy backend " + std::string(where) +
+                   ": --ca, --client-cert and --client-key encrypt every backend "
+                   "leg, and there is no TLS to a unix socket").c_str());
+        return false;
+    }
+
+    b.is_unix = true;
+    b.unix_path = std::string(path);
+    // The path is the endpoint, and resolved_port stays 0 — see backend_info.
+    // has_cached_addr says "this backend has somewhere to connect to", which a
+    // path always does: there is no lookup to fail and so nothing for the idle
+    // sweep to retry.
+    b.resolved_host = b.unix_path;
+    b.resolved_port = 0;
+    b.has_cached_addr = true;
+    return true;
+}
+
 bool proxy_instance::resolve_backend(backend_info& b)
 {
     // Group references (@groupname) are resolved dynamically at connection time
@@ -988,86 +1079,9 @@ bool proxy_instance::resolve_backend(backend_info& b)
     }
 
     // ─── unix:/path/to.sock ─────────────────────────────────────────────────
-    //
-    // Checked here and nowhere else, and every one of these refuses the whole
-    // start rather than letting the proxy come up and answer 502 to its first
-    // request.  A backend that provably cannot work is known at configuration
-    // time; reporting it at traffic time is reporting it to the wrong person.
     if (std::string_view(b.address).starts_with("unix:"))
-    {
-        const std::string_view path = std::string_view(b.address).substr(5);
-
-        if (path.empty())
-        {
-            LOG_ERROR("proxy backend \"unix:\": no socket path after the prefix");
-            return false;
-        }
-
-        // Absolute, and this is not tidiness.  Two things rest on it: a
-        // relative path is resolved against the daemon's working directory,
-        // which is not something an operator writing a flag can see, and the
-        // connection pool keys a unix backend as (path, 0) — a leading '/' is
-        // what makes that key unable to collide with a hostname's.  A leading
-        // NUL, which is how Linux spells an abstract socket, is refused by the
-        // same test and deliberately: an abstract name is in no filesystem and
-        // so is bounded by nothing but the network namespace.
-        if (path[0] != '/')
-        {
-            LOG_ERROR(("proxy backend \"" + b.address +
-                       "\": the socket path must be absolute").c_str());
-            return false;
-        }
-
-        // sun_path is 108 bytes including its terminator, and the kernel
-        // truncates silently.  A trimmed path names a different socket — very
-        // possibly one that exists — so this refuses rather than binds the
-        // proxy to whatever the first 107 bytes happen to reach.
-        struct sockaddr_un probe{};
-        if (path.size() >= sizeof(probe.sun_path))
-        {
-            LOG_ERROR(("proxy backend \"" + b.address + "\": the socket path is " +
-                       std::to_string(path.size()) + " bytes, and the kernel's limit is " +
-                       std::to_string(sizeof(probe.sun_path) - 1) +
-                       " -- it would be truncated to a different socket").c_str());
-            return false;
-        }
-
-        // A NUL inside the path would end it early for the kernel and not for
-        // us, which is the truncation above wearing a different hat.
-        if (path.find('\0') != std::string_view::npos)
-        {
-            LOG_ERROR("proxy backend: the socket path contains a NUL byte");
-            return false;
-        }
-
-        // TLS to a unix socket is refused, not ignored.  b.tls is already set
-        // from the backend-TLS options by the time this runs, so this catches
-        // --ca / --client-cert / --client-key applied to a proxy that has a
-        // unix backend, and an `https://` scheme cannot reach here at all.
-        // Encrypting a socket the kernel never puts on a wire buys nothing that
-        // the filesystem permissions on the node do not already give; quietly
-        // dropping the flags would be the fail-open answer, and this project
-        // has the rule that none of the three means anything against a
-        // cleartext peer.
-        if (b.tls)
-        {
-            LOG_ERROR(("proxy backend \"" + b.address +
-                       "\": --ca, --client-cert and --client-key encrypt every backend "
-                       "leg, and there is no TLS to a unix socket").c_str());
-            return false;
-        }
-
-        b.is_unix = true;
-        b.unix_path = std::string(path);
-        // The path is the endpoint, and resolved_port stays 0 — see
-        // backend_info.  has_cached_addr says "this backend has somewhere to
-        // connect to", which a path always does; there is no lookup to fail and
-        // so nothing for the idle sweep to retry.
-        b.resolved_host = b.unix_path;
-        b.resolved_port = 0;
-        b.has_cached_addr = true;
-        return true;
-    }
+        return configure_unix_backend(b, std::string_view(b.address).substr(5),
+                                      "\"" + b.address + "\"");
 
     // A scheme says how to reach this backend, not only where.  "https://" is
     // how one backend is asked for over TLS while its neighbours stay
@@ -1169,8 +1183,21 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return false;
 
     const runtime_endpoint* ep = m_endpoints->find_name(b.address);
-    if (!ep || ep->port == 0)
+    if (!ep)
         return false;
+
+    // A runtime that listens with `--listen unix:...` publishes its socket path
+    // here with the port left at 0 — the same (path, 0) shape used everywhere
+    // else a unix endpoint has to be named.  It reaches the same validation the
+    // written-out `unix:` form does, which is the point of that being a
+    // function: a proxy pointed at such a runtime by name must be refused for
+    // the same reasons and told so in the same words.
+    if (ep->port == 0)
+    {
+        if (ep->host.empty() || ep->host[0] != '/')
+            return false;
+        return configure_unix_backend(b, ep->host, "\"" + b.address + "\"");
+    }
 
     b.resolved_host = ep->host;
     const uint16_t port = ep->port;

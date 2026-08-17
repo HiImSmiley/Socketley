@@ -718,6 +718,7 @@ l l l.
 Field	Type	Description
 _
 port	number	Listener/connection port \fB(requires restart)\fR
+listen	string	"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server; requires restart)\fR
 log_file	string	State transition log file path
 write_file	string	Message write file path
 lua_script	string	Lua script path (absolute)
@@ -1346,6 +1347,59 @@ group rather than present and refusing connections \(em being routed to an
 address that is not accepting yet would trip the routing proxy's circuit breaker
 against a member that is merely young.
 .SH SERVER FLAGS
+.TP
+.BI "\-\-listen unix:" "/path/to.sock"
+Listen on an AF_UNIX socket instead of a TCP port. The other half of
+.BI \-\-backend " unix:" /path/to.sock
+under
+.BR "PROXY FLAGS" ,
+so a proxy and the server it fronts can talk on one host without a loopback TCP
+stack between them.
+.RS
+.PP
+Mutually exclusive with
+.BR \-p ,
+with
+.B \-\-udp
+(that would be a unix datagram socket, which is a different thing and is not
+this) and with
+.B \-\-tls
+(a unix socket is not on a network; the permissions on the node are what
+restrict it). Each combination is refused at start with the reason in the daemon
+log, rather than one of the two winning quietly.
+.PP
+The path must be absolute and shorter than 108 bytes, which is what the kernel's
+.I sun_path
+holds. Both are refused when the flag is read \(em the kernel truncates a long
+path silently, and a trimmed path names a different socket, very possibly a real
+one belonging to something else.
+.PP
+.B The socket node is created 0600.
+Connecting to a unix socket needs write permission on the node, so leaving that
+to the umask means a daemon running under
+.B umask 0
+publishes a listener anybody on the machine can talk to. There is deliberately
+no flag to widen it: a peer running as another user cannot connect, and the way
+round that today is a parent directory the operator owns and controls.
+.PP
+The node is removed when the runtime stops. One left behind by a daemon that was
+killed, or by a machine that lost power, is taken over on the next start \(em but
+only after connecting to it to check that nobody is serving it. A path that
+something IS serving is refused, so a second runtime cannot take a live socket
+away from the first.
+.PP
+A server listening this way is reachable as a proxy backend both by its path and
+by its runtime name. It is deliberately NOT offered as an
+.BI @ group
+member: a group's members are resolved to network addresses per request, and an
+entry the group path cannot dial would take a turn of the round\-robin and answer
+503 with it.
+.PP
+.nf
+socketley create server app --listen unix:/run/app.sock --http /srv/www -s
+socketley create proxy  gw  -p 8080 --backend app -s
+.fi
+.RE
 .TP
 .BI "\-\-mode " "mode"
 Message flow direction:

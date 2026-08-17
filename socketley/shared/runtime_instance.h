@@ -83,6 +83,21 @@ public:
     void set_port(uint16_t port);
     uint16_t get_port() const;
 
+    // Where this runtime listens, when that is not a port.
+    //
+    // `--listen unix:/run/app.sock` on a server: the listener is an AF_UNIX
+    // socket at this path and the port stays 0.  Empty means the ordinary
+    // case, a TCP listener on get_port().  The two are alternatives and never
+    // both — whoever accepts the flag refuses the combination, rather than
+    // leaving this object to decide which of them wins.
+    //
+    // Kept here rather than on server_instance because the things that ask a
+    // runtime where it listens do not know its type: the endpoint table (a
+    // proxy reaching a server by runtime name has to be handed a path instead
+    // of a port), `ls`, `show`, and the state file.
+    void set_listen_path(std::string_view path);
+    std::string_view get_listen_path() const;
+
     void set_log_file(std::string_view path);
     std::string_view get_log_file() const;
 
@@ -685,6 +700,7 @@ private:
     // See last_on_start_error().  Empty unless the most recent on_start raised.
     std::string m_on_start_error;
     uint16_t m_port = 0;
+    std::string m_listen_path;
     bool m_test_mode = false;
     std::string m_log_file;
     std::string m_write_file;

@@ -1099,13 +1099,21 @@ void runtime_manager::publish_endpoints()
         for (const auto& [name, inst] : runtimes)
         {
             const uint16_t port = inst->get_port();
-            if (port == 0)
+            // A runtime listening on a unix socket has no port, and publishes
+            // its socket path in the host field with the port left at 0.  That
+            // is the same (path, 0) shape the proxy keys a unix backend by, and
+            // it cannot be mistaken for a network endpoint for the same reason:
+            // the path is absolute and no hostname is.
+            const std::string_view listen_path = inst->get_listen_path();
+            if (port == 0 && listen_path.empty())
                 continue;
 
             // By name: no state filter, because this is what a backend given as
             // a bare runtime name resolves to, and that resolution happens while
             // the proxy itself is starting — before the target may have.
-            tbl->set_name(name, runtime_endpoint{"127.0.0.1", port});
+            tbl->set_name(name, listen_path.empty()
+                                    ? runtime_endpoint{"127.0.0.1", port}
+                                    : runtime_endpoint{std::string(listen_path), 0});
 
             // By group: running only, which is what get_by_group() filtered on.
             // A member that is merely configured has nothing listening.
@@ -1118,10 +1126,20 @@ void runtime_manager::publish_endpoints()
             // question and is answered by whoever owns the child.  Always true
             // for a runtime that binds here, so nothing about the in-process
             // case changes.
+            //
+            // A unix listener is deliberately NOT offered as a group member.
+            // The group path resolves a member to an AF_INET address per
+            // request and has no route for anything else, so an entry it cannot
+            // dial would take a turn of the round-robin and answer 503 with it.
+            // This is what a unix runtime already got before it could be
+            // published at all — a group has never carried one — and it is said
+            // here so the exclusion is a decision rather than a leftover.  By
+            // name and by explicit `unix:` path, both of which name exactly one
+            // peer, it works.
             const std::string_view group = inst->get_group();
             const bool running = (inst->get_state() == runtime_running) &&
                                  inst->endpoint_live();
-            if (!group.empty() && running)
+            if (!group.empty() && running && listen_path.empty())
                 tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
 
             // And what this runtime says it will answer, if its script says so

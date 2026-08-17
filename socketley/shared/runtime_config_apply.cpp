@@ -52,6 +52,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     // function is used on a runtime that is already configured as well as on a
     // fresh one.
     if (cfg.port > 0)                rt.set_port(cfg.port);
+    if (!cfg.listen_path.empty())    rt.set_listen_path(cfg.listen_path);
     if (!cfg.group.empty())          rt.set_group(cfg.group);
     if (!cfg.log_file.empty())       rt.set_log_file(cfg.log_file);
     if (!cfg.write_file.empty())     rt.set_write_file(cfg.write_file);
