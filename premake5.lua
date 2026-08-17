@@ -768,6 +768,42 @@ project "floor_relay"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Benchmark: floor_sockmap ───
+--
+-- The same four handoffs with the relay taken out of the loop entirely: a BPF
+-- sockmap moves the bytes between the two sockets inside the kernel.  Needs
+-- root to run (unprivileged BPF is off on this kernel) and answers one
+-- question -- what the relay's own syscalls and copies are worth.  See the
+-- header of test/benchmark/floor_sockmap.c.
+
+project "floor_sockmap"
+    kind "ConsoleApp"
+    language "C"
+    cdialect "C17"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    buildoptions { "-pipe" }
+
+    files { "test/benchmark/floor_sockmap.c" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Benchmark: floor_pingpong ───
 --
 -- One duplex exchange, AF_UNIX against loopback TCP, interleaved -- the number
