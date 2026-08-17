@@ -1747,6 +1747,15 @@ Enable automatic reconnection with exponential backoff when the connection
 is lost. Backoff starts at 1 second and doubles each attempt up to 30 seconds,
 with random jitter. Set to 0 for infinite attempts (default when flag is given
 without a value). Set to a positive number to limit reconnection attempts.
+.IP
+"When the connection is lost" includes a peer that never says so. A close sends
+a FIN or an RST and is acted on at once, but a machine that loses power, a link
+that partitions or a firewall that forgets an idle flow send nothing at all, and
+an idle client that never writes would never find out. Every client socket
+therefore carries TCP keepalive: 60 seconds idle, then three probes ten seconds
+apart, so a peer that has silently gone is noticed in about 90 seconds and the
+backoff above starts from there. There is no flag for it \(em the kernel's own
+default is two hours, which for this purpose is the same as never.
 .PP
 A client also takes the TLS flags \(em see
 .B \-\-tls

@@ -82,6 +82,46 @@ size_t client_instance::get_connection_count() const
     return m_connected ? 1 : 0;
 }
 
+// ─── EVERYTHING A CLIENT'S SOCKET NEEDS, IN ONE PLACE ───────────────────────
+//
+// try_connect() creates the socket twice -- once, and again after a cached DNS
+// answer turns out to be stale -- and each copy set TCP_NODELAY for itself.
+// Two is how three starts, and the option below is exactly the kind that gets
+// added to one of them: the second socket is on the *reconnect* path, which is
+// the path that needs it most.
+//
+// SO_KEEPALIVE, because a peer can go away without saying so.  A FIN or an RST
+// is a message, and a client acts on either the moment it arrives; a machine
+// that loses power, a link that partitions, a firewall that forgets an idle
+// flow -- none of those send anything.  The socket then stays ESTABLISHED
+// against nothing, and an idle client never writes, so it never finds out.
+// With --reconnect that is the worse half: the runtime believes it is connected
+// and therefore never reconnects, which is the documented promise not kept.
+//
+// The kernel's own default idle is two hours.  60s idle, 10s between probes,
+// 3 probes puts detection at about 90 seconds -- one packet every 60s per idle
+// connection, which is nothing, against a promise that otherwise waits until
+// after lunch.  No flag: a knob here would be a number nobody has a reason to
+// pick, and the failure it guards is not one an operator can see coming.
+//
+// This is the client's own outbound socket.  A server's accepted connections
+// are covered by --idle-timeout, which is a different question -- "this peer
+// has nothing to say" rather than "this peer is gone".
+static void tune_client_socket(int fd, bool udp)
+{
+    if (udp)
+        return;   // no connection to keep alive, and no Nagle to turn off
+
+    int opt = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {}
+
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0) {}
+    int idle = 60, intvl = 10, cnt = 3;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle))  < 0) {}
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {}
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt))   < 0) {}
+}
+
 bool client_instance::try_connect()
 {
     std::string host = "127.0.0.1";
@@ -116,11 +156,7 @@ bool client_instance::try_connect()
     if (m_conn->fd < 0)
         return false;
 
-    if (!m_udp)
-    {
-        int opt = 1;
-        setsockopt(m_conn->fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    }
+    tune_client_socket(m_conn->fd, m_udp);
 
     // Try cached DNS result first (same host:port)
     if (m_has_cached_addr && m_cached_host == host && m_cached_port == port)
@@ -140,11 +176,7 @@ bool client_instance::try_connect()
                         (m_udp ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (m_conn->fd < 0)
             return false;
-        if (!m_udp)
-        {
-            int opt2 = 1;
-            setsockopt(m_conn->fd, IPPROTO_TCP, TCP_NODELAY, &opt2, sizeof(opt2));
-        }
+        tune_client_socket(m_conn->fd, m_udp);
     }
 
     {
