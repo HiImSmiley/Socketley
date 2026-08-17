@@ -60,6 +60,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/un.h>
+#include <stddef.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -92,8 +94,43 @@ static int listen_on(int port)
     return fd;
 }
 
+/* The backend leg, in whichever family it was asked for.
+ *
+ * `host` is either a dotted quad or "unix:/path/to.sock".  The second form is
+ * here for one comparison and one only: the relay's listener stays TCP, so the
+ * client half of the round trip is byte-for-byte the same in both arms and the
+ * only thing that changes is the address family of the backend leg.  Run it
+ * both ways and the difference is exactly what the kernel charges for putting
+ * a loopback TCP stack under a connection that never leaves the host --
+ * measured with none of socketley's code in the path, which is the only way to
+ * say whether the proxy is capturing that saving or losing it.
+ *
+ * tune() is TCP_NODELAY and means nothing on AF_UNIX, so it is not called
+ * there.  Nagle is the one thing that could make this comparison a lie in the
+ * unix arm's favour if it were left applying to only one side. */
 static int dial(const char *host, int port)
 {
+    if (strncmp(host, "unix:", 5) == 0) {
+        const char *path = host + 5;
+        struct sockaddr_un a;
+        memset(&a, 0, sizeof(a));
+        a.sun_family = AF_UNIX;
+        /* sun_path is 108 bytes and truncation is silent, which would dial a
+         * different socket and report its timings as this one's. */
+        if (strlen(path) >= sizeof(a.sun_path)) {
+            fprintf(stderr, "floor_relay: unix path too long (max %zu)\n",
+                    sizeof(a.sun_path) - 1);
+            return -1;
+        }
+        memcpy(a.sun_path, path, strlen(path));
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                                     strlen(path) + 1);
+        if (connect(fd, (struct sockaddr *)&a, alen) < 0) { close(fd); return -1; }
+        return fd;
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_in a;
@@ -224,30 +261,46 @@ int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
 
-    if (argc < 4) {
+    if (argc < 3) {
         fprintf(stderr,
             "Usage: %s <listen-port> <backend-host> <backend-port> [-m block|epoll]\n"
+            "       %s <listen-port> unix:<path>                   [-m block|epoll]\n"
             "\n"
             "The cost of four handoffs with nothing of ours between them.  Pair it\n"
             "with floor_server as the backend and drive both with socketley_bench:\n"
             "\n"
             "  floor_server 30002 -m block &\n"
             "  floor_relay  30001 127.0.0.1 30002 -m block &\n"
-            "  socketley_bench server msg 127.0.0.1 30001 20000 64\n",
-            argv[0]);
+            "  socketley_bench server msg 127.0.0.1 30001 20000 64\n"
+            "\n"
+            "The second form dials the backend over AF_UNIX while the listener\n"
+            "stays TCP, so the two arms differ in the backend leg alone:\n"
+            "\n"
+            "  floor_server -u /tmp/be.sock -m block &\n"
+            "  floor_relay  30001 unix:/tmp/be.sock -m block &\n",
+            argv[0], argv[0]);
         return 1;
     }
 
     int lport = atoi(argv[1]);
     const char *bhost = argv[2];
-    int bport = atoi(argv[3]);
-    if (lport <= 0 || lport > 65535 || bport <= 0 || bport > 65535) {
+    const int backend_is_unix = (strncmp(bhost, "unix:", 5) == 0);
+    /* A unix backend has no port, so the third argument is the mode's and the
+     * option scan starts one earlier. */
+    int argi = backend_is_unix ? 3 : 4;
+    int bport = 0;
+    if (!backend_is_unix) {
+        if (argc < 4) { fprintf(stderr, "floor_relay: a tcp backend needs a port\n"); return 1; }
+        bport = atoi(argv[3]);
+        if (bport <= 0 || bport > 65535) { fprintf(stderr, "floor_relay: bad port\n"); return 1; }
+    }
+    if (lport <= 0 || lport > 65535) {
         fprintf(stderr, "floor_relay: bad port\n");
         return 1;
     }
 
     const char *mode = "block";
-    for (int i = 4; i < argc; i++) {
+    for (int i = argi; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) { mode = argv[i + 1]; i++; }
         else { fprintf(stderr, "floor_relay: unknown argument: %s\n", argv[i]); return 1; }
     }
