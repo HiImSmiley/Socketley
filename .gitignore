@@ -104,3 +104,11 @@ CONTRIBUTING.md
 *.gcda
 *.gcno
 *.gcov
+
+# Agent scratch, not project configuration.  `.claude/worktrees/` holds live
+# git worktrees -- 2.1 GiB of them at the time of writing -- and the lock file
+# belongs to whatever is running, not to the tree.  `.claude/skills/` is left
+# tracked-able on purpose: if it ever holds something the project shares, that
+# is a decision to make deliberately rather than one this line takes away.
+.claude/worktrees/
+.claude/scheduled_tasks.lock
