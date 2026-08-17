@@ -103,6 +103,7 @@
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/un.h>
 
 #define BUF_SIZE   65536
 #define MAX_EVENTS 256
@@ -111,10 +112,43 @@
 /* TCP_NODELAY on every accepted socket, because socketley sets it on its own
  * (server_instance.cpp) and a floor running with Nagle enabled would lose a
  * round-trip comparison to a socket option rather than to anything real. */
+/* TCP_NODELAY on every accepted socket, because socketley sets it on its own
+ * (server_instance.cpp) and a floor left with Nagle on would lose a round-trip
+ * comparison to a socket option.  On AF_UNIX there is no such option and the
+ * setsockopt simply fails, which is why its result is discarded here. */
 static void tune(int fd)
 {
     int opt = 1;
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) { }
+}
+
+/* An AF_UNIX listener, for measuring the same traffic without the TCP stack.
+ *
+ * Added because the handoff budget put 59% of a proxy's cost in the kernel's
+ * charge for two extra handoffs, and a strict ping-pong then measured AF_UNIX at
+ * 9.83us against loopback TCP's 17.93us across a process boundary.  A floor that
+ * could only speak TCP could not be the backend of that comparison. */
+static int listen_unix(const char *path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket(AF_UNIX)"); return -1; }
+
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    /* sun_path is 108 bytes and truncation is silent, which would bind a
+     * different socket than the caller named. */
+    if (strlen(path) >= sizeof(a.sun_path)) {
+        fprintf(stderr, "floor_server: unix path too long (max %zu)\n", sizeof(a.sun_path) - 1);
+        close(fd);
+        return -1;
+    }
+    strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+
+    unlink(path);   /* a stale node from a previous run refuses the bind */
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("bind(AF_UNIX)"); close(fd); return -1; }
+    if (listen(fd, BACKLOG) < 0) { perror("listen"); close(fd); return -1; }
+    return fd;
 }
 
 static int listen_on(int port)
@@ -282,14 +316,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int port = atoi(argv[1]);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "floor_server: bad port: %s\n", argv[1]);
-        return 1;
+    /* `-u PATH` listens on an AF_UNIX socket instead of a port.  Everything
+     * after this point is identical, which is the point: the only difference
+     * between the two numbers is the address family. */
+    const char *unix_path = NULL;
+    int port = 0;
+    if (strcmp(argv[1], "-u") == 0) {
+        if (argc < 3) { fprintf(stderr, "floor_server: -u needs a path\n"); return 1; }
+        unix_path = argv[2];
+    } else {
+        port = atoi(argv[1]);
+        if (port <= 0 || port > 65535) {
+            fprintf(stderr, "floor_server: bad port: %s\n", argv[1]);
+            return 1;
+        }
     }
 
     const char *mode = "block";
-    for (int i = 2; i < argc; i++) {
+    for (int i = unix_path ? 3 : 2; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             mode = argv[i + 1];
             i++;
@@ -299,7 +343,7 @@ int main(int argc, char **argv)
         }
     }
 
-    int lfd = listen_on(port);
+    int lfd = unix_path ? listen_unix(unix_path) : listen_on(port);
     if (lfd < 0) return 2;
 
     if (strcmp(mode, "block") == 0) return run_blocking(lfd);
