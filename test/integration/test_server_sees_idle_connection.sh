@@ -111,10 +111,20 @@ else fail "the client connects at all" "no handshake against port $((P + 1)); no
 # timer we have to guess at.  With TCP_DEFER_ACCEPT the server end of a silent
 # connection sits in SYN-RECV -- a request sock, not a socket -- while the
 # client end is ESTABLISHED.  Without it both ends are ESTABLISHED at once.
+#
+# The awk reads to the end and keeps the first match rather than `exit`ing on
+# it.  An early exit closes the pipe, `ss` takes SIGPIPE, and under
+# `set -o pipefail` the pipeline reports 141 -- so the assertion blows the file
+# up precisely when it MATCHES.  Standalone it survived, because a quiet box
+# gives `ss` few enough rows that it is done writing before awk leaves; inside
+# the suite there are hundreds still unwritten and it aborted every time.
+# run_all.sh and lib_daemon.sh both carry this warning already; this is the
+# third place it has been learned.
 srv_state() {
     ss -tan 2>/dev/null | awk -v p="$1" '
-        { n = split($4, l, ":"); m = split($5, r, ":")
-          if (l[n] == p && r[m] != "*") { print $1; exit } }'
+        got == "" { n = split($4, l, ":"); m = split($5, r, ":")
+                    if (l[n] == p && r[m] != "*") got = $1 }
+        END { print got }'
 }
 ST=""
 for _ in $(seq 1 10); do        # 10 x 0.1s = 1s, well inside the old 1s deferral

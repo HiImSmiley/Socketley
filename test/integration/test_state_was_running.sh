@@ -68,7 +68,13 @@ sleep 0.8
 # matching directory the filesystem happens to return first -- which under the
 # full suite was an empty one, and every assertion below then read as vacuous
 # instead of as a result.
-REC=$(find "$HOME/.local/share/socketley" -name 'wr_live.json' -type f 2>/dev/null | head -1)
+# `-print -quit` and not `| head -1`: head closes the pipe at its first line,
+# find takes SIGPIPE, and under `set -o pipefail` the assignment reports 141 and
+# `set -e` ends the file.  It survives here only because this directory is small
+# enough that find is done writing first -- which is a property of the fixture,
+# not of the code.  test_server_sees_idle_connection.sh had the same shape over
+# `ss -tan`, where it is not, and aborted on every full-suite run.
+REC=$(find "$HOME/.local/share/socketley" -name 'wr_live.json' -type f -print -quit 2>/dev/null)
 
 if [ -f "$REC" ]; then pass
 else fail "the state record exists" "no file at $REC; every check below is vacuous"; fi
