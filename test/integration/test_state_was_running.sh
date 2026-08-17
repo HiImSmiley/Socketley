@@ -59,16 +59,16 @@ echo "=== Integration: was_running survives a stop ==="
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 1480))
 
-STATE_DIR=$(find "$HOME/.local/share/socketley" -maxdepth 1 -type d -name 'runtimes*' 2>/dev/null | head -1)
-
 "$BIN" create server wr_live -p $((P + 1)) -s >/dev/null 2>&1 || true
 "$BIN" create server wr_dead -p $((P + 2)) -s >/dev/null 2>&1 || true
 sleep 0.8
 
-if [ -z "$STATE_DIR" ]; then
-    STATE_DIR=$(find "$HOME/.local/share/socketley" -maxdepth 1 -type d -name 'runtimes*' 2>/dev/null | head -1)
-fi
-REC="$STATE_DIR/wr_live.json"
+# Found by the record rather than by the directory's name.  The daemon derives
+# that name from its socket path, and a `runtimes*` glob picks whichever
+# matching directory the filesystem happens to return first -- which under the
+# full suite was an empty one, and every assertion below then read as vacuous
+# instead of as a result.
+REC=$(find "$HOME/.local/share/socketley" -name 'wr_live.json' -type f 2>/dev/null | head -1)
 
 if [ -f "$REC" ]; then pass
 else fail "the state record exists" "no file at $REC; every check below is vacuous"; fi
