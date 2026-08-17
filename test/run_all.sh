@@ -115,7 +115,13 @@ sweep_own_daemons() {
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
         [ "/proc/$p/exe" -ef "$SYS_BIN" ] || continue
-        case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+        # Brace group, as on the environ read below, and not `tr ... <file
+        # 2>/dev/null`.  Redirections are applied left to right, so in that
+        # form the INPUT one is attempted while stderr is still the terminal
+        # and bash reports a vanished process as an error the run cannot act
+        # on:  "run_all.sh: line 118: /proc/425042/cmdline: No such file".
+        # This walk races every exiting daemon by construction.
+        case "$( { tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null )" in
             *" daemon "*|*" daemon") ;;
             *) continue ;;
         esac
