@@ -224,6 +224,46 @@ setup_cache() {
     fi
 }
 
+# Eight runtimes, all silent.
+#
+# Every scenario above this one runs a single runtime, and a single runtime
+# cannot see the cost this scenario exists to catch.  Anything the daemon pushes
+# to its workers scales as workers x rows: with one worker holding one row -- its
+# own -- there is nothing to push and nothing to compare, so a change that wakes
+# every worker on a timer reads as zero here and as zero in every earlier
+# reading of this file.
+#
+# The runtime map replication is the immediate reason, but the shape is general
+# and predates it: `endpoints` is pushed the same way, and so will the cluster
+# view be.  An idle daemon must produce no frames, and the only way to know is
+# to have more than one child to send them to.
+#
+# Read this against cache_idle rather than against daemon_only.  The interesting
+# quantity is (eight_idle - daemon_only) / 8 against (cache_idle - daemon_only):
+# if the per-runtime idle cost is flat, replication is suppressed when nothing
+# changes.  If it grows, something is being sent to a worker that has no reason
+# to wake up.
+setup_eight_idle() {
+    local i port
+    for i in $(seq 1 8); do
+        port=$((CACHE_PORT + 10 + i))
+        socketley_cmd create cache "idle-many-$i" -p "$port" -s >/dev/null 2>&1
+        if ! wait_for_port "$port" 50; then
+            log_error "runtime $i never opened port $port — scenario is invalid"
+            return 1
+        fi
+    done
+    # Confirm all eight are actually up rather than trusting eight creates: a
+    # scenario that silently ran four would report half the cost as though it
+    # were the whole of it.
+    local up
+    up=$(socketley_cmd ls 2>/dev/null | grep -c "idle-many-")
+    if [[ "$up" -ne 8 ]]; then
+        log_error "only $up of 8 runtimes are listed — scenario is invalid"
+        return 1
+    fi
+}
+
 setup_cache_with_ttl() {
     setup_cache || return 1
     # Seed keys whose TTL outlasts the whole measurement, so the sweep keeps
@@ -287,6 +327,10 @@ main() {
     d_cache=$SCENARIO_RESULT
     run_scenario "cache_ttl_keys" "Daemon + cache runtime (200 TTL keys)" setup_cache_with_ttl
     d_ttl=$SCENARIO_RESULT
+    cleanup_runtimes >/dev/null 2>&1
+    local d_eight
+    run_scenario "eight_idle"     "Daemon + 8 idle runtimes"              setup_eight_idle
+    d_eight=$SCENARIO_RESULT
 
     cleanup_runtimes >/dev/null 2>&1
 
@@ -296,6 +340,25 @@ main() {
     printf "  %-42s %9s%%\n" "Daemon only (no runtimes)"        "$d_only"
     printf "  %-42s %9s%%\n" "Daemon + cache runtime (no keys)" "$d_cache"
     printf "  %-42s %9s%%\n" "Daemon + cache (200 TTL keys)"    "$d_ttl"
+    printf "  %-42s %9s%%\n" "Daemon + 8 idle runtimes"         "$d_eight"
+
+    # The per-runtime figure is the point of the last row.  One runtime cannot
+    # show whether anything the daemon pushes to a worker scales with how many
+    # there are; eight can.  Flat means idle really is idle.
+    if [[ -n "$d_only" && -n "$d_eight" && -n "$d_cache" ]]; then
+        python3 - "$d_only" "$d_cache" "$d_eight" <<'PY' 2>/dev/null || true
+import sys
+only, one, eight = (float(x) for x in sys.argv[1:4])
+per_one   = one - only
+per_eight = (eight - only) / 8.0
+print()
+print("  per idle runtime, measured with one : %+.3f%% CPU" % per_one)
+print("  per idle runtime, measured with 8   : %+.3f%% CPU" % per_eight)
+if per_one > 0.02 and per_eight > per_one * 1.5:
+    print("  -> grows with runtime count: something is waking workers that")
+    print("     have no reason to wake.  Not noise at this ratio.")
+PY
+    fi
     echo ""
     echo "  Results: $RESULTS_FILE"
     echo ""
