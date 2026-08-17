@@ -56,6 +56,13 @@ HOLD_PID=""
 cleanup() { [ -n "$HOLD_PID" ] && kill "$HOLD_PID" 2>/dev/null; daemon_stop; }
 trap cleanup EXIT
 
+# Under `set -e` every assertion here is silent when it passes, so a command
+# that fails between them ends the file having printed nothing but its title --
+# which is what this looked like the first time it happened inside the full
+# suite, and standalone it passed on the next two runs.  A death with no line
+# number is not something the next reader can act on, so it says which line.
+trap 'rc=$?; echo "  ABORTED at line $LINENO (exit $rc): ${BASH_COMMAND}"; exit $rc' ERR
+
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail() {
     TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
@@ -142,9 +149,10 @@ if [ -s "$WORK/connected" ]; then pass
 else fail "on_connect fires for an idle connection" \
           "the script's on_connect wrote nothing, so the connection reached no Lua at all"; fi
 
+# `wait ""` is an error, so the pid is used before it is cleared.
 kill "$HOLD_PID" 2>/dev/null || true
-HOLD_PID=""
 wait "$HOLD_PID" 2>/dev/null || true
+HOLD_PID=""
 
 # ─── 3. Removing the server ends the client's connection ────────────────────
 #
@@ -156,7 +164,11 @@ wait "$HOLD_PID" 2>/dev/null || true
 "$BIN" create server dropsrv -p $((P + 2)) --mode inout -s >/dev/null 2>&1 || true
 sleep 1.0
 
-RES=$(python3 "$HERE/lib_idle_conn.py" eof 127.0.0.1 $((P + 2)) 8 "$BIN" remove dropsrv 2>&1 | tail -1)
+# The pipeline is guarded rather than left to `set -o pipefail`: a python that
+# cannot start would otherwise end the file silently instead of failing this
+# assertion, which is the difference between a result and a mystery.
+RES=$(python3 "$HERE/lib_idle_conn.py" eof 127.0.0.1 $((P + 2)) 8 "$BIN" remove dropsrv 2>&1 | tail -1) \
+    || RES="the probe itself failed"
 case "$RES" in
     eof\ *) pass ;;
     *)      fail "removing a server ends an idle client's connection" \
