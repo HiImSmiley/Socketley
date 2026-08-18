@@ -44,6 +44,23 @@ namespace
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
+// How far the publish may back off while nothing changes.  See the block in the
+// worker loop for why this is not simply "publish on change".
+//
+// 900 ms, and the number is not free.  test_worker_idle_cost.sh asserts that an
+// idle runtime's figures are no more than 1000 ms old, because figures_age_ms is
+// what ready_conns waits on, what `stats` prints, and the one signal an operator
+// has that a worker has wedged.  A first attempt capped at 2000 ms and that test
+// caught it at 1358 ms — correctly, and that is the contract being spent rather
+// than a bound being too tight.
+//
+// So the cap sits under the bound with room for the frame to land: 900 ms takes
+// 72% of the publishes off an idle worker where 2000 would have taken 87%, and
+// leaves the freshness guarantee exactly where it was.  The last 15% is
+// available to anyone willing to argue for a looser staleness contract; this
+// change is not that argument.
+constexpr auto stats_backoff_max = std::chrono::milliseconds(900);
+
 // The longest the worker's loop will wait when it has no notification it can
 // trust — the two states named at the wait in run().  It is the constant that
 // wait used to use unconditionally; keeping it here rather than inlining it is
@@ -336,6 +353,33 @@ public:
 
         auto last_stats = std::chrono::steady_clock::now();
 
+        // ─── THE PUBLISH IS THE LAST THING AN IDLE WORKER STILL PAYS FOR ────
+        //
+        // With the 20 ms poll gone, 93% of what an idle runtime costs is this
+        // 4 Hz publish: measured, 395.8 us/s per idle runtime of the 425 that
+        // remained.  Four frames a second, every one of them carrying the same
+        // numbers as the last, for a runtime with nothing connected to it.
+        //
+        // So the interval backs off while nothing moves and snaps back the
+        // instant something does.  A worker under any traffic at all publishes
+        // at the old cadence; one that has been idle converges on
+        // stats_backoff_max.
+        //
+        // WHY NOT PUBLISH ONLY ON CHANGE.  Because the contract is not about
+        // the value.  lib_ready.sh's ready_conns waits until `now -
+        // figures_age_ms >= start` -- until a sample exists that was TAKEN
+        // after the caller asked -- and it asks that of runtimes whose value is
+        // already what it wants.  A pure on-change publish would leave those
+        // callers waiting for a heartbeat that the absence of change is
+        // precisely what delays.  The backoff keeps the heartbeat and only
+        // stretches it.
+        //
+        // The cap is set where the freshness contract puts it — see
+        // stats_backoff_max.  It also bounds the safety pump below, which reads
+        // the control socket once per publish whatever the poll flag says, so
+        // stretching the publish stretches that bound too.
+        auto stats_cur = stats_interval;
+
         while (!m_done && !g_term_requested)
         {
             // One drain pass of the ring, waiting until the next thing this
@@ -409,10 +453,10 @@ public:
             const auto turn_now = std::chrono::steady_clock::now();
             const auto since    = turn_now - last_stats;
             int wait_ms = 0;
-            if (since < stats_interval)
+            if (since < stats_cur)
                 wait_ms = static_cast<int>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                        stats_interval - since).count()) + 1;   // round up: a
+                        stats_cur - since).count()) + 1;   // round up: a
                                                                 // truncated 0
                                                                 // would spin
 
@@ -465,7 +509,7 @@ public:
                 arm_control();
 
             const auto now = std::chrono::steady_clock::now();
-            if (now - last_stats >= stats_interval)
+            if (now - last_stats >= stats_cur)
             {
                 // The skip above rests on "armed and unfired means not
                 // readable".  That is the poll contract, but a worker that
@@ -543,7 +587,13 @@ public:
                     }
                 }
 
-                push_stats();
+                // Doubling, not a jump to the cap: a runtime that goes quiet
+                // for one interval and then moves should not have paid a full
+                // cap's worth of staleness for it.
+                if (push_stats())
+                    stats_cur = stats_interval;
+                else if (stats_cur < stats_backoff_max)
+                    stats_cur = std::min(stats_cur * 2, stats_backoff_max);
                 last_stats = now;
             }
         }
@@ -647,10 +697,13 @@ private:
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
-    void push_stats()
+    bool push_stats()
     {
+        // No runtime, so nothing published and nothing changed — and reporting
+        // "changed" here would hold the interval at its floor for a worker that
+        // has nothing to say.
         if (!m_rt)
-            return;
+            return false;
 
         // On the event-loop thread, which is the only thread allowed to walk
         // the proxy's connection tables.  Everything that leaves this process
@@ -673,13 +726,32 @@ private:
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
 
+        // Did anything the daemon can see actually move?  taken_ns is excluded
+        // on purpose: it changes every time by construction, so comparing it
+        // would make every publish "a change" and the backoff below would never
+        // engage.
+        const bool changed =
+            !m_have_last
+            || s.total_connections  != m_last_pub.total_connections
+            || s.total_messages     != m_last_pub.total_messages
+            || s.bytes_in           != m_last_pub.bytes_in
+            || s.bytes_out          != m_last_pub.bytes_out
+            || s.active_connections != m_last_pub.active_connections
+            || s.detail             != m_last_pub.detail;
+        m_last_pub  = s;
+        m_have_last = true;
+
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::stats,
                                                  worker_proto::encode_stats(s)))) {}
+        return changed;
     }
 
     // Returns false when the control socket is gone, which is the worker's
     // instruction to exit: a proxy whose supervisor has died has nobody to
     // report to and nobody to stop it.
+    worker_proto::stats_wire m_last_pub{};
+    bool m_have_last{false};
+
     bool pump_control()
     {
         m_pump_took = false;
