@@ -2870,16 +2870,20 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         //     that basis — so backend_op_in_flight() reads true for a backend
         //     sitting idle with its answer long since delivered, and the hold
         //     became unconditional.  What that cost: a client that sends
-        //     `Connection: close`, is answered, and then closes.  Its pair is
-        //     deliberately never detached (see handle_backend_read: a client
-        //     that asked for the connection to close is not put back in the
-        //     keep-alive pool), so reset_client_for_next_request is never
-        //     called for it and the hold below has nothing that can ever end
-        //     it.  The pair was held — client socket, backend socket, and the
-        //     splice pipes of every runtime behind it — until the proxy
-        //     stopped.  Measured: 13 pairs and 110 descriptors left over from
-        //     one run of test_proxy_group_keepalive_load, on a check whose
-        //     whole ceiling is 40 descriptors of slack.
+        //     `Connection: close`, is answered, and then closes.  Its pair was
+        //     at the time deliberately never detached — handle_backend_read
+        //     refused the detach for a client that had asked for the connection
+        //     to close — so reset_client_for_next_request was never called for
+        //     it and the hold below had nothing that could ever end it.  The
+        //     pair was held — client socket, backend socket, and the splice
+        //     pipes of every runtime behind it — until the proxy stopped.
+        //     Measured: 13 pairs and 110 descriptors left over from one run of
+        //     test_proxy_group_keepalive_load, on a check whose whole ceiling
+        //     is 40 descriptors of slack.  (That refusal has since been removed
+        //     for a reason of its own: it cost a backend connection per client
+        //     request.  Such a pair is now detached like any other and closed
+        //     by reset_client_for_next_request, so this case reaches the hold's
+        //     ending by the ordinary route as well.)
         //
         //     So the two disjuncts below are the two states in which a request
         //     has gone and its answer has not arrived: it has not reached a
@@ -4155,9 +4159,32 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
         {
             auto& ce = m_conn_idx[conn->client_fd];
-            if (ce.side == conn_client && !ce.client->closing &&
-                !ce.client->client_conn_close)
+            if (ce.side == conn_client && !ce.client->closing)
             {
+                // The client's own `Connection: close` used to be a third
+                // condition here, and it is not one.  It says the CLIENT will
+                // send no more requests on ITS connection; it says nothing
+                // about whether the backend socket is still at a message
+                // boundary, and that is the only question this detach asks.
+                // Refusing on it took the backend connection down with the
+                // client's, so a connection-per-request client cost a backend
+                // connection per request — see rewrite_http_request for the
+                // measurement and for the other half of the same mistake.
+                //
+                // The client is still closed, and by the client's own request:
+                // reset_client_for_next_request, at the end of every path out
+                // of here, treats client_conn_close exactly as it treats
+                // client_eof — there is no next request, so the connection ends
+                // once the answer is out.
+                //
+                // The two refusals that remain are about the backend and stay:
+                // a backend whose response said `Connection: close` (the socket
+                // is going away because its own end says so) and a response
+                // relayed by splice (this proxy never saw the bytes, so it
+                // cannot say where the stream now stands).  Both live in
+                // backend_pool_eligible / the conditions above, which is where
+                // a fact about the backend belongs.
+                //
                 // This used to run only when !m_backends[backend_idx].is_group,
                 // and backend_idx does not describe a group-routed connection at
                 // all — the group path writes the chosen endpoint onto the
@@ -4191,10 +4218,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // through reset_client_for_next_request, which closes on client_eof.
     //
     // Everything that falls PAST the detach had no ending at all.  The detach is
-    // refused for a client that sent `Connection: close` (it must not go back in
-    // the keep-alive pool), for a backend whose own response said the same, and
-    // for a response relayed by splice — and none of those three reaches
-    // reset_client_for_next_request.  So the client sat there answered in full,
+    // refused for a backend whose own response said `Connection: close` and for
+    // a response relayed by splice — neither reaches
+    // reset_client_for_next_request.  (There used to be a third: a client that
+    // sent `Connection: close`.  That one was the bug, not the case — see the
+    // detach above — and it is gone, which is also why this hold no longer has
+    // that shape of leak to end.)  So the client sat there answered in full,
     // half-closed, write queue empty and nothing of its own in flight, while the
     // only thing armed anywhere was the backend's idle read; and that read
     // completes only if the backend sends something, which it will not, because
@@ -4724,18 +4753,37 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         result += "\r\n";
     }
 
-    // Request keep-alive to enable backend connection pooling, unless the
-    // client sent Connection: close — or unless this request carries an upgrade
-    // offer, whose own Connection header has just been forwarded verbatim.
-    // Adding one here as well would put two Connection fields on the request,
-    // with conflicting tokens, and leave the backend to pick.
+    // Request keep-alive to enable backend connection pooling, unless this
+    // request carries an upgrade offer, whose own Connection header has just
+    // been forwarded verbatim.  Adding one here as well would put two
+    // Connection fields on the request, with conflicting tokens, and leave the
+    // backend to pick.
+    //
+    // Unconditionally — and in particular NOT "close, when the client said
+    // close".  Connection is hop-by-hop (RFC 9110 Section 7.6.1): the client's
+    // token governs the client's own connection to this proxy and says nothing
+    // whatever about the connection between this proxy and its backend.  This
+    // used to copy it across, and that turned one connection-per-request client
+    // into one connection-per-request backend twice over — the backend was told
+    // to close, so it closed, and the socket was then unpoolable by the
+    // backend's own instruction (backend_pool_eligible refuses conn_close), on
+    // top of the detach being refused outright.
+    //
+    // Measured on this tree, 12,000 requests at concurrency 8 through one
+    // --http backend, a fresh daemon per arm: 16-18 backend sockets with a
+    // keep-alive client, and 11,992 and 12,000 in two runs with a close client
+    // — one per request, to the socket.  9,593 of them were still in TIME-WAIT
+    // the instant the run ended, and a series of such runs drove the box to
+    // tcp_max_tw_buckets, 65,536.  There are 28,231 ephemeral ports here and
+    // the run does 24,000 requests a second, so a sustained load of that shape
+    // empties the range in about a second and the proxy then cannot reach its
+    // backend at all.  The rate is the smaller half of it.  Afterwards: 0.
+    //
+    // What the client asked for is honoured where it applies — on the client's
+    // own connection, which reset_client_for_next_request closes as soon as
+    // this request has been answered.
     if (!upgrade_offered)
-    {
-        if (conn->client_conn_close)
-            result += "Connection: close\r\n";
-        else
-            result += "Connection: keep-alive\r\n";
-    }
+        result += "Connection: keep-alive\r\n";
 
     result += "\r\n";
 
@@ -7970,19 +8018,41 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
 
 void proxy_instance::reset_client_for_next_request(proxy_client_connection* cconn)
 {
-    // There is no next request.  The client half-closed its write side during
-    // this exchange, which says exactly that, and handle_client_read held the
-    // pair open so this answer could be finished rather than thrown away.  It
-    // has been: every caller of this function reaches it with the response
-    // already forwarded or queued.  So the hold ends here — close_pair defers
-    // on whatever is still in flight and on whatever is still in the write
-    // queue, so the tail of the answer goes out first.
+    // There is no next request.  Two things say so, and they are one question:
     //
-    // This is what keeps the hold bounded on the happy path: the connection is
-    // not put back into the keep-alive pool to wait for a second request that
-    // by definition cannot come, and no read is armed on it that would let it
-    // sit there.
-    if (SOCKETLEY_UNLIKELY(cconn->client_eof) && cconn->fd >= 0)
+    //   * client_eof — the client half-closed its write side during this
+    //     exchange, and handle_client_read held the pair open so this answer
+    //     could be finished rather than thrown away;
+    //   * client_conn_close — the client wrote `Connection: close` on the
+    //     request, which is the same statement made in a header instead of a
+    //     FIN (RFC 9112 Section 9.6: the recipient sends no further requests on
+    //     that connection).
+    //
+    // Every caller of this function reaches it with the response already
+    // forwarded or queued.  So the connection ends here — close_pair defers on
+    // whatever is still in flight and on whatever is still in the write queue,
+    // so the tail of the answer goes out first.
+    //
+    // This is the one place the answer is given.  It is asked of the CLIENT
+    // connection, which is the only thing either flag describes; the backend
+    // leg has already been detached and, where it was poolable, pooled.  Before
+    // this, `Connection: close` was answered at the detach instead — one
+    // function earlier, on the wrong socket — and the cost was a backend
+    // connection per client request.  A rule about the client's connection
+    // asked once, at the end of the client's request, cannot be applied to the
+    // backend's by mistake.
+    //
+    // It is also what keeps the half-close hold bounded on the happy path: the
+    // connection is not put back into the keep-alive pool to wait for a second
+    // request that by definition cannot come, and no read is armed on it that
+    // would let it sit there.
+    //
+    // A request pipelined behind one that said `Connection: close` is dropped
+    // with the connection, which is what RFC 9112 Section 9.6 requires: the
+    // client declared that request the last one, so bytes behind it are not a
+    // request this proxy may act on.
+    if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->client_conn_close) &&
+        cconn->fd >= 0)
     {
         cconn->closing = true;
         close_pair(cconn->fd, cconn->backend_fd);
