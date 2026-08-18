@@ -35,9 +35,11 @@
 #            perfectly on section 1.  Nothing else in this directory would
 #            notice: the runtime is idle, so nothing it fails to do is visible.
 #
-# Section 3  CPU per idle runtime.  The number the whole change is about, at a
-#            bound loose enough that only a regression of the same kind can
-#            reach it (see the figure quoted at the assertion).
+# Section 3  CPU per idle runtime.  The number the whole change is about.
+#            Release only: under a sanitizer the two builds are 1.8x apart
+#            rather than 2.7x and no bound between them survives the machine's
+#            own load — the reasoning, and the reading that proved it, are at
+#            the assertion.
 #
 # Section 4  the freshness contract.  The cheapest way to make sections 1-3
 #            green is to publish less often, and that is not free: figures_age_ms
@@ -163,31 +165,52 @@ else
 fi
 
 # ─── 3: CPU per idle runtime ────────────────────────────────────────────────
+#
+# The figure the whole change is about, and the one assertion here that has to
+# say what build it is talking about.
+#
+# 750 us/s per runtime, between two sets of numbers measured on this machine:
+#
+#                            32 runtimes   100 runtimes   8, under load
+#   fixed 20 ms timeout           951            788           875
+#   waiting on the deadline       368            357        312-562
+#
+# The 30 s columns are three interleaved repetitions on a quiet box.  The last
+# one matters more for the bound: 562 is this test's own reading with three
+# other suites running on the same machine, so the margin against 750 is 1.33x
+# and the margin the other way, against the cheapest reading of the defect, is
+# 1.17x.  Tight on purpose — anything looser stops separating the two.
+#
+# ─── AND WHY IT DOES NOT RUN ON A SANITIZER BUILD ───────────────────────────
+#
+# Because it cannot be made to mean the same thing there.  The same source
+# measured 1375 us/s per idle runtime under ASan/UBSan against 2437 for the
+# defect: a 1.8x separation rather than Release's 2.7x, because what is left on
+# the correct side is the 4 Hz publish, and instrumentation makes a publish far
+# more expensive than it makes a bare wakeup.  A bound between 1375 and 2437 has
+# less headroom than the machine's own load moves the number by, so it would be
+# a coin toss reported as a defect.  It was: this file's first Sanitize run read
+# 1500 and failed against a bound calibrated on Release.
+#
+# Sections 1 and 2 are unaffected by any of that -- a wakeup count is a count,
+# and it reads 4/s on both builds -- so the sanitizer run keeps the assertion
+# that names the mechanism and loses only the one about its price.
 PER=$(( (T1 - T0) / WINDOW / N ))
 echo "  $N idle runtimes: $PER us/s of CPU each (daemon + its workers)"
 
-# 650 us/s per runtime, and the two figures it sits between were both measured
-# on this machine over 30 s windows, three interleaved repetitions each.  The
-# 8-runtime row is not quoted: two of the eight creates lost a race in one of
-# those runs, and a per-runtime figure divided by runtimes that never existed is
-# not a figure.
-#
-#                            32 runtimes   100 runtimes
-#   fixed 20 ms timeout           951            788   us/s each
-#   waiting on the deadline       368            357
-#
-# So the bound is roughly twice what a correct build costs and two thirds of
-# what the defect costs at its cheapest.  It is deliberately not tighter: most
-# of what remains on the correct side is the 4 Hz publish and the daemon's read
-# of it — measured at 93% of it, by comparing against a build publishing every
-# 3 s — which this change does not touch and a tighter bound would be forbidding
-# by accident.
-if [ "$PER" -le 650 ]; then
-    ok "an idle runtime costs $PER us/s (bound 650; a fixed-timeout loop costs ~790-1210)"
+# Asked of the binary rather than of $SOCKETLEY_CONFIG or the path: agents in
+# this tree copy the build elsewhere under other names, which is the same reason
+# lib_daemon.sh stopped identifying daemons by process name.
+if grep -aqm1 __asan_init "$BIN"; then
+    echo "  (not asserted: this is a sanitizer build — see the note above)"
+elif [ "$PER" -le 750 ]; then
+    ok "an idle runtime costs $PER us/s (bound 750; a fixed-timeout loop costs ~790-950)"
 else
-    bad "an idle runtime costs $PER us/s, over the bound of 650 us/s." \
+    bad "an idle runtime costs $PER us/s, over the bound of 750 us/s." \
         " A hundred idle runtimes would be $((PER / 100))% of a core spent on nothing."
     echo "         daemon+workers went from $T0 to $T1 us over ${WINDOW}s across $N runtimes."
+    echo "         Check section 1 first: if the wakeup rate is 4/s this is a busy"
+    echo "         machine rather than a build that regressed."
 fi
 
 # ─── 4: the figures did not get older to pay for it ─────────────────────────
