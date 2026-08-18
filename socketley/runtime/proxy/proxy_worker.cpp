@@ -1,5 +1,6 @@
 #include "proxy_worker.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
@@ -42,6 +43,12 @@ namespace
 // from, and the daemon coalesces its map pushes to the same period.
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
+
+// The longest the worker's loop will wait when it has no notification it can
+// trust — the two states named at the wait in run().  It is the constant that
+// wait used to use unconditionally; keeping it here rather than inlining it is
+// so the fallback and the thing it replaces are visibly the same number.
+constexpr int ctl_fallback_ms = 20;
 
 // SIGTERM asked for, and not yet acted on.
 //
@@ -331,21 +338,100 @@ public:
 
         while (!m_done && !g_term_requested)
         {
-            // One drain pass of the ring, with a short wait so an idle worker
-            // is not spinning.  run() is not usable here: it owns the thread
-            // until the ring stops, and the control socket has to be serviced
-            // between completions.
+            // One drain pass of the ring, waiting until the next thing this
+            // loop actually owes somebody.  run() is not usable here: it owns
+            // the thread until the ring stops, and the control socket has to be
+            // serviced between completions.
             //
+            // ─── WHY THE TIMEOUT IS A DEADLINE AND NOT A CONSTANT ───────────
+            //
+            // This was a flat 20 ms, with the reasoning that a short wait keeps
+            // an idle worker from spinning.  It does — and it replaces the spin
+            // with a fixed 50 Hz clock that runs whether or not anything is
+            // happening.  Measured on an idle runtime: 50.0 context switches a
+            // second, 0.13% of a core, per runtime, for a process with nothing
+            // to do.  At a hundred idle runtimes that is a core and a third of
+            // wakeups against an empty ring.
+            //
+            // Nothing in the loop below is periodic except the stats publish.
+            // pump_control() is answered by the poll armed on the control
+            // socket, which ends the ring's wait the moment a frame arrives;
+            // the runtime's own timers — the Lua tick, health checks, backend
+            // deadlines — are timeouts in this same ring and complete into this
+            // same drain.  So the honest timeout is the time left until the
+            // next publish, and an idle worker then wakes at the publish rate
+            // rather than at fifty hertz.
+            //
+            // A worker with work is unaffected: io_uring_wait_cqe_timeout()
+            // returns on the first completion, so a longer ceiling adds nothing
+            // to a wait that ends early anyway.
+            //
+            // ─── THE STATES IN WHICH THE ARM DOES NOT COVER THIS WAIT ───────
+            //
+            // A long wait is only as good as the notification standing in the
+            // ring.  Every state in which an idle worker has none, found by
+            // walking every assignment to m_ctl_armed and every early return
+            // out of arm_control():
+            //
+            //   (a) There is no ring yet.  arm_control() returns at once while
+            //       ring_open() is false, from the fork until on_config()
+            //       builds the ring.  Covered by the else branch below, which
+            //       waits on the descriptor itself — the complete notification
+            //       for that state, and the reason this branch needs no
+            //       fallback.
+            //
+            //   (b) The submission did not reach the ring.  submit_poll_add()
+            //       answers false when get_sqe() has nothing to give, and the
+            //       flag is then false with nothing outstanding.  The same
+            //       state follows a completion that cleared the flag after
+            //       arm_control() had already run for the turn — the drain in
+            //       the publish branch below does exactly that.
+            //
+            //   (c) The arm is standing but blind to what is being waited for.
+            //       Its mask is fixed when it is placed, so an arm made while
+            //       the write queue was empty carries no POLLOUT, and the
+            //       daemon starting to read again does not end the wait.
+            //
+            //   (d) m_done — arm_control() is skipped once the worker has
+            //       decided to leave.  Not a wait state: m_done is the loop's
+            //       own condition, so there is no next wait to be uncovered.
+            //
+            // (b) and (c) fall back to the old constant, which is what that
+            // constant was always doing for them.  Neither can be true of an
+            // idle worker: it is armed and has nothing queued, so the fallback
+            // costs nothing in the case this change is about.
+            //
+            // What is NOT on this list, and was checked: a frame arriving
+            // between the drain's last EAGAIN and the arm reaching the kernel.
+            // A poll_add is level-triggered on submit, so it completes at once
+            // against a descriptor that is already readable, and no wakeup is
+            // lost there.
+            const auto turn_now = std::chrono::steady_clock::now();
+            const auto since    = turn_now - last_stats;
+            int wait_ms = 0;
+            if (since < stats_interval)
+                wait_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        stats_interval - since).count()) + 1;   // round up: a
+                                                                // truncated 0
+                                                                // would spin
+
             // Before the ring exists poll_completions() returns at once no
             // matter what timeout it is handed, so the wait has to come from
             // somewhere else or this loop is a spinning core for as long as the
             // config takes to arrive.  Waiting on the control socket is the
             // right place for it anyway: the frame is the only thing that can
-            // happen to a worker in that window.
+            // happen to a worker in that window — and poll() on the fd is its
+            // own notification, so this branch needs no fallback, only the
+            // POLLOUT the arm would have carried.
             if (m_loop.ring_open())
-                m_loop.poll_completions(20);
+            {
+                if (!m_ctl_armed || m_writer.pending())
+                    wait_ms = std::min(wait_ms, ctl_fallback_ms);
+                m_loop.poll_completions(wait_ms);
+            }
             else
-                wait_for_control(20);
+                wait_for_control(wait_ms, m_writer.pending());
 
             // Only when the ring is not already holding an unfired poll on this
             // socket.  While m_ctl_armed is true a one-shot POLLIN is
@@ -390,13 +476,71 @@ public:
                 // reports rather than merely repairs, a build that breaks the
                 // invariant says so in the log instead of getting quietly
                 // slower.  This is 4 reads a second, not 2 per round trip.
+                //
+                // ─── WHAT m_ctl_armed ACTUALLY MEANS, AND WHY IT IS DRAINED ─
+                //
+                // Not "the kernel has not fired it".  It means "submitted, and
+                // this loop has not dispatched the completion yet" — the flag
+                // is cleared in on_cqe(), which only runs when a drain reaps
+                // the CQE.  Between the arm_control() ten lines above and this
+                // read there is no ring entry at all, so a frame arriving in
+                // that window leaves the poll fired, its completion sitting
+                // unreaped, and the flag still set.  The read then finds bytes
+                // and the warning below fires at a fault that does not exist —
+                // which is why it has only ever been seen on Sanitize, and
+                // only under load: those are the conditions that widen the
+                // window and fill it.
+                //
+                // Draining first collapses that case.  If the poll had fired,
+                // on_cqe() clears the flag here and the ordinary path takes
+                // the frame on the next turn.  What survives — still armed,
+                // and the socket has bytes — is the real thing this check is
+                // for: a notification the kernel owes and is not going to
+                // send.
+                //
+                // The re-arm is left to the next turn.  That state is state
+                // (b) in the audit at the wait above, so the next wait clamps
+                // itself to ctl_fallback_ms and the socket is pumped
+                // unconditionally at the top of the turn after this one.
+                //
+                // ─── AND ONCE MORE AFTER THE READ, WHICH IS WHAT CLOSES IT ──
+                //
+                // Draining first is not enough on its own, and that was
+                // measured rather than reasoned about: a Sanitize build under
+                // 62 control frames a second reported this warning once a
+                // minute before the drain was added and still reported it in
+                // one run of three afterwards.  All the first drain does is
+                // shrink the window — from "everything between the arm and
+                // this read" to "everything between this drain and this read"
+                // — and a window that is merely small is still a window that a
+                // long enough run will find.
+                //
+                // What closes it is that a one-shot poll_add fires from the
+                // wakeup at the instant the descriptor becomes readable.  The
+                // readiness is recorded then, by the kernel, and it does not
+                // stop being true because this loop got to the bytes first.
+                // So a frame that arrived between the drain and the read has
+                // already made the poll ready, and entering the ring once more
+                // reaps it — after the read has taken the data, which is
+                // exactly the case that looked like a fault and was not.
+                //
+                // A notification that is genuinely not coming survives all
+                // three steps, which is the only thing left that warns.
+                if (m_ctl_armed)
+                    m_loop.poll_completions(0);
+
                 if (m_ctl_armed)
                 {
                     if (!pump_control())
                         break;
                     if (m_pump_took)
-                        LOG_WARN("proxy worker: a control frame was waiting while "
-                                 "the ring's poll on that socket had not fired");
+                    {
+                        m_loop.poll_completions(0);
+                        if (m_ctl_armed)
+                            LOG_WARN("proxy worker: a control frame was waiting "
+                                     "while the ring's poll on that socket had "
+                                     "not fired");
+                    }
                 }
 
                 push_stats();
@@ -452,12 +596,22 @@ private:
             if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
     }
 
-    // Block until the control socket has something or the timeout runs out.
-    // Only used before there is a ring; afterwards the ring's own wait covers
-    // it, and the control socket is drained between completions.
-    void wait_for_control(int timeout_ms) const
+    // Block until the control socket has something, or will take what is
+    // waiting to go out, or the timeout runs out.  Only used before there is a
+    // ring; afterwards the ring's own wait covers it, and the control socket is
+    // drained between completions.
+    //
+    // POLLOUT is not decoration.  This is the only wait a worker has before its
+    // config arrives, and it is also the wait that holds while the hello frame
+    // is going out; with the timeout no longer a flat 20 ms, a queue that the
+    // socket would not take would otherwise sit until the deadline rather than
+    // until the socket drained.  Asked for only when there is something to
+    // send, so an idle worker is not woken by a socket that is merely writable.
+    void wait_for_control(int timeout_ms, bool want_write) const
     {
-        struct pollfd pfd{m_fd, POLLIN, 0};
+        struct pollfd pfd{m_fd,
+                          static_cast<short>(POLLIN | (want_write ? POLLOUT : 0)),
+                          0};
         if (::poll(&pfd, 1, timeout_ms) < 0) {}
     }
 
