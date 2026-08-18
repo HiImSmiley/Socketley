@@ -8,9 +8,9 @@
 # idle runtime on the machine bought 50 wakeups a second against an empty ring:
 #
 #     0 runtimes    0.000% of a core
-#     8 runtimes    0.967%          }  30 s windows, three interleaved
-#    32 runtimes    3.044%          }  repetitions, quiet box:
-#   100 runtimes    7.878%          }  790-1210 us/s per idle runtime
+#    32 runtimes    3.044%          }  30 s windows, three interleaved
+#   100 runtimes    7.878%          }  repetitions, quiet box:
+#                                   }  951 and 788 us/s per idle runtime
 #
 # and 50.0 context switches a second in each of those workers — the timeout,
 # exactly, not a rate that anything about the workload explains.  A hundred idle
@@ -167,17 +167,21 @@ PER=$(( (T1 - T0) / WINDOW / N ))
 echo "  $N idle runtimes: $PER us/s of CPU each (daemon + its workers)"
 
 # 650 us/s per runtime, and the two figures it sits between were both measured
-# on this machine over 30 s windows, three interleaved repetitions each:
+# on this machine over 30 s windows, three interleaved repetitions each.  The
+# 8-runtime row is not quoted: two of the eight creates lost a race in one of
+# those runs, and a per-runtime figure divided by runtimes that never existed is
+# not a figure.
 #
-#              8 runtimes   32 runtimes   100 runtimes
-#   fixed 20 ms timeout      1208            951            788   us/s each
-#   waiting on the deadline   347            368            357
+#                            32 runtimes   100 runtimes
+#   fixed 20 ms timeout           951            788   us/s each
+#   waiting on the deadline       368            357
 #
 # So the bound is roughly twice what a correct build costs and two thirds of
 # what the defect costs at its cheapest.  It is deliberately not tighter: most
 # of what remains on the correct side is the 4 Hz publish and the daemon's read
-# of it, which this change does not touch and a tighter bound would be
-# forbidding by accident.
+# of it — measured at 93% of it, by comparing against a build publishing every
+# 3 s — which this change does not touch and a tighter bound would be forbidding
+# by accident.
 if [ "$PER" -le 650 ]; then
     ok "an idle runtime costs $PER us/s (bound 650; a fixed-timeout loop costs ~790-1210)"
 else
