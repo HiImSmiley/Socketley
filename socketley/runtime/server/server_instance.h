@@ -1077,6 +1077,14 @@ private:
     // HTTP static file serving
     std::filesystem::path m_http_dir;
     std::filesystem::path m_http_base;  // canonical resolved path (set at setup/rebuild time)
+
+    // A directory descriptor on m_http_base, so a request can be opened
+    // relative to it with openat2(RESOLVE_BENEATH) instead of canonicalising
+    // the path first.  See serve_http's disk mode for what that replaces and
+    // what it costs.  -1 when there is no --http dir or the open failed, in
+    // which case the old path is taken.
+    int m_http_root_fd{-1};
+    void open_http_root();
     bool m_http_cache_enabled{false};
     struct cached_file { std::shared_ptr<const std::string> response; };
     std::unordered_map<std::string, cached_file> m_http_cache;
