@@ -502,6 +502,30 @@ public:
                 // (b) in the audit at the wait above, so the next wait clamps
                 // itself to ctl_fallback_ms and the socket is pumped
                 // unconditionally at the top of the turn after this one.
+                //
+                // ─── AND ONCE MORE AFTER THE READ, WHICH IS WHAT CLOSES IT ──
+                //
+                // Draining first is not enough on its own, and that was
+                // measured rather than reasoned about: a Sanitize build under
+                // 62 control frames a second reported this warning once a
+                // minute before the drain was added and still reported it in
+                // one run of three afterwards.  All the first drain does is
+                // shrink the window — from "everything between the arm and
+                // this read" to "everything between this drain and this read"
+                // — and a window that is merely small is still a window that a
+                // long enough run will find.
+                //
+                // What closes it is that a one-shot poll_add fires from the
+                // wakeup at the instant the descriptor becomes readable.  The
+                // readiness is recorded then, by the kernel, and it does not
+                // stop being true because this loop got to the bytes first.
+                // So a frame that arrived between the drain and the read has
+                // already made the poll ready, and entering the ring once more
+                // reaps it — after the read has taken the data, which is
+                // exactly the case that looked like a fault and was not.
+                //
+                // A notification that is genuinely not coming survives all
+                // three steps, which is the only thing left that warns.
                 if (m_ctl_armed)
                     m_loop.poll_completions(0);
 
@@ -510,8 +534,13 @@ public:
                     if (!pump_control())
                         break;
                     if (m_pump_took)
-                        LOG_WARN("proxy worker: a control frame was waiting while "
-                                 "the ring's poll on that socket had not fired");
+                    {
+                        m_loop.poll_completions(0);
+                        if (m_ctl_armed)
+                            LOG_WARN("proxy worker: a control frame was waiting "
+                                     "while the ring's poll on that socket had "
+                                     "not fired");
+                    }
                 }
 
                 push_stats();
