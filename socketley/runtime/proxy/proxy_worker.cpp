@@ -390,6 +390,34 @@ public:
                 // reports rather than merely repairs, a build that breaks the
                 // invariant says so in the log instead of getting quietly
                 // slower.  This is 4 reads a second, not 2 per round trip.
+                //
+                // ─── WHAT m_ctl_armed ACTUALLY MEANS, AND WHY IT IS DRAINED ─
+                //
+                // Not "the kernel has not fired it".  It means "submitted, and
+                // this loop has not dispatched the completion yet" — the flag
+                // is cleared in on_cqe(), which only runs when a drain reaps
+                // the CQE.  Between the arm_control() ten lines above and this
+                // read there is no ring entry at all, so a frame arriving in
+                // that window leaves the poll fired, its completion sitting
+                // unreaped, and the flag still set.  The read then finds bytes
+                // and the warning below fires at a fault that does not exist —
+                // which is why it has only ever been seen on Sanitize, and
+                // only under load: those are the conditions that widen the
+                // window and fill it.
+                //
+                // Draining first collapses that case.  If the poll had fired,
+                // on_cqe() clears the flag here and the ordinary path takes
+                // the frame on the next turn.  What survives — still armed,
+                // and the socket has bytes — is the real thing this check is
+                // for: a notification the kernel owes and is not going to
+                // send.
+                //
+                // The re-arm is left to the next turn.  Being unarmed for one
+                // wait costs at most that wait: the top of the loop pumps the
+                // socket unconditionally whenever m_ctl_armed is false.
+                if (m_ctl_armed)
+                    m_loop.poll_completions(0);
+
                 if (m_ctl_armed)
                 {
                     if (!pump_control())
