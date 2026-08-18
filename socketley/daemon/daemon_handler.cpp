@@ -5156,6 +5156,36 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             out += name;
             out += " could not start: the worker did not accept its "
                    "configuration (the reason is in the daemon log)\n";
+
+            // ─── AND IT IS NOT `was_running` ────────────────────────────────
+            //
+            // cmd_start and cmd_reload both set was_running=true the moment
+            // m_manager.start() returns, which is before the child exists --
+            // the placeholder is optimistically `running` and the verdict is
+            // this frame, arriving later.  Neither cleared it when the verdict
+            // came back refused, so a runtime that never served was recorded as
+            // one the operator wants brought back, and the next daemon start
+            // brought it back.
+            //
+            // Two writers, and every path that learns a start did not happen
+            // comes through this function, so the clear belongs here rather
+            // than at each of them -- a third caller is a matter of time and
+            // would not know to do it.
+            //
+            // Only on `refused`, never on `pending`: pending is this side not
+            // knowing, and the case below says so at length.  Clearing on a
+            // child that is merely slow would leave a listener serving traffic
+            // and marked not-to-be-restored, which is the worse of the two
+            // wrong answers.
+            //
+            // What it cost, measured on `--listen unix:` where two claimants
+            // for one path cannot both win: a refused server was restored after
+            // a daemon restart, took the path from the runtime that owned it,
+            // and -- having no --http of its own -- answered 404 to every
+            // request, permanently.  22% of runs under load, on this commit and
+            // on every commit before it.
+            if (m_persistence)
+                m_persistence->set_was_running(name, false);
             return 1;
 
         case proxy_supervisor::startup::pending:
