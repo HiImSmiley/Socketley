@@ -2526,13 +2526,9 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
         // Larger socket receive buffer reduces kernel-to-user copies
-        // EXPERIMENT C: a second syscall per connection, and setting SO_RCVBUF
-        // explicitly also turns off the kernel's own receive-buffer autotuning.
-        if (getenv("SKL_NO_RCVBUF") == nullptr)
-        {
-            int rcvbuf = 131072;  // 128KB
-            setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        }
+        // Larger socket receive buffer reduces kernel-to-user copies
+        int rcvbuf = 131072;  // 128KB
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         auto conn = pool_acquire(client_fd);
         conn->partial.reserve(8192);
@@ -2540,10 +2536,8 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
                            op_read, conn->generation };
         conn->write_req = { this, nullptr, client_fd, 0, op_write, conn->generation };
 
-        // EXPERIMENT B: fixed-file registration is one io_uring_register(2) per
-        // accepted connection.  Gated so the cost can be measured.
-        int slot = (getenv("SKL_NO_FIXED_FILES") != nullptr) ? -1
-                 : m_loop->alloc_fixed_file_slot();
+        // Register fd in fixed file table for fget/fput-free I/O
+        int slot = m_loop->alloc_fixed_file_slot();
         if (slot >= 0)
         {
             if (m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
