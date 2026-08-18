@@ -73,8 +73,8 @@ PX_PORT=$((PORT + 8))
 BE2_PORT=$((PORT + 9))
 PX2_PORT=$((PORT + 10))
 
-NAMES="dl_spin dl_byst dl_own dl_slow dl_sink dl_px dl_px2"
-BE_PID=""; BE2_PID=""
+NAMES="dl_spin dl_byst dl_own dl_slow dl_px dl_px2"
+BE_PID=""; BE2_PID=""; SINK_PID=""
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -86,8 +86,9 @@ fail() {
 }
 
 cleanup() {
-    [ -n "$BE_PID" ]  && kill "$BE_PID"  2>/dev/null
-    [ -n "$BE2_PID" ] && kill "$BE2_PID" 2>/dev/null
+    [ -n "$BE_PID" ]   && kill "$BE_PID"   2>/dev/null
+    [ -n "$BE2_PID" ]  && kill "$BE2_PID"  2>/dev/null
+    [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null
     # shellcheck disable=SC2086
     "$BIN" stop $NAMES 2>/dev/null || true
     sleep 0.3
@@ -131,9 +132,27 @@ mk_echo_spinner "$OWN"  "callback_timeout_ms = 300"
 
 # The control: a callback that takes real time and finishes.
 #
-# The delay is a socketley.http call at a runtime that accepts connections and
-# never answers (dl_sink, --mode in), so the block is poll() waiting out its own
-# 400ms timeout — WALL time, spent asleep in the kernel.
+# The delay is a socketley.http call at a listener that accepts the connection
+# and then does nothing at all — never answers, never closes — so the block is
+# socketley.http waiting out its own 400ms timeout.  WALL time, spent asleep in
+# the kernel.
+#
+# ─── THE SINK CANNOT BE A SOCKETLEY RUNTIME, AND USED TO BE ─────────────────
+#
+# It was `create server dl_sink --mode in`, described here as a runtime that
+# "accepts and answers nothing".  That was never true.  A --mode in server
+# answers 404 to any HTTP request, immediately — probed at 109 bytes back
+# inside a millisecond.  The 400ms was never poll() waiting for an answer that
+# did not come; the answer came at once, and socketley.http then sat waiting
+# for EOF because it ignores the response framing.  The delay was the server
+# NOT closing the connection.
+#
+# So this control was measuring a defect.  When --http learned to honour the
+# `Connection: close` that socketley.http sends, the server began closing at
+# once, the EOF arrived immediately, and the 400ms evaporated: the round trip
+# fell from >2.3s to 2.006s, which is nc's 2s linger with the block gone.  The
+# fixture has to be a listener that really does stay silent, and nothing built
+# out of this daemon can be one.
 #
 # This was a `while os.clock() - t < 0.4` busy loop and that is a trap worth
 # recording.  os.clock() is CPU time and the deadline is wall-clock, so on a
@@ -172,9 +191,40 @@ create_ok "spinner created"    "$BIN" create server dl_spin -p "$SPIN_PORT" --mo
 create_ok "bystander created"  "$BIN" create server dl_byst -p "$BYST_PORT" --mode inout --lua "$BYST" --daemon-process -s
 create_ok "own-budget created" "$BIN" create server dl_own  -p "$OWN_PORT"  --mode inout --lua "$OWN"  --daemon-process -s
 create_ok "slow one created"   "$BIN" create server dl_slow -p "$SLOW_PORT" --mode inout --lua "$SLOW" --daemon-process -s
-# Accepts and answers nothing, so the HTTP call in $SLOW spends its whole
-# timeout in poll() and no part of the delay depends on this machine's speed.
-create_ok "the sink created"   "$BIN" create server dl_sink -p "$SINK_PORT" --mode in -s
+# The sink: accepts, and from there on says and does nothing.  Not a socketley
+# runtime — see the block above $SLOW for why one cannot serve here.  The
+# accepted sockets are kept in a list on purpose: dropping the last reference
+# lets the garbage collector close them, and a close is an EOF, which is the
+# one thing this must never send.
+cat > "$SOCKETLEY_TMPD/sink.py" <<'SINKEOF'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(16)
+print("ready", flush=True)
+held = []
+while True:
+    try:
+        c, _ = s.accept()
+        held.append(c)
+    except Exception:
+        break
+SINKEOF
+python3 "$SOCKETLEY_TMPD/sink.py" "$SINK_PORT" >"$SOCKETLEY_TMPD/sink.log" 2>&1 &
+SINK_PID=$!
+SINK_READY=""
+for _ in $(seq 1 50); do
+    grep -q ready "$SOCKETLEY_TMPD/sink.log" 2>/dev/null && { SINK_READY=1; break; }
+    sleep 0.1
+done
+# Counted as an assertion because the control below is worthless without it: a
+# sink that never bound gives socketley.http an instant ECONNREFUSED, which
+# looks exactly like the fast return that control exists to rule out.
+if [ -n "$SINK_READY" ]; then pass; else
+    fail "the silent sink is listening" \
+         "nothing bound 127.0.0.1:$SINK_PORT within 5s" \
+         "$(head -3 "$SOCKETLEY_TMPD/sink.log" 2>/dev/null)"
+fi
 
 ready_tcp 127.0.0.1 "$SPIN_PORT" 8 || echo "  NOTE: dl_spin never accepted a connection"
 ready_tcp 127.0.0.1 "$BYST_PORT" 8 || echo "  NOTE: dl_byst never accepted a connection"
