@@ -701,7 +701,35 @@ BENCH_TIMEOUT_SCRIPT=${BENCH_TIMEOUT_SCRIPT:-300}
 
 # Log a timestamped benchmark event to the bench log file.
 # The log file is the primary record — always written regardless of
-# stdout/stderr redirection.  Also echoes to stderr when visible.
+# stdout/stderr redirection.  Also echoes to stderr.
+#
+# ─── stderr, and why it is not a preference ─────────────────────────────────
+#
+# The comment above always said "echoes to stderr" and it went to stdout, which
+# is where the results files are.  Sixteen call sites in four scripts run
+#
+#     bench_run -j <test> >> "$RESULTS_FILE"
+#
+# and bench_run calls log_bench when socketley_bench exits 2.  So a run that
+# refused to stand behind its own figure appended
+#
+#     [INFO] [06:15:27] [UNUSABLE] socketley_bench -j -r 5 -W 1 -d 800 proxy
+#     overhead ... — run short, or repetitions too far apart to resolve
+#
+# with its colour escapes into the middle of the JSON array, and the file stopped
+# parsing from that line on.  Observed in results/proxy_20260818_060839.json,
+# where it cost the three records that followed it.
+#
+# That is the same failure the BENCH_TIMEOUT_SCRIPT comment above describes and
+# for a worse reason: a truncated file is at least the result of something
+# visibly going wrong, while this one is written by the diagnostic that fires
+# precisely when a benchmark is being careful.  The more honest socketley_bench
+# becomes about refusing a figure, the more results files it destroys.
+#
+# Fixed here rather than at the sixteen redirections, because the redirections
+# are where the next one will be added and this is the one function all of them
+# already go through.  Nothing log_bench prints is data; all of it is
+# diagnostics, and diagnostics belong on stderr.
 log_bench() {
     local tag=$1
     shift
@@ -710,8 +738,8 @@ log_bench() {
     local msg="[$ts] [$tag] $*"
     echo "$msg" >> "$BENCH_LOG" 2>/dev/null
     case "$tag" in
-        TIMEOUT|FAIL) log_error "$msg" 2>/dev/null || true ;;
-        *)            log_info "$msg"  2>/dev/null || true ;;
+        TIMEOUT|FAIL) log_error "$msg" >&2 || true ;;
+        *)            log_info  "$msg" >&2 || true ;;
     esac
 }
 
