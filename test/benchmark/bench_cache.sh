@@ -343,7 +343,17 @@ cache_pipe_measure() {
     return 1
 }
 
-# Print and record one pipelined result.  A refusal is printed as a refusal and
+# Print and record one pipelined result.
+#
+# The kind of thing measured goes under `measures` rather than `metric`, and
+# that is not arbitrary: generate_summary() puts every row carrying `metric`
+# into the main table and reads its rate from median_round_trips_per_sec or one
+# of its two siblings.  These rows carry lpush_ops_sec and friends, so a `metric`
+# key here would file them in a table whose Median column can only print "-" for
+# them.  Without it they land in the name/value table, which is where the rows
+# this file writes itself have always gone.
+#
+# A refusal is printed as a refusal and
 # recorded with usable:0 rather than being left out: a row that silently
 # disappears reads to the next comparison as a test that was never run.
 cache_pipe_report() {
@@ -354,15 +364,21 @@ cache_pipe_report() {
     else
         log_error   "  $label: REFUSED — $CP_VERDICT"
     fi
-    awk -v sp="$CP_SPREAD" -v w="$CACHE_PIPE_SPREAD_WARN" 'BEGIN{exit !(sp > w)}' \
-        && { stable=0; wide="  — too wide to quote the median alone"; }
+    # A spread of 0 means it was never measured, which is not the same as steady
+    # -- reporting stable:1 for it is the claim of perfect repeatability from
+    # something never repeated that bench.c refuses to make.
+    if awk -v sp="$CP_SPREAD" 'BEGIN{exit !(sp <= 0)}'; then
+        stable=0
+    elif awk -v sp="$CP_SPREAD" -v w="$CACHE_PIPE_SPREAD_WARN" 'BEGIN{exit !(sp > w)}'; then
+        stable=0; wide="  — too wide to quote the median alone"
+    fi
     log_info "    $CP_OPS ops/run, window $(awk -v u="$CP_WINDOW_US" 'BEGIN{printf "%.0f", u/1000}') ms, harness ${CP_RES}% of it"
     log_info "    spread $CP_LO .. $CP_HI (${CP_SPREAD}x)${wide}; resolves differences above ${CP_CI}% over $CACHE_PIPE_RUNS runs"
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
         "operations"          "$CP_OPS" \
         "runs"                "$CACHE_PIPE_RUNS" \
-        "metric"              "pipelined_ops_per_sec" \
+        "measures"            "pipelined_ops_per_sec" \
         "$key"                "$CP_RATE" \
         "min_per_sec"         "$CP_LO" \
         "max_per_sec"         "$CP_HI" \

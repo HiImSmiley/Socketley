@@ -47,10 +47,17 @@ ensure_clean() {
     socketley_cmd stop bench_proxy 2>/dev/null
     socketley_cmd stop backend1 2>/dev/null
     socketley_cmd stop named_backend 2>/dev/null
+    # The HTTP backends are runtimes now rather than a Python process, so a run
+    # that died between create and remove leaves them holding their ports and
+    # the next run's wait_for_port is satisfied by the corpse.
+    socketley_cmd stop bench_be1 2>/dev/null
+    socketley_cmd stop bench_be2 2>/dev/null
     sleep 0.5
     socketley_cmd remove bench_proxy 2>/dev/null
     socketley_cmd remove backend1 2>/dev/null
     socketley_cmd remove named_backend 2>/dev/null
+    socketley_cmd remove bench_be1 2>/dev/null
+    socketley_cmd remove bench_be2 2>/dev/null
 }
 
 # ─── The HTTP fixture, and why it stopped being Python ──────────────────────
