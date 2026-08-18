@@ -339,9 +339,109 @@ wait_for_port_free() {
     done
 }
 
+# ─── Clocks ─────────────────────────────────────────────────────────────────
+#
+# get_time_ms() is a fork.  `$(date +%s%N)` starts a process, and on this box a
+# `date` costs 6.8 ms wall from fork to reap and about 1.5 ms from the fork to
+# the moment it reads the clock -- most of it loading the timezone; the same
+# call with TZ=UTC costs 1.3 ms.  Measured directly, the interval this reports
+# for two calls with nothing between them is 1..2 ms.
+#
+# So every window timed with it carries a bias of one to two milliseconds on top
+# of a resolution of one millisecond, and the cache data-structure tests timed
+# windows of five to nine.  What they published -- 833,333 and 1,000,000 ops/sec
+# for lpush and lpop -- is 5000/6 and 5000/5: two integers a millisecond apart,
+# printed to six significant figures.  Nothing in the output said so.
+#
+# EPOCHREALTIME is a bash variable, so reading it forks nothing: 11 us per read
+# in a loop, and 3 us for the interval between two reads.  That is the floor of
+# what a bash-timed window can resolve, and it is 300x better than the fork.
+#
+# Both are kept.  get_time_ms() is still correct for the things it is used for
+# elsewhere -- waiting, sleeping, second-scale phases -- and rewriting those
+# would be a change with no measurement behind it.  Anything timing work that
+# finishes in under a second uses get_time_us().
+BENCH_CLOCK_KIND="epochrealtime"
+if [[ -z "${EPOCHREALTIME:-}" ]]; then
+    BENCH_CLOCK_KIND="date"
+fi
+
+# Microseconds since the epoch, into the variable NOW_US.  No subshell, no
+# fork, no `date`.
+#
+# It assigns rather than echoes on purpose, and that is not a style choice: a
+# function whose value is taken with $( ) is run in a forked subshell, and a
+# fork costs about 400 us here.  Measured, the three idioms cost 3 us inlined,
+# 11 us through `now_us`, and 267..931 us through `t=$(now_us_echoing)` -- so
+# the convenient spelling would have put back two orders of magnitude of the
+# very overhead this exists to remove.  Read NOW_US straight after the call.
+#
+# The digits are pulled out rather than the '.' being replaced, because
+# EPOCHREALTIME uses the *locale's* decimal separator: under a locale with
+# LC_NUMERIC=de_DE it reads "1787022899,674305", and ${x/./} would then leave
+# the comma in place and produce a number bash refuses to do arithmetic on.
+NOW_US=0
+if [[ "$BENCH_CLOCK_KIND" == "epochrealtime" ]]; then
+    now_us() { local t=${EPOCHREALTIME}; NOW_US=${t//[!0-9]/}; }
+else
+    # bash < 5.0.  A fork per reading, and bench_clock_floor_us() reports it.
+    now_us() { NOW_US=$(($(date +%s%N) / 1000)); }
+fi
+
 # Get high-resolution timestamp in milliseconds
 get_time_ms() {
     echo $(($(date +%s%N) / 1000000))
+}
+
+# What the clock above costs, in microseconds: the median interval this harness
+# reports for a window in which nothing happened.
+#
+# Measured rather than assumed, once per shell, because it is the number that
+# decides whether a window is long enough to mean anything -- and because it is
+# different by two orders of magnitude between the two branches of
+# get_time_us().  A caller that lengthens a window until the clock stops
+# mattering has to be told what "stops mattering" costs here.
+bench_clock_floor_us() {
+    if [[ -n "${BENCH_CLOCK_FLOOR_US:-}" ]]; then
+        printf '%s' "$BENCH_CLOCK_FLOOR_US"
+        return
+    fi
+    local i a b samples=()
+    for i in 1 2 3 4 5 6 7 8 9; do
+        now_us; a=$NOW_US; now_us; b=$NOW_US
+        samples+=( $((b - a)) )
+    done
+    BENCH_CLOCK_FLOOR_US=$(printf '%s\n' "${samples[@]}" | sort -n | awk '{v[n++]=$1} END{print v[int(n/2)]}')
+    [[ "$BENCH_CLOCK_FLOOR_US" -lt 1 ]] && BENCH_CLOCK_FLOOR_US=1
+    printf '%s' "$BENCH_CLOCK_FLOOR_US"
+}
+
+# The resolution a window of WINDOW_US has, as a percentage: how much of it the
+# clock alone could account for.
+#
+# Printed beside every figure derived from a bash-timed window, and not only
+# when it is bad -- a resolution shown only when it is poor teaches the reader
+# that its absence means the question was asked and answered well, when in fact
+# it means the question was never asked.
+bench_resolution_pct() {
+    local window_us=$1 floor
+    floor=$(bench_clock_floor_us)
+    awk -v w="$window_us" -v f="$floor" \
+        'BEGIN { if (w <= 0) { print "inf"; exit } printf "%.3f", 100 * f / w }'
+}
+
+# Is a window long enough for the clock behind it?  Echoes "ok" or "unresolved".
+#
+# BENCH_WINDOW_FLOOR_PCT is the largest share of a window the clock is allowed
+# to be.  1% is not a statistical claim -- run-to-run spread is far wider than
+# that and is reported separately -- it is the line below which the *instrument*
+# stops being the reason two numbers differ.  The old cache tests sat at 11..20%
+# by this measure and printed six significant figures.
+BENCH_WINDOW_FLOOR_PCT=${BENCH_WINDOW_FLOOR_PCT:-1.0}
+bench_window_verdict() {
+    local window_us=$1
+    awk -v p="$(bench_resolution_pct "$window_us")" -v lim="$BENCH_WINDOW_FLOOR_PCT" \
+        'BEGIN { print (p == "inf" || p > lim) ? "unresolved" : "ok" }'
 }
 
 # Calculate statistics from a file of numbers (one per line)
