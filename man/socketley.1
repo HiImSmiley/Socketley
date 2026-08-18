@@ -4902,7 +4902,21 @@ cannot be established with certainty \(em because its header block was
 split across reads, or was not strictly CRLF-framed, or because more
 bytes arrived than the length it declared \(em is forwarded to
 the client unchanged, and its connection is closed instead of returned
-to the pool.
+to the pool. A backend that answers
+.B Connection: close
+is not pooled either: it has said the socket is going away.
+.PP
+A
+.B Connection: close
+sent by the
+.I client
+does not do this. It is a hop-by-hop field about the client's own
+connection to the proxy, so it is not forwarded upstream and it does not
+end the backend connection: the proxy answers the request, returns the
+backend socket to the pool, and closes the client connection as asked.
+A client that opens a connection per request \(em curl, a health checker,
+any HTTP library used without a session \(em therefore costs one accept
+and no backend connect, the same as a keep-alive client.
 .PP
 A connection already in the pool is checked before it is handed to the
 next request, and one with unread data on it is closed rather than

@@ -8,13 +8,22 @@
 # to end that hold when the answer lands, and until now only one path did — the
 # keep-alive detach, through reset_client_for_next_request.
 #
-# A client that sends `Connection: close` never reaches that path: it must not
-# go back in the keep-alive pool, so the detach is refused and the hold had
+# An exchange the detach refuses never reaches that path, and the hold then had
 # nothing that could ever end it.  The client was answered in full and then kept
 # for ever — its socket, the backend's socket, and the splice pipes behind them —
 # because the only thing armed anywhere was the backend's idle read, and that
 # read completes only if the backend sends something it has no reason to send.
 # The descriptors came back when the proxy stopped and not before.
+#
+# The refusal used here is a backend that answered `Connection: close`: its own
+# end has said the socket is finished, so it must not be pooled.  This test was
+# originally written around a different one — a CLIENT that sent
+# `Connection: close` — and that refusal has since been removed, because a
+# client's Connection token is hop-by-hop and refusing on it cost a backend
+# connection per client request (see test_proxy_http_close_pool.sh).  The client
+# still sends the header, because it is also what makes the client half-close
+# below the natural end of the exchange; what keeps this test on the path past
+# the detach is now the backend's answer.
 #
 # ─── WHY BOTH ASSERTIONS ARE HERE ───────────────────────────────────────────
 #
@@ -27,6 +36,29 @@
 #
 # Against the broken build the bodies still arrive — the hold worked, it just
 # never ended — so the descriptor assertion is the one that discriminates.
+#
+# ─── AND IT DOES NOT, ON THIS BOX ───────────────────────────────────────────
+#
+# Measured while repairing the fixture above, because a fixture change has to be
+# shown not to have gutted the check it feeds.  The pre-fix source was built
+# with the hold's ending — the close_pair in handle_backend_read that
+# client_answer_owed guards — compiled out, which is exactly the build this file
+# names, and this test passed 8/8 against it with FD1 == FD0 == 7.  Both the old
+# fixture and the new one.
+#
+# The likely reason is that the client here does not stay alive: it gives its
+# read ten seconds, times out, and closes the socket outright.  A multishot recv
+# on the client leg is still armed from before the hold, so that full close
+# delivers a completion and the pair is torn down by the ordinary route — after
+# the exchange this test is about, but well before the descriptors are counted.
+# The leak adadd79 recorded was measured on test_proxy_group_keepalive_load,
+# whose clients do stay alive, and that is where it is still visible.
+#
+# Left as it stands rather than rewritten: making it discriminate needs a client
+# that holds its socket open past the count, which is a different test from this
+# one, and this file's body assertions do still cover the half-close hold
+# itself.  Written down so the next person does not read the descriptor line as
+# coverage it does not provide.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -103,15 +135,31 @@ def serve(c):
         # any of this is written.
         time.sleep(0.6)
         body = b"marker=" + marker
+        # `Connection: close` in the response, and then the socket is HELD open
+        # anyway.  Both halves are needed, and for different reasons.
+        #
+        # The header is what puts this exchange on the path the test is about.
+        # The pool detach is refused for a backend that said close — its own end
+        # has declared the socket finished — so this exchange falls PAST the
+        # detach, which is where the hold used to have no ending at all.  A
+        # response without that header is detached and pooled instead, and the
+        # hold then ends by the ordinary keep-alive route: green either way, and
+        # measuring the wrong thing.
+        #
+        # Holding the socket open is what stops the pair being reaped by
+        # accident.  A backend that actually closes hands the proxy a
+        # zero-length read on the backend leg, and that path tears the pair down
+        # for reasons of its own, so the leak below could not be seen.
+        #
+        # This fixture used to send no Connection header and hold — which said
+        # the socket stayed usable and then refused to read a second request on
+        # it.  That was answered by the refusal to pool a `Connection: close`
+        # CLIENT, and when that refusal was removed (it cost a backend
+        # connection per client request) the proxy started reusing this socket,
+        # correctly, and waited on a backend that had stopped reading.  A
+        # fixture may not promise keep-alive and then not serve it.
         c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " +
-                  str(len(body)).encode() + b"\r\n\r\n" + body)
-        # And then HOLD the connection open, which is what a keep-alive backend
-        # does and what makes this test discriminate.  A backend that closes
-        # after answering hands the proxy a zero-length read on the backend leg,
-        # and that path tears the pair down for its own reasons — so a backend
-        # that hangs up reaps the held client by accident and the leak below
-        # cannot be seen.  Nothing about the response says `Connection: close`,
-        # so the proxy is entitled to expect this socket to stay usable.
+                  str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
         while True:
             time.sleep(3600)
     except Exception:
