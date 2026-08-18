@@ -248,6 +248,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->file_is_html = false;
     conn->file_read_pending = false;
     conn->http_keep_alive = false;
+    conn->wr_shutdown = false;
 
     SKL_INV_POOLABLE("server::pool_release", conn->fd,
         conn_ops_pending(conn.get()),
@@ -644,6 +645,68 @@ static std::string build_http_headers_only(std::string_view content_type, size_t
     return resp;
 }
 
+// One comma-separated field, one token, case-insensitive: `Connection` is a
+// list header, and "keep-alive, Upgrade" has to match "keep-alive".
+static bool header_list_has_token(std::string_view v, std::string_view lower_tok)
+{
+    size_t i = 0;
+    while (i < v.size())
+    {
+        while (i < v.size() && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) ++i;
+        const size_t start = i;
+        while (i < v.size() && v[i] != ',') ++i;
+        size_t end = i;
+        while (end > start && (v[end - 1] == ' ' || v[end - 1] == '\t')) --end;
+        if (end - start == lower_tok.size())
+        {
+            bool eq = true;
+            for (size_t j = 0; j < lower_tok.size(); ++j)
+            {
+                if (static_cast<char>(std::tolower(static_cast<unsigned char>(v[start + j])))
+                    != lower_tok[j])
+                {
+                    eq = false;
+                    break;
+                }
+            }
+            if (eq)
+                return true;
+        }
+        if (i < v.size()) ++i;
+    }
+    return false;
+}
+
+// ─── THE CLIENT'S `Connection` HEADER DECIDES, NOT THE VERSION ──────────────
+//
+// This was `req.version.find("1.1")` and nothing else, written out at 2 places
+// and read at 26.  The version only supplies the *default* (RFC 9112 §9.3); an
+// explicit `Connection: close` overrides it and an explicit
+// `Connection: keep-alive` overrides an HTTP/1.0 default.  Neither was
+// consulted, so a client that asked to close was answered
+// `Connection: keep-alive`, was never closed on, and had to perform the active
+// close itself — which is what put the TIME-WAIT on the client's *ephemeral*
+// port instead of on our fixed listening port.
+//
+// It lives here, on its own, because 2 deciders against 26 readers is how the
+// two deciders came to disagree in the first place: the cached-response path
+// and the Lua path each grew their own copy.  There is one now, and
+// conn->http_keep_alive is the only place its answer is kept.
+static bool http_request_keep_alive(const http_request& req)
+{
+    for (const auto& [k, v] : req.headers)
+    {
+        if (fnv1a_lower(k) != fnv1a("connection"))
+            continue;
+        if (header_list_has_token(v, "close"))
+            return false;
+        if (header_list_has_token(v, "keep-alive"))
+            return true;
+        break;
+    }
+    return req.version.find("1.1") != std::string_view::npos;
+}
+
 static const std::shared_ptr<const std::string>& http_404_response(bool keep_alive = false)
 {
     static const auto resp_close = std::make_shared<const std::string>(
@@ -704,10 +767,14 @@ void server_instance::rebuild_http_cache()
         if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
             content = inject_ws_script(content);
 
-        // Store pre-built response as shared_ptr (zero-copy on cache hit)
-        // Use keep-alive since 99%+ clients are HTTP/1.1
+        // Store pre-built responses as shared_ptrs (zero-copy on cache hit).
+        // Both, not just the keep-alive one: this map used to hold a single
+        // string built with keep_alive=true, so `--http-cache` answered
+        // `Connection: keep-alive` to every request including the ones that
+        // asked to close — and, unlike disk mode, even to HTTP/1.0.
         m_http_cache[url_path] = {
-            std::make_shared<const std::string>(build_http_response(ct, content, true))
+            std::make_shared<const std::string>(build_http_response(ct, content, true)),
+            std::make_shared<const std::string>(build_http_response(ct, content, false))
         };
     }
 }
@@ -789,7 +856,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
         auto it = m_http_cache.find(url_path);
         conn->write_queue.push(it != m_http_cache.end()
-            ? it->second.response : http_404_response(conn->http_keep_alive));
+            ? (conn->http_keep_alive ? it->second.response : it->second.response_close)
+            : http_404_response(conn->http_keep_alive));
 
         if (!conn->write_pending)
             flush_write_queue(conn);
@@ -1092,6 +1160,10 @@ static std::string_view http_reason(int status)
 
 void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
 {
+    // Decided once, before anything can answer, so that every path below —
+    // Lua, cached, disk, 404 — agrees about what the client asked for.
+    conn->http_keep_alive = http_request_keep_alive(req);
+
 #ifndef SOCKETLEY_NO_LUA
     // ─── The Lua handler ────────────────────────────────────────────────────
     //
@@ -1131,8 +1203,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
             lua_headers[std::string(k)] = std::string(v);
         lua_req["headers"] = lua_headers;
 
-        // Determine keep-alive: HTTP/1.1 defaults to keep-alive
-        const bool keep_alive = (req.version.find("1.1") != std::string_view::npos);
+        const bool keep_alive = conn->http_keep_alive;
 
         sol::protected_function_result r = lua()->on_http_request()(lua_req);
 
@@ -1201,9 +1272,6 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         }
     }
 #endif
-
-    // Determine keep-alive: HTTP/1.1 defaults to keep-alive
-    conn->http_keep_alive = (req.version.find("1.1") != std::string_view::npos);
 
     // Fallback: serve static files if configured
     if (!m_http_dir.empty())
@@ -4235,6 +4303,88 @@ bool server_instance::conn_has_output(const server_connection* conn) const
     return conn->ssl != nullptr && tls_context::has_pending_out(conn->ssl);
 }
 
+// ─── WE SEND THE FIN, NOT THE CLIENT ────────────────────────────────────────
+//
+// Whoever performs the active close holds TIME-WAIT for that 4-tuple for 60 s.
+// Ours sits on a fixed listening port and costs nothing scarce; the client's
+// sits on an ephemeral port, and this box has 28,231 of them.  Measured over
+// 2,000 connection-per-request requests before this existed: 0 closes from us,
+// 2,004 from the client — we were structurally second, every time, and the
+// client burned its cores in the port allocator finding a free one.
+//
+// Two things are load bearing:
+//
+//   shutdown(), not close().  close() on a socket that still has unread bytes
+//   in its receive queue sends RST rather than FIN, and an RST can destroy the
+//   answer just written.  The read stays armed; the client's own FIN completes
+//   it and close_conn() still runs on exactly one path, so the teardown
+//   bookkeeping is untouched.
+//
+//   Only from a write *completion*, never from where the write is queued.
+//   shutdown() is a syscall and a ring submission is not, so calling this with
+//   a write still in flight lets the FIN overtake the payload.  That is the
+//   half-close defect this tree has already fixed four times on the proxy side;
+//   the guard below is what keeps it from coming back here.  Every condition in
+//   it is "is anything still owed to the wire", and it is one function rather
+//   than a line repeated at each completion for the same reason.
+//
+// ─── DO NOT REPLACE THIS WITH A LINKED IORING_OP_SHUTDOWN ───────────────────
+//
+// It looks like the obvious improvement -- chain the FIN to the send with
+// IOSQE_IO_LINK and it leaves from inside the kernel, with no completion
+// crossing into userspace first.  It was built, and it is much WORSE.  Measured
+// as "the client closes the instant it has the whole response; was our FIN
+// already in its receive queue", 200 attempts, three repetitions, quiet box:
+//
+//     this function, from the write completion    200 / 182 / 200
+//     linked IORING_OP_SHUTDOWN + MSG_WAITALL       4 /   0 /   1
+//     linked, without MSG_WAITALL                   2 /   1 /   2
+//
+// The third row is there because MSG_WAITALL is the obvious suspect -- the
+// linked send needs it, or a short send lets the FIN out on top of an
+// unfinished response (measured directly: 6144 bytes of a 4 MB send delivered,
+// then a clean FIN).  It is not the suspect.  Dropping it changes nothing, so
+// the cost is the LINK itself: the kernel runs the second op out of the first
+// one's completion, and by then the data has already woken the client, which
+// closes before the FIN is issued.  An ordinary send completes inline and the
+// shutdown() syscall right behind it beats the client to it.
+//
+// Rate was identical between the two (-0.4%, six interleaved pairs).  CPU per
+// request could not be measured on this machine: kernel.sched_schedstats is 0,
+// and a run lasts 86 ms against a 10 ms clock tick.
+void server_instance::maybe_shutdown_write(server_connection* conn)
+{
+    if (SOCKETLEY_LIKELY(!conn->closing) || conn->wr_shutdown || conn->fd < 0)
+        return;
+
+    // A TLS connection owes a close_notify record first, and tls_flush() owns
+    // that sequence.  Sending a bare FIN under it is a truncation attack as far
+    // as the peer is concerned.
+    if (conn->ssl != nullptr)
+        return;
+
+    // Still something to send, or something in the ring that is sending it.
+    if (conn_has_output(conn) || conn->write_pending || conn->zc_notif_pending)
+        return;
+    if (conn->splice_pending || conn->splice_in_pending || conn->splice_out_pending)
+        return;
+
+    // An answer from the cache has not come back yet; close_conn() defers on
+    // this same flag and so must we, or the FIN goes out before the reply.
+    if (conn->cache_pending > 0)
+        return;
+
+    // Nothing is armed to hold the connection open, so the caller's own
+    // `closing && !conn_ops_pending` branch is about to run close_conn() and do
+    // this properly.  Only the armed-read case needs a FIN of its own — that is
+    // the case that used to wait for the client.
+    if (!conn->read_pending)
+        return;
+
+    conn->wr_shutdown = true;
+    if (shutdown(conn->fd, SHUT_WR) < 0) {}
+}
+
 // Every byte this connection sends is a TLS record, including the ones nobody
 // queued.  Called from flush_write_queue for a TLS connection and from the end
 // of handle_read; there is no other way onto the wire.
@@ -4442,6 +4592,8 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             flush_write_queue(conn);
         else if (conn->write_queue.empty() && conn->closing && !conn_ops_pending(conn))
             close_conn(conn);
+        else
+            maybe_shutdown_write(conn);
         return;
     }
 
@@ -4478,6 +4630,22 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             total_submitted += conn->write_iovs[i].iov_len;
 
         size_t written = static_cast<size_t>(cqe->res);
+        if (written < total_submitted && SOCKETLEY_UNLIKELY(conn->wr_shutdown))
+        {
+            // Our write side is already closed, so the remainder cannot be sent
+            // and retrying it would only earn an EPIPE.  maybe_shutdown_write()
+            // only fires with the queue empty and nothing in flight, so getting
+            // here means something queued more output after the FIN — a Lua
+            // send, in practice.  Drop it rather than retry a truncated
+            // response forever against a socket that will not take it.
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                conn->write_batch[i].reset();
+            conn->write_batch_count = 0;
+            conn->closing = true;
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
+            return;
+        }
         if (written < total_submitted)
         {
             // Advance past fully-written iovecs
@@ -4552,6 +4720,12 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             conn->write_batch[i].reset();
         conn->write_batch_count = 0;
     }
+
+    // The response is on the wire and the queue behind it is empty: this is the
+    // moment our write side is finished, and the only moment at which sending
+    // the FIN cannot overtake anything.  It declines by itself if either is
+    // untrue, so it goes before the branch rather than inside one arm of it.
+    maybe_shutdown_write(conn);
 
     // Check if more messages to send.  conn_has_output and not the queue alone:
     // a TLS connection owes the wire the next handshake flight or a session
@@ -4802,6 +4976,9 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     if (!conn->http_keep_alive)
     {
         conn->closing = true;
+        // splice_cleanup() has just cleared the last splice flag, so this is the
+        // write completion for the file path: same moment, same reasoning.
+        maybe_shutdown_write(conn);
     }
     else
     {
