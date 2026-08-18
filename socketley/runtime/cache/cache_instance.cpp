@@ -338,10 +338,48 @@ bool cache_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data
-    int defer_secs = 1;
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
-
+    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
+    //
+    // This set it with a one-second timeout.  setup_tcp_listener in
+    // server_instance.cpp carries the full argument; what follows is what is
+    // different about a cache, because a cache is the case where the usual
+    // defence of this option is actually true.
+    //
+    // RESP is request/response and nothing greets, so a cache client speaks
+    // first by definition and the DELAY the option introduces costs a real one
+    // nothing.  Measured here and stated plainly:
+    //
+    //     connect storm      (`server burst`, no client ever speaks)
+    //         with 106,456/s   without 73,448/s   -25.8%  +/-13.9% CI95
+    //     client speaks first (connect, SET, read the answer, close)
+    //         with  28,708/s   without 30,887/s    +7.9%  +/-10.3% CI95
+    //
+    // Fifteen pairs each, interleaved, gated on the port pool; the method and
+    // why the paired median is the statistic are written out once, next to the
+    // same measurement in proxy_instance.cpp.
+    //
+    // So the intuition holds and is now a number: on the only shape a cache
+    // client has, this option is worth nothing that can be told from zero.  The
+    // -26% is a storm of connections that never send a command, which is not a
+    // cache workload -- it is the case the deferral was written for.
+    //
+    // It is removed anyway, and not for the delay.  A connection still in
+    // SYN-RECV is a request sock rather than a socket, and when the listener
+    // closes the kernel drops it with no FIN and no RST — the client keeps an
+    // ESTABLISHED socket against a peer that no longer exists, and nothing on an
+    // accepted cache connection sets SO_KEEPALIVE.  "Until it next writes" is
+    // the whole problem for this runtime in particular: a cache client library
+    // holds a POOL of idle connections and hands one out on demand, so a
+    // connection killed while idle is not noticed at the moment it dies but at
+    // the moment somebody's request is written into it.  Idle is the normal
+    // state of most of that pool, and the window is every connection between
+    // the handshake and the first command.
+    //
+    // Nor is it only the delay that the deferral hides: a connection in
+    // SYN-RECV is in no count, no stats figure and no listing this runtime can
+    // produce, so an operator asking how many clients a cache has is told a
+    // number the kernel disagrees with.
+    //
     int rcvbuf = 131072;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     setsockopt(m_listen_fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));

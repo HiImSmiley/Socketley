@@ -1553,11 +1553,75 @@ bool proxy_instance::setup(event_loop& loop)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // TCP_DEFER_ACCEPT: kernel delays accept CQE until client sends data,
-    // eliminating the empty-accept + read round-trip on the hot path
-    int defer_secs = 1;
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_secs, sizeof(defer_secs));
-
+    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
+    //
+    // This set it with a one-second timeout, "eliminating the empty-accept +
+    // read round-trip on the hot path".  setup_tcp_listener in
+    // server_instance.cpp carries the full argument and the measurement behind
+    // it; what follows is only what is different about a proxy.
+    //
+    // The option was removed from the server and left here and in
+    // cache_instance, which is the whole of why this comment exists.  Measured
+    // on this tree before the removal, one silent client, server-side state
+    // 0.4 s after connect:
+    //
+    //     server   ESTAB       (already fixed)
+    //     proxy    SYN-RECV
+    //     cache    SYN-RECV
+    //
+    // A CLIENT-SPEAKS-FIRST PROTOCOL DOES NOT MAKE IT FREE.  It is the obvious
+    // objection here — an HTTP proxy is answered by a request, so the deferral
+    // never delays anything real — and it answers the wrong half.  The delay is
+    // the smaller half.  A connection still in SYN-RECV is a request sock
+    // rather than a socket, and when the listener closes the kernel drops it
+    // with no FIN and no RST; the client is left ESTABLISHED against a peer that
+    // no longer exists, and nothing on an accepted proxy connection sets
+    // SO_KEEPALIVE, so it holds that dead socket until it next writes.  That
+    // window is not rare for a proxy: it is every connection between the accept
+    // and the request, which is a whole round trip on a real network, and a
+    // health checker or a load balancer that opens a connection and stops there
+    // sits in it indefinitely.
+    //
+    // It is also the one state in which this runtime cannot see or account for
+    // a connection at all — not in stats, not in a count, not to a Lua hook —
+    // and the accept-path work removed in that trade is work the proxy has to
+    // do the moment the request arrives regardless.
+    //
+    // WHAT IT COSTS HERE, measured rather than assumed by symmetry with the
+    // server's -17%.  Interleaved A/B, one build against the other, 2,000
+    // connections a run so the box's 28,231 ephemeral ports are not what is
+    // being timed -- the first measurement of the server's cost was wrong for
+    // exactly that reason:
+    //
+    //     connect storm      (`server burst`, no client ever speaks)
+    //         with 98,255/s    without 81,054/s    -22.7%  +/-18.1% CI95
+    //     client speaks first (connect, GET, read the answer, close)
+    //         with 16,859/s    without 17,993/s     +5.5%  +/- 5.6% CI95
+    //
+    // Fifteen pairs each, two daemons side by side, arms alternating which one
+    // leads, every run 2,000 connections with zero failures, and no run started
+    // while more than 12,000 sockets were in TIME-WAIT.  The paired median and
+    // not the mean, because consecutive bursts against ONE daemon decline
+    // within a sequence -- 102,466 then 78,513 then 66,305 at only 257 sockets
+    // in TIME-WAIT, so that is the runtime and not the port pool -- and pairing
+    // with an alternating lead is what keeps that off one arm.
+    //
+    // THE TWO NUMBERS DISAGREE, AND THE SECOND ONE IS THIS LISTENER'S WORKLOAD.
+    // A storm of connections in which nobody ever speaks is exactly the case
+    // the deferral optimises: connect() returns on the SYN-ACK and this runtime
+    // is not involved at all.  It is not a case an HTTP proxy has.  Every real
+    // client -- a browser, a health checker, curl, another proxy -- writes its
+    // request immediately, and then there is nothing left to defer: the option
+    // saves one accept-then-read round inside the ring and nothing on the wire.
+    // Measured on that shape it is worth nothing here this instrument can tell
+    // from zero, and the point estimate is on the other side of it.
+    //
+    // The server's -17% was taken with the first instrument, and there the
+    // connect storm is a shape that runtime genuinely sees: a client that
+    // connects and waits to be greeted is the whole reason that fix was made.
+    // The trade was real there.  It is not the same trade here, which is what
+    // measuring it rather than assuming symmetry was for.
+    //
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
