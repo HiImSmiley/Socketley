@@ -44,18 +44,49 @@ generate_large_bin() {
     fi
 }
 
-# Parse k6 JSON summary export and extract metrics
-# k6 export format: metrics.{name}.{stat} (no 'values' nesting)
-# Counters: {count, rate}  Trends: {avg, min, med, max, p(90), p(95)}  Rates: {value, passes, fails}
+# ─── Parse the k6 summary export ────────────────────────────────────────────
+#
+# This used to pull one p50 and one p99 out of http_req_duration and record them
+# as the latency of the run:
+#
+#     k6_http_disk    p50 5.06 ms   p99 57.96 ms
+#     k6_http_cached  p50 2.85 ms   p99 53.27 ms
+#
+# Both p99s sit +51 ms above their own median, identically, which reads as a
+# tail defect that --http-cache does nothing about.  It is a percentile taken
+# across a load profile that deliberately doubles to 200 VUs against a
+# single-threaded server, with a 100 KB file in the mix.  The slowest 1% of the
+# run is the spike, always, by construction -- so the number cannot move when
+# the server gets faster and does move when the stage table is edited.
+#
+# k6/http_bench.js now keeps a Trend per stage.  Measured on the disk arm right
+# after the change, one run:
+#
+#     whole run   p50 6.14 ms   p95 20.72 ms   p99  52.39 ms   433,175 reqs
+#     ramp        p50 2.74      p95 10.82      p99  17.70       47,967
+#     steady      p50 6.26      p95 16.68      p99  25.96      161,982
+#     spike_ramp  p50 8.04      p95 23.80      p99  55.08       54,545
+#     spike       p50 7.86      p95 31.81      p99 104.07      114,162
+#     cooldown    p50 4.61      p95 18.24      p99  37.00       54,519
+#
+# The aggregate p99 of 52 ms is a blend of a 26 ms steady tail and a 104 ms
+# spike tail and describes neither.  Quote `steady` for latency and `spike` for
+# behaviour under a doubling; the aggregate is still recorded, under a label
+# that says what it is, so older comparisons keep working.
+#
+# Each stage is written as its own row so that a comparison between two runs
+# lines the stages up rather than the mixtures.
+
+# Emit one summary row per stage, plus the whole-run row.
 parse_k6_summary() {
     local json_file=$1
     local test_name=$2
     local mode=$3  # "disk" or "cached"
 
     local parsed
-    parsed=$(python3 -c "
+    parsed=$(python3 - "$json_file" <<'K6PARSE' 2>/dev/null
 import json, sys
-d = json.load(open('$json_file'))
+d = json.load(open(sys.argv[1]))
 m = d.get('metrics', {})
 
 def g(metric, key, default=0):
@@ -64,22 +95,29 @@ def g(metric, key, default=0):
         v = v['values']
     return v.get(key, default)
 
-reqs_total = int(g('http_reqs', 'count'))
-reqs_rate = g('http_reqs', 'rate')
-avg = g('http_req_duration', 'avg')
-p50 = g('http_req_duration', 'med', g('http_req_duration', 'p(50)'))
-p95 = g('http_req_duration', 'p(95)')
-p99 = g('http_req_duration', 'p(99)')
-failed_rate = g('http_req_failed', 'value', g('http_req_failed', 'rate', 0))
+print('%d' % int(g('http_reqs', 'count')))
+print('%.2f' % g('http_reqs', 'rate'))
+print('%.3f' % g('http_req_duration', 'avg'))
+print('%.3f' % g('http_req_duration', 'med', g('http_req_duration', 'p(50)')))
+print('%.3f' % g('http_req_duration', 'p(95)'))
+print('%.3f' % g('http_req_duration', 'p(99)'))
+print('%.4f' % (g('http_req_failed', 'value', g('http_req_failed', 'rate', 0)) * 100))
 
-print(f'{reqs_total}')
-print(f'{reqs_rate:.2f}')
-print(f'{avg:.3f}')
-print(f'{p50:.3f}')
-print(f'{p95:.3f}')
-print(f'{p99:.3f}')
-print(f'{failed_rate * 100:.4f}')
-" 2>/dev/null)
+# Discovered from the file rather than listed here, so a stage added to
+# http_bench.js shows up without this being edited -- the same reason
+# generate_summary() builds its tables from the data it was given.
+order = ['ramp', 'steady', 'spike_ramp', 'spike', 'cooldown']
+found = sorted(
+    (k[len('stage_'):-len('_duration')] for k in m
+     if k.startswith('stage_') and k.endswith('_duration')),
+    key=lambda n: order.index(n) if n in order else 99)
+for name in found:
+    t = 'stage_%s_duration' % name
+    print('STAGE %s %d %.3f %.3f %.3f %.3f %.3f' % (
+        name, int(g(t, 'count')), g(t, 'avg'),
+        g(t, 'med', g(t, 'p(50)')), g(t, 'p(95)'), g(t, 'p(99)'), g(t, 'max')))
+K6PARSE
+)
 
     if [[ -z "$parsed" ]]; then
         log_error "Failed to parse k6 summary"
@@ -97,19 +135,55 @@ print(f'{failed_rate * 100:.4f}')
 
     log_success "Mode: $mode"
     log_success "  Requests: $reqs_total total, $reqs_rate req/sec"
-    log_success "  Latency avg: ${avg}ms  p50: ${p50}ms  p95: ${p95}ms  p99: ${p99}ms"
+    log_success "  Whole run (mixes every stage — not a tail metric):"
+    log_success "    avg ${avg}ms  p50 ${p50}ms  p95 ${p95}ms  p99 ${p99}ms"
     log_success "  Failed: ${failed_pct}%"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
-        "mode"          "$mode" \
-        "requests_total" "$reqs_total" \
+        "mode"            "$mode" \
+        "stage"           "whole_run" \
+        "measures"        "all stages mixed; quote the per-stage rows instead" \
+        "requests_total"  "$reqs_total" \
         "requests_per_sec" "$reqs_rate" \
-        "latency_avg_ms" "$avg" \
-        "latency_p50_ms" "$p50" \
-        "latency_p95_ms" "$p95" \
-        "latency_p99_ms" "$p99" \
-        "failed_percent" "$failed_pct"
+        "latency_avg_ms"  "$avg" \
+        "latency_p50_ms"  "$p50" \
+        "latency_p95_ms"  "$p95" \
+        "latency_p99_ms"  "$p99" \
+        "failed_percent"  "$failed_pct"
+
+    # No per-stage rows means the script under k6 is an older copy that does not
+    # record them.  Said rather than passed over: the aggregate above would then
+    # be the only thing in the file, which is exactly the state this change
+    # exists to leave behind.
+    if ! echo "$parsed" | grep -q '^STAGE '; then
+        log_error "  no per-stage metrics in the export — k6/http_bench.js is"
+        log_error "  not the version that records them, and the run above is"
+        log_error "  one percentile over a saturated phase and an unsaturated one"
+        return 0
+    fi
+
+    log_success "  Per stage:"
+    local name count s_avg s_p50 s_p95 s_p99 s_max label
+    while read -r _ name count s_avg s_p50 s_p95 s_p99 s_max; do
+        case "$name" in
+            steady) label="steady state, 100 VUs" ;;
+            spike)  label="under the spike, 200 VUs" ;;
+            *)      label="transitional" ;;
+        esac
+        log_success "    $(printf '%-11s' "$name") p50 ${s_p50}ms  p95 ${s_p95}ms  p99 ${s_p99}ms  max ${s_max}ms  (${count} reqs, $label)"
+        append_result
+        write_json_result "$test_name" "$RESULTS_FILE" \
+            "mode"           "$mode" \
+            "stage"          "$name" \
+            "measures"       "$label" \
+            "requests_total" "$count" \
+            "latency_avg_ms" "$s_avg" \
+            "latency_p50_ms" "$s_p50" \
+            "latency_p95_ms" "$s_p95" \
+            "latency_p99_ms" "$s_p99" \
+            "latency_max_ms" "$s_max"
+    done < <(echo "$parsed" | grep '^STAGE ')
 }
 
 # Test: HTTP static serving (disk)
