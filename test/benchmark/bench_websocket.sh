@@ -97,7 +97,8 @@ test_ws_concurrent() {
     socketley_cmd remove bench_ws
 }
 
-# Test 4: TCP coexistence throughput (mixed WS + TCP clients) — bash-based
+# Test 4: TCP coexistence (mixed WS + TCP clients) — bash-based
+#
 # ─── What this row can and cannot measure ───────────────────────────────────
 #
 # It reported "Combined throughput 2221 ops/sec" for 200 operations.  The
@@ -144,7 +145,7 @@ ws_coex_fork_floor_us() {   # num_ops batch -> microseconds for the whole loop
 }
 
 test_ws_tcp_coexistence() {
-    local num_ops=${1:-200}
+    local num_ops=${1:-500}
     local test_name="ws_tcp_coexistence"
 
     log_section "Test: WS + TCP Coexistence ($num_ops mixed connections)"

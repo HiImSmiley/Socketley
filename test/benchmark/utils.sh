@@ -360,7 +360,7 @@ wait_for_port_free() {
 # Both are kept.  get_time_ms() is still correct for the things it is used for
 # elsewhere -- waiting, sleeping, second-scale phases -- and rewriting those
 # would be a change with no measurement behind it.  Anything timing work that
-# finishes in under a second uses get_time_us().
+# finishes in under a second uses now_us().
 BENCH_CLOCK_KIND="epochrealtime"
 if [[ -z "${EPOCHREALTIME:-}" ]]; then
     BENCH_CLOCK_KIND="date"
@@ -440,9 +440,14 @@ get_time_ms() {
 #
 # Measured rather than assumed, once per shell, because it is the number that
 # decides whether a window is long enough to mean anything -- and because it is
-# different by two orders of magnitude between the two branches of
-# get_time_us().  A caller that lengthens a window until the clock stops
-# mattering has to be told what "stops mattering" costs here.
+# different by two orders of magnitude between the two branches of now_us().  A
+# caller that lengthens a window until the clock stops mattering has to be told
+# what "stops mattering" costs here.
+#
+# "Once per shell" only holds if it is first called as a statement --
+# `bench_clock_floor_us >/dev/null` -- because $( ) runs it in a subshell that
+# takes the cached value away with it when it exits.  Same trap as now_us(),
+# and bench_cache.sh's cache_pipe_measure_floor() records what it cost there.
 bench_clock_floor_us() {
     if [[ -n "${BENCH_CLOCK_FLOOR_US:-}" ]]; then
         printf '%s' "$BENCH_CLOCK_FLOOR_US"
@@ -456,34 +461,6 @@ bench_clock_floor_us() {
     BENCH_CLOCK_FLOOR_US=$(printf '%s\n' "${samples[@]}" | sort -n | awk '{v[n++]=$1} END{print v[int(n/2)]}')
     [[ "$BENCH_CLOCK_FLOOR_US" -lt 1 ]] && BENCH_CLOCK_FLOOR_US=1
     printf '%s' "$BENCH_CLOCK_FLOOR_US"
-}
-
-# The resolution a window of WINDOW_US has, as a percentage: how much of it the
-# clock alone could account for.
-#
-# Printed beside every figure derived from a bash-timed window, and not only
-# when it is bad -- a resolution shown only when it is poor teaches the reader
-# that its absence means the question was asked and answered well, when in fact
-# it means the question was never asked.
-bench_resolution_pct() {
-    local window_us=$1 floor
-    floor=$(bench_clock_floor_us)
-    awk -v w="$window_us" -v f="$floor" \
-        'BEGIN { if (w <= 0) { print "inf"; exit } printf "%.3f", 100 * f / w }'
-}
-
-# Is a window long enough for the clock behind it?  Echoes "ok" or "unresolved".
-#
-# BENCH_WINDOW_FLOOR_PCT is the largest share of a window the clock is allowed
-# to be.  1% is not a statistical claim -- run-to-run spread is far wider than
-# that and is reported separately -- it is the line below which the *instrument*
-# stops being the reason two numbers differ.  The old cache tests sat at 11..20%
-# by this measure and printed six significant figures.
-BENCH_WINDOW_FLOOR_PCT=${BENCH_WINDOW_FLOOR_PCT:-1.0}
-bench_window_verdict() {
-    local window_us=$1
-    awk -v p="$(bench_resolution_pct "$window_us")" -v lim="$BENCH_WINDOW_FLOOR_PCT" \
-        'BEGIN { print (p == "inf" || p > lim) ? "unresolved" : "ok" }'
 }
 
 # Calculate statistics from a file of numbers (one per line)
