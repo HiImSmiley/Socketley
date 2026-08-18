@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """Closed-loop HTTP client for the proxy benchmarks.
 
+NOT WIRED INTO THE SUITE ANY MORE, and the reason is measured rather than
+stylistic.  This client caps at about 7,700 req/sec on this box whatever it is
+pointed at: against the Python backend it replaced it reported 8,264, and
+against a socketley `--http --http-cache` backend that serves the C client
+14,084 it still reported 7,518.  Both numbers are this file's ceiling, not the
+proxy's.  bench_proxy.sh therefore drives those two rows with socketley_bench's
+`proxy http-close`, which is C and threaded, against a socketley backend.
+
+It is kept because it is still the only client here that checks the status code
+-- socketley_bench's http_read_response() accepts any well-formed response, so a
+404 counts as a served request -- and because it is a usable standalone probe
+when a quick number is wanted without a build.  bench_proxy.sh grew its own
+require_200() preflight to cover the oracle this file used to provide.
+
+
 Both HTTP tests used to drive the proxy from bash: a subshell per request,
 /dev/tcp for the connection, and `read` for the reply.  What that timed was
 bash.  The single-backend test additionally called get_time_ms() twice inside

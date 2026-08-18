@@ -339,9 +339,128 @@ wait_for_port_free() {
     done
 }
 
+# ─── Clocks ─────────────────────────────────────────────────────────────────
+#
+# get_time_ms() is a fork.  `$(date +%s%N)` starts a process, and on this box a
+# `date` costs 6.8 ms wall from fork to reap and about 1.5 ms from the fork to
+# the moment it reads the clock -- most of it loading the timezone; the same
+# call with TZ=UTC costs 1.3 ms.  Measured directly, the interval this reports
+# for two calls with nothing between them is 1..2 ms.
+#
+# So every window timed with it carries a bias of one to two milliseconds on top
+# of a resolution of one millisecond, and the cache data-structure tests timed
+# windows of five to nine.  What they published -- 833,333 and 1,000,000 ops/sec
+# for lpush and lpop -- is 5000/6 and 5000/5: two integers a millisecond apart,
+# printed to six significant figures.  Nothing in the output said so.
+#
+# EPOCHREALTIME is a bash variable, so reading it forks nothing: 11 us per read
+# in a loop, and 3 us for the interval between two reads.  That is the floor of
+# what a bash-timed window can resolve, and it is 300x better than the fork.
+#
+# Both are kept.  get_time_ms() is still correct for the things it is used for
+# elsewhere -- waiting, sleeping, second-scale phases -- and rewriting those
+# would be a change with no measurement behind it.  Anything timing work that
+# finishes in under a second uses now_us().
+BENCH_CLOCK_KIND="epochrealtime"
+if [[ -z "${EPOCHREALTIME:-}" ]]; then
+    BENCH_CLOCK_KIND="date"
+fi
+
+# Microseconds since the epoch, into the variable NOW_US.  No subshell, no
+# fork, no `date`.
+#
+# It assigns rather than echoes on purpose, and that is not a style choice: a
+# function whose value is taken with $( ) is run in a forked subshell, and a
+# fork costs about 400 us here.  Measured, the three idioms cost 3 us inlined,
+# 11 us through `now_us`, and 267..931 us through `t=$(now_us_echoing)` -- so
+# the convenient spelling would have put back two orders of magnitude of the
+# very overhead this exists to remove.  Read NOW_US straight after the call.
+#
+# The digits are pulled out rather than the '.' being replaced, because
+# EPOCHREALTIME uses the *locale's* decimal separator: under a locale with
+# LC_NUMERIC=de_DE it reads "1787022899,674305", and ${x/./} would then leave
+# the comma in place and produce a number bash refuses to do arithmetic on.
+NOW_US=0
+if [[ "$BENCH_CLOCK_KIND" == "epochrealtime" ]]; then
+    now_us() { local t=${EPOCHREALTIME}; NOW_US=${t//[!0-9]/}; }
+else
+    # bash < 5.0.  A fork per reading, and bench_clock_floor_us() reports it.
+    now_us() { NOW_US=$(($(date +%s%N) / 1000)); }
+fi
+
+# ─── A port block inside the ephemeral range is a benchmark that breaks itself ─
+#
+# The connection-per-request HTTP benchmarks in this directory open and close a
+# connection per request.  Each close leaves a socket in TIME_WAIT on the client
+# side for 60 s, and the client's side is an ephemeral port.  At the rates these
+# run, the TIME_WAIT table fills to tcp_max_tw_buckets within a couple of minutes
+# -- observed here at 65,527 of 65,536 -- and every ephemeral port is occupied.
+#
+# A listener whose port falls inside net.ipv4.ip_local_port_range (32768..60999
+# on this box) then collides with one of those TIME_WAIT sockets and bind()
+# returns EADDRINUSE, for a port nothing is listening on and that `ss -ltn`
+# shows as free.  socketley reports that as
+#
+#     runtime X could not start: the worker did not accept its configuration
+#
+# which names neither the port nor the cause, and it arrives long after the run
+# that caused it.  It cost an hour here before `nc -l` on an obviously unused
+# port failed the same way and gave it away.
+#
+# The suite's own blocks are all below 32768 and are therefore safe by accident
+# rather than by design.  This says so out loud, so the next person to point
+# BENCH_PORT_BASE somewhere convenient finds out before the run instead of after.
+bench_check_port_range() {
+    local lo hi p bad=0
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || return 0
+    [[ -z "$lo" || -z "$hi" ]] && return 0
+    for p in "$@"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        if [[ "$p" -ge "$lo" && "$p" -le "$hi" ]]; then
+            log_warn "port $p is inside the ephemeral range ($lo..$hi)"
+            bad=1
+        fi
+    done
+    if [[ $bad -eq 1 ]]; then
+        log_warn "a connection-per-request benchmark fills that range with TIME_WAIT"
+        log_warn "sockets, after which these listeners fail to bind with EADDRINUSE"
+        log_warn "on ports nothing is listening on. Move the block below $lo."
+        return 1
+    fi
+    return 0
+}
+
 # Get high-resolution timestamp in milliseconds
 get_time_ms() {
     echo $(($(date +%s%N) / 1000000))
+}
+
+# What the clock above costs, in microseconds: the median interval this harness
+# reports for a window in which nothing happened.
+#
+# Measured rather than assumed, once per shell, because it is the number that
+# decides whether a window is long enough to mean anything -- and because it is
+# different by two orders of magnitude between the two branches of now_us().  A
+# caller that lengthens a window until the clock stops mattering has to be told
+# what "stops mattering" costs here.
+#
+# "Once per shell" only holds if it is first called as a statement --
+# `bench_clock_floor_us >/dev/null` -- because $( ) runs it in a subshell that
+# takes the cached value away with it when it exits.  Same trap as now_us(),
+# and bench_cache.sh's cache_pipe_measure_floor() records what it cost there.
+bench_clock_floor_us() {
+    if [[ -n "${BENCH_CLOCK_FLOOR_US:-}" ]]; then
+        printf '%s' "$BENCH_CLOCK_FLOOR_US"
+        return
+    fi
+    local i a b samples=()
+    for i in 1 2 3 4 5 6 7 8 9; do
+        now_us; a=$NOW_US; now_us; b=$NOW_US
+        samples+=( $((b - a)) )
+    done
+    BENCH_CLOCK_FLOOR_US=$(printf '%s\n' "${samples[@]}" | sort -n | awk '{v[n++]=$1} END{print v[int(n/2)]}')
+    [[ "$BENCH_CLOCK_FLOOR_US" -lt 1 ]] && BENCH_CLOCK_FLOOR_US=1
+    printf '%s' "$BENCH_CLOCK_FLOOR_US"
 }
 
 # Calculate statistics from a file of numbers (one per line)
@@ -582,7 +701,35 @@ BENCH_TIMEOUT_SCRIPT=${BENCH_TIMEOUT_SCRIPT:-300}
 
 # Log a timestamped benchmark event to the bench log file.
 # The log file is the primary record — always written regardless of
-# stdout/stderr redirection.  Also echoes to stderr when visible.
+# stdout/stderr redirection.  Also echoes to stderr.
+#
+# ─── stderr, and why it is not a preference ─────────────────────────────────
+#
+# The comment above always said "echoes to stderr" and it went to stdout, which
+# is where the results files are.  Sixteen call sites in four scripts run
+#
+#     bench_run -j <test> >> "$RESULTS_FILE"
+#
+# and bench_run calls log_bench when socketley_bench exits 2.  So a run that
+# refused to stand behind its own figure appended
+#
+#     [INFO] [06:15:27] [UNUSABLE] socketley_bench -j -r 5 -W 1 -d 800 proxy
+#     overhead ... — run short, or repetitions too far apart to resolve
+#
+# with its colour escapes into the middle of the JSON array, and the file stopped
+# parsing from that line on.  Observed in results/proxy_20260818_060839.json,
+# where it cost the three records that followed it.
+#
+# That is the same failure the BENCH_TIMEOUT_SCRIPT comment above describes and
+# for a worse reason: a truncated file is at least the result of something
+# visibly going wrong, while this one is written by the diagnostic that fires
+# precisely when a benchmark is being careful.  The more honest socketley_bench
+# becomes about refusing a figure, the more results files it destroys.
+#
+# Fixed here rather than at the sixteen redirections, because the redirections
+# are where the next one will be added and this is the one function all of them
+# already go through.  Nothing log_bench prints is data; all of it is
+# diagnostics, and diagnostics belong on stderr.
 log_bench() {
     local tag=$1
     shift
@@ -591,8 +738,8 @@ log_bench() {
     local msg="[$ts] [$tag] $*"
     echo "$msg" >> "$BENCH_LOG" 2>/dev/null
     case "$tag" in
-        TIMEOUT|FAIL) log_error "$msg" 2>/dev/null || true ;;
-        *)            log_info "$msg"  2>/dev/null || true ;;
+        TIMEOUT|FAIL) log_error "$msg" >&2 || true ;;
+        *)            log_info  "$msg" >&2 || true ;;
     esac
 }
 
