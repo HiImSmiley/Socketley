@@ -398,39 +398,31 @@ ensure_clean() {
     socketley_cmd remove bench_cache 2>/dev/null
 }
 
-# ─── One-off commands, and the second that was being reported as I/O ────────
+# ─── The second that was being reported as I/O ──────────────────────────────
 #
-# This was:
+# Every one-off command in this file went through
 #
 #     printf '%s\n' "$1" | timeout $BENCH_TIMEOUT_NC nc -q1 localhost $CACHE_PORT
 #
 # `-q1` means "after EOF on stdin, wait one second, then quit".  The wait is
 # unconditional: it does not wait *for* anything, it waits.  test_persistence()
-# had this inside its timing window, so it published flush_time_ms 1018 and
+# had it inside its timing window, so it published flush_time_ms 1018 and
 # load_time_ms 1006 for 10,000 keys and 649 KB -- which reads as 0.65 MB/s and
 # was quoted as a persistence bottleneck.  Measured on the same store the same
-# afternoon: the flush is 18 ms and the load 8 ms, so the file said 1006 for a
-# thing that took 8, and 998 of it was netcat sleeping.
+# afternoon, the flush is about 12 ms and the load about 1: the file said 1006
+# for a thing that took one, and 1005 of it was netcat sleeping.
 #
-# The linger *is* load-bearing in one direction, which is why it cannot simply
-# become -q0: every caller here needs the cache's answer (FLUSH and LOAD reply
-# "ok", SIZE replies a count), and -q0 quits at EOF on stdin without waiting for
-# it.  So the reply is read explicitly and the connection ends when the reply
-# arrives -- which is both what the reader wanted and what a duration should
-# measure.  Verified: FLUSH, LOAD and SIZE each answer one line.
-cache_cmd() {
-    local fd reply=""
-    if ! exec {fd}<>/dev/tcp/127.0.0.1/$CACHE_PORT 2>/dev/null; then
-        return 1
-    fi
-    printf '%s\n' "$1" >&$fd
-    IFS= read -r -t "$BENCH_TIMEOUT_NC" reply <&$fd
-    exec {fd}>&-
-    printf '%s' "$reply"
-}
-
-# The same round trip on a connection the caller already holds, so that a timed
-# window contains the command and nothing else -- no connect, no process.
+# The linger is load-bearing in one direction, which is why -q0 is not the fix
+# on its own: every caller needs the cache's answer (FLUSH and LOAD reply "ok",
+# SIZE replies a count) and -q0 quits at EOF on stdin without waiting for it.
+# So the reply is read explicitly, and a timed window ends when the reply
+# arrives -- which is both what the caller wanted and what a duration should
+# measure.  Verified: FLUSH, LOAD and SIZE each answer exactly one line.
+#
+# The connection is opened once and held, rather than opened per command, so
+# that a timed window contains the command and its reply and nothing else: no
+# connect, no process start.  On this box that is the difference between a
+# 79 us round trip and a 2.6 ms one, against a flush of 12 ms.
 #
 # cache_conn_open sets CACHE_FD; cache_conn_rpc puts the reply in CACHE_REPLY.
 CACHE_FD=""
@@ -548,7 +540,7 @@ test_concurrent_access() {
 # flush_time_ms 1018 and load_time_ms 1006 for 10,000 keys and a 649 KB file.
 # Read as I/O that is 0.65 MB/s, which is a bottleneck worth a paragraph in a
 # report -- and one was written.  Both figures were `nc -q1`: a fixed one-second
-# linger after EOF, inside the timing window.  See cache_cmd() above.
+# linger after EOF, inside the timing window.  See the connection helpers above.
 #
 # Re-measured on the same store: the flush is about 12..14 ms and the load
 # about 1..2 ms for the same 633 KB, i.e. 43..51 MB/s flushed and 260..483 MB/s
