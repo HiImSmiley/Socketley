@@ -144,8 +144,21 @@ run_benchmarks() {
     # when the numbers matter: the interval narrows as 1/sqrt(pairs), and on a
     # ten-core box the 8-connection case needed about twenty pairs to get under
     # 15%.  Exits cleanly when haproxy is not installed.
+    #
+    # Its own timeout, for the same reason the HTTP comparison below has one and
+    # measured rather than guessed.  At the three pairs exported above this
+    # script takes 345 s, against the 300 s BENCH_TIMEOUT_SCRIPT allows -- so
+    # the suite killed it about forty seconds from the end, every time, leaving
+    # a results file that stops parsing.  Observed:
+    # results/proxy_vs_haproxy_20260818_060839.json, "Expecting ',' delimiter:
+    # line 81", against 6 clean rows once it is allowed to finish.
+    #
+    # 900 rather than 400, because PAIRS defaults to 7 when BENCH_HAPROXY_RUNS
+    # is not set and the interval only narrows as 1/sqrt(pairs): at 7 the same
+    # script takes 652 s, and anyone raising the pair count to get a usable
+    # interval should not also have to find this line.
     export BENCH_HAPROXY_RUNS=3
-    run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
+    BENCH_TIMEOUT_SCRIPT=900 run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
     unset BENCH_HAPROXY_RUNS
     restart_daemon
 
@@ -269,6 +282,12 @@ EOF
     bench_section "Cache vs Redis" "${RESULTS_DIR}/cache_resp_${TIMESTAMP}.json"
     bench_section "Proxy Runtime"  "${RESULTS_DIR}/proxy_${TIMESTAMP}.json"
     bench_section "WebSocket"      "${RESULTS_DIR}/websocket_${TIMESTAMP}.json"
+    # The two k6 files were written by every run and read by none of them.  That
+    # mattered less while k6_http reported one p50 and one p99 for a run that
+    # deliberately doubles its load halfway through; now that it reports a row
+    # per stage, the rows are the point and they have to reach the summary.
+    bench_section "k6 HTTP"        "${RESULTS_DIR}/k6_http_${TIMESTAMP}.json"
+    bench_section "k6 WebSocket"   "${RESULTS_DIR}/k6_ws_${TIMESTAMP}.json"
 
     cat >> "$SUMMARY_FILE" << EOF
 
