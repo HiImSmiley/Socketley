@@ -345,8 +345,21 @@ def counters(*names):
 # specified in, and the baselines are quiesced so that a phase can never be
 # credited with the previous phase's bytes in either direction.
 
-PUBLISH_INTERVAL = 0.25      # proxy_worker.cpp: stats_interval
-SETTLE           = 1.0       # four publish intervals: margin for a loaded machine
+# ─── NO COPY OF THE WORKER'S CADENCE LIVES HERE ANY MORE ───────────────────
+#
+# This was `PUBLISH_INTERVAL = 0.25  # proxy_worker.cpp: stats_interval` and a
+# SETTLE of four of them.  A second copy of a constant that lives in C++, and it
+# drifted the moment that constant stopped being a constant: the publish now
+# backs off to 900 ms while nothing changes, so 1.0 s stopped being four
+# intervals and became one.  The after-reading then landed on a publish that
+# still carried the previous phase's bytes, and `unchanged` reported
+# 268 -> 366 -- a real increment the old timing had been hiding, in a test whose
+# whole subject is whether an increment happened.
+#
+# The fix is not a bigger number.  `stats` prints figures_age_ms, so a reader can
+# ask directly for a sample TAKEN after the moment it cares about, which is what
+# lib_ready.sh's ready_conns does and what makes it correct at any cadence.
+SETTLE_TIMEOUT   = 8.0       # only a bound on waiting for a fresh sample
 BOUND            = 5.0       # give-up, so a counter that never moves still fails
 
 
@@ -358,11 +371,15 @@ def counters_quiet(*names):
     one's bytes, passing a `grew` that should have failed and failing an
     `unchanged` that should have passed.  Waits for two readings a publish
     interval apart to agree."""
-    prev = counters(*names)
+    # Two agreeing readings, each of them FRESH -- taken after the previous one
+    # was read.  The old form slept a hard-coded 1.5 publish intervals between
+    # reads, which stopped meaning anything when the publish interval stopped
+    # being a constant: two reads inside one interval agree trivially, because
+    # they are the same sample.
+    prev = counters_settled(*names)
     end = time.time() + BOUND
     while time.time() < end:
-        time.sleep(PUBLISH_INTERVAL * 1.5)
-        cur = counters(*names)
+        cur = counters_settled(*names)
         if cur == prev:
             return cur
         prev = cur
@@ -384,9 +401,48 @@ def counters_grown(baseline, *names):
 
 
 def counters_settled(*names):
-    """Read only once a change would certainly have been published."""
-    time.sleep(SETTLE)
+    """Read a sample every named runtime took AFTER this call was entered.
+
+    Not a sleep: the worker publishes on its own schedule and that schedule is
+    deliberately not fixed.  figures_age_ms is the interval between the worker
+    reading its counters and the daemon printing them, so `now - age` is the
+    instant the figure describes, and requiring that instant to be later than
+    the moment this function was entered is exactly the claim the caller needs.
+
+    A runtime with no figures_age_ms is answered in the daemon, where the
+    counters are read as they are printed -- that figure postdates the call by
+    construction and is taken as it stands."""
+    start = time.monotonic()
+    deadline = start + SETTLE_TIMEOUT
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if all(_sample_instant(n, now) >= start for n in names):
+            return counters(*names)
+        time.sleep(0.05)
+    # Out of time: return what there is rather than hang.  The assertion that
+    # follows is then reading a possibly stale sample, which is the state this
+    # function exists to avoid -- so it says so.
+    print("P_WARN counters_settled timed out waiting for a fresh sample")
     return counters(*names)
+
+
+def _sample_instant(name, now):
+    """When the runtime's published figures were taken, on time.monotonic()'s
+    scale.  `now` is passed in, read before the round trip, so the arithmetic can
+    only ever place the sample earlier than it really was -- erring towards
+    waiting one more turn rather than accepting a stale read."""
+    try:
+        out = subprocess.run([binary, "stats", name], capture_output=True,
+                             text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1.0
+    for line in out.splitlines():
+        if line.startswith("figures_age_ms:"):
+            try:
+                return now - int(line.split(":", 1)[1]) / 1000.0
+            except ValueError:
+                return now
+    return now        # in-daemon runtime: read at print time
 
 
 def read_response(s):
