@@ -5,6 +5,9 @@
 source "$(dirname "$0")/utils.sh"
 
 HTTP_PORT=19020
+# Above this share of failed requests the latency rows are refused rather than
+# printed; k6's own threshold in http_bench.js is the same 1%.
+K6_MAX_FAILED_PCT=${K6_MAX_FAILED_PCT:-1.0}
 K6_DIR="${SCRIPT_DIR}/k6"
 HTTP_ROOT_SRC="${K6_DIR}/http-root"
 HTTP_ROOT="$HTTP_ROOT_SRC"
@@ -135,9 +138,36 @@ K6PARSE
 
     log_success "Mode: $mode"
     log_success "  Requests: $reqs_total total, $reqs_rate req/sec"
+
+    # ─── The oracle these rows needed and did not have ──────────────────────
+    #
+    # A run where the server is not there produces percentiles, and they are
+    # zero.  Observed on 2026-08-18: the daemon under this test went away
+    # mid-run, k6 got "connection refused" 1,556,778 times out of 1,587,812,
+    # and every per-stage row came out
+    #
+    #     steady   p50 0.0  p95 0.0  p99 0.0   n=633708
+    #
+    # -- six figures of sample count next to three zeros, which reads as a
+    # server so fast it answers instantly.  The failure rate was printed four
+    # lines away and nothing tied the two together.
+    #
+    # A latency figure over refused connections is not a slow measurement, it is
+    # a measurement of something else, so above K6_MAX_FAILED_PCT the rows are
+    # refused rather than printed and go into the file with usable:0.  The
+    # threshold is k6's own: http_bench.js declares 'http_req_failed rate<0.01'.
+    local usable=1 fail_note=""
+    if awk -v f="$failed_pct" -v lim="$K6_MAX_FAILED_PCT" 'BEGIN{exit !(f > lim)}'; then
+        usable=0
+        fail_note="${failed_pct}% of requests failed — these are not latencies of a served request"
+        log_error "  Failed: ${failed_pct}%"
+        log_error "  REFUSED — $fail_note"
+    else
+        log_success "  Failed: ${failed_pct}%"
+    fi
+
     log_success "  Whole run (mixes every stage — not a tail metric):"
     log_success "    avg ${avg}ms  p50 ${p50}ms  p95 ${p95}ms  p99 ${p99}ms"
-    log_success "  Failed: ${failed_pct}%"
 
     append_result
     write_json_result "$test_name" "$RESULTS_FILE" \
@@ -150,7 +180,9 @@ K6PARSE
         "latency_p50_ms"  "$p50" \
         "latency_p95_ms"  "$p95" \
         "latency_p99_ms"  "$p99" \
-        "failed_percent"  "$failed_pct"
+        "failed_percent"  "$failed_pct" \
+        "usable"          "$usable" \
+        "verdict"         "${fail_note:-ok}"
 
     # No per-stage rows means the script under k6 is an older copy that does not
     # record them.  Said rather than passed over: the aggregate above would then
@@ -171,7 +203,11 @@ K6PARSE
             spike)  label="under the spike, 200 VUs" ;;
             *)      label="transitional" ;;
         esac
-        log_success "    $(printf '%-11s' "$name") p50 ${s_p50}ms  p95 ${s_p95}ms  p99 ${s_p99}ms  max ${s_max}ms  (${count} reqs, $label)"
+        if [[ $usable -eq 1 ]]; then
+            log_success "    $(printf '%-11s' "$name") p50 ${s_p50}ms  p95 ${s_p95}ms  p99 ${s_p99}ms  max ${s_max}ms  (${count} reqs, $label)"
+        else
+            log_error   "    $(printf '%-11s' "$name") REFUSED (would have read p50 ${s_p50}ms p99 ${s_p99}ms over ${count} mostly-failed requests)"
+        fi
         append_result
         write_json_result "$test_name" "$RESULTS_FILE" \
             "mode"           "$mode" \
@@ -182,7 +218,10 @@ K6PARSE
             "latency_p50_ms" "$s_p50" \
             "latency_p95_ms" "$s_p95" \
             "latency_p99_ms" "$s_p99" \
-            "latency_max_ms" "$s_max"
+            "latency_max_ms" "$s_max" \
+            "failed_percent" "$failed_pct" \
+            "usable"         "$usable" \
+            "verdict"        "${fail_note:-ok}"
     done < <(echo "$parsed" | grep '^STAGE ')
 }
 
