@@ -63,6 +63,7 @@ struct alignas(64) server_connection
     bool routed{false};
     bool file_read_pending{false};
     bool http_keep_alive{false};
+    bool wr_shutdown{false};   // our FIN is already on the wire (shutdown SHUT_WR)
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
 
@@ -875,6 +876,10 @@ private:
     // record or a session ticket sits in the write BIO with the queue empty.
     bool conn_has_output(const server_connection* conn) const;
 
+    // Sends our FIN once the response is fully on the wire.  See the definition
+    // for why it is shutdown() and not close(), and why only completions call it.
+    void maybe_shutdown_write(server_connection* conn);
+
     // The listener's TLS context, or null when this server serves cleartext.
     // Rebuilt by setup() on every start so that `reload` is how a renewed
     // certificate is installed; sessions already handed out hold their own
@@ -1086,7 +1091,15 @@ private:
     int m_http_root_fd{-1};
     void open_http_root();
     bool m_http_cache_enabled{false};
-    struct cached_file { std::shared_ptr<const std::string> response; };
+    // Both variants are prebuilt.  A cache hit has to stay a refcount bump —
+    // that is the whole point of this map — and the response's own Connection
+    // header has to match what the client asked for, so the choice cannot be
+    // made by rewriting the string at serve time.
+    struct cached_file
+    {
+        std::shared_ptr<const std::string> response;        // Connection: keep-alive
+        std::shared_ptr<const std::string> response_close;  // Connection: close
+    };
     std::unordered_map<std::string, cached_file> m_http_cache;
 
     // Splice pipe for zero-copy file serving (shared across connections, one at a time)
