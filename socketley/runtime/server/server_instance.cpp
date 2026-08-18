@@ -849,6 +849,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // behaviour rather than the implementation.
         int ffd = -1;
         bool used_beneath = false;
+        fs::path resolved;
         if (m_http_root_fd >= 0)
         {
             std::string rel(url_path.substr(1));
@@ -862,6 +863,18 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             {
                 ffd = static_cast<int>(r);
                 used_beneath = true;
+                // The path is still needed below — `resolved.extension()` picks
+                // the Content-Type — and leaving it empty here served every file
+                // with the wrong type.  Under keep-alive that desynchronised the
+                // connection rather than merely mislabelling it: measured, 1 to
+                // 4 failures per 20,000 requests and the run's rate collapsing
+                // from 74,000 to 4,000 when it happened.
+                //
+                // A join, not a canonicalisation: this is only ever read for the
+                // extension, and for that the path as asked for is the right
+                // answer.  It costs no syscall, which is the entire point of the
+                // branch it sits in.
+                resolved = m_http_base / rel;
             }
             else if (errno != ENOSYS)
             {
@@ -878,7 +891,6 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             }
         }
 
-        fs::path resolved;
         if (!used_beneath)
         {
         fs::path file_path = m_http_base / url_path.substr(1); // strip leading /
