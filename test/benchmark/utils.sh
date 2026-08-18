@@ -388,6 +388,48 @@ else
     now_us() { NOW_US=$(($(date +%s%N) / 1000)); }
 fi
 
+# ─── A port block inside the ephemeral range is a benchmark that breaks itself ─
+#
+# The connection-per-request HTTP benchmarks in this directory open and close a
+# connection per request.  Each close leaves a socket in TIME_WAIT on the client
+# side for 60 s, and the client's side is an ephemeral port.  At the rates these
+# run, the TIME_WAIT table fills to tcp_max_tw_buckets within a couple of minutes
+# -- observed here at 65,527 of 65,536 -- and every ephemeral port is occupied.
+#
+# A listener whose port falls inside net.ipv4.ip_local_port_range (32768..60999
+# on this box) then collides with one of those TIME_WAIT sockets and bind()
+# returns EADDRINUSE, for a port nothing is listening on and that `ss -ltn`
+# shows as free.  socketley reports that as
+#
+#     runtime X could not start: the worker did not accept its configuration
+#
+# which names neither the port nor the cause, and it arrives long after the run
+# that caused it.  It cost an hour here before `nc -l` on an obviously unused
+# port failed the same way and gave it away.
+#
+# The suite's own blocks are all below 32768 and are therefore safe by accident
+# rather than by design.  This says so out loud, so the next person to point
+# BENCH_PORT_BASE somewhere convenient finds out before the run instead of after.
+bench_check_port_range() {
+    local lo hi p bad=0
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || return 0
+    [[ -z "$lo" || -z "$hi" ]] && return 0
+    for p in "$@"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        if [[ "$p" -ge "$lo" && "$p" -le "$hi" ]]; then
+            log_warn "port $p is inside the ephemeral range ($lo..$hi)"
+            bad=1
+        fi
+    done
+    if [[ $bad -eq 1 ]]; then
+        log_warn "a connection-per-request benchmark fills that range with TIME_WAIT"
+        log_warn "sockets, after which these listeners fail to bind with EADDRINUSE"
+        log_warn "on ports nothing is listening on. Move the block below $lo."
+        return 1
+    fi
+    return 0
+}
+
 # Get high-resolution timestamp in milliseconds
 get_time_ms() {
     echo $(($(date +%s%N) / 1000000))
