@@ -39,7 +39,10 @@
 #   3.57x total for roughly a quarter of the per-core rate given up.  That is a
 #   good trade on a machine with idle cores and a bad one on a machine without.
 #   And --http-cache is held once PER SHARD, so eight shards is eight copies of
-#   the file cache in memory.
+#   the file cache in memory.  Plain --http now keeps its responses in memory
+#   too -- revalidated by one statx per request, so it still picks up edits --
+#   and that is per shard as well, though it is capped at 64 MiB each where
+#   --http-cache is however large the directory happens to be.
 #
 #   One shard is 0.99 cores with fifteen more idle, which is the whole case for
 #   the flag: a server does not run out of machine, it runs out of the single

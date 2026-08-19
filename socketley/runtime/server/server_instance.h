@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <filesystem>
+#include <sys/stat.h>
 
 #include "../../shared/conn_identity.h"
 #include "../../shared/runtime_instance.h"
@@ -167,6 +168,11 @@ struct alignas(64) server_connection
     size_t file_size{0};
     std::string file_content_type;
     bool file_is_html{false};
+    // Set only when this read is a candidate for the revalidating cache above,
+    // so handle_file_read knows which key to store the bytes under and what
+    // identity they were read at.  Empty means "do not store".
+    std::string file_url_path;
+    struct stat file_st{};
 
     // Splice state for zero-copy file serving (non-HTML only)
     io_request splice_in_req;
@@ -311,6 +317,8 @@ struct alignas(64) server_connection
         file_size = 0;
         file_content_type.clear();
         file_is_html = false;
+        file_url_path.clear();
+        file_st = {};
         file_read_pending = false;
         splice_in_req = {};
         splice_out_req = {};
@@ -1101,6 +1109,61 @@ private:
         std::shared_ptr<const std::string> response_close;  // Connection: close
     };
     std::unordered_map<std::string, cached_file> m_http_cache;
+
+    // ─── DISK MODE'S REVALIDATING CACHE ─────────────────────────────────────
+    //
+    // Plain `--http DIR` is the development mode: edit a file, reload, see the
+    // edit.  That promise is what it costs, and the cost was measured rather
+    // than assumed -- with strace -c over 2000 keep-alive requests, disk mode
+    // spends openat2 + fstat + close (1.000 each per request) and one extra
+    // io_uring_enter for the file read that `--http-cache` does not, then
+    // mallocs the file, copies it, and formats a response string, per request.
+    //
+    // This map keeps the response the way m_http_cache does and pays ONE statx
+    // per request to decide whether it is still good.  Priced on this box:
+    // openat2+fstat+close 1838 ns, statx 662 ns.
+    //
+    // The identity is dev+ino+size+mtime and dev+ino is not optional.  `mv`
+    // into place, `cp`, git checkout and every editor that writes-then-renames
+    // put a NEW inode at the same path, and `touch -r` will hand it the old
+    // timestamp to the nanosecond -- so an (mtime, size) check, which is the
+    // natural thing to write, serves the old bytes forever.  Pinned by
+    // test_http_disk_freshness.sh.
+    //
+    // It is also why the map cannot leak a file it may not serve: a MISS falls
+    // through to the openat2(RESOLVE_BENEATH) path, which is the only thing
+    // that ever admits bytes here, and a HIT means dev+ino equal to an inode
+    // that path already admitted.  statx follows symlinks, but a symlink to
+    // somewhere else is a different inode and therefore a miss.
+    struct reval_file
+    {
+        dev_t    dev{0};
+        ino_t    ino{0};
+        uint64_t size{0};
+        int64_t  mtime_sec{0};
+        uint32_t mtime_nsec{0};
+        size_t   bytes{0};   // what this entry costs, both variants together
+        std::shared_ptr<const std::string> response;        // Connection: keep-alive
+        std::shared_ptr<const std::string> response_close;  // Connection: close
+    };
+    std::unordered_map<std::string, reval_file> m_http_reval;
+    size_t m_http_reval_bytes{0};
+    bool   m_http_reval_full_logged{false};
+
+    // Bounded, unlike m_http_cache, because this one fills lazily from whatever
+    // is requested rather than eagerly from a tree the operator can see the RSS
+    // of at startup.  A file over the per-file cap is served exactly as it is
+    // today and never enters the map.
+    static constexpr size_t HTTP_REVAL_MAX_FILE  = 1u << 20;   // 1 MiB
+    static constexpr size_t HTTP_REVAL_MAX_TOTAL = 64u << 20;  // 64 MiB
+
+    // SOCKETLEY_HTTP_REVALIDATE=0 turns it off and restores the per-request
+    // open/read exactly.  Read once, at start.
+    bool m_http_reval_enabled{true};
+    bool http_reval_active() const { return m_http_reval_enabled && m_http_root_fd >= 0; }
+    void http_reval_store(const std::string& url_path, const struct stat& st,
+                          std::shared_ptr<const std::string> ka,
+                          std::shared_ptr<const std::string> cl);
 
     // Splice pipe for zero-copy file serving (shared across connections, one at a time)
     int m_splice_pipe[2]{-1, -1};

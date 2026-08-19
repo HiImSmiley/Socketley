@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <linux/openat2.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 
 server_instance::server_instance(std::string_view name)
     : runtime_instance(runtime_server, name), m_mode(mode_inout), m_listen_fd(-1), m_loop(nullptr)
@@ -779,6 +780,47 @@ void server_instance::rebuild_http_cache()
     }
 }
 
+// One entry, or none.  Called only from handle_file_read, and only for a read
+// that completed in full through the openat2(RESOLVE_BENEATH) path.
+void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
+                                       std::shared_ptr<const std::string> ka,
+                                       std::shared_ptr<const std::string> cl)
+{
+    size_t cost = (ka ? ka->size() : 0) + (cl ? cl->size() : 0);
+    // What this key already costs is reclaimed before the cap is tested, or a
+    // file edited repeatedly near the limit would stop being kept the moment
+    // its own entry pushed the total over -- refused on the strength of the
+    // bytes it is about to give back.
+    auto old_it = m_http_reval.find(url_path);
+    size_t reclaimed = (old_it != m_http_reval.end()) ? old_it->second.bytes : 0;
+    if (m_http_reval_bytes - reclaimed + cost > HTTP_REVAL_MAX_TOTAL)
+    {
+        // Full: stop taking new files rather than evicting one.  What is in the
+        // map stays correct either way -- every hit is revalidated -- so the
+        // only thing at stake is which files are fast, and an operator whose
+        // document root is larger than the cap is better served by a stable
+        // answer than by a cache that thrashes.  Said once, not per request.
+        if (!m_http_reval_full_logged)
+        {
+            m_http_reval_full_logged = true;
+            LOG_INFO("server: --http content cache reached its 64 MiB limit; the "
+                     "files already in it stay fast, the rest are read per request");
+        }
+        return;
+    }
+    auto& e = m_http_reval[url_path];
+    m_http_reval_bytes -= e.bytes;          // replacing an existing entry
+    e.dev        = st.st_dev;
+    e.ino        = st.st_ino;
+    e.size       = static_cast<uint64_t>(st.st_size);
+    e.mtime_sec  = st.st_mtim.tv_sec;
+    e.mtime_nsec = static_cast<uint32_t>(st.st_mtim.tv_nsec);
+    e.bytes      = cost;
+    e.response       = std::move(ka);
+    e.response_close = std::move(cl);
+    m_http_reval_bytes += cost;
+}
+
 // The directory every --http request is opened relative to.  Opened once, here,
 // because openat2(RESOLVE_BENEATH) needs a descriptor to be beneath and because
 // re-opening it per request would put back the syscall this exists to remove.
@@ -792,6 +834,11 @@ void server_instance::open_http_root()
     }
     if (m_http_base.empty())
         return;
+    // Every key in the revalidating map is relative to the descriptor being
+    // replaced, so it does not survive the replacement.
+    m_http_reval.clear();
+    m_http_reval_bytes = 0;
+    m_http_reval_full_logged = false;
     m_http_root_fd = ::open(m_http_base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     // -1 is survivable: serve_http falls back to canonicalising per request,
     // which is what it did before this existed.
@@ -890,6 +937,60 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             }
         }
 
+        // ─── ONE statx INSTEAD OF open + fstat + read + close ───────────────
+        //
+        // The bytes of a file already served are kept, exactly as --http-cache
+        // keeps them, and this decides whether they are still the file's bytes.
+        // A hit is a refcount bump and one syscall; a miss falls through to the
+        // path below, which is the only code that ever admits bytes into the
+        // map.  So the map cannot serve anything that path would refuse: a hit
+        // requires dev+ino to equal an inode that openat2(RESOLVE_BENEATH)
+        // already accepted, and a symlink pointing somewhere else is a
+        // different inode and therefore a miss.
+        //
+        // dev+ino is in the comparison for a second, independent reason: `mv`
+        // into place puts a new inode at the same path, and `touch -r` gives it
+        // the old mtime to the nanosecond.  On (mtime, size) alone that request
+        // is a hit and the old bytes are served forever.
+        std::string rel_path(url_path.substr(1));
+        if (rel_path.empty())
+            rel_path = ".";
+
+        bool reval_ok = http_reval_active();
+        if (reval_ok)
+        {
+            auto rit = m_http_reval.find(url_path);
+            if (rit != m_http_reval.end())
+            {
+                struct statx sx{};
+                const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+                if (::statx(m_http_root_fd, rel_path.c_str(), 0, want, &sx) == 0 &&
+                    (sx.stx_mask & want) == want &&
+                    S_ISREG(sx.stx_mode) &&
+                    makedev(sx.stx_dev_major, sx.stx_dev_minor) == rit->second.dev &&
+                    static_cast<ino_t>(sx.stx_ino) == rit->second.ino &&
+                    sx.stx_size == rit->second.size &&
+                    sx.stx_mtime.tv_sec == rit->second.mtime_sec &&
+                    sx.stx_mtime.tv_nsec == rit->second.mtime_nsec)
+                {
+                    conn->write_queue.push(conn->http_keep_alive ? rit->second.response
+                                                                 : rit->second.response_close);
+                    if (!conn->write_pending)
+                        flush_write_queue(conn);
+                    if (!conn->http_keep_alive)
+                        conn->closing = true;
+                    else
+                        conn->proto = proto_unknown;
+                    return;
+                }
+                // Stale, replaced or gone.  Dropped rather than left to be
+                // re-checked: a file deleted from the tree would otherwise hold
+                // its bytes in the map for the life of the process.
+                m_http_reval_bytes -= rit->second.bytes;
+                m_http_reval.erase(rit);
+            }
+        }
+
         // ─── THE ESCAPE CHECK IS THE KERNEL'S, NOT A STRING COMPARISON ──────
         //
         // This was fs::canonical(requested) followed by "does the result still
@@ -920,9 +1021,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         fs::path resolved;
         if (m_http_root_fd >= 0)
         {
-            std::string rel(url_path.substr(1));
-            if (rel.empty())
-                rel = ".";
+            const std::string& rel = rel_path;
             struct open_how how{};
             how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
             how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
@@ -1021,6 +1120,18 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         auto ct = http_content_type(ext);
 
+        // Whether this miss may be turned into a map entry.  Storing needs the
+        // bytes in user space, which the splice path never has, so a small
+        // non-HTML file is deliberately routed to the read path below: it pays
+        // one read once and one statx thereafter, instead of a splice every
+        // time.  Nothing is lost by that -- IORING_OP_SPLICE is prepped
+        // REQ_F_FORCE_ASYNC and measured 17.19 us against read's 0.72 us, and
+        // is only ahead above ~128 KB, which is well over the per-file cap.
+        // Files over the cap keep today's behaviour exactly.
+        const bool reval_take = reval_ok && used_beneath &&
+                                fsize <= HTTP_REVAL_MAX_FILE &&
+                                m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
+
         // Splice path: zero-copy file→pipe→socket for non-HTML files.
         //
         // Never on a TLS connection.  A splice moves the file's bytes into the
@@ -1030,7 +1141,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // that reads as a protocol error rather than as a leak.  The
         // read-and-encrypt path below serves the same file correctly; the cost
         // is one copy on a connection that is already paying for a cipher.
-        if (!is_html && !conn->ssl && !m_splice_busy && m_splice_pipe[0] >= 0)
+        if (!is_html && !conn->ssl && !m_splice_busy && m_splice_pipe[0] >= 0 && !reval_take)
         {
             conn->splice_file_fd = ffd;
             conn->splice_remaining = fsize;
@@ -1070,6 +1181,19 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         conn->file_content_type = std::string(ct);
         conn->file_is_html = is_html;
         conn->file_read_pending = true;
+        // Non-empty only when the completion may keep the bytes.  The identity
+        // is the one fstat() reported on this very descriptor, so it describes
+        // the inode the bytes actually came from and not whatever is at the
+        // path by the time the read completes.
+        if (reval_take)
+        {
+            conn->file_url_path = url_path;
+            conn->file_st = st;
+        }
+        else
+        {
+            conn->file_url_path.clear();
+        }
 
         // Submit async read — req->fd = socket fd for CQE dispatch
         conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read,
@@ -1826,6 +1950,16 @@ bool server_instance::setup(event_loop& loop)
         m_accept_armed = loop.submit_accept(m_listen_fd, &m_accept_addr, &m_accept_addrlen,
                                             m_accept_req.get());
     }
+
+    // SOCKETLEY_HTTP_REVALIDATE=0 puts disk mode back on an open+read per
+    // request.  Read here rather than at construction so a restart picks it up.
+    if (const char* rv = ::getenv("SOCKETLEY_HTTP_REVALIDATE"))
+        m_http_reval_enabled = !(rv[0] == '0' && rv[1] == '\0');
+    else
+        m_http_reval_enabled = true;
+    m_http_reval.clear();
+    m_http_reval_bytes = 0;
+    m_http_reval_full_logged = false;
 
     // Build HTTP file cache if enabled
     if (m_http_cache_enabled && !m_http_dir.empty())
@@ -4833,9 +4967,31 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         ? std::string_view(body)
         : file_content;
 
-    conn->write_queue.push(
-        std::make_shared<const std::string>(
-            build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
+    // A short read is served, and is deliberately NOT stored: cqe->res below
+    // st_size means the bytes in hand are not the file, and an entry built from
+    // them would be revalidated against the full size forever after and always
+    // miss -- or, worse, match if the file were later truncated to exactly
+    // this length.  Storing only a complete read keeps the map's contents and
+    // its identity describing the same thing.
+    const bool store = !conn->file_url_path.empty() &&
+                       static_cast<uint64_t>(cqe->res) ==
+                           static_cast<uint64_t>(conn->file_st.st_size);
+    if (store)
+    {
+        auto ka = std::make_shared<const std::string>(
+            build_http_response(conn->file_content_type, resp_body, true));
+        auto cl = std::make_shared<const std::string>(
+            build_http_response(conn->file_content_type, resp_body, false));
+        conn->write_queue.push(conn->http_keep_alive ? ka : cl);
+        http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
+    }
+    else
+    {
+        conn->write_queue.push(
+            std::make_shared<const std::string>(
+                build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
+    }
+    conn->file_url_path.clear();
 
     // Free file buffer
     free(conn->file_buf);

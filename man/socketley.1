@@ -1526,20 +1526,51 @@ on one of the client's ephemeral ports. The header is parsed token\-wise and
 case\-insensitively, so
 .B "Connection: close, TE"
 counts as close.
+.IP
+Without
+.B \-\-http\-cache
+this is the development mode, and a file edited on disk is picked up by the
+next request. It reaches that without re\-reading the file every time: the
+response is kept in memory and one
+.BR statx (2)
+per request decides whether it is still the file's response. The check is on
+the device, the inode number, the size and the modification time together
+\(em the inode number is part of it because writing a new file and renaming it
+over the old one, which is what
+.BR mv ,
+.BR cp ,
+.B "git checkout"
+and most editors actually do, leaves the size and can be given back the old
+timestamp exactly.
+.IP
+The memory this uses is bounded, unlike
+.BR \-\-http\-cache 's,
+because it fills from whatever is requested rather than from a directory the
+operator can see the size of before starting: a file larger than 1 MiB is never
+kept, and once the kept responses reach 64 MiB in total no further file is
+added. Files not kept are served exactly as before, by reading them per
+request. See
+.B SOCKETLEY_HTTP_REVALIDATE
+to switch the whole mechanism off.
 .TP
 .B \-\-http\-cache
 When used with \-\-http, reads all files into memory at startup instead of
-reading from disk on each request. Faster for production. The cache is rebuilt
-on
-.BR reload\-lua .
+consulting the filesystem on each request. Faster for production, and the
+difference from plain
+.B \-\-http
+is one
+.BR statx (2)
+per request. The cache is rebuilt on
+.BR reload\-lua ,
+and only then: a file edited on disk is
+.B not
+picked up, which is the reason to use this flag and the reason not to.
 Each file is held twice, once with a
 .B Connection: keep\-alive
 response header and once with
 .BR "Connection: close" ,
 so that a cache hit stays a refcount bump and still answers with the header the
 client asked for.
-Without this flag, files are read from disk on each request (suitable for
-development).
 .TP
 .TP
 .BI "\-u " "host:port"
@@ -5984,6 +6015,21 @@ This is the default for every script that does not declare its own
 global; a script that does declare one overrides it. A value that is not a
 whole number of milliseconds in 0\(en3600000 is refused with a warning and the
 default is used.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_HTTP_REVALIDATE
+Set to
+.B 0
+to switch off the response cache that plain
+.B \-\-http
+keeps, putting it back on an open, a read and a close per request. Any other
+value, or the variable being unset, leaves it on. Read when the runtime starts,
+so a
+.B restart
+picks up a change. What the server serves is the same either way \(em the cache
+is revalidated on every request \(em so this exists for measurement and for
+ruling the cache out when diagnosing something else.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
