@@ -1,4 +1,5 @@
 #include "cache_instance.h"
+#include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/ipc_framing.h"
 #include "../../shared/trace.h"
@@ -934,9 +935,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 #endif
 }
 
-// See the call site in on_cqe() for why this exists.  Everything here is a
-// guard: a descriptor with no connection on it, or one that is not closing, or
-// one the ring still owes an answer for, is somebody else's business.
+// See the call site in on_cqe() for why this exists.  The rule itself, and the
+// argument for it, moved to shared/conn_reachability.h when the server turned
+// out to have the same defect through the same shape; what is left here is the
+// part that is this runtime's — finding the connection, naming its flags, and
+// closing it.
+//
+// Everything before the verdict is a guard: a descriptor with no connection on
+// it, or one that is not closing, is somebody else's business.
 void cache_instance::finish_unreachable_client(int fd)
 {
     if (fd < 0 || fd >= MAX_FDS)
@@ -945,31 +951,51 @@ void cache_instance::finish_unreachable_client(int fd)
     if (SOCKETLEY_LIKELY(conn == nullptr || !conn->closing))
         return;
 
-    // The two the ring genuinely owes.  Their completion comes back here and
-    // asks this question again.
-    if (conn->write_pending || conn->zc_notif_pending)
-        return;
+    using socketley::reach::verdict;
 
-    // Bytes the client already handed us and considers answered are not
-    // "nothing left": push them out and let the write completion finish the
-    // teardown, exactly as the closing block in handle_read does.  A flush can
-    // legitimately submit nothing — a TLS session with a reply queued while the
-    // handshake is still running has output and no way to send it — and that
-    // leaves nothing to wake it either.
-    if (conn_has_output(conn))
+    switch (socketley::reach::classify(conn->closing, conn_owed(conn),
+                                       conn_has_output(conn)))
     {
-        if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
-        {
-            close_client(conn, fd, "unreachable-write-submit-failed");
+        case verdict::keep:
+            // A write or a zero-copy notification is outstanding.  Its
+            // completion comes back here and asks this question again.
             return;
-        }
-        if (conn->write_pending || conn->zc_notif_pending)
-            return;
-        close_client(conn, fd, "unreachable-with-unsendable-output");
-        return;
-    }
 
-    close_client(conn, fd, "unreachable-closing");
+        case verdict::flush:
+            // Bytes the client already handed us and considers answered are not
+            // "nothing left": push them out and let the write completion finish
+            // the teardown, exactly as the closing block in handle_read does.
+            if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+            {
+                close_client(conn, fd, "unreachable-write-submit-failed");
+                return;
+            }
+            // A flush can legitimately submit nothing — a TLS session with a
+            // reply queued while the handshake is still running has output and
+            // no way to send it — and that leaves nothing to wake it either.
+            if (socketley::reach::classify(conn->closing, conn_owed(conn),
+                                           /*has_output=*/false) == verdict::keep)
+                return;
+            close_client(conn, fd, "unreachable-with-unsendable-output");
+            return;
+
+        case verdict::finish:
+            close_client(conn, fd, "unreachable-closing");
+            return;
+    }
+}
+
+// The flags this runtime's connection carries, sorted by who is obliged to
+// report them.  A cache client has no file read, no splice and no cross-runtime
+// request of its own, so three of the shared fields are simply not reachable
+// here; the two that are are the two the ring answers whatever the socket does.
+socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) const
+{
+    socketley::reach::owed o;
+    o.write    = conn->write_pending;
+    o.zc_notif = conn->zc_notif_pending;
+    o.read     = conn->read_pending;   // not counted; see the header
+    return o;
 }
 
 #ifdef SOCKETLEY_INVARIANTS

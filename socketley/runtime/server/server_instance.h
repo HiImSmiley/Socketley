@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/conn_reachability.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -813,6 +814,17 @@ private:
     // flags, and the lists disagreed: the zero-copy notification was missing
     // from two of them and the splice ops were tracked by nothing at all.
     bool conn_ops_pending(const server_connection* conn) const;
+
+    // The same flags, sorted by who is obliged to report them.  See
+    // shared/conn_reachability.h; this function is the seam between that
+    // classification and this runtime's connection struct.
+    socketley::reach::owed conn_owed(const server_connection* conn) const;
+
+    // The one place a connection nothing is going to finish is finished.
+    // Called from on_cqe() after every completion, for the connection that
+    // completion named; see the call site for why an armed read does not count
+    // as something that will finish it.
+    void finish_unreachable_conn(int fd);
     // The single teardown for a client connection.  Only legal when
     // conn_ops_pending() is false.
     void close_conn(server_connection* conn, bool notify_disconnect = true);

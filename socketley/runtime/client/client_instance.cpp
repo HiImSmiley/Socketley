@@ -854,6 +854,39 @@ resubmit:
     arm_read();
 }
 
+// ─── THE TWO read_pending GUARDS BELOW, AND WHY THEY STAY ───────────────────
+//
+// Both of them defer a teardown to an armed read, which is the shape
+// shared/conn_reachability.h exists to refuse: an armed read is ended by the
+// peer sending something or by the socket ending, and a connection that is
+// `closing` is one whose peer has already gone.  It cost the cache a stranded
+// connection (78c9ecc) and the server one too, and here the stakes are higher
+// per occurrence rather than lower — a client has exactly one connection, so a
+// stranded one means the whole runtime sits connected and deaf and, with
+// --reconnect configured, never dials again, because drop_connection() is the
+// only thing that would tell it the connection was gone.
+//
+// It is nevertheless left alone, for the same reason as the proxy and with the
+// same two properties named:
+//
+//   * the read is SINGLE-SHOT (op_read / op_read_provided), never multishot, so
+//     it is re-armed per completion rather than parked in the kernel across
+//     them, and arm_read() is the one place that does it;
+//   * it is armed on the DESCRIPTOR, never on a fixed-file index — this file
+//     mentions neither multishot nor fixed files anywhere — so close_fd() can
+//     withdraw it, which free_fixed_file_slot() explains is exactly what a
+//     fixed-index submission does not allow.
+//
+// MEASURED, and it is a weaker measurement than the other two.  A client in
+// --mode inout with a 60 KB write in flight, reset by its peer with
+// SO_LINGER (on, 0): 109 consecutive resets, 109 reconnects, no stranding.  109 is
+// not 15,000, and "not reproduced in 109 trials" is not "it is not there" — what
+// makes this a decision rather than a gap is the two properties above, not the
+// run length.  A reproducer would move it, and it would move it here.
+//
+// One shape is immune by construction and worth knowing: in --mode out on a
+// cleartext socket arm_read() declines outright, so read_pending is false for
+// the life of the connection and both guards always fire.
 void client_instance::handle_write(struct io_uring_cqe* cqe)
 {
     m_conn->write_pending = false;

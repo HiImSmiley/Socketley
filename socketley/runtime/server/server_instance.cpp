@@ -1,4 +1,5 @@
 #include "server_instance.h"
+#include "../../shared/conn_reachability.h"
 
 // http_whole_decimal: the checked Content-Length parser the proxy already
 // uses.  Shared rather than copied — a second implementation of "is this a
@@ -125,10 +126,45 @@ conn_ref server_instance::ref_for_fd(int fd) const
     return conn_ref{owner_key(), m_conn_idx[fd]->ref_serial};
 }
 
+// "Anything at all is outstanding on this connection."
+//
+// Two different questions are asked of this, and only one of them is answered
+// correctly by it.  As "may this struct be reused / released" — release_conn(),
+// pool_release(), reap_retired() — it is exactly right: a read still armed means
+// the ring still names this memory, whether or not the read will ever report.
+//
+// As "may the teardown be deferred" it is not, because an armed read makes no
+// promise to come back.  That question now has its own answer in
+// shared/conn_reachability.h and its own caller at the tail of on_cqe(); the 16
+// guards in this file that ask it through this predicate are deliberately left
+// alone, because a teardown they decline is picked up there one dispatch later
+// rather than never.  See finish_unreachable_client().
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
     return conn->read_pending || conn->write_pending || conn->zc_notif_pending
         || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending;
+}
+
+// Every flag this connection can carry, sorted by who is obliged to report it.
+// The sorting is shared/conn_reachability.h's business and the flags are this
+// runtime's, so this function is the whole of the seam between them: a flag
+// added to server_connection has to appear here to be counted anywhere.
+//
+// cache_pending is a promised reply rather than a ring operation — the request
+// sits in a channel, which guarantees exactly one reply per request, `dropped`
+// included, and delivers it back into this loop.  close_conn() defers on it for
+// that reason and says so.
+socketley::reach::owed server_instance::conn_owed(const server_connection* conn) const
+{
+    socketley::reach::owed o;
+    o.write          = conn->write_pending;
+    o.zc_notif       = conn->zc_notif_pending;
+    o.file_read      = conn->file_read_pending;
+    o.splice_in      = conn->splice_in_pending;
+    o.splice_out     = conn->splice_out_pending;
+    o.promised_reply = conn->cache_pending > 0;
+    o.read           = conn->read_pending;   // not counted; see the header
+    return o;
 }
 
 void server_instance::release_conn(std::unique_ptr<server_connection> conn)
@@ -2428,14 +2464,12 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         return;
     }
 
-#ifdef SOCKETLEY_INVARIANTS
     // Remembered before the dispatch, because the handler may release the
     // struct and the request with it.  Only per-connection operations are worth
     // asking about; an accept or a timer names no connection.
-    const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
+    const int cqe_fd = (req->type == op_accept || req->type == op_multishot_accept ||
                         req->type == op_timeout || req->type == op_recvmsg)
                        ? -1 : req->fd;
-#endif
 
     switch (req->type)
     {
@@ -2589,9 +2623,65 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
             break;
     }
 
+    // ── The chokepoint ──────────────────────────────────────────────────────
+    //
+    // Every teardown in this runtime runs out of a completion handler, and every
+    // completion handler runs from here.  Each handler decides for itself whether
+    // the connection it just touched may be finished, and all 16 of those
+    // decisions ask conn_ops_pending(), which counts an armed read as a
+    // completion that is owed.  It is not one: see shared/conn_reachability.h for
+    // why, and for the two runtimes this has now been found in.
+    //
+    // So the rule goes here, after the dispatch, for the connection the
+    // completion named — the one place every path already goes through.  The 16
+    // guards keep their own answer and are not touched; a teardown one of them
+    // declines for the wrong reason is picked up here on the same dispatch
+    // instead of never.
+    finish_unreachable_conn(cqe_fd);
+
 #ifdef SOCKETLEY_INVARIANTS
-    inv_check_reachable(inv_fd, "server::on_cqe");
+    inv_check_reachable(cqe_fd, "server::on_cqe");
 #endif
+}
+
+// See the call site in on_cqe() for why this exists.  Everything before the
+// verdict is a guard: a descriptor with no connection on it, or one that is not
+// closing, is somebody else's business.
+void server_instance::finish_unreachable_conn(int fd)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+    auto* conn = m_conn_idx[fd];
+    if (SOCKETLEY_LIKELY(conn == nullptr || !conn->closing))
+        return;
+
+    using socketley::reach::verdict;
+
+    switch (socketley::reach::classify(conn->closing, conn_owed(conn),
+                                       conn_has_output(conn)))
+    {
+        case verdict::keep:
+            return;
+
+        case verdict::flush:
+            // Bytes the client already handed us and considers answered are not
+            // "nothing left".  flush_write_queue() marks the connection closing
+            // on any failure it cannot recover from, so the only thing to do
+            // afterwards is ask again — which is what the second classify below
+            // is.  A flush that reached the ring answers `keep` and its
+            // completion finishes the teardown; one that submitted nothing
+            // answers `finish`, because nothing would wake it either.
+            flush_write_queue(conn);
+            if (socketley::reach::classify(conn->closing, conn_owed(conn),
+                                           /*has_output=*/false) == verdict::keep)
+                return;
+            close_conn(conn);
+            return;
+
+        case verdict::finish:
+            close_conn(conn);
+            return;
+    }
 }
 
 #ifdef SOCKETLEY_INVARIANTS
@@ -6156,6 +6246,25 @@ submit_next:
     }
 }
 
+// ─── UPSTREAMS ARE OUTSIDE THE CHOKEPOINT, AND THIS IS WHY ──────────────────
+//
+// The guard below is the same shape as the one on the client side that stranded
+// a connection: mark closing, then defer the teardown to an armed read.  It is
+// nevertheless left alone, and finish_unreachable_conn() cannot reach it anyway
+// — an upstream's fd lives in m_upstream_by_fd, never in m_conn_idx, which is
+// the only table that function looks in.
+//
+// That is a decision rather than an oversight, and it rests on the same property
+// that excuses the proxy and the client: an upstream read is armed with
+// submit_read(uc->fd, ...) — SINGLE-SHOT, on the DESCRIPTOR, never multishot and
+// never on a fixed-file index.  So close_fd() can withdraw it and the socket's
+// own error reaches it, which is exactly what a fixed-index multishot recv on an
+// accepted client cannot promise.  See shared/conn_reachability.h.
+//
+// NOT MEASURED.  Unlike the proxy and the client, no storm was aimed at an
+// upstream, so this rests on the structural argument alone.  A reproducer would
+// move it, and the chokepoint would then have to grow a second table lookup
+// rather than a second copy of the rule.
 void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc)
 {
     uc->write_pending = false;

@@ -148,6 +148,52 @@ static bool backend_connect_addr(const backend_info& b,
 // completions under multishot recv, so this reads true for a backend that owes
 // nothing at all.  handle_client_read asks that one for itself, out of the
 // state that describes the exchange rather than the ring.
+//
+// ─── WHY read_pending IS COUNTED HERE AND NOWHERE ELSE ──────────────────────
+//
+// shared/conn_reachability.h says an armed read is NOT something the ring owes,
+// and cache and server both act on it: a closing connection whose only
+// outstanding operation is a read is finished rather than deferred to.  Both
+// have a stranded connection to show for the other choice.  This predicate
+// deliberately disagrees, and the reason is a property of how the read is armed
+// rather than a difference of opinion about the rule.
+//
+// The cache and the server arm their client reads on a DIRECT descriptor —
+// submit_recv_multishot_fixed_file, a multishot recv against a fixed-file
+// index.  free_fixed_file_slot() explains what that costs: a submission naming a
+// fixed index is not counted against a descriptor number, so close_fd() cannot
+// withdraw it, and the only thing that can is the teardown — which is exactly
+// what was deferred.  This proxy never does that.  submit_read_op() calls
+// submit_recv_multishot(fd, ...) and submit_read(fd, ...), always on the
+// descriptor, so the read is both cancellable and reachable by the socket's own
+// error.
+//
+// MEASURED, and the numbers are the argument.  Six rounds of a pipelined-abort
+// storm against a --protocol http proxy, 4 MB backend responses, roughly 15,000
+// clients reset with SO_LINGER (on, 0) and a response in flight:
+//
+//     close_pair deferred a client on an armed read ALONE   33,364 / 33,384
+//     clients whose own write consumed the socket error          2
+//     connections still held after the storm                     0
+//
+// So the state shared/conn_reachability.h calls unreachable is entered here
+// thirty-three thousand times per six rounds and is not unreachable: the reset
+// reaches the armed read, the read reports, and the deferred teardown runs.
+// Acting on the shared verdict here would tear down 33,364 connections a few
+// microseconds earlier for no defect, which is the mechanical sweep this tree
+// keeps warning about, at maximum scale.
+//
+// ONE THING FOUND WHILE MEASURING IT, NOT FIXED HERE.  The shutdown(SHUT_RD)
+// that close_pair issues on the deferring path — the syscall whose whole job is
+// to end that armed read through the socket's wait queue — failed with ENOTCONN
+// 33,384 times out of 33,384.  A socket that has taken an RST is already
+// TCP_CLOSE, and shutdown() on TCP_CLOSE does nothing at all.  Every one of
+// those connections was reaped anyway, by the read taking the error directly, so
+// this is a belt that has never once held while the braces did.  It is left
+// alone because there is no reproducer to fix it against and its removal or
+// repair would change 33,384 paths on a hypothesis; it is recorded here because
+// the next reader of that line will otherwise believe it is what makes the
+// deferral safe, and it is not.
 static inline bool client_op_in_flight(const proxy_client_connection* c)
 {
     return c->read_pending || c->write_pending || c->zc_notif_pending ||
@@ -155,6 +201,11 @@ static inline bool client_op_in_flight(const proxy_client_connection* c)
            c->abort_watch_pending;
 }
 
+// Same rule and the same reason as the client half above: this proxy's backend
+// reads are armed on the descriptor too, so an armed read here is both
+// cancellable and reachable by the socket's error.  Measured in the same runs:
+// 993 of 23,189 backend deferrals were on an armed read alone, and none of them
+// stranded.
 static inline bool backend_op_in_flight(const proxy_backend_connection* b)
 {
     return b->read_pending || b->write_pending || b->zc_notif_pending ||

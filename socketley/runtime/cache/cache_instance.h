@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/conn_reachability.h"
 #include <string>
 #include <string_view>
 #include <vector>
@@ -642,4 +643,9 @@ private:
     // completion named; see the call site for the reasoning and for why an
     // armed read does not count as something that will finish it.
     void finish_unreachable_client(int fd);
+
+    // The same flags, sorted by who is obliged to report them.  See
+    // shared/conn_reachability.h; this function is the seam between that
+    // classification and this runtime's connection struct.
+    socketley::reach::owed conn_owed(const client_connection* conn) const;
 };
