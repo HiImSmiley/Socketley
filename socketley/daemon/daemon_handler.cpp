@@ -26,6 +26,7 @@
 #include <cstring>
 #include <charconv>
 #include <chrono>
+#include <optional>
 #include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -107,6 +108,30 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
                               inst->get_key_path(), inst->get_ca_path(),
                               mesh_ca, mesh_cert, mesh_key,
                               inst->get_replication_target());
+}
+
+// Why this runtime's shard count cannot be honoured, or an empty string if it
+// can.  The instance's own answer to shards_config_refusal — see
+// runtime_definitions.h for the rule and why it lives there rather than here.
+//
+// `lua_override` is for the one caller that cannot ask the instance: `create`
+// defers --lua to after every flag has been read, so at the point the set is
+// checked the script is still a local string and get_lua_script_path() is
+// empty.  Passing it explicitly is what makes `--shards 4 --lua x` and
+// `--lua x --shards 4` the same command.  Every other caller passes nullopt and
+// gets the instance's own.
+static std::string instance_shards_refusal(const runtime_instance* inst,
+                                           std::optional<bool> lua_override = std::nullopt)
+{
+    if (!inst)
+        return {};
+
+    return shards_config_refusal(inst->get_type(),
+                                 inst->get_shards(),
+                                 lua_override.value_or(
+                                     !inst->get_lua_script_path().empty()),
+                                 inst->get_listen_path(),
+                                 inst->is_out_of_process());
 }
 
 // ─── MAY THIS CALLER HAND THE DAEMON THIS PID ───────────────────────────────
@@ -1426,6 +1451,23 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    // And the shard count, for the third time the same reason — this one with
+    // the sharpest edge.  --shards is refused on a server that has a script,
+    // and the script arrives as --lua, which may be typed on either side of it.
+    // Checked only in the --shards case label, `--shards 4 --lua x.lua` would
+    // be accepted and `--lua x.lua --shards 4` refused: one runtime, two
+    // answers, decided by the order somebody's fingers happened to reach.
+    //
+    // lua_script rather than the instance, because the load below is what sets
+    // the path on the instance and it has deliberately not run yet.
+    if (const std::string msg = instance_shards_refusal(instance, !lua_script.empty());
+        !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
     // ─── The script, last, because it reads everything else back ────────────
     //
     // Loading builds the interpreter, runs the file's top level and snapshots
@@ -1642,6 +1684,19 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // configuration promising encryption.  Reached by runtimes restored
             // from a state file written before TLS was gated at parse time.
             if (const std::string msg = instance_tls_refusal(inst); !msg.empty())
+            {
+                conn->write_buf += std::string(n) + ": " + msg;
+                ++failed;
+                continue;
+            }
+
+            // Reached by a runtime whose shard count did not come from a flag:
+            // a state file written by hand or by another build, restored at
+            // boot without passing a parser.  runtime_instance::start() refuses
+            // it too and is the gate that cannot be walked around, but it can
+            // only say so by failing — this is what puts the reason on the
+            // terminal of whoever typed `start`.
+            if (const std::string msg = instance_shards_refusal(inst); !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
                 ++failed;
@@ -3196,6 +3251,11 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     const std::string cert_before(instance->get_cert_path());
     const std::string key_before(instance->get_key_path());
     const std::string ca_before(instance->get_ca_path());
+    // The same rule for the same reason, one set along: --shards and --listen
+    // are only meaningful together, and a pair that comes out incompatible has
+    // to leave the runtime exactly as it found it.
+    const uint32_t    shards_before = instance->get_shards();
+    const std::string listen_before(instance->get_listen_path());
     // The proxy's half of the same set.  Its backend leg is configured by
     // three more paths, and they are as much a set as the listener's: half a
     // client-certificate pair is refused, so an edit that leaves one behind
@@ -3279,6 +3339,24 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             prx->set_mesh_client_cert(mesh_cert_before);
             prx->set_mesh_client_key(mesh_key_before);
         }
+        std::cout << msg;
+        return 1;
+    }
+
+    // The shard set, checked here for the reason the TLS set is: --listen and
+    // --shards are both editable, and either can be the flag that completes an
+    // incompatible pair.  `edit srv --listen unix:/tmp/s.sock` on a runtime
+    // already carrying --shards 4 is refused by nothing in the --listen case
+    // label, because that label has no reason to know about shards.
+    //
+    // Rolled back the same way and for the same sentence: a set that comes out
+    // incomplete has to leave no trace, or an operator who mistyped one flag is
+    // left with a runtime whose in-memory configuration no longer matches its
+    // state file.
+    if (const std::string msg = instance_shards_refusal(instance); !msg.empty())
+    {
+        instance->set_shards(shards_before);
+        instance->set_listen_path(listen_before);
         std::cout << msg;
         return 1;
     }
@@ -3427,6 +3505,31 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                                                    eff_tls, eff_udp, eff_cert, eff_key,
                                                    eff_ca, eff_mca, eff_mcrt, eff_mkey,
                                                    eff_repl);
+        !msg.empty())
+    {
+        conn->write_buf = msg;
+        return 1;
+    }
+
+    // The shard set, merged the same way and for the same reason.  Reading cfg
+    // alone would judge a configuration that is not the one about to exist: a
+    // document naming only `shards` on a server that already carries a script
+    // says lua_script="" and would pass, and the apply would then produce
+    // exactly the sharded scripted server the flag parser refuses.
+    //
+    // Before the apply rather than after it, because import has no rollback: it
+    // writes each field as it reads it, so a refusal that came later would
+    // leave the runtime half-changed and its state file disagreeing with it.
+    const uint32_t    eff_shards = merged("shards", cfg.shards,
+                                          instance->get_shards());
+    const std::string eff_lua    = merged("lua_script", cfg.lua_script,
+                                          std::string(instance->get_lua_script_path()));
+    const std::string eff_listen = merged("listen", cfg.listen_path,
+                                          std::string(instance->get_listen_path()));
+
+    if (const std::string msg = shards_config_refusal(type, eff_shards,
+                                                      !eff_lua.empty(), eff_listen,
+                                                      instance->is_out_of_process());
         !msg.empty())
     {
         conn->write_buf = msg;
@@ -3865,6 +3968,15 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         // before touching the runtime rather than tearing it down and
         // bringing it back up in cleartext.
         if (const std::string msg = instance_tls_refusal(inst); !msg.empty())
+        {
+            conn->write_buf += std::string(n) + ": " + msg;
+            ++refused;
+            continue;
+        }
+        // A reload is a start, so it asks a start's questions -- and refuses
+        // before touching the runtime rather than tearing down a working
+        // listener to discover it cannot be brought back.
+        if (const std::string msg = instance_shards_refusal(inst); !msg.empty())
         {
             conn->write_buf += std::string(n) + ": " + msg;
             ++refused;

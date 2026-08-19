@@ -26,10 +26,12 @@ Raw TCP byte forwarding without HTTP parsing.
 socket through `SO_REUSEPORT` — the only way a single runtime uses more than the
 one core its event loop runs on. It stays one runtime: `ls` shows one line,
 `stats` sums the connection count across the shards, `stop` takes all of them
-down. It is a declaration and it is proxy-only: a sharded cache would be N
-separate stores behind one port, and a sharded server would split whatever
-cross-connection state its script holds — both silently, which is why both
-refuse the flag. `SO_REUSEPORT` balances per connection, not per request.
+down. It is a declaration, and it is offered only where an operator can make
+it: a cache refuses it because N shards would be N separate stores behind one
+port, a client because it has no listener to share, and a server may shard only
+when it has no `--lua` — with a script the state being split would be the
+script's own, and it splits silently. See `../server/sharded-server.sh`.
+`SO_REUSEPORT` balances per connection, not per request.
 
 ### Unix Socket Sidecar
 `--backend unix:/path/to.sock` on the proxy and `--listen unix:/path/to.sock` on

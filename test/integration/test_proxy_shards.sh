@@ -129,16 +129,21 @@ shard_pids() {
     done
 }
 
-echo "== --shards is a declaration, and three types refuse it =="
+echo "== --shards is a declaration, and two types refuse it outright =="
 out=$("$BIN" create cache shc -p $P_SPARE1 --shards 4 2>&1); rc=$?
 check "cache refuses --shards" "$rc" "1"
-[[ "$out" == *"only available on a proxy"* ]] && ok "cache says why" || bad "cache reason: $out"
-
-out=$("$BIN" create server shs -p $P_SPARE2 --shards 4 2>&1); rc=$?
-check "server refuses --shards" "$rc" "1"
+[[ "$out" == *"not available on a cache"* ]] && ok "cache says why" || bad "cache reason: $out"
 
 out=$("$BIN" create client shk -t 127.0.0.1:$P_BACK --shards 4 2>&1); rc=$?
 check "client refuses --shards" "$rc" "1"
+
+# A server used to be the third.  It is not any more: with no --lua it has no
+# cross-connection state to lose and may shard, and with one it still may not.
+# The whole of that rule and its five doors are test_server_shards.sh; this is
+# the one line that keeps THIS file honest about which types are absolute.
+out=$("$BIN" create server shs -p $P_SPARE2 --shards 4 2>&1); rc=$?
+check "a server with no script is no longer refused" "$rc" "0"
+"$BIN" remove shs >/dev/null 2>&1
 
 out=$("$BIN" create proxy shbad -p $P_SPARE3 --backend 127.0.0.1:$P_BACK --shards 0 2>&1); rc=$?
 check "--shards 0 refused" "$rc" "1"
