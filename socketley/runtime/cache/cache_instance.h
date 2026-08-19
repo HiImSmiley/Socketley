@@ -636,4 +636,10 @@ private:
     // next connection that happens to get the same fd number inherits the dead
     // client's channels.
     void close_client(client_connection* conn, int fd, const char* reason);
+
+    // The one place a connection nothing is going to finish is finished.
+    // Called from on_cqe() after every completion, for the connection that
+    // completion named; see the call site for the reasoning and for why an
+    // armed read does not count as something that will finish it.
+    void finish_unreachable_client(int fd);
 };

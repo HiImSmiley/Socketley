@@ -847,13 +847,11 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         }
     }
 
-#ifdef SOCKETLEY_INVARIANTS
     // Remembered before the dispatch: the handler may release the struct and the
     // request along with it.  Only per-connection operations name a connection.
-    const int inv_fd = (req->type == op_accept || req->type == op_multishot_accept ||
+    const int cqe_fd = (req->type == op_accept || req->type == op_multishot_accept ||
                         req->type == op_timeout)
                        ? -1 : req->fd;
-#endif
 
     switch (req->type)
     {
@@ -908,9 +906,70 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             break;
     }
 
+    // ── The chokepoint ──────────────────────────────────────────────────────
+    //
+    // Every teardown in this runtime runs out of a completion handler, and
+    // every completion handler runs from here.  The handlers each decide for
+    // themselves whether the connection they just touched can be finished, and
+    // seven of those decisions say a connection with a read armed cannot be —
+    // "a completion is still owed, so the teardown will run when it lands".
+    //
+    // For a read that is not true, and it is the only one of the three flags
+    // for which it is not.  A write and a zero-copy notification are requests
+    // the ring answers whatever the socket does.  An armed read is finished by
+    // the peer sending something, or by the socket ending — and a connection
+    // that is closing is one whose peer has already gone.  free_fixed_file_slot()
+    // records the same finding one level down: a multishot recv "could only ever
+    // end by itself, and by itself means the peer or the socket".
+    //
+    // So this runs after the dispatch, for the connection the completion named,
+    // and finishes it when nothing the ring owes can.  Taking the read back is
+    // close_client()'s to do and it already does it: close_fd() cancels one
+    // armed on a descriptor, free_fixed_file_slot() cancels one armed on a fixed
+    // index, and retire() holds the struct until that -ECANCELED lands.
+    finish_unreachable_client(cqe_fd);
+
 #ifdef SOCKETLEY_INVARIANTS
-    inv_check_reachable(inv_fd, "cache::on_cqe");
+    inv_check_reachable(cqe_fd, "cache::on_cqe");
 #endif
+}
+
+// See the call site in on_cqe() for why this exists.  Everything here is a
+// guard: a descriptor with no connection on it, or one that is not closing, or
+// one the ring still owes an answer for, is somebody else's business.
+void cache_instance::finish_unreachable_client(int fd)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+    auto* conn = m_conn_idx[fd];
+    if (SOCKETLEY_LIKELY(conn == nullptr || !conn->closing))
+        return;
+
+    // The two the ring genuinely owes.  Their completion comes back here and
+    // asks this question again.
+    if (conn->write_pending || conn->zc_notif_pending)
+        return;
+
+    // Bytes the client already handed us and considers answered are not
+    // "nothing left": push them out and let the write completion finish the
+    // teardown, exactly as the closing block in handle_read does.  A flush can
+    // legitimately submit nothing — a TLS session with a reply queued while the
+    // handshake is still running has output and no way to send it — and that
+    // leaves nothing to wake it either.
+    if (conn_has_output(conn))
+    {
+        if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
+        {
+            close_client(conn, fd, "unreachable-write-submit-failed");
+            return;
+        }
+        if (conn->write_pending || conn->zc_notif_pending)
+            return;
+        close_client(conn, fd, "unreachable-with-unsendable-output");
+        return;
+    }
+
+    close_client(conn, fd, "unreachable-closing");
 }
 
 #ifdef SOCKETLEY_INVARIANTS

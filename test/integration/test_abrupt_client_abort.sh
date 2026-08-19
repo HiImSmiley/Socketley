@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# suite: quiet -- carries a pre-existing race of its own: one connection of
-# ~1,700 aborts is still live 8s later, measured at 4/30 runs on
-# integration/everything and 6/30 on feat/server-shards (p=0.73, so no
-# difference between them).  Running it quiet does not fix that; it keeps a
-# group run from reporting somebody else's defect as their own.
 # Integration test: a client that vanishes with a reply still owed is torn down.
 #
 # The read path of every runtime here is written around "a completion is still
@@ -49,6 +44,13 @@
 #   - a leak of one connection in a thousand.  The 'connections' check is exact,
 #     but only a connection still held *after the drain deadline* counts, so a
 #     runtime that reaps late rather than never passes
+#   - a descriptor held by an unreaped connection.  The fd sample below is taken
+#     after both runtimes have been stopped, and teardown() closes every client
+#     socket it still has, so a connection that was never reaped gives its
+#     descriptor back at that point like any other.  'delta=0' alongside a
+#     failed drain is the expected reading, not a contradiction of it, and it
+#     was read as one for a while: the descriptor check answers "did the
+#     lifecycle give the fds back", never "was this connection reaped"
 #
 # HONEST ABOUT TIMING — whether an individual abort lands inside the narrow
 # window is luck; the 150ms backend delay and the size of the cache pipeline are
