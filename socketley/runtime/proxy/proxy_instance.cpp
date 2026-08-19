@@ -4770,17 +4770,29 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             nl = headers_section.size();
         std::string_view hdr_line = headers_section.substr(h_pos, nl - h_pos);
 
-        // Track client's Connection: close intent before stripping
+        // Track the client's `Connection: close` intent before stripping.
+        //
+        // The same list parse the Upgrade check above uses, twenty-nine lines
+        // up, and for the same reason: Connection is a comma-separated list
+        // (RFC 9110 Section 7.6.1), so the token can be anywhere in it.
+        //
+        // This was a two-character prefix test --
+        //
+        //     val.size() >= 5 && (val[0]|0x20)=='c' && (val[1]|0x20)=='l'
+        //
+        // -- and it was wrong in both directions.  "keep-alive, close" starts
+        // "ke", so the close went unseen and the proxy kept a connection the
+        // client had asked it to end.  "clientinfo" starts "cl" and is five
+        // bytes, so client_conn_close was set on a connection nobody had asked
+        // to close, and the request pipelined behind it was dropped
+        // unanswered.  Both measured; see
+        // test/integration/test_proxy_connection_close_token.sh.
         if (header_name_equals(hdr_line, "connection", 10))
         {
-            auto colon = hdr_line.find(':');
-            if (colon != std::string_view::npos)
-            {
-                auto val = hdr_line.substr(colon + 1);
-                while (!val.empty() && val[0] == ' ') val.remove_prefix(1);
-                if (val.size() >= 5 && (val[0] | 0x20) == 'c' && (val[1] | 0x20) == 'l')
-                    conn->client_conn_close = true;
-            }
+            const auto colon = hdr_line.find(':');
+            if (colon != std::string_view::npos &&
+                http_list_has_token(http_trim_ows(hdr_line.substr(colon + 1)), "close", 5))
+                conn->client_conn_close = true;
         }
 
         // Skip hop-by-hop headers (RFC 7230 Section 6.1) — except the two that

@@ -242,6 +242,19 @@ def http_seeds():
     s["long_path"] = b"GET /px/" + b"a" * 8000 + b" HTTP/1.1\r\nHost: h\r\n\r\n"
     s["nul_in_path"] = b"GET /px/a\x00b HTTP/1.1\r\nHost: h\r\n\r\n"
 
+    # Connection as a LIST, which is what it is (RFC 9110 Section 7.6.1).
+    # rewrite_http_request decided "did the client ask to close" with a
+    # two-character prefix test on the field value, and 45 seeds went past it
+    # without ever putting the token anywhere but first.  Both directions:
+    # conn_close_in_list carries the token and must be seen; conn_close_lookalike
+    # carries no token at all and must NOT be, though it does start "cl".
+    s["conn_close_in_list"] = (b"GET /px/ HTTP/1.1\r\nHost: h\r\n"
+                               b"Connection: keep-alive, close\r\n\r\n")
+    s["conn_close_lookalike"] = (b"GET /px/ HTTP/1.1\r\nHost: h\r\n"
+                                 b"Connection: clientinfo\r\n\r\n")
+    s["conn_close_tab_ows"] = (b"GET /px/ HTTP/1.1\r\nHost: h\r\n"
+                               b"Connection:\tclose\r\n\r\n")
+
     # Smuggling shapes — the reason the oracle in fuzz_http_request.cpp exists.
     s["cl_te_crlf"] = (b"POST /px/ HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
                        b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
