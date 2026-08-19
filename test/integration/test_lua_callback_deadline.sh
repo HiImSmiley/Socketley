@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# suite: quiet -- times a 400ms block against a 1500ms budget.  Its own
+# comment records this going red under the sanitizer while three other jobs
+# were running; six parallel workers is that, deliberately.
 # Integration test: a Lua callback that never returns is stopped, and only it.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- waits on wall-clock deadlines for a runtime to remove
+# itself; a loaded box moves the deadline, not the behaviour.
 # Integration test: a subscriber may remove its own runtime.
 #
 # ─── WHICH PATH THIS IS, EXACTLY ────────────────────────────────────────────

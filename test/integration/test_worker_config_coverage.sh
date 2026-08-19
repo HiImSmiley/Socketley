@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# suite: quiet -- races a 2s stats push with fixed 2.5s sleeps, so under a
+# parallel group run it reads total_messages=0 for a datagram that did
+# arrive.  Quiet is a workaround: the real fix is to poll for the push, the
+# way test_server_shards.sh does, and then this line can go.
 # Integration test: every field of runtime_config reaches a worker's runtime.
 #
 # ─── WHY ────────────────────────────────────────────────────────────────────
