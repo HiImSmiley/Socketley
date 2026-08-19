@@ -42,24 +42,20 @@
 # pins: a change that sends small non-HTML files back to the splice path makes
 # it fail again.
 #
-# ─── WHAT IS STILL OPEN, AND DELIBERATELY NOT ASSERTED HERE ─────────────────
+# ─── THE REST OF THE FAMILY, AND WHERE IT IS ASSERTED ───────────────────────
 #
-# Files ABOVE server_instance.h's HTTP_REVAL_MAX_FILE (1 MiB) still take the
-# splice path on the default configuration, and still stall: 31, 34 and 46 of
-# 200 connections on a 2 MiB .txt, on a clean Release binary with no
-# environment overrides.  That is a live defect, not a historical one, and it
-# is not asserted here because it is not fixed -- see
-# repro_http_splice_keepalive_stall.sh next to this file, which reproduces it
-# and is not part of the suite for exactly that reason.
+# Files ABOVE server_instance.h's HTTP_REVAL_MAX_FILE (1 MiB) take the splice
+# path on the default configuration and stalled the same way: 33, 33 and 34 of
+# 200 connections on a 2 MiB .txt.  That is now fixed in parse_partial() and
+# pinned next door by test_http_splice_keepalive_stall.sh, which asserts the
+# large-file case this file cannot reach.
 #
-# The same is true above HTTP_REVAL_MAX_TOTAL (64 MiB): once the map is full
-# reval_take goes false for every file and non-HTML returns to splice.  Not
-# asserted, not measured -- read from the code only.
-#
-# HTTP pipelining is a third, larger defect in the same family and is also not
-# asserted: two requests in one write are answered once on EVERY serving path,
-# --http-cache included, and the rest are parked in conn->partial forever.
-# Measured 1 of 4 answered on all six path/mode combinations.
+# HTTP pipelining was the same defect wearing different clothes: two requests in
+# one write were answered once on EVERY serving path, --http-cache included, and
+# the rest sat in conn->partial forever.  Measured 1 of 4 on all six path/mode
+# combinations before, 4 of 4 after, and 256 of 256 at depth 256.  It is not
+# asserted here only because it belongs with the loop rather than with this
+# file's subject; the same one-line change closed both.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #

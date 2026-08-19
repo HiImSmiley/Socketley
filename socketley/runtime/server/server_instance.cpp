@@ -2992,122 +2992,30 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
     }
 }
 
-void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
+// ─── THE PARSE, MADE RE-DRIVABLE ────────────────────────────────────────────
+//
+// Lifted out of handle_read() unchanged except for the loop at the end of the
+// HTTP arm, because a read completion is not the only moment at which
+// `conn->partial` can hold a request nobody has answered.
+//
+// The guard in the HTTP arm below declines to parse while this connection is
+// still finishing its last response, and said "the bytes stay in partial and
+// are parsed when the next read completes".  Nothing re-parsed them.  A
+// multishot recv is already armed, so it has ALREADY moved the next request out
+// of the socket and into `partial`; the response completion then armed a read
+// and waited for bytes the client had sent long before, while the client waited
+// for a response that was never going to be produced.  Both sides waited.
+//
+// Counted before choosing where to put the rule: `partial` is parsed for HTTP
+// in 1 place, and 15 places set conn->proto = proto_unknown to mean "this
+// connection has finished its response and may have another".  None of the 15
+// can resume a parse, and a rule that fifteen call sites have to remember is
+// one that the sixteenth will not.  So it goes in the loop and in the three
+// completion arms that own an async response -- handle_splice_out()'s
+// keep-alive arm and handle_file_read()'s two -- rather than at the fifteen.
+void server_instance::parse_partial(server_connection* conn)
 {
-    int fd = req->fd;
-    auto* conn = m_conn_idx[fd];
-    if (SOCKETLEY_UNLIKELY(!conn))
-        return;
-
-    bool is_multishot_recv = (req->type == op_recv_multishot);
-    bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
-
-    // For multishot recv, the read remains pending as long as MORE flag is set
-    if (!is_multishot_recv)
-        conn->read_pending = false;
-    else if (!multishot_more)
-        conn->read_pending = false;
-
-    bool is_provided = (req->type == op_read_provided || is_multishot_recv);
-
-    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
-    {
-        // Return provided buffer if kernel allocated one before error
-        if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
-        {
-            uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
-        }
-
-        // ENOBUFS: buffer pool exhausted — fall back to regular read
-        if (is_provided && cqe->res == -ENOBUFS)
-        {
-            conn->read_pending = true;
-            // Reset the request type: the fallback is a plain read into the
-            // connection's own buffer, not a provided-buffer one.  Leaving it
-            // as a recv/provided type makes the completion handler treat the
-            // result as a buffer-ring delivery — it then appends whatever sits
-            // in ring buffer 0 instead of the bytes just read, discards those
-            // bytes, and returns a buffer it never took, corrupting the ring's
-            // free list.
-            conn->read_req.type = op_read;
-            bool queued;
-            if (conn->direct_fd)
-                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
-            else
-                queued = m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
-            if (SOCKETLEY_UNLIKELY(!queued))
-            {
-                conn->read_pending = false;
-                conn->closing = true;
-            }
-            return;
-        }
-
-        // Connection closed or error.  A zero-copy send clears write_pending on
-        // its first completion and keeps DMA-ing out of write_batch[0] until the
-        // notification arrives, so the old guard here — which did not look at
-        // zc_notif_pending — released the struct while the kernel was still
-        // reading the pages, and another connection's bytes went out on the
-        // wire.  Splices were not tracked at all.  conn_ops_pending() is now the
-        // one answer to that question.
-        conn->closing = true;
-        if (!conn_ops_pending(conn))
-            close_conn(conn);
-        return;
-    }
-
-    if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
-        conn->last_activity = std::chrono::steady_clock::now();
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
-
-    // On a TLS connection these bytes are ciphertext and tls_feed is what puts
-    // plaintext into partial; everything below this point reads exactly the
-    // same buffer it always did and knows nothing about TLS.
-    if (is_provided)
-    {
-        // Extract buffer ID from CQE flags
-        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-        char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-        if (SOCKETLEY_LIKELY(buf_ptr != nullptr))
-        {
-            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
-                tls_feed(conn, buf_ptr, static_cast<size_t>(cqe->res));
-            else
-                conn->partial.append(buf_ptr, cqe->res);
-            // Back to the group whatever the session made of it: the group is
-            // shared with every other server on this loop, and one failed
-            // handshake is no reason to starve them.
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
-        }
-    }
-    else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
-    {
-        tls_feed(conn, conn->read_buf, static_cast<size_t>(cqe->res));
-    }
-    else
-    {
-        conn->partial.append(conn->read_buf, cqe->res);
-    }
-
-    // This client has said something, and from here on it is one that is owed
-    // an answer rather than one that is only listening.  Here rather than in
-    // each of the three branches above because this is where they meet, and on
-    // `partial` rather than on cqe->res because on a TLS connection the bytes
-    // that just arrived may be a handshake record the session answers by
-    // itself: a client is not waiting on the relay for that.  Sticky — a
-    // connection does not become a listener again by falling silent, and the
-    // sticky part is what keeps a keep-alive HTTP client, whose protocol is
-    // reset to unknown between requests, out of the deadline's reach.
-    if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
-        conn->spoke = true;
-
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
-    {
-        conn->closing = true;
-        goto submit_next_read;
-    }
-
+reparse:
     // Multi-protocol auto-detection
     if (conn->proto == proto_unknown)
     {
@@ -3133,7 +3041,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (conn->partial.size() < 4)
         {
             if (conn->partial.find('\n') == std::string::npos)
-                goto submit_next_read;   // still mid-line: more may yet come
+                return;   // still mid-line: more may yet come
 
             const char s0 = conn->partial[0];
             const char s1 = conn->partial.size() > 1 ? conn->partial[1] : '\0';
@@ -3192,9 +3100,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (conn->partial.size() > 16384)
             {
                 conn->closing = true;
-                goto submit_next_read;
+                return;
             }
-            goto submit_next_read; // Incomplete headers
+            return; // Incomplete headers
         }
 
         // Single-pass header scan: find Upgrade + Sec-WebSocket-Key without allocation
@@ -3388,7 +3296,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             else
                 conn->partial.erase(0, offset);
         }
-        goto submit_next_read;
+        return;
     }
 
     // proto_http: full HTTP request handling
@@ -3419,7 +3327,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // The bytes stay in partial and are parsed when the next read completes.
         if (SOCKETLEY_UNLIKELY(conn->file_read_pending || conn->splice_pending ||
                                conn->splice_in_pending || conn->splice_out_pending))
-            goto submit_next_read;
+            return;
 
         // Wait for complete headers
         auto hdr_end = conn->partial.find("\r\n\r\n");
@@ -3428,9 +3336,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (conn->partial.size() > 16384)
             {
                 conn->closing = true;
-                goto submit_next_read;
+                return;
             }
-            goto submit_next_read;
+            return;
         }
 
         // Extract request line
@@ -3444,14 +3352,14 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (sp1 == std::string_view::npos || sp2 == std::string_view::npos)
         {
             conn->closing = true;
-            goto submit_next_read;
+            return;
         }
 
         http_request hreq;
         hreq.method = req_line.substr(0, sp1);
         std::string_view raw_path = req_line.substr(sp1 + 1, sp2 - sp1 - 1);
         hreq.version = req_line.substr(sp2 + 1);
-        hreq.client_id = fd;
+        hreq.client_id = conn->fd;
 
         // Split path and query string
         auto qpos = raw_path.find('?');
@@ -3521,12 +3429,36 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
         size_t total_expected = hdr_end + 4 + content_length;
         if (conn->partial.size() < total_expected)
-            goto submit_next_read;  // Need more body data
+            return;  // Need more body data
 
         hreq.body = full.substr(hdr_end + 4, content_length);
 
         handle_http_request(conn, hreq, total_expected);
-        goto submit_next_read;
+
+        // ─── ROUND AGAIN, RATHER THAN WAITING FOR A READ THAT IS NOT COMING ──
+        //
+        // This is the whole fix.  Every other arm in this function already
+        // consumes everything it can -- proto_tcp loops on '\n', proto_resp
+        // loops on a frame -- and HTTP took exactly one request per read
+        // completion and left the rest of `partial` for "the next read", which
+        // for a multishot recv is a read that only arrives if the client sends
+        // MORE bytes.  It has none to send: it is waiting for the answer to the
+        // request already sitting here.
+        //
+        // Deliberately a jump back to the protocol detection above and not a
+        // second parse in place.  A pipelined GET may be a WebSocket upgrade,
+        // and deciding that here would duplicate the sniff -- and duplicating
+        // it is how the two copies come to disagree.  Detection is idempotent
+        // on a fresh `partial`, so this is exactly what the next read
+        // completion would have done, minus the wait.
+        //
+        // It terminates: handle_http_request() erases at least the four bytes
+        // of one header terminator before returning, so every trip round is
+        // strictly shorter, and the three exits above -- busy, need-more,
+        // closing -- are unchanged.
+        if (!conn->closing && !conn->partial.empty())
+            goto reparse;
+        return;
     }
 
     // proto_resp: RESP2 wire protocol (reuses resp_parser from cache)
@@ -3579,7 +3511,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             else
                 conn->partial.erase(0, offset);
         }
-        goto submit_next_read;
+        return;
     }
 
     // proto_tcp: existing newline-delimited parsing
@@ -3614,6 +3546,126 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 conn->partial.erase(0, scan_from);
         }
     }
+
+}
+
+void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
+{
+    int fd = req->fd;
+    auto* conn = m_conn_idx[fd];
+    if (SOCKETLEY_UNLIKELY(!conn))
+        return;
+
+    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
+
+    // For multishot recv, the read remains pending as long as MORE flag is set
+    if (!is_multishot_recv)
+        conn->read_pending = false;
+    else if (!multishot_more)
+        conn->read_pending = false;
+
+    bool is_provided = (req->type == op_read_provided || is_multishot_recv);
+
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
+    {
+        // Return provided buffer if kernel allocated one before error
+        if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
+        {
+            uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+        }
+
+        // ENOBUFS: buffer pool exhausted — fall back to regular read
+        if (is_provided && cqe->res == -ENOBUFS)
+        {
+            conn->read_pending = true;
+            // Reset the request type: the fallback is a plain read into the
+            // connection's own buffer, not a provided-buffer one.  Leaving it
+            // as a recv/provided type makes the completion handler treat the
+            // result as a buffer-ring delivery — it then appends whatever sits
+            // in ring buffer 0 instead of the bytes just read, discards those
+            // bytes, and returns a buffer it never took, corrupting the ring's
+            // free list.
+            conn->read_req.type = op_read;
+            bool queued;
+            if (conn->direct_fd)
+                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            else
+                queued = m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+            if (SOCKETLEY_UNLIKELY(!queued))
+            {
+                conn->read_pending = false;
+                conn->closing = true;
+            }
+            return;
+        }
+
+        // Connection closed or error.  A zero-copy send clears write_pending on
+        // its first completion and keeps DMA-ing out of write_batch[0] until the
+        // notification arrives, so the old guard here — which did not look at
+        // zc_notif_pending — released the struct while the kernel was still
+        // reading the pages, and another connection's bytes went out on the
+        // wire.  Splices were not tracked at all.  conn_ops_pending() is now the
+        // one answer to that question.
+        conn->closing = true;
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+        return;
+    }
+
+    if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
+        conn->last_activity = std::chrono::steady_clock::now();
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
+    // On a TLS connection these bytes are ciphertext and tls_feed is what puts
+    // plaintext into partial; everything below this point reads exactly the
+    // same buffer it always did and knows nothing about TLS.
+    if (is_provided)
+    {
+        // Extract buffer ID from CQE flags
+        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+        char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
+        if (SOCKETLEY_LIKELY(buf_ptr != nullptr))
+        {
+            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+                tls_feed(conn, buf_ptr, static_cast<size_t>(cqe->res));
+            else
+                conn->partial.append(buf_ptr, cqe->res);
+            // Back to the group whatever the session made of it: the group is
+            // shared with every other server on this loop, and one failed
+            // handshake is no reason to starve them.
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+        }
+    }
+    else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+    {
+        tls_feed(conn, conn->read_buf, static_cast<size_t>(cqe->res));
+    }
+    else
+    {
+        conn->partial.append(conn->read_buf, cqe->res);
+    }
+
+    // This client has said something, and from here on it is one that is owed
+    // an answer rather than one that is only listening.  Here rather than in
+    // each of the three branches above because this is where they meet, and on
+    // `partial` rather than on cqe->res because on a TLS connection the bytes
+    // that just arrived may be a handshake record the session answers by
+    // itself: a client is not waiting on the relay for that.  Sticky — a
+    // connection does not become a listener again by falling silent, and the
+    // sticky part is what keeps a keep-alive HTTP client, whose protocol is
+    // reset to unknown between requests, out of the deadline's reach.
+    if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
+        conn->spoke = true;
+
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
+    {
+        conn->closing = true;
+        goto submit_next_read;
+    }
+
+    parse_partial(conn);
 
 submit_next_read:
     // Relay traffic that arrived while this connection had no protocol yet.
@@ -4946,6 +4998,25 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
             conn->proto = proto_unknown;
             if (!conn->read_pending)
                 submit_conn_read(conn);
+            // ─── THE ERROR ARM OWES THE SAME DEBT AS THE SUCCESS ARM ─────
+            //
+            // The invariant is about the connection, not about the outcome: if
+            // this connection deferred a parse in order to get here, a request
+            // is sitting in conn->partial and somebody has to answer it.
+            // Answering 404 to the FIRST request does not discharge that, and
+            // an arm that returns without draining leaves the client waiting on
+            // a response that will never be produced -- the exact failure this
+            // whole change exists to remove, reintroduced on the path nobody
+            // reads because it is the error path.
+            //
+            // This is why the rule is not "remember to drain after a successful
+            // response".  A rule phrased that way is one every future arm has to
+            // know about, and 15 places in this file already mean "finished, may
+            // have another" without knowing anything of the sort.  Phrased as
+            // "every arm that finishes a response drains", the omission is
+            // visible as a missing line rather than invisible as a missing
+            // thought.
+            parse_partial(conn);
         }
         return;
     }
@@ -5011,6 +5082,11 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         // Resubmit socket read for next HTTP request
         if (!conn->read_pending)
             submit_conn_read(conn);
+        // Last statement -- see handle_splice_out.  Reachable here only by a
+        // client that pipelines, because on the read path the client cannot
+        // have the response before the read completes and so has no reason to
+        // have sent anything; it is the same rule all the same.
+        parse_partial(conn);
     }
 }
 
@@ -5141,6 +5217,15 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
         conn->proto = proto_unknown;
         if (!conn->read_pending)
             submit_conn_read(conn);
+
+        // Last statement, and that is the whole contract: parse_partial() can
+        // dispatch a request that arms the next splice on this same connection,
+        // so anything after it would be operating on the next response's state.
+        // The request it finds here arrived while splice_out_pending was set --
+        // the pipe->socket completion lands after the client already holds the
+        // whole response, so its next request has had time to arrive and be
+        // deferred.  That is the one the client is waiting for.
+        parse_partial(conn);
     }
 }
 

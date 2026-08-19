@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Reproducer for an OPEN defect.  Not a test -- run_all.sh globs test_*.sh, and
-# this file is deliberately outside that glob because it fails on a correct
-# checkout of this tree.  It fails because the defect is real, not because the
-# reproducer is wrong.  When the defect is fixed, rename it to test_*.sh.
+# Integration test: a splice-served file must not silence a keep-alive connection
 #
-# ─── THE DEFECT ─────────────────────────────────────────────────────────────
+# This was a reproducer for an open defect and sat outside the test_*.sh glob
+# because it failed on a correct checkout.  It is inside the glob now because
+# the defect is fixed; the numbers below are what it measured before and after.
+#
+# ─── THE DEFECT IT PINS ─────────────────────────────────────────────────────
 #
 # In `--http DIR` disk mode, on the DEFAULT configuration with no environment
 # overrides, a keep-alive client asking repeatedly for a non-HTML file larger
-# than server_instance.h's HTTP_REVAL_MAX_FILE (1 MiB) will sooner or later get
+# than server_instance.h's HTTP_REVAL_MAX_FILE (1 MiB) would sooner or later get
 # nothing back at all: no response, no FIN, no RST, connection still open.  It
-# waits forever.
+# waited forever.
+#
+# Interleaved A/B, alternating order, 200 connections of 20 requests, same file
+# and same box -- before the fix 33, 33 and 34 connections dead of 200; after it
+# 0, 0 and 0.  Wall clock 69.0 / 69.3 / 70.9 s against 1.63 / 1.77 / 1.50 s,
+# because most of the old number is the client sitting in its own timeouts.
 #
 # Measured on 25552d9, clean Release binary, 2 MiB .txt, 200 connections of 20
 # requests, three runs: 31, 34 and 46 connections dead of 200, and 3762, 3724
@@ -59,23 +65,23 @@
 # reval_take goes false for every file, the splice path and the gap are both
 # exactly as they were.
 #
-# ─── THE FIX THIS IS WAITING FOR ────────────────────────────────────────────
+# ─── THE FIX ────────────────────────────────────────────────────────────────
 #
-# Counted on 25552d9: conn->partial is parsed for HTTP in 1 place, and 15 places
-# set conn->proto = proto_unknown to mean "this connection has finished its
-# response and may have another".  None of the 15 can resume a parse.  So the
-# rule belongs at a chokepoint rather than at the deferral: the HTTP arm of
-# handle_read should loop while partial holds a request the connection can
-# accept, and the two async completions that finish a response --
-# handle_splice_out's keep-alive arm and the file-read completion -- should
-# drive that same loop as their last statement.  Two call sites, not fifteen.
+# Counted before choosing where the rule went: conn->partial is parsed for HTTP
+# in 1 place, and 15 places set conn->proto = proto_unknown to mean "finished,
+# may have another".  None of the 15 could resume a parse, and a rule fifteen
+# call sites have to remember is one the sixteenth will not.  So parse_partial()
+# loops -- as proto_tcp and proto_resp always did -- and the three completion
+# arms that own an async response drive it as their last statement.
 #
-# Not attempted here: it is a change to the hot path of server_instance.cpp,
-# which another agent held at the time, and it needs both the Release and the
-# Sanitize suite behind it.
+# ─── WHAT ELSE THIS CATCHES ─────────────────────────────────────────────────
 #
-# usage: ./repro_http_splice_keepalive_stall.sh [bursts]
-# exit 1 when it reproduces (the current expectation), 0 when it does not.
+# Assertion 2 is the control and it is not decoration: it serves the same 2 MiB
+# through the read path instead of the splice path.  If both arms go red the
+# cause is not the splice window, and the file says so rather than leaving the
+# next reader to guess.
+#
+# usage: ./test_http_splice_keepalive_stall.sh [bursts]
 
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -84,16 +90,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib_ports.sh"
 exec 2>&1
 daemon_isolate spstall
-BURSTS="${1:-600}"
+BURSTS="${1:-200}"
 # The control only has to show the read path is clean, and at 2 MiB the read
 # path is 6x SLOWER than splice (measured: 4.9 GB in 42.6 s against 6.9 s), so
 # running it at the full count would dominate the runtime for no extra evidence.
-CTRL_BURSTS=$(( BURSTS < 120 ? BURSTS : 120 ))
+# 200 bursts is chosen against the measured broken rate at its LOWEST, not its
+# highest: 33 of 200 under load but 8 of 200 on an idle box, because what the
+# defect races is how long the splice takes.  A count picked against the loaded
+# figure would let a red build pass on a quiet CI machine, and an assertion that
+# can pass on a broken build is not one.
+CTRL_BURSTS=$(( BURSTS < 40 ? BURSTS : 40 ))
 WORK=$(mktemp -d)
 cleanup(){ rm -rf "$WORK"; daemon_stop; }
 trap cleanup EXIT
 
-echo "=== Reproducer: --http disk mode stalls a keep-alive connection above the 1 MiB cap ==="
+echo "=== Integration: --http splice path answers every keep-alive request ==="
 echo "    loadavg at start: $(cut -d' ' -f1 /proc/loadavg)"
 
 CLIENT="$WORK/ka_stall"
@@ -130,10 +141,11 @@ taskset -c 1 "$CLIENT" "$P" 20 "$CTRL_BURSTS" 2000 /big.html MARKER-BIG || true
 echo "    elapsed $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 
 if [ "$rc_txt" -ne 0 ]; then
-    echo "  REPRODUCED: the splice path went silent on an open keep-alive connection."
-    echo "  If the control above is 0 stalls, the read path is fine and this is the splice window."
+    echo "  FAIL: the splice path went silent on an open keep-alive connection."
+    echo "        stall>0 means the server stopped talking with the connection still up."
+    echo "        If the control above is ALSO non-zero the cause is not the splice"
+    echo "        window and this file is pointing at the wrong thing."
     exit 1
 fi
-echo "  did NOT reproduce this run -- the window is load and duration dependent;"
-echo "  try more bursts, and record the loadavg."
+echo "--- 2/2 passed ---"
 exit 0

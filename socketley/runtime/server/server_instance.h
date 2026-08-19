@@ -785,6 +785,11 @@ private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_file_read(struct io_uring_cqe* cqe, io_request* req);
+    // Parses conn->partial and dispatches whatever whole messages are in it.
+    // Called from handle_read, and from the three completion arms that finish
+    // an async HTTP response -- a response completion is the other moment at
+    // which a request can be sitting here unanswered.  See the definition.
+    void parse_partial(server_connection* conn);
     void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
     void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
     void splice_cleanup(server_connection* conn);
