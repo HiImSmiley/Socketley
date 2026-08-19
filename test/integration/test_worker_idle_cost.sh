@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- asserts microseconds of CPU per second per idle runtime.
+# Under a parallel run that number is the parallel run's.
 # Integration test: what a runtime that is doing nothing costs.
 #
 # ─── WHAT THIS IS FOR ───────────────────────────────────────────────────────

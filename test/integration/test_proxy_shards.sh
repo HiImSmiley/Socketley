@@ -123,8 +123,15 @@ PY
 # command line, so it also matches the shell carrying the string in its own
 # arguments -- including the one doing the matching.
 shard_pids() {
+    # Scoped to THIS run's daemon, not to the binary.  Matching the binary was
+    # enough while the suite ran one file at a time; it counts the siblings'
+    # workers the moment two files run together, and the failure reads as a
+    # product defect -- "four worker processes: expected '4', got '14'".  The
+    # socket path is in every worker's environ because the daemon inherited it
+    # and the fork carries it.
     for p in $(pgrep -x socketley 2>/dev/null); do
         [[ "$(readlink /proc/$p/exe 2>/dev/null)" == "$BIN" ]] || continue
+        grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
         tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'proxy-worker' && echo "$p"
     done
 }

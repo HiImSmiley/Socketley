@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- asserts how stale a pushed figure is allowed to be, which
+# is a bound on wall-clock delay and not on the code under test.
 # Integration test: `stats` says how old an out-of-process runtime's figures are.
 #
 # ─── WHY THE AGE IS REPORTED AND NOT REMOVED ────────────────────────────────
