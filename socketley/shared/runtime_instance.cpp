@@ -151,6 +151,31 @@ bool runtime_instance::start(event_loop& loop)
         return false;
     }
 
+    // The shard count, on the same terms and for the same reason, and BEFORE
+    // the out-of-process return below: the count is acted on by the daemon —
+    // reconcile_proxy_workers() forks this many children — so the placeholder is
+    // the object that has to refuse, and it has to refuse before a single child
+    // is forked.  A shard itself never asks this question; it is one process
+    // serving one socket and does not know which of N it is.
+    //
+    // `create`, `edit` and `import` all ask shards_config_refusal already, and
+    // they are where the operator gets the message on their terminal.  This is
+    // the path none of them is on: a state file carrying `"shards": 4` on a
+    // scripted server — written by hand, or by a build from before this rule
+    // existed — is restored at boot and auto-started without passing a parser.
+    // Without this line it would come up sharded and silently split its
+    // script's cross-connection state, which is the one outcome the rule
+    // exists to prevent.
+    if (const std::string msg = shards_config_refusal(
+            get_type(), m_shards, !m_lua_script_path.empty(),
+            get_listen_path(), m_out_of_process || in_worker_process());
+        !msg.empty())
+    {
+        LOG_ERROR(msg.c_str());
+        m_state.store(runtime_failed, std::memory_order_release);
+        return false;
+    }
+
     // A placeholder for a worker process arms nothing and binds nothing: the
     // supervisor forks the child that does both.  Returning before
     // register_owner() is what keeps has_armed_io() false for it, so removal

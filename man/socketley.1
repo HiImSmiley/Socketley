@@ -1619,6 +1619,133 @@ command costs a round trip that the same command typed at the cache's own
 port does not. See
 .B Cache Access via Server
 below for what that guarantees and what it costs.
+.SS Sharding
+.TP
+.BI "\-\-shards " "N"
+Serve this server from
+.I N
+worker processes instead of one, sharing the listening socket through
+.BR SO_REUSEPORT .
+The kernel gives each incoming connection to one of them. 1 to 64; the default
+is 1, which is what every server was before this flag was offered here.
+.PP
+A runtime is one process and therefore one event loop on one core. This is the
+only way to give a single server more than that.
+.PP
+.B "Only on a server with no \-\-lua."
+A sharded runtime is a declaration that nothing is shared between connections.
+For a
+.B proxy
+that is a property of code in this tree. For a server it is a property of the
+operator's own script, and cross-connection state there is the common case
+rather than the exception \(em a chat room, a presence table, a counter. Sharded,
+a message from a client on shard 1 never reaches a client on shard 2, and
+nothing reports it: the operator finds out from a user, under exactly the load
+the flag was bought for.
+.BR self.broadcast ,
+.B owner_broadcast
+and
+.B upstream_broadcast
+are per-process, so a script that broadcasts is wrong the moment there is a
+second process.
+.PP
+So a server carrying
+.B \-\-lua
+refuses
+.BR \-\-shards ,
+in either flag order, and refuses it through
+.BR edit ,
+through
+.B import
+and at start-up from a state file as well \(em there is no door that accepts the
+pair. Shard a server with no script, or run the scripted one unsharded.
+.PP
+.B "What it bought, measured."
+One server runtime in
+.B \-\-http
+mode with
+.BR \-\-http\-cache ,
+driven by
+.B "socketley_bench proxy http-keepalive"
+over 64 keep-alive connections; seven interleaved passes, median of the per-pass
+ratios. The cores are the SERVER processes' own \(em daemon plus workers, from
+.I /proc/<pid>/stat
+\(em and not the box's, because a box-wide figure includes the benchmark client and
+at this concurrency the client is the larger half of it.
+.PP
+.RS
+.TS
+l r r r.
+shards	throughput	cores	per core
+_
+1	126,497 req/s	0.99	127,775 req/s
+8	451,097 req/s	4.78	94,372 req/s
+.TE
+.RE
+.PP
+3.57x at eight shards, with the per-pass ratios spread from 3.18x to 4.26x.
+.PP
+.B "One shard is exactly one core."
+0.99 of one, at every concurrency tried, while the machine had fifteen more
+sitting idle. That is the whole case for this flag stated as a measurement: a
+server does not run out of machine, it runs out of the single event loop it is
+allowed.
+.PP
+.B "Per-core efficiency falls by about a quarter, and that is the price."
+127,775 req/s per core at one shard against 94,372 at eight. Sharding buys
+throughput with cores, not with efficiency; if the machine has cores that are
+otherwise idle that is a good trade, and if it does not, this flag makes things
+worse rather than better. Do not set more shards than the machine has cores to
+give them.
+.PP
+.B "Measure with enough connections to feed the shards, or the flag looks worse than it is."
+The same eight shards driven by only
+.I 16
+connections read 294,917 req/s and 2.54x \(em not because they were slower but
+because they were starved: the arm used 4.12 cores where the 64-connection run
+used 4.78, and
+.B SO_REUSEPORT
+hands out whole connections, so sixteen over eight shards is two apiece with an
+uneven tail and the slowest shard gates the pass. A shard count above the
+client's concurrency measures the client.
+.B "The load is balanced per connection, not per request."
+.B SO_REUSEPORT
+picks a shard when the connection is accepted and never revisits it, so one
+heavy long-lived connection makes one shard hot while the others idle, and the
+spread over a small number of connections is uneven \(em eight connections over
+four shards were measured landing 3/2/2/1. Sharding helps a server carrying many
+comparable connections; it does nothing for a server carrying one big one.
+.PP
+.B "The surface still answers about the runtime, not the shard."
+.B ls
+shows one entry,
+.B stats
+reports the connection count summed across the shards and labels each shard's
+detail text,
+.B stop
+and
+.B remove
+take all of them down, and the count is persisted so a daemon restart brings
+back the number that was asked for. The count may be changed with
+.B edit
+only while the runtime is stopped, for the same reason
+.B \-p
+may.
+.PP
+.B "\-\-shards is refused with \-\-daemon\-process and with \-\-listen."
+A shard is a worker process, so a server asked to stay in the daemon has exactly
+one however many it declares; and
+.B SO_REUSEPORT
+is not what a unix socket does, so
+.I N
+processes on one
+.B "\-\-listen unix:"
+path would unlink each other's node and only the last to bind would be
+reachable. Both are refused rather than accepted and quietly ignored. See
+.B Sharding
+under
+.B PROXY FLAGS
+for the fuller treatment of the flag.
 .SS Multi-Protocol Auto-Detection
 Server connections automatically detect the protocol from the first bytes
 received. No flags are needed \(em all four protocols coexist on the same
@@ -1980,11 +2107,12 @@ and
 take all of them down, and the count is persisted so a restart brings back the
 number that was asked for.
 .PP
-.B "It is a declaration, and every other type refuses it."
+.B "It is a declaration, and not every type may make it."
 Sharding is correct exactly when nothing is shared between connections, and
 nothing can detect that \(em not the flags, and not the script, because a table
 at file scope is indistinguishable from one that happens never to be read
-twice. A
+twice. So the operator declares it, and the flag is offered only where they are
+in a position to. A
 .B cache
 refuses it because
 .I N
@@ -1999,11 +2127,30 @@ stored, with no error anywhere. A
 .B client
 refuses it because it has no listening socket to share. A
 .B server
-refuses it because the property being declared would be a property of the
-operator's own script, where cross-connection state \(em a room, a presence
-table, a counter \(em is the common case rather than the exception, and the
-failure is silent: a message from a client on one shard never reaches a client
-on another, and that shows up under exactly the load the flag was bought for.
+may shard when it has no
+.BR \-\-lua ,
+and may not when it has one \(em see
+.B Sharding
+under
+.B SERVER FLAGS
+for that rule and what it costs.
+.PP
+.B "Two combinations are refused on every type."
+.B \-\-shards
+with
+.B \-\-daemon\-process
+is refused because a shard is a worker process: a runtime asked to stay in the
+daemon has exactly one however many it declares, and being told four while one
+event loop serves the port is worse than being told no.
+.B \-\-shards
+with
+.B "\-\-listen unix:"
+is refused because
+.B SO_REUSEPORT
+is not what a unix socket does \(em
+.I N
+processes would unlink each other's socket node and only the last to bind would
+be reachable.
 .PP
 .B "What it bought, measured."
 An

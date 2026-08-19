@@ -1489,6 +1489,10 @@ int proxy_worker_main(int control_fd)
     // half of the Lua management API has nothing here to answer from and says so
     // instead of answering nothing.
     lua_context::set_worker_process(true);
+    // The same fact, in the bit that survives a SOCKETLEY_NO_LUA build.  Read by
+    // the --shards placement rule, which would otherwise refuse every shard of a
+    // runtime the daemon had just accepted -- see shards_config_refusal.
+    set_worker_process(true);
 
     worker w(control_fd);
     return w.run();

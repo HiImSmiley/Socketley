@@ -21,12 +21,15 @@
 #   with that; it only adds another process to supervise.
 #
 # WHAT IT IS NOT:
-#   It is not automatic and it is not offered on the other three runtime types.
-#   Sharding is correct exactly when nothing is shared between connections, and
-#   nothing can detect that -- so the operator declares it and owns it.  A cache
-#   would become N separate stores behind one port; a server whose Lua holds
-#   state across connections would have that state split N ways.  Both fail
-#   silently, which is why both refuse the flag rather than accepting it.
+#   It is not automatic, and it is not offered wherever the declaration cannot
+#   be made.  Sharding is correct exactly when nothing is shared between
+#   connections, and nothing can detect that -- so the operator declares it and
+#   owns it.  A cache refuses it outright: N shards would be N separate stores
+#   behind one port, and a GET on a new connection would miss data that was
+#   stored.  A client refuses it outright: it has no listening socket to share.
+#   A server may shard when it has no --lua, and may not when it has one, for
+#   the reason spelled out in ../server/sharded-server.sh -- its state would be
+#   its script's, and splitting it fails silently.
 #
 # =============================================================================
 

@@ -45,6 +45,9 @@ examples/
   the host name verified; also mutual TLS and what is refused
 
 ### Server
+- `sharded-server.sh` - `--shards N` on a server: N worker processes on one
+  port through `SO_REUSEPORT`, still one runtime. Only without `--lua`, and
+  the example shows what is refused and why
 - `tls-server.sh` - TLS on a server listener, plus mutual TLS; also shows what
   is refused (TLS on a cache, and any incomplete key pair)
 - `auth-token.lua`, `auth-ip-allowlist.lua` - connection authorisation

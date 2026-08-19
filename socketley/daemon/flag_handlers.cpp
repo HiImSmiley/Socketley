@@ -93,49 +93,29 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         // those apart either.  So the operator declares it and owns what
         // follows.
         //
-        // ─── WHY THE OTHER THREE TYPES REFUSE IT ────────────────────────────
+        // ─── WHO MAY DECLARE IT ─────────────────────────────────────────────
         //
-        // Because for them the declaration is not one an operator is in a
-        // position to make, and the failure is silent.
+        // The whole rule, with the reason for each half, is in
+        // shards_config_refusal (runtime_definitions.h) and not repeated here:
+        // it is asked from five places and a second copy of the reasoning is a
+        // copy that drifts.  In one line each — a proxy may, because the
+        // property is one of code in this tree; a server with no --lua may,
+        // because it has no cross-connection state to lose; a server WITH --lua
+        // may not, because the property would be one of the operator's own
+        // file; a cache and a client may not at all.
         //
-        // A cache: N shards are N separate stores behind one port.  A SET lands
-        // in whichever process the kernel gave that connection to and a later
-        // GET on a new connection asks a different one, so the answer is a miss
-        // for data that was stored — 1/N of the time, without an error
-        // anywhere.
-        //
-        // A client: there is no listening socket to share.  A client dials out;
-        // N of them would be N connections to the peer, which is a different
-        // feature wearing this flag's name.
-        //
-        // A server: this is the one worth arguing, and the answer is still no.
-        // The proxy's declaration is safe because "nothing is shared between
-        // connections" is a property of THIS tree's proxy — audited, fixed, and
-        // true by construction — so the operator is really asserting something
-        // about code they can read here.  A server's is a property of their own
-        // script, where cross-connection state is the common case rather than
-        // the exception: a chat room, a presence table, a counter.  Sharded, a
-        // message from a client on shard 1 never reaches a client on shard 2,
-        // and nothing reports it — the operator finds out from a user, under
-        // exactly the load the flag was bought for.  Refusing first and
-        // widening later is the direction that cannot break anybody: a
-        // checkable rule (no --lua at all, or an explicit opt-in inside the
-        // script's own declaration) can be added on top of this, and until one
-        // exists the flag is not offered for a judgement nobody can make.
+        // The server half was the widening the original refusal named for
+        // itself: "a checkable rule (no --lua at all, or an explicit opt-in
+        // inside the script's own declaration) can be added on top of this".
+        // This is the first of those two.  The second is not invented here —
+        // self.broadcast, owner_broadcast and upstream_broadcast are per-process
+        // today, so an opt-in would be an argument about those three and not
+        // about this flag.
         case fnv1a("--shards"):
         {
             if (i + 1 >= pa.count)
             {
                 std::cout << "--shards requires a count\n";
-                return 1;
-            }
-
-            if (instance->get_type() != runtime_proxy)
-            {
-                std::cout << "--shards is only available on a proxy; "
-                             "see the man page for why a "
-                          << type_to_string(instance->get_type())
-                          << " does not shard\n";
                 return 1;
             }
 
@@ -146,13 +126,24 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
 
-            // Bounded rather than trusted.  Past the core count every extra
-            // shard is a process competing for the same cores plus its own
-            // idle cost, so a large number is never what the operator wanted;
-            // this refuses the typo instead of forking it.
-            if (n > max_shards)
+            // Bounded rather than trusted, and the type rule with it.  Both
+            // come from shards_config_refusal, which is the one place the
+            // question is answered -- see runtime_definitions.h.
+            //
+            // Asked here with only the facts that cannot change further along
+            // the command line: the type, and the number just parsed.  The rest
+            // of what it wants -- whether there is a script, a --listen path, a
+            // --daemon-process -- may be typed AFTER this flag, so asking about
+            // them here would make the answer depend on the order the operator
+            // typed.  `--shards 4 --lua x.lua` and `--lua x.lua --shards 4`
+            // describe one runtime and must be refused identically, so the
+            // whole question is asked again in cmd_create once every flag has
+            // been seen, exactly where the TLS set is checked and for the same
+            // reason.
+            if (const std::string msg = shards_config_refusal(
+                    instance->get_type(), n, false, {}, true); !msg.empty())
             {
-                std::cout << "--shards must be between 1 and " << max_shards << "\n";
+                std::cout << msg;
                 return 1;
             }
 
@@ -1142,23 +1133,23 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "--shards requires a count\n";
                 return 1;
             }
-            if (instance->get_type() != runtime_proxy)
-            {
-                std::cout << "--shards is only available on a proxy; "
-                             "see the man page for why a "
-                          << type_to_string(instance->get_type())
-                          << " does not shard\n";
-                return 1;
-            }
             uint32_t n = 0;
             if (!parse_uint32(pa.args[++i], n) || n < 1)
             {
                 std::cout << "invalid shard count\n";
                 return 1;
             }
-            if (n > max_shards)
+            // Unlike the create case above, an edit CANNOT gain a script or a
+            // --daemon-process further along its own command line: neither flag
+            // is editable.  --listen is, so it is left to the set check in
+            // cmd_edit rather than read here, and this asks the half of the
+            // question whose inputs are already final.
+            if (const std::string msg = shards_config_refusal(
+                    instance->get_type(), n,
+                    !instance->get_lua_script_path().empty(), {},
+                    instance->is_out_of_process()); !msg.empty())
             {
-                std::cout << "--shards must be between 1 and " << max_shards << "\n";
+                std::cout << msg;
                 return 1;
             }
             instance->set_shards(n);
