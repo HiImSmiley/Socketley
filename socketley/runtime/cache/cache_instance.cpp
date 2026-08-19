@@ -4542,10 +4542,57 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             if (sub_conn->closing || sub_conn->is_follower)
                 continue;
 
+            // ─── Why the two marks below defer to an armed read, and may ────
+            //
+            // Both of them leave a `closing` connection whose teardown is left
+            // to the read that subscriber has armed, which is the shape
+            // shared/conn_reachability.h exists to refuse — and on_cqe's
+            // chokepoint cannot see these, because publish() runs on the
+            // PUBLISHER's completion while the connection being given up on is
+            // a subscriber's.  It is sound anyway, and the divergence is in the
+            // premise rather than the shape.
+            //
+            // That rule rests on "a connection that is `closing` is one whose
+            // peer has already gone".  True in the two defects it was written
+            // for — 78c9ecc here and ceaa3f2 in the server both marked the
+            // connection closing BECAUSE the peer reset, with the error already
+            // consumed by a write, so nothing was left to complete the read.
+            // Neither mark below has anything to do with the peer: one is this
+            // process running out of queue budget, the other this process
+            // running out of submission queue.  The subscriber is alive and its
+            // read is reachable by the one thing that can complete it.
+            //
+            // MEASURED, because acting on the shared verdict here is the
+            // obvious repair and it is a regression.  Same binary, the drain
+            // switched by an environment variable, SQPOLL, 3000 subscribers,
+            // one publish, 952 of them given up on; each then made to speak:
+            //
+            //     left to the armed read      952 of 952 reached and closed
+            //     routed through classify()     0 of 952
+            //
+            // finish_unreachable_client() runs inside the window where the
+            // submission queue is exhausted, which is the only window in which
+            // the second mark fires at all, so close_fd() cannot submit the
+            // cancel that would release the connection — and it has already
+            // been taken out of m_conn_idx, so nothing looks at it again.
+            // test_cache_publish_subscriber_reachable.sh holds that line.
+            //
+            // What is NOT claimed here: that giving up is the right answer.  A
+            // subscriber dropped for a transient local shortage is dropped
+            // silently, never retried and never told, and goes on believing it
+            // is subscribed.  That is a real defect, it is about delivery
+            // rather than reachability, and it is not this one.
+
             // A subscriber that has stopped reading must not be allowed to grow
             // the queue without limit, but the bound is memory: a slow reader on
             // 30-byte notifications was dropped after 123 KB when this counted
             // entries.
+            //
+            // Reaching this cap needs a write in flight — every push below is
+            // followed by a flush when nothing is pending — so the ring does owe
+            // this connection a completion and the chokepoint sees it on that
+            // completion regardless.  Measured over a backlog storm: 180 marks
+            // here, 0 of them with nothing outstanding.
             if (sub_conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
             {
                 sub_conn->closing = true;
@@ -4585,6 +4632,12 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 // walking, and publish() returns into a command handler that
                 // goes on using its own connection.  The subscriber has a read
                 // armed; its handler finishes the teardown.
+                //
+                // Nothing reached the ring, so this is the local-shortage mark
+                // the block above describes: reachable only when get_sqe()
+                // cannot produce an SQE, which under SQPOLL means one publish
+                // fanning out past the ring's depth.  Measured at 952 of 3000
+                // subscribers on a 2048-entry ring, every one of them alive.
                 sub_conn->closing = true;
                 continue;
             }

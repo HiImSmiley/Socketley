@@ -183,17 +183,40 @@ static bool backend_connect_addr(const backend_info& b,
 // microseconds earlier for no defect, which is the mechanical sweep this tree
 // keeps warning about, at maximum scale.
 //
-// ONE THING FOUND WHILE MEASURING IT, NOT FIXED HERE.  The shutdown(SHUT_RD)
+// ONE THING FOUND WHILE MEASURING IT, AND THEN CORRECTED.  The shutdown(SHUT_RD)
 // that close_pair issues on the deferring path — the syscall whose whole job is
-// to end that armed read through the socket's wait queue — failed with ENOTCONN
-// 33,384 times out of 33,384.  A socket that has taken an RST is already
-// TCP_CLOSE, and shutdown() on TCP_CLOSE does nothing at all.  Every one of
-// those connections was reaped anyway, by the read taking the error directly, so
-// this is a belt that has never once held while the braces did.  It is left
-// alone because there is no reproducer to fix it against and its removal or
-// repair would change 33,384 paths on a hypothesis; it is recorded here because
-// the next reader of that line will otherwise believe it is what makes the
-// deferral safe, and it is not.
+// to end that armed read through the socket's wait queue — was reported as
+// having failed with ENOTCONN 33,384 times out of 33,384, and called "a belt
+// that has never once held while the braces did".
+//
+// That number was taken on a client-abort storm, and it was generalised from
+// the one path where the syscall CANNOT work to the call as a whole.  A socket
+// that has taken an RST is already TCP_CLOSE, where shutdown() does nothing —
+// but that describes an aborting client, and close_pair issues this on three
+// descriptors, only one of which is the client's.  Counted per site across the
+// whole proxy group, 59 files, every teardown the suite reaches:
+//
+//     shutdown(backend_fd, SHUT_RD)   7054 ok    0 ENOTCONN   (100.0% ok)
+//     shutdown(client_fd,  SHUT_RD)    359 ok 1983 ENOTCONN   ( 15.3% ok)
+//
+// So it works, and on the backend it works every single time: a backend socket
+// is ESTABLISHED when the proxy tears the pair down, and this is the syscall
+// that makes its armed read complete now rather than whenever TCP gets round to
+// it.  The client site is the mixed one — 84.7% ENOTCONN is the aborting
+// clients, and the 359 are the teardowns the proxy itself starts against a live
+// client.
+//
+// The tree already carries proof that the backend one works, in a place nobody
+// connected to it: the circuit-breaker comment in handle_backend_read below
+// documents a measured defect — 7067 connections, 84 messages delivered, the
+// breaker open in front of a healthy backend — caused by exactly these
+// shutdowns completing the backend read with res == 0 and being charged as
+// backend hangups.  A syscall that never worked could not have done that.
+//
+// It is therefore NOT redundant and must not be removed.  What is true is
+// narrower and is stated at each of the three call sites: on a client that has
+// already reset it does nothing, and there the armed read is reached by the
+// socket error instead.
 static inline bool client_op_in_flight(const proxy_client_connection* c)
 {
     return c->read_pending || c->write_pending || c->zc_notif_pending ||
@@ -7663,6 +7686,12 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 // open and push them out; the write completion tears down once the
                 // queue has actually drained.
                 bconn->closing = true;
+                // This one earns its keep: a backend socket is ESTABLISHED when
+                // the proxy tears the pair down, so the shutdown really does end
+                // the read armed on it.  7054 of 7054 succeeded across the proxy
+                // group.  It is also why handle_backend_read must not charge the
+                // resulting res == 0 to the circuit breaker — see the comment
+                // there, and the measured 7067-connection outage it describes.
                 if (!bconn->write_pending &&
                     (!bconn->write_queue.empty() || tls_owes_output(bconn)) &&
                     !flush_backend_write_queue(bconn))
@@ -7737,6 +7766,11 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     if (defer2)
                     {
                         bconn2->closing = true;
+                        // Same as the backend block above, and on the same
+                        // reasoning.  Not separately measured: the proxy group
+                        // never reached this arm — a client holding a second
+                        // backend at teardown — so it rests on the argument
+                        // rather than on a count, and says so.
                         if (!bconn2->write_pending &&
                             (!bconn2->write_queue.empty() || tls_owes_output(bconn2)) &&
                             !flush_backend_write_queue(bconn2))
@@ -7799,6 +7833,19 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
             if (defer_c)
             {
                 conn->closing = true;
+                // EXPECTED TO FAIL on the abort path, and it is not what makes
+                // the deferral safe there.  A client that reset is already
+                // TCP_CLOSE and shutdown() does nothing: 1983 of 2342 calls
+                // across the proxy group returned ENOTCONN, and a client-abort
+                // storm returns it 33,384 times out of 33,384.  What reaps those
+                // is the armed read taking the socket error directly — see
+                // client_op_in_flight above for why this proxy's reads are
+                // reachable that way and the cache's and the server's were not.
+                //
+                // It is kept because the other 359 are teardowns the proxy
+                // itself starts against a LIVE client, where the socket is
+                // ESTABLISHED and this is what ends the read promptly.  Do not
+                // read a failure here as a fault, and do not "repair" it.
                 if (!conn->write_pending &&
                     (!conn->write_queue.empty() || tls_owes_output(conn)) &&
                     !flush_client_write_queue(conn))
