@@ -169,7 +169,7 @@ bool name_is(std::string_view line, std::string_view lower)
 // accepted by a recipient and a bare CR may be accepted or turned into a space,
 // and "may" is per recipient: the proxy and the backend choose independently,
 // and the moment they choose differently they disagree about where one request
-// ends.  Written out here rather than borrowed from http_response_framing.h so
+// ends.  Written out here rather than borrowed from http_framing.h so
 // that the oracle does not judge the code under test with the code under test.
 bool crlf_framed(std::string_view block)
 {

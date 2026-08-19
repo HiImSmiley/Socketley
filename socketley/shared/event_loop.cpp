@@ -1160,7 +1160,7 @@ void event_loop::flush()
 // of code inside a loop is not a symbol: no test can call it, and neither the
 // explicit-instantiation trick nor the access-specifier one reaches it, because
 // both of those get at *functions*.  That is the same wall
-// runtime/proxy/http_response_framing.h was lifted over, and the same answer —
+// shared/http_framing.h was lifted over, and the same answer —
 // take what was already a self-contained decision and give it a name, so that
 // test/fuzz/fuzz_event_loop.cpp can feed it a completion the ring never
 // produced.

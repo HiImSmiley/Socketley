@@ -1108,7 +1108,7 @@ project "fuzz_cache_ops"
 --
 -- The counterpart to fuzz_http_request, and the cheap one.  The response parser
 -- used to be a block of statements inside handle_backend_read, reachable only
--- from a running daemon; it is now runtime/proxy/http_response_framing.h, which
+-- from a running daemon; it is now shared/http_framing.h, which
 -- includes <charconv> and <string_view> and nothing else.  So this target is
 -- three translation units like fuzz_resp, links no libraries, and belongs in
 -- the per-push job — unlike fuzz_http_request, which still needs the whole SDK.
@@ -1124,7 +1124,7 @@ project "fuzz_http_response"
         "test/fuzz/fuzz_http_response.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/runtime/proxy/http_response_framing.h"
+        "socketley/shared/http_framing.h"
     }
 
     fuzz_target_settings()
@@ -1150,7 +1150,7 @@ project "fuzz_proxy_tunnel"
         "test/fuzz/fuzz_proxy_tunnel.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/runtime/proxy/http_response_framing.h"
+        "socketley/shared/http_framing.h"
     }
 
     fuzz_target_settings()

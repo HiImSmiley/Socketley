@@ -2819,7 +2819,7 @@ void proxy_instance::rearm_accept()
 
 // header_name_equals and http_eol_framing_ok used to live here.  Both are read
 // by the response side as well as the request side, and the response side now
-// lives in runtime/proxy/http_response_framing.h so that a fuzz target can call
+// lives in shared/http_framing.h so that a fuzz target can call
 // it — so they moved there too rather than being declared in two places.
 
 // Walk one Transfer-Encoding field value left to right, carrying `chunked_seen`
@@ -2873,7 +2873,7 @@ static bool te_line_codings_ok(std::string_view hdr_line, bool& chunked_seen)
     }
 }
 
-// backend_response_complete() moved to http_response_framing.h as
+// backend_response_complete() moved to http_framing.h as
 // http_response_frame_complete(), alongside the scan that produces the state it
 // reads.  Both pooling paths still ask exactly one predicate; it is simply one
 // a test can call.
@@ -4222,7 +4222,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // chunk the client is allowed to see.  Those were one question all along and
     // only one of them was being asked.
     //
-    // The scan itself is in runtime/proxy/http_response_framing.h.  It used to
+    // The scan itself is in shared/http_framing.h.  It used to
     // be a hundred and twenty lines here, in the middle of a completion
     // handler, which meant nothing short of a running daemon could call it and
     // it was the last parser in the tree with no fuzz target.  It is the same

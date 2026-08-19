@@ -31,7 +31,7 @@
 //
 // The decision used to be the body of run()'s io_uring_for_each_cqe, and a
 // block of code inside a loop is not a symbol — the same wall
-// runtime/proxy/http_response_framing.h was lifted over, and lifted the same
+// shared/http_framing.h was lifted over, and lifted the same
 // way: it is now event_loop::dispatch_cqe(), one completion in, one "keep going
 // or stop" out.  Nothing else about the loop changed.  See the note above it in
 // event_loop.cpp.

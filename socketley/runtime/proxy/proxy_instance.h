@@ -18,7 +18,7 @@
 #include "../../shared/tls_context.h"
 #include "../../shared/trace.h"
 #include "../../shared/invariants.h"
-#include "http_response_framing.h"
+#include "../../shared/http_framing.h"
 
 class runtime_manager;
 
@@ -376,7 +376,7 @@ struct alignas(64) proxy_backend_connection
     int pipe_to_client[2]{-1, -1};
 
     // HTTP response tracking for connection pooling.  The whole of it lives in
-    // http_response_framing.h now — the scan, the completeness predicate and
+    // http_framing.h now — the scan, the completeness predicate and
     // the state below — so that it can be reached without a daemon, a socket or
     // an event loop.  test/fuzz/fuzz_http_response.cpp drives exactly this
     // struct through exactly the function handle_backend_read calls.

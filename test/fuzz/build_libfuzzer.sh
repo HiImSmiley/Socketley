@@ -133,7 +133,7 @@ want fuzz_cache_ops && build fuzz_cache_ops \
 
 # fuzz_http_response is as cheap as the two parser targets even though it fuzzes
 # the proxy: the response framing was lifted out of handle_backend_read into
-# runtime/proxy/http_response_framing.h, which includes <charconv> and
+# shared/http_framing.h, which includes <charconv> and
 # <string_view> and nothing else.  One translation unit, no libraries, no SDK —
 # which is why this one is in the per-push job and fuzz_http_request is not.
 want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_response.cpp"

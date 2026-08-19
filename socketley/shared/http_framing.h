@@ -20,6 +20,20 @@
 // this header alone rather than against the fifteen translation units of the
 // SDK — which is why that target can run in the per-push CI job.
 //
+// ─── AND WHY IT IS IN shared/ ───────────────────────────────────────────────
+//
+// It lived in runtime/proxy/ until this move, and the server included it as
+// "../proxy/http_response_framing.h" — five lines above the comment in
+// server_instance.cpp explaining why that file deliberately does *not* include
+// cache_instance.h.  One runtime reaching into another's directory for a helper
+// is the shape that comment exists to prevent, and the helper was never
+// proxy-specific: header-line splitting, OWS trimming, comma-list token
+// matching and "is this a whole decimal" are the same questions for anything
+// that speaks HTTP.
+//
+// Nothing about the decision changed in the move.  What changed is that a
+// second runtime can now reach it without reaching *through* a first one.
+
 // ─── WHAT THE DECISION IS FOR ───────────────────────────────────────────────
 //
 // Every byte of the response is forwarded to the client either way; nothing

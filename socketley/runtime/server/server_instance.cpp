@@ -1,10 +1,15 @@
 #include "server_instance.h"
 #include "../../shared/conn_reachability.h"
 
-// http_whole_decimal: the checked Content-Length parser the proxy already
-// uses.  Shared rather than copied — a second implementation of "is this a
-// whole decimal" is a second place for the answer to differ.
-#include "../proxy/http_response_framing.h"
+// The HTTP header-line helpers: http_whole_decimal, http_trim_ows,
+// http_list_has_token.  Shared rather than copied — a second implementation of
+// "is this a whole decimal" is a second place for the answer to differ.
+//
+// This was "../proxy/http_response_framing.h" until the header moved to
+// shared/, which is to say this runtime reached into another runtime's
+// directory for it — the exact thing the note on cache_instance.h below exists
+// to prevent, eight lines apart and going unremarked.
+#include "../../shared/http_framing.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"

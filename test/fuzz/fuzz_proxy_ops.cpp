@@ -233,7 +233,7 @@
 #include "shared/tls_context.h"
 #include "shared/trace.h"
 #include "shared/write_queue.h"
-#include "runtime/proxy/http_response_framing.h"
+#include "shared/http_framing.h"
 
 // Reaching inside the class, for the same reason and by the same means as
 // fuzz_server_ops and fuzz_cache_ops: the invariants are about m_backend_pool,

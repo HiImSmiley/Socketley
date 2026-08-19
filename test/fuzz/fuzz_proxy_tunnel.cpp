@@ -1,5 +1,5 @@
 // Fuzz target: the tunnel half of proxy response framing
-// (socketley/runtime/proxy/http_response_framing.h).
+// (socketley/shared/http_framing.h).
 //
 // The relay is the one proxy path that had no fuzzer, and it is the path where
 // a framing mistake is least likely to announce itself.  A tunnel that gets its
@@ -96,7 +96,7 @@
 // tunnel disarms.
 
 #include "fuzz_common.h"
-#include "runtime/proxy/http_response_framing.h"
+#include "shared/http_framing.h"
 
 #include <string>
 #include <vector>
