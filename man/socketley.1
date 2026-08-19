@@ -5121,6 +5121,12 @@ does not do this. It is a hop-by-hop field about the client's own
 connection to the proxy, so it is not forwarded upstream and it does not
 end the backend connection: the proxy answers the request, returns the
 backend socket to the pool, and closes the client connection as asked.
+The field is a comma-separated list and is parsed token\-wise and
+case\-insensitively, as it is on the server, so
+.B "Connection: keep\-alive, close"
+counts as close while a value that merely begins with those letters \(em
+.B "Connection: clientinfo"
+\(em does not.
 A client that opens a connection per request \(em curl, a health checker,
 any HTTP library used without a session \(em therefore costs one accept
 and no backend connect, the same as a keep-alive client.
