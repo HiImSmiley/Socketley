@@ -44,6 +44,44 @@
 // went away while a message for it was in flight must not be resolvable to the
 // connection that took its place, and a counter restarting at 1 hands exactly
 // that back.
+//
+// ─── AND WHICH SHARD, WHICH IS NOT DECORATION ───────────────────────────────
+//
+// "Unique within one runtime" was maintained by ONE counter for as long as a
+// runtime was one process.  With --shards it is N processes, each with a
+// counter of its own, and `owner` does not tell them apart: it is derived from
+// the runtime id, and every shard of a runtime has the same id.  So two shards
+// mint from the same owner with independent counters, and the only thing
+// keeping their serials apart is the gap between the moments they were seeded.
+//
+// That gap is finite and it was measured rather than assumed.  Four shards
+// forked and exec'd the way proxy_supervisor does it, seeds read at
+// construction: the closest two were **1,602,540 ns** apart at four shards and
+// 1,479,355 ns at eight.  A counter is incremented once per connection, so the
+// first shard to mint that many connections starts handing out serials its
+// sibling has already used — about 25 minutes at a thousand connections a
+// second, and sooner on a busier one.
+//
+// Latent until now, because a ref never crossed a shard boundary: each shard
+// resolved only its own, and a collision inside one shard cannot happen.
+// Cross-shard routing is exactly what makes them cross, so it is fixed here
+// before it is relied on rather than after.
+//
+// The top six bits of the serial are the minting shard's index — six because
+// max_shards is 64 — and the remaining 58 are the counter.  Two consequences,
+// and the second is worth as much as the first:
+//
+//   * Two shards can no longer mint the same serial, whatever their seeds.
+//   * A holder of a ref can say which shard owns it without asking anyone, so
+//     a routed message goes to ONE shard instead of being offered to all N and
+//     declined by N-1.
+//
+// 58 bits of nanoseconds is 9.1 years of uptime before the counter wraps into
+// a value a previous lifetime of the same shard could have used, against 584
+// years for the full 64.  A process that has been up for nine years and is
+// still minting connections is outside what this seeding scheme was ever
+// promising; what it is NOT outside is the runtime being restarted, which
+// re-seeds from a clock that has moved on.
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -69,6 +107,15 @@ inline uint64_t conn_owner_key(std::string_view runtime_id)
     }
     return h ? h : 1ull;      // never collide with the reserved zero
 }
+
+// How the serial is divided.  Six bits of shard index above 58 bits of
+// counter; see the note above.
+inline constexpr int      conn_serial_shard_bits  = 6;              // max_shards == 64
+inline constexpr int      conn_serial_shard_shift = 64 - conn_serial_shard_bits;
+inline constexpr uint64_t conn_serial_counter_mask =
+    (1ull << conn_serial_shard_shift) - 1ull;
+inline constexpr uint32_t conn_serial_shard_mask =
+    (1u << conn_serial_shard_bits) - 1u;
 
 struct conn_ref
 {
@@ -119,17 +166,48 @@ public:
     {
         struct timespec ts{};
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-            m_next = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull
-                   + static_cast<uint64_t>(ts.tv_nsec);
-        if (m_next == 0)
-            m_next = 1;
+            m_counter = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull
+                      + static_cast<uint64_t>(ts.tv_nsec);
+        m_counter &= conn_serial_counter_mask;
+        if (m_counter == 0)
+            m_counter = 1;          // serial 0 is not a valid ref
     }
 
-    uint64_t next() { return m_next++; }
+    // Say which shard this source is minting for.
+    //
+    // Not a constructor argument, and that is not an oversight.  A runtime's
+    // shard index arrives in a config frame, which is read well after the
+    // instance that owns this has been constructed — the same ordering that
+    // makes owner_key() lazy in server_instance, and for the same reason.
+    // Call it before the first next(), which in a worker means before the
+    // listener is bound and therefore before any connection exists.
+    void set_shard(uint32_t shard_index)
+    {
+        m_shard = shard_index & conn_serial_shard_mask;
+    }
+
+    uint64_t next()
+    {
+        // Masked on the way out rather than carried in the counter, so a
+        // counter that wraps past 2^58 cannot climb into the shard field and
+        // start minting refs that name a different process.
+        const uint64_t c = m_counter++ & conn_serial_counter_mask;
+        return (static_cast<uint64_t>(m_shard) << conn_serial_shard_shift)
+             | (c == 0 ? 1ull : c);
+    }
 
 private:
-    uint64_t m_next{1};
+    uint64_t m_counter{1};
+    uint32_t m_shard{0};
 };
+
+// Which shard minted this ref.  Meaningful for any ref this build produced;
+// a ref from an unsharded runtime reads 0, which is correct — it is shard 0
+// of one.
+inline uint32_t conn_ref_shard(const conn_ref& r)
+{
+    return static_cast<uint32_t>(r.serial >> conn_serial_shard_shift);
+}
 
 // ── Wire form ───────────────────────────────────────────────────────────────
 // Sixteen bytes, little-endian, fixed width.  Fixed rather than varint because

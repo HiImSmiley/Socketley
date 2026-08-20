@@ -1043,6 +1043,11 @@ private:
     // be holding from a previous lifetime.
     conn_serial_source m_serials;
 
+    // Whether m_serials has been told which shard it mints for; see
+    // next_serial().  Not a value comparison, because shard 0 is a real shard.
+    bool     m_serials_shard_set{false};
+    uint64_t next_serial();
+
     // conn_owner_key(get_id()), computed once.  get_id() is set after
     // construction, so this is filled lazily on first use rather than in the
     // constructor — a ref minted before the daemon has assigned an id would

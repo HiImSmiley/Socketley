@@ -106,10 +106,41 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
     // and not one that appears when somebody first asks: `routed` can be set
     // and cleared several times, and a name that came and went with it would
     // let two spells of routing share a name.
-    conn->ref_serial = m_serials.next();
+    conn->ref_serial = next_serial();
     if (fd >= 0)
         m_conn_by_serial[conn->ref_serial] = fd;
     return conn;
+}
+
+// The shard field in a conn_ref serial has to be wide enough for every shard a
+// build allows.  conn_identity.h cannot check this itself — it does not include
+// runtime_definitions.h, deliberately, because it is included by things that
+// have no notion of a runtime — so the check lives here, where both are already
+// in scope.  Raising max_shards past 64 fails this rather than silently minting
+// refs whose shard index has been truncated into a sibling's.
+static_assert(max_shards <= (1u << conn_serial_shard_bits),
+              "conn_ref's serial cannot name every shard --shards allows");
+
+// Mints a serial, having first told the source which shard it is minting for.
+//
+// Lazy for exactly the reason owner_key() below is lazy, and the two are
+// deliberately adjacent: both need a value the daemon supplies after this
+// object is constructed.  The shard index arrives in the config frame, and the
+// first connection cannot be accepted before that frame has been read — the
+// listener is bound from it — so "before the first mint" and "after the config"
+// are never in the wrong order.
+//
+// One flag rather than comparing the index to zero: shard 0 is a real shard,
+// and a source rebased every time it minted for shard 0 would work but would
+// invite somebody to write the comparison the other way round.
+uint64_t server_instance::next_serial()
+{
+    if (!m_serials_shard_set)
+    {
+        m_serials.set_shard(get_shard_index());
+        m_serials_shard_set = true;
+    }
+    return m_serials.next();
 }
 
 uint64_t server_instance::owner_key() const

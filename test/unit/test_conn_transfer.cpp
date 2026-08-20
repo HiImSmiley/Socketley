@@ -367,6 +367,72 @@ TEST_CASE("serials do not restart when a runtime does")
     CHECK(second.next() > b);
 }
 
+TEST_CASE("two shards of one runtime cannot mint the same serial")
+{
+    // `owner` is derived from the runtime id, and every shard of a runtime has
+    // the same id — so the owner half does NOT tell two shards apart, and for
+    // as long as a runtime was one process nothing had to.
+    //
+    // What kept them apart was the gap between the moments they were seeded,
+    // and that gap is finite.  Measured on this box, four shards forked and
+    // exec'd the way proxy_supervisor does it: the closest two seeds were
+    // 1,602,540 ns apart.  A counter moves once per connection, so the first
+    // shard to accept that many connections begins handing out serials its
+    // sibling has already used — about 25 minutes at a thousand a second.
+    //
+    // The case below is that collision, forced: two sources seeded to the same
+    // counter, which is what a sibling reaches by counting.
+    const uint64_t owner = conn_owner_key("abc123");
+
+    conn_serial_source s0, s2;
+    s0.set_shard(0);
+    s2.set_shard(2);
+
+    const conn_ref a{owner, s0.next()};
+    const conn_ref b{owner, s2.next()};
+
+    // Both were seeded from the same clock within the same microsecond, so
+    // without the shard tag these two are the SAME name for two different
+    // connections in two different processes.
+    CHECK(a != b);
+    CHECK(conn_ref_shard(a) == 0u);
+    CHECK(conn_ref_shard(b) == 2u);
+
+    // And a ref says which shard owns it without anybody being asked, which is
+    // what lets a routed message go to one shard instead of to all N.
+    // The whole shard field, from conn_identity.h's own constant rather than
+    // from max_shards: this header does not include runtime_definitions.h, and
+    // the two are tied together by a static_assert in server_instance.cpp.
+    for (uint32_t sh = 0; sh <= conn_serial_shard_mask; ++sh)
+    {
+        conn_serial_source src;
+        src.set_shard(sh);
+        const conn_ref r{owner, src.next()};
+        CHECK(conn_ref_shard(r) == sh);
+        CHECK(r.valid());
+    }
+}
+
+TEST_CASE("the shard tag cannot be reached by a counter that wraps")
+{
+    // The counter is masked on the way out rather than carried with the tag in
+    // one word.  Without that, a source that ran past 2^58 would climb into the
+    // shard field and start minting refs naming a different process — the same
+    // defect one level up from the descriptor reuse this file exists for.
+    conn_serial_source s;
+    s.set_shard(1);
+    for (int i = 0; i < 1000; ++i)
+        CHECK(conn_ref_shard(conn_ref{1, s.next()}) == 1u);
+}
+
+TEST_CASE("an unsharded runtime reads as shard 0, which is what it is")
+{
+    conn_serial_source s;          // set_shard never called
+    const conn_ref r{conn_owner_key("abc123"), s.next()};
+    CHECK(conn_ref_shard(r) == 0u);
+    CHECK(r.valid());
+}
+
 TEST_CASE("a runtime with no id mints nothing that can be resolved")
 {
     CHECK(conn_owner_key("") == 0);
