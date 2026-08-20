@@ -110,8 +110,8 @@ export SOCKETLEY_SOCKET="$SUITE_HOME/suite.sock"
 #
 # The environment check cannot hit this script or the test shells, because they
 # do not satisfy the exe test — which is the trap the -f form fell into.
-sweep_own_daemons() {
-    local d p
+own_daemon_pids() {
+    local d p out=""
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
         [ "/proc/$p/exe" -ef "$SYS_BIN" ] || continue
@@ -131,8 +131,20 @@ sweep_own_daemons() {
         # same warning for the same reason.
         { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
             | grep -x "SL_PORT_BASE=$SL_PORT_BASE" >/dev/null || continue
+        out="$out $p"
+    done
+    printf '%s' "${out# }"
+}
+
+# Split out from the sweep so the same two facts can be used to ASK the
+# question as well as to act on it -- see the per-file leak check in the
+# integration loop, which needs the pids rather than their absence.
+sweep_own_daemons() {
+    local p
+    for p in $(own_daemon_pids); do
         kill -9 "$p" 2>/dev/null || true
     done
+    return 0
 }
 
 # A suite that leaves daemons behind poisons the next thing anyone measures,
@@ -381,11 +393,73 @@ sleep 0.2
 
 export BIN="$SYS_BIN"
 
+# ─── Which file left a daemon behind ────────────────────────────────────────
+#
+# The sweep at the top and the one in the EXIT trap keep the MACHINE clean, and
+# between them they have hidden this for as long as they have existed: a test
+# that leaks its daemon is invisible, because the backstop tidies up after it
+# without saying so, and the damage lands on whatever runs next.
+#
+# It is a real generator, not a hypothetical.  Measured on 2026-08-20 in
+# test_cache_publish_subscriber_reachable.sh: `OUT=$(run_arm ...)` runs the
+# function in a SUBSHELL, so the SOCKETLEY_DPID that daemon_start exports there
+# never reaches the trap in the parent shell, and the file's own cleanup finds
+# nothing to stop.  Four processes survived each invocation -- two daemons and
+# two workers -- holding their ports.  What that looks like several runs later
+# is `FATAL: no free 2000-port window` from lib_ports.sh, attributed to
+# whichever file was unlucky enough to be next.
+#
+# So the question is asked after every file, and the answer is attributed to the
+# file that produced it.  The check costs one /proc walk per file, the same walk
+# the sweep already does; only a file that leaks pays the extra second.
+#
+# Printed rather than counted as a failure, for the reason lib_daemon.sh gives
+# where it prints invariant violations: a library check that can turn 151 files
+# red is a check somebody switches off.  The summary at the end names the files,
+# which is the number that was missing -- the leak itself was always visible in
+# `ss`, and never attributable.
+LEAKED_FILES=""
+check_leaked_daemons() {
+    local name=$1 pids i
+    pids=$(own_daemon_pids)
+    [ -n "$pids" ] || return 0
+    # A daemon on its way out is not a leak.  daemon_stop sends SIGTERM and
+    # waits, but the file's own trap can return before the kernel has reaped
+    # the process, and a check with no grace would report every well-behaved
+    # test as a leaking one.  Only a file that already looks like it leaked
+    # pays this second.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.1
+        pids=$(own_daemon_pids)
+        [ -n "$pids" ] || return 0
+    done
+    echo "WARNING: $name left this run's daemons running: $pids"
+    echo "         They hold the ports of window $SL_PORT_BASE, and every file"
+    echo "         after this one runs beside them.  Killed here so the rest of"
+    echo "         this run is not measuring them."
+    LEAKED_FILES="$LEAKED_FILES $name"
+    sweep_own_daemons
+    echo ""
+    return 0
+}
+
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
     name=$(basename "$script" .sh)
     run_test "$name" bash "$script"
+    check_leaked_daemons "$name"
 done
+
+if [ -n "$LEAKED_FILES" ]; then
+    echo "─── files that left a daemon running ──────────────────────────────"
+    for f in $LEAKED_FILES; do echo "    $f"; done
+    echo "    Each of these ran its cleanup and its daemon survived it.  The"
+    echo "    usual cause is a variable the trap needs being assigned inside a"
+    echo "    command substitution or another subshell, where it dies with the"
+    echo "    subshell -- see the comment at the top of run_arm() in"
+    echo "    integration/test_cache_publish_subscriber_reachable.sh."
+    echo ""
+fi
 
 # Did anything drive the run-level socket?
 #
