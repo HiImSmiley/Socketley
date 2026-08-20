@@ -1100,6 +1100,9 @@ lua_config() {
 
     echo -e "${BOLD}Runtime Methods:${NC}"
     echo "  self.connections()          - Current connection count (ALL FOUR types)"
+    echo "                                With --shards this is the whole runtime's"
+    echo "                                count, summed across its worker processes,"
+    echo "                                not the count of the shard you are in."
     echo "  self.send(msg)              - Send message (client)"
     echo "  self.send(id, msg)          - Send to specific client (server)"
     echo "  self.broadcast(msg)         - Broadcast (server)"

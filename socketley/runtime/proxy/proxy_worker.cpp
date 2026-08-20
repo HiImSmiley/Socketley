@@ -41,6 +41,15 @@ namespace
 // The number itself is in worker_protocol.h now, because the daemon needs it
 // too: these frames are where the connection counts in the runtime map come
 // from, and the daemon coalesces its map pushes to the same period.
+// The shared shard table, at the number proxy_supervisor::spawn dup2'd it onto.
+// Named twice on purpose — the daemon's constant is in proxy_supervisor.cpp and
+// this is the worker's — because the two sides are different processes and the
+// number is the whole of the contract between them; a header shared for one
+// integer would hide that.  If these ever disagree, the worker finds no
+// descriptor and reports that it will answer only for itself, which is the
+// loudest a mismatch here can be made without inventing a handshake.
+constexpr int worker_shard_fd = 4;
+
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
@@ -596,6 +605,35 @@ public:
                     stats_cur = std::min(stats_cur * 2, stats_backoff_max);
                 last_stats = now;
             }
+
+            // ── This shard's line, once per turn ────────────────────────────
+            //
+            // The END of the turn and not the top of it, because that is what
+            // makes this one site instead of several: every drain this turn
+            // performs is above this line — the main one, the one after
+            // pump_control, and the one inside the stats block — so whatever
+            // any of them accepted or reaped is counted before the loop comes
+            // round again.
+            //
+            // Once per turn rather than at every place a connection count
+            // moves.  A count changes in accept and in teardown, and those are
+            // 34 call sites across four runtimes with nothing in common but
+            // the loop that dispatched them; putting the publish where every
+            // path already passes is the rule this tree states about the
+            // half-close hold, applied before rather than after the fourth fix.
+            //
+            // NOT on the 250 ms stats timer, which is the other thing already
+            // here and is the wrong clock: a script that is told a client
+            // connected and asks how many there are would be answered from a
+            // sibling's quarter-second-old figure.  A turn is microseconds.
+            //
+            // Costs one virtual call and one release store for a sharded
+            // runtime, and one predictable branch for every runtime that is
+            // not — mapped() is false for all of them, and the whole tree
+            // before this change is all of them.
+            if (m_rt && m_rt->shard_stats_table().mapped())
+                m_rt->shard_stats_table().publish_active(
+                    static_cast<uint64_t>(m_rt->get_connection_count()));
         }
 
         // ─── Past this line the guarantee has already done its job ──────────
@@ -900,6 +938,27 @@ private:
         // it did call succeeded.  See runtime_config_apply.h.
         apply_common_config(*m_rt, cfg);
         apply_typed_config(*m_rt, cfg);
+
+        // ── This shard's line in the table its siblings share ───────────────
+        //
+        // Before the script is loaded, which is the constraint that decides
+        // where this goes: a script's top level runs inside load_lua_script()
+        // below and may call self.connections(), and a runtime that is not
+        // attached yet answers that with its own count — a fraction, silently,
+        // exactly the defect this exists to remove.
+        //
+        // The descriptor is at a fixed number the supervisor dup2'd it onto, or
+        // it is not there at all.  Absent is the ordinary case and not an
+        // error: it is every unsharded runtime, and every worker forked by a
+        // daemon that could not make a region.  fcntl is the cheapest way to
+        // ask whether a descriptor exists without disturbing it.
+        if (cfg.shards > 1 && ::fcntl(worker_shard_fd, F_GETFD, 0) >= 0)
+        {
+            if (!m_rt->shard_stats_table().adopt(worker_shard_fd,
+                                                 m_rt->get_shard_index()))
+                LOG_WARN("proxy worker: the shared shard table could not be "
+                         "mapped; this shard will answer only for itself");
+        }
 
         // ── the channel, both directions ────────────────────────────────────
         //

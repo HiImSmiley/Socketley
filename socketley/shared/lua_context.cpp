@@ -3557,8 +3557,23 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                           + " on " + q(m_owner_name)
                           + " — it may have closed, or it may never have been one");
     };
+    // ─── ONE RUNTIME'S CONNECTIONS, NOT ONE PROCESS'S ───────────────────────
+    //
+    // shard_connection_count() rather than get_connection_count(), and the
+    // difference is only visible with --shards: N processes share one listening
+    // socket, so a script asking how many clients its runtime has was answered
+    // with how many THIS process had -- 10 for a four-shard runtime holding 40,
+    // with nothing anywhere saying so.
+    //
+    // Unsharded it is get_connection_count() and costs exactly what it did, so
+    // all four of these bindings are written the same way rather than only the
+    // ones --shards can reach today.  A client cannot be sharded and is refused
+    // outright; writing its binding differently would leave the next reader to
+    // work out which of four identical-looking calls was the deliberate one.
+    //
+    // See runtime_instance::shard_connection_count and shard_stats.h.
     self["connections"] = [owner]() -> size_t {
-        return owner->get_connection_count();
+        return static_cast<size_t>(owner->shard_connection_count());
     };
     self["protocol"] = owner->is_udp() ? "udp" : "tcp";
 
@@ -3815,8 +3830,10 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
         return api_why(L, q(m_owner_name) + " is not connected to its server, "
                           "or was created --mode in and does not send");
     };
+    // One runtime's connections and not one process's; see the note on the
+    // server's copy of this binding, in register_server_table above.
     self["connections"] = [owner]() -> size_t {
-        return owner->get_connection_count();
+        return static_cast<size_t>(owner->shard_connection_count());
     };
     self["protocol"] = owner->is_udp() ? "udp" : "tcp";
 }
@@ -3895,8 +3912,10 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
         return owner->lua_cache_publish(channel, message);
     };
 
+    // One runtime's connections and not one process's; see the note on the
+    // server's copy of this binding, in register_server_table above.
     self["connections"] = [owner]() -> size_t {
-        return owner->get_connection_count();
+        return static_cast<size_t>(owner->shard_connection_count());
     };
 }
 
@@ -3904,8 +3923,10 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
 {
     auto* proxy = static_cast<proxy_instance*>(owner);
 
+    // One runtime's connections and not one process's; see the note on the
+    // server's copy of this binding, in register_server_table above.
     self["connections"] = [owner]() -> size_t {
-        return owner->get_connection_count();
+        return static_cast<size_t>(owner->shard_connection_count());
     };
     self["protocol"] = proxy->get_protocol() == protocol_http ? "http" : "tcp";
     self["peer_ip"] = [proxy](int client_id) -> std::string {

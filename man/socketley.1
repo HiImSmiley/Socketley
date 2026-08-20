@@ -4178,7 +4178,9 @@ self.name      -- Runtime name (read-only)
 self.port      -- Port number (read-only)
 self.state     -- Current state (read-only)
 self.type      -- Runtime type (read-only)
-self.connections()         -- Current connection count (all four types)
+self.connections()         -- Current connection count (all four types).
+                              With --shards, the whole runtime's count summed
+                              across its worker processes, not the shard's own
 
 self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
                -- (not set on a cache)

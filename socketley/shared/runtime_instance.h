@@ -19,6 +19,7 @@
 #include "liburing_version.h"   // must precede <liburing.h>; see that file
 #include <liburing.h>
 #include "runtime_definitions.h"
+#include "shard_stats.h"
 #include "event_loop_definitions.h"
 
 class event_loop;
@@ -435,6 +436,53 @@ public:
     void     set_shards(uint32_t n);
     uint32_t get_shards() const;
 
+    // ── Which of those processes THIS one is ────────────────────────────────
+    //
+    // 0..get_shards()-1, and 0 for every runtime that is not sharded — which is
+    // the same answer a one-shard runtime gives, correctly: it is shard 0 of 1.
+    //
+    // The daemon's placeholder is not any shard and reads 0 too.  Nothing in
+    // the daemon may use this to mean "the first shard"; the daemon addresses
+    // shards through m_proxy_workers, where the position in the vector IS the
+    // index and is the thing that was sent.
+    //
+    // Set from the config frame in a worker and from nowhere else.  There is no
+    // flag for it and there must not be: an operator naming a shard index would
+    // be naming one of N processes the kernel deliberately makes
+    // indistinguishable.
+    void     set_shard_index(uint32_t i);
+    uint32_t get_shard_index() const;
+
+    // ── What every shard of this runtime is publishing about itself ─────────
+    //
+    // Mapped in a worker whose daemon handed it a region — see shard_stats.h —
+    // and unmapped everywhere else, which is every unsharded runtime and every
+    // runtime in the daemon.  `mapped()` false is the ordinary case and every
+    // reader below is written for it.
+    shard_stats::shard_table& shard_stats_table() { return m_shard_stats; }
+
+    // How many connections THIS RUNTIME has, counting the ones its sibling
+    // shards are holding.
+    //
+    // This is what a script means by `self.connections()`.  Unsharded, or in
+    // the daemon, it is exactly get_connection_count() and costs the same.
+    // Sharded, it is this shard's own count published into its slot and then a
+    // sum over N slots — N loads out of shared memory, no round trip, and no
+    // way for a shard that has stopped running to delay it.
+    //
+    // Publishing our own count first rather than trusting the last periodic
+    // publish is what makes the commonest case right: a script that has just
+    // been told a client connected asks how many there are, and the answer has
+    // to include that client.
+    uint64_t shard_connection_count()
+    {
+        const uint64_t mine = static_cast<uint64_t>(get_connection_count());
+        if (!m_shard_stats.mapped())
+            return mine;
+        m_shard_stats.publish_active(mine);
+        return m_shard_stats.sum_active();
+    }
+
     // ── Ring policy ─────────────────────────────────────────────────────────
     // What this runtime's I/O was asked to run as: which CPUs, and whether its
     // ring carries a submission poller.
@@ -766,6 +814,12 @@ private:
     // One, and not zero, so that every reader can multiply or loop by it
     // without first asking whether it was ever set.  See set_shards().
     uint32_t m_shards = 1;
+
+    // 0 unless a config frame said otherwise; see set_shard_index().
+    uint32_t m_shard_index = 0;
+
+    // Empty unless this process is one shard of several; see shard_stats.h.
+    shard_stats::shard_table m_shard_stats;
 
     std::shared_ptr<const route_table> m_worker_routes;
 

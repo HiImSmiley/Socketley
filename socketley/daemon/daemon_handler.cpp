@@ -4944,6 +4944,11 @@ void daemon_handler::reconcile_proxy_workers()
         {
             for (auto& sup : it->second)
                 retire_one(std::move(sup));
+            // The region goes with the last shard.  Nothing may read it after
+            // this — every process that had it mapped is being torn down — and
+            // keeping it would hand a restarted runtime a table still holding
+            // the counts of the shards it replaced.
+            m_shard_regions.erase(it->first);
             it = m_proxy_workers.erase(it);
             continue;
         }
@@ -4961,6 +4966,16 @@ void daemon_handler::reconcile_proxy_workers()
             retire_one(std::move(it->second.back()));
             it->second.pop_back();
         }
+
+        // The surviving shards must stop counting the ones that just went.  A
+        // retired shard publishes nothing on its way out — that is the whole
+        // point of retiring it — so its last figure would sit in the table
+        // being summed forever, and `self.connections()` would report a runtime
+        // holding connections that no process has.  Told here, by the one side
+        // that knows a shard has gone.
+        if (const auto r = m_shard_regions.find(it->first); r != m_shard_regions.end())
+            r->second.set_shard_count(static_cast<uint32_t>(w->second));
+
         ++it;
     }
 
@@ -4996,9 +5011,50 @@ void daemon_handler::reconcile_proxy_workers()
         // publishing it once for N children beats publishing it N times.
         std::vector<proxy_supervisor*> forked;
 
+        // ── The shared table this runtime's shards publish into ─────────────
+        //
+        // Made before the first fork and kept for the life of the runtime; see
+        // m_shard_regions.  A runtime that is not sharded gets none and every
+        // reader below is written for that: shard_fd stays -1, the supervisor
+        // passes nothing across the exec, and the worker finds no descriptor and
+        // does not map anything.
+        //
+        // A region that cannot be made is not fatal.  memfd_create is old
+        // enough to be everywhere this daemon runs, but the failure mode if it
+        // is not is the behaviour this tree had yesterday — each shard answers
+        // for itself — and taking the runtime down instead would turn a missing
+        // optimisation into an outage.  It is logged once, here, so the reason
+        // `self.connections()` is answering per-shard is written down somewhere.
+        int shard_fd = -1;
+        if (want_count > 1)
+        {
+            auto& region = m_shard_regions[name];
+            if (!region.mapped())
+            {
+                if (!region.create(static_cast<uint32_t>(want_count)))
+                    LOG_WARN(("could not create the shared shard table for "
+                              + name
+                              + "; each shard will answer only for itself").c_str());
+            }
+            else
+            {
+                // Growing: the shards that already exist keep their slots and
+                // their published figures, and the new ones get slots that were
+                // out of range a moment ago.
+                region.set_shard_count(static_cast<uint32_t>(want_count));
+            }
+            shard_fd = region.fd();
+        }
+
         while (shards.size() < want_count)
         {
         auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
+
+        // Which of N this child is, and where it publishes.  The position in
+        // this vector IS the index — reconcile only ever appends here and only
+        // ever retires from the back, exactly so that a shard's index does not
+        // move underneath a reader — so no counter has to be kept beside it.
+        sup->set_shard(static_cast<uint32_t>(shards.size()), shard_fd);
 
         // The supervisor answers for the runtime it supervises.  Set before the
         // spawn so that a request arriving in the same turn as the start has
@@ -5119,7 +5175,13 @@ void daemon_handler::reconcile_proxy_workers()
         // empty vector: `m_proxy_workers.find(name)` succeeding with nothing in
         // it would answer "this runtime has workers" to every site that asks.
         if (shards.empty())
+        {
             m_proxy_workers.erase(name);
+            // And the region goes with them, for the same reason: a table with
+            // no process publishing into it is not a smaller table, it is one
+            // whose every reader has gone.
+            m_shard_regions.erase(name);
+        }
     }
 }
 

@@ -224,6 +224,26 @@ private:
     using worker_shards = std::vector<std::unique_ptr<proxy_supervisor>>;
     std::unordered_map<std::string, worker_shards> m_proxy_workers;
 
+    // ── The shared table each runtime's shards publish into ─────────────────
+    //
+    // One region per SHARDED runtime, keyed the same way as the shards above
+    // and created beside them.  See shard_stats.h for what is in it and why it
+    // is a memfd; what belongs here is why the DAEMON holds it when the daemon
+    // never reads a figure out of it.
+    //
+    // Because it has to outlive any one shard.  A shard that dies is replaced,
+    // and the replacement has to map the same region as its siblings — so the
+    // descriptor cannot belong to the supervisor that hands it over, or a
+    // restart would hand out a fresh region and the runtime would split into
+    // two aggregations that each answer for half of itself.  The daemon is the
+    // only object here whose lifetime covers the runtime rather than one of its
+    // processes.
+    //
+    // Absent for every unsharded runtime, which is the ordinary case: nothing
+    // is mapped, nothing is created, and the shards path costs a lookup that
+    // misses.
+    std::unordered_map<std::string, shard_stats::shard_table> m_shard_regions;
+
     // What every shard of one runtime last reported, added up and written into
     // the placeholder that stands for it.
     //

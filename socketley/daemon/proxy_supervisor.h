@@ -226,6 +226,29 @@ public:
     proxy_supervisor(const proxy_supervisor&)            = delete;
     proxy_supervisor& operator=(const proxy_supervisor&) = delete;
 
+    // ── Which shard this supervisor's child is, and where it publishes ──────
+    //
+    // A supervisor stands for ONE process.  With --shards there are N of them
+    // for one runtime and they are otherwise identical — same config, same
+    // port, same script — so the index is the only thing this object knows
+    // that its siblings do not, and it is what the child is told so that it can
+    // know it too.
+    //
+    // `region_fd` is the shared aggregation table, the same descriptor for
+    // every shard of one runtime; see shard_stats.h.  Not owned here — the
+    // daemon holds the region for as long as the runtime exists, which is
+    // longer than any one child — so this is a borrowed descriptor that spawn()
+    // dup2s across the exec and never closes.  -1 for an unsharded runtime,
+    // which is every runtime that never typed the flag.
+    //
+    // Set before spawn().  A restart replays the config from m_config_json, and
+    // the index is inside it, so a replacement shard comes back as the same
+    // shard and takes the same slot.
+    void set_shard(uint32_t index, int region_fd)
+    { m_shard_index = index; m_shard_region_fd = region_fd; }
+
+    uint32_t shard_index() const { return m_shard_index; }
+
     // Fork, exec, and send the config.  The placeholder is left in `running`
     // only once the child has been forked and the config written.
     bool spawn(const runtime_config& cfg);
@@ -483,6 +506,11 @@ private:
     // writes nothing anywhere on the strength of it.
     runtime_state m_worker_state{runtime_created};
     bool          m_worker_state_seen{false};
+
+    // See set_shard().  Zero and -1 mean "the only process serving this
+    // runtime", which is what every unsharded runtime is.
+    uint32_t     m_shard_index{0};
+    int          m_shard_region_fd{-1};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

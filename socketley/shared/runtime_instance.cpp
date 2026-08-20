@@ -951,6 +951,16 @@ void runtime_instance::set_shards(uint32_t n)
     m_shards = n < 1 ? 1 : (n > max_shards ? max_shards : n);
 }
 uint32_t runtime_instance::get_shards() const { return m_shards; }
+void runtime_instance::set_shard_index(uint32_t i)
+{
+    // Clamped rather than refused: this arrives in a config frame, and a frame
+    // naming a slot outside the table would otherwise be a write past the end
+    // of the shared mapping.  shard_table::adopt() refuses the same value
+    // again on its own account, which is the check that decides whether this
+    // process publishes at all.
+    m_shard_index = i < max_shards ? i : 0;
+}
+uint32_t runtime_instance::get_shard_index() const { return m_shard_index; }
 void runtime_instance::set_child_policy(child_policy p) { m_child_policy = p; }
 runtime_instance::child_policy runtime_instance::get_child_policy() const { return m_child_policy; }
 void runtime_instance::set_cpus(const cpu_set_spec& cpus) { m_cpus = cpus; m_cpus_set = true; }

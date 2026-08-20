@@ -30,6 +30,14 @@ namespace
 // child's very first action can be a read.
 constexpr int child_control_fd = 3;
 
+// The shared aggregation table, for a runtime that has one.  Four rather than
+// three for the reason three is three: a fixed number both sides agree on
+// without negotiating, immediately after the control socket, and below anything
+// the worker opens for itself.  A child of an unsharded runtime never has this
+// descriptor at all, and the worker treats its absence as "not sharded" rather
+// than as an error — see proxy_worker's on_config.
+constexpr int child_shard_fd = 4;
+
 // A child that dies immediately and repeatedly is not going to be fixed by
 // forking it again — a bad port, a backend that cannot be resolved, a Lua
 // script that throws.  After this many restarts inside the window the runtime
@@ -308,6 +316,14 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // that runtime and outranks the daemon's default, which is the order that
     // already applied when the two shared a loop.
     runtime_config effective = cfg;
+
+    // Which of N this child is.  The ONLY field that differs between the N
+    // frames one runtime's shards are sent, and the one thing SO_REUSEPORT
+    // deliberately does not tell them.  Written into the copy that becomes
+    // m_config_json, so a restart replays the same index and the replacement
+    // takes the same slot in the shared table.
+    effective.shard_index = m_shard_index;
+
     if (m_loop)
     {
         if (effective.cpus.empty() && !m_loop->cpus().all)
@@ -392,6 +408,54 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         // held at fork time.  dup2 clears FD_CLOEXEC on the copy, which is what
         // lets the control socket survive the exec.
         ::close(sv[0]);
+
+        // ─── Two fixed numbers, and the case where one is already taken ─────
+        //
+        // Both descriptors are placed by dup2, and dup2 destroys whatever was
+        // at the destination.  The control socket has always been moved to 3
+        // and there is now a second one to place at 4, so the ONE ordering
+        // hazard is a socketpair that came back holding 4 already: dup2ing the
+        // region onto it would close the control socket, and the child would
+        // exec into a process whose only link to the daemon is a memfd.
+        //
+        // Rare — the daemon holds stdio, its listener and its ring long before
+        // any worker is forked — and cheap to make impossible, which is the
+        // trade this file makes everywhere else.  Moved out of the way first,
+        // then the region, then the control socket, so no placement can undo
+        // one that has already happened.
+        if (m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
+        {
+            const int moved = ::fcntl(sv[1], F_DUPFD, 16);
+            if (moved < 0)
+                _exit(127);
+            ::close(sv[1]);
+            sv[1] = moved;
+        }
+
+        // The fifth descriptor, and only for a runtime that has shards.  The
+        // memfd is MFD_CLOEXEC in the daemon precisely so that it reaches no
+        // child by accident; dup2 clears that flag on the copy, so this is the
+        // whole of what makes it reach the ones it should.
+        //
+        // A failure here is fatal to the child rather than survivable.  The
+        // alternative is a shard that serves connections and publishes them
+        // nowhere, which is the silent wrong answer this whole mechanism exists
+        // to remove — and the supervisor's restart path is the right response.
+        if (m_shard_region_fd >= 0)
+        {
+            if (m_shard_region_fd != child_shard_fd)
+            {
+                if (::dup2(m_shard_region_fd, child_shard_fd) < 0)
+                    _exit(127);
+            }
+            else
+            {
+                const int fl = ::fcntl(m_shard_region_fd, F_GETFD, 0);
+                if (fl >= 0)
+                    if (::fcntl(m_shard_region_fd, F_SETFD, fl & ~FD_CLOEXEC) < 0) {}
+            }
+        }
+
         if (sv[1] != child_control_fd)
         {
             if (::dup2(sv[1], child_control_fd) < 0)

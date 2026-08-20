@@ -771,6 +771,13 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     // state file that differs from the one the previous build wrote for it.
     if (cfg.shards > 1)
         append_int_field("shards", static_cast<int>(cfg.shards));
+    // Above zero only, and that is not merely tidiness: read_from_instance()
+    // describes the daemon's placeholder, which is not any shard and reads 0,
+    // so a state file never gains this key.  Shard 0's own config frame does
+    // not carry it either and does not need to — absent parses as 0, which is
+    // what shard 0 is.
+    if (cfg.shard_index > 0)
+        append_int_field("shard_index", static_cast<int>(cfg.shard_index));
     if (!cfg.cpus.empty())
         append_str_field("cpus", cfg.cpus);
     // Written for both values and omitted only when nothing was asked for, so
@@ -946,6 +953,9 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     // no worker at all.
     if (const uint32_t s = json_get_uint32(json, "shards"); s > 0)
         cfg.shards = s;
+    // Absent means shard 0, which is a real answer and not a missing one.  See
+    // the note on runtime_config::shard_index.
+    cfg.shard_index = json_get_uint32(json, "shard_index");
     cfg.cpus = json_get_string(json, "cpus");
     // Read through json_get_string rather than json_get_bool: the question here
     // is whether the key is there at all, and json_get_bool answers false to

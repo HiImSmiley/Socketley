@@ -76,6 +76,21 @@ struct runtime_config
     // all as wrong.
     uint32_t shards = 1;
 
+    // WHICH of those processes this config frame is addressed to: 0..shards-1.
+    //
+    // Not a property of the runtime, unlike `shards` above — it is a property
+    // of one child, and it is the only field in this struct that differs
+    // between the N frames the daemon writes for one runtime.  A worker has no
+    // other way to learn it: the whole point of SO_REUSEPORT is that the shards
+    // are indistinguishable from the outside, and a process that cannot say
+    // which one it is has neither an aggregation slot nor an ownership claim.
+    //
+    // The daemon's own placeholder always reads 0 here, so a state file never
+    // carries it — see format_json_pretty, which writes it only above zero.  If
+    // it ever did, a restore would give every shard the same index and the
+    // region below would have N writers on one line.
+    uint32_t shard_index = 0;
+
     // Ring policy: what this runtime's --cpus / --sqpoll asked its I/O to run
     // as.  See runtime_instance.h — these are a request, not a result, and the
     // daemon refuses one its ring cannot meet.

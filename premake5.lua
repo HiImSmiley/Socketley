@@ -451,6 +451,45 @@ project "test_cache_store"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: the shared shard table ───
+
+project "test_shard_stats"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    -- Header-only, and deliberately so: the whole of shard_stats.h depends on
+    -- runtime_definitions.h for one constant, so this test links no runtime and
+    -- can fork freely.  A test that had to bring up an event loop could not.
+    files {
+        "test/unit/test_shard_stats.cpp",
+        "socketley/shared/shard_stats.h"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: RESP parser ───
 
 project "test_resp_parser"

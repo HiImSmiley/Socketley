@@ -76,6 +76,11 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     // serving one listening socket, and which of N it happens to be changes
     // nothing about what it does.
     if (cfg.shards > 1)              rt.set_shards(cfg.shards);
+    // Unconditional, unlike every other line here.  Zero is a real value — it
+    // is shard 0 — and the guarded form would leave a restarted shard 0 holding
+    // whichever index this object last had.  Nothing else writes it, so there
+    // is no default underneath for this to overwrite.
+    rt.set_shard_index(cfg.shard_index);
 
     // The ring request, recorded on the runtime so `stats` answers about what
     // was asked for and not only about what the ring happens to be.  Applying
