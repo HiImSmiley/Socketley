@@ -3364,9 +3364,14 @@ reparse:
                     return;
                 }
                 {
+                    // Same underflow guard as the proto_http arm below: an
+                    // upgrade always carries fields in practice, but "in
+                    // practice" is not what the subtraction is bounded by.
                     const size_t rl_end = hdrs.find("\r\n");
+                    const size_t up_len =
+                        (hdr_end > rl_end + 2) ? (hdr_end - rl_end - 2) : 0;
                     const http_request_framing_scan up =
-                        http_scan_request_headers(hdrs.substr(rl_end + 2, hdr_end - rl_end - 2));
+                        http_scan_request_headers(hdrs.substr(rl_end + 2, up_len));
                     if (SOCKETLEY_UNLIKELY(!up.ok))
                     {
                         refuse_http_request(conn, http_400_response());
@@ -3607,8 +3612,21 @@ reparse:
         // drops the connection with a 400, this server answers first — and that
         // difference is the runtime's own business, which is why only the
         // decision is shared.
+        // first_crlf is the first "\r\n" and hdr_end the first "\r\n\r\n", and the
+        // latter BEGINS with the former — so the two are equal for a request
+        // that carries no header fields at all.  "GET / HTTP/1.0\r\n\r\n" is
+        // eighteen legal bytes, and the subtraction then wraps to SIZE_MAX-1,
+        // string_view::substr clamps it to the terminator itself, and the scan
+        // sees an empty line and refuses a request nothing is wrong with.  The
+        // proxy has carried this guard since a fuzzer walked the same
+        // subtraction off the end of the address space; this call site is new
+        // and needed it too.  Nothing in test/integration sends a header-less
+        // request, so the suite did not catch it — test_http_request_framing.sh
+        // now does.
+        const size_t hdr_len =
+            (hdr_end > first_crlf + 2) ? (hdr_end - first_crlf - 2) : 0;
         const http_request_framing_scan framing =
-            http_scan_request_headers(full.substr(first_crlf + 2, hdr_end - first_crlf - 2));
+            http_scan_request_headers(full.substr(first_crlf + 2, hdr_len));
 
         if (SOCKETLEY_UNLIKELY(!framing.ok))
         {

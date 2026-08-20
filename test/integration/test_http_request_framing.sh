@@ -183,6 +183,14 @@ def build(case, path, spath):
     if case == "E":     # bare LF, which merges Host and Content-Length into one line
         return ("POST %s HTTP/1.1\r\nHost: x\nContent-Length: %d\r\n\r\n"
                 % (path, n)).encode() + s2
+    if case == "bare":  # a request with NO header fields at all -- legal HTTP/1.0
+        # Not a malformation: it is here because the offset arithmetic that
+        # finds the header block subtracts the request line's CRLF from the
+        # block terminator, and for this request those are the SAME position.
+        # An unguarded subtraction wraps, the clamped view is the terminator
+        # itself, and the scan refuses a request nothing is wrong with.  One
+        # answer, because there is no second request to smuggle.
+        return ("GET %s HTTP/1.0\r\n\r\n" % path).encode()
     if case == "F":     # chunked, whose chunk data is a whole request
         return (head + "Transfer-Encoding: chunked\r\n\r\n").encode() + \
                ("%x\r\n" % n).encode() + s2 + b"\r\n0\r\n\r\n"
@@ -243,6 +251,10 @@ both() {
 echo "--- well-formed: the message ends where the client said it does ---"
 both control "200=2 400=0 501=0 secret=yes"
 both B       "200=2 400=0 501=0 secret=yes"
+# The boundary case, and the reason it is in a framing test: nothing in
+# test/integration sends a request with no header fields, so the offset
+# underflow this catches went green through the whole suite.
+both bare    "200=1 400=0 501=0 secret=no"
 
 echo "--- malformed framing: refused, once, with an answer ---"
 both A       "200=0 400=1 501=0 secret=no"
