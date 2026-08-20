@@ -600,14 +600,31 @@ ensure_socketley_bench() {
 
 # Kill all benchmark-related background processes
 cleanup_all() {
-    # Kill any python backends (used by proxy bench)
-    pkill -9 -f "python3.*socket.*listen" 2>/dev/null || true
-    # Kill any lingering nc processes from pipe benchmarks
-    pkill -9 -f "nc.*localhost.*1900" 2>/dev/null || true
-    # Kill any k6 processes
-    pkill -9 -f "k6 run" 2>/dev/null || true
-    # Kill any redis-benchmark
-    pkill -9 -f "redis-benchmark.*1900" 2>/dev/null || true
+    # Four `pkill -9 -f` sweeps stood here -- for python backends, for nc, for
+    # k6 and for redis-benchmark.  They are gone rather than narrowed, because
+    # counted against what this directory actually starts they had no target of
+    # their own and only a blast radius.
+    #
+    # Nothing here backgrounds python3, k6 or redis-benchmark at all: every use
+    # is foreground and has returned before this function runs.  The one
+    # backgrounded `nc` is bench_websocket.sh's, and it is `wait`ed for -- and
+    # the pattern would not have found it anyway, because that port is 19010 and
+    # `nc.*localhost.*1900` does not match "nc -q0 localhost 19010".  A sweep
+    # that cannot match its own target can only match somebody else's.
+    #
+    # Measured 2026-08-20 with four decoys of the shape a concurrent run has,
+    # using pgrep so that nothing had to be killed to show what would be: all
+    # four patterns matched the foreign process.  `-f` compares an argument
+    # list, and an argument list is not an identity -- the same reason given
+    # above for the daemon and below for socketley_bench.
+    #
+    # Every background process this directory does start is already reaped by
+    # something that knows which one is its own: the daemon and its workers and
+    # socketley_bench by executable (below and in stop_daemon), haproxy by
+    # HA_PID in its own EXIT trap, the floor binary by FLOOR_PID in floor_stop,
+    # and the websocket subshells by `wait`.  If a future benchmark backgrounds
+    # a helper, capture its pid at the spawn site the way those four do; do not
+    # reintroduce a pattern sweep.
 
     # This tree's socketley_bench, and only this tree's.
     #

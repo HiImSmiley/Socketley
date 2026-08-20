@@ -38,19 +38,18 @@
 # daemon_pids/daemon_starting_pids are the worked version; run_all.sh's
 # own_daemon_pids is the other.
 #
-# ─── WHAT IT DELIBERATELY DOES NOT COVER ────────────────────────────────────
+# ─── benchmark/ USED TO BE EXCLUDED, AND IS NOT ANY MORE ────────────────────
 #
-# test/benchmark/ is excluded, and the exclusion is not an oversight.  Four
-# `pkill -9 -f` calls live in benchmark/utils.sh's cleanup_all, and all four
-# target processes that are not socketley: a python3 backend, `nc`, `k6` and
-# `redis-benchmark`.  The recipe above cannot be applied to them — there is no
-# socketley exe to compare against — and the correct fix is to record each
-# helper's pid where it is spawned, which is a change across benchmark/ and
-# belongs to whoever holds that territory.  They are over-broad in a different
-# way, too: `pkill -9 -f "nc.*localhost.*1900"` reaches another worktree's
-# benchmark run, which is the same fault the socketley_bench sweep directly
-# below them was already fixed for.  Named here so the exclusion is a decision
-# on the record rather than a gap.
+# This scan once skipped test/benchmark/, because cleanup_all held four
+# `pkill -9 -f` calls the recipe above could not repair: they named a python3
+# backend, `nc`, `k6` and `redis-benchmark`, none of which is a socketley
+# binary, so there is no exe to compare a pid against.
+#
+# Counted afterwards, none of the four had a target of its own — nothing under
+# benchmark/ backgrounds python3, k6 or redis-benchmark at all, the one
+# backgrounded `nc` is `wait`ed for, and `nc.*localhost.*1900` did not even
+# match it (that port is 19010).  All four were deleted rather than narrowed,
+# and benchmark/ is now inside this scan so they cannot come back.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -67,9 +66,10 @@ bad() {
 
 echo "=== Integration: the harness never matches a process by its command line ==="
 
-# Every shell file under test/ except benchmark/, which the header exempts by
-# name.  Derived from a find rather than listed, for the reason run_all.sh globs
-# instead of naming: a list goes stale by reporting a pass.
+# Every shell file under test/, benchmark/ included since the four sweeps that
+# forced its exemption were removed.  Derived from a find rather than listed,
+# for the reason run_all.sh globs instead of naming: a list goes stale by
+# reporting a pass.
 #
 # This file is excluded from its own scan, and has to be: it carries both
 # offending spellings on purpose, in the probe below, and the probe is the only
@@ -77,8 +77,7 @@ echo "=== Integration: the harness never matches a process by its command line =
 # basename rather than by a marker comment so that a copy of this file under
 # another name is still scanned.
 SELF=$(basename "$0")
-FILES=$(find "$TESTROOT" -name '*.sh' -type f \
-             -not -path "$TESTROOT/benchmark/*" -not -name "$SELF" | sort)
+FILES=$(find "$TESTROOT" -name '*.sh' -type f -not -name "$SELF" | sort)
 
 N_FILES=$(printf '%s\n' "$FILES" | grep -c . || true)
 if [ "$N_FILES" -ge 100 ]; then
