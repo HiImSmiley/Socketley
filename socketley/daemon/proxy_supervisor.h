@@ -43,6 +43,7 @@
 #include <string>
 #include <sys/types.h>
 
+#include "../shared/conn_identity.h"
 #include "../shared/request_channel.h"
 // For runtime_state: await_startup() remembers the state the child reported
 // without adopting it, so the enum is part of this class's own storage now
@@ -176,6 +177,21 @@ public:
     using deliver_handler = std::function<void(proxy_supervisor* from,
                                                std::string_view name,
                                                std::string_view message)>;
+
+    // A message for a connection held by a SIBLING of the shard that asked.
+    //
+    // `send` addressed by conn_ref rather than by runtime name, which is the
+    // one thing a name cannot express: every shard of a runtime has the same
+    // name, and this message is for exactly one of them.  The daemon does not
+    // have to search — a ref carries its minting shard in the top six bits of
+    // its serial — so this is a lookup and one write, not a fan-out.
+    using send_ref_handler = std::function<void(proxy_supervisor* from,
+                                                const conn_ref& ref,
+                                                std::string_view message)>;
+    void set_send_ref_handler(send_ref_handler h) { m_on_send_ref = std::move(h); }
+
+    // The message on its way down to the shard that owns the connection.
+    bool send_deliver_ref(const conn_ref& ref, std::string_view message);
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
 
     // ── The figures this child last published ───────────────────────────────
@@ -258,8 +274,12 @@ public:
     // Set before spawn().  A restart replays the config from m_config_json, and
     // the index is inside it, so a replacement shard comes back as the same
     // shard and takes the same slot.
-    void set_shard(uint32_t index, int region_fd)
-    { m_shard_index = index; m_shard_region_fd = region_fd; }
+    // `clients_fd` is the second region — which connections each shard holds,
+    // by name; see shard_clients.h.  Borrowed on the same terms as the first
+    // and for the same reason.
+    void set_shard(uint32_t index, int region_fd, int clients_fd)
+    { m_shard_index = index; m_shard_region_fd = region_fd;
+      m_shard_clients_fd = clients_fd; }
 
     uint32_t shard_index() const { return m_shard_index; }
 
@@ -487,8 +507,9 @@ private:
     unsigned     m_poll_mask{0};
     bool         m_poll_armed{false};
 
-    publish_handler m_on_publish;
-    deliver_handler m_on_deliver;
+    publish_handler  m_on_publish;
+    deliver_handler  m_on_deliver;
+    send_ref_handler m_on_send_ref;
     stats_handler   m_on_stats;
 
     bool         m_state_changed{false};
@@ -525,6 +546,7 @@ private:
     // runtime", which is what every unsharded runtime is.
     uint32_t     m_shard_index{0};
     int          m_shard_region_fd{-1};
+    int          m_shard_clients_fd{-1};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

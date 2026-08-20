@@ -455,7 +455,8 @@ public:
     std::string lua_peer_ip(int client_fd);
 
     // Lua client enumeration + multicast
-    std::vector<int> lua_clients() const;
+    std::vector<int> lua_clients();
+    int handle_for_sibling_ref(const conn_ref& r);
     size_t lua_multicast(const std::vector<int>& fds, std::string_view msg);
 
     // Lua per-connection metadata

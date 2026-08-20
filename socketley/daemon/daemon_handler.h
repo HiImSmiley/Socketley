@@ -9,6 +9,7 @@
 
 #include "../shared/event_loop_definitions.h"
 #include "../shared/runtime_instance.h"
+#include "../shared/shard_clients.h"
 #include "../cli/arg_parser.h"
 
 class event_loop;
@@ -251,6 +252,17 @@ private:
     // misses.
     std::unordered_map<std::string, shard_stats::shard_table> m_shard_regions;
 
+    // And which connections each shard is holding, by name.  A second region
+    // for the reason shard_clients.h opens with: the counter is touched every
+    // turn of every shard's loop and the list is touched when a connection
+    // arrives or leaves, so putting the cold 128 KB behind the same fd as the
+    // hottest line in the process buys nothing and costs cache.
+    //
+    // Same lifetime rule as the counters above, and for the same reason: it has
+    // to outlive any one shard, because a replacement must map what its
+    // siblings already have.
+    std::unordered_map<std::string, shard_clients::client_table> m_shard_client_regions;
+
     // What every shard of one runtime last reported, added up and written into
     // the placeholder that stands for it.
     //
@@ -447,6 +459,12 @@ private:
     // worker that holds them.
     void on_worker_deliver(proxy_supervisor* from, std::string_view name,
                            std::string_view message);
+
+    // A `send` addressed by conn_ref: one shard asking that a message reach a
+    // connection a SIBLING is holding.  The ref names its own shard, so this
+    // resolves to one supervisor and writes one frame.
+    void on_worker_send_ref(proxy_supervisor* from, const conn_ref& ref,
+                            std::string_view message);
 
     // A publish that came UP from a worker's cache, fanned out to everything
     // this daemon can reach — its own runtimes and every OTHER worker.  The

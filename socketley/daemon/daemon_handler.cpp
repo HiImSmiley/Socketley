@@ -4784,6 +4784,57 @@ bool daemon_handler::deliver_to_worker(std::string_view name,
     return any;
 }
 
+void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
+                                        const conn_ref& ref,
+                                        std::string_view message)
+{
+    if (!from)
+        return;
+
+    // Which runtime the asking shard belongs to.  Found by walking the map
+    // rather than carried on the frame, for the reason on_worker_deliver gives:
+    // the daemon already holds the only authoritative answer, and a field the
+    // worker filled in would be a second one to disagree with it.
+    //
+    // A ref is only ever resolvable inside the runtime that minted it, so a
+    // shard cannot address another runtime's connection by accident — and if it
+    // tried, write_to_ref() at the far end refuses on the owner half.
+    for (auto& [name, shards] : m_proxy_workers)
+    {
+        bool mine = false;
+        for (const auto& sup : shards)
+            if (sup.get() == from) { mine = true; break; }
+        if (!mine)
+            continue;
+
+        const uint32_t target = conn_ref_shard(ref);
+        if (target >= shards.size())
+        {
+            // A ref minted by a shard that has since been retired.  Not an
+            // error: the connection went with the process, and the far end
+            // would have refused it anyway.  Said at debug because a script
+            // holding one is not doing anything wrong.
+            LOG_DEBUG("a send named a connection on a shard that is gone");
+            return;
+        }
+
+        // The asking shard is not a legal target here.  It would have written
+        // the message itself rather than sending it up — send_to_client only
+        // reaches the ref sink when the shard in the ref is NOT its own — so a
+        // frame that comes back round is a build that has lost that check, and
+        // delivering it would hide the fault rather than the message.
+        if (shards[target].get() == from)
+        {
+            LOG_WARN("a shard asked the daemon to deliver to itself; dropped");
+            return;
+        }
+
+        if (!shards[target]->send_deliver_ref(ref, message))
+            LOG_WARN("could not reach the shard holding a routed connection");
+        return;
+    }
+}
+
 void daemon_handler::on_worker_publish(proxy_supervisor* from,
                                        std::string_view cache_name,
                                        std::string_view channel,
@@ -4991,6 +5042,7 @@ void daemon_handler::reconcile_proxy_workers()
             // keeping it would hand a restarted runtime a table still holding
             // the counts of the shards it replaced.
             m_shard_regions.erase(it->first);
+            m_shard_client_regions.erase(it->first);
             it = m_proxy_workers.erase(it);
             continue;
         }
@@ -5017,6 +5069,16 @@ void daemon_handler::reconcile_proxy_workers()
         // that knows a shard has gone.
         if (const auto r = m_shard_regions.find(it->first); r != m_shard_regions.end())
             r->second.set_shard_count(static_cast<uint32_t>(w->second));
+
+        // The client list is sized from the shard count, so it cannot be
+        // resized in place the way the counter table can.  A retired shard's
+        // block is cleared instead, which is what stops it being read; the
+        // region keeps its original width until the runtime stops and the next
+        // start builds one to fit.
+        if (const auto c = m_shard_client_regions.find(it->first);
+            c != m_shard_client_regions.end())
+            for (size_t i = w->second; i < c->second.count(); ++i)
+                c->second.clear_block(static_cast<uint32_t>(i));
 
         ++it;
     }
@@ -5067,7 +5129,8 @@ void daemon_handler::reconcile_proxy_workers()
         // for itself — and taking the runtime down instead would turn a missing
         // optimisation into an outage.  It is logged once, here, so the reason
         // `self.connections()` is answering per-shard is written down somewhere.
-        int shard_fd = -1;
+        int shard_fd   = -1;
+        int clients_fd = -1;
         if (want_count > 1)
         {
             auto& region = m_shard_regions[name];
@@ -5086,6 +5149,30 @@ void daemon_handler::reconcile_proxy_workers()
                 region.set_shard_count(static_cast<uint32_t>(want_count));
             }
             shard_fd = region.fd();
+
+            // And the client list.  Same lifetime, same failure policy: a
+            // region that cannot be made leaves each shard answering
+            // self.clients() with its own connections, which is the behaviour
+            // this tree had before the change and not an outage.
+            auto& creg = m_shard_client_regions[name];
+            if (!creg.mapped())
+            {
+                if (!creg.create(static_cast<uint32_t>(want_count)))
+                    LOG_WARN(("could not create the shared client list for "
+                              + name
+                              + "; each shard will list only its own").c_str());
+            }
+            else if (creg.count() != want_count)
+            {
+                // Width is fixed at creation, so a changed shard count needs a
+                // new region.  Reached only when a runtime grew while running,
+                // which reconcile does not currently produce — see the note on
+                // set_shard_count above.
+                if (!creg.create(static_cast<uint32_t>(want_count)))
+                    LOG_WARN(("could not resize the shared client list for "
+                              + name).c_str());
+            }
+            clients_fd = creg.fd();
         }
 
         while (shards.size() < want_count)
@@ -5096,7 +5183,7 @@ void daemon_handler::reconcile_proxy_workers()
         // this vector IS the index — reconcile only ever appends here and only
         // ever retires from the back, exactly so that a shard's index does not
         // move underneath a reader — so no counter has to be kept beside it.
-        sup->set_shard(static_cast<uint32_t>(shards.size()), shard_fd);
+        sup->set_shard(static_cast<uint32_t>(shards.size()), shard_fd, clients_fd);
 
         // The supervisor answers for the runtime it supervises.  Set before the
         // spawn so that a request arriving in the same turn as the start has
@@ -5111,6 +5198,9 @@ void daemon_handler::reconcile_proxy_workers()
         sup->set_deliver_handler([this](proxy_supervisor* f, std::string_view n,
                                         std::string_view m)
                                  { on_worker_deliver(f, n, m); });
+        sup->set_send_ref_handler([this](proxy_supervisor* f, const conn_ref& r,
+                                         std::string_view m)
+                                  { on_worker_send_ref(f, r, m); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
 
         // ─── Only the first shard is the request sink ───────────────────────
@@ -5220,10 +5310,11 @@ void daemon_handler::reconcile_proxy_workers()
         if (shards.empty())
         {
             m_proxy_workers.erase(name);
-            // And the region goes with them, for the same reason: a table with
+            // And the regions go with them, for the same reason: a table with
             // no process publishing into it is not a smaller table, it is one
             // whose every reader has gone.
             m_shard_regions.erase(name);
+            m_shard_client_regions.erase(name);
         }
     }
 }

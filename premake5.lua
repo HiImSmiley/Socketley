@@ -451,7 +451,7 @@ project "test_cache_store"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
--- ─── Test: the shared shard table ───
+-- ─── Test: the two shared shard regions ───
 
 project "test_shard_stats"
     kind "ConsoleApp"
@@ -470,7 +470,8 @@ project "test_shard_stats"
     -- can fork freely.  A test that had to bring up an event loop could not.
     files {
         "test/unit/test_shard_stats.cpp",
-        "socketley/shared/shard_stats.h"
+        "socketley/shared/shard_stats.h",
+        "socketley/shared/shard_clients.h"
     }
 
     filter "configurations:Debug"

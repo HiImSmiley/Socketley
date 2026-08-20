@@ -48,6 +48,7 @@
 #include <string>
 #include <memory>
 #include <utility>
+#include "conn_identity.h"
 #include "route_table.h"
 // The cluster snapshot travels whole, in the structs the daemon already has it
 // in — see the note above encode_cluster_view.  This is the same reason
@@ -98,6 +99,11 @@ enum class frame_type : uint16_t
     reload_err = 6,  // payload: why a `reload` failed; see below
     start_err  = 7,  // payload: why `start`'s on_start raised; see below
     deliver_to = 8,  // payload: see encode_deliver_to
+    send_ref   = 9,  // payload: see encode_send_ref
+
+    // daemon → worker, again
+    deliver_ref = 27,  // payload: see encode_send_ref — the same frame coming
+                       // back down, which is why it is one codec and two names
 };
 
 // ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
@@ -553,6 +559,47 @@ inline bool decode_deliver_to(std::string_view payload, std::string& name,
 {
     reader r(payload.data(), payload.size());
     name    = std::string(r.str());
+    message = std::string(r.str());
+    return r.ok;
+}
+
+// ── send_ref / deliver_ref: a message for a connection in another shard ─────
+//
+// `self.send(id, msg)` where `id` names a client of a SIBLING shard.  The two
+// names are one codec because they are one message travelling in two legs: up
+// from the shard that was asked, and down to the shard that owns the socket.
+//
+// The daemon does not have to search for the owner.  A conn_ref's serial
+// carries the minting shard in its top six bits — see conn_identity.h — so the
+// second leg goes to exactly one worker.  That is the whole reason the shard
+// index went into the serial rather than into a table somewhere.
+//
+// Nothing is answered, and that is a decision rather than an omission.  A
+// `send` on this tree's own in-process path returns "queued", not "delivered":
+// send_to() can still drop the connection for exceeding its write-queue bound,
+// and the caller learns that from the connection going away.  Answering across
+// a process boundary would therefore have to answer a question the local path
+// does not answer either — and it would cost a Lua callback a round trip,
+// which is the thing this design has spent two steps avoiding.  What the
+// caller IS told is whether the ref named a connection this runtime has at
+// all, and that is decided locally against the published client list.
+inline std::string encode_send_ref(const conn_ref& ref, std::string_view message)
+{
+    std::string out;
+    out.reserve(conn_ref_wire_size + 4 + message.size());
+    put_conn_ref(out, ref);
+    put_str(out, message);
+    return out;
+}
+
+inline bool decode_send_ref(std::string_view payload, conn_ref& ref,
+                            std::string& message)
+{
+    const char* p   = payload.data();
+    const char* end = payload.data() + payload.size();
+    if (!take_conn_ref(p, end, ref))
+        return false;
+    reader r(p, static_cast<size_t>(end - p));
     message = std::string(r.str());
     return r.ok;
 }

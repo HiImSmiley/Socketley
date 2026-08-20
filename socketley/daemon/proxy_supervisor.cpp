@@ -38,6 +38,10 @@ constexpr int child_control_fd = 3;
 // than as an error — see proxy_worker's on_config.
 constexpr int child_shard_fd = 4;
 
+// And the client-list region; see shard_clients.h.  Five for the reason four is
+// four.
+constexpr int child_clients_fd = 5;
+
 // A child that dies immediately and repeatedly is not going to be fixed by
 // forking it again — a bad port, a backend that cannot be resolved, a Lua
 // script that throws.  After this many restarts inside the window the runtime
@@ -155,6 +159,7 @@ uint32_t proxy_supervisor::retire()
     // republish the runtime map on behalf of a child it no longer supervises.
     m_on_publish = nullptr;
     m_on_deliver = nullptr;
+    m_on_send_ref = nullptr;
     m_on_stats   = nullptr;
 
     if (!m_loop)
@@ -423,7 +428,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         // trade this file makes everywhere else.  Moved out of the way first,
         // then the region, then the control socket, so no placement can undo
         // one that has already happened.
-        if (m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
+        if ((m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
+            || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd))
         {
             const int moved = ::fcntl(sv[1], F_DUPFD, 16);
             if (moved < 0)
@@ -441,20 +447,41 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         // alternative is a shard that serves connections and publishes them
         // nowhere, which is the silent wrong answer this whole mechanism exists
         // to remove — and the supervisor's restart path is the right response.
-        if (m_shard_region_fd >= 0)
+        //
+        // Both regions are placed by the same three lines, because the hazard
+        // is the same one: dup2 destroys its destination, and a source that is
+        // already sitting on the OTHER region's destination would be destroyed
+        // by the placement that has not happened yet.  So each source is moved
+        // out of the way first if it collides, and only then are the two placed.
+        int region_src  = m_shard_region_fd;
+        int clients_src = m_shard_clients_fd;
+        if (clients_src >= 0 && region_src == child_clients_fd)
         {
-            if (m_shard_region_fd != child_shard_fd)
+            region_src = ::fcntl(region_src, F_DUPFD, 16);
+            if (region_src < 0) _exit(127);
+        }
+        if (region_src >= 0 && clients_src == child_shard_fd)
+        {
+            clients_src = ::fcntl(clients_src, F_DUPFD, 16);
+            if (clients_src < 0) _exit(127);
+        }
+
+        const auto place = [](int src, int dst) {
+            if (src < 0) return;
+            if (src != dst)
             {
-                if (::dup2(m_shard_region_fd, child_shard_fd) < 0)
+                if (::dup2(src, dst) < 0)
                     _exit(127);
             }
             else
             {
-                const int fl = ::fcntl(m_shard_region_fd, F_GETFD, 0);
+                const int fl = ::fcntl(src, F_GETFD, 0);
                 if (fl >= 0)
-                    if (::fcntl(m_shard_region_fd, F_SETFD, fl & ~FD_CLOEXEC) < 0) {}
+                    if (::fcntl(src, F_SETFD, fl & ~FD_CLOEXEC) < 0) {}
             }
-        }
+        };
+        place(region_src,  child_shard_fd);
+        place(clients_src, child_clients_fd);
 
         if (sv[1] != child_control_fd)
         {
@@ -1092,6 +1119,19 @@ void proxy_supervisor::ingest(const std::string&)
                 break;
             }
 
+            case worker_proto::frame_type::send_ref:
+            {
+                // `self.send(handle, msg)` out there, for a client one of this
+                // shard's siblings is holding.  Routed by the handler, which is
+                // the daemon and holds every shard's socket.
+                conn_ref    ref{};
+                std::string message;
+                if (m_on_send_ref &&
+                    worker_proto::decode_send_ref(payload, ref, message))
+                    m_on_send_ref(this, ref, message);
+                break;
+            }
+
             case worker_proto::frame_type::state:
                 // created / running / stopped are still not acted on, and for
                 // the reason that was always given: the daemon's own record is
@@ -1300,6 +1340,14 @@ bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
 }
 
 // ─── the other direction ────────────────────────────────────────────────────
+
+bool proxy_supervisor::send_deliver_ref(const conn_ref& ref,
+                                       std::string_view message)
+{
+    return write_frame(worker_proto::frame(
+        worker_proto::frame_type::deliver_ref,
+        worker_proto::encode_send_ref(ref, message)));
+}
 
 void proxy_supervisor::on_chan_req(std::string_view payload)
 {

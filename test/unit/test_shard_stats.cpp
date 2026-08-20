@@ -2,6 +2,7 @@
 #include "doctest.h"
 #include "../../socketley/shared/shard_stats.h"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <sys/wait.h>
@@ -208,4 +209,193 @@ TEST_CASE("what a sum over eight shards costs")
         / static_cast<double>(reps);
     MESSAGE("sum over 8 shards: " << ns << " ns per call");
     CHECK(region.sum_active() == 40);
+}
+
+// ─── The second region: which connections each shard holds, by name ─────────
+//
+// shard_clients.h, and every case that claims sharing forks for the reason the
+// cases above do: a single-process test of this passes on a heap allocation.
+
+#include "../../socketley/shared/shard_clients.h"
+
+namespace
+{
+conn_ref mk(uint64_t owner, uint64_t serial) { return conn_ref{owner, serial}; }
+}
+
+TEST_CASE("four shards publish their clients and any one can read the rest")
+{
+    shard_clients::client_table region;
+    REQUIRE(region.create(4));
+    CHECK(region.count() == 4);
+
+    for (uint32_t i = 0; i < 4; ++i)
+        CHECK(in_child([&] {
+            shard_clients::client_table w;
+            if (!w.adopt(::dup(region.fd()), i, 4)) return 1;
+            // Two clients each, named so the reader can tell whose is whose.
+            w.push(mk(99, (i + 1) * 100 + 1));
+            w.push(mk(99, (i + 1) * 100 + 2));
+            return w.own_count() == 2 ? 0 : 2;
+        }) == 0);
+
+    // Everything, including this reader's own block: invalid_index skips
+    // nothing, which is what the daemon and these tests want.
+    std::vector<conn_ref> all;
+    CHECK(region.read_others(all, shard_clients::client_table::invalid_index));
+    CHECK(all.size() == 8);
+
+    // And a reader that IS one of the shards leaves its own out, because the
+    // caller already has those as descriptors.
+    CHECK(in_child([&] {
+        shard_clients::client_table r;
+        if (!r.adopt(::dup(region.fd()), 1, 4)) return 1;
+        // adopt() clears the block it takes, so shard 1's two are gone from
+        // the region as well as skipped — 6 remain.
+        std::vector<conn_ref> out;
+        if (!r.read_others(out, r.index())) return 2;
+        return out.size() == 6 ? 0 : 3;
+    }) == 0);
+}
+
+TEST_CASE("a swap-remove leaves the list exactly as the vector has it")
+{
+    shard_clients::client_table region;
+    REQUIRE(region.create(1));
+
+    CHECK(in_child([&] {
+        shard_clients::client_table w;
+        if (!w.adopt(::dup(region.fd()), 0, 1)) return 1;
+        for (uint64_t i = 1; i <= 5; ++i) w.push(mk(7, i));
+        // Remove the middle one, which is the case that moves another entry:
+        // server_instance does exactly this to m_active_fds, and active_idx is
+        // the index into both.
+        w.swap_remove(1);
+        return w.own_count() == 4 ? 0 : 2;
+    }) == 0);
+
+    std::vector<conn_ref> out;
+    REQUIRE(region.read_others(out, shard_clients::client_table::invalid_index));
+    REQUIRE(out.size() == 4);
+    // 1, 5, 3, 4 — the last entry swapped into the hole, exactly as the vector
+    // would have it.
+    CHECK(out[0] == mk(7, 1));
+    CHECK(out[1] == mk(7, 5));
+    CHECK(out[2] == mk(7, 3));
+    CHECK(out[3] == mk(7, 4));
+}
+
+TEST_CASE("a retired shard's clients stop being listed")
+{
+    shard_clients::client_table region;
+    REQUIRE(region.create(2));
+    for (uint32_t i = 0; i < 2; ++i)
+        CHECK(in_child([&] {
+            shard_clients::client_table w;
+            if (!w.adopt(::dup(region.fd()), i, 2)) return 1;
+            w.push(mk(7, i + 1));
+            return 0;
+        }) == 0);
+
+    std::vector<conn_ref> out;
+    REQUIRE(region.read_others(out, shard_clients::client_table::invalid_index));
+    REQUIRE(out.size() == 2);
+
+    // The shard is gone and publishes nothing on its way out — that is what
+    // being killed means — so the daemon is the only one that can say so.
+    region.clear_block(1);
+    REQUIRE(region.read_others(out, shard_clients::client_table::invalid_index));
+    CHECK(out.size() == 1);
+    CHECK(out[0] == mk(7, 1));
+}
+
+TEST_CASE("a replacement shard does not inherit its predecessor's clients")
+{
+    shard_clients::client_table region;
+    REQUIRE(region.create(1));
+    CHECK(in_child([&] {
+        shard_clients::client_table w;
+        if (!w.adopt(::dup(region.fd()), 0, 1)) return 1;
+        w.push(mk(7, 1)); w.push(mk(7, 2));
+        return 0;
+    }) == 0);
+
+    std::vector<conn_ref> out;
+    REQUIRE(region.read_others(out, shard_clients::client_table::invalid_index));
+    REQUIRE(out.size() == 2);
+
+    CHECK(in_child([&] {
+        shard_clients::client_table w;
+        if (!w.adopt(::dup(region.fd()), 0, 1)) return 1;
+        return w.own_count() == 0 ? 0 : 2;
+    }) == 0);
+}
+
+TEST_CASE("a reader never sees half of one shard's list")
+{
+    // The seqlock's whole job.  A list is a length and N entries that have to
+    // agree, and a reader CAN catch a length that no longer matches the
+    // entries — which a counter cannot, and which is why these are two regions.
+    //
+    // ─── THE FIRST VERSION OF THIS CASE ASSERTED THE WRONG THING ────────────
+    //
+    // It had the writer clear its block and rebuild it, alternating between a
+    // three-entry set and a five-entry one, and asserted that every read showed
+    // one set whole.  That failed 24,649 times out of 200,000 — and the code
+    // was right, the assertion was wrong.  clear_own() and each push() are
+    // separate critical sections, so a reader can see a consistent view of a
+    // rebuild in progress: two of the five, correctly reported as two.
+    //
+    // The reason it was the wrong model is that PRODUCTION NEVER REBUILDS.
+    // server_instance publishes one push per accept and one swap_remove per
+    // close, mirroring what it already does to m_active_fds — that is the whole
+    // point of the incremental writer — and the only clear_own() calls are at
+    // setup and teardown, where the list is empty either way.
+    //
+    // So the writer below is shaped like the real one, and the invariant is the
+    // one a real reader depends on: the list holds DISTINCT serials.  That is
+    // exactly the tearing signature of swap_remove, which copies the last entry
+    // over the hole and then shortens the count — a reader that saw the old
+    // count over the new entries would see the tail twice.
+    shard_clients::client_table region;
+    REQUIRE(region.create(1));
+
+    const pid_t writer = ::fork();
+    REQUIRE(writer >= 0);
+    if (writer == 0)
+    {
+        shard_clients::client_table w;
+        if (!w.adopt(::dup(region.fd()), 0, 1)) _exit(1);
+        uint64_t next = 1;
+        for (int round = 0; round < 200000; ++round)
+        {
+            if (w.own_count() < 8)
+                w.push(mk(7, next++));
+            else
+                w.swap_remove(round % 8);      // middles as well as the end
+        }
+        _exit(0);
+    }
+
+    int reads = 0, dup = 0, empty = 0;
+    for (int i = 0; i < 300000; ++i)
+    {
+        std::vector<conn_ref> out;
+        if (!region.read_block(0, out))
+            continue;                          // gave up within the bound
+        ++reads;
+        if (out.empty()) { ++empty; continue; }
+        std::vector<uint64_t> serials;
+        serials.reserve(out.size());
+        for (const auto& r : out) serials.push_back(r.serial);
+        std::sort(serials.begin(), serials.end());
+        if (std::adjacent_find(serials.begin(), serials.end()) != serials.end())
+            ++dup;
+    }
+    int st = 0; ::waitpid(writer, &st, 0);
+
+    MESSAGE("seqlock: " << reads << " clean reads, " << empty << " empty, "
+                        << dup << " with a duplicated entry");
+    CHECK(dup == 0);
+    CHECK(reads > 0);
 }

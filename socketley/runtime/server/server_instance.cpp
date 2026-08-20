@@ -24,6 +24,7 @@
 #include "../cache/resp_parser.h"
 
 #include <unistd.h>
+#include <unordered_set>
 #include <cstring>
 #include <cstdlib>
 #include <charconv>
@@ -1800,6 +1801,11 @@ bool server_instance::setup(event_loop& loop)
     // only in so far as it must not be touched.
     m_active_fds.clear();
     m_active_fds.reserve(256);  // Pre-allocate to avoid reallocs on first connections
+    // And the shared view of it.  A restart that left the previous lifetime's
+    // names in place would have siblings routing to connections that no longer
+    // exist -- resolved to nothing at the far end, but reported to the script
+    // as clients it has.
+    shard_clients_table().clear_own();
 
     m_loop = &loop;
     m_ring_loop = &loop;
@@ -2290,6 +2296,7 @@ void server_instance::teardown(event_loop& loop)
     }
 
     m_active_fds.clear();
+    shard_clients_table().clear_own();
 
     for (auto& [fd, conn] : m_clients)
     {
@@ -2836,6 +2843,16 @@ inline void server_instance::remove_active_fd(int fd)
     m_active_fds.pop_back();
     if (back_fd != fd && back_fd >= 0 && back_fd < MAX_FDS && m_conn_idx[back_fd])
         m_conn_idx[back_fd]->active_idx = idx;
+
+    // The same swap-remove, at the same index, in the table this runtime's
+    // sibling shards read.  Here rather than rebuilt from m_active_fds on a
+    // timer, because `active_idx` IS the index into both and doing the same
+    // operation to both is what keeps them aligned — a second structure
+    // rebuilt from the first is how the two come to disagree, and a
+    // disagreement here is a script sending to a connection that closed.
+    //
+    // A no-op for every unsharded runtime: the table is not mapped.
+    shard_clients_table().swap_remove(idx);
 }
 
 inline void server_instance::submit_conn_read(server_connection* conn)
@@ -2950,6 +2967,11 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         m_conn_idx[client_fd] = ptr;
         ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
         m_active_fds.push_back(client_fd);
+
+        // And into the shared table, at the same position.  The ref is minted
+        // above in pool_acquire(), so it exists by now and is this connection's
+        // name for its whole life.
+        shard_clients_table().push(conn_ref{owner_key(), ptr->ref_serial});
 
         // A TLS listener gives every accepted socket a session before anybody
         // else touches the connection, and in particular before on_auth and
@@ -5840,6 +5862,28 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     {
         auto it = m_forwarded.find(client_id);
         if (it == m_forwarded.end()) return false;
+        const conn_ref ref = it->second.ref;
+
+        // ─── A sibling shard of THIS runtime ────────────────────────────────
+        //
+        // Checked before the manager, because the manager cannot answer it: in
+        // a worker every other runtime is a replica with no connections, and
+        // this runtime's own name resolves to the copy in THIS process — which
+        // does not hold the connection either.  What names the holder is the
+        // ref itself: same owner as ours, a different shard in its top six
+        // bits.  See conn_identity.h.
+        if (ref.owner == owner_key()
+            && conn_ref_shard(ref) != get_shard_index()
+            && has_ref_sink())
+        {
+            send_to_ref(ref, msg);
+            // Queued, which is what "sent" means on this path everywhere else
+            // in this file — the in-process branch below says so in its own
+            // words.  What has been established is that the id named a
+            // connection this runtime has; whether the far shard still has it
+            // is answered there, by write_to_ref, exactly as it would be here.
+            return true;
+        }
 
         auto* mgr = get_runtime_manager();
         if (!mgr) return false;
@@ -5848,7 +5892,7 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
         auto* srv = origin->as_server();
         if (!srv) return false;
 
-        return srv->write_to_ref(it->second.ref, msg);
+        return srv->write_to_ref(ref, msg);
     }
 
     if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return false;
@@ -6058,9 +6102,86 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
 
 // ─── Lua client enumeration ───
 
-std::vector<int> server_instance::lua_clients() const
+// Every client of this RUNTIME, not of this process.
+//
+// The descriptors this shard owns come back unchanged, because every script in
+// existence treats them as opaque and they are what on_connect handed out.  A
+// sibling's client has no descriptor here to be, so it comes back as a handle
+// out of conn_identity.h's reserved range — the same mechanism a client routed
+// in from another runtime already uses, and the reason that range exists.
+//
+// Not const any more: a handle for a sibling's connection is minted the first
+// time it is asked for and kept, so the same client is the same number to a
+// script that calls this twice.
+std::vector<int> server_instance::lua_clients()
 {
-    return m_active_fds;
+    if (!shard_clients_table().mapped())
+        return m_active_fds;
+
+    std::vector<conn_ref> foreign;
+    const bool complete = shard_clients_table().read_others(foreign, shard_clients_table().index());
+    if (!complete)
+    {
+        // A block that could not be read within its retry bound.  Said out
+        // loud: a script handed a short list with no indication is exactly the
+        // failure this whole step exists to remove, and the alternative to
+        // saying so is becoming the thing being fixed.
+        LOG_WARN(("self.clients() on " + std::string(get_name())
+                  + " could not read one shard's client list; the list below "
+                    "is missing it").c_str());
+    }
+
+    std::vector<int> out = m_active_fds;
+    out.reserve(out.size() + foreign.size());
+
+    std::unordered_set<conn_ref, conn_ref_hash> live;
+    live.reserve(foreign.size() * 2);
+
+    for (const conn_ref& r : foreign)
+    {
+        live.insert(r);
+        out.push_back(handle_for_sibling_ref(r));
+    }
+
+    // Handles for siblings' connections that have since gone.  Pruned here
+    // rather than never, because m_forwarded would otherwise grow for the life
+    // of the runtime — one entry per connection any sibling ever accepted.
+    //
+    // Only the ones minted HERE: an entry whose origin is another runtime
+    // belongs to route(), which owns its own lifetime, and dropping one of
+    // those would unroute a client nobody asked to unroute.
+    for (auto it = m_forwarded.begin(); it != m_forwarded.end();)
+    {
+        if (it->second.origin == get_name() && live.find(it->second.ref) == live.end())
+        {
+            m_forwarded_by_ref.erase(it->second.ref);
+            it = m_forwarded.erase(it);
+        }
+        else
+            ++it;
+    }
+
+    return out;
+}
+
+// A stable local number for a connection a sibling shard owns.
+//
+// Stable is the whole point: a script that calls self.clients() twice and
+// compares must get the same number for the same client, or every id it stores
+// is worthless.  m_forwarded_by_ref is what makes it stable, and it is the same
+// table route() uses — the origin is this runtime's own name, which is what
+// tells the two apart when one is pruned and the other is not.
+int server_instance::handle_for_sibling_ref(const conn_ref& r)
+{
+    if (const auto it = m_forwarded_by_ref.find(r); it != m_forwarded_by_ref.end())
+        return it->second;
+
+    const int h = alloc_handle();
+    if (h < 0)
+        return h;
+    m_forwarded[h] = forwarded_client{r, std::string(get_name())};
+    m_forwarded_by_ref[r] = h;
+    return h;
 }
 
 // How many of the named connections the message was queued to.

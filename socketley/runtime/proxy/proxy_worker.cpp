@@ -50,6 +50,10 @@ namespace
 // loudest a mismatch here can be made without inventing a handshake.
 constexpr int worker_shard_fd = 4;
 
+// And the client-list region; see shard_clients.h.  Same contract, same reason
+// it is named on both sides rather than shared through a header.
+constexpr int worker_clients_fd = 5;
+
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
@@ -833,6 +837,7 @@ private:
         switch (type)
         {
             case worker_proto::frame_type::config:    on_config(payload);    break;
+            case worker_proto::frame_type::deliver_ref: on_deliver_ref(payload); break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
             case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
@@ -958,6 +963,29 @@ private:
                                                  m_rt->get_shard_index()))
                 LOG_WARN("proxy worker: the shared shard table could not be "
                          "mapped; this shard will answer only for itself");
+        }
+
+        // And the client list.  Adopted here for the same reason and with the
+        // same guard: a script's top level may call self.clients(), and a
+        // runtime that is not attached yet answers with its own connections.
+        if (cfg.shards > 1 && ::fcntl(worker_clients_fd, F_GETFD, 0) >= 0)
+        {
+            if (!m_rt->shard_clients_table().adopt(worker_clients_fd,
+                                                   m_rt->get_shard_index(),
+                                                   cfg.shards))
+                LOG_WARN("proxy worker: the shared client list could not be "
+                         "mapped; this shard will list only its own clients");
+
+            // Where a message for a sibling's connection goes.  The daemon
+            // reads the shard out of the ref itself, so this is one hop to one
+            // process and not an offer to all of them.
+            m_rt->set_ref_sink(
+                [this](const conn_ref& r, std::string_view message)
+                {
+                    if (!m_writer.write(worker_proto::frame(
+                            worker_proto::frame_type::send_ref,
+                            worker_proto::encode_send_ref(r, message)))) {}
+                });
         }
 
         // ── the channel, both directions ────────────────────────────────────
@@ -1378,6 +1406,36 @@ private:
             default:
                 break;   // send is a server/client verb; cmd_send says so
         }
+    }
+
+    // A message for one of THIS shard's connections, sent by a sibling.
+    //
+    // write_to_ref() is the same function a routed-in message from another
+    // runtime lands in, and it already checks the three things that matter:
+    // that the name is ours to resolve, that it still resolves, and that what
+    // it resolves to is the connection it named when it was minted.  A ref for
+    // a client that has since gone answers false and the message is dropped —
+    // which is conn_identity.h's whole promise, and the reason nothing here has
+    // to guess.
+    void on_deliver_ref(const std::string& payload)
+    {
+        if (!m_rt || m_rt->get_state() != runtime_running)
+            return;
+
+        conn_ref    ref{};
+        std::string message;
+        if (!worker_proto::decode_send_ref(payload, ref, message))
+        {
+            LOG_WARN("proxy worker: malformed deliver_ref frame, dropped");
+            return;
+        }
+
+        auto* srv = m_rt->as_server();
+        if (!srv)
+            return;   // only a server has clients named this way
+        if (!srv->write_to_ref(ref, message))
+            LOG_DEBUG("proxy worker: a sibling's message named a connection "
+                      "this shard no longer has");
     }
 
     void on_publish(const std::string& payload)

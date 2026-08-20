@@ -20,6 +20,7 @@
 #include <liburing.h>
 #include "runtime_definitions.h"
 #include "shard_stats.h"
+#include "shard_clients.h"
 #include "event_loop_definitions.h"
 
 class event_loop;
@@ -461,6 +462,27 @@ public:
     // reader below is written for it.
     shard_stats::shard_table& shard_stats_table() { return m_shard_stats; }
 
+    // And which connections each shard is holding, by name; see
+    // shard_clients.h.  Unmapped for every unsharded runtime and every runtime
+    // in the daemon, which is what every reader below is written for.
+    shard_clients::client_table& shard_clients_table() { return m_shard_clients; }
+
+    // ── A message for a connection this process does not own ────────────────
+    //
+    // `self.send(id, msg)` where `id` names a client of a SIBLING shard.  Set
+    // only in a worker; the daemon reads the conn_ref's own shard tag and hands
+    // the message to exactly that worker, so this is one hop and not a search.
+    //
+    // Nothing is returned, for the reason worker_protocol.h gives above
+    // encode_send_ref: the in-process path answers "queued", not "delivered",
+    // and an answer here would have to be a promise the local path does not
+    // make -- at the price of a round trip inside a Lua callback.
+    using ref_sink = std::function<void(const conn_ref&, std::string_view)>;
+    void set_ref_sink(ref_sink s) { m_ref_sink = std::move(s); }
+    bool has_ref_sink() const { return static_cast<bool>(m_ref_sink); }
+    void send_to_ref(const conn_ref& r, std::string_view msg)
+    { if (m_ref_sink) m_ref_sink(r, msg); }
+
     // ── Reaching the clients this runtime has in OTHER processes ────────────
     //
     // The third of the three shapes a sharded runtime needs — fan-out — and the
@@ -864,6 +886,12 @@ private:
 
     // Set only in a worker, and only used above one shard; see set_sibling_sink.
     sibling_sink m_sibling_sink;
+
+    // Which connections each shard of this runtime holds; see shard_clients.h.
+    shard_clients::client_table m_shard_clients;
+
+    // See set_ref_sink.  Empty everywhere but in a worker.
+    ref_sink m_ref_sink;
 
     std::shared_ptr<const route_table> m_worker_routes;
 
