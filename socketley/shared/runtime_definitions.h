@@ -87,21 +87,45 @@ inline bool in_worker_process()         { return g_worker_process; }
 // tree's proxy — audited, fixed, and true by construction — so the operator is
 // asserting something about code they can read here.
 //
-// A SERVER WITH NO SCRIPT: yes, and this is the half of the widening the
-// original refusal named.  Without --lua a server has no cross-connection state
-// to lose: it accepts, it echoes or serves files, and every byte it holds
-// belongs to the connection it came from.  There is nothing for a second
-// process to be unaware of.
+// A SERVER, WITH OR WITHOUT A SCRIPT: yes.  Without --lua it always could —
+// a server with no script has no cross-connection state to lose.  With one it
+// was refused, and the refusal named the reason: "a message from a client on
+// one shard never reaches a client on another, and nothing reports it."
 //
-// A SERVER WITH A SCRIPT: no.  The property would be one of the operator's own
-// file, where cross-connection state is the common case rather than the
-// exception — a chat room, a presence table, a counter — and the failure is
-// silent: a message from a client on shard 1 never reaches a client on shard 2,
-// and nothing reports it.  self.broadcast, owner_broadcast and
-// upstream_broadcast are per-process today, so a script that broadcasts is
-// wrong the moment there is a second process, and no flag the operator types
-// makes it right.  An explicit opt-in inside the script's own declaration is
-// the other half of the widening and is deliberately not invented here.
+// ─── THAT REFUSAL WAS ON THE WRONG RUNTIME ──────────────────────────────────
+//
+// The failure it described was real and it was never fixed; it was only made
+// unreachable on ONE of the two types that could reach it.  proxy + --lua +
+// --shards has been accepted by this build all along, and it was answering a
+// fraction: measured on the tip, `self.connections()` on a four-shard proxy
+// holding forty clients reported between 5 and 13, and a `self.broadcast`
+// reached 15 of 40.  So the refusal protected a scripted server from a defect
+// that a scripted proxy was shipping.
+//
+// What removes it is that the three shapes a script can ask for now cross a
+// shard boundary, each proved against its own measured red:
+//
+//   aggregate   self.connections() sums every shard's own published counter
+//               out of a shared mapping -- wait-free, ~10 ns over eight shards
+//               against ~10 us for one AF_UNIX round trip.  shard_stats.h.
+//   fan out     self.broadcast reaches every shard's clients, once each: the
+//               local delivery happens where it stands and the daemon fans the
+//               rest, excluding the shard that asked.
+//   route       self.clients() lists the whole runtime -- this shard's
+//               descriptors plus a stable handle per sibling's client -- and
+//               self.send(id) reaches the owning shard in one hop, because a
+//               conn_ref carries its minting shard in its serial.
+//
+// What a script does NOT get, and this is a property of sharding rather than a
+// gap in it: per-connection state is per SHARD.  on_connect for a sibling's
+// client fired in that sibling, so a script holds no state for the ids
+// clients() hands it from elsewhere.  That is what sharding means, and it is
+// unambiguously better than being told a fraction with no way to know.
+//
+// self.route is still refused in a worker — sharded or not, and for a reason
+// that predates shards: route_client() reaches into another runtime's private
+// maps and calls its on_connect on this thread's stack.  Nothing here lifts
+// that.
 //
 // A CACHE: no.  N shards are N separate stores behind one port.  A SET lands in
 // whichever process the kernel gave that connection to and a later GET on a new
@@ -144,7 +168,6 @@ inline bool in_worker_process()         { return g_worker_process; }
 // worker the answer is yes.
 inline std::string shards_config_refusal(runtime_type type,
                                          uint32_t    shards,
-                                         bool        has_lua,
                                          std::string_view listen_path,
                                          bool        served_by_workers)
 {
@@ -168,14 +191,6 @@ inline std::string shards_config_refusal(runtime_type type,
                "has no listening socket to share, so N of them would be N "
                "connections to the peer -- a different feature wearing this "
                "flag's name\n";
-
-    if (type == runtime_server && has_lua)
-        return "--shards is not available on a server with --lua: sharding "
-               "declares that nothing is shared between connections, and with a "
-               "script that is a property of your file rather than of this "
-               "build -- a message from a client on one shard never reaches a "
-               "client on another, and nothing reports it.  Shard a server with "
-               "no script, or run the scripted one unsharded\n";
 
     if (!listen_path.empty())
         return "--shards and --listen are not compatible: shards share a port "

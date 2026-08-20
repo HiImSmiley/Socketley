@@ -3,14 +3,18 @@
 #
 # ─── WHAT CHANGED, AND WHAT THE RULE IS ─────────────────────────────────────
 #
-# --shards used to be refused on everything but a proxy, and the refusal named
-# its own way out: "a checkable rule (no --lua at all, or an explicit opt-in
-# inside the script's own declaration) can be added on top of this".  This is
-# the first of those two.  A server with NO script may shard; a server WITH one
-# may not, because the property being declared — nothing is shared between
-# connections — would be a property of the operator's file rather than of this
-# tree, and the failure is silent: a message from a client on shard 1 never
-# reaches a client on shard 2, and nothing reports it.
+# --shards was refused on everything but a proxy, then widened to a server with
+# NO script, and is now open to a scripted server as well.  What removed the
+# last refusal is that the three shapes a script can ask for cross a shard
+# boundary: self.connections() sums every shard's counter, self.broadcast
+# reaches every shard's clients once each, and self.clients()/self.send(id)
+# name and reach a client whichever shard holds it.
+#
+# The behaviour is asserted by test_shard_lua_fanout.sh and
+# test_shard_lua_route.sh.  What THIS file asserts is that the door is open at
+# every one of the five places the rule is asked — create in both flag orders,
+# edit, import, and a state file that never sees a parser — because a rule
+# removed from four of five is the shape 4af38f0 was.
 #
 # ─── WHAT IS BEING ASSERTED, AND WHICH BROKEN BUILD EACH ONE CATCHES ────────
 #
@@ -18,27 +22,31 @@
 #   server + --shards, no script     accepted.   Broken build: the old blanket
 #                                                refusal, so the flag does
 #                                                nothing for anybody.
-#   --shards 4 --lua x               refused.    Broken build: a scripted server
-#   --lua x --shards 4               refused.    split across processes, silently.
-#                                                The PAIR is the assertion: with
-#                                                the check only in the --shards
-#                                                case label the first order is
-#                                                accepted (the script has not
-#                                                been seen yet) and the second
-#                                                refused.  One runtime, two
-#                                                answers, decided by the order
-#                                                somebody's fingers reached.
-#   neither leaves a runtime behind  Broken build: `create` refuses and the
-#                                                half-configured runtime stays
-#                                                in the map.
-#   edit --shards onto a script      refused.    Broken build: the create rule
-#                                                walked around by `edit`.
-#   import shards onto a script      refused.    Broken build: the same, through
+#   --shards 4 --lua x               accepted.   Broken build: the refusal left
+#   --lua x --shards 4               accepted.   in one of the five doors.  The
+#                                                PAIR is still the assertion, and
+#                                                still for the order reason: a
+#                                                check left in the --shards case
+#                                                label alone would refuse only
+#                                                one of these two, and one
+#                                                runtime with two answers is the
+#                                                same defect whichever way the
+#                                                answer falls.
+#   the shard count is stored        Broken build: accepted and dropped, so `ls`
+#                                                says Up and one process serves.
+#                                                Acceptance alone cannot see
+#                                                that; the count is read back.
+#   edit --shards onto a script      accepted.   Broken build: the removed rule
+#                                                still standing in cmd_edit.
+#   import shards onto a script      accepted.   Broken build: the same, through
 #                                                the door that never sees a flag
 #                                                parser — 4af38f0's shape.
-#   a state file with both           refused at  Broken build: restored at boot
-#                                    start.      and auto-started sharded, which
-#                                                no command ever typed.
+#   a state file with both           starts.     Broken build: the last gate, in
+#                                                runtime_instance::start(), still
+#                                                refusing what every command
+#                                                above it now accepts — and
+#                                                failing it at BOOT, where no
+#                                                operator is watching.
 #
 # TWO CONFIGURATIONS THAT WOULD DO NOTHING, OR WORSE
 #   --shards + --listen unix:        refused.    Broken build: N processes
@@ -183,40 +191,42 @@ check "create server --shards 4 accepted" "$rc" "0"
 n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"shards": 4')
 check "the count was stored" "$n" "1"
 
-echo "== a server with a script may not, in either flag order =="
+echo "== a server with a script may too, in either flag order =="
+# The count is read back, not just the exit code.  A build that accepted the
+# flag and dropped it would pass an rc check and serve one process for a
+# runtime `ls` reports as four — which is the --daemon-process trap this same
+# file pins, arriving through a different door.
 out=$("$BIN" create server ss_lua -p $P_A --shards 4 --lua "$LUA" 2>&1); rc=$?
-check "--shards before --lua refused" "$rc" "1"
-[[ "$out" == *"--lua"* ]] && ok "and names --lua as the reason" || bad "reason: $out"
-n=$("$BIN" ls 2>/dev/null | grep -c ' ss_lua ')
-check "the refused runtime was not left behind" "$n" "0"
+check "--shards before --lua accepted" "$rc" "0"
+[[ -z "$out" ]] && ok "and said nothing (silence is success)" || bad "unexpected output: $out"
+n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards": 4')
+check "the count was stored" "$n" "1"
+"$BIN" remove ss_lua >/dev/null 2>&1
 
 out=$("$BIN" create server ss_lua -p $P_A --lua "$LUA" --shards 4 2>&1); rc=$?
-check "--lua before --shards refused" "$rc" "1"
-[[ "$out" == *"--lua"* ]] && ok "and names --lua as the reason" || bad "reason: $out"
-n=$("$BIN" ls 2>/dev/null | grep -c ' ss_lua ')
-check "the refused runtime was not left behind" "$n" "0"
+check "--lua before --shards accepted" "$rc" "0"
+n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards": 4')
+check "the count was stored in this order too" "$n" "1"
+"$BIN" remove ss_lua >/dev/null 2>&1
 
-# The control for the pair above: the same script with no --shards is fine, so
-# the two refusals are about the combination and not about the script.
+echo "== and edit may add shards to a scripted server =="
 out=$("$BIN" create server ss_lua -p $P_A --lua "$LUA" 2>&1); rc=$?
-check "the same script unsharded is accepted" "$rc" "0"
-
-echo "== and edit may not add shards to a scripted server =="
+check "the same script unsharded is still accepted" "$rc" "0"
 out=$("$BIN" edit ss_lua --shards 4 2>&1); rc=$?
-check "edit --shards onto a script refused" "$rc" "1"
-[[ "$out" == *"--lua"* ]] && ok "edit names --lua too" || bad "edit reason: $out"
-n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards"')
-check "the refused edit left no shard count behind" "$n" "0"
+check "edit --shards onto a script accepted" "$rc" "0"
+n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards": 4')
+check "and the edit stored the count" "$n" "1"
+"$BIN" edit ss_lua --shards 1 >/dev/null 2>&1
 
-echo "== nor may import, which never sees a flag parser =="
+echo "== and so may import, which never sees a flag parser =="
 DOC=$("$BIN" show ss_lua 2>/dev/null)
 CHANGED=$(printf '%s' "$DOC" | sed 's/"type": "server",/"type": "server", "shards": 4,/')
 [[ "$CHANGED" != "$DOC" ]] && ok "the probe document really differs" \
                            || bad "could not inject shards into the document"
 out=$(printf '%s' "$CHANGED" | "$BIN" import ss_lua 2>&1); rc=$?
-check "import of shards onto a scripted server refused" "$rc" "1"
-n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards"')
-check "the refused import applied nothing" "$n" "0"
+check "import of shards onto a scripted server accepted" "$rc" "0"
+n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards": 4')
+check "and the import applied the count" "$n" "1"
 "$BIN" remove ss_lua >/dev/null 2>&1
 
 echo "== --shards and --listen unix: are two different listeners =="
@@ -376,9 +386,13 @@ sleep 0.8
 echo "== a state file is the one door with no parser behind it =="
 # Written by hand, which is exactly how a document from another build arrives:
 # a scripted server carrying a shard count no command line ever produced.  The
-# gate that has to catch this is the last one, in runtime_instance::start(), and
-# it is the only assertion here that the three command-level refusals cannot
-# make.
+# gate is the last one, in runtime_instance::start(), and it is the only place
+# the three command-level checks cannot speak for.
+#
+# It used to have to REFUSE this.  It now has to accept it and fork, and that
+# is the sharper assertion of the two: a gate left refusing here fails at BOOT,
+# on the auto-restart path, where no operator is watching and the only trace is
+# a line in the daemon log.
 "$BIN" create server ss_state -p $P_A --lua "$LUA" >/dev/null 2>&1
 rc=$?
 check "the scripted server was created unsharded" "$rc" "0"
@@ -404,10 +418,17 @@ if [[ -n "$SF" ]]; then
     daemon_start "$BIN"
     sleep 1.0
     out=$("$BIN" start ss_state 2>&1); rc=$?
-    check "start of a hand-edited sharded scripted server refused" "$rc" "1"
-    [[ "$out" == *"--lua"* ]] && ok "and says why" || bad "reason: $out"
+    check "start of a hand-edited sharded scripted server accepted" "$rc" "0"
+    # Four processes, not "it did not error".  The last gate accepting and the
+    # daemon forking are two different things, and only the second is what the
+    # operator asked for.
+    for _ in $(seq 1 50); do
+        [[ "$(worker_pids | grep -c .)" == "4" ]] && break
+        sleep 0.2
+    done
     n=$(worker_pids | grep -c .)
-    check "and forked nothing" "$n" "0"
+    check "and forked all four shards" "$n" "4"
+    "$BIN" stop ss_state >/dev/null 2>&1
 fi
 
 echo

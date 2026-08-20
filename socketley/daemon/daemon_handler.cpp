@@ -114,22 +114,19 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
 // can.  The instance's own answer to shards_config_refusal — see
 // runtime_definitions.h for the rule and why it lives there rather than here.
 //
-// `lua_override` is for the one caller that cannot ask the instance: `create`
-// defers --lua to after every flag has been read, so at the point the set is
-// checked the script is still a local string and get_lua_script_path() is
-// empty.  Passing it explicitly is what makes `--shards 4 --lua x` and
-// `--lua x --shards 4` the same command.  Every other caller passes nullopt and
-// gets the instance's own.
-static std::string instance_shards_refusal(const runtime_instance* inst,
-                                           std::optional<bool> lua_override = std::nullopt)
+// It used to take a `lua_override`, for the one caller that could not ask the
+// instance: `create` defers --lua to after every flag has been read, so at the
+// point the set was checked the script was still a local string.  That existed
+// solely to make `--shards 4 --lua x` and `--lua x --shards 4` refuse
+// identically.  A scripted server is no longer refused, so there is nothing for
+// the order to change and the parameter is gone with the rule that needed it.
+static std::string instance_shards_refusal(const runtime_instance* inst)
 {
     if (!inst)
         return {};
 
     return shards_config_refusal(inst->get_type(),
                                  inst->get_shards(),
-                                 lua_override.value_or(
-                                     !inst->get_lua_script_path().empty()),
                                  inst->get_listen_path(),
                                  inst->is_out_of_process());
 }
@@ -1451,16 +1448,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // And the shard count, for the third time the same reason — this one with
-    // the sharpest edge.  --shards is refused on a server that has a script,
-    // and the script arrives as --lua, which may be typed on either side of it.
-    // Checked only in the --shards case label, `--shards 4 --lua x.lua` would
-    // be accepted and `--lua x.lua --shards 4` refused: one runtime, two
-    // answers, decided by the order somebody's fingers happened to reach.
+    // And the shard count, for the third time the same reason: --listen and
+    // --daemon-process may be typed on either side of --shards, so the whole
+    // set is checked here once every flag has been seen.
     //
-    // lua_script rather than the instance, because the load below is what sets
-    // the path on the instance and it has deliberately not run yet.
-    if (const std::string msg = instance_shards_refusal(instance, !lua_script.empty());
+    // --lua used to be the sharpest member of that set — a scripted server was
+    // refused, so the answer had to be the same whichever side of --shards the
+    // script was typed.  It is no longer part of the question.
+    if (const std::string msg = instance_shards_refusal(instance);
         !msg.empty())
     {
         std::cout << msg;
@@ -3548,13 +3543,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // leave the runtime half-changed and its state file disagreeing with it.
     const uint32_t    eff_shards = merged("shards", cfg.shards,
                                           instance->get_shards());
-    const std::string eff_lua    = merged("lua_script", cfg.lua_script,
-                                          std::string(instance->get_lua_script_path()));
     const std::string eff_listen = merged("listen", cfg.listen_path,
                                           std::string(instance->get_listen_path()));
 
     if (const std::string msg = shards_config_refusal(type, eff_shards,
-                                                      !eff_lua.empty(), eff_listen,
+                                                      eff_listen,
                                                       instance->is_out_of_process());
         !msg.empty())
     {

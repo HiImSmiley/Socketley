@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Integration test: self.clients() and self.send(id) across a shard boundary.
 #
-# ─── WHY THIS FILE IS NAMED pending_ AND NOT test_ ──────────────────────────
+# ─── THIS FILE COULD NOT RUN UNTIL THE REFUSAL CAME OFF ────────────────────
 #
-# run_all.sh globs integration/test_*.sh.  This file is outside that glob for
-# the same reason pending_shard_lua_fanout.sh is: the only runtime that can
-# exercise it is a scripted server with --shards, and that is still refused.
-# The numbers below come from a scratch build with the one refusal line
-# disabled and nothing else changed.  Rename both files into the glob in the
-# change that removes the refusal.
+# The only runtime that can exercise this is a scripted server with --shards,
+# and that was refused while the mechanism was being built.  So it lived
+# outside run_all.sh's test_*.sh glob as pending_, carrying the numbers below
+# from a scratch build with the one refusal line disabled and nothing else
+# changed.  It runs for real from the commit that removed the refusal; the
+# figures are kept because they are the red this was watched failing at.
 #
 #     without this change   clients() said 10; 10 of 40 sockets pinged
 #     with it               clients() said 40; 40 of 40, each exactly once
-#     one-shard control     40 either way, which is what says the test is
-#                           about sharding and not about sending
+#     one-shard control     40 either way, which is what says the test is about
+#                           sharding and not about sending
 #
 # ─── THE DEFECT ────────────────────────────────────────────────────────────
 #

@@ -14,19 +14,32 @@
 # FLAGS DEMONSTRATED:
 #   --shards N       Serve this server from N worker processes
 #
-# THE ONE RULE: NO --lua.
-#   Sharding declares that nothing is shared between connections, and nothing
-#   can detect whether that is true -- a Lua table at file scope is the same
-#   object whether the operator meant it as per-connection scratch or as the
-#   room every connection publishes into.  For a proxy the declaration is about
-#   code in this tree.  For a server it would be about the operator's own
-#   script, where cross-connection state is the common case rather than the
-#   exception: a chat room, a presence table, a counter.  Sharded, a message
-#   from a client on shard 1 never reaches a client on shard 2 and nothing
-#   reports it -- self.broadcast, owner_broadcast and upstream_broadcast are all
-#   per-process.  So a server carrying --lua refuses --shards, in either flag
-#   order, and refuses it through edit, through import and at start-up from a
-#   state file as well.
+# WITH --lua TOO, AND WHAT THAT DOES AND DOES NOT GIVE YOU.
+#   A scripted server used to refuse this flag.  Everything a script could ask
+#   about its clients was answered per PROCESS: on four shards
+#   self.connections() reported a quarter of them, self.broadcast reached a
+#   quarter of them, and self.clients() listed a quarter -- as descriptors, so
+#   an id from one shard named a different socket on another.  None of it was
+#   reported.
+#
+#   All four now cross a shard boundary.  connections() sums every shard's own
+#   figure out of a shared mapping with no round trip; broadcast reaches every
+#   shard's clients once each; clients() lists the whole runtime, this shard's
+#   descriptors plus a stable handle per sibling's client; and send(id) on one
+#   of those handles reaches the shard that owns it.
+#
+#   WHAT DOES NOT CROSS, and this is what sharding means rather than a gap in
+#   it: per-connection state is PER SHARD.  A connection belongs to one shard,
+#   so on_connect and on_message for it run there and nowhere else.  A script
+#   holds no state for the ids clients() hands it from elsewhere -- it can name
+#   them, count them and send to them, and it never saw them arrive.  So keep
+#   cross-connection state in a cache runtime, which every shard reaches, and
+#   not in a Lua table at file scope, which each shard has its own copy of.
+#   Step [3/4] below shows both halves.
+#
+#   self.route is still refused in a worker, sharded or not: it hands a live
+#   client to another runtime and runs that runtime's on_connect on this
+#   thread's stack, and there is no channel for that between two processes.
 #
 # WHAT IT COSTS:
 #   Throughput bought with cores, not with efficiency.  Measured on this tree,
@@ -84,22 +97,36 @@ echo "     every process, because 'pid' can only name one of four."
 socketley stats shard-srv 2>/dev/null | grep -E '^shards:|^shard_pids:' || true
 
 echo ""
-echo "[3/4] The rule, demonstrated.  A script and shards together are refused,"
-echo "      and it does not matter which order the flags are typed in:"
+echo "[3/4] A script and shards together, and the one thing to know about it."
 echo ""
 cat > /tmp/sharded-server-demo.lua <<'LUA'
--- Cross-connection state: the ordinary case, and the reason for the rule.
+-- self.connections() is the WHOLE runtime's count, not this process's, and
+-- self.broadcast reaches every shard's clients.  Both are summed and fanned
+-- out for you.
+function on_message(msg)
+    if msg:find("WHO") then
+        self.broadcast("clients: " .. tostring(#self.clients()))
+    end
+end
+
+-- But `room` is per SHARD: each of the four processes has its own copy, and
+-- on_connect for a client fires only in the shard that accepted it.  This is
+-- the table to move into a cache runtime if every shard has to see it.
 local room = {}
 function on_connect(conn) room[#room + 1] = conn end
 LUA
 echo "  \$ socketley create server chat -p 9111 --lua demo.lua --shards 4"
-socketley create server chat -p 9111 --lua /tmp/sharded-server-demo.lua --shards 4 || true
+socketley create server chat -p 9111 --lua /tmp/sharded-server-demo.lua --shards 4 && \
+  echo "     accepted -- and in the other flag order too" || true
+socketley remove chat >/dev/null 2>&1 || true
 echo ""
 echo "  \$ socketley create server chat -p 9111 --shards 4 --lua demo.lua"
-socketley create server chat -p 9111 --shards 4 --lua /tmp/sharded-server-demo.lua || true
+socketley create server chat -p 9111 --shards 4 --lua /tmp/sharded-server-demo.lua && \
+  echo "     accepted" || true
+socketley remove chat >/dev/null 2>&1 || true
 
 echo ""
-echo "[4/4] Two more combinations that are refused rather than ignored:"
+echo "[4/4] Three combinations that are refused rather than ignored:"
 echo ""
 echo "  \$ socketley create server s -p 9112 --shards 4 --daemon-process"
 socketley create server s -p 9112 --shards 4 --daemon-process || true
@@ -110,6 +137,11 @@ echo "  \$ socketley create server s --shards 4 --listen unix:/tmp/s.sock"
 socketley create server s --shards 4 --listen unix:/tmp/s.sock || true
 echo "     (SO_REUSEPORT shares a port; a unix socket is a path, and N"
 echo "      processes would unlink each other's node)"
+echo ""
+echo "  \$ socketley create cache c -p 9113 --shards 4"
+socketley create cache c -p 9113 --shards 4 || true
+echo "     (N shards would be N separate stores behind one port, so a SET"
+echo "      lands in one process and a later GET asks another)"
 
 rm -f /tmp/sharded-server-demo.lua
 

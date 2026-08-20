@@ -98,19 +98,9 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         // The whole rule, with the reason for each half, is in
         // shards_config_refusal (runtime_definitions.h) and not repeated here:
         // it is asked from five places and a second copy of the reasoning is a
-        // copy that drifts.  In one line each — a proxy may, because the
-        // property is one of code in this tree; a server with no --lua may,
-        // because it has no cross-connection state to lose; a server WITH --lua
-        // may not, because the property would be one of the operator's own
-        // file; a cache and a client may not at all.
-        //
-        // The server half was the widening the original refusal named for
-        // itself: "a checkable rule (no --lua at all, or an explicit opt-in
-        // inside the script's own declaration) can be added on top of this".
-        // This is the first of those two.  The second is not invented here —
-        // self.broadcast, owner_broadcast and upstream_broadcast are per-process
-        // today, so an opt-in would be an argument about those three and not
-        // about this flag.
+        // copy that drifts.  In one line each — a proxy may and a server may,
+        // with or without --lua, because what a script can ask for now crosses
+        // a shard boundary; a cache and a client may not at all.
         case fnv1a("--shards"):
         {
             if (i + 1 >= pa.count)
@@ -132,16 +122,18 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             //
             // Asked here with only the facts that cannot change further along
             // the command line: the type, and the number just parsed.  The rest
-            // of what it wants -- whether there is a script, a --listen path, a
-            // --daemon-process -- may be typed AFTER this flag, so asking about
-            // them here would make the answer depend on the order the operator
-            // typed.  `--shards 4 --lua x.lua` and `--lua x.lua --shards 4`
-            // describe one runtime and must be refused identically, so the
-            // whole question is asked again in cmd_create once every flag has
-            // been seen, exactly where the TLS set is checked and for the same
-            // reason.
+            // of what it wants -- a --listen path, a --daemon-process -- may be
+            // typed AFTER this flag, so asking about them here would make the
+            // answer depend on the order the operator typed.  The whole question
+            // is asked again in cmd_create once every flag has been seen,
+            // exactly where the TLS set is checked and for the same reason.
+            //
+            // --lua used to be one of those, and was the sharpest of them: a
+            // scripted server was refused, so `--shards 4 --lua x` and
+            // `--lua x --shards 4` had to reach the same answer.  It is no
+            // longer part of the question at all.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n, false, {}, true); !msg.empty())
+                    instance->get_type(), n, {}, true); !msg.empty())
             {
                 std::cout << msg;
                 return 1;
@@ -1139,14 +1131,13 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid shard count\n";
                 return 1;
             }
-            // Unlike the create case above, an edit CANNOT gain a script or a
-            // --daemon-process further along its own command line: neither flag
-            // is editable.  --listen is, so it is left to the set check in
+            // Unlike the create case above, an edit CANNOT gain a
+            // --daemon-process further along its own command line: the flag is
+            // not editable.  --listen is, so it is left to the set check in
             // cmd_edit rather than read here, and this asks the half of the
             // question whose inputs are already final.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n,
-                    !instance->get_lua_script_path().empty(), {},
+                    instance->get_type(), n, {},
                     instance->is_out_of_process()); !msg.empty())
             {
                 std::cout << msg;

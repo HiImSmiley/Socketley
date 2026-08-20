@@ -161,13 +161,11 @@ bool runtime_instance::start(event_loop& loop)
     // `create`, `edit` and `import` all ask shards_config_refusal already, and
     // they are where the operator gets the message on their terminal.  This is
     // the path none of them is on: a state file carrying `"shards": 4` on a
-    // scripted server — written by hand, or by a build from before this rule
-    // existed — is restored at boot and auto-started without passing a parser.
-    // Without this line it would come up sharded and silently split its
-    // script's cross-connection state, which is the one outcome the rule
-    // exists to prevent.
+    // cache — written by hand, or by a build whose rules differed — is restored
+    // at boot and auto-started without passing a parser.  Without this line it
+    // would come up sharded and answer a miss for 1/N of the data it holds.
     if (const std::string msg = shards_config_refusal(
-            get_type(), m_shards, !m_lua_script_path.empty(),
+            get_type(), m_shards,
             get_listen_path(), m_out_of_process || in_worker_process());
         !msg.empty())
     {

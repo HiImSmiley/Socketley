@@ -27,9 +27,11 @@
 #   owns it.  A cache refuses it outright: N shards would be N separate stores
 #   behind one port, and a GET on a new connection would miss data that was
 #   stored.  A client refuses it outright: it has no listening socket to share.
-#   A server may shard when it has no --lua, and may not when it has one, for
-#   the reason spelled out in ../server/sharded-server.sh -- its state would be
-#   its script's, and splitting it fails silently.
+#   A server may shard with or without --lua: connections(), broadcast(),
+#   clients() and send(id) all cross a shard boundary now.  What does not is
+#   per-connection state -- on_connect for a client fires only in the shard
+#   holding it -- so a script keeps shared state in a cache rather than in a
+#   Lua table.  See ../server/sharded-server.sh.
 #
 # =============================================================================
 

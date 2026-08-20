@@ -1663,33 +1663,62 @@ is 1, which is what every server was before this flag was offered here.
 A runtime is one process and therefore one event loop on one core. This is the
 only way to give a single server more than that.
 .PP
-.B "Only on a server with no \-\-lua."
-A sharded runtime is a declaration that nothing is shared between connections.
-For a
-.B proxy
-that is a property of code in this tree. For a server it is a property of the
-operator's own script, and cross-connection state there is the common case
-rather than the exception \(em a chat room, a presence table, a counter. Sharded,
-a message from a client on shard 1 never reaches a client on shard 2, and
-nothing reports it: the operator finds out from a user, under exactly the load
-the flag was bought for.
-.BR self.broadcast ,
-.B owner_broadcast
-and
-.B upstream_broadcast
-are per-process, so a script that broadcasts is wrong the moment there is a
-second process.
+.B "With or without \-\-lua."
+A scripted server used to refuse this flag, because the three things a script
+can ask about its clients were answered per PROCESS: on four shards
+.B self.connections()
+reported a quarter of them,
+.B self.broadcast
+reached a quarter of them, and
+.B self.clients()
+listed a quarter of them \(em as descriptors, so an id from one shard named a
+different socket on another. None of it was reported.
 .PP
-So a server carrying
-.B \-\-lua
-refuses
-.BR \-\-shards ,
-in either flag order, and refuses it through
-.BR edit ,
-through
-.B import
-and at start-up from a state file as well \(em there is no door that accepts the
-pair. Shard a server with no script, or run the scripted one unsharded.
+Each of those now crosses a shard boundary.
+.B self.connections()
+sums every shard's own published figure out of a shared mapping, with no round
+trip.
+.B self.broadcast
+and
+.B socketley.send
+addressed to this runtime reach every shard's clients, once each.
+.B self.clients()
+lists the whole runtime \(em this shard's descriptors, plus a stable handle for
+each client a sibling holds \(em and
+.B self.send
+on one of those handles reaches the shard that owns it.
+.PP
+.B "Per-connection state is per shard, and that is what sharding means."
+A connection belongs to exactly one shard, so every callback about it runs
+there and nowhere else.
+.B on_connect
+for a client a sibling accepted fired in that sibling, and
+.B on_message
+for it will too. A script therefore holds no state for the ids
+.B self.clients()
+hands it from another shard: it can name them, count them and send to them, and
+it has never seen them arrive. Design the script for that \(em keep
+cross-connection state in a
+.B cache
+runtime, which every shard reaches, rather than in a Lua table at file scope,
+which each shard has its own copy of.
+.PP
+.B "self.route is still refused in a worker."
+Sharded or not. Routing hands a live client to another runtime, which answers it
+while this server keeps the socket and relays the bytes; that reaches into the
+other runtime's tables and runs its
+.B on_connect
+on this thread's stack, and there is no channel for it between two processes.
+Nothing about
+.B \-\-shards
+changes that in either direction \(em an unsharded server in a worker refuses it
+too.
+.B unroute,
+.B get_route
+and
+.B owner_send
+are not refused: they read this runtime's own tables, which in a worker are
+empty because nothing was ever routed in.
 .PP
 .B "What it bought, measured."
 One server runtime in

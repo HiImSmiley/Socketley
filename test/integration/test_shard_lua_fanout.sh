@@ -1,26 +1,19 @@
 #!/usr/bin/env bash
 # Integration test: self.broadcast on a runtime that is N processes.
 #
-# ─── WHY THIS FILE IS NAMED pending_ AND NOT test_ ──────────────────────────
+# ─── THIS FILE COULD NOT RUN UNTIL THE REFUSAL CAME OFF ────────────────────
 #
-# run_all.sh globs integration/test_*.sh.  This file is deliberately outside
-# that glob, because the only runtime that can exercise self.broadcast across a
-# shard boundary is a scripted server with --shards, and that configuration is
-# still REFUSED — lifting the refusal is step 5, and it must not be lifted until
-# routing holds too.
+# The only runtime that can exercise this is a scripted server with --shards,
+# and that was refused while the mechanism was being built.  So it lived
+# outside run_all.sh's test_*.sh glob as pending_, carrying the numbers below
+# from a scratch build with the one refusal line disabled and nothing else
+# changed.  It runs for real from the commit that removed the refusal; the
+# figures are kept because they are the red this was watched failing at.
 #
-# It is committed rather than held back, because it has been run, and the
-# numbers below are what it produced.  Measured on a scratch build with the one
-# refusal line disabled and nothing else changed:
-#
-#     without the fan-out    15 of 40 sockets reached, 15 deliveries
-#     with the fan-out       40 of 40 sockets reached, 40 deliveries
-#     one-shard control      40 of 40 in both, which is what says the test is
-#                            about sharding and not about broadcasting
-#
-# Rename it to test_shard_lua_fanout.sh in the change that removes the refusal.
-# That change is where it starts running, and where it stops being a claim
-# about a build nobody else can make.
+#     without the fan-out   15 of 40 sockets reached, 15 deliveries
+#     with the fan-out      40 of 40 sockets reached, 40 deliveries
+#     one-shard control     40 of 40 in both, which is what says the test is
+#                           about sharding and not about broadcasting
 #
 # ─── THE DEFECT ────────────────────────────────────────────────────────────
 #
