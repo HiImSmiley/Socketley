@@ -175,7 +175,7 @@ echo "--- Unit Tests ---"
 echo ""
 # Every unit-test binary the build produced, rather than a list of five.
 #
-# premake5.lua defines eleven.  test_conn_transfer, test_managed_runtime and the
+# premake5.lua defines fourteen.  test_conn_transfer, test_managed_runtime and the
 # four SDK tests were compiled by every build and run by nothing — not here, not
 # in ci.yml, not in nightly.yml.  A list of names goes stale the moment somebody
 # adds a test and forgets one file, and it goes stale silently, which is the one
@@ -186,11 +186,86 @@ echo ""
 # in there is run too — which is how the count above was first written down as
 # thirteen: bin/Release still held test_single_header and test_single_header_lua
 # from February, with no project, no source and nothing that rebuilds them.
-# They passed, and passing said nothing about this tree.
+# They passed, and passing said nothing about this tree.  They are still run,
+# and are now named as they go past -- see the check immediately below, which
+# reads premake5.lua for the expectation the glob cannot supply.
+
+# ─── What the build was supposed to produce ─────────────────────────────────
+#
+# The glob above answers "what is in the directory", and that is not the same
+# question as "did everything get built".  Measured on 2026-08-20: a Sanitize
+# run started while `make` was still linking found bin/Sanitize without
+# test_managed_runtime and test_worker_map in it -- they link last -- and the
+# suite reported `172 passed, 0 failed` and exited 0.  Both binaries pass
+# standalone.  A run that skipped two whole test binaries is indistinguishable
+# from a run that had nothing to skip, because the only number that moved was a
+# total nobody has a reference value for.
+#
+# So the expectation is read from premake5.lua, which is the one authority on
+# what this tree defines, and a shortfall is fatal rather than quiet.  The same
+# reasoning as the empty-glob check below it, applied to a PARTIAL glob: an
+# empty one was already caught, and the partial one is the case that produces a
+# green run instead of an obvious one.
+#
+# Derived, never listed -- for the reason the glob is a glob.  A hand-kept
+# expected count would go stale the moment somebody adds a project, and it would
+# go stale by reporting a PASS.
+#
+# It stays a check on names, not a replacement for the glob: the glob still runs
+# whatever is there, so a stale binary from a deleted project is still executed
+# and is now also NAMED, which is what the comment above wanted and could not
+# have.
+expected_targets() {   # PREFIX -> the project names premake5.lua defines
+    sed -n "s/^project \"\($1[A-Za-z0-9_]*\)\".*/\1/p" "$ROOT/premake5.lua"
+}
+
+# missing_targets PREFIX  -> names defined by the build but absent from BIN_DIR
+missing_targets() {
+    local n missing=""
+    for n in $(expected_targets "$1"); do
+        [ -f "$BIN_DIR/$n" ] && [ -x "$BIN_DIR/$n" ] && continue
+        missing="$missing $n"
+    done
+    printf '%s' "${missing# }"
+}
+
+UNIT_TARGETS=$(expected_targets test_ | tr '\n' ' ')
+unit_expected=$(printf '%s' "$UNIT_TARGETS" | wc -w)
+unit_missing=$(missing_targets test_)
+# premake5.lua unreadable, moved, or its project syntax changed: the expectation
+# is then vacuous and would wave through exactly the build this check exists to
+# stop.  Fatal, because a check that cannot fail is worse than no check.
+if [ "$unit_expected" -eq 0 ]; then
+    echo "ERROR: no test_* projects found in $ROOT/premake5.lua."
+    echo "       This check derives what the build owes from that file; with no"
+    echo "       expectation it cannot tell a complete build from half of one."
+    exit 1
+fi
+# Before a single test runs, not after.  A shortfall makes every number below
+# it meaningless, and ten minutes of integration tests on top of a half-linked
+# build is ten minutes spent producing a total that must be thrown away.
+if [ -n "$unit_missing" ]; then
+    echo "ERROR: premake5.lua defines $unit_expected unit test targets and"
+    echo "       $BIN_DIR holds fewer.  Missing:"
+    for m in $unit_missing; do echo "         $m"; done
+    echo "       A build that is still linking looks exactly like this: the glob"
+    echo "       finds what has been written so far, every one of them passes,"
+    echo "       and the run reports a smaller total as a success.  Finish the"
+    echo "       build (or delete the stale directory) and run again."
+    exit 1
+fi
+echo "  ($unit_expected unit targets defined in premake5.lua, all present)"
+echo ""
+
 unit_found=0
 for t in "$BIN_DIR"/test_*; do
     [ -f "$t" ] && [ -x "$t" ] || continue
     unit_found=$((unit_found + 1))
+    case " $UNIT_TARGETS " in
+        *" $(basename "$t") "*) ;;
+        *) echo "NOTE: $(basename "$t") is in $BIN_DIR but no project builds it;"
+           echo "      it is run below, and what it passes says nothing about this tree." ;;
+    esac
     run_test "$(basename "$t" | sed 's/^test_//')" "$t"
 done
 
@@ -239,6 +314,26 @@ fi
 echo "--- Fuzz Corpus Replay ---"
 echo ""
 FUZZ_CORPUS_DIR="$SCRIPT_DIR/fuzz/corpus"
+# The same partial-glob check as the unit section, for the same reason and from
+# the same authority.  These link last of all, so a run started mid-build loses
+# them first.
+FUZZ_TARGETS=$(expected_targets fuzz_ | tr '\n' ' ')
+fuzz_expected=$(printf '%s' "$FUZZ_TARGETS" | wc -w)
+fuzz_missing=$(missing_targets fuzz_)
+if [ "$fuzz_expected" -eq 0 ]; then
+    echo "ERROR: no fuzz_* projects found in $ROOT/premake5.lua."
+    exit 1
+fi
+if [ -n "$fuzz_missing" ]; then
+    echo "ERROR: premake5.lua defines $fuzz_expected fuzz targets and $BIN_DIR"
+    echo "       holds fewer.  Missing:"
+    for m in $fuzz_missing; do echo "         $m"; done
+    echo "       A target that is not there replays no corpus and reports no"
+    echo "       finding, which is what a target that found nothing also does."
+    exit 1
+fi
+echo "  ($fuzz_expected fuzz targets defined in premake5.lua, all present)"
+echo ""
 fuzz_found=0
 for f in "$BIN_DIR"/fuzz_*; do
     [ -f "$f" ] && [ -x "$f" ] || continue

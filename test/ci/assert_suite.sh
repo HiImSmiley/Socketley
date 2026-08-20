@@ -32,18 +32,39 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG="${1:-$ROOT/suite.log}"
 
-# The unit tests test/run_all.sh runs by name, in the order it runs them.
-UNIT_TESTS=(test_command_hashing test_cache_store test_resp_parser test_name_resolver test_ws_parser)
-
+# What the suite owes, from the two places that define it: premake5.lua for the
+# binaries and the directory listing for the integration files.
+#
+# This was a hand-written list of five unit tests, and the floor it produced was
+# too low to do the job (3) claims for it.  The suite runs fourteen unit
+# binaries and eleven fuzz replays; against a floor of 5 + integration, a run
+# that lost two whole unit binaries still cleared it by twenty and reported
+# PASS.  That is the exact failure this wrapper was written to catch, in the
+# wrapper: measured on 2026-08-20, a Sanitize run started while make was still
+# linking skipped test_managed_runtime and test_worker_map and reported
+# "172 passed, 0 failed".
+#
+# Derived, so it cannot go stale the way the list did.  run_all.sh now refuses
+# to start when a defined target is missing from the build directory, which is
+# the earlier and better place for it; this stays as the check on what actually
+# RAN, which is a different question and the one a wrapper can answer.
+unit_count=$(sed -n 's/^project "\(test_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | wc -l)
+fuzz_count=$(sed -n 's/^project "\(fuzz_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | wc -l)
 integration_count=$(find "$ROOT/test/integration" -maxdepth 1 -name 'test_*.sh' -type f | wc -l)
-expected=$((${#UNIT_TESTS[@]} + integration_count))
+expected=$((unit_count + fuzz_count + integration_count))
 
 if [ "$integration_count" -eq 0 ]; then
     echo "ERROR: found no integration tests in $ROOT/test/integration — refusing to report a pass."
     exit 2
 fi
+if [ "$unit_count" -eq 0 ] || [ "$fuzz_count" -eq 0 ]; then
+    echo "ERROR: premake5.lua names $unit_count test_* and $fuzz_count fuzz_* projects."
+    echo "       With no expectation to compare against, the count check below"
+    echo "       would pass on a run that executed almost nothing."
+    exit 2
+fi
 
-echo "expecting ${#UNIT_TESTS[@]} unit tests + $integration_count integration tests = $expected"
+echo "expecting $unit_count unit + $fuzz_count fuzz + $integration_count integration = $expected"
 
 bash "$ROOT/test/run_all.sh" 2>&1 | tee "$LOG"
 suite_rc=${PIPESTATUS[0]}
