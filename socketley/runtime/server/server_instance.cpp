@@ -4486,6 +4486,18 @@ void server_instance::lua_broadcast(std::string_view msg)
     }
 }
 
+// One pass over every connection, one submission each, and no return to the
+// event loop in between — the same shape as cache_instance::publish(), and it
+// had the same defect for the same reason.  get_sqe() used to report a full
+// submission queue as a permanent failure, so flush_write_queue() below dropped
+// the bytes and set `closing`: measured on this tree, SQPOLL on, 3000 connected
+// clients and a 2048-entry ring, one broadcast reached exactly 2048 of them and
+// 952 were marked closing and never told the message existed.  Fixed in
+// shared/event_loop.cpp, which is where it belongs — two runtimes had it.
+// test_server_broadcast_reaches_all.sh is the guard.
+//
+// Anything added here that submits per connection inherits that history: this
+// loop is bounded only by how many clients are connected.
 void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))

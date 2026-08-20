@@ -44,6 +44,25 @@
 # otherwise.  One publish to more subscribers than the ring has SQ entries
 # (2048 by default) runs out partway down the subscriber list — measured here at
 # exactly 2048 delivered of 3000, with 952 given up on.
+#
+# ─── THE PROVOCATION NO LONGER FIRES, AND THAT IS THE POINT ─────────────────
+#
+# The paragraph above describes the tree as it was.  get_sqe() now waits for the
+# SQPOLL thread to drain the submission queue instead of reporting a permanent
+# failure, so publish() no longer gives up on anybody for a shortage of SQEs:
+# this file's sqpoll arm delivers 3000 of 3000 and prints its own "gave up on
+# nobody" note.  The delivery half of that is
+# test_cache_publish_delivers_to_all.sh, which is where the numbers above now
+# live as a regression guard.
+#
+# This file is NOT redundant and must not be deleted.  publish() still has two
+# marks that defer a `closing` connection's teardown to its armed read — the
+# 8 MB write-queue cap and a flush that genuinely could not reach the ring — and
+# the assertion below is the only thing standing between them and the "obvious
+# repair" that routes them through classify(), which was measured at 0 of 952
+# reachable.  What it no longer does is provoke the second mark; its own NOTE
+# says so on every run, and that honesty is worth more than a green tick that
+# would be true of a build with nothing in it.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"

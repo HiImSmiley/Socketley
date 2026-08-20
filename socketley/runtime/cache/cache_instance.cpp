@@ -4577,11 +4577,22 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             // been taken out of m_conn_idx, so nothing looks at it again.
             // test_cache_publish_subscriber_reachable.sh holds that line.
             //
-            // What is NOT claimed here: that giving up is the right answer.  A
-            // subscriber dropped for a transient local shortage is dropped
-            // silently, never retried and never told, and goes on believing it
-            // is subscribed.  That is a real defect, it is about delivery
-            // rather than reachability, and it is not this one.
+            // The defect that paragraph left open — a subscriber dropped for a
+            // transient local shortage, silently, never retried and never told,
+            // going on believing it is subscribed — was real and is fixed, and
+            // NOT here.  It was one line in shared/event_loop.cpp: get_sqe()
+            // treated a full submission queue as permanent because its only
+            // recovery was io_uring_submit(), which under SQPOLL is a store to
+            // the ring tail and frees no slot.  It now waits for the poller.
+            // See get_sqe_when_full() for the measurements and for why waiting
+            // rather than dropping or growing the ring is the answer, and
+            // test_cache_publish_delivers_to_all.sh for the guard.
+            //
+            // So the second mark below is now reached only when the ring is
+            // genuinely closed or the kernel refuses IORING_ENTER_SQ_WAIT, and
+            // the loop logs both.  The reasoning above still governs what
+            // happens WHEN it is reached, and it is still not classify()'s
+            // business — which is why the sibling test stays.
 
             // A subscriber that has stopped reading must not be allowed to grow
             // the queue without limit, but the bound is memory: a slow reader on
@@ -4634,10 +4645,12 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 // armed; its handler finishes the teardown.
                 //
                 // Nothing reached the ring, so this is the local-shortage mark
-                // the block above describes: reachable only when get_sqe()
-                // cannot produce an SQE, which under SQPOLL means one publish
-                // fanning out past the ring's depth.  Measured at 952 of 3000
-                // subscribers on a 2048-entry ring, every one of them alive.
+                // the block above describes.  It used to fire for a submission
+                // queue that was merely full — measured at 952 of 3000
+                // subscribers on a 2048-entry ring, every one of them alive and
+                // none of them told — and get_sqe() now waits that out instead.
+                // What is left here is a ring that is closed or a kernel that
+                // will not wait, and the loop has already logged either.
                 sub_conn->closing = true;
                 continue;
             }

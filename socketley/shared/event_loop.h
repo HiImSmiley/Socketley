@@ -544,8 +544,18 @@ public:
     // the caller, not to a log line nobody reads.
     bool affinity_applied() const { return m_affinity_applied; }
 
+    // How often the submission queue was found full, and how often that ended
+    // in an operation being refused the ring anyway.  The second number is the
+    // one that costs something: every caller turns a refusal into dropped bytes
+    // or a closed connection, so a non-zero count is a delivery defect that has
+    // already happened.  Exposed because the alternative is a shortage that
+    // only shows up as unexplained losses somewhere else entirely.
+    uint64_t sq_full_count() const { return m_sq_full_count; }
+    uint64_t sq_exhausted_count() const { return m_sq_exhausted_count; }
+
 private:
     struct io_uring_sqe* get_sqe();
+    struct io_uring_sqe* get_sqe_when_full();
     void setup_eventfd();
     bool init_fd_tables();
     void apply_cpu_affinity();
@@ -618,6 +628,16 @@ private:
     // shutdown_ring().  get_sqe() is the single door every submission goes
     // through, so testing it there covers all of them.
     bool m_ring_open{false};
+    // See get_sqe_when_full().  m_sq_full_logged keeps the warning to one line
+    // per ring: the condition repeats once per submission for the rest of a
+    // fan-out, and a line each would bury the thing it is reporting.
+    bool m_sq_full_logged{false};
+    uint64_t m_sq_full_count{0};
+    uint64_t m_sq_exhausted_count{0};
+    // How many times IORING_ENTER_SQ_WAIT may be re-entered for one SQE.  Each
+    // return either freed an entry or ended the loop, so this is a bound on
+    // signal interruptions and not a retry budget.
+    static constexpr unsigned SQ_WAIT_ATTEMPTS = 8;
     uint32_t m_registered_file_count{0};
 
     // Fixed file slot allocation (bitmap-based)

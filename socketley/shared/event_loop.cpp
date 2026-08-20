@@ -225,10 +225,9 @@ void event_loop::setup_eventfd()
     }
 }
 
-// Centralized SQE acquisition: get an SQE, flushing if the ring is full.
-// The fast path (SQE available) is branch-predicted; the flush path is cold.
-// After flush, retry once — if still null the SQ is genuinely full (shouldn't
-// happen at our queue depths, but defensive).
+// Centralized SQE acquisition: get an SQE, and go the long way round when the
+// ring has none.  The fast path is branch-predicted; everything else is out of
+// line in get_sqe_when_full().
 inline struct io_uring_sqe* event_loop::get_sqe()
 {
     // There is no ring to hand out an SQE from before init() and none after
@@ -242,10 +241,107 @@ inline struct io_uring_sqe* event_loop::get_sqe()
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
     if (__builtin_expect(!sqe, 0))
+        sqe = get_sqe_when_full();
+    return sqe;
+}
+
+// ─── The submission queue is full ───────────────────────────────────────────
+//
+// Two very different situations arrive here and they need different answers.
+//
+// WITHOUT SQPOLL, io_uring_submit() is a syscall that consumes everything the
+// ring holds, so one submit-and-retry always makes room.  If it does not, the
+// kernel refused the submission outright and no amount of waiting changes that.
+// That is what the code below the retry is for, and it is unchanged.
+//
+// UNDER SQPOLL it is not a syscall at all — it is a store to the ring tail —
+// and the entries are consumed by a kernel thread at a moment nothing here can
+// observe.  The retry therefore waited for room that nothing was making, and
+// every caller was told "this never reached the ring" for what is only a
+// transient local shortage.  That answer is then read as a permanent
+// per-connection failure at nineteen sites across cache, server and proxy: the
+// queued bytes are dropped, `closing` is set, or a read is never re-armed.
+// Measured on this tree, SQPOLL on, a 2048-entry ring:
+//
+//     one publish to 3000 subscribers      2048 delivered, 952 thrown away
+//                                          silently — never retried, never
+//                                          reported, and every one of those
+//                                          subscribers still believed it was
+//                                          subscribed
+//     3000 subscribes, acks read after     up to 250 acknowledgements lost, so
+//       all of them were sent                those clients never subscribed at
+//                                            all
+//
+// So the answer here is back-pressure, not loss.  Nothing is wrong with the
+// connection and nothing is wrong with the data; the only thing that has run
+// out is a queue somebody else is draining right now.  Waiting for one entry
+// restores the contract all 145 submit_* call sites already assume — that a
+// submission fails when the ring is closed, and otherwise does not.
+//
+// Growing the ring was the other candidate and it is not an answer: it moves
+// the width at which a fan-out overruns the queue without removing it, and the
+// next report is the same defect at 8192 subscribers.
+//
+// The submit() below is load-bearing beyond flushing.  Under SQPOLL liburing
+// only enters the kernel when the poller has parked and set IORING_SQ_NEED_WAKEUP,
+// and it is that call which carries IORING_ENTER_SQ_WAKEUP; waiting on a parked
+// poller without having woken it would be a wait nobody ends.
+struct io_uring_sqe* event_loop::get_sqe_when_full()
+{
+    io_uring_submit(&m_ring);
+    m_pending_submissions = 0;
+
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
+    if (sqe)
+        return sqe;
+
+    if (m_sqpoll_enabled)
     {
-        io_uring_submit(&m_ring);
-        m_pending_submissions = 0;
-        sqe = io_uring_get_sqe(&m_ring);
+        ++m_sq_full_count;
+
+        // io_uring_sqring_wait() returns as soon as the poller has consumed at
+        // least one entry, so one pass is normally the whole story; the loop
+        // exists for a signal arriving in the middle of it.  A kernel that does
+        // not support IORING_ENTER_SQ_WAIT answers -EINVAL, and that must end
+        // the loop rather than turn it into a spin.
+        for (unsigned attempt = 0; attempt < SQ_WAIT_ATTEMPTS; ++attempt)
+        {
+            const int r = io_uring_sqring_wait(&m_ring);
+            if (r < 0 && r != -EINTR)
+                break;
+            sqe = io_uring_get_sqe(&m_ring);
+            if (sqe)
+                break;
+        }
+
+        // Once per ring.  The condition repeats for every remaining submission
+        // of the fan-out that provoked it, and a line each would bury it.
+        if (!m_sq_full_logged)
+        {
+            m_sq_full_logged = true;
+            LOG_WARN("event loop: the submission queue was full and this ring had "
+                     "to wait for the SQPOLL thread to drain it; the queue depth "
+                     "is below what this workload submits in one go");
+        }
+    }
+
+    if (!sqe)
+    {
+        // Whatever else happens, this does not go unsaid.  The caller is about
+        // to be told the submission never reached the ring, and every caller
+        // turns that into dropped bytes, a closed connection or a read that is
+        // never re-armed — none of which the peer is ever told about.
+        ++m_sq_exhausted_count;
+        if (m_sq_exhausted_count == 1 || (m_sq_exhausted_count % 1000) == 0)
+        {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "event loop: no submission queue entry could be obtained; "
+                     "%llu operation(s) have now been refused the ring and their "
+                     "data dropped",
+                     static_cast<unsigned long long>(m_sq_exhausted_count));
+            LOG_ERROR(msg);
+        }
     }
     return sqe;
 }
