@@ -1843,6 +1843,72 @@ const ws = new WebSocket("ws://localhost:9000");
 ws.onmessage = e => console.log(e.data);
 ws.send("hello");
 .fi
+.SS Request Framing
+The server frames an HTTP request by exactly the rules the proxy uses, and
+they are the same rules because they are the same code. A request whose
+header block gives no answer, or two answers, to "how long is the body" is
+answered
+.B 400 Bad Request
+and its connection is closed. That happens when the block contains any of:
+.RS
+.IP \(bu 2
+a bare LF or a bare CR \(em every line must end with CRLF
+.IP \(bu 2
+whitespace between a field name and its colon
+.RB ( "Content\-Length : 6" )
+.IP \(bu 2
+a continuation (obs\-fold) line, i.e. one starting with a space or tab
+.IP \(bu 2
+a field line with no colon, or with an empty field name
+.IP \(bu 2
+more than one
+.B Content\-Length
+field, or a
+.B Content\-Length
+together with a
+.B Transfer\-Encoding
+.IP \(bu 2
+a
+.B Content\-Length
+that is not a whole decimal number
+.RB ( "Content\-Length: 6x" )
+.RE
+.PP
+A tab is legal optional whitespace around a field value \(em a
+.B Content\-Length
+separated from its colon by a tab rather than a space is an ordinary
+request and is served, as is a value with trailing whitespace. Values reach
+.B on_http_request
+with that whitespace removed from both ends.
+.PP
+.B Transfer\-Encoding
+is answered
+.B 501 Not Implemented
+and the connection is closed. This server implements no transfer coding,
+including
+.BR chunked ,
+and a body it cannot read is a body whose end it cannot find \(em so the
+request is refused rather than treated as though it had no body at all.
+Send a
+.B Content\-Length
+instead. A proxy in front forwards
+.B chunked
+verbatim, so a chunked request through a socketley proxy to a socketley
+server is answered 501 by the server and the 501 is relayed.
+.PP
+Why a server bothers with any of this, when it is the last recipient and
+has nobody to disagree with: it usually is not. The moment anything sits
+in front of it \(em this proxy, or any other \(em there are two parsers
+reading one byte stream, and a header a strict parser ignores and a
+lenient one honours moves the boundary between one request and the next.
+Since the server serves pipelined requests without waiting for another
+read, a body it wrongly measured as empty is read as the next request:
+one message in, two answered, and the client chooses what the second one
+says. Compliant clients emit none of these shapes.
+.PP
+A request whose header block is still arriving is held until the
+terminating blank line, subject to a 16 KiB header limit; past that the
+connection is closed.
 .SS Cache Access via Server
 When a server is linked to a cache with
 .BR \-\-cache ,
@@ -3630,6 +3696,16 @@ version     string   HTTP version (e.g. "1.1")
 headers     table    Request headers {["Host"]="...", ...}
 .fi
 .IP
+Header names arrive as the client spelled them. Values arrive with
+optional whitespace \(em spaces and tabs \(em removed from both ends, so
+.B "X\-Token:\ \ abc\ "
+reaches the callback as
+.BR abc .
+The callback is not reached at all by a request whose framing this server
+refuses; see
+.B "Request Framing"
+above for what those are and what they are answered.
+.IP
 Return a table with the HTTP response:
 .nf
 {
@@ -5003,6 +5079,11 @@ in TCP mode there is no request boundary to measure from.
 .SS Request Framing
 In HTTP mode the proxy is strict about how a request's header block is
 framed, and refuses anything it and a backend could read differently.
+These are the same rules a socketley server applies to a request it
+receives directly, from one implementation \(em see
+.B "Request Framing"
+under
+.BR "SERVER FLAGS" .
 The proxy forwards bytes to a backend that parses them independently; if
 the two disagree about where a request ends, the next request on the
 same connection starts in the wrong place, which is request smuggling.

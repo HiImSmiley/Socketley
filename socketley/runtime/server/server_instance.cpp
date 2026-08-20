@@ -766,6 +766,50 @@ static const std::shared_ptr<const std::string>& http_404_response(bool keep_ali
     return keep_alive ? resp_ka : resp_close;
 }
 
+// ─── THE TWO WAYS A REQUEST IS REFUSED BEFORE IT IS A REQUEST ───────────────
+//
+// Both are `Connection: close` unconditionally, and that is not politeness.
+// Refusing means this end could not decide where the message ends; carrying on
+// would mean deciding exactly that, so the next request on the socket could
+// start.  The connection goes with the refusal, and handle_read drops whatever
+// is still buffered so that nothing already on the wire is picked up as a
+// fresh request while the error is on its way out.
+static const std::shared_ptr<const std::string>& http_400_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: close\r\n\r\n"
+        "Bad Request\n");
+    return resp;
+}
+
+// A Transfer-Encoding this server does not implement — which is all of them.
+// RFC 9112 Section 6.1 asks for 501 here rather than 400: the request is
+// well-formed, it is this recipient that cannot follow it.  The distinction is
+// worth keeping because it is the honest one, and because a client that gets a
+// 400 for a legal chunked request has been told something untrue about its own
+// message.
+//
+// The alternative was to implement chunked framing, and it was rejected for
+// this change rather than forgotten: it is a body-reading feature with its own
+// buffer limits, its own trailer handling and its own size cap, and none of
+// that belongs in a change whose subject is where a header block ends.  What is
+// NOT defensible is the third option, which is what stood here — a chunked body
+// read as a body of length zero, so the chunk data was parsed as the next
+// request on the connection.
+static const std::shared_ptr<const std::string>& http_501_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 501 Not Implemented\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 34\r\n"
+        "Connection: close\r\n\r\n"
+        "Transfer-Encoding not implemented\n");
+    return resp;
+}
+
 void server_instance::rebuild_http_cache()
 {
     m_http_cache.clear();
@@ -1322,6 +1366,25 @@ static std::string_view http_reason(int status)
     }
 }
 #endif
+
+void server_instance::refuse_http_request(server_connection* conn,
+                                          const std::shared_ptr<const std::string>& resp)
+{
+    // The buffer goes first.  Everything in it was measured against a header
+    // block this end could not frame, so its boundaries are exactly what is in
+    // doubt; leaving it for the reparse loop at the bottom of handle_read would
+    // hand the client the second answer the refusal exists to withhold.
+    conn->partial.clear();
+
+    conn->write_queue.push(resp);
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+
+    // Unconditional, and not conditioned on http_keep_alive the way the 404
+    // path is: keep-alive means "the next request starts where this one ends",
+    // and this end has just said it cannot tell where that is.
+    conn->closing = true;
+}
 
 void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
 {
@@ -3278,6 +3341,39 @@ reparse:
             }
             else
             {
+                // ─── THE THIRD REQUEST-PARSE REGION, AND THE SAME GATE ──────
+                //
+                // A GET that turns out NOT to be an upgrade falls through to
+                // proto_http above and is judged there.  One that IS an upgrade
+                // used to be answered 101 without its header block having been
+                // framed by anybody, so the same obs-fold and bare-LF blocks the
+                // proxy refuses outright would have opened a WebSocket here.
+                //
+                // It is a weaker case than the pipelined one and worth saying
+                // why: an upgrade consumes exactly hdr_end + 4 and then reads
+                // frames, so a malformed block cannot produce a second answer —
+                // no smuggle.  What it can do is let this end and a proxy in
+                // front read the handshake's own fields differently, which is
+                // the disagreement the rest of this change exists to remove.
+                // The scan is not run on the fall-through path, so a plain GET
+                // pays nothing for it.
+                if (SOCKETLEY_UNLIKELY(
+                        !http_eol_framing_ok(std::string_view(conn->partial.data(), hdr_end), true)))
+                {
+                    refuse_http_request(conn, http_400_response());
+                    return;
+                }
+                {
+                    const size_t rl_end = hdrs.find("\r\n");
+                    const http_request_framing_scan up =
+                        http_scan_request_headers(hdrs.substr(rl_end + 2, hdr_end - rl_end - 2));
+                    if (SOCKETLEY_UNLIKELY(!up.ok))
+                    {
+                        refuse_http_request(conn, http_400_response());
+                        return;
+                    }
+                }
+
                 std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
 
                 // Send 101 response
@@ -3436,6 +3532,27 @@ reparse:
             return;
         }
 
+        // ─── THE BLOCK IS JUDGED BEFORE ANYTHING IS PARSED OUT OF IT ─────
+        //
+        // A bare LF in the header block is a line ending only one of the two
+        // ends of a keep-alive conversation may honour, and the loop at the
+        // bottom of this arm makes that a live boundary rather than a cosmetic
+        // one: "Host: x\nContent-Length: 38\r\n" splits on CRLF into ONE line
+        // whose name is Host, so the Content-Length is never seen, the body is
+        // taken as empty, and the 38 bytes behind it are read as the NEXT
+        // request.  Measured on ada6f1c: two answers to one message, the second
+        // one the client's to choose.  The proxy has refused this since it
+        // learned to; the server did not, and the two sit in the same pipeline.
+        //
+        // `complete` is true: this runs only once "\r\n\r\n" has been found, so
+        // a trailing CR is a real bare CR and not a CRLF split across reads.
+        if (SOCKETLEY_UNLIKELY(!http_eol_framing_ok(
+                std::string_view(conn->partial.data(), hdr_end), true)))
+        {
+            refuse_http_request(conn, http_400_response());
+            return;
+        }
+
         // Extract request line
         std::string_view full(conn->partial.data(), conn->partial.size());
         auto first_crlf = full.find("\r\n");
@@ -3468,8 +3585,55 @@ reparse:
             hreq.path = raw_path;
         }
 
-        // Parse headers + detect Content-Length
-        size_t content_length = 0;
+        // ─── WHERE THIS MESSAGE ENDS: ONE DECISION, SHARED WITH THE PROXY ───
+        //
+        // This used to be a Content-Length lookup and nothing else, and every
+        // shape it did not know about resolved the same way — length zero, body
+        // empty, and whatever followed read as the next request on the
+        // connection.  Four of those shapes were measured against this server
+        // and the proxy side by side on one binary (ada6f1c), one write each,
+        // with a distinct file behind the smuggled request:
+        //
+        //     Content-Length : 38          proxy 400   server 2 answers, leaked
+        //     Content-Length twice         proxy 400   server 2 answers, leaked
+        //     obs-fold hiding the length   proxy 400   server 2 answers, leaked
+        //     bare LF in the block         proxy 400   server 2 answers, leaked
+        //
+        // The comment that used to stand a few lines below said there was "no
+        // second framing party here the way there is in the proxy".  There is:
+        // ours, one hop in front, and it is the pipeline the proxy tests build.
+        // So the rules moved to shared/http_framing.h and both runtimes ask the
+        // same function.  What differs is the answer given back — the proxy
+        // drops the connection with a 400, this server answers first — and that
+        // difference is the runtime's own business, which is why only the
+        // decision is shared.
+        const http_request_framing_scan framing =
+            http_scan_request_headers(full.substr(first_crlf + 2, hdr_end - first_crlf - 2));
+
+        if (SOCKETLEY_UNLIKELY(!framing.ok))
+        {
+            refuse_http_request(conn, http_400_response());
+            return;
+        }
+
+        // A transfer coding this server does not implement — grep this file for
+        // "transfer-encoding" before this change and the count was zero, so a
+        // chunked request was framed by a Content-Length that was not there.
+        // Refusing is not the only defensible answer; treating the chunk data
+        // as the next request is the one that is not.
+        if (SOCKETLEY_UNLIKELY(framing.transfer_encoding))
+        {
+            refuse_http_request(conn, http_501_response());
+            return;
+        }
+
+        const size_t content_length = framing.content_length;
+
+        // The header pairs, for the Lua API and for handle_http_request.  This
+        // loop deliberately decides nothing: the block above has already ruled
+        // on the framing, and a second walk that came to its own conclusions
+        // about Content-Length is exactly the arrangement that produced the
+        // table above.  It reads names and values and stops there.
         {
             size_t line_start = first_crlf + 2;
             while (line_start < hdr_end)
@@ -3480,43 +3644,14 @@ reparse:
                 auto colon = line.find(':');
                 if (colon != std::string_view::npos)
                 {
-                    std::string_view name = line.substr(0, colon);
-                    size_t vs = colon + 1;
-                    while (vs < line.size() && line[vs] == ' ') ++vs;
-                    std::string_view value = line.substr(vs);
-                    hreq.headers.emplace_back(name, value);
-
-                    // ─── Checked, and a bad one ends the request ─────────
-                    //
-                    // The result was discarded, so a Content-Length that is not
-                    // a whole decimal left this at 0 and the body was treated
-                    // as empty — with everything after it read as the NEXT
-                    // request on the same keep-alive connection.  The two ways
-                    // in are a value with a non-digit in it, which from_chars
-                    // stops at, and one large enough to overflow, which it
-                    // refuses outright:
-                    //
-                    //     Content-Length: abc                     -> 0
-                    //     Content-Length: 99999999999999999999    -> 0
-                    //
-                    // There is no second framing party here the way there is in
-                    // the proxy, so this is not request smuggling — but the
-                    // boundaries between pipelined requests move, which is the
-                    // same class of defect one runtime along and is what
-                    // http_whole_decimal was written for.  The proxy has used
-                    // it for exactly this since it was added; the server was
-                    // still on the bare call.
-                    if (fnv1a_lower(name) == fnv1a("content-length"))
-                    {
-                        if (!http_whole_decimal(value, content_length))
-                        {
-                            // Nothing about the rest of this connection can be
-                            // framed once the length is unreadable, so it goes
-                            // rather than being guessed at.
-                            conn->closing = true;
-                            return;
-                        }
-                    }
+                    // OWS is SP or HTAB (RFC 9110 Section 5.6.3).  Skipping only
+                    // spaces left the tab on the front of the value, and every
+                    // consumer downstream then compared against a value that
+                    // began with one — which is how "Content-Length:\t4", an
+                    // ordinary legal request the proxy accepts, got this server
+                    // to hang up without answering at all.
+                    hreq.headers.emplace_back(line.substr(0, colon),
+                                              http_trim_ows(line.substr(colon + 1)));
                 }
                 line_start = line_end + 2;
             }

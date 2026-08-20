@@ -850,6 +850,14 @@ private:
     void serve_http(server_connection* conn, std::string_view path);
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
 
+    // Answer a request whose framing could not be established, and end the
+    // connection.  One function rather than one copy per refusal site, because
+    // the three steps are a unit: a refusal that forgets to clear `partial`
+    // leaves bytes behind that the reparse loop picks up as a fresh request —
+    // which is the very confusion being refused.
+    void refuse_http_request(server_connection* conn,
+                             const std::shared_ptr<const std::string>& resp);
+
     // Upstream helpers
     bool upstream_try_connect(upstream_connection* uc);
     void upstream_schedule_reconnect(upstream_connection* uc);

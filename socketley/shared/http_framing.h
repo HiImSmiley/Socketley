@@ -317,6 +317,255 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
     return out;
 }
 
+// ─── REQUEST FRAMING: WHERE DOES THIS MESSAGE END, AND IS IT WELL-FORMED ────
+//
+// Everything above this line reads a *response*, and the cost of getting it
+// wrong is one backend socket wrongly returned to the pool.  The request side
+// is worse, and it is worse for a structural reason: a response is read by one
+// recipient, and a request is read by two.  A proxy decides where the message
+// ends and a server behind it decides again, independently, on the same bytes.
+// When those two answers differ the client has put one message on the wire and
+// caused two to be answered — and it chooses what the second one says.  That is
+// request smuggling, and it needs neither end to be *wrong* about anything: it
+// needs only that one is lenient where the other is strict.
+//
+// Which is exactly what this tree had.  proxy_instance::parse_http_request_line
+// carried these rules and server_instance did not, so the same bytes measured
+// against both on one binary (ada6f1c, ports 21440-21442):
+//
+//     Content-Length : N   (space before the colon)  proxy 400   server 2x200
+//     duplicate Content-Length                       proxy 400   server 2x200
+//     obs-fold hiding a Content-Length               proxy 400   server 2x200
+//     bare LF in the header block                    proxy 400   server 2x200
+//
+// Each of those four server rows served the *second* request out of the first
+// one's body, and the fixture proved it by putting a distinct file there: all
+// four leaked it.  The mirror case was there too — "Content-Length:\thexdigit",
+// a tab where the server's trim knew only about spaces, is an ordinary legal
+// request that the proxy accepted and the server hung up on, so a socketley
+// proxy in front of a socketley server answered a gateway error to a correct
+// client.
+//
+// So the rules live here, once, and both runtimes ask this function.  What each
+// runtime does with the verdict still differs and should — the proxy refuses
+// with 400 and drops the connection, the server refuses with 400 or 501 — but
+// the *decision* about the bytes is one decision with one implementation.
+//
+// ─── WHAT IT DELIBERATELY DOES NOT DO ───────────────────────────────────────
+//
+// It does not collect the headers.  The server needs the name/value pairs for
+// its Lua API and the proxy does not, and folding that in would have made this
+// a parse loop rather than a decision — the one shape the note in CLAUDE.md
+// says gets reverted.  Callers walk the block themselves for whatever else they
+// want out of it; they take the framing answer from here.
+//
+// It does not decide whether the connection survives.  That is a separate
+// question with its own readers on both sides.
+//
+// It does not read the body.  `chunked` says the message is framed by chunk
+// sizes; it does not say this recipient can follow them.
+
+// One transfer coding list, left to right, carrying `chunked_seen` across the
+// several Transfer-Encoding field lines of one message: "chunked" on one line
+// and "gzip" on the next is the same message as "chunked, gzip" on one, and
+// just as unframeable.  False means a coding was applied after chunked, i.e.
+// chunked is not the final coding.
+//
+// Codings are a comma list, each optionally carrying parameters after a ';',
+// and empty list elements are legal in an HTTP list and mean nothing.
+inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen)
+{
+    size_t pos = 0;
+    for (;;)
+    {
+        const auto comma = val.find(',', pos);
+        const size_t end = (comma == std::string_view::npos) ? val.size() : comma;
+        std::string_view coding = val.substr(pos, end - pos);
+
+        if (const auto semi = coding.find(';'); semi != std::string_view::npos)
+            coding = coding.substr(0, semi);
+        coding = http_trim_ows(coding);
+
+        if (!coding.empty())
+        {
+            // Anything at all after the chunked coding — including a second
+            // chunked, which RFC 9112 Section 6.1 forbids outright — means the
+            // body is not framed by chunk sizes the way it claims to be.
+            if (chunked_seen)
+                return false;
+            if (http_token_equals(coding, "chunked", 7))
+                chunked_seen = true;
+        }
+
+        if (comma == std::string_view::npos)
+            return true;
+        pos = comma + 1;
+    }
+}
+
+// The framing a request header block declares about itself.
+//
+// `ok == false` means no recipient may act on this message at all: it carries
+// either no answer or two answers to "how long is the body", and every way of
+// picking one is a guess about what the *other* recipient picked.  There is no
+// partial verdict — a caller that sees false refuses and closes, and the fields
+// below are meaningless.
+struct http_request_framing_scan
+{
+    bool   ok{true};
+    bool   has_content_length{false};
+    size_t content_length{0};
+    bool   transfer_encoding{false};  // a non-empty Transfer-Encoding is present
+    bool   chunked{false};            // ... and `chunked` is its final coding
+};
+
+// Read the header lines of one complete request block.  `headers` is the block
+// after the request line's CRLF and before the terminating blank line, with no
+// terminator of its own.
+//
+// The caller must have run http_eol_framing_ok() over the block first.
+// Splitting on "\r\n" is only sound once every other line ending has been ruled
+// out: in
+//
+//     Content-Length: 6\nTransfer-Encoding: chunked\r\n
+//
+// a CRLF split yields ONE line whose field name is Content-Length, so the
+// Transfer-Encoding is never seen, no conflict is found, and the request goes
+// on to a recipient that accepts bare LF — most do — and sees two fields.  From
+// that point the two ends disagree about where the request ends.
+//
+// ─── WHERE THIS IS STRICTER THAN THE RESPONSE SCAN ABOVE ────────────────────
+//
+// http_scan_header_lines() accepts two things this refuses, and the difference
+// is deliberate rather than an oversight:
+//
+//   * A second Content-Length whose value AGREES with the first.  RFC 9112
+//     Section 6.3 permits a recipient to collapse those, and for a response we
+//     do, because we are the only recipient and we act on the value.  A request
+//     is FORWARDED: the proxy re-emits the client's header block to a backend,
+//     duplicates and all, and a backend entitled to take the first while we
+//     took the last is the disagreement this file exists to prevent.  Refusing
+//     costs a shape no correct client emits.
+//
+//   * A field line with no colon, or with an empty field name.  A response's
+//     junk line is junk to us and to nobody else; a request's is junk we hand
+//     on to a second parser that may make a field out of it.
+inline http_request_framing_scan http_scan_request_headers(std::string_view headers)
+{
+    http_request_framing_scan out;
+    bool   cl_seen         = false;
+    bool   te_final_chunked = false;
+    size_t pos             = 0;
+
+    while (pos < headers.size())
+    {
+        auto nl = headers.find("\r\n", pos);
+        if (nl == std::string_view::npos)
+            nl = headers.size();
+        const std::string_view line = headers.substr(pos, nl - pos);
+        pos = nl + 2;
+
+        // An obs-fold continuation (RFC 9112 Section 5.2): a line the two ends
+        // can read differently — as more of the previous field's value, or as a
+        // field of its own.  A server MUST reject it with 400 and an
+        // intermediary MUST reject or flatten it, and flattening is another
+        // guess about what the next parser did.  An empty line cannot occur
+        // inside a block measured to its first blank line, so one here means
+        // the caller measured something else.
+        if (SOCKETLEY_UNLIKELY(line.empty() || line[0] == ' ' || line[0] == '\t'))
+        {
+            out.ok = false;
+            return out;
+        }
+
+        const auto colon = line.find(':');
+        if (SOCKETLEY_UNLIKELY(colon == std::string_view::npos || colon == 0))
+        {
+            out.ok = false;
+            return out;
+        }
+
+        // Whitespace between the field name and its colon (RFC 9112 Section
+        // 5.1), which the standard makes a MUST-reject for exactly this reason:
+        // "Content-Length : 6" is not a Content-Length to a strict parser and
+        // is one to a lenient parser, so it walks straight past every conflict
+        // check below while the other end still frames the body by it.
+        const std::string_view name = line.substr(0, colon);
+        if (SOCKETLEY_UNLIKELY(name.back() == ' ' || name.back() == '\t'))
+        {
+            out.ok = false;
+            return out;
+        }
+
+        // OWS is SP or HTAB (RFC 9110 Section 5.6.3).  A trim that knows only
+        // about spaces reads "Content-Length:\t4" as beginning with a tab,
+        // which then fails every check below — and the message it fails is a
+        // perfectly ordinary one.
+        const std::string_view val = http_trim_ows(line.substr(colon + 1));
+
+        if (http_token_equals(name, "content-length", 14))
+        {
+            size_t v = 0;
+            // The number, not merely the presence: it is what bounds the body,
+            // so a field that cannot be read is a body that cannot be ended.
+            // std::from_chars stops at the first byte it cannot use and reports
+            // success for what it read, so "6x" comes back as 6 — a boundary
+            // six bytes into a body the other end frames differently.  RFC 9112
+            // Section 6.3 calls an invalid Content-Length unrecoverable.
+            if (SOCKETLEY_UNLIKELY(!http_whole_decimal(val, v)))
+            {
+                out.ok = false;
+                return out;
+            }
+            if (SOCKETLEY_UNLIKELY(cl_seen))
+            {
+                out.ok = false;
+                return out;
+            }
+            cl_seen                = true;
+            out.has_content_length = true;
+            out.content_length     = v;
+        }
+        else if (http_token_equals(name, "transfer-encoding", 17))
+        {
+            // Present is present, even with an empty value.  The response scan
+            // above ignores an empty Transfer-Encoding because it has only
+            // itself to satisfy; here the field is re-emitted to a backend that
+            // may well read "no codings" as "not chunked" and refuse, so an
+            // empty one falls through to the final-coding check below and is
+            // refused at this end instead.  No correct client sends one.
+            out.transfer_encoding = true;
+            if (SOCKETLEY_UNLIKELY(!http_te_codings_ok(val, te_final_chunked)))
+            {
+                out.ok = false;
+                return out;
+            }
+        }
+    }
+
+    // Content-Length together with Transfer-Encoding (RFC 9112 Section 6.3):
+    // the message carries two answers to "how long is the body" and each
+    // recipient picks one, independently.
+    if (SOCKETLEY_UNLIKELY(out.transfer_encoding && out.has_content_length))
+    {
+        out.ok = false;
+        return out;
+    }
+
+    // A Transfer-Encoding whose final coding is not chunked leaves the body
+    // with no declared length at all.  RFC 9112 Section 6.1 makes that a
+    // MUST-400 for a request, and the reason is the same as everywhere above:
+    // neither end can say where the body stops, so both guess.
+    if (SOCKETLEY_UNLIKELY(out.transfer_encoding && !te_final_chunked))
+    {
+        out.ok = false;
+        return out;
+    }
+
+    out.chunked = te_final_chunked;
+    return out;
+}
+
 // ─── response framing state ─────────────────────────────────────────────────
 //
 // One of these per backend connection, cleared when the connection is reset.

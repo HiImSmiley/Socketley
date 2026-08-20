@@ -2822,56 +2822,10 @@ void proxy_instance::rearm_accept()
 // lives in shared/http_framing.h so that a fuzz target can call
 // it — so they moved there too rather than being declared in two places.
 
-// Walk one Transfer-Encoding field value left to right, carrying `chunked_seen`
-// across the field lines of one request.  False means a coding was applied
-// after chunked, i.e. chunked is not the final coding.
-//
-// Codings are a comma list, each optionally carrying parameters after a ';',
-// and empty list elements are legal in an HTTP list and mean nothing.
-static bool te_line_codings_ok(std::string_view hdr_line, bool& chunked_seen)
-{
-    const auto colon = hdr_line.find(':');
-    if (colon == std::string_view::npos)
-        return false;
-
-    std::string_view val = hdr_line.substr(colon + 1);
-    size_t pos = 0;
-    for (;;)
-    {
-        const auto comma = val.find(',', pos);
-        const size_t end = (comma == std::string_view::npos) ? val.size() : comma;
-        std::string_view coding = val.substr(pos, end - pos);
-
-        if (const auto semi = coding.find(';'); semi != std::string_view::npos)
-            coding = coding.substr(0, semi);
-        while (!coding.empty() && (coding.front() == ' ' || coding.front() == '\t'))
-            coding.remove_prefix(1);
-        while (!coding.empty() && (coding.back() == ' ' || coding.back() == '\t'))
-            coding.remove_suffix(1);
-
-        if (!coding.empty())
-        {
-            // Anything at all after the chunked coding — including a second
-            // chunked, which RFC 9112 Section 6.1 forbids outright — means the
-            // body is not framed by chunk sizes the way it claims to be.
-            if (chunked_seen)
-                return false;
-            if (coding.size() == 7)
-            {
-                static constexpr char kChunked[] = "chunked";
-                bool match = true;
-                for (size_t i = 0; i < 7; i++)
-                    if ((coding[i] | 0x20) != kChunked[i]) { match = false; break; }
-                if (match)
-                    chunked_seen = true;
-            }
-        }
-
-        if (comma == std::string_view::npos)
-            return true;
-        pos = comma + 1;
-    }
-}
+// te_line_codings_ok() moved to shared/http_framing.h as
+// http_te_codings_ok(), with the rest of the request framing decision it was
+// one clause of.  The server had none of these rules; it has all of them now,
+// and they are the same ones because there is one copy.
 
 // backend_response_complete() moved to http_framing.h as
 // http_response_frame_complete(), alongside the scan that produces the state it
@@ -4476,102 +4430,21 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     const size_t hdr_len = (hdr_end > pos + 2) ? (hdr_end - pos - 2) : 0;
     std::string_view headers(conn->partial.data() + pos + 2, hdr_len);
 
-    // Splitting on "\r\n" is only sound because http_eol_framing_ok has already
-    // ruled out every other line ending.  It did not run before, and the
-    // consequence was precisely the hole this check exists to close: in
-    //   Content-Length: 6\nTransfer-Encoding: chunked\r\n
-    // the CRLF split yields one line, whose field name is Content-Length, so
-    // has_te never set, no conflict was seen, and the request went to a backend
-    // with both headers on it.  A backend that accepts bare LF — most do — sees
-    // two.  From that point on the two ends disagree about where the request
-    // ends, which is the whole of request smuggling.
-    bool has_te = false;
-    bool te_chunked_final = false;
-    unsigned cl_count = 0;
-    size_t cl_value = 0;
-    size_t search_pos = 0;
-    while (search_pos < headers.size())
-    {
-        auto nl = headers.find("\r\n", search_pos);
-        if (nl == std::string_view::npos)
-            nl = headers.size();
-        std::string_view hdr_line = headers.substr(search_pos, nl - search_pos);
-
-        // An obs-fold continuation (RFC 7230 Section 3.2.4) is a line the two
-        // ends can also read differently — as more of the previous field's
-        // value, or as a field of its own.  A proxy MUST reject it or flatten
-        // it, and flattening is another guess about the backend.
-        if (SOCKETLEY_UNLIKELY(hdr_line.empty() || hdr_line[0] == ' ' || hdr_line[0] == '\t'))
-            return http_request_parse::invalid;
-
-        const auto colon = hdr_line.find(':');
-        if (SOCKETLEY_UNLIKELY(colon == std::string_view::npos || colon == 0))
-            return http_request_parse::invalid;
-
-        // Whitespace before the colon is a MUST-reject for a server (RFC 9112
-        // Section 5.1) for this exact reason: "Content-Length : 6" is not a
-        // Content-Length to a strict parser and is one to a lenient parser, so
-        // it walks straight past the conflict check below while the backend
-        // still frames the body by it.
-        if (SOCKETLEY_UNLIKELY(hdr_line[colon - 1] == ' ' || hdr_line[colon - 1] == '\t'))
-            return http_request_parse::invalid;
-
-        if (header_name_equals(hdr_line, "content-length", 14))
-        {
-            cl_count++;
-            // The number, not merely the presence.  It is what bounds the body
-            // the proxy is willing to forward behind this header block, so a
-            // field it cannot read is a body it cannot end, and RFC 9112
-            // Section 6.3 already calls an invalid Content-Length unrecoverable.
-            // from_chars would have stopped at the first byte it could not use
-            // and reported success for what it read, so "6x" would have come
-            // back as 6 — a boundary six bytes into a body the backend frames
-            // differently, which is the disagreement this whole function exists
-            // to prevent.
-            if (SOCKETLEY_UNLIKELY(!http_whole_decimal(
-                    http_trim_ows(hdr_line.substr(colon + 1)), cl_value)))
-                return http_request_parse::invalid;
-        }
-        else if (header_name_equals(hdr_line, "transfer-encoding", 17))
-        {
-            has_te = true;
-            // Carried across field lines on purpose: "Transfer-Encoding:
-            // chunked" followed by "Transfer-Encoding: gzip" is the same
-            // message as "chunked, gzip" on one line, and just as unframeable.
-            if (SOCKETLEY_UNLIKELY(!te_line_codings_ok(hdr_line, te_chunked_final)))
-                return http_request_parse::invalid;
-        }
-
-        search_pos = nl + 2;
-    }
-
-    // Content-Length together with Transfer-Encoding (RFC 7230 Section 3.3.3),
-    // and two Content-Length fields (RFC 9112 Section 6.3) — in both cases the
-    // message carries two answers to "how long is the body" and the recipient
-    // picks one.  Two recipients pick independently.
-    if (SOCKETLEY_UNLIKELY((cl_count > 0 && has_te) || cl_count > 1))
-        return http_request_parse::invalid;
-
-    // A Transfer-Encoding whose final coding is not chunked leaves the body
-    // with no length at all: RFC 9112 Section 6.1 makes that a MUST-400 for a
-    // request, and the reason is the same one every other rule above exists
-    // for.  It was argued that this proxy introduces no desync because the
-    // bytes reach the backend verbatim, and that argument does not survive
-    // contact with the pool: the backend socket is *reused*, so whatever the
-    // backend decides is left over after a body it could not frame becomes the
-    // opening bytes of the next request on that socket — a request belonging to
-    // a different client.  The proxy also cannot forward such a body
-    // faithfully in any case; it never de-chunks and cannot decode a standalone
-    // "gzip" transfer coding, so it has no idea where the body ends either.
-    // Refusing is the only answer here that requires agreement with nobody.
-    if (SOCKETLEY_UNLIKELY(has_te && !te_chunked_final))
+    // The framing rules themselves, and the ONE copy of them.  They used to be
+    // eighty lines here and nowhere else, which is why the server — reading the
+    // same bytes from the same clients — disagreed with this function about
+    // where four different malformed requests ended.  See the note over
+    // http_scan_request_headers(): the rules are shared, the reaction to the
+    // verdict is not.
+    const http_request_framing_scan scan = http_scan_request_headers(headers);
+    if (SOCKETLEY_UNLIKELY(!scan.ok))
         return http_request_parse::invalid;
 
     // How long this request's body is, established from a header block that has
     // just been proved to give exactly one answer to the question.  Everything
     // past that is not this request's, and rewrite_http_request holds it back.
-    conn->declared_body_len = (cl_count == 1) ? cl_value : 0;
-    conn->declared_body_chunked = has_te;
+    conn->declared_body_len = scan.has_content_length ? scan.content_length : 0;
+    conn->declared_body_chunked = scan.transfer_encoding;
 
     return http_request_parse::complete;
 }
