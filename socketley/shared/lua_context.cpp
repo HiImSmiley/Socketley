@@ -3964,7 +3964,10 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
     };
     self["stats"] = [proxy, this]() -> sol::table {
         sol::table t = m_lua.create_table(0, 6);
-        t["connections"] = proxy->get_connection_count();
+        // The same figure self.connections() answers, and for the same reason:
+        // two members of one API disagreeing about one number is worse than
+        // either answer on its own.  See register_server_table above.
+        t["connections"] = static_cast<size_t>(proxy->shard_connection_count());
         t["bytes_in"] = proxy->m_stat_bytes_in.load(std::memory_order_relaxed);
         t["bytes_out"] = proxy->m_stat_bytes_out.load(std::memory_order_relaxed);
         t["total_connections"] = proxy->m_stat_total_connections.load(std::memory_order_relaxed);
