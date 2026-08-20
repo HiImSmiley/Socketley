@@ -157,10 +157,24 @@ public:
     // process that can decide whether that name is one of its own runtimes, one
     // in another worker, or nothing at all.
     //
-    // No `from` argument and no exclusion, unlike the publish above: a send is
-    // addressed, not broadcast, and a worker sending to its OWN runtime never
-    // reaches this — the worker's deliver sink answers that one where it stands.
-    using deliver_handler = std::function<void(std::string_view name,
+    // A `from` argument and an exclusion, exactly as the publish above has —
+    // and the note that used to stand here said the opposite, for a reason that
+    // stopped being true when a runtime could be more than one process.
+    //
+    // It said a worker sending to its OWN runtime never reaches this, because
+    // the worker's deliver sink answers that one where it stands.  That is
+    // still how the LOCAL half is served, and it is still right.  What it
+    // missed is that on N shards the local half is 1/N of the runtime's
+    // clients: the rest are in sibling processes, and the daemon is the only
+    // one that can reach them.
+    //
+    // So a worker does now send its own runtime's name up here, for the
+    // siblings, and the shard that sent it must be left out of the fan-out or
+    // its own clients receive the message twice.  `from` is what makes that
+    // possible, and it needs no wire field: a frame naming the sender's own
+    // runtime IS the sibling fan-out, by construction.
+    using deliver_handler = std::function<void(proxy_supervisor* from,
+                                               std::string_view name,
                                                std::string_view message)>;
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
 

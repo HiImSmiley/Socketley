@@ -3527,8 +3527,12 @@ void lua_context::register_bindings(runtime_instance* owner)
 
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
 {
+    // broadcast_all(), not lua_broadcast(): the second is this PROCESS's
+    // connection table, and under --shards that is a quarter of the clients on
+    // four shards -- delivered, reported as done, and wrong by nothing.
+    // Unsharded the two are the same call.  See runtime_instance::broadcast_all.
     self["broadcast"] = [owner](std::string msg) {
-        owner->lua_broadcast(msg);
+        owner->broadcast_all(msg);
     };
     // ─── THE SAME CONTRACT AT THE OTHER DOOR ────────────────────────────────
     //

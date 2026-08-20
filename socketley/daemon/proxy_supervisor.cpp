@@ -1075,14 +1075,20 @@ void proxy_supervisor::ingest(const std::string&)
 
             case worker_proto::frame_type::deliver_to:
             {
-                // `socketley.send(name, msg)` from the worker's script, for a
-                // name that is not its own runtime.  Routed by the handler,
-                // which is the daemon and holds the map; nothing is answered,
-                // because nothing is waiting — see the frame's own note.
+                // `socketley.send(name, msg)` from the worker's script, or —
+                // when `name` is the worker's OWN runtime — the sibling half of
+                // a broadcast on a sharded one.  Routed by the handler, which
+                // is the daemon and holds the map; nothing is answered, because
+                // nothing is waiting — see the frame's own note.
+                //
+                // `this` goes with it so the daemon can leave this shard out
+                // when the name is its own: the local delivery already
+                // happened out there, and a second copy would reach every one
+                // of this shard's clients twice.
                 std::string name, message;
                 if (m_on_deliver &&
                     worker_proto::decode_deliver_to(payload, name, message))
-                    m_on_deliver(name, message);
+                    m_on_deliver(this, name, message);
                 break;
             }
 

@@ -2386,7 +2386,8 @@ int daemon_handler::cmd_owner(ipc_connection* conn, const parsed_args& pa)
 // tree has already got wrong once in exactly this place.
 bool daemon_handler::deliver_to_runtime(std::string_view name,
                                         std::string_view message,
-                                        std::string& why)
+                                        std::string& why,
+                                        const proxy_supervisor* exclude)
 {
     auto* instance = m_manager.get(name);
     if (!instance)
@@ -2420,8 +2421,12 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
         // runtime and answers true if any of them took it; see the note there
         // for why delivering to one is not an option once there is more than
         // one.
-        if (!deliver_to_worker(name, message))
+        if (!deliver_to_worker(name, message, exclude))
         {
+            // With `exclude` set this is the sibling half of a broadcast on a
+            // one-shard runtime that thought it had more, or a runtime whose
+            // every other shard has gone.  Nothing was owed a delivery, so it
+            // is not an error; the caller reports it and the log says so.
             why = "could not reach the worker holding " + std::string(name);
             return false;
         }
@@ -2475,11 +2480,32 @@ int daemon_handler::cmd_send(const parsed_args& pa)
 // replica was too old to know, so it is said in the log rather than dropped:
 // the window is one push interval wide, and a send into it is a message the
 // script believes it made.
-void daemon_handler::on_worker_deliver(std::string_view name,
+void daemon_handler::on_worker_deliver(proxy_supervisor* from,
+                                       std::string_view name,
                                        std::string_view message)
 {
+    // Whether this is a cross-runtime send or a sibling fan-out is decided
+    // here, from the name, and not by a flag on the wire.  A worker holds
+    // exactly one runtime, so a frame naming that runtime can only be the
+    // second: the first would have been answered where it stood, by the
+    // worker's own deliver sink, without a wire at all.
+    //
+    // Deriving it beats carrying it.  A bit on the frame is a second place for
+    // the two sides to disagree, and the older half of this protocol would have
+    // had to grow one it never sets.
+    const proxy_supervisor* exclude = nullptr;
+    if (from)
+        if (const auto it = m_proxy_workers.find(std::string(name));
+            it != m_proxy_workers.end())
+            for (const auto& sup : it->second)
+                if (sup.get() == from)
+                {
+                    exclude = from;
+                    break;
+                }
+
     std::string why;
-    if (!deliver_to_runtime(name, message, why))
+    if (!deliver_to_runtime(name, message, why, exclude))
         LOG_WARN(("a worker's send could not be delivered: " + why).c_str());
 }
 
@@ -4729,7 +4755,8 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
 // because the alternative is telling the operator nothing was sent when most of
 // it was.  A shard that would not take the frame has already logged why.
 bool daemon_handler::deliver_to_worker(std::string_view name,
-                                       std::string_view message)
+                                       std::string_view message,
+                                       const proxy_supervisor* exclude)
 {
     auto it = m_proxy_workers.find(std::string(name));
     if (it == m_proxy_workers.end())
@@ -4737,8 +4764,23 @@ bool daemon_handler::deliver_to_worker(std::string_view name,
 
     bool any = false;
     for (auto& sup : it->second)
+    {
+        // Everyone but whoever sent it up, and only when somebody did.  A
+        // shard fanning a broadcast out to its siblings has already run the
+        // delivery against its own clients — it cannot wait for a round trip
+        // to do that, and it should not have to — so echoing the frame back
+        // would write the message into every one of its connections twice.
+        //
+        // Per PROCESS and not per runtime, which is what keeps it right: the
+        // siblings are separate processes holding separate connection tables
+        // that have NOT seen this message.  Excluding the whole shard set
+        // would deliver to nobody at all.  Same rule, same words, as the
+        // publish fan-out above — see publish_sinks().
+        if (exclude && sup.get() == exclude)
+            continue;
         if (sup->send_deliver(message))
             any = true;
+    }
     return any;
 }
 
@@ -5066,8 +5108,9 @@ void daemon_handler::reconcile_proxy_workers()
                                         std::string_view c, std::string_view ch,
                                         std::string_view m)
                                  { on_worker_publish(from, c, ch, m); });
-        sup->set_deliver_handler([this](std::string_view n, std::string_view m)
-                                 { on_worker_deliver(n, m); });
+        sup->set_deliver_handler([this](proxy_supervisor* f, std::string_view n,
+                                        std::string_view m)
+                                 { on_worker_deliver(f, n, m); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
 
         // ─── Only the first shard is the request sink ───────────────────────

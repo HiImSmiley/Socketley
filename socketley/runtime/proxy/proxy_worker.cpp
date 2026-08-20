@@ -996,12 +996,45 @@ private:
         // this socket — but it would make the commonest send in a worker's
         // script the slowest one, and it would be delivered a turn of two event
         // loops later than the call that asked for it.
+        // ── The other shards of this runtime, for anything that fans out ────
+        //
+        // One place, because two callers need it and they must not be able to
+        // disagree about what "everybody" means: `self.broadcast`, through
+        // runtime_instance::broadcast_all, and `socketley.send` addressed to
+        // this worker's own runtime, just below.
+        //
+        // The frame is the ordinary deliver_to naming this runtime's own name.
+        // The daemon reads that as the sibling fan-out and leaves this shard
+        // out of it — see on_worker_deliver — so nothing new goes on the wire.
+        //
+        // Guarded on the shard count inside fanout_to_siblings(), not here: a
+        // one-shard worker must write no frame at all rather than one the
+        // daemon fans out to nobody and then logs as undeliverable.
+        m_rt->set_sibling_sink(
+            [this](std::string_view message)
+            {
+                if (!m_writer.write(worker_proto::frame(
+                        worker_proto::frame_type::deliver_to,
+                        worker_proto::encode_deliver_to(m_rt->get_name(),
+                                                        message)))) {}
+            });
+
         m_manager.set_deliver_sink(
             [this](std::string_view name, std::string_view message) -> bool
             {
                 if (m_rt && name == m_rt->get_name())
                 {
+                    // The local half stays local, for the reason it always
+                    // did: a round trip through the daemon would work and
+                    // would make the commonest send in a worker's script the
+                    // slowest one.
                     deliver_local(message);
+
+                    // And the half that is NOT local, which did not exist
+                    // while a runtime was one process.  `socketley.send` to
+                    // one's own name reached this shard's clients and stopped
+                    // — a quarter of them on four shards, reported as sent.
+                    m_rt->fanout_to_siblings(message);
                     return true;
                 }
                 return m_writer.write(worker_proto::frame(

@@ -461,6 +461,47 @@ public:
     // reader below is written for it.
     shard_stats::shard_table& shard_stats_table() { return m_shard_stats; }
 
+    // ── Reaching the clients this runtime has in OTHER processes ────────────
+    //
+    // The third of the three shapes a sharded runtime needs — fan-out — and the
+    // one that costs least, because nothing is owed a reply.  The caller never
+    // blocks: the message is written to the supervisor's socket and the call
+    // returns, exactly as a publish already does.
+    //
+    // Empty for every runtime in the daemon and for every unsharded one, and
+    // the guard below is on the SHARD COUNT rather than on the sink, so a
+    // one-shard worker writes no frame at all rather than one the daemon has to
+    // fan out to nobody.
+    using sibling_sink = std::function<void(std::string_view message)>;
+    void set_sibling_sink(sibling_sink s) { m_sibling_sink = std::move(s); }
+
+    // Every client of this RUNTIME, not of this process.
+    //
+    // `self.broadcast` used to be lua_broadcast() alone, which is this
+    // process's connection table — so on four shards it reached a quarter of
+    // the clients and reported nothing.  Here rather than inside each runtime's
+    // lua_broadcast() override, because it is the same decision for all four
+    // and four copies of it is how one of them comes to be missing the fan-out.
+    //
+    // Local first, siblings second, and the order is deliberate: the local
+    // delivery is synchronous and cannot fail halfway, so a script that
+    // broadcasts and then reads its own state sees a consistent one.
+    void broadcast_all(std::string_view msg)
+    {
+        lua_broadcast(msg);
+        fanout_to_siblings(msg);
+    }
+
+    // The message on its way to this runtime's other shards, and a no-op
+    // everywhere else.  Separate from broadcast_all() because `socketley.send`
+    // addressed to this runtime's own name needs the second half without the
+    // first — the worker has already delivered locally by then.
+    void fanout_to_siblings(std::string_view msg)
+    {
+        if (m_shards > 1 && m_sibling_sink)
+            m_sibling_sink(msg);
+    }
+
     // How many connections THIS RUNTIME has, counting the ones its sibling
     // shards are holding.
     //
@@ -820,6 +861,9 @@ private:
 
     // Empty unless this process is one shard of several; see shard_stats.h.
     shard_stats::shard_table m_shard_stats;
+
+    // Set only in a worker, and only used above one shard; see set_sibling_sink.
+    sibling_sink m_sibling_sink;
 
     std::shared_ptr<const route_table> m_worker_routes;
 
