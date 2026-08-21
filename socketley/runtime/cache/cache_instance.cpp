@@ -2269,6 +2269,59 @@ void cache_instance::serve_one_command(std::string_view line, std::string& out)
     serve_payload(line, out, false);
 }
 
+// One command from a LEADER, applied to this shard's slice of the keyspace.
+//
+// ─── EVERY SHARD OF A SHARDED FOLLOWER SEES THE WHOLE STREAM ────────────────
+//
+// `--replicate` is a property of the runtime, so all N shards dial the leader
+// and all N are promoted: measured, a four-shard follower of one leader shows
+// `followers:4` on that leader and each shard receives the entire dump and the
+// entire command stream.  Each therefore has to keep exactly its own slice.
+//
+// That filtering already happened before this function existed, and it happened
+// BY ACCIDENT: the apply path runs on a connection with no descriptor, and the
+// router refuses a key it does not own on such a connection because there is no
+// socket to wait for the crossing on.  The keys landed in the right shards for
+// a reason that had nothing to do with replication, and the same accident lost
+// every multi-key write outright — `mset a 1 b 2` names keys belonging to
+// different shards, so it belonged to none of them and was dropped whole.
+//
+// Two things follow, and both are now decisions rather than side effects:
+//
+//   * a replicated command names AT MOST ONE KEY — enforced where they are
+//     emitted, see replicate_command();
+//   * a command whose key is not this shard's is dropped HERE, deliberately,
+//     because a sibling is applying the same command to the same key at the
+//     same moment.  Nothing is lost by dropping it; the slice that owns it has
+//     it.
+//
+// The cost, named: N shards each carry the leader's whole stream, so a sharded
+// follower reads N times the bytes an unsharded one does.  The alternative is a
+// leader that knows its follower is sharded, which the protocol has no way to
+// express — see the note on the leader-side refusal.
+void cache_instance::apply_replicated(std::string_view line)
+{
+    std::string discard;
+
+    if (SOCKETLEY_LIKELY(m_shard_n <= 1))
+    {
+        serve_one_command(line, discard);
+        return;
+    }
+
+    const cache_text_parts parts = cache_split_text(line);
+    const uint32_t         h     = fnv1a_lower(parts.cmd);
+
+    if (cache_classify_text(h) == cache_cmd_class::single_key)
+    {
+        const std::string_view key = cache_text_key(h, parts.args);
+        if (!key.empty() && cache_shard_of(key, m_shard_n) != m_shard_i)
+            return;                      // a sibling owns this one
+    }
+
+    serve_one_command(line, discard);
+}
+
 void cache_instance::run_request_lines(client_connection* conn, std::string_view payload)
 {
     size_t start = 0;
@@ -3874,7 +3927,39 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rest = rest.substr(sp2 + 1);
             }
             rb.append("ok\n", 3);
-            replicate_command(line);
+            // ── One key per replicated command; see replicate_command() ─────
+            //
+            // Not `replicate_command(line)`.  A follower that is sharded gets
+            // the whole stream and keeps what it owns, and `mset a 1 b 2` names
+            // keys that belong to different shards — so as one command it
+            // belongs to none of them and was dropped entire.  Measured: a
+            // four-shard follower of an unsharded leader lost every key of
+            // every mset, while its size never moved and nothing reported it.
+            //
+            // Replicating the EFFECT instead is the decision this file already
+            // took for SET; see repl_set_effect below.
+            {
+                std::string_view r = args;
+                while (!r.empty())
+                {
+                    const size_t s1 = r.find(' ');
+                    if (s1 == std::string_view::npos) break;
+                    const std::string_view k = r.substr(0, s1);
+                    r = r.substr(s1 + 1);
+                    const size_t s2 = r.find(' ');
+                    const std::string_view v =
+                        (s2 == std::string_view::npos) ? r : r.substr(0, s2);
+                    std::string one;
+                    one.reserve(5 + k.size() + v.size());
+                    one += "set ";
+                    one.append(k);
+                    one += ' ';
+                    one.append(v);
+                    replicate_command(one);
+                    if (s2 == std::string_view::npos) break;
+                    r = r.substr(s2 + 1);
+                }
+            }
             break;
         }
         case fnv1a("type"):
@@ -5562,7 +5647,30 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 #endif
                 }
             }
-            if (deleted > 0) repl(args, argc);
+            // ── One key per replicated command, and this one was ALREADY
+            //    broken before any of the sharding work ──────────────────────
+            //
+            // repl() joins the arguments with spaces and the follower reads the
+            // result with the TEXT interpreter, whose `del` takes the WHOLE
+            // remainder as one key.  So `DEL p1 p2` replicated as `del p1 p2`
+            // deleted a key literally named "p1 p2" on the follower and left p1
+            // and p2 where they were.  Measured on two UNSHARDED caches:
+            //
+            //     leader   after DEL p1 p2 -> nil nil
+            //     follower after DEL p1 p2 -> q1 q2
+            //
+            // The leader and the follower diverge and nothing reports it.  This
+            // is the same trap the note on repl_set_effect describes for SET,
+            // which was found and fixed there and missed here.
+            if (deleted > 0)
+                for (int i = 1; i < argc; ++i)
+                {
+                    std::string one;
+                    one.reserve(4 + args[i].size());
+                    one += "del ";
+                    one.append(args[i]);
+                    replicate_command(one);
+                }
             resp::encode_integer_into(rb, deleted);
             break;
         }
@@ -5697,7 +5805,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 #endif
             }
             resp::encode_ok_into(rb);
-            repl(args, argc);
+            // One key per replicated command, for the reason the text spelling
+            // gives above.
+            for (int i = 1; i + 1 < argc; i += 2)
+                repl_set_effect(args[i], args[i + 1], 0, 0);
             break;
         }
         case fnv1a("type"):
@@ -6636,6 +6747,27 @@ void cache_instance::refuse_follower_input(client_connection* conn)
     }
 }
 
+// ─── A REPLICATED COMMAND NAMES AT MOST ONE KEY ─────────────────────────────
+//
+// Every caller of this function owes that, and it is not decoration:
+//
+//   * the follower reads the stream with the TEXT interpreter, whose `del`
+//     takes the whole remainder as ONE key -- so `del a b`, which the RESP
+//     spelling means as two, deletes a key named "a b" and leaves a and b
+//     alone.  Leader and follower diverge with nothing reporting it.  Measured
+//     on two unsharded caches before this was fixed.
+//   * a sharded follower keeps the part of the stream its slice owns, and a
+//     command naming keys from several slices belongs to none of them.
+//
+// So the multi-key spellings replicate the EFFECT: `mset` goes out as one `set`
+// per pair and a multi-key `DEL` as one `del` per key.  That is the same
+// decision repl_set_effect describes for SET's options, applied to arity.
+//
+// It cannot be checked here, and that is worth saying plainly rather than
+// leaving as an omission: `del a b` is a legal single-key command in the text
+// protocol, so this function cannot tell a correctly-emitted one from a
+// flattened one.  The obligation lives at the emitters, and each of them names
+// it.
 void cache_instance::replicate_command(std::string_view cmd)
 {
     if (m_repl_role != repl_leader || m_followers.empty())
@@ -7004,8 +7136,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             cache_mode saved = m_mode;
             m_mode = cache_mode_readwrite;
 
-            std::string discard;
-            serve_one_command(line, discard);
+            apply_replicated(line);
 
             m_mode = saved;
         }

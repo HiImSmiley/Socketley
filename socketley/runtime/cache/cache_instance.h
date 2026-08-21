@@ -282,6 +282,10 @@ public:
     // newline, so running it through the line splitter would apply half of it —
     // which is the truncation the framing exists to stop.
     void serve_one_command(std::string_view line, std::string& out);
+    // One command from a leader, applied to this shard's slice.  See the
+    // definition for why a sharded follower sees the whole stream and what it
+    // is allowed to drop.
+    void apply_replicated(std::string_view line);
     // Shared body of the two above; `split` picks which one it is.
     void serve_payload(std::string_view payload, std::string& out, bool split);
     // Itself when it is here, and the daemon's override when it is not: the

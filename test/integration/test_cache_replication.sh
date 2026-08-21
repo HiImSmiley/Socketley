@@ -370,6 +370,52 @@ else
     echo "  FAIL [the second follower completed its full sync]: holds ${F2_KEYS:-<none>} keys, expected at least $KEYS"
 fi
 
+# ─── A MULTI-KEY DELETE HAS TO REACH THE FOLLOWER ───────────────────────────
+#
+# repl() joins a RESP command's arguments with spaces and the follower reads the
+# result with the TEXT interpreter — whose `del` takes the WHOLE remainder as one
+# key.  So `DEL p1 p2` travelled as `del p1 p2`, the follower deleted a key
+# literally named "p1 p2", and p1 and p2 stayed where they were.  Measured
+# before the fix, on these two unsharded caches:
+#
+#     leader   after DEL p1 p2 -> nil nil
+#     follower after DEL p1 p2 -> q1 q2
+#
+# The two diverge and nothing reports it — the follower is up, the link is
+# healthy, and the data is simply different.  This is the same trap the note on
+# repl_set_effect describes for SET's options, which was found there and missed
+# here.
+#
+# The assertion is on the FOLLOWER's value, not on the leader's and not on a
+# count: the leader was always right, and a key count cannot tell a delete that
+# did not replicate from one that did — both leave the follower with a key more
+# than it should have only if you know which key.
+if command -v redis-cli >/dev/null 2>&1; then
+    redis-cli -p "$LEADER_PORT" SET mkd1 mv1 >/dev/null 2>&1
+    redis-cli -p "$LEADER_PORT" SET mkd2 mv2 >/dev/null 2>&1
+    sleep 1.5
+    assert_eq "$(send_to "$FOLLOWER_PORT" 'get mkd1')" "mv1" \
+        "the follower has the key before the multi-key delete"
+
+    redis-cli -p "$LEADER_PORT" DEL mkd1 mkd2 >/dev/null 2>&1
+    sleep 1.5
+    assert_eq "$(send_to "$LEADER_PORT"   'get mkd1')" "nil" \
+        "a multi-key DEL removed the first key on the leader"
+    assert_eq "$(send_to "$FOLLOWER_PORT" 'get mkd1')" "nil" \
+        "a multi-key DEL reached the follower (first key)"
+    assert_eq "$(send_to "$FOLLOWER_PORT" 'get mkd2')" "nil" \
+        "a multi-key DEL reached the follower (second key)"
+
+    # And the other multi-key write, which was correct already and must stay so:
+    # a regression here would mean the per-pair replication dropped a pair.
+    redis-cli -p "$LEADER_PORT" MSET mks1 sv1 mks2 sv2 >/dev/null 2>&1
+    sleep 1.5
+    assert_eq "$(send_to "$FOLLOWER_PORT" 'get mks1')" "sv1" \
+        "a RESP MSET reached the follower (first pair)"
+    assert_eq "$(send_to "$FOLLOWER_PORT" 'get mks2')" "sv2" \
+        "a RESP MSET reached the follower (second pair)"
+fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
