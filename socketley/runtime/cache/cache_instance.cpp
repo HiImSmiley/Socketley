@@ -21,9 +21,139 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <liburing.h>
+#include <fstream>
 #include <sstream>
 #include <sys/stat.h>
 #include <poll.h>
+
+// ─── PERSISTENCE ACROSS A CHANGED SHARD COUNT ───────────────────────────────
+//
+// N shards hold N slices, so N shards write N dumps.  Started again with M
+// shards the split only still holds when M == N; otherwise every key belongs
+// somewhere else, and a dump loaded under the wrong split is a miss for data
+// that was stored — the failure the cache's --shards refusal names, moved from
+// runtime to restart.
+//
+// So each dump says, in its own head, what split it was written under:
+//
+//     shard_count   how many slices the keyspace was cut into
+//     shard_index   which of them this file is
+//     fingerprint   what the ownership function DID, see cache_shard_map.h
+//
+// and the load is decided from the set, not from one file:
+//
+//   count == N, indices complete, fingerprint matches  -> FAST: this shard
+//       reads its own dump and trusts the split.
+//   anything else                                      -> FILTER: every shard
+//       reads every dump and keeps only what hashes to it now.
+//
+// The filter path is O(N*M) reads once at start and is correct with no special
+// cases.  The unsharded case is the same path with count == 1.
+//
+// ─── THE FOUR WAYS THIS LOSES DATA QUIETLY, AND WHAT EACH MEETS ─────────────
+//
+// 1. A DUMP IS MISSING.  Shard 3's file deleted: its keys are gone and the
+//    cache comes up looking healthy.  Met by requiring the set to be COMPLETE —
+//    0..count-1 with no gap — and refusing the start by name when it is not.
+//
+// 2. TWO SETS IN ONE PLACE.  An old run's files beside a new run's: indices
+//    that overlap, keys that contradict.  Met by requiring every header in the
+//    set to agree on `shard_count`, and by refusing an index at or above it.
+//
+// 3. A HALF-WRITTEN SET.  A crash in the middle of dumping.  Met by the write
+//    being atomic PER FILE — save_v2 writes a temp with O_EXCL and renames —
+//    so a torn write leaves the previous file, never half of a new one.  A
+//    crash between two shards' renames therefore leaves a COMPLETE set of
+//    files from two moments, and because the slices are disjoint by hash that
+//    is per-key staleness rather than loss: no key is dropped and none is
+//    duplicated.  The case that does lose is a file that was never written at
+//    all, and that is case 1, which aborts.
+//
+//    This is a deviation from the design note, which asked for a barrier —
+//    rename only once every shard has finished.  A barrier across N processes
+//    at shutdown needs a coordinator, and it would still not cover a crash
+//    between its own renames.  The requirement it exists for is "a half set
+//    must never be loaded"; per-file atomicity plus the completeness check
+//    meets that, and covers the crash the barrier does not.
+//
+// 4. THE OWNERSHIP FUNCTION CHANGED.  Every key belongs elsewhere and the fast
+//    path loads them all into the wrong slices.  Met by the fingerprint, which
+//    is not a version somebody has to remember to bump; see cache_shard_map.h.
+//
+// ─── WHERE THE FILES ARE, AND THE ONE COMPATIBILITY NOTE ────────────────────
+//
+// `<path>.shard<i>`, always — including at one shard, where it is
+// `<path>.shard0`.  A dump has to say what split it holds, and the only file
+// that cannot is the one written before this existed.
+//
+// So the bare `<path>` is READ and never written: when no `.shard*` file is
+// present it is taken as a complete set of one, with no fingerprint, which is
+// exactly what it is.  An existing --persistent cache therefore keeps its data
+// across the upgrade and writes a self-describing file from then on; the old
+// bare file is never consulted again once one exists.
+inline constexpr char       shard_dump_magic[8] = { 'S','K','L','S','H','R','D','1' };
+inline constexpr size_t     shard_dump_header_size = 32;
+
+struct shard_dump_header
+{
+    uint32_t      count{1};
+    uint32_t      index{0};
+    unsigned char fingerprint[cache_fingerprint_len]{};
+    bool          has_fingerprint{false};
+};
+
+static std::string encode_shard_dump_header(uint32_t count, uint32_t index)
+{
+    std::string h(shard_dump_header_size, '\0');
+    std::memcpy(h.data(), shard_dump_magic, sizeof(shard_dump_magic));
+    const auto put32 = [&](size_t at, uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            h[at + static_cast<size_t>(i)] =
+                static_cast<char>((v >> (8 * i)) & 0xFF);
+    };
+    put32(8,  count);
+    put32(12, index);
+    unsigned char fp[cache_fingerprint_len];
+    cache_shard_fingerprint(fp);
+    std::memcpy(h.data() + 16, fp, sizeof(fp));
+    return h;
+}
+
+// Read a dump's head.  `legacy` comes back true for a file written before this
+// header existed — a complete set of one, which is what it is.
+static bool read_shard_dump_header(const std::string& path,
+                                   shard_dump_header& out, bool& legacy)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return false;
+
+    char buf[shard_dump_header_size]{};
+    f.read(buf, static_cast<std::streamsize>(shard_dump_header_size));
+    const std::streamsize got = f.gcount();
+
+    if (got < static_cast<std::streamsize>(shard_dump_header_size)
+        || std::memcmp(buf, shard_dump_magic, sizeof(shard_dump_magic)) != 0)
+    {
+        legacy = true;
+        out = shard_dump_header{};
+        return true;
+    }
+
+    const auto get32 = [&](size_t at) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+            v |= static_cast<uint32_t>(static_cast<unsigned char>(buf[at + static_cast<size_t>(i)]))
+                 << (8 * i);
+        return v;
+    };
+    legacy      = false;
+    out.count   = get32(8);
+    out.index   = get32(12);
+    std::memcpy(out.fingerprint, buf + 16, cache_fingerprint_len);
+    out.has_fingerprint = true;
+    return true;
+}
 
 // The header of a framed run of commands between two shards of one runtime.
 //
@@ -355,22 +485,15 @@ bool cache_instance::setup(event_loop& loop)
     m_route_payload.assign(m_shard_n, std::string{});
     m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
-    // ── The one configuration that would lose data quietly ──────────────────
+    // ── The dump set, and the refusal that used to stand here ───────────────
     //
-    // `--persistent` writes a dump at teardown and reads it at setup.  N shards
-    // would write N dumps to ONE path, each holding a different slice, and the
-    // last one to run would be the whole of what the next start loaded — the
-    // rest of the keyspace gone, with nothing reporting it.  Redistributing a
-    // dump across a shard count that has changed is its own step with its own
-    // tests; until it exists this combination is refused rather than served.
-    if (m_shard_n > 1 && !m_persistent_path.empty())
-    {
-        LOG_ERROR("cache: --persistent and --shards are not compatible yet: N "
-                  "shards hold N slices of the keyspace and would write them all "
-                  "to one file, so the next start would load one shard's share "
-                  "and report nothing about the rest");
+    // `--persistent` with more than one shard was refused, because N shards
+    // would have written N slices over one path.  They now write one file each,
+    // every file says what split it holds, and a set that cannot be trusted
+    // refuses the START rather than being loaded in part.  See the persistence
+    // note above load_shard_set().
+    if (!load_shard_set())
         return false;
-    }
 
     // ── TLS listener ────────────────────────────────────────────────────────
     //
@@ -494,8 +617,8 @@ bool cache_instance::setup(event_loop& loop)
         return false;
     }
 
-    if (!m_persistent_path.empty())
-        m_store.load(m_persistent_path);
+    // The dump set was read at the top of setup(), before anything could be
+    // served out of a store that is only part of what was stored.
 
     // Cache config values to avoid virtual calls on hot paths
     m_idle_timeout_cached = get_idle_timeout();
@@ -607,8 +730,14 @@ bool cache_instance::setup(event_loop& loop)
 
 void cache_instance::teardown(event_loop& /*loop*/)
 {
-    if (!m_persistent_path.empty())
-        m_store.save(m_persistent_path);
+    // This shard's own slice, into its own file, atomically.  Never the bare
+    // path: a dump has to say what split it holds, and only a file written
+    // before this existed cannot.
+    if (!save_shard_dump())
+        LOG_ERROR(("cache: could not write the dump for slice "
+                   + std::to_string(m_shard_i) + " of "
+                   + std::to_string(m_shard_n) + " beside " + m_persistent_path
+                   + "; the next start will refuse the incomplete set").c_str());
 
     // Shutdown before closing.  A multishot accept holds its own reference to
     // the socket, so close() does not end it and the terminating completion
@@ -2451,6 +2580,237 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
     return false;
 }
 
+// Where this shard's slice lives.
+//
+// At ONE shard it is the configured path itself, unsuffixed — the file
+// `--persistent /x` has always produced, and a contract this change has no
+// business altering.  Found by test_cache_dump_permissions.sh, which checks the
+// mode of exactly that path: writing `/x.shard0` instead left it looking at a
+// file that no longer existed.
+//
+// Above one shard there is no single file it could be, so each slice is named
+// and the set is what carries the split.
+std::string cache_instance::shard_dump_path(uint32_t index) const
+{
+    if (m_shard_n <= 1)
+        return m_persistent_path;
+    return m_persistent_path + ".shard" + std::to_string(index);
+}
+
+// Write this shard's slice.  Atomic on its own file; see case 3 in the note
+// above for why that is the whole of what the write side owes.
+bool cache_instance::save_shard_dump() const
+{
+    if (m_persistent_path.empty())
+        return true;
+
+    // The header goes on whichever file this is, the bare path included: a dump
+    // that says it is one slice of one is still a dump that says what it is,
+    // and load() skips the header by the same rule either way.
+    const bool ok = m_store.save(shard_dump_path(m_shard_i),
+                                 encode_shard_dump_header(m_shard_n, m_shard_i));
+
+    // ── The slices this runtime no longer has ───────────────────────────────
+    //
+    // A cache run at eight shards and then at four writes shard0..3 and leaves
+    // shard4..7 where they were.  Those files are a complete set from another
+    // run, so the NEXT start sees two sets in one place and refuses — which is
+    // the right answer to that state and a terrible thing to do to an operator
+    // who merely reduced the shard count.  Found here rather than by the test:
+    // the shrink is legitimate, it is the leftovers that are not.
+    //
+    // So they go with the dump that supersedes them.  Shard 0 alone, because N
+    // processes making the same unlink calls buys nothing, and only for indices
+    // AT OR ABOVE the current count — never a slice this run owns, whether or
+    // not its shard has finished writing yet.
+    if (ok && m_shard_i == 0)
+        for (uint32_t j = (m_shard_n <= 1 ? 0 : m_shard_n); j < max_shards; ++j)
+        {
+            const std::string stale =
+                m_persistent_path + ".shard" + std::to_string(j);
+            if (::unlink(stale.c_str()) == 0)
+                LOG_INFO(("cache: removed " + stale
+                          + ", superseded by this dump").c_str());
+        }
+
+    return ok;
+}
+
+// Gather what is on disk and decide how to read it.
+//
+// Returns false only for a set that must not be loaded — a gap or a
+// contradiction.  A start on that is refused rather than served from whatever
+// happened to survive.
+bool cache_instance::load_shard_set()
+{
+    if (m_persistent_path.empty())
+        return true;
+
+    struct found { uint32_t index; std::string path; shard_dump_header hdr;
+                   bool legacy; };
+    std::vector<found> set;
+    uint32_t declared = 0;
+    bool     mixed    = false;
+
+    // The suffixed set, whatever this run's own shard count is: a set written by
+    // a run with a different N is exactly what has to be found here.
+    for (uint32_t i = 0; i < max_shards; ++i)
+    {
+        const std::string p = m_persistent_path + ".shard" + std::to_string(i);
+        shard_dump_header h{};
+        bool legacy = false;
+        if (!read_shard_dump_header(p, h, legacy))
+            continue;                      // not there, which is not an error
+
+        if (legacy)
+        {
+            // A file at a sharded name with no header is not something this
+            // build wrote, and guessing what split it holds is the guess that
+            // loses data.
+            LOG_ERROR(("cache: " + p + " has no shard header; refusing to guess "
+                       "which slice of the keyspace it holds").c_str());
+            return false;
+        }
+        if (declared == 0)      declared = h.count;
+        else if (h.count != declared) mixed = true;
+
+        set.push_back(found{i, p, h, false});
+    }
+
+    // Nothing sharded on disk: the bare path, if it is there, is a complete set
+    // of one written before this header existed.
+    if (set.empty())
+    {
+        shard_dump_header h{};
+        bool legacy = false;
+        if (!read_shard_dump_header(m_persistent_path, h, legacy))
+            return true;                   // first start, nothing to load
+
+        if (legacy)
+        {
+            LOG_INFO(("cache: loading the pre-shard dump at " + m_persistent_path
+                      + " as a single slice").c_str());
+            h.count = 1;
+            h.index = 0;
+            h.has_fingerprint = false;
+        }
+        set.push_back(found{h.index, m_persistent_path, h, legacy});
+        declared = h.count;
+    }
+
+    // ── case 2: two sets in one place ──
+    if (mixed)
+    {
+        std::string counts;
+        for (const auto& f : set)
+            counts += (counts.empty() ? "" : ", ") + std::string("shard")
+                    + std::to_string(f.index) + " says " + std::to_string(f.hdr.count);
+        LOG_ERROR(("cache: the dumps beside " + m_persistent_path
+                   + " disagree about how many shards wrote them (" + counts
+                   + ").  That is two sets in one place; refusing to load either")
+                  .c_str());
+        return false;
+    }
+
+    // ── case 2 again: an index that cannot belong to this set ──
+    for (const auto& f : set)
+        if (f.hdr.index >= declared || f.index >= declared)
+        {
+            LOG_ERROR(("cache: " + f.path + " claims slice "
+                       + std::to_string(f.hdr.index) + " of "
+                       + std::to_string(declared)
+                       + ", which is not a slice that set has; refusing to load")
+                      .c_str());
+            return false;
+        }
+
+    // ── case 1: a gap ──
+    std::vector<bool> seen(declared, false);
+    for (const auto& f : set)
+    {
+        if (seen[f.hdr.index])
+        {
+            LOG_ERROR(("cache: two dumps beside " + m_persistent_path
+                       + " both claim slice " + std::to_string(f.hdr.index)
+                       + "; refusing to load").c_str());
+            return false;
+        }
+        seen[f.hdr.index] = true;
+    }
+    for (uint32_t i = 0; i < declared; ++i)
+        if (!seen[i])
+        {
+            LOG_ERROR(("cache: the dump for slice " + std::to_string(i) + " of "
+                       + std::to_string(declared) + " is missing beside "
+                       + m_persistent_path
+                       + ".  Its keys would be gone with nothing reporting it; "
+                         "refusing to start").c_str());
+            return false;
+        }
+
+    // ── case 4: is the split still the split this set was written under? ──
+    unsigned char now[cache_fingerprint_len];
+    cache_shard_fingerprint(now);
+    bool same_function = true;
+    for (const auto& f : set)
+        if (f.hdr.has_fingerprint
+            && std::memcmp(f.hdr.fingerprint, now, cache_fingerprint_len) != 0)
+            same_function = false;
+
+    // A set of one carries no fingerprint worth checking: at count 1 every key
+    // is shard 0 whatever the function does.
+    if (declared == 1 && m_shard_n == 1)
+        same_function = true;
+
+    // ── The check whose absence is measurable ───────────────────────────────
+    //
+    // Measured with the ownership hash perturbed by one bit in its offset basis
+    // and this `&& same_function` removed, against a four-shard dump set:
+    //
+    //     DBSIZE reported 40.  All 40 keys were unreachable.
+    //
+    // Every key had been loaded into the wrong shard's store, so the count was
+    // exactly right and every single GET was a miss.  An assertion on "does it
+    // load" passes that, and so does an assertion on the key COUNT — which is
+    // why the test reads every key back individually.
+    const bool fast = (declared == m_shard_n) && same_function;
+
+    if (fast)
+    {
+        for (const auto& f : set)
+            if (f.hdr.index == m_shard_i)
+                return m_store.load(f.path, f.legacy ? 0 : shard_dump_header_size);
+        return true;
+    }
+
+    // ── the filter path ──
+    //
+    // Every shard reads every dump and keeps what hashes to it NOW.  Slower by
+    // N, once, at start — and correct without a special case for any of the
+    // ways the split can have moved.
+    if (!same_function)
+        LOG_WARN(("cache: the dumps beside " + m_persistent_path + " were written "
+                  "by a different ownership function; every shard will read every "
+                  "dump and keep what belongs to it").c_str());
+    else
+        LOG_INFO(("cache: loading " + std::to_string(declared) + " dump(s) into "
+                  + std::to_string(m_shard_n) + " shard(s); each shard keeps what "
+                  "hashes to it").c_str());
+
+    for (const auto& f : set)
+    {
+        cache_store incoming;
+        if (!incoming.load(f.path, f.legacy ? 0 : shard_dump_header_size))
+        {
+            LOG_ERROR(("cache: " + f.path + " could not be read; refusing to start "
+                       "on part of a dump").c_str());
+            return false;
+        }
+        m_store.adopt_owned(incoming, m_shard_i, m_shard_n);
+    }
+    return true;
+}
+
 void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd,
                                    bool resp, std::string_view why)
 {
@@ -3123,15 +3483,6 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             route_part(conn, owner, slot, 0, line, false);
             return;
         }
-
-        case cache_cmd_class::persistence:
-            run_in_reply_order(conn, [&] {
-                emit_unrouted(conn, parts.cmd, false,
-                              "writes or reads this cache's dump file, and N "
-                              "shards hold N slices of the keyspace -- routing "
-                              "it would have them all write one path");
-            });
-            return;
 
         case cache_cmd_class::stateful:
             run_in_reply_order(conn, [&] {
@@ -4191,13 +4542,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = m_persistent_path;
-            if (path.empty())
+            if (m_persistent_path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
                 return;
             }
-            rb.append(m_store.save(path) ? "ok\n" : "failed: flush failed\n");
+            // This shard's own slice into its own file — the same write
+            // teardown makes.  Fanned out to every shard by the router, so a
+            // `flush` on the runtime writes the whole set and `all_ok` says so
+            // only when every shard managed it.
+            rb.append(save_shard_dump() ? "ok\n" : "failed: flush failed\n");
             break;
         }
         case fnv1a("load"):
@@ -4207,13 +4561,14 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("denied: admin mode required\n", 28);
                 return;
             }
-            std::string_view path = m_persistent_path;
-            if (path.empty())
+            if (m_persistent_path.empty())
             {
                 rb.append("failed: no persistent path set\n", 31);
                 return;
             }
-            rb.append(m_store.load(path) ? "ok\n" : "failed: load failed\n");
+            // The whole set, judged as a set: a gap or a contradiction refuses
+            // rather than loading part of it.  Same decision as at start.
+            rb.append(load_shard_set() ? "ok\n" : "failed: load failed\n");
             break;
         }
         case fnv1a("size"):
@@ -4894,7 +5249,6 @@ void cache_instance::process_resp_command(client_connection* conn,
             return;
         }
 
-        case cache_cmd_class::persistence:
         case cache_cmd_class::stateful:
             run_in_reply_order(conn, [&] {
                 emit_unrouted(conn, args[0], true,

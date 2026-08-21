@@ -1,4 +1,5 @@
 #include "cache_store.h"
+#include "../../shared/cache_shard_map.h"
 #include "../../shared/ipc_framing.h"
 #include "../../shared/logging.h"
 #include <fstream>
@@ -1160,17 +1161,62 @@ static constexpr char MAGIC_V2[4] = {'S', 'K', 'V', '2'};
 
 enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3 };
 
-bool cache_store::save(std::string_view path) const
+void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
+                              uint32_t shard_count)
 {
-    return save_v2(path);
+    const auto mine = [&](const std::string& k) {
+        return cache_shard_of(k, shard_count) == shard_index;
+    };
+
+    // The deadline moves with the key, and it is read BEFORE the key is moved
+    // out of `other` — after the move the string is gone and the lookup would
+    // be against an empty key.
+    const auto carry_expiry = [&](const std::string& k) {
+        const auto e = other.m_expiry.find(k);
+        if (e != other.m_expiry.end())
+            m_expiry[k] = e->second;
+    };
+
+    for (auto it = other.m_data.begin(); it != other.m_data.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_string(std::string(it->first), std::move(it->second));
+        }
+
+    for (auto it = other.m_lists.begin(); it != other.m_lists.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_list(std::string(it->first), std::move(it->second));
+        }
+
+    for (auto it = other.m_sets.begin(); it != other.m_sets.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_set(std::string(it->first), std::move(it->second));
+        }
+
+    for (auto it = other.m_hashes.begin(); it != other.m_hashes.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_hash(std::string(it->first), std::move(it->second));
+        }
 }
 
-bool cache_store::save_v2(std::string_view path) const
+bool cache_store::save(std::string_view path, std::string_view prefix) const
+{
+    return save_v2(path, prefix);
+}
+
+bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
 {
     std::string tmp_path = std::string(path) + ".tmp";
 
     // Phase 1: Calculate total file size
-    size_t total_size = 4;  // MAGIC_V2
+    size_t total_size = prefix.size() + 4;  // caller's header, then MAGIC_V2
 
     auto entry_overhead = [&](std::string_view key) -> size_t {
         // type(1) + key_len(4) + key + expiry_flag(1) [+ remaining_ms(8)]
@@ -1282,6 +1328,8 @@ bool cache_store::save_v2(std::string_view path) const
         }
     };
 
+    if (!prefix.empty())
+        emit(prefix.data(), prefix.size());
     emit(MAGIC_V2, 4);
 
     for (const auto& [key, value] : m_data)
@@ -1327,7 +1375,7 @@ bool cache_store::save_v2(std::string_view path) const
     return rename(tmp_path.c_str(), std::string(path).c_str()) == 0;
 }
 
-bool cache_store::load(std::string_view path)
+bool cache_store::load(std::string_view path, size_t offset)
 {
     // mmap path: zero-copy read from page cache
     int fd_raw = open(std::string(path).c_str(), O_RDONLY | O_CLOEXEC);
@@ -1335,7 +1383,9 @@ bool cache_store::load(std::string_view path)
         return false;
 
     struct stat st;
-    if (fstat(fd_raw, &st) < 0 || st.st_size < 4)
+    if (fstat(fd_raw, &st) < 0
+        || st.st_size < 4
+        || static_cast<size_t>(st.st_size) < offset + 4)
     {
         close(fd_raw);
         return false;
@@ -1371,6 +1421,7 @@ bool cache_store::load(std::string_view path)
         // Fallback to ifstream
         std::ifstream file(std::string(path), std::ios::binary);
         if (!file) return false;
+        if (offset > 0) file.seekg(static_cast<std::streamoff>(offset));
         char header[4]{};
         file.read(header, 4);
         if (!file) return false;
@@ -1381,19 +1432,23 @@ bool cache_store::load(std::string_view path)
         return load_v1(file, first_key_len);
     }
 
-    const char* data = static_cast<const char*>(map);
+    // The caller's header, if it wrote one, is skipped here and nowhere else:
+    // everything below this line reads exactly the bytes it always read.
+    const char* data = static_cast<const char*>(map) + offset;
+    file_size -= offset;
 
     if (std::memcmp(data, MAGIC_V2, 4) == 0)
     {
         bool ok = load_v2(data + 4, file_size - 4);
-        munmap(map, file_size);
+        munmap(map, file_size + offset);
         return ok;
     }
 
     // v1 format — fall back to stream parser
-    munmap(map, file_size);
+    munmap(map, file_size + offset);
     std::ifstream file(std::string(path), std::ios::binary);
     if (!file) return false;
+    if (offset > 0) file.seekg(static_cast<std::streamoff>(offset));
     char header[4]{};
     file.read(header, 4);
     if (!file) return false;

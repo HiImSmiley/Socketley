@@ -577,6 +577,12 @@ private:
     // This runtime's shard set, read once at setup.  get_shards() is not inline
     // and this is asked per command; 1 and 0 are the unsharded answers and make
     // every check below a single compare.
+    // ── Persistence across a changed shard count ────────────────────────────
+    // See the note above the implementation for what each of these meets.
+    std::string shard_dump_path(uint32_t index) const;
+    bool        save_shard_dump() const;
+    bool        load_shard_set();
+
     uint32_t m_shard_n{1};
     uint32_t m_shard_i{0};
 

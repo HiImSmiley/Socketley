@@ -75,7 +75,6 @@ enum class cache_cmd_class : uint8_t
     multi_key,    // several keys, possibly several owners
     keyspace,     // every shard's slice at once — keys, dbsize, memory
     cursor_scan,  // one shard per call, named by the cursor; see below
-    persistence,  // reads or writes the dump file: flush, load
     fanout,       // no key, but every shard has its own subscribers: publish
     connection,   // answered by whoever holds the socket; no key at all
     stateful,     // attaches a stream to one shard: replicate
@@ -125,6 +124,9 @@ constexpr cache_merge cache_merge_for(uint32_t h)
         case fnv1a("mset"):   return cache_merge::all_ok;
         case fnv1a("del"):    return cache_merge::sum;     // the RESP spelling
         case fnv1a("keys"):   return cache_merge::key_list;
+        case fnv1a("flush"):  case fnv1a("load"):
+            return cache_merge::all_ok;
+
         case fnv1a("dbsize"): case fnv1a("size"):
         case fnv1a("memory"): case fnv1a("maxmemory"):
         // publish answers how many subscribers it REACHED, and every shard
@@ -186,15 +188,18 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("scan"):
             return cache_cmd_class::cursor_scan;
 
-        // NOT keyspace commands, whatever their names suggest.  `flush` in this
-        // cache is m_store.save(m_persistent_path) and `load` is its inverse --
-        // they write and read the DUMP FILE, they do not empty or repopulate
-        // the keyspace.  Fanning `flush` out would have N shards write N
-        // different slices over one path, last writer wins, and the next start
-        // would load one shard's share and report nothing about the rest.  That
-        // is the silent data loss persistence has its own step for.
+        // `flush` and `load` touch the DUMP FILE rather than the keyspace, and
+        // that is why they were refused on a sharded cache: fanned out, N
+        // shards wrote N different slices over ONE path, last writer won, and
+        // the next start loaded one shard's share.
+        //
+        // Each shard now writes its OWN file, and the set says what split it
+        // holds, so the collision that made this dangerous no longer exists.
+        // They fan out like a keyspace read, with `all_ok` rather than a sum —
+        // a partial flush has to be visible as the failure it is, not averaged
+        // into a number.
         case fnv1a("flush"):      case fnv1a("load"):
-            return cache_cmd_class::persistence;
+            return cache_cmd_class::keyspace;
 
         case fnv1a("publish"):
             return cache_cmd_class::fanout;
@@ -390,4 +395,60 @@ constexpr uint64_t cache_scan_cursor_make(uint32_t shard, uint64_t store_cursor)
 {
     return (static_cast<uint64_t>(shard) << cache_scan_shard_shift)
          | (store_cursor & cache_scan_store_mask);
+}
+
+// ─── A FINGERPRINT OF THE OWNERSHIP FUNCTION ────────────────────────────────
+//
+// A dump written under one hash and loaded under another puts every key in the
+// wrong slice.  The fast path — each shard loads its own dump and trusts the
+// split — is then silently wrong, which is the failure persistence exists to
+// avoid rather than to introduce.
+//
+// The obvious guard is a version integer in the header, bumped whenever
+// cache_shard_of() changes.  That is a rule somebody has to remember, and this
+// file's whole argument is that a rule call sites must remember is one the next
+// change will not know about.  So there is no version to bump.
+//
+// Instead the dump records what the function DOES: cache_shard_of() evaluated
+// over a fixed probe set at a fixed count, packed one shard index per byte.  At
+// load the probes are recomputed and compared.
+//
+//   same function      identical fingerprint   -> the fast path is safe
+//   any change to the hash, the mixing, the modulo or the character handling
+//                      different fingerprint   -> the filter path, where every
+//                                                 shard reads every dump and
+//                                                 keeps what hashes to it
+//
+// It is self-verifying: nothing has to be remembered, and it cannot be wrong in
+// the direction that loses data.  An unnecessary filter pass is slow; a wrongly
+// trusted fast path is silent loss.
+//
+// ─── THE COUNT IS FIXED, AND THAT IS LOAD-BEARING ───────────────────────────
+//
+// Sixteen, always — never the dump's own shard count.  A fingerprint taken
+// modulo the set's count would differ between a set written at N=4 and one
+// written at N=8 for a function that never changed, and every cross-N load
+// would take the filter path believing the hash had changed.  The fingerprint
+// answers "is this the same function", not "is this the same split"; the split
+// is the count and index in the header, which are recorded separately.
+//
+// The probes live here, beside the function they fingerprint, so the two cannot
+// drift apart.
+inline constexpr uint32_t cache_fingerprint_count = 16;
+
+inline constexpr std::string_view cache_fingerprint_probes[] = {
+    "", "a", "key", "socketley", "0123456789",
+    "\xff\xfe", "a longer key with spaces", "\x01\x02\x03\x04",
+};
+
+inline constexpr size_t cache_fingerprint_len =
+    sizeof(cache_fingerprint_probes) / sizeof(cache_fingerprint_probes[0]);
+
+// Eight bytes, one shard index per probe.  Written into every dump header and
+// compared on load.
+inline void cache_shard_fingerprint(unsigned char out[cache_fingerprint_len])
+{
+    for (size_t i = 0; i < cache_fingerprint_len; ++i)
+        out[i] = static_cast<unsigned char>(
+            cache_shard_of(cache_fingerprint_probes[i], cache_fingerprint_count));
 }

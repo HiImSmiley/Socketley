@@ -147,8 +147,25 @@ public:
     uint32_t size() const;
     bool exists(std::string_view key) const;
 
-    bool save(std::string_view path) const;
-    bool load(std::string_view path);
+    // `prefix` is written ahead of the dump's own magic and is opaque here: a
+    // sharded cache puts the header that says which slice this file is in it.
+    // `offset` is how many bytes to skip back off on the way in.  Both default
+    // to nothing, so an unsharded save/load is byte-for-byte what it was.
+    // Take from `other` every key this shard owns, and leave the rest.
+    //
+    // The filter half of loading a dump set whose split is not this one: each
+    // shard reads every dump and keeps what hashes to it now.  Moves rather
+    // than copies — `other` is a dump just read and is discarded after — so a
+    // redistribution costs one pass and no duplication of the values.
+    //
+    // Expiry travels with the key.  A dump records the REMAINING time and load()
+    // has already turned it into a deadline, so what is moved here is that
+    // deadline and not a fresh one; a key that was five seconds from expiring
+    // before the restart is five seconds from expiring after it.
+    void adopt_owned(cache_store& other, uint32_t shard_index, uint32_t shard_count);
+
+    bool save(std::string_view path, std::string_view prefix = {}) const;
+    bool load(std::string_view path, size_t offset = 0);
 
     // --- Eviction / Memory ---
     void set_max_memory(size_t bytes);
@@ -220,7 +237,7 @@ private:
     bool has_type_conflict_for_set(std::string_view key) const;
     bool has_type_conflict_for_hash(std::string_view key) const;
 
-    bool save_v2(std::string_view path) const;
+    bool save_v2(std::string_view path, std::string_view prefix) const;
     bool load_v2(const char* data, size_t size);
     bool load_v2_stream(std::ifstream& file);  // legacy fallback
     bool load_v1(std::ifstream& file, uint32_t first_key_len);

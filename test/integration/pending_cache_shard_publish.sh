@@ -6,6 +6,16 @@
 #
 # run_all.sh globs integration/test_*.sh, and `--shards` on a cache is still
 # refused.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run it; it skips
+#
+# Rebuild with the define through a touch, not the flag alone:
+#
+#   touch socketley/shared/runtime_definitions.h && \
+#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
+#
+# make tracks file times, not compiler flags, so adding the define on its own
+# rebuilds nothing and leaves the refusal compiled in.  A `find -newer` check
+# cannot see that; the string can:
+#   strings bin/Release/socketley | grep -c 'not available on a cache'  # 0 = on
 # without the flag rather than failing.
 #
 # Measured on that build, four shards, 24 subscribers spread by SO_REUSEPORT:

@@ -8,7 +8,14 @@
 # pending_cache_shard_routing.sh is, and it skips rather than failing on a build
 # that has the refusal.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run it:
 #
+#   touch socketley/shared/runtime_definitions.h && \
 #   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
+#
+# The touch is not optional: make tracks file times, not compiler flags, so
+# adding or removing the define alone rebuilds nothing and leaves the refusal
+# compiled in from the previous build.  A `find -newer` freshness check cannot
+# see that either -- the only reliable check is the string:
+#   strings bin/Release/socketley | grep -c 'not available on a cache'   # 0 = on
 #
 # Measured on that build, four shards:
 #
@@ -172,18 +179,20 @@ else
         "got: $(printf '%s' "$COUT" | tr '\n' ' ')"
 fi
 
-# ── flush is refused for the RIGHT reason ───────────────────────────────────
+# ── flush is answered by the runtime, not refused ──────────────────────────
 #
-# It is not a keyspace command.  A build that treats it as one fans it out and
-# has four shards write four different slices over one path.
+# When this file was written `flush` was refused, because fanning it out would
+# have had four shards write four slices over one path.  Step four gave each
+# shard its own dump file, so it is routed now and answers with the
+# interpreter's own reply merged across the shards — `all_ok`, so a partial
+# flush shows as the refusal it is rather than being averaged away.
 FOUT=$(printf 'flush\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
 case "$FOUT" in
-    *"dump file"*)
-        ok "flush is refused as the dump-file command it is" ;;
+    *"not routed"*|"")
+        bad "flush is answered by the runtime rather than refused as unroutable" \
+            "got '$FOUT'" ;;
     *)
-        bad "flush is refused as the dump-file command it is" \
-            "got '$FOUT'; flush writes m_store.save(persistent_path), so fanning" \
-            "it out is N shards writing one file" ;;
+        ok "flush is answered by the runtime ('$FOUT')" ;;
 esac
 
 # ── RESP: the second dispatch, and SCAN ─────────────────────────────────────

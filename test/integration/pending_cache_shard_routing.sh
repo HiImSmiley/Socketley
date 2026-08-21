@@ -115,7 +115,14 @@ if ! "$BIN" create cache sh4t -p "$P_T4" --shards 4 -s >/dev/null 2>&1; then
     echo "  SKIP: this build refuses --shards on a cache, which is still the"
     echo "        shipped answer.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS"
     echo "        to run this file:"
-    echo "        make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS"
+    echo "        touch socketley/shared/runtime_definitions.h && \
+#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
+#
+# The touch is not optional: make tracks file times, not compiler flags, so
+# adding or removing the define alone rebuilds nothing and leaves the refusal
+# compiled in from the previous build.  A `find -newer` freshness check cannot
+# see that either -- the only reliable check is the string:
+#   strings bin/Release/socketley | grep -c 'not available on a cache'   # 0 = on"
     exit 0
 fi
 "$BIN" create cache sh4r -p "$P_R4" --shards 4 --resp -s >/dev/null 2>&1
@@ -224,15 +231,11 @@ if command -v redis-cli >/dev/null 2>&1; then
     # them down.  What is left is the two classes that are refused on purpose
     # rather than pending: a command that reads or writes the dump file, and one
     # that attaches a stream to a single shard.  Both would appear to work.
-    FL=$(printf 'flush\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
-    case "$FL" in
-        *"dump file"*)
-            ok "a dump-file command is refused by name, not fanned out" ;;
-        *)
-            bad "a dump-file command is refused by name" \
-                "flush is m_store.save(persistent_path); fanning it out is four" \
-                "shards writing four slices over one path — got '$FL'" ;;
-    esac
+    # `flush` was refused here when this file was written and is routed now —
+    # step four gave each shard its own dump file, so the collision that made
+    # fanning it out dangerous no longer exists.  What it answers is the
+    # interpreter's own reply, merged; pending_cache_shard_persist.sh holds the
+    # dump behaviour down.  Nothing is asserted about it here.
 
     RP=$(printf 'replicate 127.0.0.1:1\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
     case "$RP" in
@@ -264,18 +267,24 @@ fi
 # else.
 sleep 2.5
 ST=$("$BIN" stats sh4t 2>&1 || true)
-ROUTED=$(printf '%s\n' "$ST" | awk '
-    /^\[shard /            { conns = -1; cmds = -1 }
-    /^total_connections:/  { split($0, a, ":"); conns = a[2] }
-    /^commands_processed:/ { split($0, a, ":"); cmds  = a[2]
-                             if (conns == 0 && cmds > 0) n++ }
-    END { print n + 0 }')
-if [ "$ROUTED" -gt 0 ]; then
-    ok "$ROUTED shard(s) executed commands without holding a connection"
+
+# ── 3: the keys of ONE connection ended up in more than one shard ──────────
+#
+# This used to look for a shard with connections:0 and commands_processed>0,
+# which only holds when the kernel happens to give no connection to at least one
+# shard — with four shards and a handful of connections it often gives one to
+# each, and the assertion then fails on a correct build.  Luck is not a test.
+#
+# The keys are the durable evidence: one connection wrote them all, so a build
+# that does not route puts every one of them in that connection's shard.  A
+# spread over more than one shard cannot happen without a crossing.
+HOLDING=$(printf '%s\n' "$ST" | awk -F: '/^keys:/ { if ($2+0 > 0) n++ } END { print n+0 }')
+if [ "$HOLDING" -gt 1 ]; then
+    ok "one connection's keys are spread over $HOLDING shards"
 else
-    bad "a shard executed commands without holding a connection" \
-        "every shard's command count matches its own connections, so nothing" \
-        "crossed a shard boundary at all" \
+    bad "one connection's keys are spread over more than one shard" \
+        "$HOLDING shard(s) hold any keys — everything landed where the" \
+        "connection did, so nothing crossed a shard boundary" \
         "$(printf '%s' "$ST" | tr '\n' '|')"
 fi
 
