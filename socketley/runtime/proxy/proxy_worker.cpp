@@ -29,6 +29,8 @@
 #include "../../shared/runtime_manager.h"
 #include "../../shared/state_persistence.h"
 #include "../../shared/frame_writer.h"
+#include "../../shared/shard_mesh.h"
+#include "../../shared/shard_target.h"
 #include "../../shared/worker_protocol.h"
 
 namespace
@@ -54,6 +56,13 @@ constexpr int worker_shard_fd = 4;
 // And the client-list region; see shard_clients.h.  Same contract, same reason
 // it is named on both sides rather than shared through a header.
 constexpr int worker_clients_fd = 5;
+
+// And the mesh block, which must agree with proxy_supervisor's
+// child_mesh_base: slot j is this shard's link to shard j, and the slot at its
+// own index is never placed.  Absent is the ordinary case — an unsharded
+// runtime, or one the daemon could not mesh — and it means "relay", not
+// "error".  See shared/shard_mesh.h.
+constexpr int worker_mesh_base = 8;
 
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
@@ -192,10 +201,12 @@ bool claim_current_daemon(int control_fd)
     return ::getppid() == creator;
 }
 
-// The worker's writer to the daemon is shared/frame_writer.h.  Lifted out of
-// this file whole: a bounded-backlog writer with a drop policy has two places
-// to get the EAGAIN case wrong if there are two of it, and the second is always
-// found months later.
+// The worker's writer to the daemon is shared/frame_writer.h; the shard mesh
+// needs the same bounded-backlog behaviour for its links to siblings, and one
+// drop policy is what keeps the two from disagreeing about EAGAIN.  Lifted out
+// of this file whole: a bounded-backlog writer with a drop policy has two
+// places to get the EAGAIN case wrong if there are two of it, and the second is
+// always found months later.
 using control_writer = frame_writer;
 
 // Every runtime this process does not hold.
@@ -737,6 +748,22 @@ private:
         s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
         s.detail             = m_rt->get_stats();
 
+        // The two numbers that make a mesh measurement mean anything.
+        //
+        // The relay fallback is what keeps a broken mesh from being an outage,
+        // and it is also what would let one go unnoticed: a mesh that never
+        // connects reports the same throughput as one that did not help.  These
+        // say which happened.  Appended to the detail the worker already sends
+        // rather than added to the frame, because the frame is a contract
+        // between two builds and this is a figure.
+        if (!m_mesh_sinks.empty())
+        {
+            uint64_t direct = 0, relayed = 0;
+            mesh_counts(direct, relayed);
+            s.detail += "mesh_direct:"  + std::to_string(direct)  + "\n";
+            s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
+        }
+
         // Stamped here, after the reads and before the write, because this is
         // the moment the figures describe.  The daemon cannot recover it: what
         // it can observe is when the frame came off the socket, which is later
@@ -1009,6 +1036,36 @@ private:
                 });
         }
 
+        // ── The shard mesh ─────────────────────────────────────────────────
+        //
+        // Built after the channel is attached below?  No — before it, because
+        // the sinks registered here have to be in the table by the time the
+        // first request is posted, and the config frame that reaches this point
+        // is followed by `start`.  The links themselves are armed on the ring,
+        // which exists from register_owner() a few lines down, so attach() is
+        // deferred until then.
+        //
+        // A descriptor that is not there is not an error: it is an unsharded
+        // runtime, a daemon that could not build the mesh, or a shard that was
+        // restarted and cannot inherit one.  All three relay.
+        if (cfg.shards > 1)
+        {
+            const uint32_t me = m_rt->get_shard_index();
+            for (uint32_t j = 0; j < cfg.shards; ++j)
+            {
+                if (j == me)
+                    continue;
+                const int fd = worker_mesh_base + static_cast<int>(j);
+                if (::fcntl(fd, F_GETFD, 0) < 0)
+                    continue;
+                m_mesh_links.push_back(std::make_unique<shard_link>(
+                    fd, j, &m_manager.requests(), &worker_serve_mesh, this));
+            }
+            if (!m_mesh_links.empty())
+                LOG_INFO(("shard mesh: " + std::to_string(m_mesh_links.size())
+                          + " direct link(s) to siblings").c_str());
+        }
+
         // ── the channel, both directions ────────────────────────────────────
         //
         // A runtime asks through its manager, and a worker had none: every
@@ -1030,6 +1087,19 @@ private:
         if (auto* sink = m_rt->as_request_sink())
             m_manager.requests().register_sink(cfg.name, sink);
         m_manager.requests().set_default_sink(&m_remote);
+
+        // `name#j` for every sibling this process has a link to.  Registered
+        // AFTER the default sink and under the qualified name, so the lookup
+        // that used to miss and fall through to the daemon now resolves here —
+        // and a sibling with no link is simply absent from the table, which is
+        // the miss that still falls through.  See shared/shard_mesh.h.
+        for (auto& link : m_mesh_links)
+        {
+            link->attach(m_loop);
+            m_mesh_sinks.push_back(std::make_unique<mesh_sink>(link.get(), &m_remote));
+            m_manager.requests().register_sink(
+                shard_target(cfg.name, link->peer()), m_mesh_sinks.back().get());
+        }
         m_rt->set_runtime_manager(&m_manager);
 
         // ── and a send on its way out ───────────────────────────────────────
@@ -1345,6 +1415,40 @@ private:
     // was chosen over the target's own protocol.  The ticket is the channel's,
     // and it goes back with the answer so the daemon can pair them without
     // understanding either.
+    // What a mesh link hands a sibling's request to.
+    //
+    // The same two lines on_chan_req() runs for a request that came the long
+    // way round, deliberately: a key served over a direct link and the same key
+    // served through the daemon must not be able to differ.  A free function
+    // because shard_link knows nothing about runtimes and should not.
+    static bool worker_serve_mesh(void* ctx, std::string_view /*target*/,
+                                  std::string_view payload, std::string& reply)
+    {
+        auto* self = static_cast<worker*>(ctx);
+        if (!self || !self->m_rt)
+            return false;
+        auto* sink = self->m_rt->as_request_sink();
+        if (!sink)
+            return false;
+        sink->serve_request(payload, reply);
+        return true;
+    }
+
+    // Crossings by route, summed over this shard's links.
+    //
+    // Reported because the relay fallback makes a mesh that never connects look
+    // exactly like one that made no difference: same throughput, same green
+    // tests.  Without these two numbers the benchmark cannot tell them apart.
+    void mesh_counts(uint64_t& direct, uint64_t& relayed) const
+    {
+        direct = relayed = 0;
+        for (const auto& sk : m_mesh_sinks)
+        {
+            direct  += sk->stat_direct();
+            relayed += sk->stat_relayed();
+        }
+    }
+
     void on_chan_req(const std::string& payload)
     {
         worker_proto::chan_request_wire q;
@@ -1594,6 +1698,8 @@ private:
     event_loop                             m_loop;
     // Before m_remote, which holds a pointer to it.
     control_writer                         m_writer;
+    std::vector<std::unique_ptr<shard_link>> m_mesh_links;
+    std::vector<std::unique_ptr<mesh_sink>>  m_mesh_sinks;
     remote_sink                            m_remote;
     // A replica of the daemon's map, and a live channel.  See the wiring in
     // on_config() and the runtime_map frame that fills the map in.

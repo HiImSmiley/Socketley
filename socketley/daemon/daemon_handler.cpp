@@ -19,6 +19,8 @@
 #include "../shared/worker_protocol.h"
 #include "../shared/ipc_framing.h"
 #include "../shared/shard_target.h"
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
@@ -367,6 +369,62 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
 // A runtime with one worker gets no entry.  Its name already resolves to that
 // worker, and `c#0` for an unsharded cache would be a second spelling of the
 // same thing for nobody to use.
+// Is there descriptor room to mesh this many shards?
+//
+// N shards need N(N-1) descriptors held AT ONCE in the daemon while the set is
+// forked — both ends of every pair, because the second child of a pair has not
+// been forked when the first one takes its end.  At the tree's max_shards of 64
+// that is 4,032.
+//
+// Answered from RLIMIT_NOFILE rather than from taste, and it SAYS SO when it
+// refuses.  A runtime that quietly stopped meshing would report the same
+// throughput as one that never tried, and be indistinguishable from a mesh that
+// did not help — which is the whole reason the route counters exist.
+//
+// Half the soft limit, less headroom for the listeners, rings and control
+// sockets the daemon already holds.  On this box the soft limit is 1,048,576,
+// so the cap cannot fire at any legal shard count; the branch is exercised by
+// lowering the limit, which test/integration/pending_cache_shard_mesh.sh does.
+bool daemon_handler::mesh_fits(size_t shards) const
+{
+    // The measurement control.
+    //
+    // The mesh and the relay are two routes for one crossing, and the question
+    // that decides whether the mesh is worth its descriptors is a comparison
+    // between them.  A comparison across two BUILDS makes the build a variable;
+    // this makes it one binary and one environment variable, so the arms differ
+    // only in the route.  Read here because this is the one function that
+    // decides whether a runtime meshes at all.
+    if (const char* off = ::getenv("SOCKETLEY_NO_SHARD_MESH");
+        off && *off && *off != '0')
+    {
+        LOG_INFO("shard mesh disabled by SOCKETLEY_NO_SHARD_MESH; shards relay "
+                 "through the daemon");
+        return false;
+    }
+
+    struct rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return false;               // cannot tell, so do not spend descriptors
+
+    const uint64_t need   = static_cast<uint64_t>(shards) * (shards - 1);
+    const uint64_t budget = (rl.rlim_cur == RLIM_INFINITY)
+                          ? need                      // no limit to run into
+                          : (static_cast<uint64_t>(rl.rlim_cur) / 2);
+    const uint64_t headroom = 256;
+
+    if (need + headroom <= budget)
+        return true;
+
+    LOG_WARN(("the shard mesh needs " + std::to_string(need)
+              + " descriptors for " + std::to_string(shards)
+              + " shards and the open-file limit leaves room for "
+              + std::to_string(budget > headroom ? budget - headroom : 0)
+              + "; this runtime's shards will relay through the daemon instead")
+             .c_str());
+    return false;
+}
+
 void daemon_handler::publish_shard_sinks(request_channel& ch)
 {
     for (auto& [name, shards] : m_proxy_workers)
@@ -5199,6 +5257,62 @@ void daemon_handler::reconcile_proxy_workers()
             clients_fd = creg.fd();
         }
 
+        // ── The shard mesh ─────────────────────────────────────────────────
+        //
+        // N(N-1)/2 socketpairs, made here because this is the only moment both
+        // ends can reach both processes: a socketpair is inherited, never
+        // attached, so it has to exist before the fork of the second child that
+        // needs it.  mesh[i][j] is the end child i gets for talking to child j.
+        //
+        // Only for a set being forked whole.  A runtime that GREW its shard
+        // count while running would have existing children that cannot be given
+        // new descriptors, and reconcile does not currently produce that — see
+        // the note on set_shard_count above.  Those shards relay, which is the
+        // route that always exists.
+        std::vector<std::vector<int>> mesh;
+        if (want_count > 1 && shards.empty() && mesh_fits(want_count))
+        {
+            mesh.assign(want_count, std::vector<int>(want_count, -1));
+            bool made = true;
+            for (size_t i = 0; i < want_count && made; ++i)
+                for (size_t j = i + 1; j < want_count && made; ++j)
+                {
+                    int sv[2];
+                    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0)
+                    {
+                        LOG_WARN(("could not build the shard mesh for " + name
+                                  + "; its shards will relay through the daemon")
+                                 .c_str());
+                        made = false;
+                        break;
+                    }
+                    mesh[i][j] = sv[0];
+                    mesh[j][i] = sv[1];
+                }
+            if (!made)
+            {
+                for (auto& row : mesh)
+                    for (int fd : row)
+                        if (fd >= 0) ::close(fd);
+                mesh.clear();
+            }
+        }
+
+        // Every end the daemon made, closed once the whole set is forked.  It
+        // keeps none: a restarted shard cannot be given a socketpair end that
+        // its siblings are already holding the other side of, so the mesh is
+        // built once per runtime start and a restarted shard relays.
+        struct mesh_closer
+        {
+            std::vector<std::vector<int>>& m;
+            ~mesh_closer()
+            {
+                for (auto& row : m)
+                    for (int fd : row)
+                        if (fd >= 0) ::close(fd);
+            }
+        } mesh_guard{mesh};
+
         while (shards.size() < want_count)
         {
         auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
@@ -5208,6 +5322,10 @@ void daemon_handler::reconcile_proxy_workers()
         // ever retires from the back, exactly so that a shard's index does not
         // move underneath a reader — so no counter has to be kept beside it.
         sup->set_shard(static_cast<uint32_t>(shards.size()), shard_fd, clients_fd);
+
+        // Its row of the mesh, which spawn() places and then forgets.
+        if (!mesh.empty())
+            sup->set_mesh_fds(mesh[shards.size()]);
 
         // The supervisor answers for the runtime it supervises.  Set before the
         // spawn so that a request arriving in the same turn as the start has
@@ -5327,6 +5445,12 @@ void daemon_handler::reconcile_proxy_workers()
             for (auto* s : forked)
                 s->send_start();
         }
+
+        // The descriptors have been placed into every child that wanted them.
+        // Dropped from the supervisors so a restart cannot place numbers the
+        // guard above is about to close.
+        for (auto& sup : shards)
+            sup->clear_mesh_fds();
 
         // A name whose every fork failed must not be left in the map as an
         // empty vector: `m_proxy_workers.find(name)` succeeding with nothing in

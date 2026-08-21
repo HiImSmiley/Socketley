@@ -43,6 +43,17 @@ constexpr int child_shard_fd = 4;
 // four.
 constexpr int child_clients_fd = 5;
 
+// And the shard mesh: one descriptor per SIBLING, at a fixed slot per sibling
+// index.  Eight rather than six so there is room between the single-purpose
+// descriptors above and a block whose width is the shard count.
+//
+// Slot j is the link to shard j, so shard i has nothing at slot i and both
+// sides do the same arithmetic — which is none.  A child of an unsharded
+// runtime, or of one whose mesh was not built, finds no descriptor at any of
+// them and relays through the daemon, which is the route that always exists.
+// See shared/shard_mesh.h.
+constexpr int child_mesh_base = 8;
+
 // A child that dies immediately and repeatedly is not going to be fixed by
 // forking it again — a bad port, a backend that cannot be resolved, a Lua
 // script that throws.  After this many restarts inside the window the runtime
@@ -516,6 +527,29 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         };
         place(region_src,  child_shard_fd);
         place(clients_src, child_clients_fd);
+
+        // ─── And the mesh, which is a BLOCK rather than two descriptors ─────
+        //
+        // The two placements above hand-check each source against each
+        // destination, which is readable for two and is not a method that
+        // survives sixty-three.  So every mesh source is moved above the whole
+        // destination block first, and only then placed: one rule instead of a
+        // case analysis that grows as N**2.
+        for (size_t j = 0; j < m_mesh_fds.size(); ++j)
+        {
+            if (m_mesh_fds[j] < 0)
+                continue;
+            if (m_mesh_fds[j] >= child_mesh_base
+                && m_mesh_fds[j] < child_mesh_base + static_cast<int>(m_mesh_fds.size()))
+            {
+                const int moved = ::fcntl(m_mesh_fds[j], F_DUPFD, 128);
+                if (moved < 0)
+                    _exit(127);
+                m_mesh_fds[j] = moved;
+            }
+        }
+        for (size_t j = 0; j < m_mesh_fds.size(); ++j)
+            place(m_mesh_fds[j], child_mesh_base + static_cast<int>(j));
 
         if (sv[1] != child_control_fd)
         {

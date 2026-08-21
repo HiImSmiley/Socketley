@@ -460,6 +460,10 @@ private:
     // qualified name and not a second wire.
     void publish_shard_sinks(request_channel& ch);
 
+    // Whether RLIMIT_NOFILE leaves room to mesh this many shards.  Says so in
+    // the log when it refuses; see the definition.
+    bool mesh_fits(size_t shards) const;
+
     // A `send` that came UP from a worker's script, addressed to a runtime that
     // worker cannot see.  Routed exactly as cmd_send() routes the same verb
     // typed at the CLI: to the connections in this process, or on to the one

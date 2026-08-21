@@ -283,6 +283,15 @@ public:
 
     uint32_t shard_index() const { return m_shard_index; }
 
+    // The shard mesh ends this child inherits: slot j is its link to shard j,
+    // and slot i (its own index) is -1.  Handed over before the fork like the
+    // shared regions, and CONSUMED by it — cleared once spawn() has placed
+    // them, because the daemon closes its own copies as soon as the whole set
+    // is forked and a restart therefore has nothing to place.  A restarted
+    // shard relays; see shared/shard_mesh.h.
+    void set_mesh_fds(std::vector<int> fds) { m_mesh_fds = std::move(fds); }
+    void clear_mesh_fds() { m_mesh_fds.clear(); }
+
     // Fork, exec, and send the config.  The placeholder is left in `running`
     // only once the child has been forked and the config written.
     bool spawn(const runtime_config& cfg);
@@ -545,6 +554,7 @@ private:
     // See set_shard().  Zero and -1 mean "the only process serving this
     // runtime", which is what every unsharded runtime is.
     uint32_t     m_shard_index{0};
+    std::vector<int> m_mesh_fds;
     int          m_shard_region_fd{-1};
     int          m_shard_clients_fd{-1};
 
