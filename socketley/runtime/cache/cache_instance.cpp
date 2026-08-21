@@ -2388,7 +2388,21 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
             {
                 int64_t v = 0;
                 if (!parse_int_reply(p, resp, v))
-                    return false;
+                {
+                    // Not a number, so not something to add.  Every part here
+                    // is a reply to the SAME command sent to shards configured
+                    // identically, so a refusal — `denied: readonly mode`, a
+                    // usage line — is one every shard gave and echoing it is
+                    // the honest answer.  An unreachable shard lands here too,
+                    // and its error says more than a generic merge failure.
+                    //
+                    // The one case this loses is a multi-key del where one
+                    // shard errored and the others counted: the counts go with
+                    // the error.  A number that silently omits a shard is the
+                    // worse of the two.
+                    out.append(p);
+                    return true;
+                }
                 total += v;
             }
             if (resp)
@@ -2732,6 +2746,17 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
                     + (resp ? shard_batch_resp.size() : shard_batch_text.size());
     const char* end = payload.data() + payload.size();
 
+    // Saved and restored rather than set and cleared: a command served here can
+    // reach Lua, and a script can ask this cache another question from inside
+    // it.  See the note in publish().
+    const bool prev_serving = m_serving_shard_batch;
+    m_serving_shard_batch   = true;
+    struct batch_serving_guard
+    {
+        bool& flag; bool prev;
+        ~batch_serving_guard() { flag = prev; }
+    } sguard{m_serving_shard_batch, prev_serving};
+
     std::string_view one;
     std::string      produced;
     while (shard_frame_take(p, end, one))
@@ -2973,13 +2998,13 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     return true;
 }
 
-// A keyspace-wide command: the same command to every shard, merged.
+// The same command to every shard, merged: a keyspace-wide read, or a publish.
 //
 // One part per shard, and the part this shard owns is executed in place, so a
 // four-shard `dbsize` is three crossings and one local call — and if several
 // arrive in one pipeline they still share those three crossings.
-void cache_instance::fan_keyspace(client_connection* conn, uint32_t h,
-                                  std::string_view raw, bool resp)
+void cache_instance::fan_all_shards(client_connection* conn, uint32_t h,
+                                    std::string_view raw, bool resp)
 {
     const uint32_t slot = slot_open(conn, resp, cache_merge_for(h), m_shard_n);
     for (uint32_t sh = 0; sh < m_shard_n; ++sh)
@@ -3073,7 +3098,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 });
                 return;
             }
-            fan_keyspace(conn, h, line, false);
+            fan_all_shards(conn, h, line, false);
             return;
         }
 
@@ -3117,6 +3142,23 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             return;
 
         case cache_cmd_class::fanout:
+        {
+            // Every shard holds its own subscribers, so a publish that stops
+            // here reaches a fraction of them and returns a count describing
+            // that fraction — with nothing saying so.
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "has to reach every shard's subscribers, and "
+                                  "this path cannot wait for them");
+                });
+                return;
+            }
+            fan_all_shards(conn, h, line, false);
+            return;
+        }
+
         case cache_cmd_class::connection:
         case cache_cmd_class::unknown:
             break;      // answered by whoever holds the socket
@@ -4826,7 +4868,7 @@ void cache_instance::process_resp_command(client_connection* conn,
             }
             std::string raw;
             rebuild_resp(raw, args, argc);
-            fan_keyspace(conn, h, raw, true);
+            fan_all_shards(conn, h, raw, true);
             return;
         }
 
@@ -4861,6 +4903,22 @@ void cache_instance::process_resp_command(client_connection* conn,
             return;
 
         case cache_cmd_class::fanout:
+        {
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, args[0], true,
+                                  "has to reach every shard's subscribers, and "
+                                  "this path cannot wait for them");
+                });
+                return;
+            }
+            std::string raw;
+            rebuild_resp(raw, args, argc);
+            fan_all_shards(conn, h, raw, true);
+            return;
+        }
+
         case cache_cmd_class::connection:
         case cache_cmd_class::unknown:
             break;
@@ -5942,9 +6000,23 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
         }
     }
 
-    // Dispatch to Lua subscribers in other runtimes
-    if (auto* mgr = get_runtime_manager())
-        mgr->dispatch_publish(get_name(), channel, message);
+    // ─── The cross-RUNTIME half, and only from the shard the client asked ───
+    //
+    // This reaches the Lua subscribers of every OTHER runtime, and out of a
+    // worker it goes up as a frame the daemon fans to every other worker — the
+    // siblings of this runtime included, where it runs their scripts.
+    //
+    // A shard answering a sibling's crossing must not do it again.  Each of the
+    // N shards runs this same publish() for one client PUBLISH, so without the
+    // guard a four-shard cache would dispatch the message to every other
+    // runtime four times, and every sibling's Lua subscriber would fire once
+    // per shard.  The socket delivery above is per-shard and is what the
+    // crossing exists for; this is per-publish and belongs to one of them.
+    if (!m_serving_shard_batch)
+    {
+        if (auto* mgr = get_runtime_manager())
+            mgr->dispatch_publish(get_name(), channel, message);
+    }
 
     return count;
 }

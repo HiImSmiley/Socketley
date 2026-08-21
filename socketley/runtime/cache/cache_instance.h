@@ -491,8 +491,8 @@ private:
                             std::string_view* args, int argc);
 
     // A keyspace-wide command: the same command to every shard, merged.
-    void fan_keyspace(client_connection* conn, uint32_t h,
-                      std::string_view raw, bool resp);
+    void fan_all_shards(client_connection* conn, uint32_t h,
+                        std::string_view raw, bool resp);
 
     // Which shard a SCAN call resumes in, and one page out of this one.  See
     // the SCAN note in shared/cache_shard_map.h for the cursor's layout and for
@@ -579,6 +579,11 @@ private:
     // every check below a single compare.
     uint32_t m_shard_n{1};
     uint32_t m_shard_i{0};
+
+    // True while this shard is answering a crossing from a SIBLING rather than
+    // a client of its own.  Read by publish(), which has one half that is per
+    // shard and one half that belongs to a single publish; see the note there.
+    bool m_serving_shard_batch{false};
 
     // Both report whether the submission reached the ring; see the definitions
     // for why a caller must not ignore that.

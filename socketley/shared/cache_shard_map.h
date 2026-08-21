@@ -76,7 +76,7 @@ enum class cache_cmd_class : uint8_t
     keyspace,     // every shard's slice at once — keys, dbsize, memory
     cursor_scan,  // one shard per call, named by the cursor; see below
     persistence,  // reads or writes the dump file: flush, load
-    fanout,       // no key, but every shard has subscribers: publish
+    fanout,       // no key, but every shard has its own subscribers: publish
     connection,   // answered by whoever holds the socket; no key at all
     stateful,     // attaches a stream to one shard: replicate
     unknown       // not a command; the local dispatch says so
@@ -111,7 +111,7 @@ enum class cache_merge : uint8_t
     single,     // one part, verbatim.  Every command routed by step one.
     elements,   // mget: one `get` reply per key, in the caller's order
     all_ok,     // mset: every `set` must have said ok
-    sum,        // dbsize/size/memory/maxmemory/multi-del: integers added
+    sum,        // dbsize/size/memory/publish/multi-del: integers added
     key_list    // keys: the per-shard lists concatenated
 };
 
@@ -127,6 +127,9 @@ constexpr cache_merge cache_merge_for(uint32_t h)
         case fnv1a("keys"):   return cache_merge::key_list;
         case fnv1a("dbsize"): case fnv1a("size"):
         case fnv1a("memory"): case fnv1a("maxmemory"):
+        // publish answers how many subscribers it REACHED, and every shard
+        // holds its own; the runtime's answer is the total.
+        case fnv1a("publish"):
             return cache_merge::sum;
         default:              return cache_merge::single;
     }
@@ -196,6 +199,19 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("publish"):
             return cache_cmd_class::fanout;
 
+        // ─── AND THE TWO THAT MUST NOT BE FANNED OUT ────────────────────────
+        //
+        // subscribe and unsubscribe are answered by whoever holds the socket,
+        // and that is not a gap in the fan-out — it is what a subscription IS.
+        // m_store.subscribe() records a DESCRIPTOR, which means nothing in
+        // another process; sending one to every shard would have N-1 of them
+        // register a number belonging to whatever they happen to hold at that
+        // index, and a later publish would write this client's messages into a
+        // stranger's socket.
+        //
+        // The client is still reached by a publish on any shard, because
+        // publish fans out to the shards rather than subscriptions being
+        // gathered onto one.  Delivery crosses; registration does not.
         case fnv1a("ping"):
         case fnv1a("subscribe"):  case fnv1a("unsubscribe"):
             return cache_cmd_class::connection;
