@@ -290,6 +290,24 @@ void proxy_supervisor::close_control()
         else
             ::close(m_control_fd);
         m_control_fd = -1;
+
+        // The outbound backlog dies with the socket it was addressed to.  Kept,
+        // it is written to the NEXT child ahead of that child's own config —
+        // frames a restarted worker parses as if they were meant for it.
+        //
+        // This is the chokepoint rather than the call sites because it has to
+        // be: close_control() is reached from 8 places and not one of them
+        // cleared m_out, while the only m_out.clear() in the file is the
+        // compaction below, which runs when the buffer is already empty.
+        //
+        // m_in deliberately does NOT go with it.  Two of those 8 sites are the
+        // read loop closing on EOF or error and then breaking to ingest(m_in) —
+        // bytes read before the child went away are complete frames and are
+        // still owed.  The two explicit m_in.clear() calls stay where they are:
+        // they sit at the points where the input is known garbage (a malformed
+        // frame) or the child has been reaped for good.
+        m_out.clear();
+        m_out_off = 0;
     }
 }
 
@@ -351,6 +369,21 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     {
         state_persistence sp{std::filesystem::path{}};
         m_config_json = sp.format_json_pretty(effective);
+    }
+
+    // A fresh socketpair starts with an empty outbound buffer, or the first
+    // thing the new child reads is frames addressed to the dead one.  spawn()
+    // is reached again on restart with THIS object reused, so the check is not
+    // a tautology at the point of the clear: it fails for any future path that
+    // queues before the socket exists, or that closes without going through
+    // close_control().  Measured against the defect it guards: a stopped worker
+    // that is then killed left 305,170 bytes here.
+    if (pending_out() != 0)
+    {
+        LOG_ERROR("proxy supervisor: outbound backlog survived into a new "
+                  "worker's socket; dropping it");
+        m_out.clear();
+        m_out_off = 0;
     }
 
     int sv[2] = {-1, -1};
