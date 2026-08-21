@@ -118,8 +118,28 @@ proxy_supervisor::~proxy_supervisor()
 void proxy_supervisor::set_event_loop(event_loop* loop)
 {
     m_loop = loop;
-    if (m_loop)
-        m_owner_token = m_loop->register_owner(this);
+    if (!m_loop)
+        return;
+
+    // ── The registration and the ring writer, together and with no early
+    //    return between them ────────────────────────────────────────────────
+    //
+    // A submission carries its owner's token, and one made without a
+    // registration has its completion DROPPED rather than delivered — an
+    // endpoint that submits before registering never hears back and is deaf
+    // for the rest of its life.  That is not hypothetical: it is what the same
+    // ordering did in the worker, where register_owner() sat below a
+    // create_runtime() that can return null.
+    //
+    // So both facts are established here, in the one function that is called
+    // on every path that gives this object a loop, before spawn() and before
+    // any frame is written.  There is no early exit in between to slip past.
+    //
+    // The writer has no descriptor yet — the child is not forked — and does not
+    // need one: it queues, and frame_writer refuses to submit on a negative fd.
+    // spawn() hands it the socket, and use_ring()'s flush sends what waited.
+    m_owner_token = m_loop->register_owner(this);
+    m_writer.use_ring(m_loop, this);
 }
 
 uint32_t proxy_supervisor::retire()
@@ -166,6 +186,13 @@ uint32_t proxy_supervisor::retire()
     if (!m_loop)
         return 0;
 
+    // Off the ring before the descriptor goes.  A send still in flight is left
+    // to the token count below exactly like the poll is — it was submitted
+    // under this owner, so it is one of the things token_inflight() is waiting
+    // out — and leave_ring() is what stops a new one being started behind the
+    // quarantine's back.
+    m_writer.leave_ring();
+
     // Cancel the arm and let the descriptor go.  The whole point of the token
     // below is to wait out what is still in the ring, so submitting the
     // withdrawal before asking is what makes the count able to reach zero at
@@ -192,7 +219,11 @@ void proxy_supervisor::arm_control_poll()
     if (!m_loop || m_control_fd < 0 || m_poll_armed)
         return;
 
-    m_poll_mask  = POLLIN | (pending_out() ? POLLOUT : 0u);
+    // POLLIN only.  The write side is on the ring now and a send ends with its
+    // own completion, so there is nothing left to want writability for — the
+    // mask used to carry POLLOUT whenever a backlog existed, and a backlog is
+    // now a send that has not completed yet.
+    m_poll_mask  = POLLIN;
     m_poll_req   = { this, nullptr, m_control_fd, 0, op_poll };
     m_poll_armed = m_loop->submit_poll_add(m_control_fd, m_poll_mask, &m_poll_req);
 
@@ -220,8 +251,26 @@ void proxy_supervisor::disarm_control_poll()
     }
 }
 
-void proxy_supervisor::on_cqe(struct io_uring_cqe* /*cqe*/)
+void proxy_supervisor::on_cqe(struct io_uring_cqe* cqe)
 {
+    // Two submissions belong to this object now, and they are told apart by
+    // the request address rather than by the op type: a type is a shape, and
+    // two submissions of the same shape would be indistinguishable the moment
+    // a second one exists.
+    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+
+    if (req && m_writer.owns_request(req))
+    {
+        m_writer.on_send_cqe(cqe->res);
+
+        // A send that failed for a reason that is not going to get better is
+        // the child going away, which is close_control()'s business — the same
+        // verdict the old ::write reached inline, one turn later.
+        if (m_writer.dead())
+            close_control();
+        return;
+    }
+
     // Whatever the result, this arm is spent.  Cleared before the drain so a
     // frame that causes a write back into this socket can re-arm rather than
     // queue behind an arm that has already reported.
@@ -290,6 +339,24 @@ void proxy_supervisor::close_control()
         else
             ::close(m_control_fd);
         m_control_fd = -1;
+
+        // ── The backlog goes with the child it was addressed to ─────────────
+        //
+        // A supervisor outlives its worker: check_liveness() closes this
+        // socket, clears m_in and forks a replacement onto the same object.
+        // m_in was cleared there and m_out never was, so whatever the dead
+        // child had not taken was still sitting in the buffer when spawn()
+        // appended the new child's config — and the new child parsed the dead
+        // one's frames first, ahead of its own configuration.
+        //
+        // That predates this change: the buffer, the clear of m_in beside it
+        // and the absence of a clear here are all older than the ring.  It is
+        // fixed here rather than left because this is where the descriptor
+        // stops being the one those frames were queued for, and because the
+        // writer now has to be told the descriptor is gone in any case — see
+        // frame_writer::reset() for what an in-flight send does about it.
+        m_writer.set_fd(-1);
+        m_writer.reset();
     }
 }
 
@@ -519,6 +586,11 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     m_pid        = child;
     m_control_fd = sv[0];
 
+    // Before the first write_frame() below.  The writer has been on the ring
+    // since set_event_loop(); this is the descriptor it has been waiting for,
+    // and anything queued in the meantime goes out on the flush that follows.
+    m_writer.set_fd(m_control_fd);
+
     // A new child has said nothing yet.  Without this a restart would inherit
     // the previous one's report, and await_startup() would answer for a process
     // that no longer exists — most sharply on the restart path, where the child
@@ -619,53 +691,50 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
 // So the frames are queued and flushed as the socket takes them.  The cap is
 // what makes it bounded, and reaching it is a real refusal rather than an
 // invented one — see serve_deferred, which turns it into `overloaded`.
+// ─── AND WHY THE SEND IS ON THE RING WHILE THE READ IS NOT ──────────────────
+//
+// Counted, this daemon relaying for a four-shard cache, 240,000 GETs,
+// strace -f -qq -c on the daemon process:
+//
+//     write            359,994      1.500 per GET
+//     read               8,373      0.035 per GET  (3,298 EAGAIN)
+//     io_uring_enter     1,100      0.005 per GET
+//
+// The two halves of this socket are not the same problem.  1.500 writes per
+// GET is 0.75 crossings times the two hops a crossing makes through the relay,
+// and every one of them was its own syscall because a relayed frame is written
+// the moment it is routed.  A read is not: one read takes about 43 frames off
+// the socket, so the whole read side costs a fortieth of the write side.
+//
+// The read side is also the half that could not move.  poll() is called from
+// await_startup() and await_routes(), which wait on the descriptor with
+// ::poll and deliberately do not pump this ring — they run inside a command
+// handler that is itself inside a completion being dispatched.  A ring recv
+// would make those waits unable to see their own answer without re-entering
+// the loop from a position where that is not allowed, and two readers on one
+// socket is the alternative.  So the read stays where it is, and the number
+// above is the reason that is not a compromise: it is 2.3% of this endpoint's
+// blocking syscalls.
+//
+// What is left of this function is the flush contract frame_writer states at
+// use_ring(): the owner submits once per turn.  This owner has no per-turn
+// hook — a supervisor is driven by its own completions and by whoever routes a
+// frame at it — so it flushes on every write instead, which costs a branch
+// while a send is in flight and starts one when none is.  That is the
+// coalescing: the frames routed between two completions go out together.
 void proxy_supervisor::flush_control()
 {
-    while (m_out_off < m_out.size() && m_control_fd >= 0)
-    {
-        const ssize_t n = ::write(m_control_fd, m_out.data() + m_out_off,
-                                  m_out.size() - m_out_off);
-        if (n > 0)
-        {
-            m_out_off += static_cast<size_t>(n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            break;                       // the arm below waits for writability
-
-        // Anything else is the child going away, which is close_control()'s
-        // business and not a per-frame failure.
-        close_control();
+    if (m_control_fd < 0)
         return;
-    }
 
-    // Consumed prefix, dropped in one move rather than per write: erase(0, n) in
-    // the loop is quadratic in the backlog, and the backlog is exactly the case
-    // this exists for.
-    if (m_out_off > 0)
-    {
-        if (m_out_off >= m_out.size())
-        {
-            m_out.clear();
-            m_out_off = 0;
-        }
-        else if (m_out_off >= 64 * 1024)
-        {
-            m_out.erase(0, m_out_off);
-            m_out_off = 0;
-        }
-    }
+    m_writer.flush();
 
-    // A backlog means the next thing worth waking for is writability, not just
-    // readability.  Re-armed rather than adjusted: the arm is one-shot.
-    const unsigned want = POLLIN | (pending_out() ? POLLOUT : 0u);
-    if (want != m_poll_mask)
-    {
-        disarm_control_poll();
-        arm_control_poll();
-    }
+    // The old inline ::write reached this verdict without a turn; a submission
+    // reaches it one completion later.  Checked here as well as in on_cqe so a
+    // writer that was already dead when a frame arrived is not left queueing
+    // into a socket nobody will take.
+    if (m_writer.dead())
+        close_control();
 }
 
 bool proxy_supervisor::write_frame(const std::string& framed)
@@ -673,21 +742,13 @@ bool proxy_supervisor::write_frame(const std::string& framed)
     if (m_control_fd < 0)
         return false;
 
-    if (pending_out() + framed.size() > MAX_CONTROL_BACKLOG)
-    {
-        // Said once per crossing rather than per frame: a wedged child produces
-        // one of these per request otherwise.
-        if (!m_out_full)
-        {
-            LOG_WARN("proxy supervisor: control socket backlog full; the child "
-                     "is not reading");
-            m_out_full = true;
-        }
+    // The cap, the one-per-episode warning and the refusal are frame_writer's
+    // now, unchanged in value and in meaning: false still means the child has
+    // stopped reading, and serve_deferred still turns that into `overloaded`
+    // rather than into a request that vanishes.
+    if (!m_writer.write(framed))
         return false;
-    }
-    m_out_full = false;
 
-    m_out += framed;
     flush_control();
     return true;
 }
@@ -941,6 +1002,20 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         if (slice < 0)
             slice = 0;
 
+        // ── The frame has to be IN the kernel before we block on the answer ─
+        //
+        // This wait does not pump the ring — see the note above it — so a send
+        // that is only queued in the submission queue would sit there for as
+        // long as we wait for the reply to it, which is the deadlock shape:
+        // waiting for an answer to a question that was never asked.
+        //
+        // submit_pending() hands the queue over and dispatches nothing, which
+        // is exactly what is safe from here: the child receives the frame
+        // because the kernel sends it, and the completion saying how much went
+        // is reaped by whoever turns the loop next.
+        if (m_loop)
+            m_loop->submit_pending();
+
         if (m_control_fd >= 0)
         {
             struct pollfd pfd{m_control_fd, POLLIN, 0};
@@ -1002,6 +1077,12 @@ bool proxy_supervisor::await_routes(const void* previous,
             remaining.count(), 20));
         if (slice < 0)
             slice = 0;
+
+        // Same reason as in await_startup(): this wait does not pump the ring,
+        // so the reload frame it is waiting for the answer to has to be handed
+        // to the kernel before we block.  Submitting dispatches nothing.
+        if (m_loop)
+            m_loop->submit_pending();
 
         struct pollfd pfd{m_control_fd, POLLIN, 0};
         if (::poll(&pfd, 1, slice) < 0) {}

@@ -44,6 +44,7 @@
 #include <sys/types.h>
 
 #include "../shared/conn_identity.h"
+#include "../shared/frame_writer.h"
 #include "../shared/request_channel.h"
 // For runtime_state: await_startup() remembers the state the child reported
 // without adopting it, so the enum is part of this class's own storage now
@@ -451,7 +452,7 @@ private:
     // multishot poll on a descriptor this class closes on several paths is a
     // completion outliving its fd, and the arm costs one SQE per exchange.
     void   flush_control();
-    size_t pending_out() const { return m_out.size() - m_out_off; }
+    size_t pending_out() const { return m_writer.pending(); }
 
     void   arm_control_poll();
     // Give the arm back before the descriptor goes.  A completion for a closed
@@ -482,17 +483,25 @@ private:
     std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
 
-    // Frames written but not yet taken by the socket.  Bounded, because the
-    // alternative to a bound is the daemon growing without limit on behalf of a
-    // child that has stopped reading.  Generous next to what a control socket
-    // holds — about 270 request frames — so a burst is absorbed rather than
-    // refused, and small next to the channel's own 16 MB queue, which is the
-    // thing actually meant to bound a client that pipelines.
-    static constexpr size_t MAX_CONTROL_BACKLOG = 4u << 20;
-
-    std::string  m_out;
-    size_t       m_out_off{0};
-    bool         m_out_full{false};
+    // ── Frames on their way to the child ────────────────────────────────────
+    //
+    // This was a second implementation of shared/frame_writer.h, in this file:
+    // the same std::string plus offset, the same 4 MB cap, the same one-move
+    // compaction, the same "a refusal is a fact the caller acts on".  That
+    // header says in its own first paragraph that it was written here and
+    // lifted out, and having it in both places is the duplication this tree
+    // states costs most — a bounded-backlog writer with a drop policy has two
+    // places to get the EAGAIN case wrong.
+    //
+    // It is one place now, and moving it is what let the send go on the ring.
+    // Counted on this daemon relaying for four shards, 240,000 GETs:
+    // 359,994 write() and 8,373 read().  The write side is 43 times the read
+    // side because a read takes a batch of frames and every relayed frame was
+    // its own write — 1.500 per GET, which is 0.75 crossings times the two
+    // hops a crossing makes through here.
+    //
+    // The read side stays on ::read deliberately; see poll().
+    frame_writer m_writer{-1};
 
     event_loop*  m_loop{nullptr};
 

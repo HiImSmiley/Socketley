@@ -87,6 +87,27 @@ public:
     // eventfd, so nothing here ends on request_stop().
     uint32_t poll_completions(int timeout_ms = 0);
 
+    // ── Hand the submission queue to the kernel, and dispatch nothing ───────
+    //
+    // For a caller that has queued work and is about to block on something
+    // OTHER than this ring — the daemon's await_startup() and await_routes()
+    // wait on the control descriptor with ::poll and deliberately do not pump
+    // the loop, because they run inside a command handler which is itself
+    // inside a completion being dispatched, and re-entering the loop there
+    // would dispatch completions against half-updated per-turn accounting.
+    //
+    // Submitting is not dispatching.  This touches the submission side only,
+    // so it is safe from exactly that position: the frame reaches the child
+    // because the KERNEL sends it, and the completion that tells us how much
+    // went is reaped on a later turn by whoever was going to turn the loop
+    // anyway.
+    //
+    // Not on the hot path.  A caller that submits per operation gets one
+    // io_uring_enter per operation without SQPOLL, which is the cost the ring
+    // exists to avoid; the batching in poll_completions() is what the hot path
+    // uses and this is for the callers that cannot reach it.
+    void submit_pending();
+
     void request_stop();
     int get_signal_write_fd() const;
 

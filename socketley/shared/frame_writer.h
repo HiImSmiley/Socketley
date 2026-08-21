@@ -139,10 +139,14 @@ public:
             return;
         if (m_send_armed)
             m_dead = true;
-        else if (m_wire_off < m_wire.size())
+        else if (!m_wire_stale && m_wire_off < m_wire.size())
             m_out.insert(m_off, m_wire, m_wire_off, std::string::npos);
-        m_wire.clear();
-        m_wire_off = 0;
+        if (!m_send_armed)
+        {
+            m_wire.clear();
+            m_wire_off = 0;
+        }
+        m_wire_stale = false;
         m_loop  = nullptr;
         m_owner = nullptr;
     }
@@ -170,6 +174,19 @@ public:
         // buffer here would take pending() below zero.
         if (!m_loop)
             return;
+
+        // A send whose buffer reset() disowned.  The storage was held only
+        // until this completion; what the peer did not take is dropped rather
+        // than continued, because the descriptor under it is a different
+        // child's.
+        if (m_wire_stale)
+        {
+            m_wire.clear();
+            m_wire_off   = 0;
+            m_wire_stale = false;
+            flush();                 // whatever the new peer has been queued
+            return;
+        }
 
         if (res > 0)
         {
@@ -247,7 +264,11 @@ public:
     // in-flight send counts: it has not been handed over yet.
     size_t pending() const
     {
-        return (m_out.size() - m_off) + (m_wire.size() - m_wire_off);
+        // A stale wire is owed to nobody: reset() disowned it and its bytes are
+        // never going out.  Counting it would hold a caller's backlog test
+        // above the cap for a frame that has already been abandoned.
+        const size_t wire = m_wire_stale ? 0u : (m_wire.size() - m_wire_off);
+        return (m_out.size() - m_off) + wire;
     }
 
     // Queued, and nothing in the ring will move it on its own.  This is what a
@@ -262,6 +283,38 @@ public:
     bool   dead()    const { return m_dead; }
     void   mark_dead()     { m_dead = true; }
 
+    // ── Forget everything queued, because the peer it was queued for is gone ─
+    //
+    // For an owner whose descriptor is replaced rather than closed for good:
+    // the daemon restarts a dead worker on the same supervisor, and the frames
+    // the previous child never took cannot be answered by the new one — they
+    // name its state, not the new one's.  Handing them over puts a stale prefix
+    // in front of the new child's config frame, which it parses first.
+    //
+    // An in-flight send cannot simply be dropped: its buffer is under a
+    // submission the kernel may be reading this instant, so the storage must
+    // not move.  It is marked stale instead — the completion frees it and what
+    // the peer did not take is NOT sent on, which is the whole point.  Sending
+    // the tail of a dead child's frame to its replacement is the stale prefix
+    // in a different disguise, and it would be a torn frame rather than a whole
+    // one.
+    void reset()
+    {
+        m_out.clear();
+        m_off  = 0;
+        m_full = false;
+        m_dead = false;
+        if (m_send_armed)
+        {
+            m_wire_stale = true;      // freed by on_send_cqe, never continued
+        }
+        else
+        {
+            m_wire.clear();
+            m_wire_off = 0;
+        }
+    }
+
 private:
     void ring_flush()
     {
@@ -269,6 +322,15 @@ private:
         // faster writer, it is an unordered one: the kernel may take them in
         // either order and the far side reads the frames interleaved.
         if (m_dead || m_send_armed)
+            return;
+
+        // No descriptor yet, or not any more.  The daemon's supervisor goes on
+        // the ring when its loop is set, which is before the child is forked
+        // and therefore before there is a socket to send on; the frames it
+        // queues in that window go out when set_fd() gives it one.  Submitting
+        // on -1 would be an EBADF completion per frame and a writer that
+        // declared itself dead before its child existed.
+        if (m_fd < 0)
             return;
 
         if (m_wire_off >= m_wire.size())
@@ -332,4 +394,7 @@ private:
     // — see the note at the top about a pointer the kernel reads through.
     std::string m_wire;
     size_t      m_wire_off{0};
+    // Submitted, then disowned by reset() before its completion landed.  See
+    // reset(): the storage has to outlive the submission, the bytes must not.
+    bool        m_wire_stale{false};
 };

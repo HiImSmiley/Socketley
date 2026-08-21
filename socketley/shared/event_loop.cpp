@@ -1498,6 +1498,14 @@ inline unsigned event_loop::dispatch_ready(bool& got_signal)
     return count;
 }
 
+void event_loop::submit_pending()
+{
+    if (!m_ring_open || m_pending_submissions == 0)
+        return;
+    io_uring_submit(&m_ring);
+    m_pending_submissions = 0;
+}
+
 uint32_t event_loop::poll_completions(int timeout_ms)
 {
     if (!m_ring_open)
