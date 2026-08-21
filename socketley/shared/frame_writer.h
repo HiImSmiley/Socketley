@@ -98,6 +98,16 @@ public:
     //
     // Whatever is already queued goes out on the ring from here.  Order is
     // preserved because m_out is drained into m_wire in one move.
+    //
+    // ── THE ONE THING THE CALLER OWES AFTERWARDS ────────────────────────────
+    //
+    // From here, write() queues and does not submit — see the note there for
+    // the measurement that decided it.  So the owner must call flush() once per
+    // turn of its loop, and a frame written by a turn goes out at the end of
+    // that turn.  Not calling it does not lose the frame; it leaves it until
+    // the next flush, which for a control socket is a reply somebody is waiting
+    // for.  The worker's loop calls it unconditionally, one line after the
+    // control frames are dispatched, which is where it already was.
     void use_ring(event_loop* loop, io_handler* owner)
     {
         if (!loop || !owner || m_loop)
@@ -193,7 +203,34 @@ public:
         }
         m_full = false;
         m_out.append(framed);
-        flush();
+
+        // ── Why a ring writer does NOT submit here, and a blocking one does ─
+        //
+        // The blocking path writes now because there is nothing else to write
+        // it: the caller is the only thing that runs.
+        //
+        // On the ring, submitting per frame is what it looks like and is not
+        // what it costs.  A send produces a completion, a completion arriving
+        // on its own ends the ring's wait, and the loop then takes a whole turn
+        // — and one io_uring_enter — to learn that a send it did not need an
+        // answer to has finished.  Measured, four-shard cache, one shard,
+        // 200,000 GETs: submitting per frame turned 5,920 entries into 61,221,
+        // about one per crossing, because the loop stopped batching.  The 65,584
+        // blocking syscalls it removed were paid for twice over in wakeups.
+        //
+        // So the send is submitted once per turn instead, by the owner's own
+        // flush() — which the loop already called, for the EAGAIN backlog this
+        // class has always had.  Frames written during one turn go out in ONE
+        // send, which is the collapsing this change was predicted to produce
+        // and did not until the submission moved.
+        //
+        // The contract that makes it safe is stated rather than assumed: an
+        // owner that has called use_ring() MUST call flush() once per turn of
+        // its loop.  Nothing here can enforce it, and what it costs to forget
+        // is a frame that sits until the next write — so it is written down at
+        // use_ring(), which is the only place it can be got wrong.
+        if (!m_loop)
+            blocking_flush();
         return true;
     }
 
