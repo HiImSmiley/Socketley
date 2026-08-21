@@ -70,6 +70,11 @@ examples/
 - `persistent-cache.sh` - Cache with file persistence
 - `cache-integration.lua` + `cache-integration-handler.lua` - A cache as shared
   state, reached by a server's clients over `--cache`
+- `sharded-cache.sh` - `--shards N` on a cache: N worker processes on one port,
+  and still ONE keyspace — a key belongs to the shard its hash falls to, and a
+  command naming another shard's key is answered by that shard. Shows the
+  keyspace-wide commands answering for the runtime, the per-shard dumps, and a
+  restart at a different shard count with every key still there
 
 ### Lua Config
 Each of these is a **pair**: a configuration read by the CLI, and a handler

@@ -2,20 +2,14 @@
 # Integration test: a publish on a sharded cache reaches every shard's
 # subscribers, once each, and says how many it reached.
 #
-# ─── WHY THIS FILE IS NAMED pending_ AND NOT test_ ──────────────────────────
+# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
 #
-# run_all.sh globs integration/test_*.sh, and `--shards` on a cache is still
-# refused.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run it; it skips
+# `--shards` on a cache was refused while this was being built, so the file was
+# outside run_all.sh's glob and run against a scratch build.  Both are gone.
 #
-# Rebuild with the define through a touch, not the flag alone:
+# The measurements below were taken then and are kept because they are what the
+# assertions were written against:
 #
-#   touch socketley/shared/runtime_definitions.h && \
-#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
-#
-# make tracks file times, not compiler flags, so adding the define on its own
-# rebuilds nothing and leaves the refusal compiled in.  A `find -newer` check
-# cannot see that; the string can:
-#   strings bin/Release/socketley | grep -c 'not available on a cache'  # 0 = on
 # without the flag rather than failing.
 #
 # Measured on that build, four shards, 24 subscribers spread by SO_REUSEPORT:
@@ -99,9 +93,9 @@ echo "=== Integration: a publish reaches every shard's subscribers ==="
 daemon_start "$BIN"
 
 if ! "$BIN" create cache pub4 -p "$P4" --shards 4 -s >/dev/null 2>&1; then
-    echo "  SKIP: this build refuses --shards on a cache, which is still the"
-    echo "        shipped answer.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS."
-    exit 0
+    echo "  FATAL: --shards on a cache was refused.  It is a supported"
+    echo "         configuration now, so this is a defect and not a skip."
+    exit 2
 fi
 "$BIN" create cache pub1 -p "$P1" --shards 1 -s        >/dev/null 2>&1
 "$BIN" create cache pubr -p "$PR" --shards 4 --resp -s >/dev/null 2>&1

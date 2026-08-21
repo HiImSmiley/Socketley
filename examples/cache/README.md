@@ -91,3 +91,27 @@ Binary format: `[key_len][key][val_len][value]...`
 - Loaded automatically on startup
 - Saved automatically on shutdown
 - Efficient binary encoding
+
+### Sharding (`--shards N`)
+A cache may be served from N worker processes on one port. It is still **one
+keyspace**: a key belongs to the shard its hash falls to, and a command naming
+another shard's key is answered by that shard, so `dbsize` sums, `keys` lists
+all of them, `scan` walks the whole keyspace and `publish` reaches every
+subscriber.
+
+Measured, four clients at pipeline depth 1: **172k → 289k ops/s, 1.68x at four
+shards**. Drive it with more than one client — a single `redis-benchmark`
+process tops out near 90–110k ops/s and a series measured with one client is a
+series about the client.
+
+`--persistent` writes one dump per shard (`file.shard0`, `file.shard1`, …).
+Each records the split it was written under, so a set dumped at four shards and
+started at eight is **redistributed** rather than loaded into the wrong slices.
+A set with a missing slice, or whose files disagree about the shard count,
+refuses the start rather than serving part of itself.
+
+`replicate` is **refused** on a sharded cache: a follower arrives as one
+connection on one shard and would receive that shard's writes only. A sharded
+cache may still *be* a follower.
+
+See `sharded-cache.sh`.

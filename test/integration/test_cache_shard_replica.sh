@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
 # Integration test: replication and a sharded cache, in both directions.
 #
-# ─── WHY pending_ ──────────────────────────────────────────────────────────
+# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
 #
-# `--shards` on a cache is still refused.  Rebuild with the define through a
-# touch, not the flag alone:
-#
-#   touch socketley/shared/runtime_definitions.h && \
-#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
-#
-# make tracks file times, not compiler flags, so adding the define on its own
-# rebuilds nothing and leaves the refusal compiled in.  The string is the check:
-#   strings bin/Release/socketley | grep -c 'not available on a cache'  # 0 = on
+# `--shards` on a cache was refused while this was being built, so the file was
+# outside run_all.sh's glob and run against a scratch build.  Both are gone.
 #
 # ─── THE TWO DIRECTIONS ARE NOT THE SAME QUESTION ──────────────────────────
 #
@@ -80,8 +73,9 @@ g(){ printf "get $2\n" | timeout 2 nc -q1 127.0.0.1 "$1" 2>/dev/null | head -1; 
 sz(){ printf 'size\n' | timeout 3 nc -q1 127.0.0.1 "$1" 2>/dev/null | head -1; }
 
 if ! "$BIN" create cache rl4 -p "$L4" --shards 4 -s >/dev/null 2>&1; then
-    echo "  SKIP: this build refuses --shards on a cache."
-    exit 0
+    echo "  FATAL: --shards on a cache was refused.  It is a supported"
+    echo "         configuration now, so this is a defect and not a skip."
+    exit 2
 fi
 ready "$L4" || { echo "  FATAL: the four-shard cache never answered"; exit 2; }
 

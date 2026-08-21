@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
 # Integration test: the commands that touch more than one shard of a cache.
 #
-# ─── WHY THIS FILE IS NAMED pending_ AND NOT test_ ──────────────────────────
+# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
 #
-# run_all.sh globs integration/test_*.sh.  `--shards` on a cache is still
-# refused, so this file is outside that glob for the same reason
-# pending_cache_shard_routing.sh is, and it skips rather than failing on a build
-# that has the refusal.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run it:
+# `--shards` on a cache was refused while the routing was being built one
+# command class at a time, so this file lived outside run_all.sh's glob and was
+# run against a scratch build with the one refusal line compiled out.  The
+# refusal is gone and so is the flag; the file runs like any other now.
 #
-#   touch socketley/shared/runtime_definitions.h && \
-#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
-#
-# The touch is not optional: make tracks file times, not compiler flags, so
-# adding or removing the define alone rebuilds nothing and leaves the refusal
-# compiled in from the previous build.  A `find -newer` freshness check cannot
-# see that either -- the only reliable check is the string:
-#   strings bin/Release/socketley | grep -c 'not available on a cache'   # 0 = on
+# The numbers below were taken on that scratch build and are kept because they
+# are what the assertions were written against:
 #
 # Measured on that build, four shards:
 #
@@ -93,9 +87,9 @@ command -v nc >/dev/null 2>&1 || { echo "  SKIP: nc is required"; exit 0; }
 daemon_start "$BIN"
 
 if ! "$BIN" create cache mk4 -p "$P_T4" --shards 4 -s >/dev/null 2>&1; then
-    echo "  SKIP: this build refuses --shards on a cache, which is still the"
-    echo "        shipped answer.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS."
-    exit 0
+    echo "  FATAL: --shards on a cache was refused.  It is a supported"
+    echo "         configuration now, so this is a defect and not a skip."
+    exit 2
 fi
 "$BIN" create cache mkr4 -p "$P_R4" --shards 4 --resp -s >/dev/null 2>&1
 "$BIN" create cache mk1  -p "$P_T1" --shards 1 -s        >/dev/null 2>&1

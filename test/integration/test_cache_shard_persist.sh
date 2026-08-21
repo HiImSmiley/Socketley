@@ -1,20 +1,10 @@
 #!/usr/bin/env bash
 # Integration test: a sharded cache's dumps survive a changed shard count.
 #
-# ─── WHY pending_ ──────────────────────────────────────────────────────────
+# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
 #
-# `--shards` on a cache is still refused; build with
-# -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run this.  It skips without it.
-#
-# Rebuild with the define through a touch, not the flag alone:
-#
-#   touch socketley/shared/runtime_definitions.h && \
-#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
-#
-# make tracks file times, not compiler flags, so adding the define on its own
-# rebuilds nothing and leaves the refusal compiled in.  A `find -newer` check
-# cannot see that; the string can:
-#   strings bin/Release/socketley | grep -c 'not available on a cache'  # 0 = on
+# `--shards` on a cache was refused while this was being built, so the file was
+# outside run_all.sh's glob and run against a scratch build.  Both are gone.
 #
 # ─── WHY THE ASSERTION IS NOT "DOES IT LOAD" ───────────────────────────────
 #
@@ -97,7 +87,11 @@ verify() {
     printf '%s %s' "$m" "$(redis-cli -p "$PORT" DBSIZE 2>/dev/null)"
 }
 
-if ! up 4; then echo "  SKIP: this build refuses --shards on a cache."; exit 0; fi
+if ! up 4; then
+    echo "  FATAL: --shards on a cache was refused.  It is a supported"
+    echo "         configuration now, so this is a defect and not a skip."
+    exit 2
+fi
 
 # ── the matrix ─────────────────────────────────────────────────────────────
 matrix_case() {   # from to label

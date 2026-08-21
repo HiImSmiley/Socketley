@@ -136,10 +136,18 @@ shard_pids() {
     done
 }
 
-echo "== --shards is a declaration, and two types refuse it outright =="
+echo "== --shards is a declaration, and one type refuses it outright =="
+# A cache used to be the second, and is not any more.  The refusal named a real
+# failure -- N shards were N stores behind one port, so a SET landed in one
+# process and a later GET on a new connection asked another -- and what removed
+# it was ownership by key hash, not a decision to tolerate the miss.  The whole
+# of that is test_cache_shard_*.sh; this is the one line that keeps THIS file
+# honest about which types are absolute.
 out=$("$BIN" create cache shc -p $P_SPARE1 --shards 4 2>&1); rc=$?
-check "cache refuses --shards" "$rc" "1"
-[[ "$out" == *"not available on a cache"* ]] && ok "cache says why" || bad "cache reason: $out"
+check "cache accepts --shards" "$rc" "0"
+[[ "$out" != *"not available on a cache"* ]] && ok "and no longer says it cannot" \
+    || bad "cache still refuses: $out"
+"$BIN" remove shc >/dev/null 2>&1
 
 out=$("$BIN" create client shk -t 127.0.0.1:$P_BACK --shards 4 2>&1); rc=$?
 check "client refuses --shards" "$rc" "1"

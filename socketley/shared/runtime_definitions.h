@@ -127,10 +127,49 @@ inline bool in_worker_process()         { return g_worker_process; }
 // maps and calls its on_connect on this thread's stack.  Nothing here lifts
 // that.
 //
-// A CACHE: no.  N shards are N separate stores behind one port.  A SET lands in
+// A CACHE: yes, and this is the refusal that took the most to remove.
+//
+// It said: N shards are N separate stores behind one port, so a SET lands in
 // whichever process the kernel gave that connection to and a later GET on a new
-// connection asks a different one, so the answer is a miss for data that was
-// stored — 1/N of the time, without an error anywhere.
+// connection asks a different one — a miss for data that was stored, 1/N of the
+// time, without an error anywhere.  Every word of that was true.
+//
+// What makes it false now is OWNERSHIP BY KEY HASH.  `shard = hash(key) mod N`,
+// computed from shared/cache_shard_map.h so that N processes which never speak
+// to each other cannot disagree, and a command naming somebody else's key is
+// answered by them.  Each shard stays the sole reader AND sole writer of its own
+// slice, which is what keeps "no lock in cache_store" true by construction
+// rather than by care.
+//
+// Four command classes, each with its own answer, all decided at TWO sites — the
+// top of each interpreter's dispatch — in front of 54 handlers that know nothing
+// about shards:
+//
+//   one key        routed to its owner, and a pipeline is grouped by owner so a
+//                  run of commands crosses once per shard, not once per command
+//   several keys   exploded into one single-key command each and reassembled in
+//                  the order the CALLER wrote them
+//   keyspace-wide  every shard's slice, merged: dbsize sums, keys concatenates
+//                  with one terminator for the runtime
+//   scan           one shard per call, the cursor naming its own shard in the
+//                  top six bits; the iteration is sequential and a cursor is
+//                  only valid for the shard set that issued it
+//
+// publish reaches every shard's subscribers and reports the total; subscribe
+// stays where the socket is, because a subscription is a descriptor and means
+// nothing in another process.
+//
+// --persistent works across a CHANGED shard count: each dump records the split
+// it was written under and a fingerprint of the ownership function, and a set
+// that does not match is redistributed rather than trusted.  A set with a gap,
+// or one whose files disagree about the split, refuses the start.
+//
+// The one thing a sharded cache still will not do is BE A REPLICATION LEADER;
+// see the refusal in handle_replicate_request() for why the follower protocol
+// cannot carry N streams.  A sharded cache may be a follower.
+//
+// Measured, four clients against one runtime at pipeline depth 1:
+// 172k ops/s at one shard against 289k at four — 1.68x.
 //
 // A CLIENT: no.  There is no listening socket to share.  A client dials out; N
 // of them would be N connections to the peer, which is a different feature
@@ -179,30 +218,6 @@ inline std::string shards_config_refusal(runtime_type type,
 
     if (shards > max_shards)
         return "--shards must be between 1 and " + std::to_string(max_shards) + "\n";
-
-    // ── The one refusal with a way past it, and why ─────────────────────────
-    //
-    // A CACHE: still no, and the reason above is still true of what ships.  The
-    // routing that removes it is being built one command class at a time —
-    // single-key first, then multi-key, then the keyspace-wide commands, then
-    // persistence across a changed shard count — and until all four are done a
-    // sharded cache answers some commands out of one shard's slice.
-    //
-    // -DSOCKETLEY_SCRATCH_CACHE_SHARDS compiles this one line out.  It exists so
-    // that test/integration/pending_cache_shard_routing.sh can be RUN rather
-    // than merely read: a test whose red nobody else can reproduce proves
-    // nothing, and the alternative was an uncommitted patch described in prose.
-    //
-    // It is not a supported configuration and it is not an operator-facing
-    // switch — nothing reads it at run time, no flag reaches it, and a default
-    // build has no way to arrive here.  It goes when the refusal does.
-#ifndef SOCKETLEY_SCRATCH_CACHE_SHARDS
-    if (type == runtime_cache)
-        return "--shards is not available on a cache: N shards are N separate "
-               "stores behind one port, so a SET lands in one process and a "
-               "later GET on a new connection asks another -- a miss for data "
-               "that was stored, with no error anywhere\n";
-#endif
 
     if (type == runtime_client)
         return "--shards is not available on a client: a client dials out and "

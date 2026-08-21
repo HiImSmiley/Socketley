@@ -261,10 +261,18 @@ out=$("$BIN" create server ss_ed -p $P_E --daemon-process 2>&1); rc=$?
 check "--daemon-process alone still accepted" "$rc" "0"
 "$BIN" remove ss_ed >/dev/null 2>&1
 
-echo "== the other two types still refuse it outright =="
-out=$("$BIN" create cache ss_ed -p $P_F --shards 4 2>&1); rc=$?
-check "cache refuses --shards" "$rc" "1"
-[[ "$out" == *"cache"* ]] && ok "cache says why" || bad "cache reason: $out"
+echo "== a cache may shard now; a client still may not =="
+# The cache's refusal is gone: ownership by key hash makes N shards one store,
+# so the SET/GET miss it named cannot happen.  Its own behaviour is held down by
+# test_cache_shard_*.sh -- what matters here is that the FLAG's type rule moved.
+#
+# A distinct name, and removed straight away.  This create used to FAIL, so the
+# name it asked for stayed free for the client create below; now that it
+# succeeds, reusing it made the client create fail with "runtime already exists"
+# and read as a client defect.
+out=$("$BIN" create cache ss_shcache -p $P_F --shards 4 2>&1); rc=$?
+check "cache accepts --shards" "$rc" "0"
+"$BIN" remove ss_shcache >/dev/null 2>&1
 out=$("$BIN" create client ss_ed -t 127.0.0.1:$P_G --shards 4 2>&1); rc=$?
 check "client refuses --shards" "$rc" "1"
 [[ "$out" == *"client"* ]] && ok "client says why" || bad "client reason: $out"

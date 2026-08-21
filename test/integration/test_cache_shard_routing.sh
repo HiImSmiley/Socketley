@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Integration test: a cache split into N processes answers as one store.
 #
-# ─── WHY THIS FILE IS NAMED pending_ AND NOT test_ ──────────────────────────
+# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
 #
-# run_all.sh globs integration/test_*.sh.  This file is deliberately outside
-# that glob, because `--shards` on a cache is still REFUSED — lifting that
+# `--shards` on a cache was refused while the routing was being built, so this
+# file lived outside run_all.sh's glob and was run against a scratch build with
+# the one refusal line compiled out.  The refusal is gone and so is the flag.
+#
+# The numbers below were taken on that scratch build and are kept because they
+# are what the assertions were written against:
+#
 # refusal is the last step of this work and it must not be lifted until the
 # multi-key commands, the keyspace-wide commands and persistence with a changed
 # shard count are routed too.  Everything this file asserts about is step one:
@@ -12,8 +17,7 @@
 #
 # It is committed rather than held back, because it has been run.  The numbers
 # below are what it produced on a scratch build — the one refusal line in
-# shards_config_refusal() compiled out with -DSOCKETLEY_SCRATCH_CACHE_SHARDS,
-# nothing else changed:
+# shards_config_refusal() compiled out, nothing else changed:
 #
 #     without routing   9 of 12 keys read back as (nil), and which 9 changed
 #                       run to run: 4 shards, one connection each, so a SET
@@ -112,18 +116,9 @@ daemon_start "$BIN"
 # A cache with --shards is refused by every build that has not had the refusal
 # compiled out.  Said once, here, rather than as twelve failed assertions.
 if ! "$BIN" create cache sh4t -p "$P_T4" --shards 4 -s >/dev/null 2>&1; then
-    echo "  SKIP: this build refuses --shards on a cache, which is still the"
-    echo "        shipped answer.  Build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS"
-    echo "        to run this file:"
-    echo "        touch socketley/shared/runtime_definitions.h && \
-#   make -C make config=release_x64 CPPFLAGS=-DSOCKETLEY_SCRATCH_CACHE_SHARDS
-#
-# The touch is not optional: make tracks file times, not compiler flags, so
-# adding or removing the define alone rebuilds nothing and leaves the refusal
-# compiled in from the previous build.  A `find -newer` freshness check cannot
-# see that either -- the only reliable check is the string:
-#   strings bin/Release/socketley | grep -c 'not available on a cache'   # 0 = on"
-    exit 0
+    echo "  FATAL: --shards on a cache was refused.  It is a supported"
+    echo "         configuration now, so this is a defect and not a skip."
+    exit 2
 fi
 "$BIN" create cache sh4r -p "$P_R4" --shards 4 --resp -s >/dev/null 2>&1
 "$BIN" create cache sh1t -p "$P_T1" --shards 1 -s        >/dev/null 2>&1

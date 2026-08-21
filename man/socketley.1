@@ -2737,6 +2737,22 @@ rather than on the file, so put
 .I file
 somewhere only this daemon's user can write \(em not a world\-writable
 directory shared with other accounts.
+.IP
+.B With \-\-shards each shard writes its own slice, and the set survives a changed shard count.
+One shard writes
+.I file
+itself; above one they are
+.IR file .shard0 ,
+.IR file .shard1
+and so on. Each records the shard count it was written under and a fingerprint
+of the function that decides which shard owns a key, so a cache dumped at four
+shards and started at eight is redistributed rather than loaded into the wrong
+slices. Every key survives; measured across 1\->4, 4\->1, 4\->8, 8\->4 and 4\->4.
+.IP
+A set that cannot be trusted refuses the start rather than serving part of
+itself: a missing slice is named, and files that disagree about the shard count
+\(em two runs' dumps in one place \(em are refused together. Slices left by a
+run with more shards are removed by the dump that supersedes them.
 .TP
 .BI "\-\-mode " "mode"
 Access control mode:
@@ -2808,6 +2824,23 @@ command, so it never becomes a leader either. See
 .B TLS
 under
 .BR LIMITATIONS .
+.IP
+.B A sharded cache cannot be a replication leader, and says so.
+A follower arrives as one connection and
+.B SO_REUSEPORT
+gives it to one shard; that shard must be the only writer its socket ever has,
+and the other shards have no socket to it at all. Promoting it anyway would
+send the follower one shard's writes and report success, so
+.B replicate
+is refused on a cache with more than one shard, naming the reason. The follower
+protocol has no per\-shard sequence and no end\-of\-dump marker, which is what
+fanning the stream out would need first.
+.IP
+A sharded cache may be a
+.IR follower .
+Every shard dials the leader and keeps the part of the stream its slice owns,
+so it holds the leader's keys once rather than once per shard \(em at the cost
+of each shard reading the whole stream.
 .TP
 .B \-\-tls
 .TQ
