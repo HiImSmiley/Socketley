@@ -915,6 +915,31 @@ private:
             return;
         }
 
+        // ── Registered with the ring here, and not further down ─────────────
+        //
+        // The control socket's recv and the control writer's send are this
+        // handler's own submissions, and a submission carries its owner's
+        // token: made without a registration it is not merely unowned, its
+        // completion is DROPPED.  For the recv that means the arm never
+        // completes, m_ctl_armed never clears, and the worker is deaf to its
+        // daemon for the rest of its life.
+        //
+        // Everything below this line can fail and return without building a
+        // runtime — create_runtime() does, for a type this build does not have
+        // — and that exit used to be survivable because the loop read the
+        // socket once per stats interval whatever the arm said.  That read is
+        // gone with the poll it was covering for, so the registration moves to
+        // where the ring is, which is the fact it actually depends on.
+        //
+        // register_owner() is idempotent by contract, so a second config frame
+        // reaching here costs nothing and strands nothing.
+        m_loop.register_owner(this);
+
+        // And the frames going the other way go on the ring too — after the
+        // registration and not before, for the reason just stated.  Whatever
+        // the hello frame left queued goes out from here on the ring.
+        m_writer.use_ring(&m_loop, this);
+
         // The type comes from the frame the daemon sent, not from this file.
         // Everything below is either a setter every runtime has or is guarded
         // on the cast, so a worker is not a proxy worker any more.
@@ -997,15 +1022,9 @@ private:
         // Its own name is registered so a request for it is served here rather
         // than making a round trip through the daemon, which would route it
         // back to this very worker.
-        // The ring exists from here, so the control socket can be armed on it.
-        m_loop.register_owner(this);
-
-        // And the frames going the other way go on it too — after
-        // register_owner and not before, because a submission carries its
-        // owner's token and one made without a registration has its completion
-        // dropped rather than delivered.  Whatever the hello frame left queued
-        // goes out from here on the ring.
-        m_writer.use_ring(&m_loop, this);
+        // The ring, the owner registration and the writer are already up — see
+        // the block right after m_loop.init(), and the note there for why they
+        // cannot wait for a runtime that may never be built.
 
         m_manager.requests().attach(m_loop);
         if (auto* sink = m_rt->as_request_sink())
