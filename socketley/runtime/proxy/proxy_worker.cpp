@@ -266,12 +266,55 @@ public:
         m_manager.mark_replica();
     }
 
-    void on_cqe(struct io_uring_cqe* /*cqe*/) override
+    // ── The two things this worker has on the ring for itself ───────────────
+    //
+    // Its runtime's completions never arrive here: the runtime registers as its
+    // own owner.  What lands here is the control socket's recv and the control
+    // writer's send, and they are told apart by the request address rather than
+    // by the op type — a type is a shape, and two submissions of the same shape
+    // would be indistinguishable the moment a second one exists.
+    void on_cqe(struct io_uring_cqe* cqe) override
     {
-        // Nothing to do but stop waiting.  The frame is drained by the
-        // pump_control() the main loop already runs on every turn, and re-armed
-        // there too — doing either here would give this socket two readers.
+        auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+        if (!req)
+            return;
+
+        if (m_writer.owns_request(req))
+        {
+            m_writer.on_send_cqe(cqe->res);
+            return;
+        }
+
+        if (req != &m_ctl_req)
+            return;
+
+        // A recv, not a readiness notification.  The bytes are already here;
+        // the read that used to follow the poll is what this replaces.
         m_ctl_armed = false;
+
+        const int res = cqe->res;
+        if (res > 0)
+        {
+            m_in.append(m_ctl_buf, static_cast<size_t>(res));
+            return;
+        }
+
+        if (res == 0)
+        {
+            m_ctl_eof = true;                 // the daemon closed
+            return;
+        }
+
+        // Nothing arrived and nothing is wrong: re-armed at the end of the
+        // turn, and the wait before it is clamped because m_ctl_armed is false.
+        if (res == -EAGAIN || res == -EWOULDBLOCK || res == -EINTR ||
+            res == -ECANCELED)
+            return;
+
+        // A recv that failed for any other reason is the socket, and the socket
+        // is the only thing this worker is reachable through.
+        LOG_ERROR("proxy worker: the control socket could not be read");
+        m_ctl_eof = true;
     }
 
     int run()
@@ -424,29 +467,35 @@ public:
             // POLLOUT the arm would have carried.
             if (m_loop.ring_open())
             {
-                if (!m_ctl_armed || m_writer.pending())
+                // The two states the ring cannot end on its own: no recv
+                // standing (a submission get_sqe() refused), and bytes queued
+                // with no send standing for the same reason.  An in-flight send
+                // needs no clamp — it ends with a completion.
+                if (!m_ctl_armed || m_writer.needs_retry())
                     wait_ms = std::min(wait_ms, ctl_fallback_ms);
                 m_loop.poll_completions(wait_ms);
+
+                // The bytes are in m_in, put there by the recv completion.
+                // Dispatching them here rather than in on_cqe() is deliberate
+                // and is not a detail: on_config() is one of these frames and
+                // it BUILDS this ring, and the reload and stop handlers reach
+                // into the runtime.  Every one of them ran on a loop turn
+                // before the read moved onto the ring, and they still do.
+                if (!drain_frames())
+                    break;
             }
             else
+            {
+                // No ring yet, so the notification has to come from the
+                // descriptor itself.  This is the whole of what is left of the
+                // old pattern, and it costs nothing that can be measured: a
+                // worker is in this state from the fork until its config
+                // arrives, which is before it has a runtime, a port, or a
+                // sibling to cross to.
                 wait_for_control(wait_ms, m_writer.pending());
-
-            // Only when the ring is not already holding an unfired poll on this
-            // socket.  While m_ctl_armed is true a one-shot POLLIN is
-            // outstanding and has not completed, which is the kernel saying the
-            // fd is not readable — so the read this used to do unconditionally
-            // could only ever return EAGAIN.  It did: traced over 3000 round
-            // trips, the worker made 2.01 read() calls per round trip and every
-            // one of them failed with EAGAIN, against a bare C echo server that
-            // needs 2 syscalls per round trip in total.
-            //
-            // The arm is not an optimisation on top of this read, it is the
-            // notification, and on_cqe() clears the flag before the drain below
-            // ever runs.  m_ctl_armed is false in every case where nothing will
-            // tell us: before the ring exists, after a submit that failed, and
-            // while the worker is shutting down and no longer arming.
-            if (!m_ctl_armed && !pump_control())
-                break;
+                if (!pump_control())
+                    break;
+            }
 
             // Whatever the socket would not take last turn.  A reply sitting
             // here is somebody's answer, so it goes before anything else this
@@ -465,81 +514,27 @@ public:
             const auto now = std::chrono::steady_clock::now();
             if (now - last_stats >= stats_cur)
             {
-                // The skip above rests on "armed and unfired means not
-                // readable".  That is the poll contract, but a worker that
-                // silently stopped answering the daemon would be a bad way to
-                // find out it had been broken, so once every stats interval the
-                // socket is read whatever the flag says.  It bounds any such
-                // stall to one interval instead of forever, and because it
-                // reports rather than merely repairs, a build that breaks the
-                // invariant says so in the log instead of getting quietly
-                // slower.  This is 4 reads a second, not 2 per round trip.
+                // ─── THE SAFETY PUMP THAT USED TO BE HERE, AND WHY IT IS NOT ─
                 //
-                // ─── WHAT m_ctl_armed ACTUALLY MEANS, AND WHY IT IS DRAINED ─
+                // A read once per interval, whatever the arm said, plus two
+                // extra ring drains and a warning around it.  All of it existed
+                // because the arm was a POLL: a readiness notification is a
+                // claim about the socket that the loop then had to act on, and
+                // "armed and unfired means not readable" was an invariant this
+                // process could be wrong about without anything saying so.
                 //
-                // Not "the kernel has not fired it".  It means "submitted, and
-                // this loop has not dispatched the completion yet" — the flag
-                // is cleared in on_cqe(), which only runs when a drain reaps
-                // the CQE.  Between the arm_control() ten lines above and this
-                // read there is no ring entry at all, so a frame arriving in
-                // that window leaves the poll fired, its completion sitting
-                // unreaped, and the flag still set.  The read then finds bytes
-                // and the warning below fires at a fault that does not exist —
-                // which is why it has only ever been seen on Sanitize, and
-                // only under load: those are the conditions that widen the
-                // window and fill it.
+                // A recv is not a claim.  The bytes are IN the completion, so
+                // there is no second step to skip and nothing to be stale about
+                // — a frame that arrives is either delivered by the standing
+                // recv or there is no standing recv, and that second case is
+                // visible directly in m_ctl_armed and is retried at the top of
+                // every turn with the wait clamped to ctl_fallback_ms.
                 //
-                // Draining first collapses that case.  If the poll had fired,
-                // on_cqe() clears the flag here and the ordinary path takes
-                // the frame on the next turn.  What survives — still armed,
-                // and the socket has bytes — is the real thing this check is
-                // for: a notification the kernel owes and is not going to
-                // send.
-                //
-                // The re-arm is left to the next turn.  That state is state
-                // (b) in the audit at the wait above, so the next wait clamps
-                // itself to ctl_fallback_ms and the socket is pumped
-                // unconditionally at the top of the turn after this one.
-                //
-                // ─── AND ONCE MORE AFTER THE READ, WHICH IS WHAT CLOSES IT ──
-                //
-                // Draining first is not enough on its own, and that was
-                // measured rather than reasoned about: a Sanitize build under
-                // 62 control frames a second reported this warning once a
-                // minute before the drain was added and still reported it in
-                // one run of three afterwards.  All the first drain does is
-                // shrink the window — from "everything between the arm and
-                // this read" to "everything between this drain and this read"
-                // — and a window that is merely small is still a window that a
-                // long enough run will find.
-                //
-                // What closes it is that a one-shot poll_add fires from the
-                // wakeup at the instant the descriptor becomes readable.  The
-                // readiness is recorded then, by the kernel, and it does not
-                // stop being true because this loop got to the bytes first.
-                // So a frame that arrived between the drain and the read has
-                // already made the poll ready, and entering the ring once more
-                // reaps it — after the read has taken the data, which is
-                // exactly the case that looked like a fault and was not.
-                //
-                // A notification that is genuinely not coming survives all
-                // three steps, which is the only thing left that warns.
-                if (m_ctl_armed)
-                    m_loop.poll_completions(0);
-
-                if (m_ctl_armed)
-                {
-                    if (!pump_control())
-                        break;
-                    if (m_pump_took)
-                    {
-                        m_loop.poll_completions(0);
-                        if (m_ctl_armed)
-                            LOG_WARN("proxy worker: a control frame was waiting "
-                                     "while the ring's poll on that socket had "
-                                     "not fired");
-                    }
-                }
+                // So the pump is gone with the invariant it was watching, and
+                // with it the last read() on this path.  What replaced its
+                // guarantee is not an interval — it is that arm_control() runs
+                // on every turn and the only way to have no recv standing is a
+                // submission the ring refused, which the next turn resubmits.
 
                 // Doubling, not a jump to the cap: a runtime that goes quiet
                 // for one interval and then moves should not have paid a full
@@ -610,9 +605,32 @@ public:
         // Before the ring, like every other owner registration: detach answers
         // whatever is still queued `dropped` and gives the owner token back.
         m_manager.requests().detach();
-        if (m_ctl_armed)
+
+        // ── The writer comes off the ring before the ring goes ──────────────
+        //
+        // stop() above can still have written a frame — a Lua on_stop that
+        // sends, a final state — and on the ring that frame is a submission
+        // rather than bytes on the wire.  So the in-flight send is given a
+        // bounded chance to complete, and then the writer goes back to the
+        // descriptor for whatever is left.  Bounded, and short: this is a
+        // socketpair whose peer is the daemon, and a worker that will not
+        // finish unwinding is killed by the supervisor five seconds from the
+        // SIGTERM regardless.
+        //
+        // leave_ring() is what refuses to guess: see its note on why a send
+        // that is still in flight when the drains run out ends the writer
+        // rather than being rewritten.
+        for (int i = 0; i < 20 && m_writer.send_in_flight(); ++i)
+            m_loop.poll_completions(1);
+        m_writer.leave_ring();
+        m_writer.flush();
+
+        // A recv, so poll_remove no longer names it.  Cancelling by descriptor
+        // covers the recv and any send that outlived the drain above, which is
+        // the case leave_ring() has just given up on.
+        if (m_ctl_armed || m_writer.send_in_flight())
         {
-            if (!m_loop.submit_poll_remove(&m_ctl_req)) {}
+            if (!m_loop.submit_cancel_fd(m_fd)) {}
             m_ctl_armed = false;
         }
         m_loop.deregister_owner(this);
@@ -648,20 +666,40 @@ private:
         if (::poll(&pfd, 1, timeout_ms) < 0) {}
     }
 
-    // Make the ring's wait end when a frame arrives instead of when the timeout
-    // does.  One-shot: the fd outlives every arm here, but a multishot poll on
-    // it would still be reporting after shutdown_ring() and there is nothing to
-    // gain from it — one SQE per exchange against a socket that carries one
-    // frame at a time.
+    // ── The recv that used to be a poll ─────────────────────────────────────
+    //
+    // This was submit_poll_add(POLLIN), and the bytes were then taken by a
+    // ::read() in the loop.  Two things for one arrival, one of them a
+    // syscall — the epoll pattern, on the one path in this tree that still had
+    // it.  What that cost is countable and was counted: on a four-shard cache,
+    // one shard over 200,000 GETs made 50,600 write() and 14,984 read() calls
+    // against 5,920 io_uring_enter, where the same run on one shard makes 7 and
+    // 9.  Every one of them is a crossing to a sibling.
+    //
+    // No POLLOUT half any more: the send is on the ring too, and it ends with
+    // its own completion rather than with a readiness report somebody has to
+    // act on.
+    //
+    // ── AND WHY THIS IS ONE-SHOT AND NOT MULTISHOT ──────────────────────────
+    //
+    // A multishot recv would take the re-arm away as well.  The re-arm is an
+    // SQE, which under SQPOLL is a store and no syscall at all — it is not on
+    // the axis this change is about, and the counting below says so: entries
+    // per GET did not rise when the reads and writes moved onto them.
+    //
+    // What it would cost is a provided-buffer group on the one socket in this
+    // process whose frames may not be lost: an ENOBUFS fallback path, a buffer
+    // that has to be handed back on every exit from the completion handler, and
+    // a second shape of "a frame arrived".  That is a trade worth making
+    // against a measured number and not against an expected one, and there is
+    // no number here asking for it.
     void arm_control()
     {
         if (!m_loop.ring_open() || m_ctl_armed)
             return;
-        // POLLOUT only while something is waiting to go out, so an idle worker
-        // is not woken by a socket that is merely writable.
-        const unsigned mask = POLLIN | (m_writer.pending() ? POLLOUT : 0u);
-        m_ctl_req   = { this, nullptr, m_fd, 0, op_poll };
-        m_ctl_armed = m_loop.submit_poll_add(m_fd, mask, &m_ctl_req);
+        m_ctl_req   = { this, nullptr, m_fd, sizeof(m_ctl_buf), op_read };
+        m_ctl_armed = m_loop.submit_read(m_fd, m_ctl_buf, sizeof(m_ctl_buf),
+                                         &m_ctl_req);
     }
 
     void send_hello()
@@ -735,16 +773,18 @@ private:
     worker_proto::stats_wire m_last_pub{};
     bool m_have_last{false};
 
+    // Bytes off the descriptor, for the one window in which there is no ring to
+    // read them with: from the fork until on_config() builds it.  Under load
+    // this is not reached at all — the recv completion fills m_in and
+    // drain_frames() below is what runs.
     bool pump_control()
     {
-        m_pump_took = false;
         char buf[4096];
         for (;;)
         {
             const ssize_t n = ::read(m_fd, buf, sizeof(buf));
             if (n > 0)
             {
-                m_pump_took = true;
                 m_in.append(buf, static_cast<size_t>(n));
                 continue;
             }
@@ -756,6 +796,21 @@ private:
                 break;                              // nothing more for now
             return false;
         }
+        return drain_frames();
+    }
+
+    // Whole frames out of m_in, dispatched.  False is the worker's instruction
+    // to exit: the socket is gone, or what came off it was not a frame.
+    //
+    // The EOF test is first and stops before dispatch, which is what the read
+    // loop above did — a zero-length read returned false without parsing what
+    // an earlier pass had appended.  Kept rather than improved: a worker that
+    // acts on a frame from a daemon that has already gone is a new behaviour,
+    // and this change is not the place to introduce one.
+    bool drain_frames()
+    {
+        if (m_ctl_eof)
+            return false;
 
         worker_proto::frame_type type{};
         uint16_t                 ver = 0;
@@ -944,6 +999,13 @@ private:
         // back to this very worker.
         // The ring exists from here, so the control socket can be armed on it.
         m_loop.register_owner(this);
+
+        // And the frames going the other way go on it too — after
+        // register_owner and not before, because a submission carries its
+        // owner's token and one made without a registration has its completion
+        // dropped rather than delivered.  Whatever the hello frame left queued
+        // goes out from here on the ring.
+        m_writer.use_ring(&m_loop, this);
 
         m_manager.requests().attach(m_loop);
         if (auto* sink = m_rt->as_request_sink())
@@ -1538,10 +1600,19 @@ private:
     std::string                            m_in;
     io_request                             m_ctl_req{};
     bool                                   m_ctl_armed{false};
-    // Whether the last pump_control() actually took bytes off the socket.  Read
-    // by one caller only — the periodic safety pump in run(), which uses it to
-    // tell "nothing was waiting" from "the arm missed a wakeup".
-    bool                                   m_pump_took{false};
+    // Where the ring's recv puts the frame.  Read only from on_cqe(), and only
+    // for the length the completion reports; the recv that owns it is the one
+    // named by m_ctl_req and there is never more than one.
+    //
+    // 4096 was what the ::read() loop used, and that loop went round again.  A
+    // recv does not, so a short buffer is a second completion and a second
+    // turn.  16 KiB holds the largest frame this socket carries under load —
+    // a chan_req or a chan_rep with a batch of cache commands in it — and
+    // costs one page more per worker.
+    char                                   m_ctl_buf[16 * 1024];
+    // The daemon closed, or the recv failed for a reason that is not going to
+    // get better.  Set in on_cqe(), acted on by drain_frames().
+    bool                                   m_ctl_eof{false};
     bool                                   m_done{false};
     int                                    m_exit_code{0};
 };
