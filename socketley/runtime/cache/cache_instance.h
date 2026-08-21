@@ -395,6 +395,26 @@ private:
     //   the framing is understood by cache_instance alone.  The daemon relays
     //   bytes and understands neither side, which is the property that lets the
     //   crossing be a socket at all.
+    // One client command's answer.
+    //
+    // Usually one piece: a command with one key has one owner and one reply,
+    // which is every command step one routed.  A command with several keys is
+    // exploded into one single-key command per key and a keyspace-wide one into
+    // one per shard, so its answer arrives in pieces that have to be put back
+    // together in the order the CALLER wrote them -- not the order the replies
+    // came back in, which is the order the shards happened to answer.
+    //
+    // The one-piece case is the same structure with one part and
+    // cache_merge::single, deliberately: two shapes for "an answer" is how the
+    // second one stops matching the first.
+    struct reply_slot
+    {
+        cache_merge              merge{cache_merge::single};
+        std::vector<std::string> parts;
+        std::vector<uint8_t>     part_filled;
+        uint32_t                 parts_left{0};
+    };
+
     struct shard_batch
     {
         // Which connection is waiting.  A descriptor and not a pointer, checked
@@ -405,13 +425,20 @@ private:
         bool resp{false};
 
         // One per command since the batch opened, in the order the client gave
-        // them.  A local command's reply is put here filled; a crossing's
-        // arrives later.
-        std::vector<std::string> slots;
-        std::vector<uint8_t>     filled;
+        // them.
+        std::vector<reply_slot> slots;
 
-        // Crossings still owed an answer.  One per SHARD, not one per command.
+        // Crossings still owed an answer.  One per SHARD, not one per command
+        // and not one per part.
         uint32_t outstanding{0};
+    };
+
+    // Where one framed reply belongs: which command's answer, and which piece
+    // of it.
+    struct fill_target
+    {
+        uint32_t slot{0};
+        uint32_t part{0};
     };
 
     // A batch that could grow without bound is a memory path a client controls,
@@ -429,14 +456,50 @@ private:
     // anything: everything the read delivered has been classified by then.
     void route_flush(client_connection* conn);
 
-    // Reserve this command's place in the reply order and hand it to its owner.
-    void route_to_owner(client_connection* conn, uint32_t owner,
-                        std::string_view raw, bool resp);
-
     // Fill every slot a failed or missing crossing owed, so a batch cannot be
     // left one answer short of ever completing.
-    void batch_fill_error(shard_batch& b, const std::vector<size_t>& slots,
+    void batch_fill_error(shard_batch& b, const std::vector<fill_target>& targets,
                           std::string_view why);
+
+    // Reserve this command's place in the reply order.  Returns its slot index;
+    // `parts` is how many pieces its answer will be assembled from.
+    uint32_t slot_open(client_connection* conn, bool resp, cache_merge merge,
+                       uint32_t parts);
+
+    // Hand one PIECE of a command to the shard that owns it, or run it here.
+    // `raw` is a complete single-key command in the connection's protocol.
+    void route_part(client_connection* conn, uint32_t owner, uint32_t slot,
+                    uint32_t part, std::string_view raw, bool resp);
+
+    // Run one complete command out of THIS shard's store and hand back what it
+    // wrote.  One function for the two callers that must not diverge: the shard
+    // answering a crossing, and the shard filling a part it owns itself.
+    void run_local_raw(client_connection* conn, std::string_view raw, bool resp,
+                       std::string& out);
+
+    // Put a finished slot's pieces together under its merge rule.  False means
+    // the pieces did not have the shape the rule expects, which is answered as
+    // an error for that command rather than as a mis-framed reply.
+    bool slot_render(const reply_slot& sl, bool resp, std::string& out) const;
+
+    // The two multi-key spellings, exploded into single-key commands.  False
+    // means the command could not be split -- a usage error -- and is answered
+    // by the local interpreter as it always was.
+    bool explode_text_multi(client_connection* conn, uint32_t h,
+                            std::string_view args);
+    bool explode_resp_multi(client_connection* conn, uint32_t h,
+                            std::string_view* args, int argc);
+
+    // A keyspace-wide command: the same command to every shard, merged.
+    void fan_keyspace(client_connection* conn, uint32_t h,
+                      std::string_view raw, bool resp);
+
+    // Which shard a SCAN call resumes in, and one page out of this one.  See
+    // the SCAN note in shared/cache_shard_map.h for the cursor's layout and for
+    // what a caller is and is not promised across shards.
+    uint32_t scan_cursor_owner(std::string_view cursor_arg) const;
+    bool     shard_scan(uint64_t cursor, std::string_view pattern, size_t count,
+                        std::vector<std::string_view>& out, uint64_t& next);
 
     // Append a finished batch's slots to the connection's reply buffer and let
     // the rest of its pipeline run.
@@ -475,8 +538,12 @@ private:
         std::string produced;
         produced.swap(conn->response_buf);
         conn->response_buf.swap(held);
-        m_collect->slots.push_back(std::move(produced));
-        m_collect->filled.push_back(1);
+        reply_slot sl;
+        sl.merge = cache_merge::single;
+        sl.parts.push_back(std::move(produced));
+        sl.part_filled.push_back(1);
+        sl.parts_left = 0;
+        m_collect->slots.push_back(std::move(sl));
     }
 
     // Batches waiting on a sibling, by the id their connection holds.
@@ -486,8 +553,8 @@ private:
     // will fill.  Keyed by the cookie the channel hands back.
     struct posted_group
     {
-        uint64_t            batch{0};
-        std::vector<size_t> slots;
+        uint64_t                 batch{0};
+        std::vector<fill_target> targets;
     };
     std::unordered_map<uint64_t, posted_group> m_posts;
 
@@ -501,8 +568,8 @@ private:
     // Per-owner accumulation for the parse in progress: the framed payload and
     // the slots it will fill.  Sized once at setup and cleared per flush, so a
     // pipeline costs no allocation per command.
-    std::vector<std::string>         m_route_payload;
-    std::vector<std::vector<size_t>> m_route_slots;
+    std::vector<std::string>              m_route_payload;
+    std::vector<std::vector<fill_target>> m_route_slots;
 
     uint64_t m_next_batch{1};
     uint64_t m_next_cookie{1};

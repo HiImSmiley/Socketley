@@ -73,12 +73,64 @@ enum class cache_cmd_class : uint8_t
 {
     single_key,   // one key, in the first argument: route to its owner
     multi_key,    // several keys, possibly several owners
-    keyspace,     // every shard's slice at once — keys, scan, dbsize, flush
+    keyspace,     // every shard's slice at once — keys, dbsize, memory
+    cursor_scan,  // one shard per call, named by the cursor; see below
+    persistence,  // reads or writes the dump file: flush, load
     fanout,       // no key, but every shard has subscribers: publish
     connection,   // answered by whoever holds the socket; no key at all
     stateful,     // attaches a stream to one shard: replicate
     unknown       // not a command; the local dispatch says so
 };
+
+// ─── HOW THE PIECES OF ONE ANSWER ARE PUT BACK TOGETHER ─────────────────────
+//
+// A command with several keys is not sent as one command to several shards.
+// It is EXPLODED into one single-key command per key -- `mget a b c` becomes
+// three `get`s -- each routed to its own owner, and the replies are reassembled
+// here.
+//
+// That is the choice that keeps this out of the trap request_channel.h names.
+// Sending `mget a c` to one shard and `mget b` to another would come back as
+// two multi-value replies which have to be TAKEN APART again before they can be
+// interleaved, and taking them apart needs a table of reply shapes per command
+// -- "the same duplication by another route".  One key in, one reply out: the
+// pieces arrive already separated, and reassembly is concatenation in the order
+// the caller wrote the keys.
+//
+// It costs nothing in crossings.  A crossing is one queue entry per SHARD per
+// pipeline, and the exploded sub-commands are grouped by owner exactly like any
+// others -- `mget` over 100 keys on 4 shards is still 3 crossings, carrying 25
+// framed commands each.
+//
+// The merge rules below therefore only ever read replies to commands THIS file
+// chose to send.  That is a narrower dependence than a general reply-shape
+// table, and it is still a dependence: each rule names the exact command whose
+// reply it reads.
+enum class cache_merge : uint8_t
+{
+    single,     // one part, verbatim.  Every command routed by step one.
+    elements,   // mget: one `get` reply per key, in the caller's order
+    all_ok,     // mset: every `set` must have said ok
+    sum,        // dbsize/size/memory/maxmemory/multi-del: integers added
+    key_list    // keys: the per-shard lists concatenated
+};
+
+// What a command's parts are merged with.  `single` for everything that has one
+// part, which is every command step one routes.
+constexpr cache_merge cache_merge_for(uint32_t h)
+{
+    switch (h)
+    {
+        case fnv1a("mget"):   return cache_merge::elements;
+        case fnv1a("mset"):   return cache_merge::all_ok;
+        case fnv1a("del"):    return cache_merge::sum;     // the RESP spelling
+        case fnv1a("keys"):   return cache_merge::key_list;
+        case fnv1a("dbsize"): case fnv1a("size"):
+        case fnv1a("memory"): case fnv1a("maxmemory"):
+            return cache_merge::sum;
+        default:              return cache_merge::single;
+    }
+}
 
 // The command alone, without its arguments.
 //
@@ -123,11 +175,23 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("mget"):       case fnv1a("mset"):
             return cache_cmd_class::multi_key;
 
-        case fnv1a("keys"):       case fnv1a("scan"):
+        case fnv1a("keys"):
         case fnv1a("dbsize"):     case fnv1a("size"):
-        case fnv1a("flush"):      case fnv1a("load"):
         case fnv1a("memory"):     case fnv1a("maxmemory"):
             return cache_cmd_class::keyspace;
+
+        case fnv1a("scan"):
+            return cache_cmd_class::cursor_scan;
+
+        // NOT keyspace commands, whatever their names suggest.  `flush` in this
+        // cache is m_store.save(m_persistent_path) and `load` is its inverse --
+        // they write and read the DUMP FILE, they do not empty or repopulate
+        // the keyspace.  Fanning `flush` out would have N shards write N
+        // different slices over one path, last writer wins, and the next start
+        // would load one shard's share and report nothing about the rest.  That
+        // is the silent data loss persistence has its own step for.
+        case fnv1a("flush"):      case fnv1a("load"):
+            return cache_cmd_class::persistence;
 
         case fnv1a("publish"):
             return cache_cmd_class::fanout;
@@ -241,4 +305,73 @@ constexpr std::string_view cache_text_key(uint32_t h, std::string_view args)
         return args;
     const size_t sp = args.find(' ');
     return sp == std::string_view::npos ? args : args.substr(0, sp);
+}
+
+// ─── SCAN ACROSS N SHARDS ───────────────────────────────────────────────────
+//
+// SCAN is the one command here whose contract is a PROMISE ABOUT SUCCESSIVE
+// CALLS, so it cannot be answered by fanning out and merging: the caller holds
+// a cursor between calls and there is one integer to put it in.
+//
+// What is NOT possible, said plainly rather than worked around: N independent
+// positions cannot be carried in one 64-bit cursor that also has to carry the
+// store's own position.  Anything claiming otherwise is either widening the
+// wire format or keeping per-client state on the server, and the cursor is
+// documented as stateless.
+//
+// So the iteration is SEQUENTIAL: shard 0 to exhaustion, then shard 1, and so
+// on.  One crossing per call, not N -- cheaper than a fan-out, not more
+// expensive.  The cursor names the shard it belongs to.
+//
+//   bits 58..63   the shard whose slice this cursor is a position in
+//   bits  0..57   that shard's own cursor, exactly as cache_store issues it
+//
+// Six bits because max_shards is 64.  They come out of the top of the store's
+// cursor, whose layout is [map index : 8][bucket count : 24][bucket index : 32]
+// and whose map index only ever holds 0..3 -- four maps, fixed order.  That
+// leaves the top six bits genuinely unused rather than merely usually zero, and
+// cache_instance.cpp static_asserts the map count against this so that a fifth
+// map is a build failure and not a cursor that silently names another shard.
+//
+// ─── WHAT A CALLER IS PROMISED, AND WHAT IT IS NOT ──────────────────────────
+//
+// Unchanged from the single-store contract: a key present for the whole
+// iteration is returned at least once, and a key added or removed during it may
+// or may not appear.
+//
+// Added by sharding, and it is a real condition rather than a formality: the
+// cursor is only meaningful for the shard set that issued it.  This build
+// cannot violate it -- reconcile_proxy_workers() refuses to change a running
+// runtime's shard count, so N is fixed for the life of a run, and a restart
+// invalidates a cursor exactly as it already invalidates an unsharded one.  If
+// that ever stops being true, a cursor from the old N has to be REFUSED here
+// rather than followed into a shard that is not the one it meant.
+//
+// One visible consequence, which is a property of sequential iteration and not
+// a defect: a page never mixes shards, and the call that finishes a shard
+// returns an empty page carrying the next shard's opening cursor.  Redis's own
+// SCAN is allowed to return an empty page with a non-zero cursor and every
+// client handles it; COUNT is a hint on both.
+inline constexpr int      cache_scan_shard_bits  = 6;          // max_shards == 64
+inline constexpr int      cache_scan_shard_shift = 64 - cache_scan_shard_bits;
+inline constexpr uint64_t cache_scan_store_mask  =
+    (1ull << cache_scan_shard_shift) - 1ull;
+
+// Which shard a cursor is a position in.  0 for every cursor an unsharded cache
+// ever issues, which is what makes this a no-op there.
+constexpr uint32_t cache_scan_cursor_shard(uint64_t cursor)
+{
+    return static_cast<uint32_t>(cursor >> cache_scan_shard_shift);
+}
+
+// That shard's own cursor, as cache_store::scan() would recognise it.
+constexpr uint64_t cache_scan_cursor_store(uint64_t cursor)
+{
+    return cursor & cache_scan_store_mask;
+}
+
+constexpr uint64_t cache_scan_cursor_make(uint32_t shard, uint64_t store_cursor)
+{
+    return (static_cast<uint64_t>(shard) << cache_scan_shard_shift)
+         | (store_cursor & cache_scan_store_mask);
 }

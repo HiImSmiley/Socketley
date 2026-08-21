@@ -111,6 +111,14 @@ public:
     bool setnx(std::string_view key, std::string_view value);
 
     // --- Cursor scan (stateless offset cursor; returns next cursor, 0=done) ---
+    //
+    // The cursor packs [map index : 8][bucket count : 24][bucket index : 32],
+    // and the map index only ever holds 0..scan_last_map.  That is stated here
+    // rather than left inside scan() because something else now depends on it:
+    // a sharded cache carries the shard in the top six bits of this cursor, and
+    // those are free only while the map index fits in the two below them.
+    // cache_instance.cpp static_asserts the two against each other.
+    static constexpr uint8_t scan_last_map = 3;   // m_data, m_lists, m_sets, m_hashes
     uint64_t scan(uint64_t cursor, std::string_view pattern,
                   size_t count, std::vector<std::string_view>& out) const;
 

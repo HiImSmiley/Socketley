@@ -63,11 +63,13 @@
 #   4. The one-shard control does all of the above and must stay green on both
 #      builds.  Without it a red in 1-3 could be an ordinary cache defect.
 #
-#   5. The commands that are NOT routed yet — mget, dbsize and the rest of the
-#      keyspace-wide class — are refused by name.  A silent wrong answer from
-#      one shard's slice is the exact failure this whole change exists to
-#      remove, so "not implemented" has to be louder than "not implemented
-#      well".
+#   5. The commands that are NOT routed are refused by name.  When this file was
+#      written that meant the multi-key and keyspace-wide classes; those are
+#      routed now and pending_cache_shard_multikey.sh holds them down, so what
+#      is asserted here is the two that are refused on purpose — the dump-file
+#      commands and replication.  A silent wrong answer from one shard's slice
+#      is the exact failure this whole change exists to remove, so "not
+#      implemented" has to be louder than "not implemented well".
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -215,25 +217,31 @@ if command -v redis-cli >/dev/null 2>&1; then
             "sites, and one of them is not asking who owns the key"
     fi
 
-    # ── 5: what is NOT routed yet is refused by name ────────────────────────
-    MG=$(redis-cli -p "$P_R4" MGET rk0 rk1 2>&1 | head -1)
-    case "$MG" in
-        *"spans every shard"*)
-            ok "a multi-key command is refused by name, not answered from one slice" ;;
+    # ── 5: what is NOT routed is refused by name ────────────────────────────
+    #
+    # The multi-key and keyspace-wide classes were refused here when this file
+    # was written and are routed now — pending_cache_shard_multikey.sh holds
+    # them down.  What is left is the two classes that are refused on purpose
+    # rather than pending: a command that reads or writes the dump file, and one
+    # that attaches a stream to a single shard.  Both would appear to work.
+    FL=$(printf 'flush\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
+    case "$FL" in
+        *"dump file"*)
+            ok "a dump-file command is refused by name, not fanned out" ;;
         *)
-            bad "a multi-key command is refused by name" \
-                "an answer built from one shard's quarter of the keyspace is a" \
-                "miss for data that was stored — got '$MG'" ;;
+            bad "a dump-file command is refused by name" \
+                "flush is m_store.save(persistent_path); fanning it out is four" \
+                "shards writing four slices over one path — got '$FL'" ;;
     esac
 
-    DB=$(redis-cli -p "$P_R4" DBSIZE 2>&1 | head -1)
-    case "$DB" in
-        *"spans every shard"*)
-            ok "a keyspace-wide command is refused by name" ;;
+    RP=$(printf 'replicate 127.0.0.1:1\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
+    case "$RP" in
+        *"one shard"*)
+            ok "a replication stream is refused rather than carrying a fraction" ;;
         *)
-            bad "a keyspace-wide command is refused by name" \
-                "DBSIZE on a quarter of the keyspace is a confident wrong number" \
-                "got '$DB'" ;;
+            bad "a replication stream is refused" \
+                "a follower attached to one shard receives that shard's writes" \
+                "and nothing says the rest are missing — got '$RP'" ;;
     esac
 
     # And a command that needs no key at all is still answered where it is

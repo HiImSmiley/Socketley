@@ -801,7 +801,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     };
 
     // The four in a fixed order, so a cursor names the same map on every call.
-    const uint8_t last_map = 3;
+    const uint8_t last_map = scan_last_map;
     for (uint8_t idx = in_map; idx <= last_map; ++idx)
     {
         size_t start = 0;

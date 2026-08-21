@@ -353,7 +353,7 @@ bool cache_instance::setup(event_loop& loop)
         m_shard_i = 0;
 
     m_route_payload.assign(m_shard_n, std::string{});
-    m_route_slots.assign(m_shard_n, std::vector<size_t>{});
+    m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
     // ── The one configuration that would lose data quietly ──────────────────
     //
@@ -2187,6 +2187,256 @@ static inline void append_int_nl(std::string& buf, int64_t v)
 // every entry point compares against it first — which is what keeps the cost of
 // this on the runtime that does not use it at exactly one predicted branch.
 
+// An error written into a plain buffer rather than a connection: a merge that
+// cannot be performed has to answer the command it belongs to, and by then the
+// answer is a slot, not a socket.
+static void append_error_reply(std::string& out, bool resp, std::string_view why)
+{
+    if (resp)
+        resp::encode_error_into(out, why);
+    else
+    {
+        out.append("error: ");
+        out.append(why);
+        out.push_back('\n');
+    }
+}
+
+// `<int>\n` in the text protocol, `:<int>\r\n` in RESP.  Strict: anything else
+// is a reply this rule was not written for, and saying so is what keeps a
+// mis-framed answer from being summed into a confident wrong number.
+static bool parse_int_reply(std::string_view part, bool resp, int64_t& out)
+{
+    if (resp)
+    {
+        if (part.size() < 4 || part.front() != ':' || !part.ends_with("\r\n"))
+            return false;
+        part.remove_prefix(1);
+        part.remove_suffix(2);
+    }
+    else
+    {
+        if (part.empty() || part.back() != '\n')
+            return false;
+        part.remove_suffix(1);
+    }
+    if (part.empty())
+        return false;
+    const auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), out);
+    return ec == std::errc{} && ptr == part.data() + part.size();
+}
+
+// `*N\r\n` off the front of a RESP array, leaving the elements.
+static bool take_resp_array_header(std::string_view part, int64_t& count,
+                                   std::string_view& elements)
+{
+    if (part.empty() || part.front() != '*')
+        return false;
+    const size_t nl = part.find("\r\n");
+    if (nl == std::string_view::npos)
+        return false;
+    const std::string_view digits = part.substr(1, nl - 1);
+    if (digits.empty())
+        return false;
+    const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), count);
+    if (ec != std::errc{} || ptr != digits.data() + digits.size() || count < 0)
+        return false;
+    elements = part.substr(nl + 2);
+    return true;
+}
+
+// Run one complete command out of THIS shard's store and hand back what it
+// wrote, without disturbing whatever the connection has queued.
+//
+// One function for the two callers that need it — the shard answering a
+// crossing, and the shard routing one to a part it owns itself — because they
+// have to run a command the same way or a key served locally and the same key
+// served across a boundary stop agreeing.
+void cache_instance::run_local_raw(client_connection* conn, std::string_view raw,
+                                   bool resp, std::string& out)
+{
+    std::string held;
+    held.swap(conn->response_buf);
+
+    if (resp)
+    {
+        static constexpr int MAX_RESP_ARGS = 64;
+        std::string_view args[MAX_RESP_ARGS];
+        int    argc     = 0;
+        size_t consumed = 0;
+        if (resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed)
+                == resp::parse_result::ok
+            && argc > 0)
+            process_resp_command_local(conn, args, argc);
+        else
+            resp::encode_error_into(conn->response_buf, "protocol error");
+    }
+    else if (!raw.empty())
+    {
+        process_command_local(conn, raw);
+    }
+
+    out.clear();
+    out.swap(conn->response_buf);
+    conn->response_buf.swap(held);
+}
+
+// Reserve a command's place in the reply order.  `parts` is how many pieces its
+// answer will be assembled from: one for everything step one routed.
+uint32_t cache_instance::slot_open(client_connection* conn, bool resp,
+                                   cache_merge merge, uint32_t parts)
+{
+    if (!m_collect)
+    {
+        m_collect       = std::make_unique<shard_batch>();
+        m_collect->fd   = conn->fd;
+        m_collect->resp = resp;
+        m_collect_fd    = conn->fd;
+    }
+
+    const uint32_t idx = static_cast<uint32_t>(m_collect->slots.size());
+    reply_slot sl;
+    sl.merge = merge;
+    sl.parts.assign(parts, std::string{});
+    sl.part_filled.assign(parts, 0);
+    sl.parts_left = parts;
+    m_collect->slots.push_back(std::move(sl));
+    return idx;
+}
+
+void cache_instance::route_part(client_connection* conn, uint32_t owner,
+                                uint32_t slot, uint32_t part,
+                                std::string_view raw, bool resp)
+{
+    // A piece this shard owns is run here and filled now.  At least one part of
+    // every keyspace fan-out is always this, and no crossing is opened for it.
+    if (owner == m_shard_i)
+    {
+        std::string produced;
+        run_local_raw(conn, raw, resp, produced);
+
+        reply_slot& sl = m_collect->slots[slot];
+        sl.parts[part] = std::move(produced);
+        if (!sl.part_filled[part])
+        {
+            sl.part_filled[part] = 1;
+            if (sl.parts_left > 0)
+                --sl.parts_left;
+        }
+        return;
+    }
+
+    std::string& pay = m_route_payload[owner];
+    if (pay.empty())
+        pay.append(resp ? shard_batch_resp : shard_batch_text);
+    shard_frame_append(pay, raw);
+    m_route_slots[owner].push_back(fill_target{slot, part});
+}
+
+// Put a finished slot's pieces together.  False means they did not have the
+// shape the rule expects — which is answered as an error for that one command,
+// because a merge that guesses produces a reply the client cannot frame.
+bool cache_instance::slot_render(const reply_slot& sl, bool resp,
+                                 std::string& out) const
+{
+    switch (sl.merge)
+    {
+        case cache_merge::single:
+            if (!sl.parts.empty())
+                out.append(sl.parts[0]);
+            return true;
+
+        case cache_merge::elements:
+        {
+            // Each part is one `get` reply, which is already exactly one
+            // element in both protocols: `val\n` or `nil\n` in text, a bulk
+            // string or a null in RESP.  So there is nothing to parse.
+            if (resp)
+            {
+                out.push_back('*');
+                out.append(std::to_string(sl.parts.size()));
+                out.append("\r\n", 2);
+            }
+            for (const auto& p : sl.parts)
+                out.append(p);
+            if (!resp)
+                out.append("end\n", 4);
+            return true;
+        }
+
+        case cache_merge::all_ok:
+        {
+            const std::string_view ok = resp ? std::string_view("+OK\r\n")
+                                             : std::string_view("ok\n");
+            for (const auto& p : sl.parts)
+                if (p != ok)
+                {
+                    // The first shard that refused, said in its own words.  A
+                    // blanket "ok" over a partial write is the answer this
+                    // cannot give.
+                    out.append(p);
+                    return true;
+                }
+            out.append(ok);
+            return true;
+        }
+
+        case cache_merge::sum:
+        {
+            int64_t total = 0;
+            for (const auto& p : sl.parts)
+            {
+                int64_t v = 0;
+                if (!parse_int_reply(p, resp, v))
+                    return false;
+                total += v;
+            }
+            if (resp)
+                resp::encode_integer_into(out, total);
+            else
+            {
+                out.append(std::to_string(total));
+                out.push_back('\n');
+            }
+            return true;
+        }
+
+        case cache_merge::key_list:
+        {
+            if (resp)
+            {
+                int64_t     total = 0;
+                std::string body;
+                for (const auto& p : sl.parts)
+                {
+                    int64_t          n = 0;
+                    std::string_view elems;
+                    if (!take_resp_array_header(p, n, elems))
+                        return false;
+                    total += n;
+                    body.append(elems);
+                }
+                out.push_back('*');
+                out.append(std::to_string(total));
+                out.append("\r\n", 2);
+                out.append(body);
+                return true;
+            }
+            // Text: each part is its shard's lines followed by `end\n`.  One
+            // terminator for the runtime, not one per shard.
+            for (const auto& p : sl.parts)
+            {
+                if (!p.ends_with("end\n"))
+                    return false;
+                out.append(std::string_view(p).substr(0, p.size() - 4));
+            }
+            out.append("end\n", 4);
+            return true;
+        }
+    }
+    return false;
+}
+
 void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd,
                                    bool resp, std::string_view why)
 {
@@ -2211,28 +2461,6 @@ void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd
         conn->response_buf.append(why);
         conn->response_buf.push_back('\n');
     }
-}
-
-void cache_instance::route_to_owner(client_connection* conn, uint32_t owner,
-                                    std::string_view raw, bool resp)
-{
-    if (!m_collect)
-    {
-        m_collect = std::make_unique<shard_batch>();
-        m_collect->fd   = conn->fd;
-        m_collect->resp = resp;
-        m_collect_fd    = conn->fd;
-    }
-
-    const size_t idx = m_collect->slots.size();
-    m_collect->slots.emplace_back();
-    m_collect->filled.push_back(0);
-
-    std::string& pay = m_route_payload[owner];
-    if (pay.empty())
-        pay.append(resp ? shard_batch_resp : shard_batch_text);
-    shard_frame_append(pay, raw);
-    m_route_slots[owner].push_back(idx);
 }
 
 void cache_instance::route_flush(client_connection* conn)
@@ -2313,8 +2541,11 @@ void cache_instance::route_flush(client_connection* conn)
     if (batch->outstanding == 0)
     {
         // Nothing crossed, so nothing is owed and the connection never waits.
-        for (auto& sl : batch->slots)
-            conn->response_buf.append(sl);
+        for (const reply_slot& sl : batch->slots)
+            if (!slot_render(sl, batch->resp, conn->response_buf))
+                append_error_reply(conn->response_buf, batch->resp,
+                                   "this cache's shards answered in a shape "
+                                   "this build cannot put back together");
         return;
     }
 
@@ -2323,25 +2554,22 @@ void cache_instance::route_flush(client_connection* conn)
 }
 
 void cache_instance::batch_fill_error(shard_batch& b,
-                                      const std::vector<size_t>& slots,
+                                      const std::vector<fill_target>& targets,
                                       std::string_view why)
 {
-    for (const size_t idx : slots)
+    for (const fill_target& t : targets)
     {
-        if (idx >= b.slots.size() || b.filled[idx])
+        if (t.slot >= b.slots.size())
             continue;
-        if (b.resp)
-        {
-            b.slots[idx].clear();
-            resp::encode_error_into(b.slots[idx], why);
-        }
-        else
-        {
-            b.slots[idx].assign("error: ");
-            b.slots[idx].append(why);
-            b.slots[idx].push_back('\n');
-        }
-        b.filled[idx] = 1;
+        reply_slot& sl = b.slots[t.slot];
+        if (t.part >= sl.parts.size() || sl.part_filled[t.part])
+            continue;
+
+        sl.parts[t.part].clear();
+        append_error_reply(sl.parts[t.part], b.resp, why);
+        sl.part_filled[t.part] = 1;
+        if (sl.parts_left > 0)
+            --sl.parts_left;
     }
 }
 
@@ -2377,8 +2605,11 @@ void cache_instance::batch_finish(uint64_t id)
         return;
     }
 
-    for (auto& sl : it->second.slots)
-        conn->response_buf.append(sl);
+    for (const reply_slot& sl : it->second.slots)
+        if (!slot_render(sl, it->second.resp, conn->response_buf))
+            append_error_reply(conn->response_buf, it->second.resp,
+                               "this cache's shards answered in a shape this "
+                               "build cannot put back together");
 
     m_batches.erase(it);
     conn->batch_id = 0;
@@ -2429,34 +2660,40 @@ void cache_instance::on_request_reply(uint64_t cookie, request_status st,
 
     if (st != request_status::ok)
     {
-        batch_fill_error(b, grp.slots, request_status_text(st));
+        batch_fill_error(b, grp.targets, request_status_text(st));
     }
     else
     {
-        // One frame per command, in the order they were given.  A reply with
-        // the wrong number of frames is a build on the other side that does not
-        // speak this framing; the slots it did not fill are answered rather
-        // than left, because a slot nobody fills is a client that never hears
-        // back.
+        // One frame per command sent, in the order they were sent.  A reply
+        // with the wrong number of frames is a build on the other side that
+        // does not speak this framing; the pieces it did not fill are answered
+        // rather than left, because a piece nobody fills is a client that never
+        // hears back.
         const char* p   = reply.data();
         const char* end = reply.data() + reply.size();
         size_t      i   = 0;
-        for (; i < grp.slots.size(); ++i)
+        for (; i < grp.targets.size(); ++i)
         {
             std::string_view one;
             if (!shard_frame_take(p, end, one))
                 break;
-            const size_t idx = grp.slots[i];
-            if (idx < b.slots.size() && !b.filled[idx])
-            {
-                b.slots[idx].assign(one);
-                b.filled[idx] = 1;
-            }
+
+            const fill_target& t = grp.targets[i];
+            if (t.slot >= b.slots.size())
+                continue;
+            reply_slot& sl = b.slots[t.slot];
+            if (t.part >= sl.parts.size() || sl.part_filled[t.part])
+                continue;
+
+            sl.parts[t.part].assign(one);
+            sl.part_filled[t.part] = 1;
+            if (sl.parts_left > 0)
+                --sl.parts_left;
         }
-        if (i < grp.slots.size())
+        if (i < grp.targets.size())
         {
-            const std::vector<size_t> rest(grp.slots.begin() + static_cast<ptrdiff_t>(i),
-                                           grp.slots.end());
+            const std::vector<fill_target> rest(
+                grp.targets.begin() + static_cast<ptrdiff_t>(i), grp.targets.end());
             batch_fill_error(b, rest,
                              "the shard that owns this key answered in a framing "
                              "this build does not read");
@@ -2496,40 +2733,257 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
     const char* end = payload.data() + payload.size();
 
     std::string_view one;
+    std::string      produced;
     while (shard_frame_take(p, end, one))
     {
-        conn->response_buf.clear();
-
-        if (resp)
-        {
-            // Re-parsed rather than trusted: the bytes are a RESP array this
-            // side built out of the args the other side parsed, and running the
-            // parser again is what keeps one interpreter for both arrivals.
-            static constexpr int MAX_RESP_ARGS = 64;
-            std::string_view args[MAX_RESP_ARGS];
-            int    argc     = 0;
-            size_t consumed = 0;
-            if (resp::parse_message_views(one, args, MAX_RESP_ARGS, argc, consumed)
-                    == resp::parse_result::ok
-                && argc > 0)
-            {
-                process_resp_command_local(conn, args, argc);
-            }
-            else
-            {
-                resp::encode_error_into(conn->response_buf, "protocol error");
-            }
-        }
-        else if (!one.empty())
-        {
-            process_command_local(conn, one);
-        }
-
-        shard_frame_append(out, conn->response_buf);
+        // The same call the routing side makes for a part it owns itself, so a
+        // key served here and the same key served there cannot diverge.
+        run_local_raw(conn, one, resp, produced);
+        shard_frame_append(out, produced);
     }
 
     conn->response_buf.clear();
     return true;
+}
+
+// The sharded scan cursor takes the top six bits of the store's cursor.  They
+// are free only while the store's map index fits in the two bits below them.
+static_assert(cache_scan_shard_shift == 64 - 6,
+              "the sharded scan cursor assumes six shard bits");
+static_assert(cache_store::scan_last_map <= 3,
+              "cache_store::scan() now walks more than four maps, so its map "
+              "index no longer fits below the six bits the sharded scan cursor "
+              "takes -- a cursor would silently name another shard");
+
+// Rebuild a RESP command from the arguments the parser produced.
+//
+// The same message: parse_message_views() made those views out of exactly these
+// bytes.  Building it here rather than carrying the original length down from
+// the parse loop keeps one fact about one message in one place.
+static void rebuild_resp(std::string& out, std::string_view* args, int argc)
+{
+    out.clear();
+    out.reserve(16 + static_cast<size_t>(argc) * 24);
+    out.push_back('*');
+    out.append(std::to_string(argc));
+    out.append("\r\n", 2);
+    for (int i = 0; i < argc; ++i)
+    {
+        out.push_back('$');
+        out.append(std::to_string(args[i].size()));
+        out.append("\r\n", 2);
+        out.append(args[i]);
+        out.append("\r\n", 2);
+    }
+}
+
+// Which shard a SCAN call resumes in, read off its cursor.
+//
+// A cursor this shard cannot make sense of — not a number, or naming a shard
+// that does not exist — is answered HERE rather than sent somewhere: the local
+// interpreter already has the words for an invalid cursor, and shard_scan()
+// below makes the same judgement so the two cannot disagree.
+uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
+{
+    const size_t sp = cursor_arg.find(' ');
+    const std::string_view tok =
+        (sp == std::string_view::npos) ? cursor_arg : cursor_arg.substr(0, sp);
+    if (tok.empty())
+        return m_shard_i;
+
+    uint64_t cur = 0;
+    const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), cur);
+    if (ec != std::errc{} || ptr != tok.data() + tok.size())
+        return m_shard_i;
+
+    const uint32_t sh = cache_scan_cursor_shard(cur);
+    return sh < m_shard_n ? sh : m_shard_i;
+}
+
+// One SCAN page out of this shard, and the cursor the caller resumes with.
+//
+// Unsharded this is m_store.scan() and nothing else — the shard field is zero,
+// the store cursor is the whole cursor, and the exhausted answer is 0, exactly
+// as before.  Sharded it is the sequential walk described in
+// shared/cache_shard_map.h: this shard to exhaustion, then the next shard's
+// opening cursor, then zero when the last one is done.
+bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
+                                size_t count, std::vector<std::string_view>& out,
+                                uint64_t& next)
+{
+    if (SOCKETLEY_LIKELY(m_shard_n <= 1))
+    {
+        next = m_store.scan(cursor, pattern, count, out);
+        return true;
+    }
+
+    const uint32_t sh = cache_scan_cursor_shard(cursor);
+    if (sh >= m_shard_n)
+        return false;           // a cursor from a shard set that is not this one
+
+    const uint64_t store_next =
+        m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out);
+
+    if (store_next != 0)
+        next = cache_scan_cursor_make(m_shard_i, store_next);
+    else if (m_shard_i + 1 < m_shard_n)
+        next = cache_scan_cursor_make(m_shard_i + 1, 0);   // on to the next slice
+    else
+        next = 0;               // every shard walked
+    return true;
+}
+
+// A single-key command built for the wire, in whichever protocol the caller is
+// speaking.  The sub-commands a multi-key command explodes into are built here
+// and nowhere else.
+static void build_text_cmd(std::string& out, std::string_view verb,
+                           std::string_view a, std::string_view b = {})
+{
+    out.clear();
+    out.append(verb);
+    out.push_back(' ');
+    out.append(a);
+    if (!b.empty() || verb == "set")
+    {
+        out.push_back(' ');
+        out.append(b);
+    }
+}
+
+static void build_resp_cmd(std::string& out, std::string_view verb,
+                           std::string_view a, const std::string_view* b = nullptr)
+{
+    const int argc = b ? 3 : 2;
+    out.clear();
+    out.push_back('*');
+    out.append(std::to_string(argc));
+    out.append("\r\n", 2);
+    const std::string_view parts[3] = { verb, a, b ? *b : std::string_view{} };
+    for (int i = 0; i < argc; ++i)
+    {
+        out.push_back('$');
+        out.append(std::to_string(parts[i].size()));
+        out.append("\r\n", 2);
+        out.append(parts[i]);
+        out.append("\r\n", 2);
+    }
+}
+
+// A ceiling on how many pieces one command may be exploded into.
+//
+// `partial` is capped at a megabyte, so `mget` with ten-byte keys can already
+// name a hundred thousand of them, and each piece costs a string here and a
+// framed command on the wire.  Beyond this the command is refused by name
+// rather than served slowly: a limit that says so is a better answer than a
+// limit discovered as memory.
+static constexpr size_t MAX_PARTS_PER_COMMAND = 65536;
+
+// mget / mset in the text protocol, exploded into one single-key command each.
+//
+// The splitting must match the interpreter's exactly — mget takes keys
+// separated by single spaces, mset takes key value pairs the same way, and a
+// text mset value therefore cannot contain a space.  Read off those two
+// handlers rather than assumed; see cache_shard_map.h on why the router and the
+// store must read a line the same way.
+bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
+                                        std::string_view args)
+{
+    std::vector<std::string_view> keys, vals;
+    std::string_view rest = args;
+
+    if (h == fnv1a("mget"))
+    {
+        while (!rest.empty())
+        {
+            const size_t sp = rest.find(' ');
+            const std::string_view k = (sp == std::string_view::npos) ? rest : rest.substr(0, sp);
+            if (!k.empty()) keys.push_back(k);
+            if (sp == std::string_view::npos) break;
+            rest = rest.substr(sp + 1);
+        }
+    }
+    else    // mset
+    {
+        while (!rest.empty())
+        {
+            const size_t sp1 = rest.find(' ');
+            if (sp1 == std::string_view::npos) break;
+            const std::string_view k = rest.substr(0, sp1);
+            rest = rest.substr(sp1 + 1);
+            const size_t sp2 = rest.find(' ');
+            const std::string_view v = (sp2 == std::string_view::npos) ? rest : rest.substr(0, sp2);
+            keys.push_back(k);
+            vals.push_back(v);
+            if (sp2 == std::string_view::npos) break;
+            rest = rest.substr(sp2 + 1);
+        }
+    }
+
+    if (keys.empty() || keys.size() > MAX_PARTS_PER_COMMAND)
+        return false;       // a usage error, or past the ceiling
+
+    const uint32_t slot = slot_open(conn, false, cache_merge_for(h),
+                                    static_cast<uint32_t>(keys.size()));
+    std::string raw;
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        if (h == fnv1a("mget")) build_text_cmd(raw, "get", keys[i]);
+        else                    build_text_cmd(raw, "set", keys[i], vals[i]);
+        route_part(conn, cache_shard_of(keys[i], m_shard_n), slot,
+                   static_cast<uint32_t>(i), raw, false);
+    }
+    return true;
+}
+
+// mget / mset / multi-key del in RESP, the same way.
+bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
+                                        std::string_view* args, int argc)
+{
+    const bool is_mset = (h == fnv1a("mset"));
+    const size_t n = is_mset ? static_cast<size_t>((argc - 1) / 2)
+                             : static_cast<size_t>(argc - 1);
+
+    if (n == 0 || n > MAX_PARTS_PER_COMMAND)
+        return false;
+    if (is_mset && ((argc - 1) % 2 != 0))
+        return false;       // the interpreter's own arity refusal
+
+    const uint32_t slot = slot_open(conn, true, cache_merge_for(h),
+                                    static_cast<uint32_t>(n));
+    std::string raw;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const std::string_view key = is_mset ? args[1 + i * 2] : args[1 + i];
+        if (is_mset)
+        {
+            const std::string_view val = args[2 + i * 2];
+            build_resp_cmd(raw, "SET", key, &val);
+        }
+        else if (h == fnv1a("mget"))
+        {
+            build_resp_cmd(raw, "GET", key);
+        }
+        else    // del
+        {
+            build_resp_cmd(raw, "DEL", key);
+        }
+        route_part(conn, cache_shard_of(key, m_shard_n), slot,
+                   static_cast<uint32_t>(i), raw, true);
+    }
+    return true;
+}
+
+// A keyspace-wide command: the same command to every shard, merged.
+//
+// One part per shard, and the part this shard owns is executed in place, so a
+// four-shard `dbsize` is three crossings and one local call — and if several
+// arrive in one pipeline they still share those three crossings.
+void cache_instance::fan_keyspace(client_connection* conn, uint32_t h,
+                                  std::string_view raw, bool resp)
+{
+    const uint32_t slot = slot_open(conn, resp, cache_merge_for(h), m_shard_n);
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+        route_part(conn, sh, slot, sh, raw, resp);
 }
 
 // The one place the text interpreter asks who owns a key.
@@ -2578,7 +3032,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         });
                         return;
                     }
-                    route_to_owner(conn, owner, line, false);
+                    const uint32_t slot =
+                        slot_open(conn, false, cache_merge::single, 1);
+                    route_part(conn, owner, slot, 0, line, false);
                     return;
                 }
             }
@@ -2586,12 +3042,77 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
 
         case cache_cmd_class::multi_key:
+        {
+            // A crossing needs somebody to keep waiting; the scratch connection
+            // serve_payload() answers another runtime on cannot.  Same gate as
+            // the single-key case, same reason.
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "names keys several shards own, and this path "
+                                  "cannot wait for them");
+                });
+                return;
+            }
+            if (explode_text_multi(conn, h, parts.args))
+                return;
+            // Could not be split: a usage error or past the ceiling, and the
+            // interpreter's own answer to it is the right one.
+            break;
+        }
+
         case cache_cmd_class::keyspace:
+        {
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "reads every shard's slice, and this path "
+                                  "cannot wait for them");
+                });
+                return;
+            }
+            fan_keyspace(conn, h, line, false);
+            return;
+        }
+
+        case cache_cmd_class::cursor_scan:
+        {
+            // The cursor names the shard.  One crossing per call, and the
+            // owning shard re-packs the cursor it hands back — see the SCAN
+            // note in cache_shard_map.h.
+            const uint32_t owner = scan_cursor_owner(parts.args);
+            if (owner == m_shard_i)
+                break;
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "resumes in another shard, and this path "
+                                  "cannot wait for it");
+                });
+                return;
+            }
+            const uint32_t slot = slot_open(conn, false, cache_merge::single, 1);
+            route_part(conn, owner, slot, 0, line, false);
+            return;
+        }
+
+        case cache_cmd_class::persistence:
+            run_in_reply_order(conn, [&] {
+                emit_unrouted(conn, parts.cmd, false,
+                              "writes or reads this cache's dump file, and N "
+                              "shards hold N slices of the keyspace -- routing "
+                              "it would have them all write one path");
+            });
+            return;
+
         case cache_cmd_class::stateful:
             run_in_reply_order(conn, [&] {
                 emit_unrouted(conn, parts.cmd, false,
-                              "spans every shard of this cache and is not "
-                              "routed yet");
+                              "attaches a stream to one shard, which would "
+                              "carry a fraction of this cache's writes");
             });
             return;
 
@@ -3607,7 +4128,12 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 }
             }
             std::vector<std::string_view> scan_keys;
-            uint64_t next_cursor = m_store.scan(scan_cursor, scan_pattern, scan_count, scan_keys);
+            uint64_t next_cursor = 0;
+            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor))
+            {
+                rb.append("error: invalid cursor\n", 22);
+                return;
+            }
             append_int_nl(rb, static_cast<int64_t>(next_cursor));
             for (auto& k : scan_keys) { rb.append(k); rb.push_back('\n'); }
             rb.append("end\n", 4);
@@ -4261,19 +4787,10 @@ void cache_instance::process_resp_command(client_connection* conn,
                     // is a second fact about one message for the two to
                     // disagree about.
                     std::string raw;
-                    raw.reserve(16 + static_cast<size_t>(argc) * 24);
-                    raw.push_back('*');
-                    raw.append(std::to_string(argc));
-                    raw.append("\r\n", 2);
-                    for (int i = 0; i < argc; ++i)
-                    {
-                        raw.push_back('$');
-                        raw.append(std::to_string(args[i].size()));
-                        raw.append("\r\n", 2);
-                        raw.append(args[i]);
-                        raw.append("\r\n", 2);
-                    }
-                    route_to_owner(conn, owner, raw, true);
+                    rebuild_resp(raw, args, argc);
+                    const uint32_t slot =
+                        slot_open(conn, true, cache_merge::single, 1);
+                    route_part(conn, owner, slot, 0, raw, true);
                     return;
                 }
             }
@@ -4281,12 +4798,65 @@ void cache_instance::process_resp_command(client_connection* conn,
         }
 
         case cache_cmd_class::multi_key:
+        {
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, args[0], true,
+                                  "names keys several shards own, and this path "
+                                  "cannot wait for them");
+                });
+                return;
+            }
+            if (explode_resp_multi(conn, h, args, argc))
+                return;
+            break;
+        }
+
         case cache_cmd_class::keyspace:
+        {
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, args[0], true,
+                                  "reads every shard's slice, and this path "
+                                  "cannot wait for them");
+                });
+                return;
+            }
+            std::string raw;
+            rebuild_resp(raw, args, argc);
+            fan_keyspace(conn, h, raw, true);
+            return;
+        }
+
+        case cache_cmd_class::cursor_scan:
+        {
+            const uint32_t owner =
+                scan_cursor_owner(argc >= 2 ? args[1] : std::string_view{});
+            if (owner == m_shard_i)
+                break;
+            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, args[0], true,
+                                  "resumes in another shard, and this path "
+                                  "cannot wait for it");
+                });
+                return;
+            }
+            std::string raw;
+            rebuild_resp(raw, args, argc);
+            const uint32_t slot = slot_open(conn, true, cache_merge::single, 1);
+            route_part(conn, owner, slot, 0, raw, true);
+            return;
+        }
+
+        case cache_cmd_class::persistence:
         case cache_cmd_class::stateful:
             run_in_reply_order(conn, [&] {
                 emit_unrouted(conn, args[0], true,
-                              "spans every shard of this cache and is not "
-                              "routed yet");
+                              "is not routed across the shards of this cache");
             });
             return;
 
@@ -5181,7 +5751,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 }
             }
             std::vector<std::string_view> scan_keys;
-            uint64_t next_cursor = m_store.scan(scan_cursor, scan_pattern, scan_count, scan_keys);
+            uint64_t next_cursor = 0;
+            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor))
+            {
+                resp::encode_error_into(rb, "ERR invalid cursor");
+                return;
+            }
             // RESP: *2\r\n + bulk(next_cursor_str) + array(keys)
             rb.append("*2\r\n");
             char cur_buf[24];
