@@ -114,11 +114,122 @@ echo "=== Integration: a close-mode client must not cost a backend connection ==
 # cannot resolve is refused by the pool for that reason instead and the test
 # would then be measuring the wrong refusal.
 cat > "$TMPDIR_T/backend.py" <<'PYEOF'
-import socket, sys, threading
+import os, socket, sys, threading, time
 
 port = int(sys.argv[1])
 mode = sys.argv[2]              # "keepalive" | "close"
 countfile = sys.argv[3]
+acceptlog = sys.argv[4]
+
+# ─── WHY EVERY ACCEPT IDENTIFIES ITSELF ─────────────────────────────────────
+#
+# The assertion below is KA_NOW - KA_BASE, both read from this backend's own
+# counter, so it counts CONNECTIONS TO A PORT and not answers attributable to
+# this test.  Anything on this machine that dials this port inflates it, and on
+# 2026-08-21 it read 7 for 6 requests -- one more connection than there were
+# requests, which the proxy cannot produce by failing to pool and which no rerun
+# reproduced (80 attempts, 40 of them against 12 busy loops, zero failures).
+#
+# A count cannot answer that question, so it is not the only thing recorded.
+# Each accept writes its peer port and the time it arrived, and a thread off the
+# accept path resolves that peer port to the process holding it -- /proc/net/tcp
+# for the socket inode, then /proc/<pid>/fd for the owner.  The next occurrence
+# therefore says whether the extra connection came from the daemon (a retry or a
+# speculative open, and a real defect) or from something else on the box (this
+# assertion is contamination-sensitive by construction, and the test is what
+# needs fixing).
+#
+# Off the accept path deliberately: the client spaces its requests 50 ms apart
+# and the pool detach is asynchronous, so delaying an accept by a /proc scan
+# would change the very timing the rare event lives in.
+
+
+def log(line):
+    try:
+        with open(acceptlog, "a") as f:
+            f.write(line + "\n")
+            f.flush()
+    except OSError:
+        pass
+
+
+def peer_inode(peer_port, my_port):
+    """The socket inode of the far end of an accepted connection.
+
+    Looked up from the PEER's point of view: its local port is peer_port and
+    its remote port is ours.  Returns (inode, tcp_state) or (None, None) when
+    the entry is already gone, which is itself an answer -- a peer that has
+    vanished by the time this runs did not behave like a proxy holding a
+    backend socket."""
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                f.readline()
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    try:
+                        lp = int(parts[1].rsplit(":", 1)[1], 16)
+                        rp = int(parts[2].rsplit(":", 1)[1], 16)
+                    except (IndexError, ValueError):
+                        continue
+                    if lp == peer_port and rp == my_port:
+                        return parts[9], parts[3]
+        except OSError:
+            continue
+    return None, None
+
+
+def inode_owner(inode):
+    """The pid holding that socket inode, with enough of its identity to name
+    it.  A miss is reported as a miss rather than guessed at."""
+    target = "socket:[%s]" % inode
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        fddir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue                      # exited, or not ours to look at
+        for fd in fds:
+            try:
+                if os.readlink("%s/%s" % (fddir, fd)) != target:
+                    continue
+            except OSError:
+                continue
+            def read(rel, sep=None):
+                try:
+                    with open("/proc/%s/%s" % (pid, rel), "rb") as f:
+                        raw = f.read()
+                except OSError:
+                    return "?"
+                if sep is not None:
+                    raw = raw.replace(sep, b" ")
+                return raw.decode("latin1", "replace").strip()
+            try:
+                exe = os.readlink("/proc/%s/exe" % pid)
+            except OSError:
+                exe = "?"
+            return pid, read("comm"), exe, read("cmdline", b"\0")
+    return None, None, None, None
+
+
+def identify(ordinal, peer_port):
+    inode, state = peer_inode(peer_port, port)
+    if inode is None:
+        log("OWNER %d peer=%d UNRESOLVED no-/proc/net/tcp-entry "
+            "(the peer socket was already gone)" % (ordinal, peer_port))
+        return
+    pid, comm, exe, cmdline = inode_owner(inode)
+    if pid is None:
+        log("OWNER %d peer=%d inode=%s state=%s UNRESOLVED "
+            "no-process-holds-this-inode" % (ordinal, peer_port, inode, state))
+        return
+    log("OWNER %d peer=%d inode=%s state=%s pid=%s comm=%s exe=%s cmdline=%s"
+        % (ordinal, peer_port, inode, state, pid, comm, exe, cmdline))
+
 
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -162,7 +273,7 @@ def handle(c, ordinal):
 
 while True:
     try:
-        conn, _ = srv.accept()
+        conn, peer = srv.accept()
     except OSError:
         break
     with lock:
@@ -174,15 +285,30 @@ while True:
         with open(countfile, "w") as f:
             f.write("%d\n" % accepted)
             f.flush()
+    peer_port = peer[1] if isinstance(peer, tuple) and len(peer) > 1 else -1
+    # Written before the lookup and before the handler, so the ordering and the
+    # arrival time survive even if the peer disappears or the lookup throws.
+    log("ACCEPT %d t=%.6f peer=%s:%d" % (n, time.time(), peer[0], peer_port))
+    threading.Thread(target=identify, args=(n, peer_port), daemon=True).start()
     threading.Thread(target=handle, args=(conn, n), daemon=True).start()
 PYEOF
 
+ACCLOG_KA="$TMPDIR_T/acceptlog.ka"
+ACCLOG_CL="$TMPDIR_T/acceptlog.cl"
+: >"$ACCLOG_KA"
+: >"$ACCLOG_CL"
+
 python3 "$TMPDIR_T/backend.py" "$BE_PORT"  keepalive "$TMPDIR_T/accepts.ka" \
-    >"$TMPDIR_T/backend.log" 2>&1 &
+    "$ACCLOG_KA" >"$TMPDIR_T/backend.log" 2>&1 &
 BEPID=$!
 python3 "$TMPDIR_T/backend.py" "$BEC_PORT" close     "$TMPDIR_T/accepts.cl" \
-    >"$TMPDIR_T/backend_ctl.log" 2>&1 &
+    "$ACCLOG_CL" >"$TMPDIR_T/backend_ctl.log" 2>&1 &
 BECPID=$!
+
+# The accept log is a timeline and an accept alone does not say where in the run
+# it landed, so the phases mark themselves in it.  A stray connection is then
+# placed without having to reason backwards from a bare timestamp.
+mark() { printf 'MARK %s t=%s\n' "$1" "$(date +%s.%N)" >>"$ACCLOG_KA"; }
 
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
@@ -256,6 +382,7 @@ fi
 read_count() { tr -dc '0-9' <"$1" 2>/dev/null || true; }
 KA_BASE=$(read_count "$TMPDIR_T/accepts.ka"); KA_BASE=${KA_BASE:-0}
 CL_BASE=$(read_count "$TMPDIR_T/accepts.cl"); CL_BASE=${CL_BASE:-0}
+mark "BASELINE ka_base=$KA_BASE cl_base=$CL_BASE daemon_pid=$DPID"
 
 # ─── The client ─────────────────────────────────────────────────────────────
 #
@@ -343,7 +470,9 @@ for i in range(1, count + 1):
         print("RESP %d WRONG-BODY want=%r got=%r" % (i, marker, got_marker[:60]))
         s.close()
         break
-    print("RESP %d OK %s" % (i, ordinal))
+    # The timestamp is appended, not inserted: the assertions below grep this
+    # line with a ^-anchored pattern that ends at the ordinal.
+    print("RESP %d OK %s t=%.6f" % (i, ordinal, time.time()))
     ok += 1
     # The client asked the proxy to close, so the proxy must close.  A build
     # that pools the backend and then forgets the client would leave this
@@ -364,11 +493,15 @@ for i in range(1, count + 1):
 print("DONE %d/%d" % (ok, count))
 PYEOF
 
+mark "CLIENT-START"
 python3 "$TMPDIR_T/client.py" "$PX_PORT"  "$PX_NAME"  "$NREQ" >"$OUT"  2>&1 || true
+mark "CLIENT-DONE"
 python3 "$TMPDIR_T/client.py" "$PXC_PORT" "$PXC_NAME" "$NREQ" >"$OUTC" 2>&1 || true
+mark "CONTROL-DONE"
 
 # Give the last detach its completion before the counts are read.
 sleep 0.5
+mark "COUNTS-READ"
 
 KA_NOW=$(read_count "$TMPDIR_T/accepts.ka"); KA_NOW=${KA_NOW:-0}
 CL_NOW=$(read_count "$TMPDIR_T/accepts.cl"); CL_NOW=${CL_NOW:-0}
@@ -419,6 +552,21 @@ else
     FAIL=$((FAIL+1))
     echo "  FAIL [backend connections for $NREQ close-mode requests]: got $KA_NEW, want 0..2"
     echo "        a client's Connection: close is hop-by-hop and must not reach the backend leg"
+fi
+
+# Whenever this run opened a backend connection at all -- failing or not, since
+# the measured value on a healthy build is 0 and the ceiling of 2 is headroom --
+# the accept log is printed with the client's own timeline beside it.  On
+# 2026-08-21 this assertion read 7 for 6 requests and nothing recorded could say
+# where the seventh came from; it is a count of connections to a PORT, so a
+# dialler that has nothing to do with this test inflates it just as well as a
+# proxy that stopped pooling.  These lines name the peer and its owning process,
+# which separates those two.
+if [ "$KA_NEW" -gt 0 ]; then
+    echo "  NOTE: $KA_NEW backend connection(s) opened after the baseline; who dialled:"
+    sed -n "/MARK BASELINE/,\$p" "$ACCLOG_KA" 2>/dev/null | sed 's/^/        /' || true
+    echo "        client timeline:"
+    grep -E '^(RESP|EOF) ' "$OUT" 2>/dev/null | sed 's/^/        /' || true
 fi
 
 # The same fact read off the answers instead of off the backend's counter, so a
