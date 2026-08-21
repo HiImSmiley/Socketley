@@ -20,6 +20,7 @@
 #include "../shared/logging.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/state_persistence.h"
+#include "../shared/shard_target.h"
 #include "../shared/worker_protocol.h"
 
 namespace
@@ -1376,6 +1377,32 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
     {
         refuse(request_status::no_target);
         return;
+    }
+
+    // The same door, one notch finer.
+    //
+    // A shard-qualified target (`c#3`, see shared/shard_target.h) is how one
+    // shard of a runtime reaches another, and the check above cannot see it —
+    // `c#3` is not `c`.  A shard naming its OWN index would be posted into the
+    // daemon's channel, resolve to this very supervisor, and go straight back
+    // down the socket it came from, for ever.
+    //
+    // The router never produces its own index: cache_instance only crosses when
+    // the owner is somebody else.  This is the second lock on that door, the
+    // same arrangement on_worker_send_ref makes for a shard asking the daemon
+    // to deliver to itself, and for the same reason — a worker built by an
+    // older binary must not be able to start two processes handing one request
+    // back and forth.
+    {
+        std::string_view base;
+        uint32_t         idx = 0;
+        if (m_placeholder && parse_shard_target(q.target, base, idx)
+            && base == m_placeholder->get_name() && idx == m_shard_index)
+        {
+            LOG_WARN("a shard asked the daemon for its own slice; refused");
+            refuse(request_status::no_target);
+            return;
+        }
     }
 
     if (!m_channel ||

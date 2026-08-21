@@ -10,6 +10,7 @@
 #include "../../shared/logging.h"
 #include "../../shared/invariants.h"
 #include "../../cli/command_hashing.h"
+#include "../../shared/shard_target.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -24,6 +25,52 @@
 #include <sys/stat.h>
 #include <poll.h>
 
+// The header of a framed run of commands between two shards of one runtime.
+//
+// A control byte no command can begin with, then which interpreter the bytes
+// that follow are for.  It is deliberately NOT a general request payload: only
+// cache_instance writes one and only cache_instance reads one, and a payload
+// that does not begin with this is the ordinary `cache <cmd>` stream any other
+// runtime sends.
+static constexpr char shard_batch_marker = '\x01';
+static constexpr std::string_view shard_batch_text = "\x01skl-shard t\n";
+static constexpr std::string_view shard_batch_resp = "\x01skl-shard r\n";
+
+// `<len>\n<bytes>`, the framing both directions use.  Length-prefixed rather
+// than newline-delimited because RESP commands contain newlines and a text
+// value may as well.
+static void shard_frame_append(std::string& out, std::string_view bytes)
+{
+    out.append(std::to_string(bytes.size()));
+    out.push_back('\n');
+    out.append(bytes);
+}
+
+// Take one frame off the front.  False leaves `p` where it was, which is what
+// makes a truncated or foreign reply detectable rather than half-consumed.
+static bool shard_frame_take(const char*& p, const char* end, std::string_view& out)
+{
+    const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+    if (!nl || nl == p)
+        return false;
+
+    size_t len = 0;
+    for (const char* d = p; d < nl; ++d)
+    {
+        if (*d < '0' || *d > '9')
+            return false;
+        len = len * 10 + static_cast<size_t>(*d - '0');
+        if (len > (32u << 20))          // nothing this side ever frames is larger
+            return false;
+    }
+    if (static_cast<size_t>(end - (nl + 1)) < len)
+        return false;
+
+    out = std::string_view(nl + 1, len);
+    p   = nl + 1 + len;
+    return true;
+}
+
 cache_instance::cache_instance(std::string_view name)
     : runtime_instance(runtime_cache, name), m_listen_fd(-1), m_loop(nullptr)
 {
@@ -37,7 +84,14 @@ cache_instance::~cache_instance()
     // test, or one whose removal raced a rebuild — where a stale entry would be
     // a pointer into this object after it is freed.
     if (auto* mgr = get_runtime_manager())
+    {
         mgr->requests().drop_sink(this);
+        // And the other direction, for the same reason and on the same path a
+        // server takes: a cache that routes is an ORIGIN as well as a sink, and
+        // an origin the channel still holds is a pointer into this object after
+        // it is freed.
+        mgr->requests().drop_origin(this);
+    }
 
     close_tracked(m_listen_fd);
 }
@@ -201,6 +255,12 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
 void cache_instance::close_client([[maybe_unused]] client_connection* conn, int fd,
                                   [[maybe_unused]] const char* reason)
 {
+    // A crossing this socket was waiting on has nowhere to land now.  Dropped
+    // here — the one function every close on this runtime goes through — rather
+    // than at each of them, so a path added later cannot forget it.
+    if (conn)
+        batch_drop(conn);
+
     m_store.unsubscribe_all(fd);
     // A follower registered on this descriptor has to go with it.  It holds no
     // reference of its own — the socket is this client's — so leaving it behind
@@ -281,6 +341,36 @@ bool cache_instance::setup(event_loop& loop)
     // Kept across teardown: a descriptor closed after a stop still has to be
     // checked against the ring, and m_loop is null exactly then.
     m_retired_loop = &loop;
+
+    // ── This shard's slice of the keyspace ──────────────────────────────────
+    //
+    // Read once, here, because get_shards() is not inline and the question is
+    // asked per command.  1 and 0 are the unsharded answers, which is what
+    // makes every routing check below a single compare against a member.
+    m_shard_n = get_shards();
+    m_shard_i = get_shard_index();
+    if (m_shard_i >= m_shard_n)
+        m_shard_i = 0;
+
+    m_route_payload.assign(m_shard_n, std::string{});
+    m_route_slots.assign(m_shard_n, std::vector<size_t>{});
+
+    // ── The one configuration that would lose data quietly ──────────────────
+    //
+    // `--persistent` writes a dump at teardown and reads it at setup.  N shards
+    // would write N dumps to ONE path, each holding a different slice, and the
+    // last one to run would be the whole of what the next start loaded — the
+    // rest of the keyspace gone, with nothing reporting it.  Redistributing a
+    // dump across a shard count that has changed is its own step with its own
+    // tests; until it exists this combination is refused rather than served.
+    if (m_shard_n > 1 && !m_persistent_path.empty())
+    {
+        LOG_ERROR("cache: --persistent and --shards are not compatible yet: N "
+                  "shards hold N slices of the keyspace and would write them all "
+                  "to one file, so the next start would load one shard's share "
+                  "and report nothing about the rest");
+        return false;
+    }
 
     // ── TLS listener ────────────────────────────────────────────────────────
     //
@@ -750,6 +840,20 @@ void cache_instance::teardown(event_loop& /*loop*/)
             retire(std::shared_ptr<void>(std::move(m_accept_backoff_timer)), owed, 1);
         }
     }
+
+    // ── Nothing may be told about a crossing after this ─────────────────────
+    //
+    // Symmetrical with the sink registration the manager withdraws: an origin
+    // is a bare pointer in the channel, and a runtime can be stopped without
+    // ever being destroyed.  The batches go with it — every connection that was
+    // waiting on one has just been pooled above, so there is nobody left to
+    // deliver to.
+    if (auto* mgr = get_runtime_manager())
+        mgr->requests().drop_origin(this);
+    m_batches.clear();
+    m_posts.clear();
+    m_collect.reset();
+    m_collect_fd = -1;
 
     m_ttl_timer_armed = false;
     m_loop = nullptr;
@@ -1435,6 +1539,86 @@ bool cache_instance::tls_flush(client_connection* conn)
     return true;
 }
 
+// The text line splitter, out of handle_read so that a connection whose
+// crossing has just come back is driven by the same code the read handler uses.
+// Two drivers for one parser is how the second one stops matching the first.
+void cache_instance::parse_text_lines(client_connection* conn)
+{
+    size_t scan_from = 0;
+    size_t pos;
+    while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
+    {
+        // A run of routed commands is cut here rather than in the router,
+        // because this is the loop that decides what has been CONSUMED.  What
+        // is left stays in `partial` and runs on the turn after this crossing
+        // lands: nothing is lost and nothing is reordered.
+        if (SOCKETLEY_UNLIKELY(m_collect
+                               && m_collect->slots.size() >= MAX_ROUTED_PER_BATCH))
+            break;
+
+        std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
+
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+
+        SKL_TRACE_ADD(conn, commands_parsed, 1);
+        const size_t rb_before = conn->response_buf.size();
+        process_command(conn, line);
+        if (conn->response_buf.size() != rb_before)
+            SKL_TRACE_ADD(conn, responses_made, 1);
+
+        scan_from = pos + 1;
+
+        // REPLICATE takes effect on the line that carried it, so the rest of
+        // the batch is already follower input.  Answering it would put a
+        // second writer on the socket the dump is going out on.
+        if (SOCKETLEY_UNLIKELY(conn->is_follower))
+            break;
+    }
+
+    if (scan_from > 0)
+    {
+        if (scan_from >= conn->partial.size())
+            conn->partial.clear();
+        else
+            conn->partial.erase(0, scan_from);
+    }
+
+    // Whatever was pipelined behind REPLICATE is refused, not executed.
+    if (SOCKETLEY_UNLIKELY(conn->is_follower && !conn->partial.empty()))
+        refuse_follower_input(conn);
+}
+
+// Everything a connection's buffered bytes turn into: commands run here,
+// commands sent to the shard that owns their key, and replies queued for the
+// wire.
+//
+// The one thing it will not do is start a second crossing for a connection that
+// is already waiting on one.  That is the ordering rule, and it is here rather
+// than at each of the two dispatches because it is a property of the SOCKET,
+// not of a command: replies go back down one pipe, in the order the questions
+// came up it.
+void cache_instance::pump(client_connection* conn)
+{
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+        return;
+    if (SOCKETLEY_UNLIKELY(conn->batch_id != 0))
+        return;
+
+    if (SOCKETLEY_UNLIKELY(conn->is_follower))
+    {
+        refuse_follower_input(conn);
+        return;
+    }
+
+    if (conn->resp_mode)
+        process_resp(conn);
+    else
+        parse_text_lines(conn);
+
+    route_flush(conn);
+}
+
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -1510,7 +1694,26 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // reading out of write_batch[0] — which the struct's reset() clears the
         // moment it is handed to the next connection.
         m_store.unsubscribe_all(fd);
-        if (conn->write_pending || conn->zc_notif_pending)
+
+        // Asked FIRST, and the order is the whole of the fix.
+        //
+        // A crossing owed to this socket outranks a write in flight, because
+        // `closing` is not "tear down when the ring is finished" for these
+        // bytes — flush_responses() drops the buffer of a closing connection,
+        // so the reply that is still coming would never be written at all.
+        // With the two tests the other way round the hold applied only to a
+        // connection that happened to have no write outstanding: measured, one
+        // run in five of a twelve-command pipeline came back with the first
+        // reply alone.
+        if (conn->batch_id != 0)
+        {
+            // Held, not closed.  Another shard of this runtime owes this
+            // socket an answer, and the client half-closing the moment it
+            // finished asking is what a request/response client does — see
+            // client_connection::peer_gone.
+            conn->peer_gone = true;
+        }
+        else if (conn->write_pending || conn->zc_notif_pending)
         {
             conn->closing = true;
         }
@@ -1584,52 +1787,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // socket carries the replication stream and this runtime is its only writer.
     // Parsing what arrives on it would produce replies with nowhere to go —
     // handle_replicate_request() has the rule and the reasoning.
-    if (SOCKETLEY_UNLIKELY(conn->is_follower))
-    {
-        refuse_follower_input(conn);
-    }
-    else if (conn->resp_mode)
-    {
-        process_resp(conn);
-    }
-    else
-    {
-        size_t scan_from = 0;
-        size_t pos;
-        while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
-        {
-            std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
-
-            if (!line.empty() && line.back() == '\r')
-                line.remove_suffix(1);
-
-            SKL_TRACE_ADD(conn, commands_parsed, 1);
-            const size_t rb_before = conn->response_buf.size();
-            process_command(conn, line);
-            if (conn->response_buf.size() != rb_before)
-                SKL_TRACE_ADD(conn, responses_made, 1);
-
-            scan_from = pos + 1;
-
-            // REPLICATE takes effect on the line that carried it, so the rest of
-            // the batch is already follower input.  Answering it would put a
-            // second writer on the socket the dump is going out on.
-            if (SOCKETLEY_UNLIKELY(conn->is_follower))
-                break;
-        }
-
-        if (scan_from > 0)
-        {
-            if (scan_from >= conn->partial.size())
-                conn->partial.clear();
-            else
-                conn->partial.erase(0, scan_from);
-        }
-
-        // Whatever was pipelined behind REPLICATE is refused, not executed.
-        if (SOCKETLEY_UNLIKELY(conn->is_follower && !conn->partial.empty()))
-            refuse_follower_input(conn);
-    }
+    pump(conn);
 
     // Flush accumulated responses as single write
     if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
@@ -1933,6 +2091,24 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
         return;
     }
 
+    // A run of commands from a SIBLING SHARD of this runtime, framed so the
+    // replies can be taken apart again.  Recognised before anything else parses
+    // it: the payload is not a command stream and reading it as one would run
+    // the marker line as a command.  See the routing note in cache_instance.h.
+    if (SOCKETLEY_UNLIKELY(split && !payload.empty()
+                           && payload.front() == shard_batch_marker))
+    {
+        struct batch_guard
+        {
+            bool& flag;
+            ~batch_guard() { flag = false; }
+        } bguard{m_serving};
+        m_serving = true;
+
+        if (serve_shard_batch(payload, out))
+            return;
+    }
+
     if (!m_request_conn)
         m_request_conn = std::make_unique<client_connection>();
 
@@ -2000,7 +2176,435 @@ static inline void append_int_nl(std::string& buf, int64_t v)
     buf.push_back('\n');
 }
 
+// ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────────
+//
+// The mechanism, in one sentence: a shard owns the keys whose hash falls to it,
+// so a command naming somebody else's key is framed, grouped with every other
+// command in the same pipeline bound for the same shard, and answered by the
+// process that holds it.
+//
+// Everything below is unreachable on an unsharded cache — m_shard_n is 1 and
+// every entry point compares against it first — which is what keeps the cost of
+// this on the runtime that does not use it at exactly one predicted branch.
+
+void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd,
+                                   bool resp, std::string_view why)
+{
+    // Named rather than swallowed, and named per command rather than per
+    // connection: a client that pipelines `get k` and `mget a b` gets an answer
+    // to the first and a refusal to the second, in that order, which is the
+    // only shape a pipelined client can read.
+    if (resp)
+    {
+        std::string text;
+        text.reserve(4 + cmd.size() + why.size());
+        text.append(cmd);
+        text.push_back(' ');
+        text.append(why);
+        resp::encode_error_into(conn->response_buf, text);
+    }
+    else
+    {
+        conn->response_buf.append("error: ");
+        conn->response_buf.append(cmd);
+        conn->response_buf.push_back(' ');
+        conn->response_buf.append(why);
+        conn->response_buf.push_back('\n');
+    }
+}
+
+void cache_instance::route_to_owner(client_connection* conn, uint32_t owner,
+                                    std::string_view raw, bool resp)
+{
+    if (!m_collect)
+    {
+        m_collect = std::make_unique<shard_batch>();
+        m_collect->fd   = conn->fd;
+        m_collect->resp = resp;
+        m_collect_fd    = conn->fd;
+    }
+
+    const size_t idx = m_collect->slots.size();
+    m_collect->slots.emplace_back();
+    m_collect->filled.push_back(0);
+
+    std::string& pay = m_route_payload[owner];
+    if (pay.empty())
+        pay.append(resp ? shard_batch_resp : shard_batch_text);
+    shard_frame_append(pay, raw);
+    m_route_slots[owner].push_back(idx);
+}
+
+void cache_instance::route_flush(client_connection* conn)
+{
+    if (SOCKETLEY_LIKELY(!m_collect))
+        return;
+
+    // A connection that has given up on the answer is not worth crossing for.
+    // The slots go with it; nothing else has a reference to them.
+    if (conn->closing)
+    {
+        for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+        {
+            m_route_payload[sh].clear();
+            m_route_slots[sh].clear();
+        }
+        m_collect.reset();
+        m_collect_fd = -1;
+        return;
+    }
+
+    auto  batch = std::move(m_collect);
+    auto* mgr   = get_runtime_manager();
+    m_collect.reset();
+    const int collected_for = m_collect_fd;
+    m_collect_fd = -1;
+
+    // The batch being collected belongs to the connection being parsed, and one
+    // connection is parsed at a time.  Checked rather than assumed, because the
+    // cost of it not holding is a reply written down somebody else's socket —
+    // and because a future caller of pump() that does not know this is the way
+    // it stops holding.
+    if (SOCKETLEY_UNLIKELY(collected_for != conn->fd))
+    {
+        LOG_WARN("cache: a routed batch was collected for another connection; "
+                 "dropped rather than answered to the wrong socket");
+        for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+        {
+            m_route_payload[sh].clear();
+            m_route_slots[sh].clear();
+        }
+        return;
+    }
+
+    const uint64_t id = m_next_batch++;
+
+    // Posted first, counted first.  A crossing whose post is refused is filled
+    // in on the spot — the alternative is a batch permanently one answer short
+    // of complete, which is a client waiting for ever on a socket nothing will
+    // ever write to.
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+    {
+        if (m_route_payload[sh].empty())
+            continue;
+
+        bool taken = false;
+        if (mgr)
+        {
+            const uint64_t cookie = m_next_cookie++;
+            m_posts[cookie] = posted_group{id, m_route_slots[sh]};
+            taken = mgr->requests().post(
+                        this, cookie, shard_target(get_name(), sh),
+                        m_route_payload[sh], request_class::client);
+            if (taken)
+                ++batch->outstanding;
+            else
+                m_posts.erase(cookie);
+        }
+
+        if (!taken)
+            batch_fill_error(*batch, m_route_slots[sh],
+                             "the shard that owns this key could not be reached");
+
+        m_route_payload[sh].clear();
+        m_route_slots[sh].clear();
+    }
+
+    if (batch->outstanding == 0)
+    {
+        // Nothing crossed, so nothing is owed and the connection never waits.
+        for (auto& sl : batch->slots)
+            conn->response_buf.append(sl);
+        return;
+    }
+
+    conn->batch_id = id;
+    m_batches.emplace(id, std::move(*batch));
+}
+
+void cache_instance::batch_fill_error(shard_batch& b,
+                                      const std::vector<size_t>& slots,
+                                      std::string_view why)
+{
+    for (const size_t idx : slots)
+    {
+        if (idx >= b.slots.size() || b.filled[idx])
+            continue;
+        if (b.resp)
+        {
+            b.slots[idx].clear();
+            resp::encode_error_into(b.slots[idx], why);
+        }
+        else
+        {
+            b.slots[idx].assign("error: ");
+            b.slots[idx].append(why);
+            b.slots[idx].push_back('\n');
+        }
+        b.filled[idx] = 1;
+    }
+}
+
+void cache_instance::batch_drop(client_connection* conn)
+{
+    if (conn->batch_id == 0)
+        return;
+    m_batches.erase(conn->batch_id);
+    conn->batch_id = 0;
+    // The posts are left where they are.  Each one resolves through the batch,
+    // so a reply that arrives for a batch that has gone finds nothing and is
+    // dropped — the same arrangement the channel makes for a stale origin, and
+    // for the same reason: a cookie is the only thing that survives being
+    // stale.
+}
+
+void cache_instance::batch_finish(uint64_t id)
+{
+    const auto it = m_batches.find(id);
+    if (it == m_batches.end())
+        return;
+
+    const int fd = it->second.fd;
+    client_connection* conn =
+        (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+
+    // Both halves are load-bearing.  The descriptor may already belong to a
+    // client that never asked anything, and that client would have a batch_id
+    // of its own or none — either way not this one.
+    if (!conn || conn->batch_id != id)
+    {
+        m_batches.erase(it);
+        return;
+    }
+
+    for (auto& sl : it->second.slots)
+        conn->response_buf.append(sl);
+
+    m_batches.erase(it);
+    conn->batch_id = 0;
+
+    // Whatever the client pipelined behind the crossing has been sitting in
+    // `partial` since; it runs now, and may open a crossing of its own.  A peer
+    // that has gone is no reason to skip it: the commands arrived before the
+    // FIN did and are owed answers exactly as much as this one was.
+    if (!conn->closing)
+        pump(conn);
+
+    if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+        conn->closing = true;
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr) && !tls_flush(conn))
+        conn->closing = true;
+
+    // Another crossing opened by the pump above: the hold continues, and the
+    // reply that ends it will come back through here.
+    if (conn->batch_id != 0)
+        return;
+
+    // The debt is paid, so a held close can be taken.  After the flush, which
+    // is what puts the answer in the ring — the write completion is what
+    // actually tears the connection down.
+    if (conn->peer_gone)
+        conn->closing = true;
+
+    if (conn->closing && !conn->write_pending && !conn->zc_notif_pending
+        && !conn->read_pending)
+        close_client(conn, fd, "crossing-answered");
+}
+
+void cache_instance::on_request_reply(uint64_t cookie, request_status st,
+                                      std::string_view reply)
+{
+    const auto pit = m_posts.find(cookie);
+    if (pit == m_posts.end())
+        return;                       // already answered, or withdrawn
+
+    const posted_group grp = std::move(pit->second);
+    m_posts.erase(pit);
+
+    const auto bit = m_batches.find(grp.batch);
+    if (bit == m_batches.end())
+        return;                       // the connection went while this crossed
+
+    shard_batch& b = bit->second;
+
+    if (st != request_status::ok)
+    {
+        batch_fill_error(b, grp.slots, request_status_text(st));
+    }
+    else
+    {
+        // One frame per command, in the order they were given.  A reply with
+        // the wrong number of frames is a build on the other side that does not
+        // speak this framing; the slots it did not fill are answered rather
+        // than left, because a slot nobody fills is a client that never hears
+        // back.
+        const char* p   = reply.data();
+        const char* end = reply.data() + reply.size();
+        size_t      i   = 0;
+        for (; i < grp.slots.size(); ++i)
+        {
+            std::string_view one;
+            if (!shard_frame_take(p, end, one))
+                break;
+            const size_t idx = grp.slots[i];
+            if (idx < b.slots.size() && !b.filled[idx])
+            {
+                b.slots[idx].assign(one);
+                b.filled[idx] = 1;
+            }
+        }
+        if (i < grp.slots.size())
+        {
+            const std::vector<size_t> rest(grp.slots.begin() + static_cast<ptrdiff_t>(i),
+                                           grp.slots.end());
+            batch_fill_error(b, rest,
+                             "the shard that owns this key answered in a framing "
+                             "this build does not read");
+        }
+    }
+
+    if (b.outstanding > 0)
+        --b.outstanding;
+    if (b.outstanding == 0)
+        batch_finish(grp.batch);
+}
+
+// ─── the answering side ─────────────────────────────────────────────────────
+
+bool cache_instance::serve_shard_batch(std::string_view payload, std::string& out)
+{
+    bool resp;
+    if (payload.rfind(shard_batch_text, 0) == 0)
+        resp = false;
+    else if (payload.rfind(shard_batch_resp, 0) == 0)
+        resp = true;
+    else
+        return false;
+
+    if (!m_request_conn)
+        m_request_conn = std::make_unique<client_connection>();
+
+    auto* conn = m_request_conn.get();
+    conn->fd        = -1;
+    conn->rl_max    = 0;
+    conn->rl_tokens = 0.0;
+    conn->batch_id  = 0;
+    conn->response_buf.clear();
+
+    const char* p   = payload.data()
+                    + (resp ? shard_batch_resp.size() : shard_batch_text.size());
+    const char* end = payload.data() + payload.size();
+
+    std::string_view one;
+    while (shard_frame_take(p, end, one))
+    {
+        conn->response_buf.clear();
+
+        if (resp)
+        {
+            // Re-parsed rather than trusted: the bytes are a RESP array this
+            // side built out of the args the other side parsed, and running the
+            // parser again is what keeps one interpreter for both arrivals.
+            static constexpr int MAX_RESP_ARGS = 64;
+            std::string_view args[MAX_RESP_ARGS];
+            int    argc     = 0;
+            size_t consumed = 0;
+            if (resp::parse_message_views(one, args, MAX_RESP_ARGS, argc, consumed)
+                    == resp::parse_result::ok
+                && argc > 0)
+            {
+                process_resp_command_local(conn, args, argc);
+            }
+            else
+            {
+                resp::encode_error_into(conn->response_buf, "protocol error");
+            }
+        }
+        else if (!one.empty())
+        {
+            process_command_local(conn, one);
+        }
+
+        shard_frame_append(out, conn->response_buf);
+    }
+
+    conn->response_buf.clear();
+    return true;
+}
+
+// The one place the text interpreter asks who owns a key.
+//
+// Sixty-odd command handlers sit behind this switch and none of them knows a
+// shard exists.  That is the point: an invariant every handler has to remember
+// is one the next handler will not know about, and the handlers outnumber the
+// people reading them.
 void cache_instance::process_command(client_connection* conn, std::string_view line)
+{
+    if (SOCKETLEY_LIKELY(m_shard_n <= 1))
+    {
+        process_command_local(conn, line);
+        return;
+    }
+
+    const cache_text_parts parts = cache_split_text(line);
+    const uint32_t         h     = fnv1a_lower(parts.cmd);
+
+    switch (cache_classify_text(h))
+    {
+        case cache_cmd_class::single_key:
+        {
+            const std::string_view key = cache_text_key(h, parts.args);
+            // No key at all is a usage error, and "usage" is the same answer in
+            // every process — so it is answered here rather than crossing.
+            if (!key.empty())
+            {
+                const uint32_t owner = cache_shard_of(key, m_shard_n);
+                if (owner != m_shard_i)
+                {
+                    // A crossing needs somebody to keep waiting, and only a
+                    // socket can.  fd < 0 is the scratch connection
+                    // serve_payload() answers a request from ANOTHER runtime
+                    // on: that answer is filled in before serve_request()
+                    // returns, so there is no later turn for a reply to arrive
+                    // on.  Refused by name rather than served out of this
+                    // shard's slice — the wrong answer here is a miss for data
+                    // that was stored.
+                    if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+                    {
+                        run_in_reply_order(conn, [&] {
+                            emit_unrouted(conn, parts.cmd, false,
+                                          "names a key another shard owns, and "
+                                          "this path cannot wait for it");
+                        });
+                        return;
+                    }
+                    route_to_owner(conn, owner, line, false);
+                    return;
+                }
+            }
+            break;
+        }
+
+        case cache_cmd_class::multi_key:
+        case cache_cmd_class::keyspace:
+        case cache_cmd_class::stateful:
+            run_in_reply_order(conn, [&] {
+                emit_unrouted(conn, parts.cmd, false,
+                              "spans every shard of this cache and is not "
+                              "routed yet");
+            });
+            return;
+
+        case cache_cmd_class::fanout:
+        case cache_cmd_class::connection:
+        case cache_cmd_class::unknown:
+            break;      // answered by whoever holds the socket
+    }
+
+    run_in_reply_order(conn, [&] { process_command_local(conn, line); });
+}
+
+void cache_instance::process_command_local(client_connection* conn, std::string_view line)
 {
     if (SOCKETLEY_UNLIKELY(line.empty()))
         return;
@@ -2049,6 +2653,14 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         return {a.substr(0, sp), a.substr(sp + 1)};
     };
 
+    // ─── A COMMAND ADDED HERE MUST BE CLASSIFIED IN cache_shard_map.h ───────
+    //
+    // A hash this table does not name reads `unknown` and is served where it
+    // was asked.  That is right for a command that does not exist — "unknown
+    // command" is the same answer in every process — and WRONG for a real one,
+    // which would then be answered out of one shard's slice with nothing saying
+    // so.  All 54 handlers across this switch and the RESP one are classified
+    // today; the next one is the one at risk.
     switch (fnv1a_lower(cmd))
     {
         // ─── Strings ───
@@ -3546,6 +4158,12 @@ void cache_instance::process_resp(client_connection* conn)
 
     while (offset < conn->partial.size())
     {
+        // Same cut as parse_text_lines makes, for the same reason and in the
+        // same place: the loop that consumes is the loop that decides how much.
+        if (SOCKETLEY_UNLIKELY(m_collect
+                               && m_collect->slots.size() >= MAX_ROUTED_PER_BATCH))
+            break;
+
         std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
         auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
 
@@ -3598,7 +4216,90 @@ void cache_instance::process_resp(client_connection* conn)
     }
 }
 
-void cache_instance::process_resp_command(client_connection* conn, std::string_view* args, int argc)
+// The same question, asked once for the other interpreter.
+//
+// Two sites decide routing after this change and zero decided it before, which
+// is the count that matters: the alternative was the sixty-odd handlers behind
+// these two switches.
+void cache_instance::process_resp_command(client_connection* conn,
+                                          std::string_view* args, int argc)
+{
+    if (SOCKETLEY_LIKELY(m_shard_n <= 1) || argc <= 0)
+    {
+        process_resp_command_local(conn, args, argc);
+        return;
+    }
+
+    const uint32_t h = fnv1a_lower(args[0]);
+
+    switch (cache_classify_resp(h, argc))
+    {
+        case cache_cmd_class::single_key:
+        {
+            if (argc >= 2 && !args[1].empty())
+            {
+                const uint32_t owner = cache_shard_of(args[1], m_shard_n);
+                if (owner != m_shard_i)
+                {
+                    // The same gate the text router explains: a scratch
+                    // connection has no later turn for a reply to arrive on.
+                    if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+                    {
+                        run_in_reply_order(conn, [&] {
+                            emit_unrouted(conn, args[0], true,
+                                          "names a key another shard owns, and "
+                                          "this path cannot wait for it");
+                        });
+                        return;
+                    }
+
+                    // Rebuilt from the parsed arguments rather than forwarded as
+                    // the bytes that arrived.  The two are the same message —
+                    // parse_message_views() produced these views out of exactly
+                    // those bytes — and building it here means the router does
+                    // not have to be handed a length from the parse loop, which
+                    // is a second fact about one message for the two to
+                    // disagree about.
+                    std::string raw;
+                    raw.reserve(16 + static_cast<size_t>(argc) * 24);
+                    raw.push_back('*');
+                    raw.append(std::to_string(argc));
+                    raw.append("\r\n", 2);
+                    for (int i = 0; i < argc; ++i)
+                    {
+                        raw.push_back('$');
+                        raw.append(std::to_string(args[i].size()));
+                        raw.append("\r\n", 2);
+                        raw.append(args[i]);
+                        raw.append("\r\n", 2);
+                    }
+                    route_to_owner(conn, owner, raw, true);
+                    return;
+                }
+            }
+            break;
+        }
+
+        case cache_cmd_class::multi_key:
+        case cache_cmd_class::keyspace:
+        case cache_cmd_class::stateful:
+            run_in_reply_order(conn, [&] {
+                emit_unrouted(conn, args[0], true,
+                              "spans every shard of this cache and is not "
+                              "routed yet");
+            });
+            return;
+
+        case cache_cmd_class::fanout:
+        case cache_cmd_class::connection:
+        case cache_cmd_class::unknown:
+            break;
+    }
+
+    run_in_reply_order(conn, [&] { process_resp_command_local(conn, args, argc); });
+}
+
+void cache_instance::process_resp_command_local(client_connection* conn, std::string_view* args, int argc)
 {
     if (SOCKETLEY_UNLIKELY(argc == 0))
         return;
@@ -3688,6 +4389,14 @@ void cache_instance::process_resp_command(client_connection* conn, std::string_v
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
+    // ─── A COMMAND ADDED HERE MUST BE CLASSIFIED IN cache_shard_map.h ───────
+    //
+    // A hash this table does not name reads `unknown` and is served where it
+    // was asked.  That is right for a command that does not exist — "unknown
+    // command" is the same answer in every process — and WRONG for a real one,
+    // which would then be answered out of one shard's slice with nothing saying
+    // so.  All 54 handlers across this switch and the RESP one are classified
+    // today; the next one is the one at risk.
     switch (fnv1a_lower(args[0]))
     {
         case fnv1a("set"):

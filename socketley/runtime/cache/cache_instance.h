@@ -13,6 +13,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
+#include "../../shared/cache_shard_map.h"
 #include "cache_store.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
@@ -47,6 +48,35 @@ struct client_connection
     bool write_pending{false};
     bool closing{false};
     bool zc_notif_pending{false};
+
+    // ── A crossing this connection is waiting on ────────────────────────────
+    //
+    // Non-zero while commands from this socket are being answered by ANOTHER
+    // shard of this runtime — see cache_instance's routing note.  It is the
+    // whole of what stops the pipeline: every reply after the first crossing
+    // has to wait behind an answer that has not arrived, because a client
+    // pipelining down one socket has no way to tell two replies apart except
+    // by the order they come back in.
+    //
+    // An id and not a pointer.  The reply lands on a later turn of the loop, by
+    // which time this struct may have been pooled and handed to somebody else,
+    // and an id resolves to nothing where a pointer would resolve to a
+    // stranger's socket.
+    uint64_t batch_id{0};
+
+    // The peer sent its FIN while a crossing was still owed.
+    //
+    // A request/response client that half-closes the moment it has finished
+    // asking is an ordinary client and not a broken one — `nc -q1` is one, and
+    // so is every test in this directory that pipes into it.  Until routing
+    // existed the distinction could not arise: the answer was produced inside
+    // the same read handler that saw the bytes, so it was already queued when
+    // the FIN arrived.  A crossing is answered on a later turn, and closing on
+    // the FIN throws away an answer the client is still sitting there reading.
+    //
+    // So the close is HELD rather than taken: no more input is expected, the
+    // debt is paid, and the teardown happens once the reply is on the wire.
+    bool peer_gone{false};
 
     // RESP protocol mode (auto-detected or forced)
     bool resp_mode{false};
@@ -121,6 +151,8 @@ struct client_connection
         write_pending = false;
         closing = false;
         zc_notif_pending = false;
+        batch_id = 0;
+        peer_gone = false;
         resp_mode = false;
         resp_detected = false;
         is_follower = false;
@@ -146,7 +178,8 @@ enum cache_mode : uint8_t
     cache_mode_admin     = 2   // all incl. FLUSH, LOAD
 };
 
-class cache_instance : public runtime_instance, public request_sink
+class cache_instance : public runtime_instance, public request_sink,
+                      public request_origin
 {
 public:
     cache_instance(std::string_view name);
@@ -237,6 +270,13 @@ public:
     // runs inside a completion the channel owns, so nothing here is on anybody
     // else's message path.  See shared/request_channel.h.
     void serve_request(std::string_view payload, std::string& out) override;
+
+    // ── request_origin ──────────────────────────────────────────────────────
+    // The other half of the same channel, and the direction that is new here: a
+    // shard asking a SIBLING for a key it does not own.  The cookie names the
+    // group of commands this reply answers; see the routing note below.
+    void on_request_reply(uint64_t cookie, request_status st,
+                          std::string_view reply) override;
     // The same interpreter over a payload that is exactly one command, newlines
     // included.  A replication frame is framed BECAUSE the command contains a
     // newline, so running it through the line splitter would apply half of it —
@@ -302,12 +342,176 @@ private:
     void inv_check_reachable(int fd, const char* where);
 #endif
 
+    // ── The two dispatches, and the one decision in front of each ───────────
+    //
+    // process_command() and process_resp_command() are the whole of what this
+    // runtime does with a command; every path in — a socket, a request from
+    // another runtime, a replication frame — arrives at one of them.  So the
+    // ownership question is asked THERE and nowhere else: two sites, both
+    // asking shared/cache_shard_map.h, against sixty-odd command handlers that
+    // would otherwise each have to remember.
+    //
+    // The `_local` halves are the interpreters as they were.  They answer out
+    // of THIS shard's store and ask no questions about ownership, which is
+    // exactly what the answering side of a crossing needs.
     void process_command(client_connection* conn, std::string_view line);
+    void process_command_local(client_connection* conn, std::string_view line);
     // Run every line of a request payload through process_command, in order.
     // See serve_request() for why a payload is a stream and not a command.
     void run_request_lines(client_connection* conn, std::string_view payload);
     void process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
+    void process_resp_command_local(client_connection* conn, std::string_view* args, int argc);
+
+    // The text line splitter, lifted out of handle_read so that a connection
+    // whose crossing has just come back can be driven from the reply handler
+    // with the same code the read handler uses.
+    void parse_text_lines(client_connection* conn);
+
+    // ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────
+    //
+    // `shard = hash(key) mod N`, and a command whose key belongs to somebody
+    // else is answered by them.  What makes that affordable is that a PIPELINE
+    // is grouped by owner before anything is sent: a run of commands crosses
+    // once per shard, not once per command, which is the difference between
+    // paying a round trip per operation and amortising one over sixteen.
+    //
+    // The crossing itself is the request channel, unchanged — see
+    // shared/request_channel.h and shared/shard_target.h.  A shard posts to
+    // `name#j`; the daemon holds the only map that resolves it and relays the
+    // request to shard j's control socket, and the reply comes back with the
+    // cookie this side posted.  Two round trips rather than the one a direct
+    // shard mesh would cost, and deliberately: N shards meshed are N**2
+    // teardown paths, which is the defect class this tree has paid for most.
+    //
+    // What a batch is, and why it is not simply a string:
+    //
+    //   Replies are NOT self-delimiting.  Ten commands answer over several
+    //   lines each and some of them end with `end\n`, so a concatenated reply
+    //   cannot be split back into per-command answers without a table of reply
+    //   shapes — which is the duplication request_channel.h refuses in its own
+    //   note.  So the two shards of one runtime frame their exchange: each
+    //   command goes over as `<len>\n<bytes>` and comes back the same way, and
+    //   the framing is understood by cache_instance alone.  The daemon relays
+    //   bytes and understands neither side, which is the property that lets the
+    //   crossing be a socket at all.
+    struct shard_batch
+    {
+        // Which connection is waiting.  A descriptor and not a pointer, checked
+        // against m_conn_idx and against the connection's own batch_id before
+        // anything is written: the socket may have closed and its number may
+        // already belong to a client that never asked anything.
+        int  fd{-1};
+        bool resp{false};
+
+        // One per command since the batch opened, in the order the client gave
+        // them.  A local command's reply is put here filled; a crossing's
+        // arrives later.
+        std::vector<std::string> slots;
+        std::vector<uint8_t>     filled;
+
+        // Crossings still owed an answer.  One per SHARD, not one per command.
+        uint32_t outstanding{0};
+    };
+
+    // A batch that could grow without bound is a memory path a client controls,
+    // so a run of routed commands is cut here and the rest is left in `partial`
+    // for the turn after this crossing lands.  Nothing is lost and nothing is
+    // reordered; the pipeline simply crosses in more than one go.
+    static constexpr size_t MAX_ROUTED_PER_BATCH = 8192;
+
+    // Parse what a connection has buffered, send what belongs to somebody else,
+    // and stop if a crossing is already in flight for it.
+    void pump(client_connection* conn);
+
+    // Post one request per owning shard and put the batch in flight.  Called
+    // once at the end of a parse, which is what makes the grouping worth
+    // anything: everything the read delivered has been classified by then.
+    void route_flush(client_connection* conn);
+
+    // Reserve this command's place in the reply order and hand it to its owner.
+    void route_to_owner(client_connection* conn, uint32_t owner,
+                        std::string_view raw, bool resp);
+
+    // Fill every slot a failed or missing crossing owed, so a batch cannot be
+    // left one answer short of ever completing.
+    void batch_fill_error(shard_batch& b, const std::vector<size_t>& slots,
+                          std::string_view why);
+
+    // Append a finished batch's slots to the connection's reply buffer and let
+    // the rest of its pipeline run.
+    void batch_finish(uint64_t id);
+
+    // Give up a batch a connection can no longer be told about.
+    void batch_drop(client_connection* conn);
+
+    // The answering side: run a framed run of commands out of THIS shard's
+    // store and frame the replies back.  Recognised by serve_payload(); see the
+    // framing note above.
+    bool serve_shard_batch(std::string_view payload, std::string& out);
+
+    // What a command that this build does not route yet is answered with.  Said
+    // out loud, per command, rather than served wrong out of one shard's slice:
+    // a multi-key or keyspace-wide command answered from a quarter of the
+    // keyspace is a miss for data that was stored, which is the failure the
+    // cache's --shards refusal names.
+    void emit_unrouted(client_connection* conn, std::string_view cmd, bool resp,
+                       std::string_view why);
+
+    // Run one command's local execution so its reply lands where the reply
+    // ORDER says it belongs: at the end of response_buf when nothing is
+    // crossing, and in a slot of its own once something is.
+    template <class Fn>
+    void run_in_reply_order(client_connection* conn, Fn&& fn)
+    {
+        if (SOCKETLEY_LIKELY(!m_collect))
+        {
+            fn();
+            return;
+        }
+        std::string held;
+        held.swap(conn->response_buf);
+        fn();
+        std::string produced;
+        produced.swap(conn->response_buf);
+        conn->response_buf.swap(held);
+        m_collect->slots.push_back(std::move(produced));
+        m_collect->filled.push_back(1);
+    }
+
+    // Batches waiting on a sibling, by the id their connection holds.
+    std::unordered_map<uint64_t, shard_batch> m_batches;
+
+    // One posted crossing: which batch it belongs to and which of its slots it
+    // will fill.  Keyed by the cookie the channel hands back.
+    struct posted_group
+    {
+        uint64_t            batch{0};
+        std::vector<size_t> slots;
+    };
+    std::unordered_map<uint64_t, posted_group> m_posts;
+
+    // The batch being collected by the parse that is running right now.  One at
+    // a time, because one connection is parsed at a time, and null everywhere
+    // else — including inside serve_request(), which is what keeps the
+    // answering side of a crossing from trying to make one of its own.
+    std::unique_ptr<shard_batch> m_collect;
+    int                          m_collect_fd{-1};
+
+    // Per-owner accumulation for the parse in progress: the framed payload and
+    // the slots it will fill.  Sized once at setup and cleared per flush, so a
+    // pipeline costs no allocation per command.
+    std::vector<std::string>         m_route_payload;
+    std::vector<std::vector<size_t>> m_route_slots;
+
+    uint64_t m_next_batch{1};
+    uint64_t m_next_cookie{1};
+
+    // This runtime's shard set, read once at setup.  get_shards() is not inline
+    // and this is asked per command; 1 and 0 are the unsharded answers and make
+    // every check below a single compare.
+    uint32_t m_shard_n{1};
+    uint32_t m_shard_i{0};
 
     // Both report whether the submission reached the ring; see the definitions
     // for why a caller must not ignore that.

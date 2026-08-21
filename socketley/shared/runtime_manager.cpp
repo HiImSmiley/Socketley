@@ -1245,6 +1245,17 @@ void runtime_manager::publish_endpoints()
         }
     }
 
+    // The per-shard entries, from the one side that knows how many processes a
+    // name has.  Outside the lock above for the reason the endpoint sink is:
+    // this walks the daemon's supervisor map, and holding the runtime map
+    // across that is how one runtime ends up waiting on another's child.
+    //
+    // After the by-name pass and never instead of it: a request that names the
+    // runtime still goes to shard 0, which is what a caller asking for the
+    // RUNTIME means.  See shared/shard_target.h.
+    if (m_shard_sink_publisher)
+        m_shard_sink_publisher(m_requests);
+
     // And to whatever lives outside this address space.  Last, and outside the
     // lock: the sink writes to sockets, and holding the runtime map across a
     // write to a process that may not be reading is how an unrelated runtime
@@ -1256,6 +1267,11 @@ void runtime_manager::publish_endpoints()
 void runtime_manager::set_endpoint_sink(std::function<void(const endpoint_table&)> sink)
 {
     m_endpoint_sink = std::move(sink);
+}
+
+void runtime_manager::set_shard_sink_publisher(std::function<void(request_channel&)> sink)
+{
+    m_shard_sink_publisher = std::move(sink);
 }
 
 void runtime_manager::set_publish_sink(

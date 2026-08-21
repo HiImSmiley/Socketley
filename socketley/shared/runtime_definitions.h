@@ -180,11 +180,29 @@ inline std::string shards_config_refusal(runtime_type type,
     if (shards > max_shards)
         return "--shards must be between 1 and " + std::to_string(max_shards) + "\n";
 
+    // ── The one refusal with a way past it, and why ─────────────────────────
+    //
+    // A CACHE: still no, and the reason above is still true of what ships.  The
+    // routing that removes it is being built one command class at a time —
+    // single-key first, then multi-key, then the keyspace-wide commands, then
+    // persistence across a changed shard count — and until all four are done a
+    // sharded cache answers some commands out of one shard's slice.
+    //
+    // -DSOCKETLEY_SCRATCH_CACHE_SHARDS compiles this one line out.  It exists so
+    // that test/integration/pending_cache_shard_routing.sh can be RUN rather
+    // than merely read: a test whose red nobody else can reproduce proves
+    // nothing, and the alternative was an uncommitted patch described in prose.
+    //
+    // It is not a supported configuration and it is not an operator-facing
+    // switch — nothing reads it at run time, no flag reaches it, and a default
+    // build has no way to arrive here.  It goes when the refusal does.
+#ifndef SOCKETLEY_SCRATCH_CACHE_SHARDS
     if (type == runtime_cache)
         return "--shards is not available on a cache: N shards are N separate "
                "stores behind one port, so a SET lands in one process and a "
                "later GET on a new connection asks another -- a miss for data "
                "that was stored, with no error anywhere\n";
+#endif
 
     if (type == runtime_client)
         return "--shards is not available on a client: a client dials out and "

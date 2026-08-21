@@ -200,6 +200,19 @@ public:
     // a socket, because for a worker it is one.
     void set_endpoint_sink(std::function<void(const endpoint_table&)> sink);
 
+    // And the finer half of the same table: who answers for ONE SHARD of a
+    // runtime that is N processes.
+    //
+    // publish_endpoints() registers a sink per runtime NAME, which is the right
+    // answer to "who serves this runtime" and cannot be the answer to "who owns
+    // this key" — a sharded cache has N stores and the name resolves to shard 0.
+    // The daemon holds the N supervisors, so it is the only side that can add
+    // the qualified entries; the manager calls this after it has rebuilt the
+    // table and before anything can use it.  See shared/shard_target.h.
+    //
+    // Unset in a worker, which has one shard and no map to enumerate.
+    void set_shard_sink_publisher(std::function<void(request_channel&)> sink);
+
     // Where a published message goes besides the in-process runtimes — the same
     // boundary rule as the endpoint sink, for the other thing the daemon used to
     // deliver by calling into each instance.
@@ -300,6 +313,7 @@ private:
     static bool script_frame_live();
 
     std::function<void(const endpoint_table&)> m_endpoint_sink;
+    std::function<void(request_channel&)> m_shard_sink_publisher;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
     std::function<bool(std::string_view, std::string_view)> m_deliver_sink;
     std::function<void()> m_worker_release_sink;

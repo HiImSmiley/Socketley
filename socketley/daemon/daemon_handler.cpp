@@ -18,6 +18,7 @@
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
 #include "../shared/ipc_framing.h"
+#include "../shared/shard_target.h"
 #include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
@@ -346,6 +347,36 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // to the manager so that a caller which has only the manager — a Lua
     // script — cannot free a placeholder out from under its supervisor.
     m_manager.set_worker_release_sink([this] { reconcile_proxy_workers(); });
+
+    // And who answers for one SHARD of a runtime.  The manager registers a sink
+    // per name; only this side knows a name is N processes, so only this side
+    // can register the qualified entries a cross-shard request is addressed to.
+    // See shared/shard_target.h.
+    m_manager.set_shard_sink_publisher([this](request_channel& ch)
+                                       { publish_shard_sinks(ch); });
+}
+
+// Every shard of every sharded runtime, under `name#index`.
+//
+// Rebuilt wholesale on every membership change, exactly like the table it is
+// appended to, and for the same reason: a supervisor that has been retired must
+// not still be reachable through a name.  The index IS the position in the
+// vector — reconcile_proxy_workers() only ever appends and only ever retires
+// from the back — so nothing else has to be kept in step with it.
+//
+// A runtime with one worker gets no entry.  Its name already resolves to that
+// worker, and `c#0` for an unsharded cache would be a second spelling of the
+// same thing for nobody to use.
+void daemon_handler::publish_shard_sinks(request_channel& ch)
+{
+    for (auto& [name, shards] : m_proxy_workers)
+    {
+        if (shards.size() <= 1)
+            continue;
+        for (size_t i = 0; i < shards.size(); ++i)
+            ch.register_sink(shard_target(name, static_cast<uint32_t>(i)),
+                             shards[i].get());
+    }
 }
 
 daemon_handler::~daemon_handler()

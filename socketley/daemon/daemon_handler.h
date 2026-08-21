@@ -18,6 +18,7 @@ class state_persistence;
 class cluster_discovery;
 class endpoint_table;
 class proxy_supervisor;
+class request_channel;
 struct cluster_event;
 
 struct ipc_connection
@@ -452,6 +453,12 @@ private:
     // would not take the frame — the caller has to be able to say so.
     bool deliver_to_worker(std::string_view name, std::string_view message,
                            const proxy_supervisor* exclude = nullptr);
+
+    // Add `name#index` for every shard of every sharded runtime to the request
+    // channel's sink table, which the manager has just rebuilt.  Installed as
+    // the manager's shard sink publisher; see shared/shard_target.h for why a
+    // qualified name and not a second wire.
+    void publish_shard_sinks(request_channel& ch);
 
     // A `send` that came UP from a worker's script, addressed to a runtime that
     // worker cannot see.  Routed exactly as cmd_send() routes the same verb
