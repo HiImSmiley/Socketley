@@ -28,6 +28,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/state_persistence.h"
+#include "../../shared/frame_writer.h"
 #include "../../shared/worker_protocol.h"
 
 namespace
@@ -191,71 +192,11 @@ bool claim_current_daemon(int control_fd)
     return ::getppid() == creator;
 }
 
-// Frames on their way to the daemon, and what happens when it is not reading.
-//
-// This was a straight write that dropped the frame on EAGAIN, which was right
-// while the socket carried stats: the next push supersedes the one that did not
-// fit. It is wrong for a request or a reply. A dropped chan_req is answered
-// `no such runtime` by the asking side — for a target that exists — and a
-// dropped chan_rep is an answer that never comes, so the origin waits until its
-// client gives up.
-//
-// Queued and flushed as the socket takes them, with a cap so a daemon that has
-// stopped reading cannot grow this process without limit.
-class control_writer
-{
-public:
-    static constexpr size_t MAX_BACKLOG = 4u << 20;
-
-    explicit control_writer(int fd) : m_fd(fd) {}
-
-    bool write(std::string_view framed)
-    {
-        if (pending() + framed.size() > MAX_BACKLOG)
-        {
-            if (!m_full)
-            {
-                LOG_WARN("proxy worker: control backlog full; the daemon is not reading");
-                m_full = true;
-            }
-            return false;
-        }
-        m_full = false;
-        m_out.append(framed);
-        flush();
-        return true;
-    }
-
-    void flush()
-    {
-        while (m_off < m_out.size())
-        {
-            const ssize_t n = ::write(m_fd, m_out.data() + m_off, m_out.size() - m_off);
-            if (n > 0) { m_off += static_cast<size_t>(n); continue; }
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                break;
-            m_dead = true;          // the daemon is gone; run() ends on the read side
-            return;
-        }
-
-        // Compacted in one move: erasing the written prefix on every pass is
-        // quadratic in exactly the backlog this exists to hold.
-        if (m_off >= m_out.size())      { m_out.clear(); m_off = 0; }
-        else if (m_off >= 64 * 1024)    { m_out.erase(0, m_off); m_off = 0; }
-    }
-
-    size_t pending() const { return m_out.size() - m_off; }
-    bool   dead()    const { return m_dead; }
-
-private:
-    int         m_fd;
-    std::string m_out;
-    size_t      m_off{0};
-    bool        m_full{false};
-    bool        m_dead{false};
-};
+// The worker's writer to the daemon is shared/frame_writer.h.  Lifted out of
+// this file whole: a bounded-backlog writer with a drop policy has two places
+// to get the EAGAIN case wrong if there are two of it, and the second is always
+// found months later.
+using control_writer = frame_writer;
 
 // Every runtime this process does not hold.
 //

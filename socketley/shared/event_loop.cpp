@@ -767,6 +767,41 @@ inline void event_loop::arm(io_request* req, uint32_t target, uint32_t target2)
         if (__builtin_expect(tok == 0, 0))
             tok = register_owner(req->owner);
     }
+    else
+    {
+        // ─── A SUBMISSION WITH NO OWNER IS ONE NOTHING WILL COMPLETE ────────
+        //
+        // The code below already knows this: a token of 0 "never matches a live
+        // registration", so run() drops the completion rather than dispatching
+        // it.  What it did not do was SAY so, and the failure that produces has
+        // no other symptom — the operation is queued, the kernel performs it,
+        // the completion arrives, and it goes in the bin.  Whatever was waiting
+        // for it waits for ever.
+        //
+        // Found the expensive way: a hand-built io_request for a poll on a new
+        // kind of socket was left with its owner unset.  Everything was
+        // submitted, nothing was ever answered, and the only visible behaviour
+        // was that operations needing that socket hung while every operation
+        // that did not touch it answered normally — which reads as a protocol
+        // defect, not as a missing field.
+        //
+        // Here rather than at that call site, because this is the one function
+        // every submit_* helper passes through on the path where the SQE was
+        // obtained.  A caller that forgets is the case this exists for, and a
+        // caller cannot be relied on to remember what it did not know about.
+        //
+        // Once, not per submission: the failure is structural — one forgotten
+        // assignment, then every submission on that request — so a line per
+        // completion would bury the first one under its own repetitions.
+        if (!m_warned_ownerless)
+        {
+            m_warned_ownerless = true;
+            LOG_ERROR("event_loop: a submission was queued with no owner; its "
+                      "completion will be dropped and whatever waits for it will "
+                      "wait for ever.  Set io_request::owner before submitting.");
+        }
+        ++m_stat_ownerless;
+    }
     req->owner_token = tok;
 
     // A token of 0 lands on slot 0 next to the unverifiable handlers.  Slot 0

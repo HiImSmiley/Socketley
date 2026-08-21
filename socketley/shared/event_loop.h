@@ -105,6 +105,12 @@ public:
     // before the first submission.  Idempotent.
     uint32_t register_owner(io_handler* owner);
 
+    // Submissions queued with no owner, whose completions were therefore
+    // dropped.  Never anything but a defect; see arm().  Counted as well as
+    // logged so a test can assert zero rather than grep a log the daemon
+    // deletes.
+    uint64_t stat_ownerless() const { return m_stat_ownerless; }
+
     // Call when the handler can no longer service a completion: a runtime that
     // has torn down, a timer about to free itself.  A handler that frees itself
     // from inside its own on_cqe must deregister there and not earlier —
@@ -599,6 +605,8 @@ private:
     std::atomic<bool> m_running;
     uint32_t m_queue_depth;
     uint32_t m_pending_submissions{0};
+    uint64_t m_stat_ownerless{0};
+    bool     m_warned_ownerless{false};
     int m_eventfd{-1};
     io_request m_signal_req{};
     uint64_t m_signal_buf{};
