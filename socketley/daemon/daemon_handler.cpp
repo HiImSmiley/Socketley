@@ -5006,6 +5006,10 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
     bool     any        = false;
     std::string detail;
 
+    const auto rit = m_shard_regions.find(name);
+    const shard_stats::shard_table* region =
+        (rit != m_shard_regions.end() && rit->second.mapped()) ? &rit->second : nullptr;
+
     for (const auto& sup : it->second)
     {
         const auto& s = sup->last_stats();
@@ -5025,11 +5029,47 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         // text is a walk of ONE process's connection tables and concatenating
         // them unlabelled would read as one runtime with the same connection
         // listed several times.
+        //
+        // ─── AND THE SHARD'S OWN FIGURES, UNDER ITS OWN NAMES ───────────────
+        //
+        // How the work is spread is a question the sum cannot answer, and it is
+        // the question a shard count is created to make somebody ask: three
+        // shards that bind and never accept look exactly like three that share
+        // the load, in every figure except these.
+        //
+        // They used to be here by accident — each shard pushed a full `stats`
+        // text, prefix and all, so a four-shard runtime printed four
+        // `total_connections:` lines and NO runtime-level one.  A reader had to
+        // know to sum them, and one that did not was reading whichever shard
+        // came first.  Now the runtime's line is the runtime's, and a shard's
+        // carries `shard_`, so neither can be mistaken for the other.
+        //
+        // Read from the region rather than from the frame that shard last sent:
+        // this runs immediately before `stats` prints, which is the same
+        // instant the summed prefix is taken at, so the parts and the total
+        // agree.
+        const size_t idx = static_cast<size_t>(&sup - it->second.data());
         if (it->second.size() > 1)
         {
+            const shard_stats::figures sf =
+                region ? region->at(static_cast<uint32_t>(idx))
+                       : shard_stats::figures{s.active_connections,
+                                              s.total_connections,
+                                              s.total_messages,
+                                              s.bytes_in, s.bytes_out};
             detail += "[shard ";
-            detail += std::to_string(&sup - it->second.data());
-            detail += "]\n";
+            detail += std::to_string(idx);
+            detail += "]\nshard_connections:";
+            detail += std::to_string(sf.active_connections);
+            detail += "\nshard_total_connections:";
+            detail += std::to_string(sf.total_connections);
+            detail += "\nshard_total_messages:";
+            detail += std::to_string(sf.total_messages);
+            detail += "\nshard_bytes_in:";
+            detail += std::to_string(sf.bytes_in);
+            detail += "\nshard_bytes_out:";
+            detail += std::to_string(sf.bytes_out);
+            detail += '\n';
         }
         detail += s.detail;
     }

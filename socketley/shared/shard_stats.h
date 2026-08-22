@@ -440,6 +440,23 @@ public:
         return false;
     }
 
+    // One named shard's whole line.  `stats` prints these under a [shard i]
+    // heading so that an operator can see how the work is spread, which is a
+    // question the sum deliberately cannot answer.
+    figures at(uint32_t i) const
+    {
+        figures f;
+        if (!m_table || i >= m_count)
+            return f;
+        const slot& s = m_table->slots[i];
+        f.active_connections = s.active_connections.load(std::memory_order_acquire);
+        f.total_connections  = s.total_connections.load(std::memory_order_relaxed);
+        f.total_messages     = s.total_messages.load(std::memory_order_relaxed);
+        f.bytes_in           = s.bytes_in.load(std::memory_order_relaxed);
+        f.bytes_out          = s.bytes_out.load(std::memory_order_relaxed);
+        return f;
+    }
+
     // What one named shard last said.  For diagnostics and for the tests; the
     // sum above is what production reads.
     uint64_t active_at(uint32_t i) const

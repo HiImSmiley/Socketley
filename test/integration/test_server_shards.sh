@@ -370,17 +370,24 @@ check "30 requests over 30 connections all answered 200" "$OK200" "30"
 # above is satisfied by a build where three shards bind and never accept: the
 # kernel would hand every connection to the one that does.
 #
-# Polled rather than read once.  A worker-backed runtime's figures are PUSHED on
-# the daemon's two-second health tick -- `stats` prints figures:pushed and an
-# age -- so a read taken the instant the last request returns answers with the
-# snapshot from before any of them.  Measured: busiest=0 total=0 with all
-# thirty already answered 200.  That is the instrument, not the build, and
-# waiting for the push is the only way to ask the question at all.
+# `shard_total_connections`, one line per shard, and NOT `total_connections`:
+# that one is now the runtime's own line and is the SUM, so an awk that matched
+# it would read busiest == total and fail this every time.  The distinction is
+# the point of the two names -- see aggregate_worker_stats().
+#
+# Still polled, though it no longer has to be.  A worker-backed runtime's
+# figures used to be PUSHED on a 250 ms timer, so a read taken the instant the
+# last request returned answered from the snapshot before any of them: measured,
+# busiest=0 total=0 with all thirty already answered 200.  They are summed out
+# of shared memory at print time now and that window is gone; the loop is kept
+# because it also covers a shard whose last accept has not yet been counted by
+# its own loop turn, and because a bound that ends on the counter costs nothing
+# when the counter is already right.
 BUSIEST=0; TOTAL=0
 for _ in $(seq 1 60); do
     S=$("$BIN" stats ss_http 2>/dev/null)
-    BUSIEST=$(printf '%s' "$S" | awk -F: '/^total_connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
-    TOTAL=$(printf '%s' "$S" | awk -F: '/^total_connections:/ {s+=$2+0} END {print s+0}')
+    BUSIEST=$(printf '%s' "$S" | awk -F: '/^shard_total_connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
+    TOTAL=$(printf '%s' "$S" | awk -F: '/^shard_total_connections:/ {s+=$2+0} END {print s+0}')
     [[ "$TOTAL" -ge 30 ]] && break
     sleep 0.2
 done

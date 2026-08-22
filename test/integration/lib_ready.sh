@@ -211,53 +211,57 @@ PY
 # The runtime's published connection count is COUNT, in a figure the runtime
 # sampled after this call began.
 #
-# ─── WHY THE SECOND HALF OF THAT SENTENCE IS THE WHOLE POINT ────────────────
+# ─── WHAT THE SECOND HALF OF THAT SENTENCE WAS FOR ──────────────────────────
 #
-# Since the process split a runtime's connection count is not read when it is
-# printed.  The worker samples its own counters every 250 ms and pushes them;
-# `stats`, `ls` and every Lua binding report the last sample that arrived.  So
-# the figure lags the truth by up to a quarter second, which `stats` says out
-# loud in figures:pushed / figures_age_ms and which is invisible in the number
-# itself.
+# It used to be the whole point.  Between the process split and the shared
+# figures table, a runtime in a worker did not have its connection count read
+# when it was printed: the worker sampled its own counters every 250 ms and
+# pushed them, and `stats`, `ls` and every Lua binding reported the last sample
+# that had arrived.  The figure lagged the truth by up to a quarter second,
+# which `stats` said out loud in figures:pushed / figures_age_ms and which was
+# invisible in the number itself.
 #
-# For a count that is RISING that lag is harmless: a test waiting for 3 cannot
+# For a count that is RISING that lag was harmless: a test waiting for 3 cannot
 # be handed 3 by a sample taken before the third client connected.  For a count
-# that has just fallen it is not, and the direction that matters most is the
+# that has just fallen it was not, and the direction that mattered most is the
 # fall to zero, because "nothing is connected" is the precondition every busy
-# assertion is read against.  Concretely, and this is a measured failure and not
-# a hypothetical: ready_tcp's `nc -z` opens and closes a connection, and the
+# assertion is read against.  Concretely, and this was a measured failure and
+# not a hypothetical: ready_tcp's `nc -z` opens and closes a connection, and the
 # worker goes on counting it until the ring reports the hangup after it reported
-# the accept.  A sample landing inside that window puts a 1 into the daemon for
-# the quarter second that follows — during which a test that asks "0
-# connections, yes?" is told 1 about a runtime nothing is connected to.
+# the accept.  A sample landing inside that window put a 1 into the daemon for
+# the quarter second that followed — during which a test that asked "0
+# connections, yes?" was told 1 about a runtime nothing was connected to.
 #
-# How wide that window is was measured rather than reasoned about, by reading
+# How wide that window was was measured rather than reasoned about, by reading
 # the figure straight after an isolated `nc -z`: 7 stale reads in 164 on an idle
-# machine, so a few percent of the 250 ms period.  That is the rate at which a
-# test doing this once per run fails for no reason — rare enough to pass alone
-# and to be called flaky, common enough to turn up in a nightly.
+# machine, so a few percent of the 250 ms period.
 #
 # Polling until the number reads 0 does not fix that, and is the trap worth
-# naming: the first read can be answered from a sample taken BEFORE the probe
-# connected, so the loop exits on a stale zero having proved nothing at all.
+# naming: the first read could be answered from a sample taken BEFORE the probe
+# connected, so the loop exited on a stale zero having proved nothing at all.
 # That is a false pass in the same place, and it is the harder one to notice.
 #
-# So the test is on the sample's age rather than on repetition.  figures_age_ms
-# is the interval between the worker reading its own counters and the daemon
-# printing them, on a clock both processes share; subtracting it from the moment
-# of the call gives the instant the figure describes, and requiring that instant
-# to be later than the moment ready_conns was entered is exactly the claim a
-# caller wants: the runtime looked, after you asked, and saw COUNT.
+# ─── AND WHY THE TEST IS STILL ON THE AGE ───────────────────────────────────
+#
+# The counters live in shared memory now.  Each worker stores its line once per
+# turn of its event loop and the daemon sums the slots when it prints, so the
+# figure postdates the call by construction for EVERY runtime and `stats` prints
+# no age for any of them.  age reads 0, sampled reads now, and the second test
+# holds on the first pass.
+#
+# The arithmetic is kept rather than deleted, and this is not caution about a
+# rename.  It is the one reader in this tree that would ACT on an age
+# reappearing: a build that put a cached aggregate or a periodic refresh back in
+# front of these figures would print one again, and every caller of ready_conns
+# would go back to waiting for a sample taken after it asked — which is the
+# correct behaviour for that build and is not behaviour anyone would think to
+# restore. The guard below is what makes that free.
 #
 # `now` is read BEFORE the stats round-trip on purpose.  Reading it after would
 # add the round-trip to the computed sample instant and could date a figure into
 # the window this function exists to exclude; taken before, the arithmetic can
 # only ever place the sample earlier than it really was, and the error is on the
 # side of waiting one more turn.
-#
-# A runtime with no figures_age_ms line is in the daemon, where the counters are
-# read at the instant they are printed — that figure postdates the call by
-# construction, so it is accepted as it stands.
 ready_conns() {
     local bin=$1 name=$2 want=$3 timeout=${4:-15}
     local start deadline now out conn age sampled
@@ -268,11 +272,11 @@ ready_conns() {
         out=$("$bin" stats "$name" 2>/dev/null) || true
         conn=$(printf '%s\n' "$out" | awk -F: '$1 == "connections" { print $2; exit }')
         age=$(printf '%s\n'  "$out" | awk -F: '$1 == "figures_age_ms" { print $2; exit }')
-        # Absent, or anything that is not a count of milliseconds, means there is
-        # no pushed figure to date — the in-daemon case above.  Guarded rather
-        # than trusted, because the alternative is arithmetic on whatever `stats`
-        # happened to print, which fails as a shell error in the middle of a wait
-        # and takes the caller's whole file with it.
+        # Absent, or anything that is not a count of milliseconds, means there
+        # is no pushed figure to date — which is now every runtime.  Guarded
+        # rather than trusted, because the alternative is arithmetic on whatever
+        # `stats` happened to print, which fails as a shell error in the middle
+        # of a wait and takes the caller's whole file with it.
         case "$age" in ''|*[!0-9]*) age=0 ;; esac
         sampled=$(( now - age ))
         if [ "$conn" = "$want" ] && [ "$sampled" -ge "$start" ]; then

@@ -19,35 +19,53 @@
 # runtimes is not an unusual inventory and it was costing most of a core to hold
 # still.
 #
-# The loop waits until its own next deadline now.  The only periodic thing it
-# owes anybody is the stats publish, so the wakeup rate an idle worker should
-# show is the publish rate — worker_proto::stats_interval_ms, 4 Hz — and nothing
-# else.
+# The loop waits until its own next deadline now, and it no longer has one.  The
+# stats publish was the last periodic thing it owed anybody; the counters moved
+# into a shared table the worker stores into once per turn and the daemon sums
+# when it prints, so the frame is sent only when the part `stats` cannot
+# compute — the ring's flags, a table walk — has CHANGED, which for an idle
+# runtime is never.
+#
+# Measured on this box, 2026-08-22, 100 idle runtimes, 30 s windows, three
+# interleaved repetitions, and again at 32:
+#
+#                              100 runtimes        32 runtimes    worker
+#                             (us/s each)         (us/s each)     wakeups/30s
+#   pushed every 250 ms       216 / 150 / 193     208 / 177       66-68
+#   published on change         3 /   6 /  10       0 /  10        1
+#
+# One wakeup in thirty seconds is idle_wait_ms exactly: nothing else in the
+# system wakes an idle worker, and that constant is a backstop and not a
+# schedule.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
-# Section 1  wakeups, upper bound.  A build that puts a fixed clock back into
-#            the worker loop.  The binary this file was written against reads
-#            50.0/s here; the bound is 12/s, which is three times the publish
-#            rate and a quarter of the rate being ruled out.
+# Section 1  wakeups, upper bound.  A build that puts a periodic clock back into
+#            the worker loop — a fixed timeout, or a publish on a timer.  The
+#            fixed 20 ms loop read 50/s here and the 250 ms publish 2.2/s; the
+#            bound is 10 in 30 s, which is six times what a correct build reads
+#            and a sixth of what the publish read.
 #
-# Section 2  wakeups, lower bound.  A build whose worker has stopped waking at
-#            all — an untimed wait with no notification standing in the ring is
-#            the shape of change this defect invites, and a wedged worker scores
-#            perfectly on section 1.  Nothing else in this directory would
-#            notice: the runtime is idle, so nothing it fails to do is visible.
+# Section 2  the worker still wakes when something happens.  This used to be a
+#            LOWER bound on the wakeup count, which was available while the
+#            worker had a heartbeat and is not any more: 0 wakeups is now the
+#            correct reading and a wedged worker scores the same.  So liveness
+#            is asked for directly — a connection is opened and the runtime has
+#            to see it — which is the thing the wakeup count was standing in for
+#            and is the assertion an untimed wait with nothing armed fails.
 #
 # Section 3  CPU per idle runtime.  The number the whole change is about.
-#            Release only: under a sanitizer the two builds are 1.8x apart
-#            rather than 2.7x and no bound between them survives the machine's
-#            own load — the reasoning, and the reading that proved it, are at
-#            the assertion.
+#            Release only: under a sanitizer the separation is smaller than the
+#            machine's own load moves the number by — the reasoning, and the
+#            reading that proved it, are at the assertion.
 #
-# Section 4  the freshness contract.  The cheapest way to make sections 1-3
-#            green is to publish less often, and that is not free: figures_age_ms
-#            is what `stats` answers "how old is this" with, what lib_ready.sh's
-#            ready_conns waits on, and what tells an operator a worker has
-#            wedged.  Pinning it here is what makes the other three honest.
+# Section 4  the freshness the cheap pass would cost.  Publishing less often is
+#            the cheap way to make sections 1-3 green, and while the figures
+#            were pushed it was caught by pinning figures_age_ms.  There is no
+#            age to pin now, so what is pinned is the property that replaced it:
+#            the FIRST `stats` after a connection already reports it.  Measured
+#            here: 253 ms median before this change, 4 ms after, and the 4 ms is
+#            the CLI round trip.
 #
 # Section 5  the wait still ends on a frame and not on its deadline.  A build
 #            that lengthened the timeout and lost the poll armed on the control
@@ -79,12 +97,14 @@ daemon_start "$BIN"
 
 # ─── Fixtures ───────────────────────────────────────────────────────────────
 #
-# Eight of them, because section 3 divides by the count and one process's CPU
-# time is reported truncated to the kernel's clock tick — a single worker's whole
-# share of a window is a couple of ticks, and the truncation is then most of the
-# reading.  Eight independent processes average that error out; they are also
-# what the 8-runtime row in the table above was measured on.
-N=8
+# Thirty-two of them, because section 3 divides by the count and one process's
+# CPU time is reported truncated to the kernel's clock tick.  Eight over twenty
+# seconds put the resolution at 62 us/s per tick, and the correct build reads
+# ONE tick over the whole window: base and fix came out 62-125 against 0-62,
+# which is a one-tick difference reported as a measurement.  Thirty-two over
+# thirty seconds is 10.4 us/s per tick, and the two builds then read 177-208
+# against 0-10 — six ticks of separation instead of one.
+N=32
 for i in $(seq 1 $N); do
     "$BIN" create server "idle$i" -p $((PORT + i)) -s >/dev/null 2>&1 || true
 done
@@ -126,7 +146,7 @@ cpu_us() { awk '{printf "%d", ($14+$15)*1000000/'"$(getconf CLK_TCK)"'}' "/proc/
 # seconds with the error averaging across nine independent processes the slack
 # is around 50 us/s per runtime, against the several hundred that separate the
 # two builds.
-WINDOW=20
+WINDOW=30
 
 # ─── 1 & 2: how often an idle worker wakes ──────────────────────────────────
 C0=$(vctx "$W")
@@ -137,33 +157,57 @@ C1=$(vctx "$W")
 T1=0; for w in $(workers); do T1=$((T1 + $(cpu_us "$w"))); done
 T1=$((T1 + $(cpu_us "$SOCKETLEY_DPID")))
 
-RATE=$(( (C1 - C0) / WINDOW ))
-echo "  idle worker $W: $RATE voluntary wakeups/s"
+WAKES=$((C1 - C0))
+echo "  idle worker $W: $WAKES voluntary wakeups in ${WINDOW}s"
 
-# 12/s: three times the 4 Hz publish this loop legitimately has, and a quarter
-# of the 50 Hz it used to run at.  A build sitting between those two — a 20 Hz
-# clock, say — is still the defect and is still caught.
-if [ "$RATE" -le 12 ]; then
-    ok "an idle worker wakes $RATE times/s (bound 12; a fixed-timeout loop reads 50)"
+# On the count and not on a rate: a correct build reads 1 here, and integer
+# division by the window turns every reading under one per second into the same
+# 0.  10 in 30 s is six times what a correct build reads, a sixth of the 66 the
+# 250 ms publish read, and a fiftieth of the 1500 the fixed 20 ms timeout read.
+# A build sitting anywhere between those — a 20 Hz clock, a 1 Hz heartbeat — is
+# still a clock nothing asked for and is still caught.
+if [ "$WAKES" -le 10 ]; then
+    ok "an idle worker woke $WAKES times in ${WINDOW}s (bound 10; a 250 ms publish reads 66)"
 else
-    bad "an idle worker wakes $RATE times/s, over the bound of 12." \
-        " A worker with no traffic should wake only to publish its figures"
-    echo "         (4 Hz).  A rate near 50 is the fixed 20 ms timeout back in"
-    echo "         the loop; whatever the rate, it is a clock nothing asked for."
+    bad "an idle worker woke $WAKES times in ${WINDOW}s, over the bound of 10." \
+        " A worker with no traffic and nothing to say should wake only for"
+    echo "         idle_wait_ms, which is once every 30 s.  Whatever the rate,"
+    echo "         a periodic wakeup here is a clock nothing asked for."
 fi
 
-# The other side of the same number, and on the raw count rather than the rate:
-# the floor is "this process is still taking turns at all", which a build that
-# merely publishes more slowly should not trip — section 4 is what answers for
-# the publish rate.  Zero is not a better score than four, it is a worker that
-# has stopped, which is what an untimed wait with nothing armed to end it
-# produces and which no other assertion in this directory would see on a runtime
-# that is deliberately doing nothing.
-if [ "$((C1 - C0))" -ge 1 ]; then
-    ok "the idle worker is still taking its turns ($((C1 - C0)) in ${WINDOW}s, floor 1)"
+# ─── 2: it still wakes for something that IS happening ──────────────────────
+#
+# This used to be a floor on the count above, which worked while the worker had
+# a heartbeat to be missing.  It has none now: 0 is the correct reading, and a
+# worker wedged in a callback reads 0 too.  A count cannot tell them apart, so
+# the question is asked directly.
+#
+# A bare TCP connect, and then the runtime has to say it has one.  That needs
+# three things a wedged or blind worker does not have: an accept standing in the
+# ring, a loop turn that reaches the completion, and the store into the shared
+# table at the end of that turn.  An untimed wait with nothing armed — the shape
+# of change this constant invites — fails it and fails nothing else in this
+# directory, because an idle runtime's failures are all invisible.
+#
+# bash's own /dev/tcp, so the connection is held by this shell and closes with
+# the descriptor rather than with somebody else's process.
+LIVE_PORT=$((PORT + 1))
+LIVE=""
+if exec 9<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null; then
+    for _ in $(seq 1 40); do
+        LIVE=$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')
+        [ "$LIVE" = "1" ] && break
+        sleep 0.05
+    done
+    exec 9>&-
+fi
+if [ "$LIVE" = "1" ]; then
+    ok "the idle worker woke for a connection and counted it"
 else
-    bad "the idle worker woke $((C1 - C0)) times in ${WINDOW}s — it is not waiting" \
-        "on anything that will end, which is a wedged worker and not a cheap one"
+    bad "an idle worker was sent a connection and reported '$LIVE' connections." \
+        " It is waiting on something that a connection does not end, which is a"
+    echo "         wedged worker and not a cheap one — see arm_control() and the"
+    echo "         accept armed on the runtime's own ring."
 fi
 
 # ─── 3: CPU per idle runtime ────────────────────────────────────────────────
@@ -171,28 +215,30 @@ fi
 # The figure the whole change is about, and the one assertion here that has to
 # say what build it is talking about.
 #
-# 750 us/s per runtime, between two sets of numbers measured on this machine:
+# 60 us/s per runtime, between two sets of numbers measured on this machine on
+# 2026-08-22, interleaved on a quiet box:
 #
-#                            32 runtimes   100 runtimes   8, under load
-#   fixed 20 ms timeout           951            788           875
-#   waiting on the deadline       368            357        312-562
+#                            32 runtimes    100 runtimes
+#   pushed every 250 ms      208 / 177      216 / 150 / 193
+#   published on change        0 /  10        3 /   6 /  10
 #
-# The 30 s columns are three interleaved repetitions on a quiet box.  The last
-# one matters more for the bound: 562 is this test's own reading with three
-# other suites running on the same machine, so the margin against 750 is 1.33x
-# and the margin the other way, against the cheapest reading of the defect, is
-# 1.17x.  Tight on purpose — anything looser stops separating the two.
+# and, further back, 788-951 for the fixed 20 ms timeout that came before the
+# publish.  The bound is six times the most expensive correct reading and three
+# times the cheapest reading of the defect it is ruling out, which is as much
+# headroom in both directions as this instrument has: one clock tick at N=32 and
+# WINDOW=30 is 10.4 us/s, so a correct build is measured to within one tick of
+# zero and the bound is six ticks above it.
 #
 # ─── AND WHY IT DOES NOT RUN ON A SANITIZER BUILD ───────────────────────────
 #
-# Because it cannot be made to mean the same thing there.  The same source
-# measured 1375 us/s per idle runtime under ASan/UBSan against 2437 for the
-# defect: a 1.8x separation rather than Release's 2.7x, because what is left on
-# the correct side is the 4 Hz publish, and instrumentation makes a publish far
-# more expensive than it makes a bare wakeup.  A bound between 1375 and 2437 has
-# less headroom than the machine's own load moves the number by, so it would be
-# a coin toss reported as a defect.  It was: this file's first Sanitize run read
-# 1500 and failed against a bound calibrated on Release.
+# Because it cannot be made to mean the same thing there.  While the figures
+# were pushed, the same source measured 1375 us/s per idle runtime under
+# ASan/UBSan against 2437 for the fixed-timeout defect — a 1.8x separation
+# rather than Release's 2.7x, because instrumentation makes a publish far more
+# expensive than it makes a bare wakeup, and a bound with less headroom than the
+# machine's own load is a coin toss reported as a defect.  It was: this file's
+# first Sanitize run read 1500 and failed against a bound calibrated on Release.
+# The bound has moved since and the reason has not, so it is still Release only.
 #
 # Sections 1 and 2 are unaffected by any of that -- a wakeup count is a count,
 # and it reads 4/s on both builds -- so the sanitizer run keeps the assertion
@@ -205,38 +251,73 @@ echo "  $N idle runtimes: $PER us/s of CPU each (daemon + its workers)"
 # lib_daemon.sh stopped identifying daemons by process name.
 if grep -aqm1 __asan_init "$BIN"; then
     echo "  (not asserted: this is a sanitizer build — see the note above)"
-elif [ "$PER" -le 750 ]; then
-    ok "an idle runtime costs $PER us/s (bound 750; a fixed-timeout loop costs ~790-950)"
+elif [ "$PER" -le 60 ]; then
+    ok "an idle runtime costs $PER us/s (bound 60; a 250 ms publish costs ~180-215)"
 else
-    bad "an idle runtime costs $PER us/s, over the bound of 750 us/s." \
+    bad "an idle runtime costs $PER us/s, over the bound of 60 us/s." \
         " A hundred idle runtimes would be $((PER / 100))% of a core spent on nothing."
     echo "         daemon+workers went from $T0 to $T1 us over ${WINDOW}s across $N runtimes."
-    echo "         Check section 1 first: if the wakeup rate is 4/s this is a busy"
+    echo "         Check section 1 first: if the worker woke more than a handful of"
+    echo "         times this is a periodic clock, and if it did not it is a busy"
     echo "         machine rather than a build that regressed."
 fi
 
 # ─── 4: the figures did not get older to pay for it ─────────────────────────
 #
-# Read after the window above, so the runtime has been idle for the whole of it
-# and any publish backoff would have had time to open up.
-AGE=$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "figures_age_ms" { print $2; exit }')
-case "$AGE" in
-    ''|*[!0-9]*)
-        bad "stats printed no usable figures_age_ms for an out-of-process runtime (got '$AGE')" ;;
-    *)
-        # One publish period is 250 ms; 1000 leaves room for the round trip and
-        # for a drain that happened to land late, and still fails a build that
-        # has stretched the publish to buy the sections above.
-        if [ "$AGE" -le 1000 ]; then
-            ok "an idle runtime's figures are ${AGE} ms old (bound 1000)"
-        else
-            bad "an idle runtime's figures are ${AGE} ms old, over the bound of 1000." \
-                " Publishing less often is the cheap way to pass sections 1-3 and it"
-            echo "         breaks ready_conns, the age stats prints, and the one signal"
-            echo "         an operator has that a worker has wedged."
-        fi
-        ;;
-esac
+# Publishing less often is the cheap way to pass sections 1-3, and while the
+# figures were pushed this section caught it by pinning figures_age_ms under
+# 1000 ms.  There is no age to pin now — there is no interval between the
+# reading and the printing to have one — so what is pinned is the property that
+# replaced it, in the two halves it has.
+#
+# FIRST: the label is gone and stays gone.  A build that goes back to a pushed
+# figure has to print an age again, and one that prints a pushed figure WITHOUT
+# an age is worse than the build this whole change replaced.
+STALE=$("$BIN" stats idle1 2>/dev/null | grep -c '^figures_age_ms:\|^figures:' || true)
+if [ "$STALE" -eq 0 ]; then
+    ok "stats reports no age for a worker-backed runtime, because there is none"
+else
+    bad "stats printed $STALE figures:/figures_age_ms line(s) for idle1." \
+        " Those exist only where a figure is pushed on a timer.  If this build"
+    echo "         pushes again, sections 1-3 are being paid for out of freshness."
+fi
+
+# SECOND, and this is the discriminating half: the first read already sees it.
+#
+# A connection is opened and `stats` is asked ONCE, immediately.  A build that
+# sums the shared table at print time answers 1; a build that reports the last
+# pushed sample answers 0 until its next publish.  Measured on this box: 253 ms
+# median to see a new connection while the figures were pushed, 4 ms after they
+# moved into shared memory — and the 4 ms is the CLI round trip, not the worker.
+#
+# Ten of them, because one first-read is a coin toss against a 250 ms publish
+# whose phase this script does not control: a pushed build passes a single
+# attempt whenever the connect lands just before a publish.  Ten make that
+# 1-in-1000, and a correct build scores 10 every time because the count cannot
+# be behind its own loop turn.
+FRESH=0
+for i in $(seq 1 10); do
+    if exec 8<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null; then
+        SEEN=$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')
+        [ "$SEEN" = "1" ] && FRESH=$((FRESH+1))
+        exec 8>&-
+        # Back to zero before the next attempt, so each one is asking the same
+        # question.  Bounded: a reap this loop never sees would otherwise make
+        # every later attempt read 1 for the wrong reason.
+        for _ in $(seq 1 40); do
+            [ "$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')" = "0" ] && break
+            sleep 0.05
+        done
+    fi
+done
+if [ "$FRESH" -ge 9 ]; then
+    ok "the first stats after a connection saw it $FRESH times out of 10"
+else
+    bad "the first stats after a connection saw it only $FRESH times out of 10." \
+        " A figure summed at print time cannot be behind the loop turn that"
+    echo "         counted the accept.  A score near zero is a pushed figure back"
+    echo "         in front of these counters; see runtime_instance::worker_figures()."
+fi
 
 # ─── 5: a frame still ends the wait, the deadline does not ──────────────────
 #

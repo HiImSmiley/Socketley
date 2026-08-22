@@ -7311,56 +7311,58 @@ The command refuses and exits 1
 and then report the failure, leaving a listener up and a state file that would
 bring it back on the next daemon restart.
 .PP
-.B "A worker's figures are pushed, and stats says how old they are."
-The child publishes them every quarter\-second and the daemon drains the control
-socket before any command that prints them, so they are recent \(em but they are
-not read at the moment of the question the way an in\-process runtime's are.
-Making them live would mean the daemon asking the child and waiting for the
-answer on its event\-loop thread, which is the synchronous cross\-runtime call
-this design refuses everywhere else. So the difference is reported instead:
-.B stats
-prints
+.B "A worker's figures are read when they are printed."
+.BR connections ,
+.BR total_connections ,
+.BR total_messages ,
+.B bytes_in
+and
+.B bytes_out
+for an out\-of\-process runtime are summed out of a small shared\-memory region
+at the instant the command prints them. Each worker stores its own line into
+that region once per turn of its event loop; the daemon adds the lines up. There
+is no round trip, nothing waits on a child that may be wedged, and there is no
+interval between the reading and the printing for a figure to go stale in.
+.PP
+Every figure is therefore identical on both paths, which is the property the
+split exists to have. Earlier releases printed
 .B figures:pushed
 and
 .BI figures_age_ms: n
-for such a runtime, and neither line for an in\-process one. Every other figure
-is identical on both paths \(em which is the property the split exists to have,
-and exactly what made this one invisible without a label.
+here, because a worker pushed its counters on a quarter\-second timer and the
+difference was real. Those lines no longer exist and nothing replaces them:
+there is no age left to report.
+.PP
+The part of
+.B stats
+that is not a summable counter \(em a cache's key count, a proxy's healthy
+backends, the ring's granted polling mode \(em is still computed inside the
+worker, because it is a walk of tables that exist only there. It crosses the
+control socket when it changes, and for a runtime with no traffic that is never:
+an idle worker sends nothing and wakes for nothing.
 .PP
 .B "And which process it is."
 .B stats
 prints
 .BI pid: n
 for a runtime that has one \(em an out\-of\-process proxy's worker, or a managed
-external runtime's child. It is the one question
-.B figures:pushed
-raises without answering: the runtime is elsewhere, and this says where, so the
-process to strace, to read
+external runtime's child. Nothing else in the output says the runtime is
+elsewhere, so this is the line that names the process to strace, to read
 .B /proc
-for, or to account a machine's memory to can be named. An in\-process runtime
-prints no such line, and neither does one whose worker has been stopped or
-reaped \(em a pid that has been returned to the system is worse than none,
-because it is a number somebody will go and look at.
+for, or to account a machine's memory to. An in\-process runtime prints no such
+line, and neither does one whose worker has been stopped or reaped \(em a pid
+that has been returned to the system is worse than none, because it is a number
+somebody will go and look at.
 .PP
-The age is measured from the moment the worker read its counters, which travels
-with them, not from the moment the daemon took the frame off the socket. Those
-are not the same instant: frames wait in the socket until something drains it,
-which is either a command that prints them or the two\-second supervision tick,
-so a figure that had been sitting unread for a second used to be reported as
-new. A normal reading is therefore under
-.BR 250 ms ,
-and it is a full measurement of staleness rather than of the last hop.
-.PP
-.B "A large figures_age_ms means the worker is not publishing"
-\(em stopped, wedged in its event loop, or gone with the daemon not yet having
-reaped it. The number is not capped and nothing resets it but a fresh push from
-the child, so it keeps growing for as long as the silence lasts, and that is the
-reading it exists to make possible. The runtime's
-.B state
-answers a different question: a worker that is
-.B running
-and has an age in the seconds is one the daemon still believes in and that has
-stopped speaking.
+A sharded runtime prints
+.BI shards: n
+and
+.B shard_pids:
+instead, because there are
+.I n
+processes and naming one of them arbitrarily is the wrong answer. Its counters
+are still one set of figures: the shared region has a line per shard and the sum
+over them is what the runtime is serving.
 .PP
 Every type can be split, and every type is split unless it asks not to be. The
 proxy was first, and the rest followed once they too routed from pushed data

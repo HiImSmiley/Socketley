@@ -189,20 +189,18 @@ NBYTES=$(( ${#PAYLOAD} + 1 ))        # echo adds the newline that is also sent
 #
 # ready_tcp above uses `nc -z`, which opens a connection and closes it — that is
 # how it knows the port answers — so the proxy has already counted one by the
-# time this line runs.  For a runtime in the daemon the counter is read live and
-# that connection is in it.  For one in a worker the figures are pushed every
-# 250ms, so the reading here can predate it: C0 comes back 0, the payload
-# connection makes it 2, and the delta is 2 for one connection.  Nothing is
-# double-counted; the baseline was taken before the worker had said so.
+# time this line runs, and the baseline has to include it.
 #
-# That difference is real and documented — `stats` labels a worker's figures
-# with figures_age_ms for exactly this reason — so a fixture comparing two
-# readings has to let the first one settle.
-# Two agreeing readings are not enough on their own: a worker pushes every
-# 250ms, so two reads 150ms apart can BOTH predate the push that carries the
-# connection ready_tcp made, agree on the stale value, and look settled.  The
-# gap has to be longer than the push interval, and three readings across two
-# such gaps is the cheap way to be sure.
+# The counter is read at print time on both paths now: a worker stores its line
+# into shared memory once per turn of its event loop and `stats` sums the slots
+# as it prints.  What is left to settle is the worker's own loop, not a publish
+# interval — the accept is counted on the turn that reaps it, and `nc -z`'s
+# close is counted on a later one — so the value can still be moving for a few
+# turns after the probe returns.
+#
+# Two agreeing readings are not enough on their own: they can both fall between
+# the accept and the close.  Three readings across two gaps is the cheap way to
+# be sure, and the gaps no longer have to out-wait anything.
 settle_counter() {                 # name key -> the value, once three agree
     local cur="" same=0 prev=""
     for _ in $(seq 1 30); do

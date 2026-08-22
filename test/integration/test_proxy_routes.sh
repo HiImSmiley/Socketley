@@ -318,19 +318,20 @@ def counters(*names):
 
 # ── Reading a counter that lives in another process ────────────────────────
 #
-# Every runtime here runs in its own process, and a runtime in a worker does not
-# have its counters read at the moment of the question: it publishes them every
-# 250 ms and `stats` drains whatever has arrived.  That is deliberate and
-# documented -- see LIMITATIONS, "A worker's figures are pushed, and stats says
-# how old they are" -- and making them live would mean the daemon blocking its
-# event loop on a child, which is the one thing that design refuses.  `stats`
-# says so per runtime, in figures:pushed and figures_age_ms.
+# Every runtime here runs in its own process.  Its counters ARE read at the
+# moment of the question -- each worker stores its line into a shared region
+# once per turn of its event loop and `stats` sums the slots as it prints -- but
+# "the moment of the question" is not the moment the request was served: the
+# bytes are counted on the turn that handles them, and a read taken between the
+# response reaching this script and the worker's next turn legitimately predates
+# them.
 #
-# Measured on this machine: a served request becomes visible in `stats` between
-# 36 ms and 251 ms afterwards, against 8-10 ms for a runtime inside the daemon.
-# So a read taken immediately after a request legitimately predates it, and this
-# oracle has to account for that in BOTH of its directions -- in opposite ways,
-# because the trap is opposite:
+# Measured on this machine, before the counters moved into shared memory: a
+# served request became visible in `stats` between 36 ms and 251 ms afterwards,
+# against 8-10 ms for a runtime inside the daemon.  Measured after: 3-7 ms,
+# which is the CLI round trip.  The window is a thousand times smaller and it is
+# not zero, so this oracle still has to account for it in BOTH directions -- in
+# opposite ways, because the trap is opposite:
 #
 #   must GROW      poll until it does.  Racing the push reports "the request
 #                  never reached the backend" for one that did.
@@ -338,7 +339,8 @@ def counters(*names):
 #                  been forwarded would already be visible.  Reading immediately
 #                  would pass against a proxy that forwarded every one of the
 #                  forty refusals, which is the single thing these assertions
-#                  exist to catch.
+#                  exist to catch.  This one is the reason the section below did
+#                  not simply lose its waiting when the lag did.
 #
 # Neither is a sleep standing in for a tick.  The first ends on the counter
 # itself; the second waits out an interval the worker's own publisher is
@@ -349,16 +351,17 @@ def counters(*names):
 #
 # This was `PUBLISH_INTERVAL = 0.25  # proxy_worker.cpp: stats_interval` and a
 # SETTLE of four of them.  A second copy of a constant that lives in C++, and it
-# drifted the moment that constant stopped being a constant: the publish now
-# backs off to 900 ms while nothing changes, so 1.0 s stopped being four
-# intervals and became one.  The after-reading then landed on a publish that
-# still carried the previous phase's bytes, and `unchanged` reported
-# 268 -> 366 -- a real increment the old timing had been hiding, in a test whose
-# whole subject is whether an increment happened.
+# drifted the moment that constant stopped being a constant: the publish backed
+# off to 900 ms while nothing changed, so 1.0 s stopped being four intervals and
+# became one.  The after-reading then landed on a publish that still carried the
+# previous phase's bytes, and `unchanged` reported 268 -> 366 -- a real
+# increment the old timing had been hiding, in a test whose whole subject is
+# whether an increment happened.
 #
-# The fix is not a bigger number.  `stats` prints figures_age_ms, so a reader can
-# ask directly for a sample TAKEN after the moment it cares about, which is what
-# lib_ready.sh's ready_conns does and what makes it correct at any cadence.
+# The fix was not a bigger number then and is not one now.  There is no publish
+# interval left to copy -- the counters are summed at print time -- so what a
+# reader waits on is the counter itself, which is what counters_quiet() below
+# does and what makes it correct whatever the worker's cadence is.
 SETTLE_TIMEOUT   = 8.0       # only a bound on waiting for a fresh sample
 BOUND            = 5.0       # give-up, so a counter that never moves still fails
 
@@ -403,15 +406,15 @@ def counters_grown(baseline, *names):
 def counters_settled(*names):
     """Read a sample every named runtime took AFTER this call was entered.
 
-    Not a sleep: the worker publishes on its own schedule and that schedule is
-    deliberately not fixed.  figures_age_ms is the interval between the worker
-    reading its counters and the daemon printing them, so `now - age` is the
-    instant the figure describes, and requiring that instant to be later than
-    the moment this function was entered is exactly the claim the caller needs.
+    Every runtime now satisfies that by construction: the figures are summed out
+    of shared memory at the instant `stats` prints them, so the sample IS the
+    read.  _sample_instant() therefore answers `now` for every runtime and this
+    returns on its first pass.
 
-    A runtime with no figures_age_ms is answered in the daemon, where the
-    counters are read as they are printed -- that figure postdates the call by
-    construction and is taken as it stands."""
+    Kept, and kept called, rather than deleted.  It is the seam where a build
+    that put a pushed figure back -- a cached aggregate, a periodic refresh --
+    would have to declare an age again, and a caller that had stopped asking
+    would not notice.  The cost of that is one comparison per phase."""
     start = time.monotonic()
     deadline = start + SETTLE_TIMEOUT
     while time.monotonic() < deadline:
@@ -427,10 +430,16 @@ def counters_settled(*names):
 
 
 def _sample_instant(name, now):
-    """When the runtime's published figures were taken, on time.monotonic()'s
-    scale.  `now` is passed in, read before the round trip, so the arithmetic can
-    only ever place the sample earlier than it really was -- erring towards
-    waiting one more turn rather than accepting a stale read."""
+    """When the runtime's figures were taken, on time.monotonic()'s scale.
+
+    `now` is passed in, read before the round trip, so the arithmetic can only
+    ever place the sample earlier than it really was -- erring towards waiting
+    one more turn rather than accepting a stale read.
+
+    No runtime prints an age any more, in the daemon or in a worker, so this
+    answers `now` for all of them.  The figures_age_ms branch is left in place
+    deliberately: it is what a build that reintroduced a pushed figure would
+    print, and this is the one reader that would act on it."""
     try:
         out = subprocess.run([binary, "stats", name], capture_output=True,
                              text=True, timeout=20).stdout
@@ -442,7 +451,7 @@ def _sample_instant(name, now):
                 return now - int(line.split(":", 1)[1]) / 1000.0
             except ValueError:
                 return now
-    return now        # in-daemon runtime: read at print time
+    return now        # no age printed: read at print time, wherever it lives
 
 
 def read_response(s):
