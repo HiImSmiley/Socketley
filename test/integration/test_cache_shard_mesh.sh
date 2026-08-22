@@ -114,6 +114,62 @@ else
 fi
 
 "$BIN" stop meshc >/dev/null 2>&1; sleep 0.3; "$BIN" remove meshc >/dev/null 2>&1
+
+# ── eight shards: 56 links, and the assertion four shards cannot make ────
+#
+# The link for sibling j sits at a fixed descriptor slot, child_mesh_base + j.
+# At four shards the widest slot in use is base+3; an arithmetic or ordering
+# defect in that block can sit entirely inside the range four shards exercise
+# and still be wrong for eight.
+#
+# So the assertion here is not "the total is above zero" — that stays true while
+# one shard is deaf and the other seven carry it.  It is that EVERY shard
+# reports a direct crossing.  A single shard stuck at zero while its siblings
+# work is precisely the shape of a mis-wired slot, and it is invisible in a sum.
+"$BIN" create cache meshc -p "$PORT" --shards 8 --resp -s >/dev/null 2>&1
+for i in $(seq 1 80); do
+    redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.25
+done
+for i in $(seq 1 120); do redis-cli -p "$PORT" SET "z$i" "u$i" >/dev/null 2>&1; done
+MISS=0
+for i in $(seq 1 120); do
+    [ "$(redis-cli -p "$PORT" GET "z$i" 2>/dev/null)" = "u$i" ] || MISS=$((MISS+1))
+done
+[ "$MISS" -eq 0 ] && ok "eight shards read every key back (120/120)" \
+    || bad "eight shards read every key back" "$MISS of 120 missing"
+
+sleep 3
+ST8=$("$BIN" stats meshc 2>&1 || true)
+SHARDS8=$(printf '%s\n' "$ST8" | grep -c '^\[shard')
+# The denominator has to be counted, not assumed.  A shard that reports NO
+# mesh_direct line at all contributes nothing to SILENT, so without this the
+# "none silent" check passes precisely when a shard has gone missing -- which
+# the mesh-off run exposed by reporting 7 of 8 where 8 were expected.
+LINES8=$(printf '%s\n' "$ST8" | grep -c '^mesh_direct:')
+SILENT=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_direct:/ && $2+0 == 0 {n++} END{print n+0}')
+D8=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_direct:/  {s+=$2} END{print s+0}')
+R8=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_relayed:/ {s+=$2} END{print s+0}')
+
+if [ "$SHARDS8" -eq 8 ]; then
+    ok "eight shards came up (stats reports $SHARDS8)"
+else
+    bad "eight shards came up" "stats reports $SHARDS8 shard sections, expected 8"
+fi
+if [ "$SHARDS8" -eq 8 ] && [ "$LINES8" -eq "$SHARDS8" ] && [ "$SILENT" -eq 0 ] && [ "$D8" -gt 0 ]; then
+    ok "every one of the eight crossed directly ($D8 direct over $LINES8 shards, none silent)"
+else
+    bad "every one of the eight crossed directly" \
+        "$SHARDS8 shard sections but $LINES8 mesh_direct lines;" \
+        "$SILENT of those report 0 while the total is $D8;" \
+        "a sum above zero stays true while one slot is mis-wired and its shard is deaf"
+fi
+if [ "$R8" -eq 0 ]; then
+    ok "eight shards, nothing fell back (relayed $R8)"
+else
+    bad "eight shards, nothing fell back" "$R8 of $((D8+R8)) relayed"
+fi
+
+"$BIN" stop meshc >/dev/null 2>&1; sleep 0.3; "$BIN" remove meshc >/dev/null 2>&1
 daemon_stop
 
 # ── the arm every measurement compares against ─────────────────────────────

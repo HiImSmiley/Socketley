@@ -384,7 +384,7 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
 // Half the soft limit, less headroom for the listeners, rings and control
 // sockets the daemon already holds.  On this box the soft limit is 1,048,576,
 // so the cap cannot fire at any legal shard count; the branch is exercised by
-// lowering the limit, which test/integration/pending_cache_shard_mesh.sh does.
+// lowering the limit, which test/integration/test_cache_shard_mesh.sh does.
 bool daemon_handler::mesh_fits(size_t shards) const
 {
     // The measurement control.

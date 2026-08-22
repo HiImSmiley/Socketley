@@ -92,6 +92,15 @@
 //
 // ─── WHAT IS NOT HERE, NAMED RATHER THAN LEFT TO BE FOUND ───────────────────
 //
+// TLS is not here, and does not belong here.  The links are socketpair ends
+// between sibling processes of one runtime on one host under one uid -- there
+// is no network path to encrypt and no second party to authenticate.  Note
+// that runtime_instance::get_mesh_tls_paths() is NOT about this file: it is
+// the PROXY's backend leg (--client-ca / --client-cert / --client-key), a
+// different feature that happens to share the word "mesh".  Reading that
+// virtual as coverage this file lacks is the mistake this paragraph exists to
+// prevent.
+//
 // A link cannot be re-established.  The descriptors are socketpair ends placed
 // at fork, and a socketpair cannot be re-attached to a process that did not
 // inherit it -- so a shard that dies and is restarted by its supervisor comes
