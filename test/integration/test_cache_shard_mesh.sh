@@ -146,6 +146,13 @@ SHARDS8=$(printf '%s\n' "$ST8" | grep -c '^\[shard')
 # "none silent" check passes precisely when a shard has gone missing -- which
 # the mesh-off run exposed by reporting 7 of 8 where 8 were expected.
 LINES8=$(printf '%s\n' "$ST8" | grep -c '^mesh_direct:')
+# Eight shards means seven siblings each, so the link count is a fact with an
+# exact expected value rather than a threshold.  It is also the assertion that
+# says WHY a shard is silent: mesh_direct 0 is equally true of a shard that
+# never connected and one that simply had no crossing to make, while
+# mesh_links 0 can only be the first.
+WRONGLINKS=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_links:/ && $2+0 != 7 {n++} END{print n+0}')
+LINKLINES=$(printf '%s\n' "$ST8" | grep -c '^mesh_links:')
 SILENT=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_direct:/ && $2+0 == 0 {n++} END{print n+0}')
 D8=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_direct:/  {s+=$2} END{print s+0}')
 R8=$(printf '%s\n' "$ST8" | awk -F: '/^mesh_relayed:/ {s+=$2} END{print s+0}')
@@ -159,9 +166,16 @@ if [ "$SHARDS8" -eq 8 ] && [ "$LINES8" -eq "$SHARDS8" ] && [ "$SILENT" -eq 0 ] &
     ok "every one of the eight crossed directly ($D8 direct over $LINES8 shards, none silent)"
 else
     bad "every one of the eight crossed directly" \
-        "$SHARDS8 shard sections but $LINES8 mesh_direct lines;" \
-        "$SILENT of those report 0 while the total is $D8;" \
+        "$SILENT of $LINES8 shards report mesh_direct 0; total is $D8" \
+        "($SHARDS8 shard sections, $LINES8 counter lines -- unequal means a shard reported nothing)" \
         "a sum above zero stays true while one slot is mis-wired and its shard is deaf"
+fi
+if [ "$LINKLINES" -eq 8 ] && [ "$WRONGLINKS" -eq 0 ]; then
+    ok "each of the eight holds seven links (8 sections, 8 counters)"
+else
+    bad "each of the eight holds seven links" \
+        "$LINKLINES mesh_links lines over $SHARDS8 shard sections," \
+        "$WRONGLINKS of them not equal to 7"
 fi
 if [ "$R8" -eq 0 ]; then
     ok "eight shards, nothing fell back (relayed $R8)"

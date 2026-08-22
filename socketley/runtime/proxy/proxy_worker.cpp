@@ -756,10 +756,21 @@ private:
         // say which happened.  Appended to the detail the worker already sends
         // rather than added to the frame, because the frame is a contract
         // between two builds and this is a figure.
-        if (!m_mesh_sinks.empty())
+        // Unconditionally, including the shard that has no links at all.
+        //
+        // These used to be inside `if (!m_mesh_sinks.empty())`, which made the
+        // ABSENCE of a line the signal for "this shard never connected" -- the
+        // one state the counters exist to expose, reported by silence.  Every
+        // reader that sums the lines, including this tree's own test, read a
+        // missing shard as a zero and could not tell it from a quiet one.
+        //
+        // mesh_links is here for the same reason: 0 says so out loud, where a
+        // reader would otherwise have to infer it from two counters that are
+        // also 0 on a mesh that is merely idle.
         {
             uint64_t direct = 0, relayed = 0;
             mesh_counts(direct, relayed);
+            s.detail += "mesh_links:"   + std::to_string(m_mesh_sinks.size()) + "\n";
             s.detail += "mesh_direct:"  + std::to_string(direct)  + "\n";
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
         }
