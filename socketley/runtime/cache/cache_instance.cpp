@@ -7187,22 +7187,15 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
 // ─── Stats ───
 
-std::string cache_instance::get_stats() const
+// The cache-specific half of `stats`.  Every figure below is a walk of a store
+// that only this process's thread may walk, which is why it is the part a
+// worker still pushes: rebuilding it in the daemon reads the placeholder's own
+// empty store and answers confidently, printing keys:0 and
+// commands_processed:0 for a cache that had just served five SETs.
+std::string cache_instance::stats_extra() const
 {
-    // Out-of-process: the text was built by the worker, walking a store that
-    // only the worker's thread may walk.  Returning it verbatim is what makes
-    // `stats` answer identically on both paths — rebuilding it here from this
-    // placeholder's own empty store is the wrong answer, and a confident one:
-    // it printed keys:0 and commands_processed:0 for a cache that had just
-    // served five SETs.  Same reasoning, same two lines, as
-    // proxy_instance::get_stats().
-    if (worker_backed())
-        return stat_detail_snapshot();
-
-    std::string base = runtime_instance::get_stats();
     std::ostringstream out;
-    out << base
-        << "keys:" << m_store.size() << "\n"
+    out << "keys:" << m_store.size() << "\n"
         << "commands_processed:" << m_stat_commands << "\n"
         << "get_hits:" << m_stat_get_hits << "\n"
         << "get_misses:" << m_stat_get_misses << "\n"

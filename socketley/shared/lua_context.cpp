@@ -3972,10 +3972,14 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
         // two members of one API disagreeing about one number is worse than
         // either answer on its own.  See register_server_table above.
         t["connections"] = static_cast<size_t>(proxy->shard_connection_count());
-        t["bytes_in"] = proxy->m_stat_bytes_in.load(std::memory_order_relaxed);
-        t["bytes_out"] = proxy->m_stat_bytes_out.load(std::memory_order_relaxed);
-        t["total_connections"] = proxy->m_stat_total_connections.load(std::memory_order_relaxed);
-        t["total_messages"] = proxy->m_stat_total_messages.load(std::memory_order_relaxed);
+        // worker_figures(), not the four atomics: for a runtime in a worker
+        // these are summed out of the shared table at this instant, which is
+        // what makes a script's answer the same one `stats` prints.
+        const shard_stats::figures f = proxy->worker_figures();
+        t["bytes_in"] = f.bytes_in;
+        t["bytes_out"] = f.bytes_out;
+        t["total_connections"] = f.total_connections;
+        t["total_messages"] = f.total_messages;
         auto addrs = proxy->lua_backends();
         t["backend_count"] = addrs.size();
         return t;

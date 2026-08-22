@@ -9680,22 +9680,17 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     return false;
 }
 
-std::string proxy_instance::get_stats() const
+// The proxy-specific half of `stats`.  Every figure below is a walk of THIS
+// process's tables — pooled connections, healthy backends, open breakers — so
+// there is no version of it the daemon could compute for a runtime living in a
+// worker, which is why it is the part that still crosses the socket while the
+// counters above it no longer do.
+std::string proxy_instance::stats_extra() const
 {
-    // Out-of-process: the text was built by the worker, on the worker's
-    // event-loop thread, walking the connection tables that only that thread
-    // may walk.  Returning it verbatim is what makes `stats` and `inspect`
-    // answer identically on both paths — and rebuilding it here from this
-    // object's own empty containers is precisely the wrong answer.
-    if (worker_backed())
-        return stat_detail_snapshot();
-
-    std::string base = runtime_instance::get_stats();
     // Use char buffer for integer formatting to avoid ostringstream overhead in stats path
     char num_buf[32];
     std::string out;
-    out.reserve(base.size() + 256);
-    out += base;
+    out.reserve(256);
 
     out += "backend_connections:";
     auto [p1, e1] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_backend_count);

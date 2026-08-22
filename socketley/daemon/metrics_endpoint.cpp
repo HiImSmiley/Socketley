@@ -354,12 +354,18 @@ std::string metrics_endpoint::build_metrics() const
             // event loop rehashes it is undefined, not just out of date.
             // Published every 2 s by the event-loop thread, so this is up to
             // that much older than the truth on top of the response cache.
+            //
+            // For a runtime in a WORKER it is neither: worker_figures() sums
+            // that runtime's shared table on this call, which is as safe on this
+            // thread as reading an atomic and is what the worker stored at the
+            // end of its last loop turn.
+            const shard_stats::figures f = rt->worker_figures();
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
-                rt->m_stat_total_connections.load(std::memory_order_relaxed),
-                rt->m_stat_total_messages.load(std::memory_order_relaxed),
-                rt->m_stat_bytes_in.load(std::memory_order_relaxed),
-                rt->m_stat_bytes_out.load(std::memory_order_relaxed),
-                static_cast<size_t>(rt->m_stat_active_connections.load(std::memory_order_relaxed))});
+                f.total_connections,
+                f.total_messages,
+                f.bytes_in,
+                f.bytes_out,
+                static_cast<size_t>(f.active_connections)});
         }
     }
 
@@ -497,12 +503,14 @@ std::string metrics_endpoint::build_json_overview() const
         runtimes_total = runtimes.size();
         for (const auto& [name, rt] : runtimes)
         {
-            total_connections += rt->m_stat_total_connections.load(std::memory_order_relaxed);
-            total_messages += rt->m_stat_total_messages.load(std::memory_order_relaxed);
-            total_bytes_in += rt->m_stat_bytes_in.load(std::memory_order_relaxed);
-            total_bytes_out += rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-            // Published, not live — see build_metrics().
-            active_connections += rt->m_stat_active_connections.load(std::memory_order_relaxed);
+            // Published, not live — see build_metrics().  For a runtime in a
+            // worker, summed out of its shared table at this instant.
+            const shard_stats::figures f = rt->worker_figures();
+            total_connections += f.total_connections;
+            total_messages    += f.total_messages;
+            total_bytes_in    += f.bytes_in;
+            total_bytes_out   += f.bytes_out;
+            active_connections += f.active_connections;
             if (rt->get_state() == runtime_running) running_count++;
         }
     }
@@ -551,13 +559,14 @@ std::string metrics_endpoint::build_json_runtimes() const
         for (const auto& [name, rt] : runtimes)
         {
             // Published, not live — see build_metrics().
+            const shard_stats::figures f = rt->worker_figures();
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
                 rt->get_port(),
-                rt->m_stat_total_connections.load(std::memory_order_relaxed),
-                rt->m_stat_total_messages.load(std::memory_order_relaxed),
-                rt->m_stat_bytes_in.load(std::memory_order_relaxed),
-                rt->m_stat_bytes_out.load(std::memory_order_relaxed),
-                static_cast<size_t>(rt->m_stat_active_connections.load(std::memory_order_relaxed))});
+                f.total_connections,
+                f.total_messages,
+                f.bytes_in,
+                f.bytes_out,
+                static_cast<size_t>(f.active_connections)});
         }
     }
 
@@ -617,16 +626,18 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += "\",\"port\":";
     json_append_uint(j, rt->get_port());
     j += ",\"connections\":";
-    // Published, not live — see build_metrics().
-    json_append_uint(j, rt->m_stat_active_connections.load(std::memory_order_relaxed));
+    // Published, not live — see build_metrics().  For a runtime in a worker,
+    // summed out of its shared table at this instant.
+    const shard_stats::figures f = rt->worker_figures();
+    json_append_uint(j, f.active_connections);
     j += ",\"messages_total\":";
-    json_append_uint(j, rt->m_stat_total_messages.load(std::memory_order_relaxed));
+    json_append_uint(j, f.total_messages);
     j += ",\"connections_total\":";
-    json_append_uint(j, rt->m_stat_total_connections.load(std::memory_order_relaxed));
+    json_append_uint(j, f.total_connections);
     j += ",\"bytes_in\":";
-    json_append_uint(j, rt->m_stat_bytes_in.load(std::memory_order_relaxed));
+    json_append_uint(j, f.bytes_in);
     j += ",\"bytes_out\":";
-    json_append_uint(j, rt->m_stat_bytes_out.load(std::memory_order_relaxed));
+    json_append_uint(j, f.bytes_out);
 
     // Add detailed stats if available.
     //

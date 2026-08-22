@@ -659,7 +659,7 @@ public:
     void set_on_proxy_response(proxy_hook cb);
 
     // Stats
-    std::string get_stats() const override;
+    std::string stats_extra() const override;
 
     // Lua API
     std::string lua_peer_ip(int client_fd);

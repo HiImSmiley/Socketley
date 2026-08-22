@@ -816,16 +816,19 @@ inline bool decode_cluster_view(std::string_view payload, cluster_view& v)
     return r.ok;
 }
 
-// ── How often a worker publishes, and why the daemon needs the number ───────
+// ── The floor on how often a worker may publish ─────────────────────────────
 //
-// The worker's own publish timer, and the floor the daemon coalesces its
-// runtime-map pushes to.  One constant, because the two have to agree: the map
-// carries the connection counts, the counts arrive in these frames, and a
-// daemon coalescing on a different period than the one new figures arrive at is
-// either sending the same numbers twice or holding new ones back.
+// Not a timer any more.  A worker publishes when the part of `stats` it alone
+// can compute has CHANGED, and this is the shortest interval two such publishes
+// may be — so a runtime under continuous traffic rebuilds its detail text four
+// times a second rather than once per completion, and an idle one publishes
+// nothing at all.
 //
-// It lived in proxy_worker.cpp, which is the one file the daemon cannot read it
-// from.
+// It is also the floor the daemon coalesces its runtime-map pushes to, and that
+// is why the number is here rather than in proxy_worker.cpp: the map carries
+// the connection counts, and a daemon coalescing on a different period than the
+// one figures move at is either sending the same numbers twice or holding new
+// ones back.
 inline constexpr int stats_interval_ms = 250;
 
 // ── Stats payload ───────────────────────────────────────────────────────────
@@ -836,21 +839,18 @@ inline constexpr int stats_interval_ms = 250;
 // off the event-loop thread, with the same prohibition on walking the
 // runtime's containers and more reason to respect it.
 //
-// ─── WHY THE MOMENT TRAVELS WITH THE FIGURES ────────────────────────────────
+// ─── WHY THERE IS NO LONGER A MOMENT TRAVELLING WITH THE FIGURES ────────────
 //
-// `stats` reports how old these are, and there is exactly one moment that can
-// honestly answer that: the one at which the worker read its counters.  Every
-// later moment the daemon has access to is contaminated by how long the frame
-// spent in the socket — which is not bounded by the publish interval but by how
-// often the daemon happens to drain, up to a full health tick.  Stamping it on
-// arrival made a figure that had been sitting unread for a second read as new,
-// and the label then said a stopped worker had published moments ago.
+// This frame used to carry the instant its counters were read, because `stats`
+// printed how old they were and only the worker could answer that honestly.
+// The counters are in shared memory now — see shard_stats.h — and are summed by
+// whoever prints them, so there is no interval between reading and printing and
+// nothing to date.  `figures:pushed` and `figures_age_ms` went with it.
 //
-// CLOCK_MONOTONIC is system-wide on Linux and the worker is a plain fork+exec
-// of the daemon, so the two processes count from the same zero and the
-// subtraction is meaningful across the boundary.  Wall-clock would not be: an
-// interval measured against a clock that steps reads as hours old or as
-// arriving from the future.
+// The counters that remain in this struct are the fallback for a runtime whose
+// region could not be created, and the reason the change test in push_stats()
+// notices a counter moving.  `detail` is the part of `stats` no shared counter
+// can carry: a walk of one process's own tables.
 
 struct stats_wire
 {
@@ -860,10 +860,6 @@ struct stats_wire
     uint64_t    bytes_out{0};
     uint64_t    active_connections{0};
     std::string detail;
-
-    // steady_clock nanoseconds at the instant the counters above were read, or
-    // 0 from a sender that predates the field.
-    uint64_t    taken_ns{0};
 };
 
 inline std::string encode_stats(const stats_wire& s)
@@ -875,13 +871,6 @@ inline std::string encode_stats(const stats_wire& s)
     put_u64(out, s.bytes_out);
     put_u64(out, s.active_connections);
     put_str(out, s.detail);
-    // Appended last, which is what makes it survive an upgrade in both
-    // directions: an old daemon reading a new worker's frame stops after the
-    // detail and never sees these eight bytes, and take_frame() has already
-    // consumed them by the payload length, so ignoring them costs it no
-    // synchronisation.  Inserting the field anywhere earlier would instead have
-    // that daemon read the stamp as a counter.
-    put_u64(out, s.taken_ns);
     return out;
 }
 
@@ -894,15 +883,11 @@ inline bool decode_stats(std::string_view payload, stats_wire& s)
     s.bytes_out          = r.u64();
     s.active_connections = r.u64();
     s.detail             = std::string(r.str());
-    if (!r.ok)
-        return false;
-
-    // Optional, not truncation.  A worker forked from the binary that was on
-    // disk before this field existed sends a payload that ends at the detail,
-    // and a daemon that treated that as a short frame would drop every figure
-    // that worker ever reports — the whole of `stats` for that runtime, to gain
-    // a timestamp.  Absent means "not stamped"; the reader decides what to do.
-    s.taken_ns = r.left() >= 8 ? r.u64() : 0;
+    // Trailing bytes a newer sender appended are left where they are: the frame
+    // header carries the length, so take_frame() has already consumed them and
+    // ignoring them costs this reader no synchronisation.  That is what the
+    // timestamp this frame used to end with relied on, and it is still what a
+    // field added after `detail` would rely on.
     return r.ok;
 }
 

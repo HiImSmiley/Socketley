@@ -216,12 +216,6 @@ public:
         uint64_t    active_connections{0};
         std::string detail;
 
-        // The child's own steady_clock reading at the instant it took the
-        // counters above, or 0 from a child that predates the field.  See the
-        // note above stats_wire for why the age has to be measured from when
-        // they were read rather than from when this process drained them.
-        int64_t     taken_ns{0};
-
         // Whether this child has published at all.  A shard forked one turn ago
         // has no figures, and letting its zeros into the sum would report a
         // runtime as losing connections for the length of every restart.

@@ -483,7 +483,7 @@ public:
     void set_on_websocket(std::function<void(int fd, const ws_headers_result&)> cb);
 
     // Stats
-    std::string get_stats() const override;
+    std::string stats_extra() const override;
 
     // ── Client routing ──────────────────────────────────────────────────────
     //

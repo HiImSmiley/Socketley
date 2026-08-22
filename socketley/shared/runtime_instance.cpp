@@ -1100,7 +1100,34 @@ std::string_view runtime_instance::get_ca_path() const { return m_ca_path; }
 
 // ─── Stats ───
 
+// ─── What `stats` prints, in the three pieces it is made of ─────────────────
+//
+// See the note above stats_prefix() in the header for why this is split.  The
+// order below is the order it has always printed in; each piece appends and
+// none of them knows what comes after it.
+
 std::string runtime_instance::get_stats() const
+{
+    // Out of process: the two halves come from two processes.  The prefix is
+    // this daemon's, computed now out of the shared table; the rest was built
+    // by the worker on its own event-loop thread — walking the connection
+    // tables that only that thread may walk — and pushed the last time it
+    // changed.  Rebuilding the second half here reads this placeholder's own
+    // empty containers, which is a confident wrong answer: it printed keys:0
+    // for a cache that had just served five SETs.
+    if (worker_backed())
+        return stats_prefix() + stat_detail_snapshot();
+
+    return stats_prefix() + stats_ring() + stats_extra();
+}
+
+// The counters, and nothing that needs a connection table walked.
+//
+// Every figure here is either configuration this process already holds or a
+// number worker_figures() can sum out of shared memory, which is what lets the
+// daemon print it for a runtime living somewhere else — at the instant it
+// prints, with no age to declare.
+std::string runtime_instance::stats_prefix() const
 {
     std::string out;
     out.reserve(256);
@@ -1110,6 +1137,8 @@ std::string runtime_instance::get_stats() const
         auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
         out.append(buf, static_cast<size_t>(ptr - buf));
     };
+
+    const shard_stats::figures f = worker_figures();
 
     out += "name:";
     out += m_name;
@@ -1123,30 +1152,35 @@ std::string runtime_instance::get_stats() const
     out += "\nconnections:";
     // Not get_connection_count(): see reported_connection_count(), which is the
     // same question asked in a way that survives the runtime living in a worker.
-    // A type that overrides get_stats() hands back the worker's whole text
-    // before reaching here; this covers the ones that do not, and any added
-    // later.
     append_u64(reported_connection_count());
     out += "\ntotal_connections:";
-    append_u64(m_stat_total_connections.load(std::memory_order_relaxed));
+    append_u64(f.total_connections);
     out += "\ntotal_messages:";
-    append_u64(m_stat_total_messages.load(std::memory_order_relaxed));
+    append_u64(f.total_messages);
     out += "\nbytes_in:";
-    append_u64(m_stat_bytes_in.load(std::memory_order_relaxed));
+    append_u64(f.bytes_in);
     out += "\nbytes_out:";
-    append_u64(m_stat_bytes_out.load(std::memory_order_relaxed));
+    append_u64(f.bytes_out);
+    out += '\n';
 
-    // ── How this runtime's I/O is running ───────────────────────────────────
-    // Read from the loop, not from what was asked for.  A runtime whose polling
-    // mode or CPU set can only be inferred from the command line that created it
-    // is one nobody can debug: the kernel refuses an SQPOLL ring on some
-    // configurations and a cpuset can refuse the pinning, and in both cases the
-    // request and the result differ with nothing on screen to say so.
-    //
-    // The three fields are the ring's, so an out-of-process runtime reports its
-    // worker's ring here — this string is built inside the worker and pushed —
-    // which is exactly the figure that is wanted once every runtime has one.
-    out += "\nsqpoll:";
+    return out;
+}
+
+// ── How this runtime's I/O is running ───────────────────────────────────────
+// Read from the loop, not from what was asked for.  A runtime whose polling
+// mode or CPU set can only be inferred from the command line that created it
+// is one nobody can debug: the kernel refuses an SQPOLL ring on some
+// configurations and a cpuset can refuse the pinning, and in both cases the
+// request and the result differ with nothing on screen to say so.
+//
+// The three fields are the ring's, so an out-of-process runtime reports its
+// worker's ring here — this piece is built inside the worker and pushed, which
+// is exactly the figure that is wanted, and is why it is NOT in the prefix the
+// daemon writes.
+std::string runtime_instance::stats_ring() const
+{
+    std::string out;
+    out += "sqpoll:";
     if (m_event_loop)
     {
         out += m_event_loop->sqpoll_enabled() ? "on"
@@ -1167,7 +1201,6 @@ std::string runtime_instance::get_stats() const
         out += "unknown\ncpus:unknown\nsq_thread_cpu:-";
     }
     out += '\n';
-
     return out;
 }
 

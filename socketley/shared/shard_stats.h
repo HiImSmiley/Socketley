@@ -73,7 +73,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
-inline constexpr uint32_t format_version = 1u;
+inline constexpr uint32_t format_version = 2u;
 
 // One shard's line.  Written by that shard and by nobody else; read by all of
 // them.
@@ -88,9 +88,35 @@ struct alignas(line_size) slot
 {
     std::atomic<uint64_t> generation;
     std::atomic<uint64_t> active_connections;
-    std::atomic<uint64_t> reserved[6];
+    std::atomic<uint64_t> total_connections;
+    std::atomic<uint64_t> total_messages;
+    std::atomic<uint64_t> bytes_in;
+    std::atomic<uint64_t> bytes_out;
+    std::atomic<uint64_t> reserved[2];
 };
 static_assert(sizeof(slot) == line_size);
+
+// Everything one process publishes about itself, in one struct so that the
+// writer cannot publish four of the five and the reader cannot forget to sum
+// one.  Every field is a number each process produces independently and that a
+// reader only ever ADDS — the property the whole mechanism rests on, and the
+// test a field has to pass before it may be put here.
+//
+// Not a snapshot: the five stores below are five independent releases and a
+// reader can land between any two of them.  That is deliberate and is what
+// keeps this wait-free.  What it costs is that `bytes_out` can be one turn
+// ahead of `total_messages` for a runtime under traffic, which is the same
+// thing that is true of the five separate atomics an in-daemon runtime reads.
+struct figures
+{
+    uint64_t active_connections{0};
+    uint64_t total_connections{0};
+    uint64_t total_messages{0};
+    uint64_t bytes_in{0};
+    uint64_t bytes_out{0};
+
+    bool operator==(const figures&) const = default;
+};
 
 struct alignas(line_size) header
 {
@@ -198,7 +224,11 @@ public:
     {
         if (!m_table || i >= max_shards)
             return;
-        m_table->slots[i].active_connections.store(0, std::memory_order_release);
+        m_table->slots[i].active_connections.store(0, std::memory_order_relaxed);
+        m_table->slots[i].total_connections.store(0, std::memory_order_relaxed);
+        m_table->slots[i].total_messages.store(0, std::memory_order_relaxed);
+        m_table->slots[i].bytes_in.store(0, std::memory_order_relaxed);
+        m_table->slots[i].bytes_out.store(0, std::memory_order_relaxed);
         m_table->slots[i].generation.store(0, std::memory_order_release);
     }
 
@@ -256,7 +286,68 @@ public:
         // this process.  Cleared before the generation is bumped, so a reader
         // never sees a live generation over a dead count.
         m_table->slots[index].active_connections.store(0, std::memory_order_relaxed);
+        m_table->slots[index].total_connections.store(0, std::memory_order_relaxed);
+        m_table->slots[index].total_messages.store(0, std::memory_order_relaxed);
+        m_table->slots[index].bytes_in.store(0, std::memory_order_relaxed);
+        m_table->slots[index].bytes_out.store(0, std::memory_order_relaxed);
         m_table->slots[index].generation.fetch_add(1, std::memory_order_release);
+        return true;
+    }
+
+    // ── daemon side, again: reading a region it made but does not write ─────
+    //
+    // The daemon holds the writable end of every region it created, and the
+    // placeholder instance for that runtime needs to READ it — `stats`, `ls`,
+    // the metrics thread and every Lua binding ask the placeholder, not the
+    // daemon_handler that owns the memfd.
+    //
+    // adopt() is not that: it claims a slot and bumps its generation, which is
+    // a shard saying "I am here".  The daemon is not a shard of anything, so it
+    // attaches with no slot at all — writable() stays false, publish() is a
+    // no-op it can never be made to do by accident, and every sum below works.
+    //
+    // The descriptor is DUPLICATED rather than adopted.  The region's owner is
+    // the daemon_handler's own shard_table and it outlives nothing here; two
+    // objects closing one descriptor is how a later `create()` on the owner
+    // comes to hand out a number this object has already closed.
+    bool attach_reader(int fd)
+    {
+        close();
+        if (fd < 0)
+            return false;
+
+        const int dup_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (dup_fd < 0)
+            return false;
+
+        struct stat st{};
+        if (::fstat(dup_fd, &st) < 0 || st.st_size != static_cast<off_t>(sizeof(table)))
+        {
+            ::close(dup_fd);
+            return false;
+        }
+
+        void* p = ::mmap(nullptr, sizeof(table), PROT_READ | PROT_WRITE,
+                         MAP_SHARED, dup_fd, 0);
+        if (p == MAP_FAILED)
+        {
+            ::close(dup_fd);
+            return false;
+        }
+
+        auto* t = static_cast<table*>(p);
+        if (t->h.magic.load(std::memory_order_acquire) != magic_value
+            || t->h.version.load(std::memory_order_relaxed) != format_version)
+        {
+            ::munmap(p, sizeof(table));
+            ::close(dup_fd);
+            return false;
+        }
+
+        m_fd    = dup_fd;
+        m_table = t;
+        m_index = invalid_index;          // reader: no slot, never writable
+        m_count = t->h.shard_count.load(std::memory_order_acquire);
         return true;
     }
 
@@ -276,6 +367,28 @@ public:
         m_table->slots[m_index].active_connections.store(n, std::memory_order_release);
     }
 
+    // This shard's whole line.  Five stores, no barrier heavier than a release
+    // each, and no call at all for a runtime with no region.
+    //
+    // One function rather than five setters because the caller is a loop turn
+    // and not a counter: the figures are read together at the end of a turn and
+    // published together, so a field added to `figures` is published by every
+    // existing call site without one of them being found and edited.
+    void publish(const figures& f)
+    {
+        if (!writable())
+            return;
+        slot& s = m_table->slots[m_index];
+        s.total_connections.store(f.total_connections, std::memory_order_relaxed);
+        s.total_messages.store(f.total_messages,       std::memory_order_relaxed);
+        s.bytes_in.store(f.bytes_in,                   std::memory_order_relaxed);
+        s.bytes_out.store(f.bytes_out,                 std::memory_order_relaxed);
+        // Last, and the only release of the five: active_connections is what
+        // every freshness assertion in the tree reads, so a reader that sees a
+        // new count also sees the counters that were taken with it.
+        s.active_connections.store(f.active_connections, std::memory_order_release);
+    }
+
     // Every shard's figure, added up.  Wait-free: a shard that is descheduled,
     // stopped or dead delays this by nothing — its slot holds whatever it last
     // said, and a shard the daemon has retired holds zero because the daemon
@@ -289,6 +402,42 @@ public:
         for (uint32_t i = 0; i < n; ++i)
             total += m_table->slots[i].active_connections.load(std::memory_order_acquire);
         return total;
+    }
+
+    // Every shard's whole line, added up.  Same wait-free property and the same
+    // reason it is one call: a reader that summed four of the five fields would
+    // print a runtime whose bytes_out did not match its own bytes_in.
+    figures sum() const
+    {
+        figures f;
+        if (!m_table)
+            return f;
+        const uint32_t n = m_count;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const slot& s = m_table->slots[i];
+            f.active_connections += s.active_connections.load(std::memory_order_acquire);
+            f.total_connections  += s.total_connections.load(std::memory_order_relaxed);
+            f.total_messages     += s.total_messages.load(std::memory_order_relaxed);
+            f.bytes_in           += s.bytes_in.load(std::memory_order_relaxed);
+            f.bytes_out          += s.bytes_out.load(std::memory_order_relaxed);
+        }
+        return f;
+    }
+
+    // Has any process ever attached to this region?  A slot's generation is
+    // bumped by adopt() and by nothing else, so this separates "every shard
+    // reports zero" from "no shard has reported yet" — the distinction the
+    // daemon needs before it prints a runtime's figures out of shared memory
+    // rather than out of the frame it used to wait for.
+    bool any_live() const
+    {
+        if (!m_table)
+            return false;
+        for (uint32_t i = 0; i < m_count; ++i)
+            if (m_table->slots[i].generation.load(std::memory_order_acquire) != 0)
+                return true;
+        return false;
     }
 
     // What one named shard last said.  For diagnostics and for the tests; the

@@ -5707,26 +5707,20 @@ bool server_instance::lua_send_to(int client_id, std::string_view msg)
     return send_to_client(client_id, msg);
 }
 
-std::string server_instance::get_stats() const
+// The server-specific half of `stats`.  peak_connections and the upstream
+// count are computed from a connection table that lives in whichever process
+// the runtime is in, so this is the part a worker still pushes; the counters
+// above it are summed out of shared memory by whoever prints them.
+//
+// The ring lines are in stats_ring() and are pushed with this one, which is
+// what keeps them the WORKER's: they depend on the worker being told the
+// daemon's ring policy — see proxy_supervisor::spawn().  Without that, the
+// worker reported its loop's configuration rather than the daemon's: pinned by
+// an inherited affinity mask while printing cpus:max.
+std::string server_instance::stats_extra() const
 {
-    // The worker's own text when there is a worker, as proxy_instance and
-    // cache_instance already do: peak_connections below is computed from a
-    // connection table that lives in the other process, so rebuilding it here
-    // reads the placeholder's empty one and prints 0 for a server with clients.
-    //
-    // This depends on the worker being told the daemon's ring policy — see
-    // proxy_supervisor::spawn().  Without that, handing back the worker's text
-    // also handed back its idea of `cpus` and `sqpoll`, which was its loop's
-    // configuration rather than the daemon's: pinned by an inherited affinity
-    // mask while reporting cpus:max.  Forwarding the policy is what makes the
-    // worker's answer the true one for every line, not just for the counters.
-    if (worker_backed())
-        return stat_detail_snapshot();
-
-    std::string base = runtime_instance::get_stats();
     std::ostringstream out;
-    out << base
-        << "peak_connections:" << m_stat_peak_connections << "\n"
+    out << "peak_connections:" << m_stat_peak_connections << "\n"
         << "mode:" << static_cast<int>(m_mode) << "\n"
         << "udp:" << (m_udp ? "true" : "false") << "\n";
     if (m_mode == mode_master)

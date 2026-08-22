@@ -323,7 +323,7 @@ public:
     std::string_view get_replication_target() const override { return m_replicate_target; }
 
     // Stats
-    std::string get_stats() const override;
+    std::string stats_extra() const override;
     uint64_t m_stat_commands{0};
     uint64_t m_stat_get_hits{0};
     uint64_t m_stat_get_misses{0};

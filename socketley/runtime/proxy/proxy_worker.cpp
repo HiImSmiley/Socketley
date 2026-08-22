@@ -67,22 +67,26 @@ constexpr int worker_mesh_base = 8;
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
-// How far the publish may back off while nothing changes.  See the block in the
-// worker loop for why this is not simply "publish on change".
+// ─── The ceiling on a wait that nothing is waiting for ──────────────────────
 //
-// 900 ms, and the number is not free.  test_worker_idle_cost.sh asserts that an
-// idle runtime's figures are no more than 1000 ms old, because figures_age_ms is
-// what ready_conns waits on, what `stats` prints, and the one signal an operator
-// has that a worker has wedged.  A first attempt capped at 2000 ms and that test
-// caught it at 1358 ms — correctly, and that is the contract being spent rather
-// than a bound being too tight.
+// Once the figures moved into shared memory the worker owes nobody a
+// heartbeat: the counters are summed by whoever prints them and the text that
+// is still pushed is pushed when it CHANGES.  A worker with an empty ring and
+// nothing to say therefore has no deadline at all, and the honest wait is
+// "until something happens".
 //
-// So the cap sits under the bound with room for the frame to land: 900 ms takes
-// 72% of the publishes off an idle worker where 2000 would have taken 87%, and
-// leaves the freshness guarantee exactly where it was.  The last 15% is
-// available to anyone willing to argue for a looser staleness contract; this
-// change is not that argument.
-constexpr auto stats_backoff_max = std::chrono::milliseconds(900);
+// poll_completions() has no such argument — a non-positive timeout means peek
+// and return — so the wait is a long finite one instead.  Thirty seconds is
+// 0.03 wakeups a second, which is under a thousandth of the 50 Hz this loop
+// used to run at and under a hundredth of the 4 Hz that replaced it.
+//
+// It is a backstop and not a schedule.  Nothing is known to need it: every
+// state in which the ring cannot end this wait on its own is enumerated at the
+// wait itself and each one clamps to ctl_fallback_ms.  It is here because that
+// enumeration is a claim about code that will keep changing, and the cost of
+// being wrong about it — a worker that sleeps through a frame for ever — is
+// out of proportion to 0.03 wakeups a second.
+constexpr int idle_wait_ms = 30000;
 
 // The longest the worker's loop will wait when it has no notification it can
 // trust — the two states named at the wait in run().  It is the constant that
@@ -361,32 +365,43 @@ public:
 
         auto last_stats = std::chrono::steady_clock::now();
 
-        // ─── THE PUBLISH IS THE LAST THING AN IDLE WORKER STILL PAYS FOR ────
+        // ─── THE PUBLISH WAS THE LAST THING AN IDLE WORKER PAID FOR ─────────
         //
-        // With the 20 ms poll gone, 93% of what an idle runtime costs is this
-        // 4 Hz publish: measured, 395.8 us/s per idle runtime of the 425 that
+        // With the 20 ms poll gone, 93% of what an idle runtime cost was a 4 Hz
+        // publish: measured, 395.8 us/s per idle runtime of the 425 that
         // remained.  Four frames a second, every one of them carrying the same
         // numbers as the last, for a runtime with nothing connected to it.
         //
-        // So the interval backs off while nothing moves and snaps back the
-        // instant something does.  A worker under any traffic at all publishes
-        // at the old cadence; one that has been idle converges on
-        // stats_backoff_max.
+        // It was a heartbeat and not a report.  lib_ready.sh's ready_conns used
+        // to wait until `now - figures_age_ms >= start` — until a sample existed
+        // that was TAKEN after the caller asked — and it asked that of runtimes
+        // whose value was already what it wanted.  So the frame had to keep
+        // arriving even when it said nothing, and on-change publishing was not
+        // available.
         //
-        // WHY NOT PUBLISH ONLY ON CHANGE.  Because the contract is not about
-        // the value.  lib_ready.sh's ready_conns waits until `now -
-        // figures_age_ms >= start` -- until a sample exists that was TAKEN
-        // after the caller asked -- and it asks that of runtimes whose value is
-        // already what it wants.  A pure on-change publish would leave those
-        // callers waiting for a heartbeat that the absence of change is
-        // precisely what delays.  The backoff keeps the heartbeat and only
-        // stretches it.
+        // The counters are in shared memory now, stored once per turn at the
+        // bottom of this loop and summed by whoever prints them, so there is no
+        // sample to be after anything: the answer is computed when the question
+        // is asked.  That removes the heartbeat's only reader, and the frame
+        // becomes what it always should have been — the part of `stats` that is
+        // NOT a summable counter, sent when it changes.
         //
-        // The cap is set where the freshness contract puts it — see
-        // stats_backoff_max.  It also bounds the safety pump below, which reads
-        // the control socket once per publish whatever the poll flag says, so
-        // stretching the publish stretches that bound too.
-        auto stats_cur = stats_interval;
+        // Which leaves the wakeup.  Nothing in this worker's address space can
+        // change while this worker is not running, so a turn in which the ring
+        // delivered no completion is a turn in which nothing can have become
+        // worth saying.  `stats_dirty` is that observation: the publish deadline
+        // exists only after a turn that did something, and an idle worker has no
+        // deadline and does not wake.
+        //
+        // WHAT THIS GIVES UP, stated because it is real: a figure that moves
+        // with the passage of time alone and without any completion would go
+        // unpublished until the next completion.  Every candidate was looked for
+        // and each one is driven by a timer that is itself an SQE in this ring —
+        // the Lua tick, health checks, key expiry, backend deadlines — so each
+        // arrives as a completion and marks the turn.  A future figure that is
+        // computed from the clock at read time would not, and would need to say
+        // so here.
+        bool stats_dirty = true;
 
         while (!m_done && !g_term_requested)
         {
@@ -458,15 +473,24 @@ public:
             // A poll_add is level-triggered on submit, so it completes at once
             // against a descriptor that is already readable, and no wakeup is
             // lost there.
+            //
+            // (e) There is no deadline at all.  Nothing has happened since the
+            //     last publish, so there is nothing to publish and no clock to
+            //     wait for; the wait is idle_wait_ms, which is a backstop and
+            //     not a schedule.  See the constant.
             const auto turn_now = std::chrono::steady_clock::now();
-            const auto since    = turn_now - last_stats;
-            int wait_ms = 0;
-            if (since < stats_cur)
-                wait_ms = static_cast<int>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        stats_cur - since).count()) + 1;   // round up: a
-                                                                // truncated 0
-                                                                // would spin
+            int wait_ms = idle_wait_ms;
+            if (stats_dirty)
+            {
+                const auto since = turn_now - last_stats;
+                wait_ms = 0;
+                if (since < stats_interval)
+                    wait_ms = static_cast<int>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            stats_interval - since).count()) + 1;   // round up:
+                                                            // a truncated 0
+                                                            // would spin
+            }
 
             // Before the ring exists poll_completions() returns at once no
             // matter what timeout it is handed, so the wait has to come from
@@ -484,7 +508,16 @@ public:
                 // needs no clamp — it ends with a completion.
                 if (!m_ctl_armed || m_writer.needs_retry())
                     wait_ms = std::min(wait_ms, ctl_fallback_ms);
-                m_loop.poll_completions(wait_ms);
+
+                // The turn did something exactly when the ring delivered
+                // something.  This is the whole of the activity test and it is
+                // taken HERE rather than inferred later from a counter that
+                // moved: a completion that changes nothing a reader can see —
+                // an accept immediately refused, a cancelled read — still ran
+                // code in this process, and the publish below is what decides
+                // whether it produced anything worth sending.
+                if (m_loop.poll_completions(wait_ms) > 0)
+                    stats_dirty = true;
 
                 // The bytes are in m_in, put there by the recv completion.
                 // Dispatching them here rather than in on_cqe() is deliberate
@@ -506,6 +539,12 @@ public:
                 wait_for_control(wait_ms, m_writer.pending());
                 if (!pump_control())
                     break;
+
+                // Unconditionally, for the window this branch covers: from the
+                // fork until on_config() builds the ring there is no runtime to
+                // have figures about, and the first publish is what tells the
+                // daemon this worker is answering for one.
+                stats_dirty = true;
             }
 
             // Whatever the socket would not take last turn.  A reply sitting
@@ -523,7 +562,7 @@ public:
                 arm_control();
 
             const auto now = std::chrono::steady_clock::now();
-            if (now - last_stats >= stats_cur)
+            if (stats_dirty && now - last_stats >= stats_interval)
             {
                 // ─── THE SAFETY PUMP THAT USED TO BE HERE, AND WHY IT IS NOT ─
                 //
@@ -547,14 +586,15 @@ public:
                 // on every turn and the only way to have no recv standing is a
                 // submission the ring refused, which the next turn resubmits.
 
-                // Doubling, not a jump to the cap: a runtime that goes quiet
-                // for one interval and then moves should not have paid a full
-                // cap's worth of staleness for it.
-                if (push_stats())
-                    stats_cur = stats_interval;
-                else if (stats_cur < stats_backoff_max)
-                    stats_cur = std::min(stats_cur * 2, stats_backoff_max);
-                last_stats = now;
+                // Cleared whether or not a frame went out.  push_stats()
+                // answers "was any of this new", and a turn whose work produced
+                // nothing a reader can see is a turn with nothing left to
+                // publish — asking again in 250 ms would only rebuild the same
+                // string and compare it against itself.  The next completion
+                // sets the flag again.
+                push_stats();
+                stats_dirty = false;
+                last_stats  = now;
             }
 
             // ── This shard's line, once per turn ────────────────────────────
@@ -578,13 +618,33 @@ public:
             // connected and asks how many there are would be answered from a
             // sibling's quarter-second-old figure.  A turn is microseconds.
             //
-            // Costs one virtual call and one release store for a sharded
-            // runtime, and one predictable branch for every runtime that is
-            // not — mapped() is false for all of them, and the whole tree
-            // before this change is all of them.
+            // ─── AND NOT ONLY THE CONNECTION COUNT ──────────────────────────
+            //
+            // Every figure `stats` prints that is a summable counter is stored
+            // here, because this is the clock they all belong on for the same
+            // reason: the daemon reads them when it prints, so whatever they say
+            // when this turn ends is what the next question is answered with.
+            // Four extra relaxed stores into a line this turn is already
+            // writing.
+            //
+            // mapped() is now true for every worker-backed runtime and not only
+            // for a sharded one — a region is made for each of them, see
+            // reconcile_proxy_workers().  For one shard the "sum" is one slot,
+            // which is the same number by a longer route and is what makes the
+            // sharded and unsharded cases one path.
             if (m_rt && m_rt->shard_stats_table().mapped())
-                m_rt->shard_stats_table().publish_active(
-                    static_cast<uint64_t>(m_rt->get_connection_count()));
+            {
+                shard_stats::figures f;
+                f.active_connections =
+                    static_cast<uint64_t>(m_rt->get_connection_count());
+                f.total_connections =
+                    m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
+                f.total_messages =
+                    m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
+                f.bytes_in  = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
+                f.bytes_out = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
+                m_rt->shard_stats_table().publish(f);
+            }
         }
 
         // ─── Past this line the guarantee has already done its job ──────────
@@ -740,13 +800,33 @@ private:
         // On the event-loop thread, which is the only thread allowed to walk
         // the proxy's connection tables.  Everything that leaves this process
         // is a copy taken here.
+        //
+        // ─── WHAT IS IN THIS FRAME AND WHAT IS NOT ──────────────────────────
+        //
+        // Not the prefix of `stats`.  name, port and the five counters are
+        // written by the daemon out of the shared table at the moment it
+        // prints — see runtime_instance::stats_prefix() — so sending them here
+        // would be a second answer to a question that already has one, and the
+        // one that is older.
+        //
+        // What is here is everything the daemon CANNOT compute: the ring's
+        // granted flags and this runtime's own type-specific figures, each of
+        // them a walk of tables that exist only in this process.
+        //
+        // The five counters still travel, and this is the one place they are
+        // duplicated.  They are the fallback for a worker whose daemon could
+        // not create a memfd region — logged at the daemon, see
+        // reconcile_proxy_workers() — where without them `stats` would report a
+        // runtime with no figures at all.  They are also what makes the change
+        // test below cover a counter moving, which is what keeps that fallback
+        // fed.
         worker_proto::stats_wire s;
         s.total_connections  = m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
         s.total_messages     = m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
         s.bytes_in           = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
         s.bytes_out          = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
         s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
-        s.detail             = m_rt->get_stats();
+        s.detail             = m_rt->stats_ring() + m_rt->stats_extra();
 
         // The two numbers that make a mesh measurement mean anything.
         //
@@ -775,20 +855,14 @@ private:
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
         }
 
-        // Stamped here, after the reads and before the write, because this is
-        // the moment the figures describe.  The daemon cannot recover it: what
-        // it can observe is when the frame came off the socket, which is later
-        // by however long nothing drained — up to a health tick, not up to a
-        // publish interval.  A frame that waits does not become newer.
-        s.taken_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count());
-
-        // Did anything the daemon can see actually move?  taken_ns is excluded
-        // on purpose: it changes every time by construction, so comparing it
-        // would make every publish "a change" and the backoff below would never
-        // engage.
+        // Did anything the daemon can see actually move?
+        //
+        // This used to decide how far the publish backed off.  It now decides
+        // whether there is a publish at all: an idle worker that was woken by
+        // something which changed nothing sends no frame, and a worker that is
+        // idle in the ordinary sense is not woken and does not reach here.
+        // There is nothing left in this struct that changes by itself — the
+        // timestamp that did is gone with the age it was for.
         const bool changed =
             !m_have_last
             || s.total_connections  != m_last_pub.total_connections
@@ -800,9 +874,16 @@ private:
         m_last_pub  = s;
         m_have_last = true;
 
+        // Only when it changed.  The daemon's copy is a copy of the last thing
+        // that was true, and re-sending it says nothing that its own record does
+        // not already say — which is exactly why the heartbeat could be removed
+        // and not merely slowed down.
+        if (!changed)
+            return false;
+
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::stats,
                                                  worker_proto::encode_stats(s)))) {}
-        return changed;
+        return true;
     }
 
     // Returns false when the control socket is gone, which is the worker's
@@ -1012,11 +1093,18 @@ private:
         // exactly the defect this exists to remove.
         //
         // The descriptor is at a fixed number the supervisor dup2'd it onto, or
-        // it is not there at all.  Absent is the ordinary case and not an
-        // error: it is every unsharded runtime, and every worker forked by a
-        // daemon that could not make a region.  fcntl is the cheapest way to
-        // ask whether a descriptor exists without disturbing it.
-        if (cfg.shards > 1 && ::fcntl(worker_shard_fd, F_GETFD, 0) >= 0)
+        // it is not there at all.  Absent is no longer the ordinary case — a
+        // region is made for every worker-backed runtime now, one shard or
+        // eight — but it is still not an error: it is a worker forked by a
+        // daemon that could not make one, which falls back to the figures in
+        // the stats frame.  fcntl is the cheapest way to ask whether a
+        // descriptor exists without disturbing it.
+        //
+        // No test on cfg.shards.  A one-shard runtime publishes into slot 0 of
+        // a one-slot table and the daemon sums one slot, which is the same
+        // number by a longer route and is the point: there is one path for the
+        // figures and not a sharded one beside an unsharded one.
+        if (::fcntl(worker_shard_fd, F_GETFD, 0) >= 0)
         {
             if (!m_rt->shard_stats_table().adopt(worker_shard_fd,
                                                  m_rt->get_shard_index()))

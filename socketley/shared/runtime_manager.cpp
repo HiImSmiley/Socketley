@@ -124,7 +124,7 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
             // figure here for the same reason it does there.  The detail text is
             // empty because a replica has none: `stats` is a command the daemon
             // serves, not something a script reads off the map.
-            inst->set_worker_stats({}, e.connections, 0);
+            inst->set_worker_stats({}, e.connections);
         }
 
         // Whatever the daemon no longer has.  Collected first because erasing

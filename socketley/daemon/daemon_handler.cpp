@@ -3967,30 +3967,22 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
         {
             conn->write_buf += inst->get_stats();
 
-            // Say how old these are when they were not read here.
+            // ─── THERE IS NO AGE TO PRINT HERE ANY MORE ─────────────────
             //
-            // Every figure above is identical whichever side the runtime runs
-            // on — that is the property the split was built to have — and that
-            // is exactly what makes the difference invisible: an in-process
-            // runtime's counters are read at this instant, a worker's were
-            // pushed up to a quarter of a second ago and drained by the
-            // poll_proxy_workers() above.  The values agree; their age does not,
-            // and an operator comparing a proxy's byte count against a backend's
-            // has no way to know which of the two they are holding.
+            // `figures:pushed` and `figures_age_ms` used to follow this, and
+            // they were honest: a worker's counters were pushed on a 250 ms
+            // timer, so they were up to a quarter second old and an operator
+            // comparing a proxy's byte count against a backend's had no way to
+            // know it.
             //
-            // Reported rather than removed: making it live would mean asking the
-            // child and waiting for the answer on this thread.  See
-            // runtime_instance::worker_stats_age_ms().
+            // The counters are summed out of shared memory now, by the
+            // stats_prefix() the line above just built — at this instant, on
+            // this thread, from lines each worker stores into once per loop
+            // turn.  There is no interval left between the reading and the
+            // printing, so a figure that stated one would be inventing it.
             //
-            // Only for a runtime that has actually reported.  An in-process one
-            // never prints these lines, so nothing that reads `stats` today sees
-            // a new field appear.
-            if (inst->worker_backed())
-            {
-                conn->write_buf += "figures:pushed\nfigures_age_ms:";
-                conn->write_buf += std::to_string(inst->worker_stats_age_ms());
-                conn->write_buf += '\n';
-            }
+            // Nothing needs the label to know a worker is elsewhere: `pid:` and
+            // `shard_pids:` below say so, and say where.
 
             // Which process this runtime is actually in.
             //
@@ -4984,12 +4976,17 @@ void daemon_handler::poll_proxy_workers()
 // which is why apply_stats() stopped writing the placeholder — see the note
 // there.
 //
-// The four lifetime counters add up because each shard has only ever counted
-// its own connections, and the active count adds up for the same reason.  The
-// timestamp does NOT: it is a moment, and the honest answer to "how old is this
-// figure" for a total is the age of its OLDEST part, because that is the last
-// instant the whole of it was true.  Taking the newest would let one busy shard
-// make three stale siblings look current.
+// ─── AND WHY THIS IS NO LONGER WHERE THE FIGURES COME FROM ──────────────────
+//
+// The five counters are summed out of the shared region instead, by whoever
+// prints them — see runtime_instance::worker_figures().  What is summed here is
+// the same arithmetic over the frames, and it is the FALLBACK: it is what
+// `stats` reports for a runtime whose memfd region could not be created, which
+// is logged where the attempt failed.  The two cannot both be in force for one
+// runtime: worker_figures() prefers the region whenever it is mapped.
+//
+// It is also still where the detail TEXT is assembled, for every runtime,
+// region or no region.  That part was never summable.
 //
 // A shard that has not published yet contributes nothing at all rather than
 // zeros.  Otherwise every restart — and every `create -s`, for the moments
@@ -5006,7 +5003,6 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         return;
 
     uint64_t total_conn = 0, total_msg = 0, in = 0, out = 0, active = 0;
-    int64_t  oldest     = 0;
     bool     any        = false;
     std::string detail;
 
@@ -5022,9 +5018,6 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         in          += s.bytes_in;
         out         += s.bytes_out;
         active      += s.active_connections;
-
-        if (s.taken_ns != 0 && (oldest == 0 || s.taken_ns < oldest))
-            oldest = s.taken_ns;
 
         // One shard's detail text is passed through unchanged, which is the
         // whole of the unsharded case and keeps `stats` byte-identical to what
@@ -5052,7 +5045,7 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
     // Where an in-process runtime's would be, so stat_detail_snapshot() — which
     // the metrics endpoint already calls — is answered identically whichever
     // side the runtime is running on, and whether it is one process or four.
-    inst->set_worker_stats(std::move(detail), active, oldest);
+    inst->set_worker_stats(std::move(detail), active);
 }
 
 void daemon_handler::reconcile_proxy_workers()
@@ -5123,6 +5116,15 @@ void daemon_handler::reconcile_proxy_workers()
             // this — every process that had it mapped is being torn down — and
             // keeping it would hand a restarted runtime a table still holding
             // the counts of the shards it replaced.
+            //
+            // The placeholder's reader goes first.  It holds a DUPLICATED
+            // descriptor and its own mapping, so dropping the map entry does
+            // not disturb it: it would go on answering `stats` out of a table
+            // no process writes any more, which is a figure that can never
+            // change and looks exactly like one that has not. Closed here, so
+            // the runtime falls back to the last figures it actually reported.
+            if (auto* inst = m_manager.get(it->first))
+                inst->shard_stats_table().close();
             m_shard_regions.erase(it->first);
             m_shard_client_regions.erase(it->first);
             it = m_proxy_workers.erase(it);
@@ -5213,15 +5215,15 @@ void daemon_handler::reconcile_proxy_workers()
         // `self.connections()` is answering per-shard is written down somewhere.
         int shard_fd   = -1;
         int clients_fd = -1;
-        if (want_count > 1)
         {
             auto& region = m_shard_regions[name];
             if (!region.mapped())
             {
                 if (!region.create(static_cast<uint32_t>(want_count)))
-                    LOG_WARN(("could not create the shared shard table for "
+                    LOG_WARN(("could not create the shared figures table for "
                               + name
-                              + "; each shard will answer only for itself").c_str());
+                              + "; its figures will come from the frames it"
+                                " pushes instead").c_str());
             }
             else
             {
@@ -5232,6 +5234,28 @@ void daemon_handler::reconcile_proxy_workers()
             }
             shard_fd = region.fd();
 
+            // ── And the daemon's own way in ─────────────────────────────────
+            //
+            // `stats`, `ls`, the metrics thread and every Lua binding ask the
+            // PLACEHOLDER for this runtime's figures, not the map that owns the
+            // memfd.  So the placeholder gets a reader's mapping of the same
+            // region — no slot, never writable — and reported_connection_count()
+            // and worker_figures() answer out of it at the moment they are
+            // called.  That is the whole of "read at print time": there is no
+            // step between the worker's store and this daemon's load.
+            //
+            // Attached once.  A region that is already mapped here is the same
+            // region: create() is called only when the map has none, and a grow
+            // rewrites the header of a mapping this reader shares.
+            if (!inst->shard_stats_table().mapped() && region.mapped())
+                if (!inst->shard_stats_table().attach_reader(shard_fd))
+                    LOG_WARN(("could not attach to the shared figures table for "
+                              + name
+                              + "; its figures will come from the frames it"
+                                " pushes instead").c_str());
+        }
+        if (want_count > 1)
+        {
             // And the client list.  Same lifetime, same failure policy: a
             // region that cannot be made leaves each shard answering
             // self.clients() with its own connections, which is the behaviour

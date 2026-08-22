@@ -142,10 +142,14 @@ public:
     // instead of at each call site.
     size_t reported_connection_count() const
     {
-        return worker_backed()
-                   ? static_cast<size_t>(
-                         m_stat_active_connections.load(std::memory_order_relaxed))
-                   : get_connection_count();
+        if (!worker_backed())
+            return get_connection_count();
+        // Summed out of the shared table at this instant.  See worker_figures()
+        // for why there is no age to print beside it any more; the load below is
+        // the pre-region fallback, for a runtime whose memfd could not be made.
+        if (m_shard_stats.mapped())
+            return static_cast<size_t>(m_shard_stats.sum_active());
+        return static_cast<size_t>(m_stat_active_connections.load(std::memory_order_relaxed));
     }
 
     // Max connections
@@ -190,10 +194,73 @@ public:
     // synchronisation whatsoever.  Both are therefore EVENT-LOOP THREAD ONLY.
     // The four counters below are atomics and may be read from anywhere.
     virtual std::string get_stats() const;
+
+    // The three pieces get_stats() is made of, so that a runtime living in
+    // another process can be printed from the two ends that know each part.
+    //
+    // ─── WHY THIS IS SPLIT AT ALL ───────────────────────────────────────────
+    //
+    // Every figure in the prefix is a counter the daemon can now read at the
+    // instant it prints — they are summed out of shared memory, see
+    // worker_figures().  Everything after it is not: the ring's granted flags,
+    // a cache's key count, a proxy's healthy backends are facts about the
+    // worker's own address space, and the only process that can state them is
+    // the worker.
+    //
+    // So the worker publishes stats_ring() + stats_extra() and the daemon puts
+    // stats_prefix() in front of it.  An in-process runtime concatenates the
+    // same three in the same order, which is what keeps `stats` byte-identical
+    // on both sides — and what makes the seam a place where a stale number
+    // cannot hide, because the two halves are produced by different processes
+    // at different moments and the split says which is which.
+    std::string stats_prefix() const;
+    std::string stats_ring() const;
+    virtual std::string stats_extra() const { return {}; }
+
     std::atomic<uint64_t> m_stat_total_connections{0};
     std::atomic<uint64_t> m_stat_total_messages{0};
     std::atomic<uint64_t> m_stat_bytes_in{0};
     std::atomic<uint64_t> m_stat_bytes_out{0};
+
+    // ── The figures to REPORT, whichever process is holding them ────────────
+    //
+    // For a runtime in this process these are the four atomics above and the
+    // live connection count, and this costs what reading them costs.
+    //
+    // For a runtime in a worker they are a sum over the shared table — one
+    // cache line per shard, no lock, no round trip and no wait — and they are
+    // read HERE, at the moment somebody asks, rather than taken from a frame
+    // the worker pushed on a timer.  That is the whole of why the timer is
+    // gone: an answer that is computed when the question is asked has no age to
+    // report, so `figures:pushed` and `figures_age_ms` have nothing left to
+    // say.
+    //
+    // Called on any thread.  The metrics endpoint has its own std::thread and
+    // is one of the callers this exists for: summing atomics out of a shared
+    // mapping is exactly as safe there as reading this object's own.
+    shard_stats::figures worker_figures() const
+    {
+        // Mapped in the daemon for every worker-backed runtime, and in a worker
+        // for every sharded one.  The worker_backed() test is what keeps a
+        // worker reading its OWN counters here: its `stats` text is one shard's
+        // and is labelled as one shard's, and summing the runtime into it would
+        // report every shard's total under each shard's heading.
+        if (worker_backed() && m_shard_stats.mapped())
+            return m_shard_stats.sum();
+
+        // No region: the four counters are this object's own atomics, which for
+        // a worker-backed placeholder is where the frame path still writes
+        // them.  active_connections is the PUBLISHED count and not
+        // get_connection_count() — this runs on the metrics endpoint's thread,
+        // which may not walk a runtime's containers.
+        shard_stats::figures f;
+        f.active_connections = m_stat_active_connections.load(std::memory_order_relaxed);
+        f.total_connections  = m_stat_total_connections.load(std::memory_order_relaxed);
+        f.total_messages     = m_stat_total_messages.load(std::memory_order_relaxed);
+        f.bytes_in           = m_stat_bytes_in.load(std::memory_order_relaxed);
+        f.bytes_out          = m_stat_bytes_out.load(std::memory_order_relaxed);
+        return f;
+    }
 
     // ── Off-thread view ─────────────────────────────────────────────────────
     // What a reader that is not on the event-loop thread gets instead.
@@ -236,21 +303,33 @@ public:
         return m_stat_detail;
     }
 
-    // ── Figures pushed from a worker process ────────────────────────────────
+    // ── What a worker pushes, and what it no longer has to ──────────────────
+    //
     // When a runtime runs in its own process the daemon keeps a placeholder
     // instance for it — the thing that holds its name, port and state — and the
-    // placeholder has no connections of its own to count.  Its figures arrive
-    // over the control socket instead and land here.
+    // placeholder has no connections of its own to count.
     //
-    // They land in exactly the fields an off-thread reader already uses, and
-    // that is the point: the metrics endpoint reads m_stat_active_connections
-    // and stat_detail_snapshot() and needs no idea that the runtime is not in
-    // this address space.  A worker is the off-thread reader's case with the
-    // boundary made physical, so it reuses the answer rather than inventing a
-    // second one.
-    // `taken_ns` is the worker's steady-clock reading at the instant it read the
-    // counters, which travels with them; 0 from a sender that does not stamp.
-    void set_worker_stats(std::string detail, uint64_t active, int64_t taken_ns)
+    // ─── WHAT USED TO ARRIVE HERE, AND WHY IT DOES NOT ──────────────────────
+    //
+    // Every figure, four times a second, whether or not any of them had moved,
+    // together with the moment they were read so that `stats` could print how
+    // stale they were.  That timer was the last periodic thing an idle worker
+    // did, and it is gone: the counters live in a shared table the worker
+    // stores into once per loop turn and the daemon sums when it prints, so
+    // there is no interval left between the reading and the printing and
+    // nothing to report an age for.  See worker_figures().
+    //
+    // What still crosses the socket is the part of `stats` that is NOT a
+    // summable counter — a cache's key count, a proxy's healthy backends, the
+    // ring's granted flags — and it crosses only when it has changed, which for
+    // an idle runtime is never.  `active` is still carried with it because a
+    // region that could not be created is a case the daemon must survive: see
+    // the fallback in worker_figures().
+    //
+    // The text lands in exactly the field an off-thread reader already uses,
+    // and that is the point: the metrics endpoint reads stat_detail_snapshot()
+    // and needs no idea that the runtime is not in this address space.
+    void set_worker_stats(std::string detail, uint64_t active)
     {
         m_stat_active_connections.store(active, std::memory_order_relaxed);
         {
@@ -258,57 +337,10 @@ public:
             m_stat_detail = std::move(detail);
         }
 
-        // The worker's moment, not this one.  This line used to read steady_ns()
-        // — the instant the frame came off the socket — which is the same thing
-        // only when the daemon drains the moment the child writes.  It does not:
-        // it drains when a command asks or when the two-second health tick comes
-        // round, so a frame can sit unread for a second and more, and stamping
-        // it here declared it new.  Unstamped is the pre-upgrade worker, whose
-        // figures are still worth having; the read moment is then the closest
-        // honest answer available and it is a lower bound on the true age.
-        m_worker_stats_ns.store(taken_ns > 0 ? taken_ns : steady_ns(),
-                                std::memory_order_relaxed);
-
         // Published after the detail it promises, with a release so a reader
         // that sees the flag also sees the text.  Setting it first would let
         // the first `stats` after a worker starts print nothing at all.
         m_worker_backed.store(true, std::memory_order_release);
-    }
-
-    // How old these figures are, in milliseconds, or -1 when none has arrived.
-    //
-    // ─── WHY THIS IS REPORTED RATHER THAN REMOVED ───────────────────────────
-    //
-    // A worker's figures are pushed, not read.  Making them live would mean the
-    // daemon asking the child a question and waiting for the answer, on the
-    // event-loop thread, with a process it does not control on the other end —
-    // which is the synchronous cross-runtime call this design already answered
-    // no to everywhere else.  The child publishes every 250ms and the daemon
-    // drains the socket before any command that prints them, so the number is
-    // recent; what it is not is instantaneous, and the difference is invisible
-    // in every figure the CLI prints.  So it is stated.
-    //
-    // Not folded into the pushed detail text: that text is built by the worker
-    // and would then be reporting its own age at the moment it was written,
-    // which is always zero.  Age is the interval between two moments — the
-    // worker's read of its own counters and this read of them — and the first
-    // of the two therefore has to cross the socket as a value, because the
-    // daemon has no way to reconstruct it.  See stats_wire::taken_ns.
-    //
-    // What a large number means is a worker that has not published: stopped,
-    // wedged, or gone with the daemon not yet having noticed.  That is the
-    // reading this field exists to make possible, so nothing here bounds it.
-    long long worker_stats_age_ms() const
-    {
-        const int64_t at = m_worker_stats_ns.load(std::memory_order_relaxed);
-        if (at == 0)
-            return -1;
-        // Clamped, because the two moments are read on two processes' clocks:
-        // CLOCK_MONOTONIC is the same clock on both, but the frame is written
-        // before it is read only in the order the two syscalls happen, and a
-        // negative age is a number no operator can use.
-        const int64_t d = steady_ns() - at;
-        return d <= 0 ? 0 : static_cast<long long>(d / 1'000'000);
     }
 
     // True once a worker has reported at least once.  Read by the placeholder's
@@ -787,21 +819,6 @@ private:
     mutable std::mutex m_stat_detail_mutex;
     std::string m_stat_detail;
     std::atomic<bool> m_worker_backed{false};
-
-    // When the worker read the figures it last pushed, on the monotonic clock,
-    // or 0 for never.  Its clock, not this process's: see set_worker_stats().
-    // Monotonic and not wall-clock: this is an interval, and a wall clock that
-    // steps — ntp, a suspend — would report a figure as hours old or as arriving
-    // from the future.  Outside m_stat_detail_mutex on purpose, so that reading
-    // the age never has to wait behind a detail-string copy.
-    std::atomic<int64_t> m_worker_stats_ns{0};
-
-    static int64_t steady_ns()
-    {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    }
 
     std::string m_name;
     std::string m_id;
