@@ -307,7 +307,12 @@ check "CONN is the sum over shards" "$CONN" "8"
 
 # The oracle for the assertion above: no single shard is holding all eight, so
 # a build that reports one shard's figure cannot report 8 by accident.
-MAXSHARD=$("$BIN" stats ss_ok 2>/dev/null | awk -F: '/^connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
+# `shard_connections`, one line per shard, and NOT `connections`: that one is now
+# the runtime's own line and is the SUM, so an awk that matched it would read
+# busiest == 8 and fail this every time, on a build whose shards are sharing the
+# work perfectly.  The two names exist to keep the runtime's figure and a
+# shard's from being mistaken for one another — see aggregate_worker_stats().
+MAXSHARD=$("$BIN" stats ss_ok 2>/dev/null | awk -F: '/^shard_connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
 [[ "$MAXSHARD" -gt 0 && "$MAXSHARD" -lt 8 ]] \
     && ok "no single shard holds all 8 (busiest has $MAXSHARD) — the sum is a real sum" \
     || bad "one shard holds all 8 (busiest=$MAXSHARD); the sum assertion proves nothing this run"
