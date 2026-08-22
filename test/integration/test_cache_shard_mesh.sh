@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
 # Integration test: shard-to-shard links, and the two ways they can be absent.
 #
-# ─── WHY pending_ ──────────────────────────────────────────────────────────
+# ─── WHY THIS IS NO LONGER pending_ ────────────────────────────────────────
 #
-# `--shards` on a cache is still refused; build with
-# -DSOCKETLEY_SCRATCH_CACHE_SHARDS to run this.  It skips without it.
+# It was written while `--shards` on a cache was refused, and its header said to
+# build with -DSOCKETLEY_SCRATCH_CACHE_SHARDS.  That flag never existed in the
+# tree; what the test actually gates on is the `create` below succeeding, which
+# is a RUNTIME check and not a compile-time one -- so there was no stale-binary
+# hazard here, only a name that kept it out of run_all.sh's `test_*.sh` glob.
+#
+# --shards on a cache landed in 56fd722, so the gate now opens and the test
+# runs.  Renamed so the suite picks it up: a mesh that ships with a test nobody
+# runs is the same as a mesh with no test, and this file's whole argument is
+# that the correctness assertions cannot tell a working mesh from an absent one.
+#
+# Verified rather than assumed, on the mesh build with the mesh forced off:
+#
+#   PASS: every key reads back over the mesh (40/40)
+#   FAIL [crossings went shard-to-shard]: mesh_direct is 0
+#   FAIL [none of them fell back to the daemon]: 12 of 12 relayed
+#
+# The correctness assertion stays green with no mesh at all.  Only the route
+# assertions move, which is the reason they are the ones here.
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────
 #
