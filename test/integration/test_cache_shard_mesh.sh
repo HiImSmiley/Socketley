@@ -179,8 +179,19 @@ else
 fi
 if [ "$R8" -eq 0 ]; then
     ok "eight shards, nothing fell back (relayed $R8)"
+elif [ "$LINKLINES" -eq 8 ] && [ "$WRONGLINKS" -eq 0 ]; then
+    # Links are all present and correctly counted, so this is not a wiring
+    # fault -- it is the fallback doing its job.  Said explicitly because the
+    # assertion is strict on purpose and the next person to see it red on a
+    # busy box should not go looking for a defect in the mesh.
+    bad "eight shards, nothing fell back" \
+        "$R8 of $((D8+R8)) relayed, but all 8 shards hold their 7 links" \
+        "so the mesh is wired and this is the daemon fallback, not a link fault;" \
+        "a saturated box can produce it -- check load before suspecting the mesh"
 else
-    bad "eight shards, nothing fell back" "$R8 of $((D8+R8)) relayed"
+    bad "eight shards, nothing fell back" \
+        "$R8 of $((D8+R8)) relayed, and the link counts are wrong too" \
+        "($LINKLINES lines, $WRONGLINKS not equal to 7) -- this is a wiring fault"
 fi
 
 "$BIN" stop meshc >/dev/null 2>&1; sleep 0.3; "$BIN" remove meshc >/dev/null 2>&1
