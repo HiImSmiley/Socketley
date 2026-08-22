@@ -51,7 +51,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -70,6 +73,11 @@ namespace shard_stats
 // target that does not fails to build rather than fails to synchronise.
 static_assert(std::atomic<uint64_t>::is_always_lock_free,
               "shard_stats needs lock-free 64-bit atomics to cross a process boundary");
+
+// The name memfd_create() is given, and the reason it is a constant rather than
+// a literal at the call: it is also how a reader decides whether a descriptor
+// it was handed is one of these.  See looks_like_region().
+inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
@@ -139,6 +147,55 @@ struct table
 };
 static_assert(sizeof(table) == line_size * (max_shards + 1));
 
+// ─── Is the descriptor at this number one of ours? ──────────────────────────
+//
+// A worker is handed its region on a FIXED descriptor number, because a number
+// is all that survives an exec.  That makes "is fd 4 open" a tempting test for
+// "was I given a region", and it is the wrong one: fd 4 is open in any process
+// that has opened four things, and adopt() takes ownership of what it is
+// handed — so a worker that guessed would CLOSE a descriptor belonging to
+// something else.
+//
+// That is not hypothetical.  A region used to be made only for a sharded
+// runtime and the worker tested `shards > 1` before looking, which was a signal
+// from the daemon and not a guess.  Making a region for every worker-backed
+// runtime removed that signal, and the first thing it cost was a worker spawned
+// outside the supervisor — test_worker_ring_deferral.sh — closing its own
+// fourth descriptor and never building a ring.
+//
+// So the descriptor is identified rather than assumed.  memfd_create names its
+// file and that name is visible through /proc/self/fd, so a region announces
+// itself: "/memfd:socketley-shards (deleted)".  Nothing else in this process
+// tree carries that name, and a descriptor that does not carry it is left
+// alone.  The size is checked too, which is what catches a region from a build
+// whose table is a different shape before adopt() maps it.
+inline bool looks_like_region(int fd)
+{
+    if (fd < 0)
+        return false;
+
+    struct stat st{};
+    if (::fstat(fd, &st) < 0 || st.st_size != static_cast<off_t>(sizeof(table)))
+        return false;
+
+    char path[64];
+    const int n = ::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(path))
+        return false;
+
+    char link[256];
+    const ssize_t len = ::readlink(path, link, sizeof(link) - 1);
+    if (len <= 0)
+        return false;
+    link[len] = '\0';
+
+    // "/memfd:<name> (deleted)".  Prefix-matched: the suffix is the kernel's
+    // and has changed shape between versions, and the name is what identifies
+    // it.
+    static const std::string want = std::string("/memfd:") + region_name;
+    return std::string_view(link, static_cast<size_t>(len)).substr(0, want.size()) == want;
+}
+
 // The daemon's half and the worker's half of one region.
 //
 // One object, two roles, because they are two ends of the same thing and the
@@ -170,7 +227,7 @@ public:
         // fixed number for the children that were, and dup2 clears the flag on
         // the copy.
         const int fd = static_cast<int>(::syscall(SYS_memfd_create,
-                                                  "socketley-shards", MFD_CLOEXEC));
+                                                  region_name, MFD_CLOEXEC));
         if (fd < 0)
             return false;
 

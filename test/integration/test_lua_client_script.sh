@@ -147,10 +147,14 @@ stat() {
         | awk -F: -v k="$2" '$1 == k { print $2; exit }'
 }
 # await_stat NAME KEY WANT — wait for a figure to reach WANT, then leave it to
-# the assertion to say whether it did.  A worker pushes its figures to the
-# daemon, so a `stats` read taken the instant a log line appears reads a number
-# that has not arrived yet; without this the two assertions using it failed
-# against a build with nothing wrong with it.
+# the assertion to say whether it did.  A worker used to push its figures to the
+# daemon on a 250 ms timer, so a `stats` read taken the instant a log line
+# appeared read a number that had not arrived yet; without this the two
+# assertions using it failed against a build with nothing wrong with it.
+#
+# The figures are summed at print time now and that gap is a loop turn rather
+# than a publish period, but the wait is kept: what it is really waiting for is
+# the worker's own turn, and a log line is written before that turn ends.
 await_stat() {
     local i
     for i in $(seq 1 100); do

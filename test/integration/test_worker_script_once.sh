@@ -103,9 +103,19 @@ assert_eq "$GHOST" "0" "no runtime is created from inside the daemon's placehold
 STATE=$("$BIN" ls 2>/dev/null | awk '$2=="oop"{print $7}' | head -1)
 assert_eq "$STATE" "Up" "the out-of-process proxy is up"
 
-# And it is still the worker that serves, so the figures still say `pushed`.
-FIG=$("$BIN" stats oop 2>/dev/null | sed -n 's/^figures:\(.*\)$/\1/p' | head -1)
-assert_eq "$FIG" "pushed" "its figures still come from the worker"
+# And it is still a worker that serves it.
+#
+# This used to read `figures:pushed`, which said exactly that: only an
+# out-of-process runtime printed it.  The figures are read at print time on both
+# paths now and the label is gone, so what says the runtime is elsewhere is the
+# process it is in — `pid:`, which no in-daemon runtime prints and which is a
+# stronger claim besides: it names the process rather than the mechanism.
+PIDLINE=$("$BIN" stats oop 2>/dev/null | sed -n 's/^pid:\(.*\)$/\1/p' | head -1)
+case "$PIDLINE" in
+    ''|*[!0-9]*) assert_eq "$PIDLINE" "<a pid>" "it is still served out of process" ;;
+    *)           assert_eq "$([ "$PIDLINE" -gt 0 ] && echo yes)" "yes" \
+                     "it is still served out of process (pid $PIDLINE)" ;;
+esac
 
 "$BIN" remove oop >/dev/null 2>&1
 "$BIN" remove ghost_from_toplevel >/dev/null 2>&1

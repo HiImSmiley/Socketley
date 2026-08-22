@@ -1104,7 +1104,16 @@ private:
         // a one-slot table and the daemon sums one slot, which is the same
         // number by a longer route and is the point: there is one path for the
         // figures and not a sharded one beside an unsharded one.
-        if (::fcntl(worker_shard_fd, F_GETFD, 0) >= 0)
+        //
+        // looks_like_region() and not fcntl(F_GETFD).  "Is fd 4 open" was a
+        // sufficient test while `shards > 1` stood in front of it, because that
+        // was the daemon saying it had placed one; with the region made for
+        // every worker-backed runtime there is no such signal left, and fd 4 is
+        // open in any process that has opened four things.  adopt() takes
+        // ownership of what it is handed, so a guess here CLOSES somebody
+        // else's descriptor — which is exactly what happened to a worker
+        // spawned outside the supervisor.  See the note on looks_like_region().
+        if (shard_stats::looks_like_region(worker_shard_fd))
         {
             if (!m_rt->shard_stats_table().adopt(worker_shard_fd,
                                                  m_rt->get_shard_index()))

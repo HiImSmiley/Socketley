@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -99,6 +100,141 @@ TEST_CASE("four processes publish and any one of them can add them up")
         // the other three are untouched.
         return r.sum_active() == 90 ? 0 : 3;
     }) == 0);
+}
+
+TEST_CASE("all five counters cross the boundary, not only the connection count")
+{
+    // The four lifetime counters moved into this region when the worker's 250 ms
+    // stats frame was removed, and the failure they invite is silent: a build
+    // that publishes active_connections and leaves the rest at zero reports a
+    // proxy that has served nothing while showing its clients connected.  So
+    // each field is given a value that could not be confused with another's.
+    shard_stats::shard_table region;
+    REQUIRE(region.create(3));
+
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        const int rc = in_child([&] {
+            shard_stats::shard_table w;
+            if (!w.adopt(::dup(region.fd()), i))
+                return 1;
+            shard_stats::figures f;
+            f.active_connections = i + 1;                //   1,   2,   3
+            f.total_connections  = (i + 1) * 10;         //  10,  20,  30
+            f.total_messages     = (i + 1) * 100;        // 100, 200, 300
+            f.bytes_in           = (i + 1) * 1000;
+            f.bytes_out          = (i + 1) * 10000;
+            w.publish(f);
+            return 0;
+        });
+        CHECK(rc == 0);
+    }
+
+    const shard_stats::figures sum = region.sum();
+    CHECK(sum.active_connections == 6);
+    CHECK(sum.total_connections  == 60);
+    CHECK(sum.total_messages     == 600);
+    CHECK(sum.bytes_in           == 6000);
+    CHECK(sum.bytes_out          == 60000);
+
+    // And one shard on its own, which is what `stats` prints under [shard i].
+    const shard_stats::figures one = region.at(1);
+    CHECK(one.active_connections == 2);
+    CHECK(one.total_messages     == 200);
+    CHECK(one.bytes_out          == 20000);
+
+    // A slot past the declared count is not a read of somebody else's line.
+    CHECK(region.at(3) == shard_stats::figures{});
+}
+
+TEST_CASE("the daemon reads a region it made without taking a slot in it")
+{
+    // The placeholder instance for a worker-backed runtime answers `stats`,
+    // `ls`, the metrics thread and every Lua binding, and it must read the same
+    // region the shards write — without becoming one of them.  adopt() would
+    // make it one: it claims a slot and bumps that slot's generation, which is a
+    // shard saying it is here.
+    shard_stats::shard_table region;
+    REQUIRE(region.create(2));
+
+    CHECK_FALSE(region.any_live());          // nothing has attached yet
+
+    REQUIRE(in_child([&] {
+        shard_stats::shard_table w;
+        if (!w.adopt(::dup(region.fd()), 0))
+            return 1;
+        shard_stats::figures f;
+        f.active_connections = 7;
+        f.bytes_in           = 4096;
+        w.publish(f);
+        return 0;
+    }) == 0);
+
+    shard_stats::shard_table reader;
+    REQUIRE(reader.attach_reader(region.fd()));
+    CHECK(reader.mapped());
+    CHECK_FALSE(reader.writable());          // no slot: it can never publish
+    CHECK(reader.count() == 2);
+    CHECK(reader.sum().active_connections == 7);
+    CHECK(reader.sum().bytes_in == 4096);
+    CHECK(reader.any_live());
+
+    // A reader that could write would cancel out the shard whose slot it landed
+    // on, once per health tick, and the figure would read low with nothing to
+    // say why.  Both publishing calls have to be no-ops.
+    reader.publish_active(999);
+    reader.publish(shard_stats::figures{999, 999, 999, 999, 999});
+    CHECK(reader.sum().active_connections == 7);
+
+    // The descriptor was DUPLICATED.  Closing the reader must not take the
+    // region's own fd with it, or the next shard forked is handed a number this
+    // object has already closed.
+    reader.close();
+    CHECK(region.at(0).active_connections == 7);
+    CHECK(::fcntl(region.fd(), F_GETFD, 0) >= 0);
+}
+
+TEST_CASE("a retired or replaced shard leaves none of its five behind")
+{
+    // clear_slot() and adopt() both zero a slot, and both were written when a
+    // slot held one number.  A build that clears active_connections and leaves
+    // the other four is the shape of the bug: connections falls to zero on a
+    // restart, as it should, while bytes_out keeps a dead process's total for
+    // ever and the runtime's lifetime counters only ever grow.
+    shard_stats::shard_table region;
+    REQUIRE(region.create(2));
+
+    REQUIRE(in_child([&] {
+        shard_stats::shard_table w;
+        if (!w.adopt(::dup(region.fd()), 1))
+            return 1;
+        w.publish(shard_stats::figures{5, 50, 500, 5000, 50000});
+        return 0;
+    }) == 0);
+    REQUIRE(region.sum().bytes_out == 50000);
+
+    region.clear_slot(1);
+    CHECK(region.sum() == shard_stats::figures{});
+
+    // And the same for a replacement, which clears the slot it takes rather
+    // than being cleared by the daemon.
+    REQUIRE(in_child([&] {
+        shard_stats::shard_table w;
+        if (!w.adopt(::dup(region.fd()), 1))
+            return 1;
+        w.publish(shard_stats::figures{5, 50, 500, 5000, 50000});
+        return 0;
+    }) == 0);
+    REQUIRE(region.sum().bytes_out == 50000);
+    REQUIRE(in_child([&] {
+        shard_stats::shard_table w;
+        // Adopting the same slot is the restart: whatever the last occupant
+        // said is not about this process.
+        if (!w.adopt(::dup(region.fd()), 1))
+            return 1;
+        return w.sum() == shard_stats::figures{} ? 0 : 2;
+    }) == 0);
+    CHECK(region.sum() == shard_stats::figures{});
 }
 
 TEST_CASE("a slot outside the declared shard count is refused")

@@ -280,14 +280,15 @@ setup_cache_with_ttl() {
 
     # Wait for the count instead of reading it once.
     #
-    # A cache in a worker process publishes its figures every quarter-second and
-    # the daemon reports what it last received, so a `stats` issued right after
-    # the final write answers for the moment before it: measured, 0 of 200
-    # immediately and 200 after 0.3s, with `get` returning the values over the
-    # cache port the whole time.  Nothing is lost and nothing is slow -- the
-    # figure is simply not read at the instant of the question the way an
-    # in-process runtime's was, which the page says under "A worker's figures
-    # are pushed".
+    # A cache in a worker process used to publish its figures every
+    # quarter-second, with the daemon reporting what it last received, so a
+    # `stats` issued right after the final write answered for the moment before
+    # it: measured, 0 of 200 immediately and 200 after 0.3s, with `get`
+    # returning the values over the cache port the whole time.  The figures are
+    # summed out of shared memory at print time now, so the gap is the worker's
+    # own loop turn rather than a publish period -- but a write acknowledged on
+    # the cache port can still be one turn ahead of the count, so the wait
+    # stays.
     #
     # The check was written when this scenario ran inside the daemon and the
     # number was live.  It is the assertion that is stale, not the cache: it had
