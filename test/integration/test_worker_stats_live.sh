@@ -28,12 +28,13 @@
 #    unlabelled.  Asserted of the in-process proxy too, which is the control:
 #    the two paths now print the same shape, which is the whole claim.
 #
-# 2  the first read already sees it.  The discriminating assertion, and the one
-#    a slower publish cannot pass: a connection is opened and `stats` is asked
-#    once, immediately.  Measured on this box before the change, 253 ms median
-#    to see a new connection; after it, 4 ms, which is the CLI round trip.  Ten
-#    attempts, because a single one is a coin toss against a publish whose phase
-#    this script does not control.
+# 2  how long after a connection the runtime says so.  The discriminating
+#    assertion, and the one a slower publish cannot pass.  Measured on this box:
+#    246-553 ms while the figures were pushed, median 253, which is the publish
+#    period exactly; 7-17 ms after they moved into shared memory, and most of
+#    that is the CLI round trip.  The median of ten, because a single attempt
+#    against a 250 ms publish whose phase this script does not control is a coin
+#    toss in both directions.
 #
 # 3  a stopped worker does not stop `stats`.  The obvious way to make figures
 #    live is to ask the child and wait for the answer, which is the synchronous
@@ -127,8 +128,16 @@ create_ok "out-of-process proxy created" "$BIN" create proxy px_oop -p "$PX_OOP_
 # Wait for the worker to be answering for itself.  Before its first frame the
 # placeholder is not worker-backed and prints its own empty containers, which is
 # a different state from the one under test.
+#
+# NOT on `pid:`, which is written by the supervisor at the fork and is there
+# before the child has said anything: this file was watched passing its first
+# assertion against a build that DOES print figures:pushed, because it read the
+# labels in the window between the fork and the first frame.  `mesh_links:` is
+# appended by push_stats() in the worker and by nothing else, so its presence is
+# the child having reported at least once — on this build and on the one this
+# assertion has to be able to fail against.
 for _ in $(seq 1 100); do
-    [ -n "$(field px_oop pid)" ] && break
+    "$BIN" stats px_oop 2>/dev/null | grep -q '^mesh_links:' && break
     sleep 0.1
 done
 
@@ -143,31 +152,71 @@ if [ "$OOP_LABEL" -eq 0 ] && [ "$IN_LABEL" -eq 0 ]; then pass; else
          "is stale without saying so, which is worse than what this replaced"
 fi
 
-# ── 2: the first read already sees a new connection ─────────────────────────
+# ── 2: how long after a connection the runtime says so ─────────────────────
+#
+# The discriminating measurement, and the one a slower publish cannot pass.  A
+# connection is opened and `stats` is asked until the count moves; what is timed
+# is the interval between the two.  While the figures were pushed on a 250 ms
+# timer this read 246-553 ms with a median of 253 — the publish period, exactly.
+# Summed at print time it reads 7-17 ms, and most of that is the CLI round trip
+# rather than anything the worker does.
+#
+# The MEDIAN of ten and not one reading: a single attempt against a 250 ms
+# publish whose phase this script does not control is a coin toss, and one
+# unlucky attempt against a correct build is a scheduler artefact.  The first
+# attempt is a warm-up and is discarded for a named reason: it is the one that
+# makes this proxy dial its backend, measured here at 240 ms against 7 ms for
+# every attempt after it, and that cost is the backend handshake and not the
+# figure being stale.
 #
 # bash's own /dev/tcp, so the connection is held by this shell and closes with
 # the descriptor rather than with somebody else's process.
-FRESH=0; ATTEMPTS=10
-for _ in $(seq 1 $ATTEMPTS); do
-    if exec 8<>"/dev/tcp/127.0.0.1/$PX_OOP_PORT" 2>/dev/null; then
-        SEEN=$(field px_oop connections)
-        [ "$SEEN" = "1" ] && FRESH=$((FRESH+1))
-        exec 8>&-
-        # Back to zero before the next attempt, so each one asks the same
-        # question.  Bounded: a reap this loop never sees would otherwise make
-        # every later attempt read 1 for the wrong reason.
-        for _ in $(seq 1 60); do
-            [ "$(field px_oop connections)" = "0" ] && break
-            sleep 0.05
-        done
-    fi
-done
-if [ "$FRESH" -ge $((ATTEMPTS - 1)) ]; then pass; else
-    fail "the first stats after a connection sees it" \
-         "it did on $FRESH of $ATTEMPTS attempts, wanted at least $((ATTEMPTS - 1))" \
+#
+# 9999 is the sentinel for "it never moved inside the loop", and against a
+# pushed figure it is a real reading rather than a broken one: the reap of the
+# previous attempt's connection and the accept of this one can land inside the
+# same publish, so the published number goes 1 -> 1 and no sample ever differs
+# from the baseline.  A build that reads at print time cannot alias like that,
+# because it sees every value the count passes through that it is asked during.
+lag_once() {                       # -> milliseconds, or 9999 if it never moved
+    local base t0 v i
+    base=$(field px_oop connections)
+    case "$base" in ''|*[!0-9]*) printf '9999'; return ;; esac
+    exec 8<>"/dev/tcp/127.0.0.1/$PX_OOP_PORT" 2>/dev/null || { printf '9999'; return; }
+    t0=$(date +%s%3N)
+    v="$base"
+    for i in $(seq 1 400); do
+        v=$(field px_oop connections)
+        [ "$v" != "$base" ] && break
+    done
+    if [ "$v" = "$base" ]; then printf '9999'
+    else printf '%s' "$(( $(date +%s%3N) - t0 ))"; fi
+    exec 8>&-
+    # Back to the baseline before the next attempt, so each one starts from the
+    # same place.  Bounded: a reap this loop never sees would otherwise leave
+    # the count high and make the next attempt time the wrong transition.
+    for i in $(seq 1 60); do
+        [ "$(field px_oop connections)" = "$base" ] && break
+        sleep 0.05
+    done
+}
+
+lag_once >/dev/null                # warm-up: the backend handshake, see above
+LAGS=""
+for _ in $(seq 1 10); do LAGS="$LAGS $(lag_once)"; done
+MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS )"
+
+# 100 ms: two and a half times the worst correct reading seen here and under
+# half the 253 ms median a 250 ms publish produces.  It is separating two
+# mechanisms, not timing a fast path, so the margin is what matters and not the
+# tightness.
+if [ "$MEDIAN" -le 100 ] 2>/dev/null; then pass; else
+    fail "a connection is visible as soon as it is asked about" \
+         "the median lag over ten attempts was ${MEDIAN} ms, bound 100" \
          "a figure summed at print time cannot be behind the loop turn that" \
-         "counted the accept.  A score near zero is a pushed figure back in" \
-         "front of these counters — see runtime_instance::worker_figures()"
+         "counted the accept.  A median near a publish period is a pushed" \
+         "figure back in front of these counters — see worker_figures()"
 fi
 
 # ── 3 & 4: a worker that cannot run does not hold up the answer ─────────────
@@ -183,11 +232,13 @@ if [ -n "$WORKER_PID" ]; then
     # stopped worker has to keep answering with must be one it was ever asked
     # about.  An identity assertion over 0 passes on a build that answers 0 to
     # everything.
+    HELD_BASE=$(field px_oop connections)
     exec 8<>"/dev/tcp/127.0.0.1/$PX_OOP_PORT" 2>/dev/null || true
+    WANT=$((HELD_BASE + 1))
     BEFORE=""
     for _ in $(seq 1 60); do
         BEFORE=$(field px_oop connections)
-        [ "$BEFORE" = "1" ] && break
+        [ "$BEFORE" = "$WANT" ] && break
         sleep 0.05
     done
 
@@ -211,9 +262,9 @@ if [ -n "$WORKER_PID" ]; then
              "running; a number this large means the daemon is waiting for one"
     fi
 
-    if [ "$BEFORE" = "1" ] && [ "$STOPPED" = "1" ]; then pass; else
+    if [ "$BEFORE" = "$WANT" ] && [ "$STOPPED" = "$WANT" ]; then pass; else
         fail "and answers with the figure that was true" \
-             "before the stop it read '$BEFORE', during it '$STOPPED', wanted 1 and 1" \
+             "before the stop it read '$BEFORE', during it '$STOPPED', wanted $WANT and $WANT" \
              "the stopped worker's line is still in the region and is still the" \
              "last thing that was true of it.  A 0 here is a reader that treats" \
              "a descheduled writer as an absent one"

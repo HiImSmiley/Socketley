@@ -191,20 +191,29 @@ fi
 #
 # bash's own /dev/tcp, so the connection is held by this shell and closes with
 # the descriptor rather than with somebody else's process.
+#
+# Against a baseline read a moment earlier rather than against the literal 1:
+# what is being asserted is that the count MOVED, and a runtime that is not at
+# zero for some reason of its own would otherwise fail this on the fixture
+# rather than on the build.
+conns() { "$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }'; }
 LIVE_PORT=$((PORT + 1))
+LIVE_BASE=$(conns)
+case "$LIVE_BASE" in ''|*[!0-9]*) LIVE_BASE=0 ;; esac
+LIVE_WANT=$((LIVE_BASE + 1))
 LIVE=""
 if exec 9<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null; then
     for _ in $(seq 1 40); do
-        LIVE=$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')
-        [ "$LIVE" = "1" ] && break
+        LIVE=$(conns)
+        [ "$LIVE" = "$LIVE_WANT" ] && break
         sleep 0.05
     done
     exec 9>&-
 fi
-if [ "$LIVE" = "1" ]; then
+if [ "$LIVE" = "$LIVE_WANT" ]; then
     ok "the idle worker woke for a connection and counted it"
 else
-    bad "an idle worker was sent a connection and reported '$LIVE' connections." \
+    bad "an idle worker was sent a connection and reported '$LIVE', wanted $LIVE_WANT." \
         " It is waiting on something that a connection does not end, which is a"
     echo "         wedged worker and not a cheap one — see arm_control() and the"
     echo "         accept armed on the runtime's own ring."
@@ -282,41 +291,58 @@ else
     echo "         pushes again, sections 1-3 are being paid for out of freshness."
 fi
 
-# SECOND, and this is the discriminating half: the first read already sees it.
+# SECOND, and this is the discriminating half: how long after a connection the
+# runtime says so.
 #
-# A connection is opened and `stats` is asked ONCE, immediately.  A build that
-# sums the shared table at print time answers 1; a build that reports the last
-# pushed sample answers 0 until its next publish.  Measured on this box: 253 ms
-# median to see a new connection while the figures were pushed, 4 ms after they
-# moved into shared memory — and the 4 ms is the CLI round trip, not the worker.
+# A connection is opened and `stats` is asked until the count moves; what is
+# timed is the interval.  A build that sums the shared table answers within a
+# CLI round trip; a build that reports the last pushed sample answers a publish
+# period late.  Measured on this box: 246-553 ms with the figures pushed, median
+# around 200; 8-11 ms after they moved into shared memory.
 #
-# Ten of them, because one first-read is a coin toss against a 250 ms publish
-# whose phase this script does not control: a pushed build passes a single
-# attempt whenever the connect lands just before a publish.  Ten make that
-# 1-in-1000, and a correct build scores 10 every time because the count cannot
-# be behind its own loop turn.
-FRESH=0
-for i in $(seq 1 10); do
-    if exec 8<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null; then
-        SEEN=$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')
-        [ "$SEEN" = "1" ] && FRESH=$((FRESH+1))
-        exec 8>&-
-        # Back to zero before the next attempt, so each one is asking the same
-        # question.  Bounded: a reap this loop never sees would otherwise make
-        # every later attempt read 1 for the wrong reason.
-        for _ in $(seq 1 40); do
-            [ "$("$BIN" stats idle1 2>/dev/null | awk -F: '$1 == "connections" { print $2; exit }')" = "0" ] && break
-            sleep 0.05
-        done
-    fi
-done
-if [ "$FRESH" -ge 9 ]; then
-    ok "the first stats after a connection saw it $FRESH times out of 10"
+# The median of ten, because one attempt against a 250 ms publish whose phase
+# this script does not control is a coin toss in both directions.
+#
+# 9999 is the sentinel for "it never moved inside the loop", and against a
+# pushed figure it is a real reading rather than a broken one: the reap of the
+# previous attempt's connection and the accept of this one can land inside the
+# same publish, so the published number goes 1 -> 1 and no sample ever differs
+# from the baseline.  A build that reads at print time cannot alias like that,
+# because it sees every value the count passes through that it is asked during.
+lag_once() {                       # -> milliseconds, or 9999 if it never moved
+    local base t0 v i
+    base=$(conns)
+    case "$base" in ''|*[!0-9]*) printf '9999'; return ;; esac
+    exec 8<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null || { printf '9999'; return; }
+    t0=$(date +%s%3N)
+    v="$base"
+    for i in $(seq 1 400); do
+        v=$(conns)
+        [ "$v" != "$base" ] && break
+    done
+    if [ "$v" = "$base" ]; then printf '9999'
+    else printf '%s' "$(( $(date +%s%3N) - t0 ))"; fi
+    exec 8>&-
+    for i in $(seq 1 60); do
+        [ "$(conns)" = "$base" ] && break
+        sleep 0.05
+    done
+}
+
+LAGS=""
+for _ in $(seq 1 10); do LAGS="$LAGS $(lag_once)"; done
+MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS )"
+
+# 100 ms: ten times the worst correct reading seen here and under half the
+# median a 250 ms publish produces.  It is separating two mechanisms, not timing
+# a fast path.
+if [ "$MEDIAN" -le 100 ] 2>/dev/null; then
+    ok "a new connection is visible in ${MEDIAN} ms (bound 100; a 250 ms publish reads ~200)"
 else
-    bad "the first stats after a connection saw it only $FRESH times out of 10." \
-        " A figure summed at print time cannot be behind the loop turn that"
-    echo "         counted the accept.  A score near zero is a pushed figure back"
-    echo "         in front of these counters; see runtime_instance::worker_figures()."
+    bad "a new connection took ${MEDIAN} ms to become visible, over the bound of 100." \
+        " Publishing less often is the cheap way to pass sections 1-3, and this"
+    echo "         is what it costs.  See runtime_instance::worker_figures()."
 fi
 
 # ─── 5: a frame still ends the wait, the deadline does not ──────────────────
