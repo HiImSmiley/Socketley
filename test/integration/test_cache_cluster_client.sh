@@ -138,27 +138,30 @@ fi
 #
 # Parsed out of CLUSTER SLOTS the way a client reads it: start, end, host, port.
 MAP=$(redis-cli -p "$P4" CLUSTER SLOTS 2>/dev/null)
-COVER=$(printf '%s\n' "$MAP" | grep -o '(integer) [0-9]*' | awk '{print $2}' | tr '\n' ' ')
-# Four shards of 16384 slots: 0-4095, 4096-8191, 8192-12287, 12288-16383, each
-# followed by its port.  Rather than parse redis-cli's indented rendering, ask
-# for the two facts that matter.
-FIRST=$(printf '%s\n' "$COVER" | awk '{print $1}')
+# redis-cli writing to a pipe emits one bare token per line -- no "(integer)"
+# markers, no indices -- so the reply reads as: start, end, host, port, id, for
+# each range in turn.  Parsed as a token list rather than as redis-cli's
+# interactive rendering, which is what the first version of this test got wrong.
+TOKENS=$(printf '%s\n' "$MAP" | sed 's/^ *//; s/ *$//' | grep -v '^$')
 PORTS_IN_MAP=0
 for i in 1 2 3 4; do
-    printf '%s\n' "$COVER" | tr ' ' '\n' | grep -qx "$((P4+i))" && PORTS_IN_MAP=$((PORTS_IN_MAP+1))
+    printf '%s\n' "$TOKENS" | grep -qx "$((P4+i))" && PORTS_IN_MAP=$((PORTS_IN_MAP+1))
 done
-if [ "$FIRST" = "0" ] && [ "$PORTS_IN_MAP" -eq 4 ]; then
-    ok "CLUSTER SLOTS publishes four ranges from slot 0 and all four shard ports"
+HAS_ZERO=$(printf '%s\n' "$TOKENS" | grep -cx 0 || true)
+HAS_LAST=$(printf '%s\n' "$TOKENS" | grep -cx 16383 || true)
+if [ "$HAS_ZERO" -ge 1 ] && [ "$PORTS_IN_MAP" -eq 4 ]; then
+    ok "CLUSTER SLOTS publishes a range from slot 0 and all four shard ports"
 else
-    bad "CLUSTER SLOTS publishes four ranges and all four shard ports" \
-        "first slot '$FIRST', $PORTS_IN_MAP of 4 ports present" \
-        "$(printf '%s' "$COVER" | head -c 200)"
+    bad "CLUSTER SLOTS publishes a range from slot 0 and all four shard ports" \
+        "slot 0 present: $HAS_ZERO, ports present: $PORTS_IN_MAP of 4" \
+        "$(printf '%s' "$TOKENS" | tr '\n' ' ' | head -c 220)"
 fi
-if printf '%s\n' "$COVER" | tr ' ' '\n' | grep -qx 16383; then
+if [ "$HAS_LAST" -ge 1 ]; then
     ok "the last slot of the keyspace is claimed by somebody"
 else
     bad "the last slot of the keyspace is claimed by somebody" \
-        "16383 appears in no range; keys above the last boundary have no owner"
+        "16383 appears in no range; keys above the last boundary have no owner" \
+        "$(printf '%s' "$TOKENS" | tr '\n' ' ' | head -c 220)"
 fi
 
 # ── 4: CLUSTER INFO tells a client whether to bother ────────────────────────
