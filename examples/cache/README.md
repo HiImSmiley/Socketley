@@ -134,6 +134,10 @@ passes per arm, medians, **rps per server core**:
 **+36.9%, and the routed arm lands within 0.3% of four separate caches.** The
 whole gap between a sharded runtime and N unsharded ones was the crossing.
 
+Quote the ratio, not the level. The same pair re-measured hours later on the
+same binary gave 84,828 and 116,894 rps/core — every absolute a third higher,
+the ratio 1.387 against 1.369.
+
 **`--cluster` is off by default, and you should read why before turning it on.**
 
 > A routing client connects to **every shard directly**, and the address this

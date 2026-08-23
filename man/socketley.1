@@ -2898,7 +2898,9 @@ four independent single\-shard caches        87,663   11.40 us/req
 .fi
 .IP
 Absolute levels are not comparable between machines or between sessions; the
-ratio within one interleaved sweep is what is claimed.
+ratio within one interleaved sweep is what is claimed. The same pair measured
+again hours later on the same binary read 84,828 and 116,894 \(em every level
+a third higher, the ratio 1.387 against 1.369.
 .TP
 .B \-\-cluster
 Publish a routable slot map, so that a cluster\-aware client sends each key

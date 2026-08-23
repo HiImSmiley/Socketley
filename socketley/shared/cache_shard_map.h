@@ -57,14 +57,29 @@
 // WHAT A CROSSING COSTS, said correctly.  15.66 - 11.44 = 4.22 us is per
 // REQUEST, and at four shards only (N-1)/N = 75% of requests cross -- the
 // counter says so directly, 9.0 M crossings for 12 M requests.  Per crossing
-// it is 4.22 / 0.75 = ~5.6 us.  Quoting the per-request difference as the
-// price of a crossing understates it by a quarter, and the mistake survives
-// because both numbers are in microseconds and neither is obviously wrong.
+// it is 4.22 / 0.75 = 5.6 us.  Quoting the per-request difference as the price
+// of a crossing understates it by a quarter, and the mistake survives because
+// both numbers are in microseconds and neither is obviously wrong.
 //
-// Absolutes are not portable between machines or sessions: utime is time, not
-// cycles, so a shift in effective clock scales both arms of a sweep alike and
-// leaves the ratio intact while moving every absolute.  The ratio within one
-// interleaved sweep is what is claimed here; the levels are not.
+// ─── AND ONLY THE RATIO TRAVELS ─────────────────────────────────────────────
+//
+// The pair above was re-measured on the same box, same binary, same harness,
+// hours later:
+//
+//     shared port  84,828 and 83,668 rps/core     11.78 / 11.95 us/req
+//     routed      116,894 and 116,801 rps/core     8.55 /  8.56 us/req
+//
+// Every absolute is ~33% higher than the sweep above.  The RATIO is 1.387
+// against 1.369 -- 1.3% apart.  utime is time, not cycles, so a shift in
+// effective clock scales both arms of an interleaved sweep by the same factor
+// and leaves the ratio standing while moving every level.  Nothing here
+// protects an absolute across sessions.
+//
+// So the per-crossing figure in microseconds does not travel either: 5.6 us on
+// the first sweep, 4.4 on the second.  What does travel is the share -- a
+// crossing is 26.9% and 27.9% of a sharded request's CPU on the two sweeps,
+// which is the same statement as "not crossing is 1.37-1.39x cheaper per
+// request", and that is the form to quote.
 //
 // Our own FNV-1a mixed better and spread more evenly and was worth nothing,
 // because no off-the-shelf client can compute it.  A non-standard hash forces a
