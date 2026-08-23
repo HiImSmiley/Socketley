@@ -3101,7 +3101,8 @@ void cache_instance::emit_moved(client_connection* conn, std::string_view key,
 
     if (resp)
     {
-        resp::encode_error_into(conn->response_buf, msg);
+        // The code is MOVED, not ERR.  See encode_error_code_into().
+        resp::encode_error_code_into(conn->response_buf, msg);
     }
     else
     {
@@ -3288,14 +3289,14 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
                 std::strtoul(std::string(arg).c_str(), nullptr, 10));
             if (slot >= cache_slot_count)
             {
-                if (resp) resp::encode_error_into(rb, "ERR Invalid slot");
+                if (resp) resp::encode_error_into(rb, "invalid slot");
                 else      rb += "error: invalid slot\n";
                 break;
             }
             if (cache_shard_of_slot(slot, n) != m_shard_i)
             {
                 if (resp) resp::encode_error_into(rb,
-                    "ERR I don't own the slot " + std::to_string(slot));
+                    "this shard does not own slot " + std::to_string(slot));
                 else      rb += "error: this shard does not own that slot\n";
                 break;
             }
@@ -3312,7 +3313,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
 
         default:
         {
-            std::string msg = "ERR unknown CLUSTER subcommand '";
+            std::string msg = "unknown CLUSTER subcommand '";
             msg.append(sub);
             msg += "' -- this cache answers SLOTS, SHARDS, NODES, INFO, MYID, "
                    "KEYSLOT and COUNTKEYSINSLOT";
@@ -3851,7 +3852,7 @@ bool cache_instance::cluster_multi_verdict(client_connection* conn,
         if (any_local || mixed_foreign)
         {
             if (resp)
-                resp::encode_error_into(conn->response_buf,
+                resp::encode_error_code_into(conn->response_buf,
                     "CROSSSLOT Keys in request don't hash to the same slot");
             else
                 conn->response_buf.append(

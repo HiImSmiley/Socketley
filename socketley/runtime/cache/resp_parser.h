@@ -61,6 +61,26 @@ inline void encode_error_into(std::string& buf, std::string_view msg)
     buf.append("\r\n", 2);
 }
 
+// ─── AN ERROR WHOSE CODE THE CALLER CHOOSES ─────────────────────────────────
+//
+// encode_error_into() writes `-ERR <msg>`, which is correct for every error
+// this cache invents: ERR is the generic code and the text after it is for a
+// human.
+//
+// It is wrong for the errors a PROTOCOL defines.  A client matches the first
+// word of an error reply, so `-ERR MOVED 12182 127.0.0.1:23803` is an unknown
+// error to every client in existence rather than a redirect.  Measured, not
+// reasoned: redis-cli -c printed that line and did not follow it, and every
+// key written through it stayed on the shard that was asked.
+//
+// So MOVED and CROSSSLOT are built here, where the code is the caller's.
+inline void encode_error_code_into(std::string& buf, std::string_view msg)
+{
+    buf += '-';
+    buf.append(msg.data(), msg.size());
+    buf.append("\r\n", 2);
+}
+
 inline void encode_simple_into(std::string& buf, std::string_view msg)
 {
     buf += '+';
