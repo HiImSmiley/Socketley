@@ -116,7 +116,7 @@ cache may still *be* a follower.
 
 See `sharded-cache.sh`.
 
-### Letting the client pick the shard (`cluster-cache.sh`)
+### Letting the client pick the shard — `--cluster` (`cluster-cache.sh`)
 
 Sharding costs a **crossing**: with N shards a random key is foreign (N-1)/N of
 the time, because all N shards share one port under `SO_REUSEPORT` and the
@@ -134,7 +134,23 @@ passes per arm, medians, **rps per server core**:
 **+36.9%, and the routed arm lands within 0.3% of four separate caches.** The
 whole gap between a sharded runtime and N unsharded ones was the crossing.
 
-The crossing is removed by letting the client route, and the client is not ours:
+**`--cluster` is off by default, and you should read why before turning it on.**
+
+> A routing client connects to **every shard directly**, and the address this
+> cache advertises is the one the *asking* connection arrived on. Put the cache
+> behind a proxy and the map names the address the **proxy** reaches it on:
+> either the client can reach that too — and the proxy's rules have been
+> bypassed by a map the cache handed out — or it cannot, and the client spends
+> its retry budget on a connection refused. Neither outcome logs anything.
+>
+> This is not fixable here. It is what client-side routing *is*, and Redis
+> Cluster has the same property. **A `--cluster` cache cannot sit behind a proxy
+> used for access control** — choose which of the two you want. Without the flag
+> the cache is reached only through its one port, which is what a proxy in front
+> of it depends on.
+
+With `--cluster`, the crossing is removed by letting the client route, and the
+client is not ours:
 
 * a key's owner is **CRC16 mod 16384**, Redis's hash slot function including the
   `{hash tag}` rule, so `redis-cli -c`, `redis-benchmark --cluster`, redis-py,
@@ -146,7 +162,18 @@ The crossing is removed by letting the client route, and the client is not ours:
 
 `port+1 .. port+N` therefore have to be free, and a cache that cannot bind one
 of them **refuses to start** rather than being advertised at an address nothing
-answers on.
+answers on — the message names the flag, because that is the thing you can turn
+off. Without `--cluster` nothing but the shared port is bound, so two four-shard
+caches one port apart work as they always did.
+
+`--cluster` is legal at `--shards 1`: one node on the base port, nothing extra
+bound, so a client can be written once and deployed at any N.
+
+**Without the flag, `--shards N` behaves exactly as it did before this existed**:
+shared port only, no redirects, `cluster_enabled:0`, and `CLUSTER SLOTS`
+publishing a single node holding every slot on that port — true and safe. The
+`CLUSTER` commands are answered either way; a client that asks deserves a
+straight answer.
 
 **The shared port is unchanged.** A client that has never heard of a slot map
 connects there and is served over the mesh exactly as before; one runtime serves

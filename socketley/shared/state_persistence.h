@@ -160,6 +160,7 @@ struct runtime_config
     std::string persistent_path;
     uint8_t cache_mode = 1;  // cache_mode (default readwrite)
     bool resp_forced = false;
+    bool cluster = false;
     std::string replicate_target;
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy

@@ -23,6 +23,19 @@
 #   four-tuple hash, so with N shards a random key is foreign (N-1)/N of the
 #   time.
 #
+# WHY IT IS A FLAG AND NOT AUTOMATIC
+#   A routing client connects to every shard DIRECTLY, and the address this
+#   cache advertises is the one the ASKING connection arrived on.  Behind a
+#   proxy that is the PROXY's address: either the client can reach it too, and
+#   the proxy's rules have been bypassed by a map the cache handed out, or it
+#   cannot, and the client burns its retries on a connection refused.  Neither
+#   logs anything.  That is what client-side routing IS -- Redis Cluster has
+#   the same property -- so a --cluster cache CANNOT SIT BEHIND A PROXY used
+#   for access control, and the operator makes that call, not the cache.
+#
+#   Off by default.  Without it, --shards N is the shared-port cache it always
+#   was: nothing extra bound, no redirects, crossings over the mesh.
+#
 # WHAT CHANGED
 #   Two things, and neither of them is a client library:
 #
@@ -31,8 +44,9 @@
 #        better -- our FNV-1a mixed better -- but because redis-cli, redis-py,
 #        go-redis, lettuce and node-redis can all compute it WITHOUT ASKING US.
 #
-#     2. Shard i binds port+1+i in addition to the shared port, and a key that
-#        arrives on the wrong one is answered `-MOVED slot host:port`.
+#     2. With --cluster, shard i binds port+1+i in addition to the shared
+#        port, and a key that arrives on the wrong one is answered
+#        `-MOVED slot host:port`.
 #
 #   Between them, an off-the-shelf cluster client bootstraps from CLUSTER SLOTS
 #   and thereafter sends every key straight to the process that holds it.
@@ -65,7 +79,7 @@ trap cleanup EXIT
 # is a formula, so a shard that could not bind its own port would be advertised
 # anyway.  The start refuses instead, naming the port.
 echo "== a cache in $SHARDS processes on $PORT, plus $((PORT+1))..$((PORT+SHARDS)) =="
-socketley create cache "$NAME" -p "$PORT" --shards "$SHARDS" --resp -s
+socketley create cache "$NAME" -p "$PORT" --shards "$SHARDS" --resp --cluster -s
 
 for _ in $(seq 1 80); do
     redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break

@@ -32,6 +32,19 @@
 # crossings MUST appear — that is the arm that says the counter works, the
 # fallback still exists, and this test could have failed.
 #
+# ─── AND THAT IT IS OFF UNLESS ASKED FOR ────────────────────────────────────
+#
+# Client-side routing gives up an enforcement point: a routing client must reach
+# every shard's own port DIRECTLY, so a cache behind a proxy either has the
+# proxy's rules bypassed by a map it handed out, or sends its clients to an
+# address they cannot reach.  That is inherent — Redis Cluster has the same
+# property — so it is a decision the operator makes, with --cluster, and the
+# default is the shared-port cache that existed before any of this.
+#
+# The last two cases below are that default, and they are the ones most likely
+# to rot: a later change that made the ports unconditional again would leave
+# every assertion above green.
+#
 # ─── THE EXTERNAL ORACLE ────────────────────────────────────────────────────
 #
 # CLUSTER KEYSLOT is checked against numbers Redis itself publishes (foo=12182,
@@ -52,8 +65,10 @@ daemon_isolate cacheclust
 #
 # A cache with --shards N binds N+1 ports: the shared one, and base+1+i per
 # shard.  Adjacent bases collide, and the collision refuses the start.
-P4=$((SL_PORT_BASE+1470))       # four shards  (+1471..1474)
+P4=$((SL_PORT_BASE+1470))       # four shards, --cluster  (+1471..1474)
 P1=$((SL_PORT_BASE+1490))       # one shard, the unsharded control
+PD=$((SL_PORT_BASE+1495))       # four shards, NO --cluster: the default
+PSQ=$((PD+1))                   # occupied first, on purpose -- see case 11
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -65,9 +80,9 @@ bad() {
 }
 
 cleanup() {
-    for n in cl4 cl1; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
+    for n in cl4 cl1 cldef clsq; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
     sleep 0.4
-    for n in cl4 cl1; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
+    for n in cl4 cl1 cldef clsq; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -81,9 +96,19 @@ fi
 
 daemon_start "$BIN"
 
-"$BIN" create cache cl4 -p "$P4" --shards 4 --resp -s >/dev/null 2>&1 \
-    || { echo "  FATAL: a four-shard cache would not start"; exit 2; }
+"$BIN" create cache cl4 -p "$P4" --shards 4 --resp --cluster -s >/dev/null 2>&1 \
+    || { echo "  FATAL: a four-shard --cluster cache would not start"; exit 2; }
 "$BIN" create cache cl1 -p "$P1" --resp -s >/dev/null 2>&1
+# ── The default arm, and the neighbour that makes it an assertion ───────────
+#
+# clsq takes PD+1 FIRST.  cldef then asks for four shards on PD without the
+# flag, so a build that bound base+1+i regardless would find PD+1 taken and
+# refuse to start -- which is exactly the behaviour --cluster is supposed to
+# have and the default is supposed not to.  The order matters and is why these
+# two are created in this one.
+"$BIN" create cache clsq -p "$PSQ" --resp -s >/dev/null 2>&1
+DEF_START_RC=1
+"$BIN" create cache cldef -p "$PD" --shards 4 --resp -s >/dev/null 2>&1 && DEF_START_RC=0
 
 ready_resp() {
     local port=$1 i
@@ -341,6 +366,74 @@ if [ "$SC_RC" -eq 0 ] && [ "$SC" -gt 0 ]; then
 else
     bad "SCAN on a shard port terminates" \
         "exit $SC_RC after $SC keys; a non-terminating cursor is a hung client"
+fi
+
+# ── 11: WITHOUT --cluster nothing is bound at base+1 ────────────────────────
+#
+# Two independent readings of the same fact, because the cheap one is weak on
+# its own: a port is also closed while a runtime is still forking.
+if [ "$DEF_START_RC" -eq 0 ]; then
+    ok "a four-shard cache without --cluster starts with base+1 already taken"
+else
+    bad "a four-shard cache without --cluster starts with base+1 already taken" \
+        "it refused, which means it tried to bind base+1+i without being asked" \
+        "to -- so client routing is on for anyone who typed --shards"
+fi
+
+ready_resp "$PD" || { echo "  FATAL: the no-flag four-shard cache never answered"; exit 2; }
+DEF_BOUND=0
+for i in 2 3 4; do
+    redis-cli -p $((PD+i)) -t 2 PING 2>/dev/null | grep -q PONG && DEF_BOUND=$((DEF_BOUND+1))
+done
+# PD+1 is skipped above: clsq is legitimately listening there, and counting it
+# would fail this on the fixture rather than on the build.
+if [ "$DEF_BOUND" -eq 0 ]; then
+    ok "--shards without --cluster binds none of base+2..base+4 either"
+else
+    bad "--shards without --cluster binds none of base+2..base+4" \
+        "$DEF_BOUND of 3 answered; a cache behind a proxy would be publishing" \
+        "addresses that bypass it"
+fi
+
+# ── 12: and a foreign key is still fetched, not redirected ─────────────────
+#
+# The other half of "off": a build that stopped binding the ports but kept the
+# -MOVED would pass case 11 and break every existing client.
+sleep 1
+DMESH_BEFORE=$("$BIN" stats cldef 2>&1 | awk -F: '/^mesh_direct:/{d+=$2} /^mesh_relayed:/{r+=$2} END{print d+r+0}')
+DMISS=0; DREDIR=0
+for i in $(seq 1 40); do redis-cli -p "$PD" SET "dk$i" "dv$i" >/dev/null 2>&1; done
+for i in $(seq 1 40); do
+    v=$(redis-cli -p "$PD" GET "dk$i" 2>&1)
+    [ "$v" = "dv$i" ] || DMISS=$((DMISS+1))
+    case "$v" in MOVED*|*MOVED*) DREDIR=$((DREDIR+1));; esac
+done
+sleep 2
+DMESH_AFTER=$("$BIN" stats cldef 2>&1 | awk -F: '/^mesh_direct:/{d+=$2} /^mesh_relayed:/{r+=$2} END{print d+r+0}')
+DCROSS=$((DMESH_AFTER - DMESH_BEFORE))
+echo "        default arm: $DMISS missing, $DREDIR redirected, $DCROSS crossings for 40 reads"
+if [ "$DMISS" -eq 0 ] && [ "$DREDIR" -eq 0 ] && [ "$DCROSS" -gt 0 ]; then
+    ok "without --cluster a foreign key is fetched over the mesh, never redirected"
+else
+    bad "without --cluster a foreign key is fetched over the mesh" \
+        "$DMISS of 40 missing, $DREDIR redirected, $DCROSS crossings" \
+        "zero crossings here would mean the reads never left one shard, which" \
+        "makes the other two numbers meaningless"
+fi
+
+# ── 13: and it says so when asked ──────────────────────────────────────────
+DINFO=$(redis-cli -p "$PD" CLUSTER INFO 2>/dev/null)
+DSLOTS=$(redis-cli -p "$PD" CLUSTER SLOTS 2>/dev/null | sed 's/^ *//' | grep -v '^$')
+DPORTS=0
+for i in 1 2 3 4; do
+    printf '%s\n' "$DSLOTS" | grep -qx "$((PD+i))" && DPORTS=$((DPORTS+1))
+done
+if printf '%s' "$DINFO" | grep -q 'cluster_enabled:0' && [ "$DPORTS" -eq 0 ]; then
+    ok "without --cluster it reports cluster_enabled:0 and advertises no shard ports"
+else
+    bad "without --cluster it reports cluster_enabled:0 and advertises no shard ports" \
+        "cluster_enabled line: $(printf '%s' "$DINFO" | grep cluster_enabled | tr -d '\r')" \
+        "$DPORTS of 4 shard ports appear in CLUSTER SLOTS, which nothing is listening on"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

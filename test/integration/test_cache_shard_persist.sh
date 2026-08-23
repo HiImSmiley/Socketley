@@ -45,14 +45,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate cacheshardpersist
-# ── Why these ports are ten apart and not one ───────────────────────────────
-#
-# A cache with --shards N binds N+1 ports: the shared one every shard joins
-# under SO_REUSEPORT, and one per shard at base+1+i, which is what a
-# cluster-aware client connects to after reading CLUSTER SLOTS.  Adjacent bases
-# therefore collide, and the collision is a REFUSED START rather than a silent
-# share — see open_listener() in cache_instance.cpp.
-PORT=$((SL_PORT_BASE+1280))     # up to eight shards (+1281..1288)
+PORT=$((SL_PORT_BASE+1280))
 WORK=$(mktemp -d)
 KEYS=60
 

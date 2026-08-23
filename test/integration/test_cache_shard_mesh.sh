@@ -57,15 +57,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 daemon_isolate cacheshardmesh
 
-# ── Why these ports are ten apart and not one ───────────────────────────────
-#
-# A cache with --shards N binds N+1 ports: the shared one every shard joins
-# under SO_REUSEPORT, and one per shard at base+1+i, which is what a
-# cluster-aware client connects to after reading CLUSTER SLOTS.  Adjacent bases
-# therefore collide, and the collision is a REFUSED START rather than a silent
-# share — see open_listener() in cache_instance.cpp.
-PORT=$((SL_PORT_BASE+1440))     # up to eight shards (+1441..1448)
-PORT_CAP=$((SL_PORT_BASE+1460)) # the second cache, also up to eight
+PORT=$((SL_PORT_BASE+1270))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -237,14 +229,14 @@ daemon_stop
     ulimit -n 512 2>/dev/null || exit 0
     daemon_isolate cacheshardcap
     daemon_start "$BIN"
-    "$BIN" create cache capc -p $PORT_CAP --shards 8 --resp -s >/dev/null 2>&1
+    "$BIN" create cache capc -p $((PORT+1)) --shards 8 --resp -s >/dev/null 2>&1
     for i in $(seq 1 80); do
-        redis-cli -p $PORT_CAP PING 2>/dev/null | grep -q PONG && break; sleep 0.25
+        redis-cli -p $((PORT+1)) PING 2>/dev/null | grep -q PONG && break; sleep 0.25
     done
-    for i in $(seq 1 20); do redis-cli -p $PORT_CAP SET "z$i" "u$i" >/dev/null 2>&1; done
+    for i in $(seq 1 20); do redis-cli -p $((PORT+1)) SET "z$i" "u$i" >/dev/null 2>&1; done
     m=0
     for i in $(seq 1 20); do
-        [ "$(redis-cli -p $PORT_CAP GET "z$i" 2>/dev/null)" = "u$i" ] || m=$((m+1))
+        [ "$(redis-cli -p $((PORT+1)) GET "z$i" 2>/dev/null)" = "u$i" ] || m=$((m+1))
     done
     said=$(grep -c "open-file limit leaves room" "$SOCKETLEY_DLOG" 2>/dev/null || echo 0)
     "$BIN" stop capc >/dev/null 2>&1; sleep 0.3; "$BIN" remove capc >/dev/null 2>&1

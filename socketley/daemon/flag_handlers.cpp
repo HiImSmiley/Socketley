@@ -1063,6 +1063,11 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         case fnv1a("--resp"):
             cache->set_resp_forced(true);
             return 0;
+        // Off by default, and deliberately a flag rather than a consequence of
+        // --shards: see cache_instance::set_cluster() for what it gives up.
+        case fnv1a("--cluster"):
+            cache->set_cluster(true);
+            return 0;
         case fnv1a("--replicate"):
         {
             if (i + 1 >= pa.count)

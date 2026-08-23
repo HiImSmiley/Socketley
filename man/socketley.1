@@ -2873,57 +2873,117 @@ worker processes over one keyspace. Which shard owns a key is decided by
 CRC16 of the key modulo 16384 \(em Redis's own hash slot function, hash tags
 included \(em and each shard owns a contiguous range of those slots.
 .IP
-.B Every shard binds its own port as well as the shared one.
-The shared port is
-.IR port ,
-joined by all
+The
 .I N
-shards under
-.BR SO_REUSEPORT ,
-and it behaves exactly as an unsharded cache does: a client connects, the
-kernel gives it to whichever shard the four\-tuple hashes to, and a key another
-shard owns is fetched from that shard over the mesh. Nothing about that
-changed.
+shards share one port under
+.BR SO_REUSEPORT :
+a client connects, the kernel gives it to whichever shard the four\-tuple
+hashes to, and a key another shard owns is fetched from that shard over the
+mesh. The cache is one store as far as any client can tell.
 .IP
-In addition, shard
+That crossing costs CPU, and with
+.I N
+shards a random key is foreign
+.RI ( N \-1)/ N
+of the time. Measured on this build, 8 client processes \(mu 50 connections,
+three interleaved passes per arm, medians, requests per second per
+.I server
+core:
+.IP
+.nf
+four shards, clients on the shared port     63,849   15.66 us/req
+the same runtime with \-\-cluster, clients
+  routed to the per\-shard ports             87,401   11.44 us/req
+four independent single\-shard caches        87,663   11.40 us/req
+.fi
+.IP
+Absolute levels are not comparable between machines or between sessions; the
+ratio within one interleaved sweep is what is claimed.
+.TP
+.B \-\-cluster
+Publish a routable slot map, so that a cluster\-aware client sends each key
+straight to the shard that owns it and no crossing happens at all. Off by
+default.
+.IP
+.B "Read this before you type it: a cache with \-\-cluster cannot sit behind a proxy used for access control."
+Client\-side routing means the client connects to every shard
+.IR directly .
+This cache tells it where they are, and the address it gives is the one the
+.I asking
+connection arrived on. Put the cache behind a proxy and the asking connection
+is the proxy's, so the map names the address the
+.I proxy
+reaches the cache on. Either the client can reach that address too \(em and the
+proxy's rules have just been bypassed by a map the cache handed out \(em or it
+cannot, and the client spends its retry budget on a connection refused.
+Neither outcome produces a log line.
+.IP
+This is not a limitation of this implementation. It is what client\-side
+routing is, and Redis Cluster has exactly the same property. There is no
+setting that makes a routing client and a proxy enforcement point work
+together; the choice is which of the two you want. Without
+.B \-\-cluster
+the cache is reached only through its one port, which is what a proxy in front
+of it depends on.
+.IP
+.B Each shard binds its own port.
+Shard
 .I i
 binds
-.IR port + 1 + i .
-A client that connects there has chosen that shard on purpose, and a key it
-does not own is answered with
+.IR port + 1 + i ,
+in addition to the shared port, which keeps working exactly as it does without
+the flag. A client that connects to a per\-shard port has chosen that shard on
+purpose, and a key it does not own is answered with
 .BI \-MOVED " slot host:port"
-rather than fetched. That is what lets an off\-the\-shelf cluster client \(em
+rather than fetched. That is what lets
 .BR "redis\-cli \-c" ,
 .BR "redis\-benchmark \-\-cluster" ,
-redis\-py, go\-redis, lettuce, node\-redis \(em compute the slot itself and send
-each key straight to its owner.
+redis\-py, go\-redis, lettuce and node\-redis route for themselves.
 .IP
-.B A sharded cache therefore needs port+1 .. port+N free, and refuses to start otherwise.
+.B A cache with \-\-cluster therefore needs port+1 .. port+N free, and refuses to start otherwise.
 The address a client is sent to is a formula, computed by whichever shard
 answers
 .BR "CLUSTER SLOTS" ,
 which has no way to learn whether its siblings bound their ports. A shard that
 ran without one would be advertised anyway and every client would spend its
-retries on a connection refused, so the start fails instead, naming the port.
-Two four\-shard caches one port apart used to work and now refuse.
+retries on a connection refused, so the start fails instead, naming the port
+and naming this flag. Without
+.B \-\-cluster
+nothing but the shared port is bound and two four\-shard caches one port apart
+work as they always did.
+.IP
+.B \-\-cluster is legal at any shard count.
+At
+.B "\-\-shards 1"
+it publishes a cluster of one node on the base port and binds nothing extra,
+so a client can be written once and deployed at any
+.IR N .
 .IP
 .B CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT
-are answered on every port, including the shared one and including an
-unsharded cache \(em which reports
-.B cluster_enabled:0
-so that a client does not open connections to shards that do not exist. There
-is no cluster bus, no failover, no slot migration and no
+are answered on every port and at every shard count, with or without this
+flag \(em a client that asks deserves a straight answer.
+.B CLUSTER INFO
+reports
+.B cluster_enabled:1
+only when
+.B \-\-cluster
+was given; without it the reply is
+.BR cluster_enabled:0 ,
+and
+.B CLUSTER SLOTS
+publishes a single node holding every slot on the shared port, which is both
+true and safe. There is no cluster bus, no failover, no slot migration and no
 .BR ASK :
 the map is a formula and there is one owner per slot for the life of the run.
 .IP
 .B On a per-shard port, a command that asks about the keyspace answers for that shard.
 .BR DBSIZE ", " KEYS ", " SCAN ", " FLUSH " and " LOAD
-report or act on the slice the shard holds, which is what a cluster client
+report or act on the slice that shard holds, which is what a cluster client
 means when it asks a node, and what
 .B redis\-cli \-\-cluster call
 adds up itself. On the shared port they still fan out across every shard and
 merge, as they always have.
-.BR PUBLISH
+.B PUBLISH
 fans out on both, because a subscriber on another shard is a subscriber.
 .IP
 A multi\-key command on a per\-shard port whose keys are all owned by one other

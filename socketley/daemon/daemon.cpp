@@ -474,6 +474,7 @@ static void restore_runtimes(state_persistence& persistence,
                 if (!cfg.persistent_path.empty()) cache->set_persistent(cfg.persistent_path);
                 cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
                 if (cfg.resp_forced) cache->set_resp_forced(true);
+                if (cfg.cluster) cache->set_cluster(true);
                 if (!cfg.replicate_target.empty()) cache->set_replicate_target(cfg.replicate_target);
                 if (cfg.max_memory > 0) cache->set_max_memory(cfg.max_memory);
                 cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));

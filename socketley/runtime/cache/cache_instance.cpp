@@ -656,7 +656,13 @@ bool cache_instance::setup(event_loop& loop)
     // The practical consequence, stated because it is a change: `--shards N` on
     // port P now needs P+1 .. P+N free as well.  Two four-shard caches one port
     // apart used to work and now refuse.
-    if (m_shard_n > 1)
+    // Only under --cluster, and only above one shard.  A cluster of one node
+    // needs no second port: its one node is the shared port, and the map says
+    // so.  Without the flag this whole block is skipped and the runtime is
+    // byte-for-byte the shared-port cache it was before client routing existed.
+    m_cluster_ports = m_cluster_forced && m_shard_n > 1;
+
+    if (m_cluster_ports)
     {
         const uint32_t wanted = static_cast<uint32_t>(port) + 1u + m_shard_i;
         if (wanted > 65535u)
@@ -664,7 +670,8 @@ bool cache_instance::setup(event_loop& loop)
             LOG_ERROR(("cache: shard " + std::to_string(m_shard_i) + " of "
                        + std::to_string(m_shard_n) + " would need port "
                        + std::to_string(wanted) + ", which is not a port -- "
-                       "a sharded cache needs base+1..base+N below 65536").c_str());
+                       "--cluster needs base+1..base+N below 65536, or drop "
+                       "--cluster and the shards share the one port").c_str());
             close_tracked(m_listen_fd);
             m_listen_fd = -1;
             return false;
@@ -676,7 +683,9 @@ bool cache_instance::setup(event_loop& loop)
                        + std::to_string(m_shard_n) + " could not bind its own port "
                        + std::to_string(m_cluster_port)
                        + " -- CLUSTER SLOTS would advertise an address nothing "
-                         "answers on, so the cache refuses to start").c_str());
+                         "answers on, so the cache refuses to start.  Free that "
+                         "port, or drop --cluster: without it the shards share "
+                         "the one port and cross for foreign keys").c_str());
             close_tracked(m_listen_fd);
             m_listen_fd = -1;
             m_cluster_port = 0;
@@ -1066,6 +1075,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
     m_loop = nullptr;
     m_multishot_active = false;
     m_cluster_multishot_active = false;
+    m_cluster_ports = false;
 }
 
 void cache_instance::arm_ttl_timer()
@@ -3014,10 +3024,12 @@ bool cache_instance::load_shard_set()
 // migrating.  A client that supports resharding will simply never see one.
 uint16_t cache_instance::cluster_port_of(uint32_t shard) const
 {
-    // Unsharded: one node, and its port is the port the operator configured.
-    // Not base+1, which nothing is bound to — a client told to go there would
-    // get a connection refused for a cache that is working perfectly.
-    if (m_shard_n <= 1)
+    // One node: its port is the port the operator configured.  Not base+1,
+    // which nothing is bound to — a client told to go there would get a
+    // connection refused for a cache that is working perfectly.  That is the
+    // answer for an unsharded cache AND for a sharded one without --cluster,
+    // which is one node as far as any client can tell.
+    if (!m_cluster_ports)
         return m_base_port;
     return static_cast<uint16_t>(m_base_port + 1 + shard);
 }
@@ -3116,7 +3128,14 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
                                   std::string_view arg, bool resp)
 {
     auto& rb = conn->response_buf;
-    const uint32_t n    = m_shard_n < 1 ? 1 : m_shard_n;
+    // How many nodes this cache presents as.  Without --cluster that is ONE,
+    // whatever the shard count: nothing is bound at base+1+i, so publishing
+    // those addresses would send every client to a connection refused.  One
+    // node covering every slot on the shared port is both true and safe.
+    const uint32_t n    = m_cluster_ports ? m_shard_n : 1;
+    // And which of them is us.  Collapsed to node 0 when there is one node, or
+    // all four shards would answer CLUSTER NODES with no line marked myself.
+    const uint32_t me   = m_cluster_ports ? m_shard_i : 0;
     const std::string host = cluster_host(conn);
     const uint32_t h    = fnv1a_lower(sub);
 
@@ -3135,7 +3154,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         const uint32_t bus = static_cast<uint32_t>(cluster_port_of(sh)) + 10000u;
         l += '@';
         l += std::to_string(bus <= 65535u ? bus : 0u);
-        l += (sh == m_shard_i) ? " myself,master - 0 " : " master - 0 ";
+        l += (sh == me) ? " myself,master - 0 " : " master - 0 ";
         l += std::to_string(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
@@ -3243,7 +3262,11 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
             // cluster_enabled is 1 only when there is a map worth reading: an
             // unsharded cache says 0, which is what stops a cluster client from
             // opening N connections to a single-node cache.
-            out += m_shard_n > 1 ? "cluster_enabled:1\r\n" : "cluster_enabled:0\r\n";
+            // The FLAG, not the shard count.  A client asking whether to
+            // route deserves the answer to that question: a sharded cache
+            // without --cluster routes nothing and must say 0, and a
+            // single-shard cache WITH it speaks the protocol and says 1.
+            out += m_cluster_forced ? "cluster_enabled:1\r\n" : "cluster_enabled:0\r\n";
             out += "cluster_state:ok\r\n";
             out += "cluster_slots_assigned:16384\r\n";
             out += "cluster_slots_ok:16384\r\n";
@@ -3262,7 +3285,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
 
         case fnv1a("myid"):
         {
-            const std::string id = cluster_node_id(m_shard_i);
+            const std::string id = cluster_node_id(me);
             if (resp) resp::encode_bulk_into(rb, id);
             else    { rb += id; rb += '\n'; }
             break;
@@ -3293,7 +3316,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
                 else      rb += "error: invalid slot\n";
                 break;
             }
-            if (cache_shard_of_slot(slot, n) != m_shard_i)
+            if (cache_shard_of_slot(slot, n) != me)
             {
                 if (resp) resp::encode_error_into(rb,
                     "this shard does not own slot " + std::to_string(slot));
@@ -7173,6 +7196,16 @@ eviction_policy cache_instance::get_eviction() const
 }
 
 // ─── RESP mode ───
+
+void cache_instance::set_cluster(bool enabled)
+{
+    m_cluster_forced = enabled;
+}
+
+bool cache_instance::get_cluster() const
+{
+    return m_cluster_forced;
+}
 
 void cache_instance::set_resp_forced(bool enabled)
 {

@@ -324,6 +324,28 @@ public:
     void set_resp_forced(bool enabled);
     bool get_resp_forced() const;
 
+    // ─── --cluster: whether this cache PUBLISHES a routable map ─────────────
+    //
+    // Off by default, and the default is the whole of the old behaviour: with
+    // --shards N alone the shards share one port, the kernel assigns
+    // connections by four-tuple hash, and a key another shard owns is fetched
+    // over the mesh.  Nothing binds base+1, nothing answers -MOVED, and
+    // CLUSTER SLOTS publishes ONE node covering every slot on the shared port,
+    // which is a true map and a safe one.
+    //
+    // It is a flag and not a consequence of --shards because client-side
+    // routing gives up an enforcement point, and that is a decision only the
+    // operator can make.  A routing client must reach every shard's own port
+    // DIRECTLY: put this cache behind a proxy and the address it advertises is
+    // the one the PROXY reaches it on, taken from getsockname() on the asking
+    // connection.  Either the client can reach that address -- and the proxy's
+    // rules have been bypassed by a map this cache handed out -- or it cannot,
+    // and the client spends its retry budget on a connection refused.  Neither
+    // is visible to the operator, and neither can be fixed here: it is what
+    // client-side routing IS, and Redis Cluster has the same property.
+    void set_cluster(bool enabled);
+    bool get_cluster() const;
+
     // Pub/Sub
     int publish(std::string_view channel, std::string_view message);
 
@@ -817,6 +839,11 @@ private:
     std::unique_ptr<accept_op> m_cluster_accept;
     bool m_cluster_multishot_active{false};
     uint16_t m_cluster_port{0};
+    // What --cluster asked for, and what this run actually does about it.
+    // m_cluster_ports is the second one: a cluster of a single shard publishes
+    // a map and binds no extra port, because its one node IS the shared port.
+    bool m_cluster_forced{false};
+    bool m_cluster_ports{false};
     // The port the operator configured — shard i's own port is this + 1 + i, and
     // the map published by CLUSTER SLOTS is that formula for every i.  Kept
     // because get_port() is not inline and the answer has to be identical in

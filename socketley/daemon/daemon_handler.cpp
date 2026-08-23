@@ -3412,7 +3412,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         {
             static constexpr uint32_t cache_only[] = {
                 fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
-                fnv1a("--replicate"), fnv1a("--resp"),
+                fnv1a("--replicate"), fnv1a("--resp"), fnv1a("--cluster"),
             };
             bool is_cache_flag = false;
             for (uint32_t h : cache_only)
@@ -3742,6 +3742,14 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "cannot change RESP mode while running\n";
                 return 1;
             }
+            // A running cluster has already published its map, and every
+            // client holding it would keep sending keys to ports that had
+            // stopped answering.  Same rule as the port itself.
+            if (cfg.cluster != cache->get_cluster())
+            {
+                conn->write_buf = "cannot change cluster mode while running\n";
+                return 1;
+            }
             if (cfg.replicate_target != std::string(cache->get_replicate_target()))
             {
                 conn->write_buf = "cannot change replication while running\n";
@@ -3929,6 +3937,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (has("persistent_path"))  cache->set_persistent(cfg.persistent_path);
             if (has("cache_mode"))       cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
             if (has("resp_forced"))      cache->set_resp_forced(cfg.resp_forced);
+            if (has("cluster"))          cache->set_cluster(cfg.cluster);
             if (has("replicate_target")) cache->set_replicate_target(cfg.replicate_target);
             if (has("max_memory"))       cache->set_max_memory(cfg.max_memory);
             if (has("eviction"))         cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));

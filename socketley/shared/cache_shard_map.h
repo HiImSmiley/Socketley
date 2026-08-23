@@ -54,6 +54,18 @@
 // runtime and N unsharded ones was the crossing, and routing removes all of it
 // rather than some of it.
 //
+// WHAT A CROSSING COSTS, said correctly.  15.66 - 11.44 = 4.22 us is per
+// REQUEST, and at four shards only (N-1)/N = 75% of requests cross -- the
+// counter says so directly, 9.0 M crossings for 12 M requests.  Per crossing
+// it is 4.22 / 0.75 = ~5.6 us.  Quoting the per-request difference as the
+// price of a crossing understates it by a quarter, and the mistake survives
+// because both numbers are in microseconds and neither is obviously wrong.
+//
+// Absolutes are not portable between machines or sessions: utime is time, not
+// cycles, so a shift in effective clock scales both arms of a sweep alike and
+// leaves the ratio intact while moving every absolute.  The ratio within one
+// interleaved sweep is what is claimed here; the levels are not.
+//
 // Our own FNV-1a mixed better and spread more evenly and was worth nothing,
 // because no off-the-shelf client can compute it.  A non-standard hash forces a
 // -MOVED on every single key, which is slower than the crossing it replaces.

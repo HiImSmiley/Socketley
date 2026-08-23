@@ -165,6 +165,7 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
                 cache.set_persistent(cfg.persistent_path);
             cache.set_mode(static_cast<cache_mode>(cfg.cache_mode));
             cache.set_resp_forced(cfg.resp_forced);
+            cache.set_cluster(cfg.cluster);
             if (!cfg.replicate_target.empty())
                 cache.set_replicate_target(cfg.replicate_target);
             if (cfg.max_memory > 0) cache.set_max_memory(cfg.max_memory);
