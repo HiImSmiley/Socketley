@@ -63,12 +63,30 @@
 // does it.  The number that has ever hurt here is how many places can tear
 // something down, and for a link it is one: die().
 //
-//   WHO NOTICES A DEAD PEER.  The reader, and nothing else.  One one-shot
-//   poll_add per link, re-armed after each drain -- the same arrangement the
-//   worker's control socket uses, and for the same reason: a link drained on a
-//   timer instead of a completion inherits that timer's latency, which cost a
-//   cross-process `cache set` a measured 20.00 ms before the control socket was
-//   armed.
+//   WHO NOTICES A DEAD PEER.  The reader, and nothing else.  One recv per
+//   link, re-armed once per turn -- the same arrangement the worker's control
+//   socket uses, and for the same reason: a link drained on a timer instead of
+//   a completion inherits that timer's latency, which cost a cross-process
+//   `cache set` a measured 20.00 ms before the control socket was armed.
+//
+//   THE RECV USED TO BE A POLL, AND THAT IS THE WHOLE OF THIS FILE'S COST.
+//   submit_poll_add() for readiness, a blocking ::read() to take the bytes, and
+//   a bare ::write() to send them -- the epoll pattern, and once the mesh
+//   landed EVERY cross-shard request travelled it.  Counted on one shard of
+//   four, 200,000 GETs, strace -f -qq -c: 52,486 write() and 18,165 read()
+//   against 5,526 io_uring_enter, which is 1.41 blocking syscalls per GET that
+//   shard served.  A recv is not a claim about a socket that this process can
+//   be wrong about -- the bytes are IN the completion -- so the read that
+//   followed the poll has nothing left to do and the safety pump such a claim
+//   needs never has to be written.
+//
+//   The send moves with it, through frame_writer::use_ring().  What that costs
+//   to get wrong is stated at use_ring() and repeated here because this file is
+//   its second caller: an owner on the ring MUST call flush() once per turn of
+//   its loop, and submitting per frame instead of once per turn is what turned
+//   5,920 ring entries into 61,221 the first time this change was made on the
+//   control socket.  pump() below is this link's once-per-turn, and the worker
+//   calls it beside its own m_writer.flush().
 //
 //   WHAT A HALF-OPEN LINK DOES.  Nothing legitimate, and this is an invariant
 //   rather than an observation.  Both directions carry traffic for the whole
@@ -86,9 +104,12 @@
 //   link can complete it, so the sweep is bounded by what that link owed.
 //
 //   WHO CLOSES THE DESCRIPTOR.  die(), after the sweep, through the loop --
-//   which holds the number until the armed poll has reported.  A completion
-//   that lands afterwards finds the link dead and drops, the same "retire, then
-//   let the completion land" the supervisor uses for a worker it is replacing.
+//   close_fd(), which submits a cancel for whatever still names the number and
+//   holds the number until that cancel has landed.  A completion that arrives
+//   afterwards finds the link dead and drops, the same "retire, then let the
+//   completion land" the supervisor uses for a worker it is replacing.  Note
+//   that poll_remove() would not do this job any more: it withdraws a poll by
+//   naming its request, and a recv and a send are withdrawn by descriptor.
 //
 // ─── WHAT IS NOT HERE, NAMED RATHER THAN LEFT TO BE FOUND ───────────────────
 //
@@ -119,7 +140,6 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <poll.h>
 #include <unistd.h>
 
 #include "event_loop.h"
@@ -160,10 +180,29 @@ public:
     shard_link(const shard_link&)            = delete;
     shard_link& operator=(const shard_link&) = delete;
 
+    // ── The order here is the whole of it, and it has been got wrong ───────
+    //
+    // register_owner() FIRST, then the writer, then the arm.  A submission
+    // carries its owner's token, and one made before the registration is not
+    // merely unowned: its completion is DROPPED.  For this link that means the
+    // recv never reports, m_armed never clears, and every crossing parked on it
+    // waits for ever.  That is not hypothetical -- it is how this file behaved
+    // before the owner was set, and the loop now warns once when it sees a
+    // submission with no owner precisely because the symptom is otherwise
+    // silent.
+    //
+    // There are N-1 links per shard, so this is N-1 chances to get it wrong
+    // rather than one, which is why it is a single function that all of them go
+    // through and there is no early return above the registration.
     bool attach(event_loop& loop)
     {
         m_loop = &loop;
         loop.register_owner(this);
+
+        // Nothing is queued on a link this new, so this only installs the ring.
+        // From here write() queues and pump() is what puts it on the wire.
+        m_writer.use_ring(&loop, this);
+
         arm();
         return m_armed;
     }
@@ -200,21 +239,90 @@ public:
         return true;
     }
 
+    // ── The two things a link has on the ring ───────────────────────────────
+    //
+    // Its recv and its writer's send, told apart by the request ADDRESS and not
+    // by the op type: a type is a shape, and the moment there are two
+    // submissions of the same shape a type cannot separate them.
     void on_cqe(struct io_uring_cqe* cqe) override
     {
+        auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+        if (!req)
+            return;
+
+        if (m_writer.owns_request(req))
+        {
+            m_writer.on_send_cqe(cqe->res);
+            if (m_writer.dead())
+                die("sending to a sibling failed");
+            return;
+        }
+
+        if (req != &m_req)
+            return;
+
         m_armed = false;
         if (m_dead)
             return;
 
-        // A cancelled poll is the loop withdrawing it, not the peer.
-        if (cqe->res < 0 && cqe->res != -EAGAIN)
+        const int res = cqe->res;
+        if (res > 0)
         {
-            die("the poll on a sibling link reported an error");
+            // A recv, not a readiness notification.  The bytes are already
+            // here; the ::read() that used to follow the poll is what this
+            // replaces, and with it the only reason this link ever needed a
+            // second syscall per arrival.
+            m_in.append(m_rbuf, static_cast<size_t>(res));
+            take_frames();
+            return;                    // re-armed by pump(), at the end of the turn
+        }
+
+        // ─── ANY END OF INPUT IS THE PEER GOING AWAY ────────────────────────
+        //
+        // Not "is this a tidy half-close or a failure".  That question does not
+        // exist on this link and must not be invented here: both directions
+        // carry traffic for the whole life of a link, so a peer that has
+        // stopped writing has stopped, and there is nothing a half-open mesh
+        // link could still be for.
+        //
+        // Written at the point the end of input is read rather than in the
+        // header alone because this is the line somebody would otherwise "fix"
+        // into a graceful-shutdown path, and that is the shape that cost this
+        // tree four fixes for one hold.
+        if (res == 0)
+        {
+            die("a sibling closed its end");
             return;
         }
 
-        if (!drain())
-            return;                    // drain() called die() itself
+        // Nothing arrived and nothing is wrong.  -ECANCELED is this ring going
+        // down or close_fd() withdrawing the arm, neither of which is the peer.
+        // Re-armed by pump(), and the wait before it is clamped because
+        // m_armed is false — see needs_wake().
+        if (res == -EAGAIN || res == -EWOULDBLOCK || res == -EINTR ||
+            res == -ECANCELED)
+            return;
+
+        die("reading from a sibling failed");
+    }
+
+    // ── Once per turn of the owner's loop ───────────────────────────────────
+    //
+    // The two things a completion cannot do for itself: put the frames this
+    // turn wrote on the wire, and replace a recv that is no longer standing.
+    //
+    // Both are here rather than in on_cqe() and that is what makes the change
+    // pay.  Flushing per frame submits a send per crossing, a send produces a
+    // completion, and a completion arriving on its own ends the ring's wait —
+    // so the loop takes a whole turn, and one io_uring_enter, to learn that a
+    // send it needed no answer to has finished.  Measured on the control
+    // socket, which is the same code: per-frame submission turned 5,920 ring
+    // entries into 61,221, about one per crossing.  Everything one turn wrote
+    // goes out in ONE send instead.
+    void pump()
+    {
+        if (m_dead)
+            return;
 
         m_writer.flush();
         if (m_writer.dead())
@@ -225,12 +333,26 @@ public:
         arm();
     }
 
+    // States the ring cannot end on its own: no recv standing, or bytes queued
+    // with no send standing — both of them a submission get_sqe() refused.  An
+    // in-flight send needs no clamp, it ends with a completion.  The owner's
+    // loop asks this to decide whether it may sleep to its own deadline.
+    bool needs_wake() const
+    {
+        return !m_dead && (!m_armed || m_writer.needs_retry());
+    }
+
     // Give up this link and answer everything it owed.
     //
     // The one function that ends a link.  Everything below is ordered so that
     // no step can be reached twice: the flag first, then the tickets, then the
     // descriptor.
-    void die(const char* why)
+    // `expected` is the ordinary shutdown of a healthy link, which is the one
+    // reason a link ends that is not worth a warning: at stop time every shard
+    // retires N-1 of them, so an unconditional LOG_WARN would put N*(N-1) lines
+    // about nothing into the log of every clean stop and teach the next reader
+    // to ignore the line that matters.
+    void die(const char* why, bool expected = false)
     {
         if (m_dead)
             return;
@@ -249,26 +371,33 @@ public:
 
         if (m_fd >= 0)
         {
-            // Through the loop, which holds the number until the armed poll has
-            // reported: a plain close() here would free it for the next accept
-            // while a completion still names it.
+            // Through the loop, which holds the number until every operation
+            // naming it has reported: a plain close() here would free it for the
+            // next accept while a completion still names it.
+            //
+            // close_fd() and not poll_remove().  A poll is withdrawn by naming
+            // the request; a recv and a send are not, and close_fd() is the one
+            // that submits a cancel for the descriptor and then holds the number
+            // until that cancel and everything it withdrew has landed.  The
+            // writer is left on the ring on purpose: mark_dead() above makes
+            // every later flush() a no-op, so nothing is submitted against a
+            // number that is on its way out, and the buffer an in-flight send is
+            // reading from outlives the cancel because this object does.
             if (m_loop)
-            {
-                if (m_armed)
-                    if (!m_loop->submit_poll_remove(&m_req)) {}
                 m_loop->close_fd(m_fd);
-            }
             else
-            {
                 ::close(m_fd);
-            }
             m_fd = -1;
         }
 
-        LOG_WARN(("shard mesh: the link to shard " + std::to_string(m_peer)
-                  + " is down (" + why + "); " + std::to_string(swept)
-                  + " crossing(s) answered, the rest relay through the daemon")
-                 .c_str());
+        const std::string note =
+            "shard mesh: the link to shard " + std::to_string(m_peer)
+            + " is down (" + std::string(why) + "); " + std::to_string(swept)
+            + " crossing(s) answered, the rest relay through the daemon";
+        if (expected)
+            LOG_DEBUG(note.c_str());
+        else
+            LOG_WARN(note.c_str());
     }
 
     size_t owed() const { return m_owed.size(); }
@@ -276,77 +405,44 @@ public:
 private:
     void arm()
     {
-        if (m_dead || !m_loop || m_armed || m_fd < 0)
+        if (m_dead || !m_loop || m_armed || m_fd < 0 || !m_loop->ring_open())
             return;
         // The request carries its own owner: the loop dispatches a completion
         // by the handler named in it, and one left empty matches no live
         // registration, so the completion is dropped.  Measured before this
         // line existed: the mesh built its links, sent its requests, and every
-        // crossing hung — the poll never came back because nothing was waiting
-        // for it.
-        m_req   = { this, nullptr, m_fd, 0, op_poll };
-        m_armed = m_loop->submit_poll_add(m_fd, POLLIN, &m_req);
-        if (!m_armed)
-        {
-            // Nothing will wake this link again, and a link nothing wakes is a
-            // link whose crossings never come back.  Better dead and relaying.
-            die("a poll on a sibling link could not be armed");
-        }
+        // crossing hung — the completion never came back because nothing was
+        // waiting for it.
+        m_req   = { this, nullptr, m_fd, sizeof(m_rbuf), op_read };
+        m_armed = m_loop->submit_read(m_fd, m_rbuf, sizeof(m_rbuf), &m_req);
+        // A submission the ring refused is not a dead link.  needs_wake() says
+        // so, the owner's loop clamps its wait on it, and pump() tries again
+        // next turn — which is the same treatment the control socket's recv
+        // gets, and it is why this no longer die()s here: get_sqe() coming back
+        // empty under load would have retired a link that had nothing wrong
+        // with it and sent its shard's crossings through the daemon for good.
     }
 
-    // Read what is there and act on every whole frame.  False means the link
-    // has been given up on.
-    bool drain()
+    // Act on every whole frame the recv completions have delivered so far.
+    //
+    // What used to be here as well was the ::read() loop that filled m_in.  It
+    // is gone with the poll it followed: the bytes arrive in the completion.
+    void take_frames()
     {
-        char buf[4096];
-        for (;;)
-        {
-            const ssize_t n = ::read(m_fd, buf, sizeof(buf));
-            if (n > 0)
-            {
-                m_in.append(buf, static_cast<size_t>(n));
-                continue;
-            }
-
-            // ─── ANY END OF INPUT IS THE PEER GOING AWAY ────────────────────
-            //
-            // Not "is this a tidy half-close or a failure".  That question does
-            // not exist on this link and must not be invented here: both
-            // directions carry traffic for the whole life of a link, so a peer
-            // that has stopped writing has stopped, and there is nothing a
-            // half-open mesh link could still be for.
-            //
-            // Written here rather than in the header alone because this is the
-            // line somebody would otherwise "fix" into a graceful-shutdown
-            // path, and that is the shape that cost this tree four fixes for
-            // one hold.
-            if (n == 0)
-            {
-                die("a sibling closed its end");
-                return false;
-            }
-            if (errno == EINTR)
-                continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-            die("reading from a sibling failed");
-            return false;
-        }
-
         worker_proto::frame_type type{};
         uint16_t                 ver = 0;
         std::string              payload;
         bool                     fatal = false;
 
         while (worker_proto::take_frame(m_in, type, ver, payload, fatal))
+        {
             handle(type, payload);
+            if (m_dead)
+                return;    // handle() gave up on the link; m_in goes with it
+        }
 
         if (fatal)
-        {
             die("a sibling sent a frame this build cannot read");
-            return false;
-        }
-        return true;
     }
 
     void handle(worker_proto::frame_type type, const std::string& payload)
@@ -404,7 +500,11 @@ private:
     bool        m_armed{false};
     bool        m_dead{false};
 
-    std::string                 m_in;
+    // What a standing recv writes into.  One at a time and named by m_req, so
+    // there is never a second completion that could be writing here.
+    char        m_rbuf[16 * 1024];
+    std::string m_in;
+
     std::unordered_set<uint64_t> m_owed;
 };
 

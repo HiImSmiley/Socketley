@@ -509,6 +509,19 @@ public:
                 if (!m_ctl_armed || m_writer.needs_retry())
                     wait_ms = std::min(wait_ms, ctl_fallback_ms);
 
+                // The same two states, per mesh link.  A link whose recv is
+                // standing and whose writer is idle needs nothing: a sibling's
+                // frame ends the wait by itself, which is the whole reason the
+                // links are on the ring.  What has to be clamped is a
+                // submission get_sqe() refused, because nothing in the ring
+                // will come back to retry it.
+                for (const auto& link : m_mesh_links)
+                    if (link->needs_wake())
+                    {
+                        wait_ms = std::min(wait_ms, ctl_fallback_ms);
+                        break;
+                    }
+
                 // The turn did something exactly when the ring delivered
                 // something.  This is the whole of the activity test and it is
                 // taken HERE rather than inferred later from a counter that
@@ -560,6 +573,24 @@ public:
             // against the fd on the way down.
             if (!m_done)
                 arm_control();
+
+            // ── And the same two steps for every link to a sibling ──────────
+            //
+            // Beside m_writer.flush() and arm_control() rather than inside
+            // shard_link::on_cqe(), and that placement is the measurement, not
+            // a tidiness preference: a send submitted per frame produces a
+            // completion per crossing, and a completion arriving alone ends the
+            // ring's wait — so the loop spends a turn and an io_uring_enter
+            // learning that a send it needed no answer to has finished.  On the
+            // control socket, which is this same code, that was 5,920 ring
+            // entries against 61,221.  Once per turn, every crossing this turn
+            // answered leaves in one send.
+            //
+            // Unconditional, including while m_done: a link that is on its way
+            // out still owes its sibling whatever it has queued, and pump() is
+            // a no-op on a dead one.
+            for (auto& link : m_mesh_links)
+                link->pump();
 
             const auto now = std::chrono::steady_clock::now();
             if (stats_dirty && now - last_stats >= stats_interval)
@@ -672,6 +703,22 @@ public:
         // into a segfault the last time it was got wrong.
         if (m_rt && m_rt->get_state() == runtime_running)
             m_rt->stop(m_loop);
+
+        // ── The links come off the ring before the ring goes ───────────────
+        //
+        // Each of them holds a standing recv, may hold an in-flight send, and
+        // owns a registration of its own.  die() is the one function that ends
+        // a link and it does all three — it sweeps the crossings the link was
+        // carrying and answers them `no_target`, so a sibling's request that
+        // was in flight when this shard was told to stop is answered rather
+        // than left to a deadline that does not exist, and it closes the
+        // descriptor through the loop so the number outlives the cancel.
+        //
+        // Before requests().detach() for the same reason detach() is before the
+        // ring: the sweep completes tickets through the channel, and a detached
+        // channel answers them `dropped` instead.
+        for (auto& link : m_mesh_links)
+            link->die("this shard is shutting down", /*expected=*/true);
 
         // Before the ring, like every other owner registration: detach answers
         // whatever is still queued `dropped` and gives the owner token back.
