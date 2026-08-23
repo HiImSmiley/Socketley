@@ -4,12 +4,19 @@
 # =============================================================================
 #
 # THE NUMBER THIS EXISTS FOR
-#   A sharded cache costs 44% more CPU per request than the same work with no
-#   crossings: 11.56 us across four shards of one runtime, 8.01 us across four
-#   independent single-shard caches.  The crossing is already as cheap as it
-#   can be made -- it is on the io_uring ring, it makes zero blocking syscalls,
-#   the daemon is not in the path -- so the only way left to remove the cost is
-#   to remove the crossing.
+#   A sharded cache costs more CPU per request than the same work with no
+#   crossings.  Measured on this tree, 8 client processes x 50 connections,
+#   three interleaved passes per arm, medians, rps per SERVER core:
+#
+#       four shards, clients on the shared port       63,849   15.66 us/req
+#       the same runtime, clients routed to the
+#         per-shard ports (zero crossings)            87,401   11.44 us/req
+#       four independent single-shard caches          87,663   11.40 us/req
+#
+#   +36.9%, and the routed arm lands within 0.3% of four separate caches.  The
+#   crossing is already as cheap as it can be made -- it is on the io_uring
+#   ring, it makes zero blocking syscalls, the daemon is not in the path -- so
+#   the only way left to remove the cost was to remove the crossing.
 #
 #   And a crossing happens because the CLIENT could not choose.  All N shards
 #   share one port through SO_REUSEPORT and the kernel assigns connections by

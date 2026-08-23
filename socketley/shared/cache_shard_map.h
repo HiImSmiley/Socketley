@@ -37,11 +37,22 @@
 // redis-benchmark --cluster, redis-py, go-redis, lettuce and node-redis all
 // already do — they read the slot map once from CLUSTER SLOTS and then open one
 // connection per shard and send each key to its owner.  A key that arrives at
-// its owner costs no crossing at all, and a crossing is where 44% of the CPU of
-// a request goes here (11.56 us across four shards of one runtime against 8.01
-// us across four independent single-shard caches, three passes each).  With N
-// shards a random key is foreign (N-1)/N of the time, so this is the difference
-// between paying that on three quarters of requests and paying it on none.
+// its owner costs no crossing at all, and with N shards a random key is foreign
+// (N-1)/N of the time, so this is the difference between paying for a crossing
+// on three quarters of requests and paying for it on none.
+//
+// Measured on this tree, 8 client processes x 50 connections, three interleaved
+// passes per arm, medians, rps per SERVER core:
+//
+//     four shards, clients on the shared port     63,849   15.66 us/req
+//     the same runtime, clients routed to the
+//       per-shard ports (zero crossings)          87,401   11.44 us/req
+//     four independent single-shard caches        87,663   11.40 us/req
+//
+// +36.9%, and the routed arm lands within 0.3% of four separate caches.  That
+// second comparison is the one that matters: the whole gap between a sharded
+// runtime and N unsharded ones was the crossing, and routing removes all of it
+// rather than some of it.
 //
 // Our own FNV-1a mixed better and spread more evenly and was worth nothing,
 // because no off-the-shelf client can compute it.  A non-standard hash forces a

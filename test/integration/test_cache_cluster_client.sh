@@ -3,11 +3,13 @@
 #
 # ─── WHAT THIS FILE IS ACTUALLY ASSERTING ───────────────────────────────────
 #
-# A sharded cache costs 44% more CPU per request than the same work with no
-# crossings: 11.56 us against 8.01 us, three passes each.  The crossing is not
-# slow because of how it is implemented — it is on the ring, it makes zero
-# blocking syscalls, the daemon relay is out of the path — it is slow because it
-# EXISTS.  With N shards a random key is foreign (N-1)/N of the time, and until
+# A sharded cache costs more CPU per request than the same work with no
+# crossings.  Measured on this tree, 8 client processes x 50 connections, three
+# interleaved passes per arm, medians, rps per server core: 63,849 on the shared
+# port against 87,401 routed, and four independent single-shard caches at
+# 87,663.  The crossing is not slow because of how it is implemented — it is on
+# the ring, it makes zero blocking syscalls, the daemon relay is out of the
+# path — it is slow because it EXISTS.  With N shards a random key is foreign (N-1)/N of the time, and until
 # now the client could not choose its shard: every shard joins one port under
 # SO_REUSEPORT and the kernel assigns by 4-tuple hash.
 #

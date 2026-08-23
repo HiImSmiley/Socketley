@@ -120,9 +120,19 @@ See `sharded-cache.sh`.
 
 Sharding costs a **crossing**: with N shards a random key is foreign (N-1)/N of
 the time, because all N shards share one port under `SO_REUSEPORT` and the
-kernel assigns connections by four-tuple hash. Measured, four shards of one
-runtime against four independent single-shard caches: **11.56 us against 8.01 us
-of CPU per request**, a 1.44x difference that is entirely the crossing.
+kernel assigns connections by four-tuple hash.
+
+Measured on this tree — 8 client processes x 50 connections, three interleaved
+passes per arm, medians, **rps per server core**:
+
+| four shards, clients on | rps/core | CPU per request | crossings |
+|---|---|---|---|
+| the shared port | 63,849 | 15.66 us | ~9.0 M |
+| the per-shard ports | **87,401** | **11.44 us** | **0** |
+| *four independent single-shard caches* | *87,663* | *11.40 us* | *0* |
+
+**+36.9%, and the routed arm lands within 0.3% of four separate caches.** The
+whole gap between a sharded runtime and N unsharded ones was the crossing.
 
 The crossing is removed by letting the client route, and the client is not ours:
 
