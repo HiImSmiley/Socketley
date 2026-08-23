@@ -224,6 +224,7 @@ cache_instance::~cache_instance()
     }
 
     close_tracked(m_listen_fd);
+    close_tracked(m_cluster_listen_fd);
 }
 
 void cache_instance::close_tracked(int fd)
@@ -443,6 +444,100 @@ size_t cache_instance::get_connection_count() const
     return m_clients.size();
 }
 
+// ─── ONE LISTENER, TWO PORTS ────────────────────────────────────────────────
+//
+// A sharded cache binds two: the shared one every shard joins under
+// SO_REUSEPORT, and one this shard alone holds.  They are the same socket with
+// the same options and the same refusals, so this is one function called twice
+// rather than a second copy that will be fixed once and stay broken in the
+// other place — the rule shared/ exists for, applied inside one file.
+bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
+{
+    // SOCK_CLOEXEC, same reasoning as the server and proxy listeners: a cache
+    // lives in the daemon, and the daemon forks proxy workers that have no use
+    // for this port and every opportunity to keep it bound after the cache is
+    // gone.
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // SO_REUSEPORT is what SPREADS the shared port across the shards, and it is
+    // exactly what the per-shard port must not have: see m_cluster_listen_fd.
+    if (reuseport)
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
+    //
+    // This set it with a one-second timeout.  setup_tcp_listener in
+    // server_instance.cpp carries the full argument; what follows is what is
+    // different about a cache, because a cache is the case where the usual
+    // defence of this option is actually true.
+    //
+    // RESP is request/response and nothing greets, so a cache client speaks
+    // first by definition and the DELAY the option introduces costs a real one
+    // nothing.  Measured here and stated plainly:
+    //
+    //     connect storm      (`server burst`, no client ever speaks)
+    //         with 106,456/s   without 73,448/s   -25.8%  +/-13.9% CI95
+    //     client speaks first (connect, SET, read the answer, close)
+    //         with  28,708/s   without 30,887/s    +7.9%  +/-10.3% CI95
+    //
+    // Fifteen pairs each, interleaved, gated on the port pool; the method and
+    // why the paired median is the statistic are written out once, next to the
+    // same measurement in proxy_instance.cpp.
+    //
+    // So the intuition holds and is now a number: on the only shape a cache
+    // client has, this option is worth nothing that can be told from zero.  The
+    // -26% is a storm of connections that never send a command, which is not a
+    // cache workload -- it is the case the deferral was written for.
+    //
+    // It is removed anyway, and not for the delay.  A connection still in
+    // SYN-RECV is a request sock rather than a socket, and when the listener
+    // closes the kernel drops it with no FIN and no RST — the client keeps an
+    // ESTABLISHED socket against a peer that no longer exists, and nothing on an
+    // accepted cache connection sets SO_KEEPALIVE.  "Until it next writes" is
+    // the whole problem for this runtime in particular: a cache client library
+    // holds a POOL of idle connections and hands one out on demand, so a
+    // connection killed while idle is not noticed at the moment it dies but at
+    // the moment somebody's request is written into it.  Idle is the normal
+    // state of most of that pool, and the window is every connection between
+    // the handshake and the first command.
+    //
+    // Nor is it only the delay that the deferral hides: a connection in
+    // SYN-RECV is in no count, no stats figure and no listing this runtime can
+    // produce, so an operator asking how many clients a cache has is told a
+    // number the kernel disagrees with.
+    //
+    int rcvbuf = 131072;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+        close_tracked(fd);
+        return false;
+    }
+
+    if (listen(fd, 4096) < 0)
+    {
+        close_tracked(fd);
+        return false;
+    }
+
+    out_fd = fd;
+    return true;
+}
+
+
+
 bool cache_instance::setup(event_loop& loop)
 {
     // Nothing from the previous run is cleaned up here any more.  teardown()
@@ -481,6 +576,10 @@ bool cache_instance::setup(event_loop& loop)
     m_shard_i = get_shard_index();
     if (m_shard_i >= m_shard_n)
         m_shard_i = 0;
+
+    m_base_port = get_port();
+    if (m_base_port == 0)
+        m_base_port = 9000;
 
     m_route_payload.assign(m_shard_n, std::string{});
     m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
@@ -535,86 +634,53 @@ bool cache_instance::setup(event_loop& loop)
         m_tls = std::move(ctx);
     }
 
-    uint16_t port = get_port();
-    if (port == 0)
-        port = 9000;
+    const uint16_t port = m_base_port;
 
-    // SOCK_CLOEXEC, same reasoning as the server and proxy listeners: a cache
-    // lives in the daemon, and the daemon forks proxy workers that have no use
-    // for this port and every opportunity to keep it bound after the cache is
-    // gone.
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
+    if (!open_listener(port, /*reuseport=*/true, m_listen_fd))
         return false;
 
-    int opt = 1;
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
+    // ── The per-shard port ──────────────────────────────────────────────────
     //
-    // This set it with a one-second timeout.  setup_tcp_listener in
-    // server_instance.cpp carries the full argument; what follows is what is
-    // different about a cache, because a cache is the case where the usual
-    // defence of this option is actually true.
+    // Bound in ADDITION to the shared one, never instead of it, so a client
+    // that has never heard of a slot map keeps being served exactly as before.
     //
-    // RESP is request/response and nothing greets, so a cache client speaks
-    // first by definition and the DELAY the option introduces costs a real one
-    // nothing.  Measured here and stated plainly:
+    // A failure here fails the START, and that is deliberate.  The address a
+    // client is sent to is a FORMULA — base + 1 + index, computed by whichever
+    // shard happens to answer CLUSTER SLOTS, which has no way to find out
+    // whether its siblings' binds succeeded.  A shard that quietly ran without
+    // its own port would be advertised anyway, and every cluster client would
+    // spend its retry budget on a connection refused.  So the operator is told
+    // now, by name, rather than the client being told later by silence.
     //
-    //     connect storm      (`server burst`, no client ever speaks)
-    //         with 106,456/s   without 73,448/s   -25.8%  +/-13.9% CI95
-    //     client speaks first (connect, SET, read the answer, close)
-    //         with  28,708/s   without 30,887/s    +7.9%  +/-10.3% CI95
-    //
-    // Fifteen pairs each, interleaved, gated on the port pool; the method and
-    // why the paired median is the statistic are written out once, next to the
-    // same measurement in proxy_instance.cpp.
-    //
-    // So the intuition holds and is now a number: on the only shape a cache
-    // client has, this option is worth nothing that can be told from zero.  The
-    // -26% is a storm of connections that never send a command, which is not a
-    // cache workload -- it is the case the deferral was written for.
-    //
-    // It is removed anyway, and not for the delay.  A connection still in
-    // SYN-RECV is a request sock rather than a socket, and when the listener
-    // closes the kernel drops it with no FIN and no RST — the client keeps an
-    // ESTABLISHED socket against a peer that no longer exists, and nothing on an
-    // accepted cache connection sets SO_KEEPALIVE.  "Until it next writes" is
-    // the whole problem for this runtime in particular: a cache client library
-    // holds a POOL of idle connections and hands one out on demand, so a
-    // connection killed while idle is not noticed at the moment it dies but at
-    // the moment somebody's request is written into it.  Idle is the normal
-    // state of most of that pool, and the window is every connection between
-    // the handshake and the first command.
-    //
-    // Nor is it only the delay that the deferral hides: a connection in
-    // SYN-RECV is in no count, no stats figure and no listing this runtime can
-    // produce, so an operator asking how many clients a cache has is told a
-    // number the kernel disagrees with.
-    //
-    int rcvbuf = 131072;
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    // The practical consequence, stated because it is a change: `--shards N` on
+    // port P now needs P+1 .. P+N free as well.  Two four-shard caches one port
+    // apart used to work and now refuse.
+    if (m_shard_n > 1)
     {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
-    }
-
-    if (listen(m_listen_fd, 4096) < 0)
-    {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
+        const uint32_t wanted = static_cast<uint32_t>(port) + 1u + m_shard_i;
+        if (wanted > 65535u)
+        {
+            LOG_ERROR(("cache: shard " + std::to_string(m_shard_i) + " of "
+                       + std::to_string(m_shard_n) + " would need port "
+                       + std::to_string(wanted) + ", which is not a port -- "
+                       "a sharded cache needs base+1..base+N below 65536").c_str());
+            close_tracked(m_listen_fd);
+            m_listen_fd = -1;
+            return false;
+        }
+        m_cluster_port = static_cast<uint16_t>(wanted);
+        if (!open_listener(m_cluster_port, /*reuseport=*/false, m_cluster_listen_fd))
+        {
+            LOG_ERROR(("cache: shard " + std::to_string(m_shard_i) + " of "
+                       + std::to_string(m_shard_n) + " could not bind its own port "
+                       + std::to_string(m_cluster_port)
+                       + " -- CLUSTER SLOTS would advertise an address nothing "
+                         "answers on, so the cache refuses to start").c_str());
+            close_tracked(m_listen_fd);
+            m_listen_fd = -1;
+            m_cluster_port = 0;
+            return false;
+        }
     }
 
     // The dump set was read at the top of setup(), before anything could be
@@ -669,18 +735,14 @@ bool cache_instance::setup(event_loop& loop)
     // listener with two accept chains sharing one io_request and one address
     // buffer.
     m_accept = std::make_unique<accept_op>();
-    m_accept->req = { this, nullptr, -1, 0, op_accept };
-    if (event_loop::supports_multishot_accept())
+    arm_listener(m_listen_fd, *m_accept, m_multishot_active);
+
+    if (m_cluster_listen_fd >= 0)
     {
-        m_accept->req.type = op_multishot_accept;
-        m_multishot_active = true;
+        m_cluster_accept = std::make_unique<accept_op>();
+        arm_listener(m_cluster_listen_fd, *m_cluster_accept,
+                     m_cluster_multishot_active);
     }
-    else
-    {
-        m_accept->req.type = op_accept;
-        m_multishot_active = false;
-    }
-    rearm_accept();
 
     // Periodic TTL sweep, started only once a key actually carries an expiry —
     // a store loaded from disk may already contain some, otherwise the first
@@ -759,6 +821,16 @@ void cache_instance::teardown(event_loop& /*loop*/)
         shutdown(m_listen_fd, SHUT_RDWR);
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
+    }
+
+    // The same two lines for the per-shard listener, and for the same reason:
+    // its multishot accept holds a reference of its own, so close() alone never
+    // ends it and the terminating completion never arrives.
+    if (m_cluster_listen_fd >= 0)
+    {
+        shutdown(m_cluster_listen_fd, SHUT_RDWR);
+        close_tracked(m_cluster_listen_fd);
+        m_cluster_listen_fd = -1;
     }
 
     // Drain: flush pending write queues with blocking writes
@@ -952,6 +1024,11 @@ void cache_instance::teardown(event_loop& /*loop*/)
             owed[0] = &m_accept->req;
             retire(std::shared_ptr<void>(std::move(m_accept)), owed, 1);
         }
+        if (m_cluster_accept)
+        {
+            owed[0] = &m_cluster_accept->req;
+            retire(std::shared_ptr<void>(std::move(m_cluster_accept)), owed, 1);
+        }
         if (m_ttl_timer)
         {
             const size_t n = m_ttl_timer_armed ? 1 : 0;
@@ -987,6 +1064,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
     m_ttl_timer_armed = false;
     m_loop = nullptr;
     m_multishot_active = false;
+    m_cluster_multishot_active = false;
 }
 
 void cache_instance::arm_ttl_timer()
@@ -1091,7 +1169,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     {
         case op_accept:
         case op_multishot_accept:
-            handle_accept(cqe);
+            handle_accept(cqe, req);
             break;
         case op_read:
         case op_read_provided:
@@ -1132,8 +1210,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             else if (m_accept_backoff_timer && req == &m_accept_backoff_timer->req)
             {
                 m_accept_backoff_timer.reset();
+                // Both listeners, and one timer for the two of them: the
+                // shortage that armed it is EMFILE or a full submission queue,
+                // and neither is a property of one socket.  A second timer
+                // would be a second retry chain for one condition.
                 if (m_listen_fd >= 0)
                     rearm_accept();
+                if (m_cluster_listen_fd >= 0)
+                    rearm_cluster_accept();
             }
             break;
         default:
@@ -1259,9 +1343,15 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
 }
 #endif
 
-void cache_instance::handle_accept(struct io_uring_cqe* cqe)
+void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 {
     int client_fd = cqe->res;
+
+    // Which of the two listeners reported.  The request is the only thing that
+    // says so — the completion carries the ACCEPTED descriptor, not the
+    // listening one — and this is why handle_accept is handed it at all.
+    const bool from_cluster =
+        (m_cluster_accept != nullptr && req == &m_cluster_accept->req);
 
     if (client_fd >= 0)
     {
@@ -1297,6 +1387,8 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
             conn->fixed_idx = slot;
             conn->direct_fd = true;
         }
+
+        conn->cluster_port = from_cluster;
 
         auto* ptr = conn.get();
         m_clients[client_fd] = std::move(conn);
@@ -1349,14 +1441,17 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe)
     }
 
 cache_resubmit_accept:
-    if (m_multishot_active)
+    // The listener that reported, and only that one.  Re-arming the other here
+    // would give it a second accept chain on one io_request and one address
+    // buffer, which is the defect accept_op was introduced to stop.
     {
-        if (!(cqe->flags & IORING_CQE_F_MORE))
-            rearm_accept();
-    }
-    else
-    {
-        rearm_accept();
+        const bool multishot = from_cluster ? m_cluster_multishot_active
+                                            : m_multishot_active;
+        if (!multishot || !(cqe->flags & IORING_CQE_F_MORE))
+        {
+            if (from_cluster) rearm_cluster_accept();
+            else              rearm_accept();
+        }
     }
 }
 
@@ -1418,27 +1513,56 @@ void cache_instance::schedule_accept_backoff()
     }
 }
 
-void cache_instance::rearm_accept()
+// Choose the accept shape and arm it.  Written once for both listeners: which
+// of multishot or one-shot this kernel can do is a property of the kernel, and
+// two copies of that choice is two places for it to be decided differently.
+void cache_instance::arm_listener(int fd, accept_op& op, bool& multishot)
 {
-    if (SOCKETLEY_UNLIKELY(!m_loop || m_listen_fd < 0 || !m_accept))
-        return;
-
-    bool queued;
-    if (m_multishot_active)
+    op.req = { this, nullptr, -1, 0, op_accept };
+    if (event_loop::supports_multishot_accept())
     {
-        queued = m_loop->submit_multishot_accept(m_listen_fd, &m_accept->req);
+        op.req.type = op_multishot_accept;
+        multishot = true;
     }
     else
     {
-        m_accept->addrlen = sizeof(m_accept->addr);
-        queued = m_loop->submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen,
-                                       &m_accept->req);
+        op.req.type = op_accept;
+        multishot = false;
+    }
+    rearm_accept_on(fd, &op, multishot);
+}
+
+void cache_instance::rearm_accept_on(int fd, accept_op* op, bool multishot)
+{
+    if (SOCKETLEY_UNLIKELY(!m_loop || fd < 0 || !op))
+        return;
+
+    bool queued;
+    if (multishot)
+    {
+        queued = m_loop->submit_multishot_accept(fd, &op->req);
+    }
+    else
+    {
+        op->addrlen = sizeof(op->addr);
+        queued = m_loop->submit_accept(fd, &op->addr, &op->addrlen, &op->req);
     }
 
     // The listener has no completion left to bring it back, so fall back to the
     // backoff timer rather than going deaf without a word.
     if (SOCKETLEY_UNLIKELY(!queued))
         schedule_accept_backoff();
+}
+
+void cache_instance::rearm_accept()
+{
+    rearm_accept_on(m_listen_fd, m_accept.get(), m_multishot_active);
+}
+
+void cache_instance::rearm_cluster_accept()
+{
+    rearm_accept_on(m_cluster_listen_fd, m_cluster_accept.get(),
+                    m_cluster_multishot_active);
 }
 
 // Ciphertext in, plaintext into conn->partial.  One call per read completion,
@@ -2864,6 +2988,340 @@ bool cache_instance::load_shard_set()
     return true;
 }
 
+// ─── THE CLUSTER VIEW ───────────────────────────────────────────────────────
+//
+// Why a cache that is not a Redis cluster answers CLUSTER at all.
+//
+// The whole point of the CRC16 slot function is that a client can compute a
+// key's owner without asking.  It still has to learn the MAP once — which
+// address holds which slots — and every cluster-aware client learns it exactly
+// one way: it sends CLUSTER SLOTS (or, on newer libraries, CLUSTER SHARDS)
+// at connect and again whenever it is redirected.  Without these replies the
+// slot function is unusable and every key would still be routed by the kernel's
+// 4-tuple hash, which is the situation this change exists to leave.
+//
+// What is published is a FORMULA, not a negotiation.  Shard i listens on
+// base + 1 + i and owns slots [i*16384/N, (i+1)*16384/N).  Any shard can
+// therefore answer for all of them, without a cluster bus, without gossip, and
+// without any shard being reachable from any other — which is what makes this
+// safe to answer on every port including the shared one.
+//
+// What is deliberately NOT here: failover, migration, ASK redirection,
+// CLUSTER SETSLOT, epochs that ever change.  There is one owner per slot for
+// the life of the run — reconcile_proxy_workers() refuses to change a running
+// runtime's shard count — so an epoch is a constant and a slot is never
+// migrating.  A client that supports resharding will simply never see one.
+uint16_t cache_instance::cluster_port_of(uint32_t shard) const
+{
+    // Unsharded: one node, and its port is the port the operator configured.
+    // Not base+1, which nothing is bound to — a client told to go there would
+    // get a connection refused for a cache that is working perfectly.
+    if (m_shard_n <= 1)
+        return m_base_port;
+    return static_cast<uint16_t>(m_base_port + 1 + shard);
+}
+
+std::string cache_instance::cluster_node_id(uint32_t shard) const
+{
+    // Deterministic, because a node id that changed on restart would make every
+    // client believe the whole cluster had been replaced.  Derived from the
+    // runtime name as well as the index so two caches in one daemon do not
+    // publish the same ids.
+    uint64_t h = 1469598103934665603ull;
+    const std::string_view nm = get_name();
+    for (const char c : nm)
+    {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    h ^= 0x100u | shard;
+    h *= 1099511628211ull;
+
+    const auto mix = [](uint64_t& x) {
+        x += 0x9E3779B97F4A7C15ull;
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    // Three draws, in statement order: the arguments of one call would be
+    // evaluated in whatever order the compiler chose, and the draws are not
+    // independent of each other.
+    const uint64_t a = mix(h);
+    const uint64_t b = mix(h);
+    const uint64_t c = mix(h);
+
+    char buf[64];
+    const int n = snprintf(buf, sizeof(buf), "%016llx%016llx%016llx",
+                           static_cast<unsigned long long>(a),
+                           static_cast<unsigned long long>(b),
+                           static_cast<unsigned long long>(c));
+    // 40 hex characters exactly: shorter and redis-cli prints a ragged table,
+    // longer and lettuce's parser refuses the line.
+    if (n < 40)
+        return std::string(buf, static_cast<size_t>(n < 0 ? 0 : n));
+    return std::string(buf, 40);
+}
+
+std::string cache_instance::cluster_host(const client_connection* conn) const
+{
+    // The listener is bound to INADDR_ANY, so it cannot say which address a
+    // client reached it on — but the accepted socket can, and that address is
+    // reachable from the client by construction.  This is what makes the map
+    // correct on loopback and on a LAN without an --announce flag.
+    if (conn && conn->fd >= 0)
+    {
+        struct sockaddr_in local{};
+        socklen_t len = sizeof(local);
+        if (getsockname(conn->fd, reinterpret_cast<struct sockaddr*>(&local),
+                        &len) == 0
+            && local.sin_family == AF_INET
+            && local.sin_addr.s_addr != htonl(INADDR_ANY))
+        {
+            char ip[INET_ADDRSTRLEN]{};
+            if (inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip)))
+                return std::string(ip);
+        }
+    }
+    return std::string("127.0.0.1");
+}
+
+void cache_instance::emit_moved(client_connection* conn, std::string_view key,
+                                uint32_t owner, bool resp)
+{
+    std::string msg;
+    msg.reserve(48);
+    msg += "MOVED ";
+    msg += std::to_string(cache_slot_of(key));
+    msg += ' ';
+    msg += cluster_host(conn);
+    msg += ':';
+    msg += std::to_string(cluster_port_of(owner));
+
+    if (resp)
+    {
+        resp::encode_error_into(conn->response_buf, msg);
+    }
+    else
+    {
+        conn->response_buf.append("error: ");
+        conn->response_buf.append(msg);
+        conn->response_buf.push_back('\n');
+    }
+}
+
+void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
+                                  std::string_view arg, bool resp)
+{
+    auto& rb = conn->response_buf;
+    const uint32_t n    = m_shard_n < 1 ? 1 : m_shard_n;
+    const std::string host = cluster_host(conn);
+    const uint32_t h    = fnv1a_lower(sub);
+
+    // A line of CLUSTER NODES, which is also the whole of the text rendering.
+    const auto node_line = [&](uint32_t sh) {
+        std::string l;
+        l += cluster_node_id(sh);
+        l += ' ';
+        l += host;
+        l += ':';
+        l += std::to_string(cluster_port_of(sh));
+        // The cluster BUS port.  There is no bus here — nothing gossips,
+        // because the map is a formula — but the field is not optional in the
+        // format and lettuce parses it as a number.  base+10000 is the
+        // convention; 0 where that would not be a port.
+        const uint32_t bus = static_cast<uint32_t>(cluster_port_of(sh)) + 10000u;
+        l += '@';
+        l += std::to_string(bus <= 65535u ? bus : 0u);
+        l += (sh == m_shard_i) ? " myself,master - 0 " : " master - 0 ";
+        l += std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        // config epoch 1 for every node, and it never changes: no slot here is
+        // ever migrating, so there is nothing for an epoch to order.
+        l += " 1 connected ";
+        l += std::to_string(cache_shard_slot_first(sh, n));
+        l += '-';
+        l += std::to_string(cache_shard_slot_last(sh, n));
+        l += '\n';
+        return l;
+    };
+
+    switch (h)
+    {
+        case fnv1a("slots"):
+        {
+            if (resp)
+            {
+                resp::encode_array_header_into(rb, static_cast<int>(n));
+                for (uint32_t sh = 0; sh < n; ++sh)
+                {
+                    resp::encode_array_header_into(rb, 3);
+                    resp::encode_integer_into(rb, cache_shard_slot_first(sh, n));
+                    resp::encode_integer_into(rb, cache_shard_slot_last(sh, n));
+                    // host, port, id — the third element has been the node id
+                    // since Redis 4 and clients index it positionally.
+                    resp::encode_array_header_into(rb, 3);
+                    resp::encode_bulk_into(rb, host);
+                    resp::encode_integer_into(rb, cluster_port_of(sh));
+                    resp::encode_bulk_into(rb, cluster_node_id(sh));
+                }
+            }
+            else
+            {
+                for (uint32_t sh = 0; sh < n; ++sh)
+                {
+                    rb += std::to_string(cache_shard_slot_first(sh, n));
+                    rb += ' ';
+                    rb += std::to_string(cache_shard_slot_last(sh, n));
+                    rb += ' ';
+                    rb += host;
+                    rb += ':';
+                    rb += std::to_string(cluster_port_of(sh));
+                    rb += ' ';
+                    rb += cluster_node_id(sh);
+                    rb += '\n';
+                }
+            }
+            break;
+        }
+
+        case fnv1a("shards"):
+        {
+            if (!resp)
+            {
+                // The text protocol has no nested types, and a client that
+                // speaks CLUSTER SHARDS speaks RESP by definition.  The same
+                // information in the line form the text protocol can carry.
+                emit_cluster(conn, "slots", arg, false);
+                break;
+            }
+            resp::encode_array_header_into(rb, static_cast<int>(n));
+            for (uint32_t sh = 0; sh < n; ++sh)
+            {
+                resp::encode_array_header_into(rb, 4);
+                resp::encode_bulk_into(rb, "slots");
+                resp::encode_array_header_into(rb, 2);
+                resp::encode_integer_into(rb, cache_shard_slot_first(sh, n));
+                resp::encode_integer_into(rb, cache_shard_slot_last(sh, n));
+                resp::encode_bulk_into(rb, "nodes");
+                resp::encode_array_header_into(rb, 1);
+                resp::encode_array_header_into(rb, 14);
+                resp::encode_bulk_into(rb, "id");
+                resp::encode_bulk_into(rb, cluster_node_id(sh));
+                resp::encode_bulk_into(rb, "port");
+                resp::encode_integer_into(rb, cluster_port_of(sh));
+                resp::encode_bulk_into(rb, "ip");
+                resp::encode_bulk_into(rb, host);
+                resp::encode_bulk_into(rb, "endpoint");
+                resp::encode_bulk_into(rb, host);
+                resp::encode_bulk_into(rb, "role");
+                resp::encode_bulk_into(rb, "master");
+                resp::encode_bulk_into(rb, "replication-offset");
+                resp::encode_integer_into(rb, 0);
+                resp::encode_bulk_into(rb, "health");
+                resp::encode_bulk_into(rb, "online");
+            }
+            break;
+        }
+
+        case fnv1a("nodes"):
+        {
+            std::string out;
+            for (uint32_t sh = 0; sh < n; ++sh)
+                out += node_line(sh);
+            if (resp) resp::encode_bulk_into(rb, out);
+            else      rb += out;
+            break;
+        }
+
+        case fnv1a("info"):
+        {
+            std::string out;
+            // cluster_enabled is 1 only when there is a map worth reading: an
+            // unsharded cache says 0, which is what stops a cluster client from
+            // opening N connections to a single-node cache.
+            out += m_shard_n > 1 ? "cluster_enabled:1\r\n" : "cluster_enabled:0\r\n";
+            out += "cluster_state:ok\r\n";
+            out += "cluster_slots_assigned:16384\r\n";
+            out += "cluster_slots_ok:16384\r\n";
+            out += "cluster_slots_pfail:0\r\n";
+            out += "cluster_slots_fail:0\r\n";
+            out += "cluster_known_nodes:" + std::to_string(n) + "\r\n";
+            out += "cluster_size:" + std::to_string(n) + "\r\n";
+            out += "cluster_current_epoch:1\r\n";
+            out += "cluster_my_epoch:1\r\n";
+            out += "cluster_stats_messages_sent:0\r\n";
+            out += "cluster_stats_messages_received:0\r\n";
+            if (resp) resp::encode_bulk_into(rb, out);
+            else      rb += out;
+            break;
+        }
+
+        case fnv1a("myid"):
+        {
+            const std::string id = cluster_node_id(m_shard_i);
+            if (resp) resp::encode_bulk_into(rb, id);
+            else    { rb += id; rb += '\n'; }
+            break;
+        }
+
+        case fnv1a("keyslot"):
+        {
+            // redis-cli's own way of asking this question, and the one command
+            // here that takes an argument.  Answering it is what lets an
+            // operator check our slot arithmetic against a real Redis without
+            // reading either source.
+            const int64_t slot = static_cast<int64_t>(cache_slot_of(arg));
+            if (resp) resp::encode_integer_into(rb, slot);
+            else    { rb += std::to_string(slot); rb += '\n'; }
+            break;
+        }
+
+        case fnv1a("countkeysinslot"):
+        {
+            // Only answerable for a slot this shard owns; every other answer
+            // would need a crossing to produce a number nothing depends on.
+            // Named rather than guessed at.
+            const uint32_t slot = static_cast<uint32_t>(
+                std::strtoul(std::string(arg).c_str(), nullptr, 10));
+            if (slot >= cache_slot_count)
+            {
+                if (resp) resp::encode_error_into(rb, "ERR Invalid slot");
+                else      rb += "error: invalid slot\n";
+                break;
+            }
+            if (cache_shard_of_slot(slot, n) != m_shard_i)
+            {
+                if (resp) resp::encode_error_into(rb,
+                    "ERR I don't own the slot " + std::to_string(slot));
+                else      rb += "error: this shard does not own that slot\n";
+                break;
+            }
+            int64_t count = 0;
+            std::vector<std::string_view> all;
+            m_store.keys("*", all);
+            for (const auto& k : all)
+                if (cache_slot_of(k) == slot)
+                    ++count;
+            if (resp) resp::encode_integer_into(rb, count);
+            else    { rb += std::to_string(count); rb += '\n'; }
+            break;
+        }
+
+        default:
+        {
+            std::string msg = "ERR unknown CLUSTER subcommand '";
+            msg.append(sub);
+            msg += "' -- this cache answers SLOTS, SHARDS, NODES, INFO, MYID, "
+                   "KEYSLOT and COUNTKEYSINSLOT";
+            if (resp) resp::encode_error_into(rb, msg);
+            else    { rb += "error: "; rb += msg; rb += '\n'; }
+            break;
+        }
+    }
+}
+
 void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd,
                                    bool resp, std::string_view why)
 {
@@ -3247,11 +3705,30 @@ uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
 // opening cursor, then zero when the last one is done.
 bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 size_t count, std::vector<std::string_view>& out,
-                                uint64_t& next)
+                                uint64_t& next, bool node_local)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
         next = m_store.scan(cursor, pattern, count, out);
+        return true;
+    }
+
+    // ── A SCAN that arrived on the per-shard port walks THIS shard only ──────
+    //
+    // The sequential walk below is what a client asking the runtime as a whole
+    // needs: shard 0 to exhaustion, then shard 1, then zero.  A cluster client
+    // does the opposite — it holds a cursor per node and expects each node's
+    // walk to END, because it is going to ask the other nodes itself.
+    //
+    // Handing it the sequential cursor would not merely duplicate keys: the
+    // cursor that says "on to shard i+1" is served HERE on this port, from the
+    // start, so the walk would restart forever and SCAN would never terminate.
+    if (node_local)
+    {
+        const uint64_t store_next =
+            m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out);
+        next = store_next == 0 ? 0
+                               : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
     }
 
@@ -3316,6 +3793,77 @@ static void build_resp_cmd(std::string& out, std::string_view verb,
 // limit discovered as memory.
 static constexpr size_t MAX_PARTS_PER_COMMAND = 65536;
 
+// ─── A MULTI-KEY COMMAND ON THE PER-SHARD PORT ──────────────────────────────
+//
+// Three outcomes, and the third is why this is a function rather than a repeat
+// of the single-key rule:
+//
+//   every key ours          -> serve it here.  Returns false; the caller falls
+//                              through to the local interpreter.
+//   every key one other     -> -MOVED naming that shard.  The client re-sends
+//   shard's                    the whole command there and it works.
+//   anything else           -> -CROSSSLOT.
+//
+// The third case is not pedantry.  A command with SOME keys here and some on
+// shard 3 cannot be answered with -MOVED 3: shard 3 would look at the same
+// command, find keys that are OURS, and answer -MOVED back.  The client would
+// bounce between the two until it ran out of redirects, which is a hang rather
+// than an error.  -CROSSSLOT is the answer every cluster client already knows,
+// and it means "split this yourself", which is what they do.
+//
+// Deliberately laxer than Redis in one direction: Redis refuses two keys in two
+// SLOTS even when one node holds both, and this serves them.  A cluster client
+// never sends that — it splits by slot before it splits by node — so the
+// difference is only ever visible to somebody typing at the port by hand.
+bool cache_instance::cluster_multi_verdict(client_connection* conn,
+                                           const std::vector<std::string_view>& keys,
+                                           bool resp)
+{
+    bool any_local = false, any_foreign = false, mixed_foreign = false;
+    uint32_t       foreign_owner = 0;
+    std::string_view foreign_key;
+
+    for (const std::string_view k : keys)
+    {
+        const uint32_t o = cache_shard_of(k, m_shard_n);
+        if (o == m_shard_i)
+        {
+            any_local = true;
+            continue;
+        }
+        if (!any_foreign)
+        {
+            any_foreign   = true;
+            foreign_owner = o;
+            foreign_key   = k;
+        }
+        else if (o != foreign_owner)
+        {
+            mixed_foreign = true;
+        }
+    }
+
+    if (!any_foreign)
+        return false;
+
+    run_in_reply_order(conn, [&] {
+        if (any_local || mixed_foreign)
+        {
+            if (resp)
+                resp::encode_error_into(conn->response_buf,
+                    "CROSSSLOT Keys in request don't hash to the same slot");
+            else
+                conn->response_buf.append(
+                    "error: CROSSSLOT Keys in request don't hash to the same slot\n");
+        }
+        else
+        {
+            emit_moved(conn, foreign_key, foreign_owner, resp);
+        }
+    });
+    return true;
+}
+
 // mget / mset in the text protocol, exploded into one single-key command each.
 //
 // The splitting must match the interpreter's exactly — mget takes keys
@@ -3360,6 +3908,13 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
     if (keys.empty() || keys.size() > MAX_PARTS_PER_COMMAND)
         return false;       // a usage error, or past the ceiling
 
+    // The per-shard port does not explode and cross; it tells the client where
+    // to go.  Returning false means every key is this shard's, and the local
+    // interpreter answers it without a crossing at all.
+    if (SOCKETLEY_UNLIKELY(conn->cluster_port)
+        && cluster_multi_verdict(conn, keys, false))
+        return true;
+
     const uint32_t slot = slot_open(conn, false, cache_merge_for(h),
                                     static_cast<uint32_t>(keys.size()));
     std::string raw;
@@ -3385,6 +3940,19 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
         return false;
     if (is_mset && ((argc - 1) % 2 != 0))
         return false;       // the interpreter's own arity refusal
+
+    // Same verdict as the text spelling, over the same keys read the RESP way.
+    // The vector is built only on this port, so the crossing path pays nothing
+    // for it.
+    if (SOCKETLEY_UNLIKELY(conn->cluster_port))
+    {
+        std::vector<std::string_view> ks;
+        ks.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            ks.push_back(is_mset ? args[1 + i * 2] : args[1 + i]);
+        if (cluster_multi_verdict(conn, ks, true))
+            return true;
+    }
 
     const uint32_t slot = slot_open(conn, true, cache_merge_for(h),
                                     static_cast<uint32_t>(n));
@@ -3441,6 +4009,26 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
     const cache_text_parts parts = cache_split_text(line);
     const uint32_t         h     = fnv1a_lower(parts.cmd);
 
+    // ── A client on the per-shard port is asking THIS NODE ──────────────────
+    //
+    // Redis answers DBSIZE, KEYS, SCAN and FLUSH for the node they were sent
+    // to, and every cluster client is written against that: it asks each node
+    // in turn and adds the answers up itself.  Fanning out here would give it N
+    // times the truth, and spend N-1 crossings doing so.
+    //
+    // Only these two classes.  A publish still fans out — pub/sub is
+    // cluster-wide in Redis too, and a subscriber on another shard is a
+    // subscriber — and a single-key command is handled by -MOVED below.
+    if (SOCKETLEY_UNLIKELY(conn->cluster_port))
+    {
+        const cache_cmd_class cc = cache_classify_text(h);
+        if (cc == cache_cmd_class::keyspace || cc == cache_cmd_class::cursor_scan)
+        {
+            run_in_reply_order(conn, [&] { process_command_local(conn, line); });
+            return;
+        }
+    }
+
     switch (cache_classify_text(h))
     {
         case cache_cmd_class::single_key:
@@ -3453,6 +4041,22 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 const uint32_t owner = cache_shard_of(key, m_shard_n);
                 if (owner != m_shard_i)
                 {
+                    // ── The whole point of the per-shard port ──────────────
+                    //
+                    // This client read the slot map and chose this shard, so a
+                    // key that is not ours is a routing mistake and not work to
+                    // do.  -MOVED is the only answer that FIXES it: every
+                    // cluster client refreshes its map on one and does not come
+                    // back.  Crossing instead would answer correctly and leave
+                    // the client making the same mistake forever, at 11.56 us
+                    // against 8.01.
+                    if (conn->cluster_port)
+                    {
+                        run_in_reply_order(conn, [&] {
+                            emit_moved(conn, key, owner, false);
+                        });
+                        return;
+                    }
                     // A crossing needs somebody to keep waiting, and only a
                     // socket can.  fd < 0 is the scratch connection
                     // serve_payload() answers a request from ANOTHER runtime
@@ -4607,7 +5211,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
-            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor))
+            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
+                            conn->cluster_port))
             {
                 rb.append("error: invalid cursor\n", 22);
                 return;
@@ -4714,6 +5319,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("memory"):
         {
             append_int_nl(rb, m_store.get_memory_used());
+            break;
+        }
+        // The same map, for the text protocol.  A cluster client speaks RESP,
+        // so this exists for the operator holding an `nc` open and for the
+        // suite, which is how it is tested at all.
+        case fnv1a("cluster"):
+        {
+            if (args.empty()) { rb.append("error: usage: cluster <slots|shards|nodes|info|myid|keyslot>\n"); break; }
+            const auto [sub, rest] = extract_key(args);
+            emit_cluster(conn, sub, rest, false);
             break;
         }
         case fnv1a("replicate"):
@@ -5240,6 +5855,26 @@ void cache_instance::process_resp_command(client_connection* conn,
 
     const uint32_t h = fnv1a_lower(args[0]);
 
+    // ── A client on the per-shard port is asking THIS NODE ──────────────────
+    //
+    // Redis answers DBSIZE, KEYS, SCAN and FLUSH for the node they were sent
+    // to, and every cluster client is written against that: it asks each node
+    // in turn and adds the answers up itself.  Fanning out here would give it N
+    // times the truth, and spend N-1 crossings doing so.
+    //
+    // Only these two classes.  A publish still fans out — pub/sub is
+    // cluster-wide in Redis too, and a subscriber on another shard is a
+    // subscriber — and a single-key command is handled by -MOVED below.
+    if (SOCKETLEY_UNLIKELY(conn->cluster_port))
+    {
+        const cache_cmd_class cc = cache_classify_resp(h, argc);
+        if (cc == cache_cmd_class::keyspace || cc == cache_cmd_class::cursor_scan)
+        {
+            run_in_reply_order(conn, [&] { process_resp_command_local(conn, args, argc); });
+            return;
+        }
+    }
+
     switch (cache_classify_resp(h, argc))
     {
         case cache_cmd_class::single_key:
@@ -5249,6 +5884,18 @@ void cache_instance::process_resp_command(client_connection* conn,
                 const uint32_t owner = cache_shard_of(args[1], m_shard_n);
                 if (owner != m_shard_i)
                 {
+                    // The per-shard port's answer, for the reason the text
+                    // router gives: this client chose this shard out of the
+                    // slot map, so -MOVED corrects the map rather than hiding
+                    // the mistake behind a crossing.
+                    if (conn->cluster_port)
+                    {
+                        run_in_reply_order(conn, [&] {
+                            emit_moved(conn, args[1], owner, true);
+                        });
+                        return;
+                    }
+
                     // The same gate the text router explains: a scratch
                     // connection has no later turn for a reply to arrive on.
                     if (SOCKETLEY_UNLIKELY(conn->fd < 0))
@@ -5836,6 +6483,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_bulk_into(rb, args[1]);
             break;
         }
+        // ─── The map a cluster client bootstraps from ───────────────────────
+        //
+        // Answered here, in the LOCAL dispatch, and therefore on every port and
+        // at every shard count.  Two consequences, both wanted: an unsharded
+        // cache still answers (with cluster_enabled:0, which is how a client
+        // learns not to bother), and a shard answers about the whole map rather
+        // than crossing to collect it — every field is derived from the shard
+        // count and the base port, which every shard already holds.
+        case fnv1a("cluster"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            emit_cluster(conn, args[1], argc >= 3 ? args[2] : std::string_view{}, true);
+            break;
+        }
         case fnv1a("dbsize"):
         {
             resp::encode_integer_into(rb, m_store.size());
@@ -6275,7 +6936,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
-            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor))
+            if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
+                            conn->cluster_port))
             {
                 resp::encode_error_into(rb, "ERR invalid cursor");
                 return;

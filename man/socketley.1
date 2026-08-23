@@ -2865,6 +2865,74 @@ Redis client needs no change beyond speaking TLS. Described in full under
 .BR "COMMON FLAGS" .
 .PP
 Default port: 9000
+.TP
+.BI "\-\-shards " "N"
+Run the cache as
+.I N
+worker processes over one keyspace. Which shard owns a key is decided by
+CRC16 of the key modulo 16384 \(em Redis's own hash slot function, hash tags
+included \(em and each shard owns a contiguous range of those slots.
+.IP
+.B Every shard binds its own port as well as the shared one.
+The shared port is
+.IR port ,
+joined by all
+.I N
+shards under
+.BR SO_REUSEPORT ,
+and it behaves exactly as an unsharded cache does: a client connects, the
+kernel gives it to whichever shard the four\-tuple hashes to, and a key another
+shard owns is fetched from that shard over the mesh. Nothing about that
+changed.
+.IP
+In addition, shard
+.I i
+binds
+.IR port + 1 + i .
+A client that connects there has chosen that shard on purpose, and a key it
+does not own is answered with
+.BI \-MOVED " slot host:port"
+rather than fetched. That is what lets an off\-the\-shelf cluster client \(em
+.BR "redis\-cli \-c" ,
+.BR "redis\-benchmark \-\-cluster" ,
+redis\-py, go\-redis, lettuce, node\-redis \(em compute the slot itself and send
+each key straight to its owner.
+.IP
+.B A sharded cache therefore needs port+1 .. port+N free, and refuses to start otherwise.
+The address a client is sent to is a formula, computed by whichever shard
+answers
+.BR "CLUSTER SLOTS" ,
+which has no way to learn whether its siblings bound their ports. A shard that
+ran without one would be advertised anyway and every client would spend its
+retries on a connection refused, so the start fails instead, naming the port.
+Two four\-shard caches one port apart used to work and now refuse.
+.IP
+.B CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT
+are answered on every port, including the shared one and including an
+unsharded cache \(em which reports
+.B cluster_enabled:0
+so that a client does not open connections to shards that do not exist. There
+is no cluster bus, no failover, no slot migration and no
+.BR ASK :
+the map is a formula and there is one owner per slot for the life of the run.
+.IP
+.B On a per-shard port, a command that asks about the keyspace answers for that shard.
+.BR DBSIZE ", " KEYS ", " SCAN ", " FLUSH " and " LOAD
+report or act on the slice the shard holds, which is what a cluster client
+means when it asks a node, and what
+.B redis\-cli \-\-cluster call
+adds up itself. On the shared port they still fan out across every shard and
+merge, as they always have.
+.BR PUBLISH
+fans out on both, because a subscriber on another shard is a subscriber.
+.IP
+A multi\-key command on a per\-shard port whose keys are all owned by one other
+shard is answered with
+.BR \-MOVED ;
+one whose keys span shards is answered with
+.BR \-CROSSSLOT .
+The second is not pedantry: redirecting it would send the client to a shard
+that would redirect it back.
 .SS Cache Protocol
 Connect via TCP and send commands (newline-terminated, all lowercase).
 .PP

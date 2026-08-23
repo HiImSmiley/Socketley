@@ -451,6 +451,45 @@ project "test_cache_store"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: the key-to-slot-to-shard map ───
+
+project "test_cache_slots"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    -- Header-only on purpose: cache_shard_map.h answers a question with no
+    -- state in it, and a test that had to link the cache runtime could not
+    -- assert over all 16384 slots at four shard counts without an event loop.
+    files {
+        "test/unit/test_cache_slots.cpp",
+        "socketley/shared/cache_shard_map.h"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: the two shared shard regions ───
 
 project "test_shard_stats"

@@ -25,27 +25,156 @@
 //
 // ─── THE HASH ───────────────────────────────────────────────────────────────
 //
-// FNV-1a, 64-bit, over the key's bytes, modulo the shard count.  Not the
-// 32-bit fnv1a() the command dispatch uses: that one is a switch label over a
-// dozen literals, where a collision is caught by reading the file.  This one
-// runs over arbitrary client-supplied keys and its only job is to spread them,
-// so the wider mix is worth the nothing it costs.
+// CRC16/XMODEM over the key, modulo 16384, and then a CONTIGUOUS range of those
+// slots per shard:
 //
-// Modulo rather than a power-of-two mask, because the shard count is whatever
-// the operator typed and 3, 5 and 6 are all legal.  One divide per command
-// against a ~150 us cache operation.
+//     slot  = crc16(hash_tag_or_key) & 16383
+//     shard = slot * N / 16384
 //
-// NOT stable across a change of N.  `shard_of(k, 4) != shard_of(k, 3)` for most
-// keys, and that is the whole of the persistence hazard: N dumps written under
-// one N and loaded under another put keys in slices that will never be asked
-// for them.  Redistribution is that step's job; this header's job is to make
-// the dependence on N impossible to miss, which is why N is a parameter and
-// never a member.
+// This is Redis's keyHashSlot() exactly, `{hash tag}` rule included, and the
+// reason it is Redis's and not ours is the only reason that matters here: a
+// client has to be able to compute it WITHOUT ASKING US.  redis-cli -c,
+// redis-benchmark --cluster, redis-py, go-redis, lettuce and node-redis all
+// already do — they read the slot map once from CLUSTER SLOTS and then open one
+// connection per shard and send each key to its owner.  A key that arrives at
+// its owner costs no crossing at all, and a crossing is where 44% of the CPU of
+// a request goes here (11.56 us across four shards of one runtime against 8.01
+// us across four independent single-shard caches, three passes each).  With N
+// shards a random key is foreign (N-1)/N of the time, so this is the difference
+// between paying that on three quarters of requests and paying it on none.
+//
+// Our own FNV-1a mixed better and spread more evenly and was worth nothing,
+// because no off-the-shelf client can compute it.  A non-standard hash forces a
+// -MOVED on every single key, which is slower than the crossing it replaces.
+// Distribution quality was never the constraint; agreement with strangers is.
+//
+// ─── WHY CONTIGUOUS RANGES AND NOT slot % N ─────────────────────────────────
+//
+// Because CLUSTER SLOTS is a list of RANGES.  `slot % N` would need 16384/N
+// entries per shard — 4096 ranges at N=4 — which every client would then hold
+// and search per key.  `slot * N / 16384` gives each shard exactly one range,
+// which is one line of the reply and a binary search over N.
+//
+// The ranges are not exactly equal when N does not divide 16384: at N=3 the
+// shards get 5462/5461/5461 slots.  That is a 0.02% imbalance, and it is
+// declared in CLUSTER SLOTS rather than hidden, which is what a client expects.
+//
+// ─── THE HASH TAG, AND WHY IT IS NOT OPTIONAL ───────────────────────────────
+//
+// `{...}` in a key means: hash only what is between the first `{` and the first
+// `}` after it, provided there is something between them.  It is how a client
+// puts several keys on one shard on purpose, and every cluster client emits it.
+// Leaving it out would not be a smaller feature — it would be a DIFFERENT hash
+// from the client's for exactly the keys where the client took care, so
+// `{user:1}:name` and `{user:1}:age` would land on two shards after the client
+// had guaranteed itself they would not.
+//
+// ─── STILL NOT STABLE ACROSS A CHANGE OF N ──────────────────────────────────
+//
+// Unchanged, and for the same reason: `shard_of(k, 4) != shard_of(k, 3)` for
+// most keys.  The SLOT is now stable across N — that is what makes a resharding
+// expressible at all — but the shard a slot lands in is not, so dumps written
+// under one N and loaded under another still put keys in slices that will never
+// be asked for them.  Redistribution is that step's job; N stays a parameter
+// and never a member.
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
 
 #include "../cli/command_hashing.h"
+
+// ─── CRC16/XMODEM ───────────────────────────────────────────────────────────
+//
+// Polynomial 0x1021, initial value 0, no reflection, no final xor.  The table
+// is built at compile time out of the bitwise definition rather than pasted in
+// as 256 magic numbers, so there is no transcription to get wrong and nothing
+// that has to be checked by eye.  test_cache_slots.cpp pins it to the published
+// check value and to slots Redis itself documents.
+inline constexpr uint16_t cache_crc16_bitwise(uint16_t crc, uint8_t byte)
+{
+    crc ^= static_cast<uint16_t>(static_cast<uint16_t>(byte) << 8);
+    for (int i = 0; i < 8; ++i)
+        crc = (crc & 0x8000u)
+            ? static_cast<uint16_t>(static_cast<uint16_t>(crc << 1) ^ 0x1021u)
+            : static_cast<uint16_t>(crc << 1);
+    return crc;
+}
+
+struct cache_crc16_table
+{
+    uint16_t v[256];
+};
+
+inline constexpr cache_crc16_table cache_make_crc16_table()
+{
+    cache_crc16_table t{};
+    for (int i = 0; i < 256; ++i)
+        t.v[i] = cache_crc16_bitwise(0, static_cast<uint8_t>(i));
+    return t;
+}
+
+inline constexpr cache_crc16_table cache_crc16_tab = cache_make_crc16_table();
+
+inline constexpr uint16_t cache_crc16(std::string_view s)
+{
+    uint16_t crc = 0;
+    for (const char c : s)
+        crc = static_cast<uint16_t>(
+            static_cast<uint16_t>(crc << 8)
+            ^ cache_crc16_tab.v[((crc >> 8) ^ static_cast<uint8_t>(c)) & 0xFFu]);
+    return crc;
+}
+
+// The number of hash slots, fixed at Redis's 16384 because the clients that
+// make this worth doing have that number compiled in.
+inline constexpr uint32_t cache_slot_count = 16384;
+
+// What of `key` is actually hashed.  The whole key, unless it carries a
+// non-empty `{...}`, in which case only what is inside.  Redis's rule to the
+// letter: the FIRST `{`, the first `}` AFTER it, and an empty pair or a missing
+// `}` means the whole key.
+constexpr std::string_view cache_hash_tag(std::string_view key)
+{
+    const size_t open = key.find('{');
+    if (open == std::string_view::npos)
+        return key;
+    const size_t close = key.find('}', open + 1);
+    if (close == std::string_view::npos || close == open + 1)
+        return key;
+    return key.substr(open + 1, close - open - 1);
+}
+
+// The hash slot a key belongs to: 0..16383, and the same number Redis would
+// give it.  Independent of the shard count, which is what lets a client cache
+// a slot per key and a client library share one slot table across a resize.
+constexpr uint32_t cache_slot_of(std::string_view key)
+{
+    return cache_crc16(cache_hash_tag(key)) & (cache_slot_count - 1);
+}
+
+// Which of `shard_count` shards owns `slot`.
+constexpr uint32_t cache_shard_of_slot(uint32_t slot, uint32_t shard_count)
+{
+    if (shard_count <= 1)
+        return 0;
+    return (slot * shard_count) / cache_slot_count;
+}
+
+// The inverse, for CLUSTER SLOTS: the first and last slot of a shard's range.
+// An empty range would need shard_count > 16384 and max_shards is 64.
+constexpr uint32_t cache_shard_slot_first(uint32_t shard, uint32_t shard_count)
+{
+    if (shard_count <= 1)
+        return 0;
+    return (shard * cache_slot_count + shard_count - 1) / shard_count;
+}
+
+constexpr uint32_t cache_shard_slot_last(uint32_t shard, uint32_t shard_count)
+{
+    if (shard_count <= 1)
+        return cache_slot_count - 1;
+    return cache_shard_slot_first(shard + 1, shard_count) - 1;
+}
 
 // Which of `shard_count` shards owns `key`.  Always 0 for an unsharded cache,
 // which is shard 0 of one and not a special case.
@@ -53,14 +182,7 @@ inline uint32_t cache_shard_of(std::string_view key, uint32_t shard_count)
 {
     if (shard_count <= 1)
         return 0;
-
-    uint64_t h = 1469598103934665603ull;
-    for (const char c : key)
-    {
-        h ^= static_cast<uint8_t>(c);
-        h *= 1099511628211ull;
-    }
-    return static_cast<uint32_t>(h % shard_count);
+    return cache_shard_of_slot(cache_slot_of(key), shard_count);
 }
 
 // ─── WHAT A COMMAND ASKS OF THE KEYSPACE ────────────────────────────────────
@@ -219,6 +341,12 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         // gathered onto one.  Delivery crosses; registration does not.
         case fnv1a("ping"):
         case fnv1a("subscribe"):  case fnv1a("unsubscribe"):
+        // CLUSTER names no key and needs no crossing: every field of every
+        // reply is derived from the shard count and the base port, and each
+        // shard holds both.  Whoever holds the socket answers for the whole
+        // map — which is what lets the map be published on the shared port as
+        // well as on the per-shard ones.
+        case fnv1a("cluster"):
             return cache_cmd_class::connection;
 
         case fnv1a("replicate"):

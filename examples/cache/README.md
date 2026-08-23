@@ -115,3 +115,36 @@ connection on one shard and would receive that shard's writes only. A sharded
 cache may still *be* a follower.
 
 See `sharded-cache.sh`.
+
+### Letting the client pick the shard (`cluster-cache.sh`)
+
+Sharding costs a **crossing**: with N shards a random key is foreign (N-1)/N of
+the time, because all N shards share one port under `SO_REUSEPORT` and the
+kernel assigns connections by four-tuple hash. Measured, four shards of one
+runtime against four independent single-shard caches: **11.56 us against 8.01 us
+of CPU per request**, a 1.44x difference that is entirely the crossing.
+
+The crossing is removed by letting the client route, and the client is not ours:
+
+* a key's owner is **CRC16 mod 16384**, Redis's hash slot function including the
+  `{hash tag}` rule, so `redis-cli -c`, `redis-benchmark --cluster`, redis-py,
+  go-redis, lettuce and node-redis all compute it themselves;
+* shard *i* binds **`port + 1 + i`** as well as the shared port, and a key that
+  arrives on the wrong one is answered `-MOVED slot host:port`;
+* `CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, `KEYSLOT` and
+  `COUNTKEYSINSLOT` are answered on every port.
+
+`port+1 .. port+N` therefore have to be free, and a cache that cannot bind one
+of them **refuses to start** rather than being advertised at an address nothing
+answers on.
+
+**The shared port is unchanged.** A client that has never heard of a slot map
+connects there and is served over the mesh exactly as before; one runtime serves
+both kinds at once. On a per-shard port `DBSIZE`, `KEYS`, `SCAN`, `FLUSH` and
+`LOAD` answer for that shard, which is what a cluster client means when it asks
+a node; on the shared port they still fan out and merge.
+
+To check that a client is actually routing, count crossings rather than
+requests: `socketley stats <name>` reports `mesh_direct` and `mesh_relayed` per
+shard, and for a routing client both are near zero. Throughput alone cannot tell
+a routing client from one that is being served over the mesh.

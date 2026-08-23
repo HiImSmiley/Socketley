@@ -49,6 +49,21 @@ struct client_connection
     bool closing{false};
     bool zc_notif_pending{false};
 
+    // ── Which listener this connection came in on ───────────────────────────
+    //
+    // False for the shared port, which every shard binds under SO_REUSEPORT and
+    // which behaves exactly as it always has: a key another shard owns is
+    // fetched over the mesh and the client never learns a shard exists.
+    //
+    // True for the port this shard alone binds, `base + 1 + shard index`.  A
+    // client that connected THERE has read CLUSTER SLOTS and chosen this shard
+    // on purpose, so a key that is not ours is not a crossing to run — it is a
+    // routing mistake to report, with -MOVED, which is the one answer that
+    // teaches the client to stop making it.  The whole 1.44x is in that
+    // difference, and it is a property of the socket rather than of the
+    // command, which is why it is recorded once at accept.
+    bool cluster_port{false};
+
     // ── A crossing this connection is waiting on ────────────────────────────
     //
     // Non-zero while commands from this socket are being answered by ANOTHER
@@ -151,6 +166,7 @@ struct client_connection
         write_pending = false;
         closing = false;
         zc_notif_pending = false;
+        cluster_port = false;
         batch_id = 0;
         peer_gone = false;
         resp_mode = false;
@@ -336,7 +352,7 @@ public:
     bool load_from(std::string_view path);
 
 private:
-    void handle_accept(struct io_uring_cqe* cqe);
+    void handle_accept(struct io_uring_cqe* cqe, io_request* req);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
 
@@ -502,8 +518,12 @@ private:
     // the SCAN note in shared/cache_shard_map.h for the cursor's layout and for
     // what a caller is and is not promised across shards.
     uint32_t scan_cursor_owner(std::string_view cursor_arg) const;
+    // `node_local` is set for a SCAN that arrived on the per-shard port: it
+    // walks this shard's slice and then ENDS, rather than handing back a cursor
+    // that names the next shard.  See the note at the implementation.
     bool     shard_scan(uint64_t cursor, std::string_view pattern, size_t count,
-                        std::vector<std::string_view>& out, uint64_t& next);
+                        std::vector<std::string_view>& out, uint64_t& next,
+                        bool node_local);
 
     // Append a finished batch's slots to the connection's reply buffer and let
     // the rest of its pipeline run.
@@ -652,7 +672,51 @@ private:
     // submission does not reach the ring.  Without that the cache stops taking
     // connections silently — there is no completion left to report it.
     void rearm_accept();
+    void rearm_cluster_accept();
     void schedule_accept_backoff();
+
+    // One listener, opened and bound.  Both of this runtime's listeners are the
+    // same socket with the same options; the only thing that differs is the
+    // port and whether SO_REUSEPORT is set, so they are one function with two
+    // arguments rather than two copies that drift.
+    bool open_listener(uint16_t port, bool reuseport, int& out_fd);
+
+    // ─── The cluster view ───────────────────────────────────────────────────
+    //
+    // Enough of Redis's CLUSTER surface that an off-the-shelf cluster client
+    // bootstraps against this cache and routes for itself.  Everything here is
+    // derived from two numbers this shard already holds — the shard count and
+    // the base port — so N processes that never speak to each other publish the
+    // same map, which is the same property cache_shard_of() is built on.
+    void     emit_cluster(client_connection* conn, std::string_view sub,
+                          std::string_view arg, bool resp);
+    // 40 lowercase hex, stable across restarts, distinct per shard: what every
+    // client uses as the identity of a node.  Derived from the runtime name and
+    // the shard index rather than drawn at random, so a client that reconnects
+    // to a restarted cache sees the topology it already knows.
+    std::string cluster_node_id(uint32_t shard) const;
+    // The address to tell a client to go to.  Taken from getsockname() on the
+    // connection that asked, so it is by construction an address that reached
+    // us: the listener is bound to INADDR_ANY and has no opinion, while the
+    // socket knows which of this host's addresses the client actually used.
+    std::string cluster_host(const client_connection* conn) const;
+    uint16_t cluster_port_of(uint32_t shard) const;
+    // -MOVED, the answer that teaches a client to stop coming here for this
+    // key.  Only ever sent on the per-shard port; see client_connection.
+    void emit_moved(client_connection* conn, std::string_view key,
+                    uint32_t owner, bool resp);
+    // The verdict on a multi-key command that arrived on the per-shard port.
+    // True means it has been answered here — -MOVED or -CROSSSLOT — and the
+    // caller must stop.  See the note at the implementation for why a mixed
+    // command cannot be answered with -MOVED.
+    bool cluster_multi_verdict(client_connection* conn,
+                               const std::vector<std::string_view>& keys,
+                               bool resp);
+
+    // Arm `op` on `fd`, choosing multishot the same way for both listeners.
+    // `multishot` is written, not read: it records what was actually armed.
+    void arm_listener(int fd, accept_op& op, bool& multishot);
+    void rearm_accept_on(int fd, accept_op* op, bool multishot);
 
     // ─── Retired I/O ───────────────────────────────────────────────────────
     //
@@ -729,6 +793,31 @@ private:
     int m_listen_fd;
     std::unique_ptr<accept_op> m_accept;
     bool m_multishot_active{false};
+
+    // ── The port this shard alone binds ─────────────────────────────────────
+    //
+    // `base + 1 + shard index`, bound in addition to the shared one and only
+    // when the cache is sharded.  It is the whole mechanism behind the client
+    // routing: a cluster-aware client reads the map out of CLUSTER SLOTS and
+    // opens one connection per shard, and a connection to THIS port can only
+    // have come from a client that meant this shard.
+    //
+    // Not under SO_REUSEPORT, deliberately, and this is the difference that
+    // matters.  The shared port is joined by every shard and the kernel picks
+    // one by 4-tuple hash — which is exactly why the client cannot choose.  If
+    // this port carried SO_REUSEPORT too, a second process binding it would be
+    // ACCEPTED and would silently take a share of connections meant for this
+    // shard, answering -MOVED for keys it does not hold.  Without it the second
+    // bind fails, loudly, at start.
+    int m_cluster_listen_fd{-1};
+    std::unique_ptr<accept_op> m_cluster_accept;
+    bool m_cluster_multishot_active{false};
+    uint16_t m_cluster_port{0};
+    // The port the operator configured — shard i's own port is this + 1 + i, and
+    // the map published by CLUSTER SLOTS is that formula for every i.  Kept
+    // because get_port() is not inline and the answer has to be identical in
+    // every shard.
+    uint16_t m_base_port{0};
 
     // The listener's TLS context, or null when this cache serves cleartext.
     // Rebuilt on every start rather than kept: `reload` is a stop followed by
