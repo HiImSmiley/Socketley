@@ -713,10 +713,6 @@ private:
                                const std::vector<std::string_view>& keys,
                                bool resp);
 
-    // Arm `op` on `fd`, choosing multishot the same way for both listeners.
-    // `multishot` is written, not read: it records what was actually armed.
-    void arm_listener(int fd, accept_op& op, bool& multishot);
-    void rearm_accept_on(int fd, accept_op* op, bool multishot);
 
     // ─── Retired I/O ───────────────────────────────────────────────────────
     //
@@ -789,6 +785,14 @@ private:
         struct sockaddr_in addr{};
         socklen_t addrlen{sizeof(struct sockaddr_in)};
     };
+
+    // Declared here rather than beside rearm_accept(): both take an accept_op,
+    // and the struct is defined immediately above.
+    //
+    // Arm `op` on `fd`, choosing multishot the same way for both listeners.
+    // `multishot` is written, not read: it records what was actually armed.
+    void arm_listener(int fd, accept_op& op, bool& multishot);
+    void rearm_accept_on(int fd, accept_op* op, bool multishot);
 
     int m_listen_fd;
     std::unique_ptr<accept_op> m_accept;

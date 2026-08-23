@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <charconv>
 #include <iostream>
 #include <arpa/inet.h>
