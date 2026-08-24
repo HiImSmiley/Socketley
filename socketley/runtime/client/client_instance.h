@@ -222,8 +222,29 @@ private:
     std::string m_tls_peer_name;
 
     // Provided buffer ring
+    // ─── SIZED FOR ONE CONNECTION, WHICH IS WHAT A CLIENT HAS ───────────────
+    //
+    // 4096 x 64 came from the shape the other runtimes need: many connections,
+    // so per-connection memory is the scarce thing and buffers are small and
+    // plentiful.  A client has exactly one connection, so that trade is
+    // backwards here -- and 4 KB was carrying 64.7 messages per ring entry at
+    // 64-byte lines, measured.
+    //
+    // Interleaved, three passes, a blaster on loopback filling the socket:
+    //
+    //   4096 x 64   24.9 M msg/s   0.037 us/msg   256 KB
+    //   65536 x 64  39.9 M msg/s   0.025 us/msg     4 MB
+    //   65536 x 16  40.8 M msg/s   0.024 us/msg     1 MB
+    //   65536 x 8   42.3 M msg/s   0.023 us/msg    512 KB
+    //   65536 x 4   42.5 M msg/s   0.023 us/msg    256 KB
+    //
+    // Fewer buffers is faster, not slower -- four 64 KB buffers stay in cache
+    // where sixty-four do not.  8 rather than 4 because they measured the same
+    // and the read is single-shot, so at most ONE buffer is ever in flight:
+    // eight is eightfold margin for 256 KB, against a path holding more than
+    // one that I could not name and did not prove absent.
     static constexpr uint16_t BUF_GROUP_ID = 4;
-    static constexpr uint32_t BUF_COUNT = 64;
-    static constexpr uint32_t BUF_SIZE = 4096;
+    static constexpr uint32_t BUF_COUNT = 8;
+    static constexpr uint32_t BUF_SIZE = 65536;
     bool m_use_provided_bufs{false};
 };
