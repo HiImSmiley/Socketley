@@ -68,7 +68,7 @@ setup)
     if [ ! -e "$STATE/lockholder.pid" ] || ! kill -0 "$(cat "$STATE/lockholder.pid")" 2>/dev/null; then
         ( flock -n 9 || { echo "FATAL: window $BASE is locked by another run" >&2; exit 2; }
           echo $BASHPID > "$STATE/lockholder.pid"
-          exec sleep 100000 ) 9>"/tmp/socketley-ports-$BASE.lock" &
+          exec sleep 100000 >/dev/null 2>&1 </dev/null ) 9>"/tmp/socketley-ports-$BASE.lock" &
         sleep 0.3
         kill -0 "$(cat "$STATE/lockholder.pid" 2>/dev/null || echo 0)" 2>/dev/null \
             || { echo "FATAL: could not hold /tmp/socketley-ports-$BASE.lock" >&2; exit 2; }
@@ -221,3 +221,33 @@ teardown)
     exit 1
     ;;
 esac
+
+# ─── Measured 2026-08-24, quiet box (suite finished, 0 socketley, window empty)
+# Raw logs: results/results-{depth,clients,rb,genclient}.txt.  All rounds
+# validated in full; not one refusal.  16 cores; unsharded cache, redis 7.0.15.
+#
+# (a) bench_cache_vs_redis, SET 64B, rates in ops/s, per-round [r1 r2 r3],
+#     cores/client = max thread over the timed window:
+#   P=1   c=1  skl [47832 49935 46945] 0.48-0.51c | redis [41445 43947 43859] 0.44-0.47c
+#   P=8   c=1  skl [360071 345935 365320] ~0.49c  | redis [276290 286812 284528] 0.39c
+#   P=32  c=1  skl [1226490 1144286 1290227] ~0.44c | redis [706418 686474 687467] ~0.27c
+#   P=128 c=1  skl [3236508 2915558 2787097] ~0.38c | redis [1184020 1213497 1223580] ~0.15c
+#   P=32  c=2  skl [2207707 2499891 2699757] ~0.42c | redis [1079462 1120924 1040780] ~0.18c
+#   P=32  c=4  skl [2506323 2645071 2540048] ~0.21c | redis [1142521 1136936 1146931] ~0.10c
+#   GET P=32 c=1 skl [1221829 1212298 1224534] ~0.48c | redis [807632 864852 781985] ~0.32c
+#   Nothing tripped GENERATOR-SATURATED.  One generator core ≈ 95k ops/s at
+#   P=1 (the known redis-benchmark ceiling) and ≈ 2.8M ops/s at P=32.
+#
+# (a) cross-check, redis-benchmark -t set -d 64 -P 32 -c 1 -n 500000:
+#   → redis     667557 / 670241 rps at 0.39 cores   (agrees with our tool within 3%)
+#   → socketley 927644 / 1006036 rps at 0.60-0.61 cores (reads 20% under our tool
+#     while spending 40% more CPU — instrument overhead, not a server difference)
+#
+# (b) client runtime as generator (one instance, prebuilt RESP batch through
+#     lua_send, response-driven refill, on_message validates +OK; fwd/rev order):
+#   depth 1    44067 /  44362 ops/s  gen 0.59c  cache 0.51c   ~75k ops/gen-core
+#   depth 8   310307 / 313337 ops/s  gen 0.61c  cache 0.49c  ~513k ops/gen-core
+#   depth 32  916602 / 926163 ops/s  gen 0.65c  cache 0.43c  ~1.42M ops/gen-core
+#   depth 128 1797090 / 1846977 ops/s gen 0.70c cache 0.45c  ~2.62M ops/gen-core
+#   SQPOLL=1 depth 32: 922037 ops/s at gen 1.54c — same rate, 2.4x the CPU;
+#   the poll thread spins and GENERATOR-SATURATED trips.  bad=0 throughout.
