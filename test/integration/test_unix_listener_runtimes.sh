@@ -139,7 +139,11 @@ CMODE=$(stat -c '%a' "$CSOCK" 2>/dev/null || echo "?")
 if [ "$CMODE" = "600" ]; then pass
 else fail "the cache's node is owner-only" "mode is $CMODE, not 600"; fi
 
-PONG=$(resp_unix "$CSOCK" "PING")
+# Framed as a RESP array, because that is what selects RESP: the cache reads
+# a first byte of '*' as RESP and anything else as its plaintext protocol
+# (cache_instance.cpp, resp_parser.h), and plaintext has no PING.  An inline
+# "PING" here answered 'failed: unknown command' -- correctly.
+PONG=$(resp_unix "$CSOCK" '*1\r\n$4\r\nPING')
 if [ "$PONG" = "+PONG" ]; then pass
 else fail "the cache answers RESP over unix" "PING answered '$PONG'"; fi
 
@@ -259,6 +263,18 @@ setup_refusal "a cache is refused --listen with -p" \
 setup_refusal "a cache is refused --cluster with --listen" \
     "--cluster" \
     cache ur_cclu --listen "unix:$D/cclu.sock" --cluster --shards 1
+
+# The dial side's own incompatibilities, decided in the client's setup() like
+# the listeners' are.  Would catch a build that dialled a SOCK_STREAM path
+# with --udp set and silently served streams, or spent a TLS handshake on a
+# peer the socket node's permissions already bound.
+setup_refusal "a client is refused --udp with a unix target" \
+    "--udp asks" \
+    client ur_cudp -t "unix:$D/cudp.sock" --udp
+
+setup_refusal "a client is refused --tls with a unix target" \
+    "--tls encrypts a dial" \
+    client ur_ctlst -t "unix:$D/ctlst.sock" --tls
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

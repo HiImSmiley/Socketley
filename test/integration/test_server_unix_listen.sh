@@ -344,14 +344,18 @@ setup_refusal() {
 setup_refusal ul_both "--listen and -p"  -p $((P + 30)) --listen "unix:$D/both.sock"
 setup_refusal ul_udp  "--udp asks for"   --listen "unix:$D/udp.sock" --udp
 
-# And --listen is a server's flag alone: a proxy or a cache given one must be
-# told so rather than take it and ignore it.
+# --listen stopped being a server's flag alone when the listener moved to
+# shared/unix_listener.h: a proxy given one is accepted at parse now.  This
+# inverts the refusal that used to sit here.  What it catches is the flag
+# falling back out of the common parser and becoming per-type again — the
+# behaviour behind it is proved in test_unix_listener_runtimes.sh, not here.
 set +e
-OUT=$("$BIN" create proxy ul_pxl -p $((P + 31)) --backend 127.0.0.1:9 --listen "unix:$D/x.sock" 2>&1)
+OUT=$("$BIN" create proxy ul_pxl --backend 127.0.0.1:9 --listen "unix:$D/x.sock" 2>&1)
 RC=$?
 set -e
-if [ "$RC" -ne 0 ] && grep -q "unknown flag" <<<"$OUT"; then pass
-else fail "--listen on a proxy is an unknown flag" "exit $RC saying: ${OUT:-<nothing>}"; fi
+if [ "$RC" -eq 0 ]; then pass
+else fail "--listen on a proxy parses" "exit $RC saying: ${OUT:-<nothing>}"; fi
+"$BIN" remove ul_pxl >/dev/null 2>&1 || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
