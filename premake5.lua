@@ -221,6 +221,7 @@ project "socketley"
     location("%{wks.location}")
 
     externalincludedirs {
+        "thirdparty/liburing",
         "thirdparty/sol2",
         "thirdparty/luajit"
     }
@@ -243,7 +244,7 @@ project "socketley"
     -- <liburing/io_uring_version.h>, not <liburing.h>.
     forceincludes { "socketley/shared/liburing_version.h" }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "luajit", "uring", "ssl", "crypto" }
 
     files {
@@ -294,7 +295,7 @@ project "socketley_sdk"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
 
     files {
         "socketley/shared/**.h",
@@ -687,7 +688,7 @@ project "test_managed_runtime"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/unit/test_managed_runtime.cpp" }
@@ -727,7 +728,7 @@ project "test_worker_map"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/unit/test_worker_map.cpp" }
@@ -1000,7 +1001,7 @@ project "test_sdk_engine"
         "socketley"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/unit/test_sdk_engine.cpp" }
@@ -1126,7 +1127,7 @@ project "fuzz_lua_json"
     cppdialect "C++latest"
 
     includedirs { "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit" }
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "luajit" }
 
     files {
@@ -1293,7 +1294,7 @@ project "fuzz_http_request"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files {
@@ -1341,7 +1342,7 @@ project "fuzz_server_ops"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files {
@@ -1367,7 +1368,7 @@ project "fuzz_client_ops"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files {
@@ -1413,7 +1414,7 @@ project "fuzz_proxy_ops"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files {
@@ -1473,7 +1474,7 @@ project "test_conn_transfer"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/unit/test_conn_transfer.cpp" }
@@ -1528,7 +1529,7 @@ project "test_event_loop_sq_wait"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/unit/test_event_loop_sq_wait.cpp" }
@@ -1569,7 +1570,7 @@ project "bench_conn_transfer"
         "include/linux"
     }
 
-    libdirs { "thirdparty/luajit" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
 
     files { "test/benchmark/bench_conn_transfer.cpp" }

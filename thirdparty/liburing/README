@@ -1,0 +1,31 @@
+liburing, vendored as a static archive.
+
+WHY, since the distro ships one:
+
+  This box had liburing 2.15 headers and .so installed over a dpkg-managed
+  liburing2 2.5 package -- dpkg owned the liburing.so.2 symlink and pointed it
+  at a file dpkg did not know about.  An `apt install --reinstall liburing2`
+  would have restored the symlink to 2.5 while the headers stayed 2.15.
+  Vendoring pins the version at build time, so no package operation can move
+  it under a built binary.
+
+  It is also what luajit already does here, so it is one pattern rather than
+  two.
+
+WHAT IT IS NOT:
+
+  Not a performance change.  liburing is 0.364% of this product's total CPU,
+  and the three symbols that appear in a profile -- io_uring_submit,
+  io_uring_wait_cqes, io_uring_wait_cqe_timeout -- are the ones that make
+  syscalls, so most of that share is the kernel entry any implementation pays.
+  Measured before and after, four interleaved passes: median +216 rps per
+  server core, 2 of 4 positive.  Not distinguishable, and not the reason.
+
+THE COST, STATED:
+
+  Distro security updates for liburing no longer reach a built binary; we own
+  rebuilding.  The surface is a 40 KB wrapper over three syscalls, which is why
+  that trade was judged acceptable -- but it is a trade, not a free win.
+
+REBUILD:  ./bin/build-thirdparty.sh liburing
+PINNED:   liburing-2.15 (commit d41bf92)
