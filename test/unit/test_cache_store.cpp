@@ -1035,3 +1035,45 @@ TEST_CASE("cache_store new methods")
             CHECK(k.substr(0, 4) == "foo:");
     }
 }
+
+TEST_CASE("accounted memory tracks contents, not deletion history")
+{
+    // Found by fuzz_cache_ops (corpus: erase_reuse_accounting-56f01737) against
+    // an open-addressing m_data: erase left the dead entry's heap buffers in
+    // the slot — libstdc++ string move-assignment from a small-string source
+    // keeps the destination's allocation — and a later insert that reused the
+    // slot inherited a 192-byte capacity it never asked for.  stored_string()
+    // reads capacity, deliberately, so the recycled buffer was CHARGED to the
+    // new key: the store stood at 421 bytes under maxmemory 400 after a write
+    // admission had approved at size zero.
+    //
+    // The property, container-independent: what a store reports after
+    // create-delete-create must equal what it reports holding the same final
+    // contents with no history.  If it does not, eviction under --maxmemory is
+    // driven by deletion history rather than by what is resident, and the
+    // cache evicts keys it could have kept.
+    //
+    // 500 large-value keys deleted, then 500 fresh empty-value keys: enough
+    // that fresh keys land on previously-occupied slots in any open-addressed
+    // layout of this size, and a no-op for any node-based one.
+    cache_store with_history;
+    for (int i = 0; i < 500; i++)
+        CHECK(with_history.set("old:" + std::to_string(i), std::string(192, 'v')));
+    const size_t loaded = with_history.get_memory_used();
+    for (int i = 0; i < 500; i++)
+        CHECK(with_history.del("old:" + std::to_string(i)));
+    for (int i = 0; i < 500; i++)
+        CHECK(with_history.set("new:" + std::to_string(i), ""));
+
+    cache_store fresh;
+    for (int i = 0; i < 500; i++)
+        CHECK(fresh.set("new:" + std::to_string(i), ""));
+
+    // The identity check below passes trivially if the two histories never
+    // differed, so first pin that they did: the large values must have been
+    // accounted while they were resident.
+    CHECK(loaded > fresh.get_memory_used() + 500 * 192);
+
+    CHECK(with_history.get_memory_used() == fresh.get_memory_used());
+    CHECK(with_history.size() == fresh.size());
+}
