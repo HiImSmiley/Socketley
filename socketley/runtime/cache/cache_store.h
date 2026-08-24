@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <functional>
 #include <chrono>
-#include "flat_map.h"
 
 // Transparent hash for heterogeneous lookup (avoids string copies on find/erase)
 struct string_hash
@@ -37,10 +36,7 @@ struct string_equal
     }
 };
 
-// m_data is the request-path map, and it is a flat open-addressing table
-// rather than an unordered_map: see flat_map.h for why, and for the iterator
-// contract cache_store relies on (erase moves nothing; insert may move all).
-using string_map = flat_map<std::string>;
+using string_map = std::unordered_map<std::string, std::string, string_hash, string_equal>;
 using list_map = std::unordered_map<std::string, std::deque<std::string>, string_hash, string_equal>;
 using set_inner = std::unordered_set<std::string, string_hash, string_equal>;
 using set_map = std::unordered_map<std::string, set_inner, string_hash, string_equal>;
@@ -326,12 +322,6 @@ private:
     // places, so counting it there would be precisely the scattered bookkeeping
     // structural_overhead() exists to avoid.  It costs one block per expiring
     // key with a name over the SSO limit.
-    // key_entry_overhead still holds for m_data now that it is a flat table:
-    // a 65-byte slot (64B entry + 1B metadata) at the table's 7/8 growth
-    // trigger amortizes to ~74 B per key.  Below the trigger it reads low —
-    // up to ~130 B/key right after a doubling — the same order of error the
-    // paragraph above already accepts for long keys, and bending the constant
-    // per-container is exactly what it warns against.
     static constexpr size_t key_entry_overhead    = 74;
     static constexpr size_t lru_entry_overhead    = 139;
     static constexpr size_t expiry_entry_overhead = 64;
