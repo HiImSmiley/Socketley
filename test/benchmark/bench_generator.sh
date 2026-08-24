@@ -36,6 +36,24 @@ cpu_us_tree() {   # total utime+stime of pid and descendants, in microseconds
     echo $(( total * 1000000 / clk ))
 }
 
+# Kill every socketley belonging to one of OUR daemons: environ match on the
+# socket path, and — for a pid whose environ is unreadable (seen on processes
+# mid-death) — an exe match against this worktree's own binary, which nothing
+# outside this harness runs.  Children first.  Never a name, never pgrep -f.
+sweep_sock() {
+    local sock=$1 p c
+    for p in $(pgrep -x socketley 2>/dev/null || true); do
+        if [ -r "/proc/$p/environ" ]; then
+            tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
+                | grep -qx "SOCKETLEY_SOCKET=$sock" || continue
+        else
+            [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$BIN" ] || continue
+        fi
+        for c in $(pgrep -P "$p" 2>/dev/null || true); do kill -9 "$c" 2>/dev/null || true; done
+        kill -9 "$p" 2>/dev/null || true
+    done
+}
+
 listeners_in_window() {
     ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' \
       | awk -v lo=$BASE -v hi=$((BASE + 2000)) '$1 >= lo && $1 < hi' | sort -u
@@ -103,6 +121,10 @@ genclient)
     export SOCKETLEY_SOCKET="$STATE/gen-daemon.sock"
     unset SOCKETLEY_CONFIG
     mkdir -p "$HOME"
+
+    # Sweep any previous generator daemon FIRST — a survivor keeps pumping at
+    # the cache and every later reading is a blend.
+    sweep_sock "$SOCKETLEY_SOCKET"
     rm -f "$SOCKETLEY_SOCKET"
     "$BIN" daemon >"$STATE/gen-daemon.log" 2>&1 &
     GEN_DPID=$!
@@ -137,17 +159,22 @@ function on_message(msg)
     if acked % DEPTH == 0 then self.send(batch) end
 end
 
-socketley.set_interval(5000, function()
+socketley.set_interval(2000, function()
     socketley.log("PUMP acked=" .. acked .. " bad=" .. bad)
 end)
 LUAEOF
 
+    # Idempotent: the daemon restores 'gen' from a previous run's state dir.
+    "$BIN" stop gen >/dev/null 2>&1 || true
+    "$BIN" remove gen >/dev/null 2>&1 || true
     "$BIN" create client gen -t "127.0.0.1:$CACHE_PORT" --lua "$LUA" -s
     sleep 1   # settle: connect + first batches, outside the window
 
     stat_msgs() {
-        "$BIN" stats gen 2>/dev/null \
-          | awk -F: '$1 ~ /total_messages/ { print $2; exit }' | tr -d ' '
+        local v
+        v=$("$BIN" stats gen 2>/dev/null \
+          | awk -F: '$1 ~ /total_messages/ { print $2; exit }' | tr -d ' ')
+        echo "${v:-0}"
     }
 
     CACHE_DPID=$(cat "$STATE/cache-daemon.pid")
@@ -157,7 +184,7 @@ LUAEOF
     m1=$(stat_msgs); g1=$(cpu_us_tree "$GEN_DPID"); s1=$(cpu_us_tree "$CACHE_DPID")
     t1=$(date +%s%6N)
 
-    grep -a "PUMP" "$STATE/gen-daemon.log" | tail -2
+    grep -a "PUMP" "$STATE/gen-daemon.log" | tail -2 || true
 
     wall=$((t1 - t0))
     ops=$((m1 - m0))
@@ -177,12 +204,7 @@ LUAEOF
 
 teardown)
     for sock in "$STATE/cache-daemon.sock" "$STATE/gen-daemon.sock"; do
-        for p in $(pgrep -x socketley 2>/dev/null || true); do
-            tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
-                | grep -qx "SOCKETLEY_SOCKET=$sock" || continue
-            for c in $(pgrep -P "$p" 2>/dev/null || true); do kill -9 "$c" 2>/dev/null || true; done
-            kill -9 "$p" 2>/dev/null || true
-        done
+        sweep_sock "$sock"
     done
     [ -e "$STATE/redis.pid" ] && kill "$(cat "$STATE/redis.pid")" 2>/dev/null || true
     [ -e "$STATE/lockholder.pid" ] && kill "$(cat "$STATE/lockholder.pid")" 2>/dev/null || true
