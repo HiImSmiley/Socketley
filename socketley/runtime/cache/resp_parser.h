@@ -291,6 +291,13 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
         if (offset + static_cast<size_t>(len) + 2 > sz)
             return parse_result::incomplete;
 
+        // The two bytes after the payload are the frame terminator, not
+        // padding: accepting anything there lets a lying length shift every
+        // later frame boundary (see test: trailing CRLF is part of the frame).
+        if (data[offset + static_cast<size_t>(len)] != '\r' ||
+            data[offset + static_cast<size_t>(len) + 1] != '\n')
+            return parse_result::error;
+
         args.emplace_back(data + offset, static_cast<size_t>(len));
         offset += static_cast<size_t>(len) + 2;
     }
@@ -398,6 +405,10 @@ inline parse_result parse_message_views(std::string_view buf,
             offset += 4;  // skip "$N\r\n"
             if (__builtin_expect(offset + static_cast<size_t>(len) + 2 > sz, 0))
                 return parse_result::incomplete;
+            // Frame terminator check — same rule as parse_message above.
+            if (__builtin_expect(data[offset + static_cast<size_t>(len)] != '\r' ||
+                                 data[offset + static_cast<size_t>(len) + 1] != '\n', 0))
+                return parse_result::error;
             args[i] = std::string_view(data + offset, static_cast<size_t>(len));
             offset += static_cast<size_t>(len) + 2;
         }
@@ -417,6 +428,11 @@ inline parse_result parse_message_views(std::string_view buf,
 
             if (__builtin_expect(offset + static_cast<size_t>(len) + 2 > sz, 0))
                 return parse_result::incomplete;
+
+            // Frame terminator check — same rule as parse_message above.
+            if (__builtin_expect(data[offset + static_cast<size_t>(len)] != '\r' ||
+                                 data[offset + static_cast<size_t>(len) + 1] != '\n', 0))
+                return parse_result::error;
 
             args[i] = std::string_view(data + offset, static_cast<size_t>(len));
             offset += static_cast<size_t>(len) + 2;

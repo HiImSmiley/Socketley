@@ -280,3 +280,72 @@ TEST_CASE("RESP to_lower")
         CHECK(s == "set");
     }
 }
+
+TEST_CASE("a bulk value's trailing CRLF is part of the frame, not padding")
+{
+    // Both parsers skipped the two bytes after a bulk payload without reading
+    // them, so "$3\r\nfooXY" parsed as "foo".  The length field is the only
+    // thing that frames a RESP stream: once it misstates the payload, every
+    // later byte is parsed at a shifted offset, and the inline-command
+    // fallback will execute whatever lands on the new boundary.  Redis
+    // answers "Protocol error: expected '\r\n'"; so must we.
+    std::vector<std::string> args;
+    std::string_view views[8];
+    int    argc     = 0;
+    size_t consumed = 0;
+
+    SUBCASE("single-digit length, the views fast path")
+    {
+        std::string buf = "*1\r\n$4\r\nPINGXX";
+        CHECK(resp::parse_message_views(buf, views, 8, argc, consumed)
+              == resp::parse_result::error);
+        CHECK(resp::parse_message(buf, args, consumed)
+              == resp::parse_result::error);
+    }
+
+    SUBCASE("multi-digit length, the views slow path")
+    {
+        std::string buf = "*1\r\n$10\r\nabcdefghijXX";
+        CHECK(resp::parse_message_views(buf, views, 8, argc, consumed)
+              == resp::parse_result::error);
+        CHECK(resp::parse_message(buf, args, consumed)
+              == resp::parse_result::error);
+    }
+
+    SUBCASE("a lying terminator mid-frame, not only on the last element")
+    {
+        std::string buf = "*3\r\n$3\r\nSET\r\n$3\r\nkeyXY$5\r\nvalue\r\n";
+        CHECK(resp::parse_message_views(buf, views, 8, argc, consumed)
+              == resp::parse_result::error);
+        CHECK(resp::parse_message(buf, args, consumed)
+              == resp::parse_result::error);
+    }
+
+    SUBCASE("a payload may contain CRLF; only the terminator position is framed")
+    {
+        // Length-based skipping must stay length-based: a fix that scanned for
+        // the next CRLF instead of checking the byte AT offset+len would
+        // reject this legal frame.  Value is "a\r\nb", length 4.
+        std::string buf = "*1\r\n$4\r\na\r\nb\r\n";
+        auto result = resp::parse_message_views(buf, views, 8, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        CHECK(consumed == buf.size());
+        REQUIRE(argc == 1);
+        CHECK(views[0] == "a\r\nb");
+
+        CHECK(resp::parse_message(buf, args, consumed) == resp::parse_result::ok);
+        REQUIRE(args.size() == 1);
+        CHECK(args[0] == "a\r\nb");
+    }
+
+    SUBCASE("a truncated terminator is incomplete, not an error")
+    {
+        // The bytes seen so far are consistent with a valid frame still in
+        // flight; erroring here would kill pipelined clients on a short read.
+        std::string buf = "*1\r\n$4\r\nPING\r";
+        CHECK(resp::parse_message_views(buf, views, 8, argc, consumed)
+              == resp::parse_result::incomplete);
+        CHECK(resp::parse_message(buf, args, consumed)
+              == resp::parse_result::incomplete);
+    }
+}
