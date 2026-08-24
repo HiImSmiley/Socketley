@@ -31,6 +31,17 @@ socketley create cache admin -p 9002 --mode admin -s
 ### Cache Integration
 Using cache with server/client via Lua.
 
+### Unix Socket (`unix-socket-cache.sh`)
+`--listen unix:/abs/path.sock` instead of `-p`, as on a server or a proxy.
+`redis-cli -s` speaks RESP to it and the plaintext protocol works on the same
+node. The node is created `0600`; the flag is refused with `-p`, `--tls`,
+`--cluster` and `--shards`, each with its reason.
+
+```bash
+socketley create cache kv --listen unix:/run/kv.sock -s
+redis-cli -s /run/kv.sock PING
+```
+
 ### TLS (`tls-cache.sh`)
 A cache terminates TLS on its own listening port with the same three flags a
 server uses:

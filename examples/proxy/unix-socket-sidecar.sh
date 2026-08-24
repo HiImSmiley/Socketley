@@ -7,8 +7,10 @@
 # TCP charges that pair for a whole stack - handshake, sequence numbers,
 # checksums, windows - on a connection that never sees a wire.
 #
-#   --listen unix:/path   on a server, instead of -p
+#   --listen unix:/path   on any runtime that listens (server, proxy, cache),
+#                         instead of -p
 #   --backend unix:/path  on a proxy, instead of ip:port
+#   -t unix:/path         on a client, to dial such a node
 #
 # and the proxy can also name the server by its runtime name, which resolves to
 # the same socket.  Both spellings are shown below.
@@ -39,7 +41,7 @@
 #     both are refused at start rather than trimmed
 #   - the socket node is created 0600, so the peer must run as the same user;
 #     there is no flag to widen it
-#   - --listen cannot be combined with -p, --udp or --tls
+#   - --listen cannot be combined with -p, --udp, --tls or --shards
 #   - a unix server is reachable as a backend by path and by runtime name, but
 #     is not offered as an @group member
 #

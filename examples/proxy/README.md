@@ -47,6 +47,11 @@ do. The backend can be named by path or by runtime name. The socket node is
 created `0600`, so both ends must run as the same user; there is no flag to
 widen it, and TLS to a unix backend is refused rather than ignored.
 
+The proxy can also serve its own front door the same way — `--listen
+unix:/path/to.sock` instead of `-p`, on a proxy or a cache exactly as on a
+server — and a client dials any such node with `-t unix:/path/to.sock`. See
+`../cache/unix-socket-cache.sh` for the cache side.
+
 ### TLS Proxy
 TLS on the proxy's own listener, on the leg to an `https://` backend, or both,
 with mutual TLS in either direction. The backend leg always verifies the chain

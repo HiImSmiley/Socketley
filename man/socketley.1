@@ -718,7 +718,7 @@ l l l.
 Field	Type	Description
 _
 port	number	Listener/connection port \fB(requires restart)\fR
-listen	string	"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server; requires restart)\fR
+listen	string	"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server/proxy/cache; requires restart)\fR
 log_file	string	State transition log file path
 write_file	string	Message write file path
 lua_script	string	Lua script path (absolute)
@@ -1358,15 +1358,18 @@ member once the worker reports it. Until then the member is absent from the
 group rather than present and refusing connections \(em being routed to an
 address that is not accepting yet would trip the routing proxy's circuit breaker
 against a member that is merely young.
-.SH SERVER FLAGS
 .TP
 .BI "\-\-listen unix:" "/path/to.sock"
-Listen on an AF_UNIX socket instead of a TCP port. The other half of
+Listen on an AF_UNIX socket instead of a TCP port. Taken by every runtime that
+listens \(em server, proxy and cache; a client dials out and listens on
+nothing, so on one the flag is refused with a pointer at
+.BR "\-t unix:" ,
+the connect side of the same socket. The other half of
 .BI \-\-backend " unix:" /path/to.sock
 under
 .BR "PROXY FLAGS" ,
-so a proxy and the server it fronts can talk on one host without a loopback TCP
-stack between them.
+so a proxy and the backend it fronts can talk on one host without a loopback
+TCP stack between them \(em or serve its own front door on one.
 .RS
 .PP
 Mutually exclusive with
@@ -1374,10 +1377,19 @@ Mutually exclusive with
 with
 .B \-\-udp
 (that would be a unix datagram socket, which is a different thing and is not
-this) and with
+this), with
 .B \-\-tls
 (a unix socket is not on a network; the permissions on the node are what
-restrict it). Each combination is refused at start with the reason in the daemon
+restrict it), with
+.B \-\-shards
+(see
+.B Sharding
+under
+.BR "SERVER FLAGS" ),
+and on a cache with
+.B \-\-cluster
+(cluster members advertise ports out of a formula, and a path has no
+successor). Each combination is refused at start with the reason in the daemon
 log, rather than one of the two winning quietly.
 .PP
 The path must be absolute and shorter than 108 bytes, which is what the kernel's
@@ -1410,8 +1422,10 @@ entry the group path cannot dial would take a turn of the round\-robin and answe
 .nf
 socketley create server app --listen unix:/run/app.sock --http /srv/www -s
 socketley create proxy  gw  -p 8080 --backend app -s
+socketley create cache  kv  --listen unix:/run/kv.sock -s   # redis-cli -s works
 .fi
 .RE
+.SH SERVER FLAGS
 .TP
 .BI "\-\-mode " "mode"
 Message flow direction:
@@ -2004,8 +2018,21 @@ to which question has no protocol left.
 Default port: 8000
 .SH CLIENT FLAGS
 .TP
-.BI "\-t " "host:port"
-Target server to connect to. Default: 127.0.0.1:8000
+.BI "\-t " "host:port | unix:/path/to.sock"
+Target server to connect to. Default: 127.0.0.1:8000.
+.IP
+.BI unix: /path/to.sock
+dials the socket node a runtime with
+.B \-\-listen unix:
+serves \(em the connect side of the same address, judged by the same rules
+(absolute, under the kernel's
+.I sun_path
+limit). Refused with
+.B \-\-udp
+and with
+.BR \-\-tls ,
+for the listener's reasons under
+.BR "COMMON FLAGS" .
 .TP
 .BI "\-\-mode " "mode"
 Message flow direction:
@@ -2058,6 +2085,17 @@ with
 .B \-\-udp
 is refused \(em that would need DTLS.
 .SH PROXY FLAGS
+.TP
+.BI "\-\-listen unix:" "/path/to.sock"
+Serve the proxy's front door on an AF_UNIX socket instead of
+.BR \-p .
+The full treatment is
+.B \-\-listen
+under
+.BR "COMMON FLAGS" ;
+refused with
+.B \-\-shards
+(SO_REUSEPORT is not a path).
 .TP
 .BI "\-\-backend " "addr"
 .B A hostname is resolved off the request path.
@@ -2718,6 +2756,22 @@ socketley create proxy slowapp \-\-sidecar \-\-backend 127.0.0.1:3000 \\
     -p 8080 \-\-backend\-timeout 30 -s
 .fi
 .SH CACHE FLAGS
+.TP
+.BI "\-\-listen unix:" "/path/to.sock"
+Serve the cache on an AF_UNIX socket instead of
+.B \-p
+\(em
+.B "redis\-cli \-s"
+connects to it, and both the plaintext and RESP protocols are detected as on a
+port. The full treatment is
+.B \-\-listen
+under
+.BR "COMMON FLAGS" ;
+refused with
+.B \-\-cluster
+(members advertise ports out of a formula, and a path has no successor) and
+with
+.BR \-\-shards .
 .TP
 .BI "\-\-persistent " "file"
 Persistent storage file. Cache is saved on stop and loaded on start.
