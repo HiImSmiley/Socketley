@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <functional>
@@ -288,7 +289,17 @@ public:
     void erase(const_iterator it)
     {
         const size_t i = static_cast<size_t>(it.operator->() - m_slots.data());
-        m_slots[i] = entry{};
+        // Destroy by moving OUT, not by assigning an empty entry in: libstdc++'s
+        // string move-assignment from an SSO source keeps the destination's
+        // heap buffer, so `m_slots[i] = entry{}` retained the erased value's
+        // allocation inside the slot.  The fuzzer caught what that does next:
+        // try_emplace reused the slot, the new value inherited the old 192-byte
+        // capacity, and the capacity-based memory accounting charged a recycled
+        // buffer to a write that was admitted at size zero -- landing the store
+        // over its configured maxmemory.  Moving out steals the buffers into a
+        // temporary whose destructor frees them.
+        { entry dead(std::move(m_slots[i])); (void)dead; }
+        m_slots[i].first.clear();
         --m_size;
         const size_t msk = mask();
         if (m_meta[(i + 1) & msk] == meta_empty)
@@ -310,8 +321,12 @@ public:
     void clear()
     {
         std::fill(m_meta.begin(), m_meta.end(), meta_empty);
-        for (auto& e : m_slots)
-            e = entry{};
+        // clear-then-resize, not assignment: destroying the entries is the only
+        // way to actually free their buffers (see erase()).  The vector keeps
+        // its own capacity, so this allocates nothing.
+        const size_t cap = m_slots.size();
+        m_slots.clear();
+        m_slots.resize(cap);
         m_size = 0;
         m_used = 0;
     }
