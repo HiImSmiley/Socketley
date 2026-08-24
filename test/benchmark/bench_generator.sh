@@ -82,6 +82,7 @@ setup)
     fi
 
     # ── socketley cache, own daemon, own HOME and socket ──
+    rm -rf "$STATE/home-cache"
     export HOME="$STATE/home-cache"
     export SOCKETLEY_SOCKET="$STATE/cache-daemon.sock"
     unset SOCKETLEY_CONFIG
@@ -117,6 +118,7 @@ genclient)
     SECS=${3:?usage: genclient DEPTH SECS}
 
     # ── generator daemon: separate process, so its CPU is separable ──
+    rm -rf "$STATE/home-gen"
     export HOME="$STATE/home-gen"
     export SOCKETLEY_SOCKET="$STATE/gen-daemon.sock"
     unset SOCKETLEY_CONFIG
