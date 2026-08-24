@@ -111,7 +111,10 @@ private:
 
     void process_message(std::string_view msg);
     void send_to_server(std::string_view msg);
-    void schedule_reconnect();
+    // Returns whether the reconnect clock is actually armed.  A caller that
+    // ignores it is claiming a client will dial again when nothing will make
+    // it.
+    [[nodiscard]] bool schedule_reconnect();
     bool try_connect();
     // The one place a read is armed, and only when one is not already armed.
     void arm_read();

@@ -371,7 +371,23 @@ void client_instance::drop_connection()
     }
     tls_release();
     m_connected = false;
-    schedule_reconnect();
+    // A refusal here has nowhere to recover to: the socket is already gone and
+    // nothing else re-drives the clock.
+    //
+    // mark_failed() is authoritative for an in-daemon client and WORKER-LOCAL
+    // for every other one, and the difference is measured rather than assumed.
+    // Same probe build, timer submission forced to fail:
+    //
+    //   --daemon-process   start refused, `ls` reads Failed, 2 log lines
+    //   worker-backed      start reports success, `ls` reads Up, 1 log line
+    //   worker, healthy    start reports success, `ls` reads Up, 0 log lines
+    //
+    // So in a worker the log IS the report, and it is the only one, because a
+    // worker's state does not reach the daemon's placeholder.  That gap is
+    // bigger than this fix and is not closed here — it is named so the next
+    // reader does not mistake the call for something it does in every case.
+    if (!schedule_reconnect())
+        mark_failed();
 }
 
 // A session belongs to one socket and dies with it.  Carrying one across a
@@ -423,20 +439,35 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     }
 }
 
-void client_instance::schedule_reconnect()
+// ─── WHAT true MEANS HERE, BECAUSE THREE OF THE RETURNS ARE NOT SUBMISSIONS ──
+//
+// The question a caller asks is not "did you submit a timer?" but "is there
+// anything left that will bring this client back, or should I stop claiming
+// there is?".  Three of the four exits answer yes without submitting anything,
+// and answering them `false` would mark a healthy runtime failed:
+//
+//   reconnect disabled   -- nothing is owed; drop_connection() calls this on
+//                           every client, including the ones that never retry
+//   attempts exhausted   -- the operator's own limit, reached as configured
+//   already pending      -- the clock is armed; this call is the no-op that
+//                           keeps two reconnect chains from racing
+//
+// Only a refused submission is false, and that is the one case where nothing
+// will ever run again.
+bool client_instance::schedule_reconnect()
 {
     int max = get_reconnect();
     if (max < 0 || !m_loop)
-        return; // Reconnect disabled
+        return true; // Reconnect disabled: nothing to arm, nothing wrong
 
     if (max > 0 && m_reconnect_attempt >= max)
-        return; // Max attempts reached
+        return true; // The configured limit, reached as asked
 
     // One timer, one request slot.  Arming it again while the kernel still
     // holds it gives the client two reconnect chains racing to open a socket,
     // and the loser's fd is leaked when the winner overwrites m_conn->fd.
     if (m_reconnect_pending)
-        return;
+        return true; // Already armed — that IS the clock running
 
     // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
     int base_sec = 1 << std::min(m_reconnect_attempt, 4); // 1,2,4,8,16
@@ -450,6 +481,24 @@ void client_instance::schedule_reconnect()
 
     m_conn->timeout_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
     m_reconnect_pending = m_loop->submit_timeout(&m_conn->timeout_ts, &m_conn->timeout_req);
+
+    // ─── A refused timer here is the end of this client, not a hiccup ────────
+    //
+    // Nothing else re-drives the reconnect clock: the three callers are
+    // drop_connection(), setup() and handle_timeout(), and every one of them
+    // is fire-and-forget.  So a refusal leaves a runtime that reports
+    // `running`, holds no connection, and will never dial again — silently.
+    //
+    // Said in words rather than as a code, the way the proxy states its own
+    // timer refusals and the way teardown() below already states the
+    // withdrawal: the operator can see a log line, and cannot see a bool that
+    // was dropped on the floor.
+    if (!m_reconnect_pending)
+        LOG_ERROR("client: the reconnect timer could not be submitted — this "
+                  "client is disconnected and will not dial again on its own; "
+                  "restart the runtime");
+
+    return m_reconnect_pending;
 }
 
 bool client_instance::setup(event_loop& loop)
@@ -548,12 +597,14 @@ bool client_instance::setup(event_loop& loop)
 
     if (!try_connect())
     {
-        // If reconnect enabled, schedule first attempt
+        // If reconnect enabled, schedule first attempt.
+        //
+        // Checked, because "we'll connect later" is only true if the clock that
+        // makes it later was actually armed.  Returning true on a refused
+        // submission is the shape of the defect this tree has already had once:
+        // a start that failed, recorded as running, answering nothing.
         if (get_reconnect() >= 0)
-        {
-            schedule_reconnect();
-            return true; // Setup "succeeds" — we'll connect later
-        }
+            return schedule_reconnect();
         return false;
     }
 
@@ -942,8 +993,10 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe)
     if (try_connect())
         return; // Reconnected successfully
 
-    // Failed — schedule another attempt
-    schedule_reconnect();
+    // Failed — schedule another attempt.  Same reasoning as drop_connection():
+    // if the clock cannot be re-armed there is no later attempt to wait for.
+    if (!schedule_reconnect())
+        mark_failed();
 }
 
 void client_instance::process_message(std::string_view msg)
