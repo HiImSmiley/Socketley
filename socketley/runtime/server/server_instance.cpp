@@ -10,6 +10,7 @@
 // directory for it — the exact thing the note on cache_instance.h below exists
 // to prevent, eight lines apart and going unremarked.
 #include "../../shared/http_framing.h"
+#include "../../shared/unix_listener.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
@@ -1673,116 +1674,19 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 
 // The AF_UNIX listener, for `--listen unix:/path/to.sock`.
 //
-// ─── THE NODE THAT IS ALREADY THERE ─────────────────────────────────────────
-//
-// bind() on a path that exists fails EADDRINUSE whether or not anything is
-// serving it, and a unix socket node outlives the process that made it: a
-// daemon killed with SIGKILL, a machine that lost power, a container image
-// with a socket committed into it all leave one behind.  Unlinking
-// unconditionally would answer that — and would also let a second copy of this
-// runtime take the path away from the first while it is serving traffic, with
-// the first left holding a socket no client can reach and no error anywhere.
-//
-// So the node is asked whether anyone is home, by connecting to it.  A refusal
-// means the node is stale and it is removed; a connection that succeeds means
-// somebody is serving this path and this start is refused, which is the answer
-// a second bind to a live TCP port would get.  There is a race in that — a
-// server could bind between the probe and ours — and it is the same race
-// `unlink` before `bind` has always had; the probe converts the common case
-// (nobody there) from a failure into a start, and the dangerous case
-// (somebody there) from a silent theft into a refusal.
-//
-// ─── WHO MAY CONNECT ────────────────────────────────────────────────────────
-//
-// The node is chmod'ed 0600 rather than left to the umask.  Connecting to a
-// unix socket needs write permission on the node, so the umask normally
-// decides who may — and a daemon running under `umask 0` publishes a listener
-// anybody on the machine can talk to, which is the same defect this tree
-// already has recorded against its 0666 control socket and its 0644 state
-// files.  0600 is the conservative end of that: the sidecar case this flag
-// exists for is a proxy and a backend under one daemon, which is one uid.
-//
-// NOT DONE, and worth saying rather than discovering: there is no flag to
-// widen it.  A peer running as another user cannot connect, and the way round
-// it today is a parent directory the operator owns and controls.
+// The mechanism — the stale-node probe, the bind, the 0600, the listen — is
+// shared/unix_listener.h now, with the reasoning that used to live here.  This
+// wrapper is what stays a server's own: which member holds the fd, and the
+// record of which path was actually bound.
 bool server_instance::setup_unix_listener(const std::string& path)
 {
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    // The caller has already refused a path that would not fit; this cannot
-    // truncate.
-    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
-    const socklen_t addr_len =
-        static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + path.size() + 1);
-
+    auto r = socketley::unix_sock::bind_listener(path);
+    if (r.fd < 0)
     {
-        // SOCK_NONBLOCK, and that matters rather than being tidy.  A blocking
-        // connect() to a unix socket whose listener has a FULL backlog waits
-        // for room -- and this runs on the daemon's event loop thread, the one
-        // thread that serves every runtime in the process.  A busy server on
-        // that path would have stalled the whole daemon for as long as it
-        // stayed busy.  Non-blocking, the same case answers EAGAIN, which is
-        // still "somebody is serving this" and is read as such.
-        const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (probe >= 0)
-        {
-            const int rc = connect(probe, reinterpret_cast<const struct sockaddr*>(&addr),
-                                   addr_len);
-            const int err = errno;
-            close(probe);   // never registered with the ring; a plain close is its own
-            if (rc == 0 || err == EAGAIN || err == EWOULDBLOCK)
-            {
-                LOG_ERROR(("server: --listen " + path +
-                           " is already being served by something -- refusing rather "
-                           "than taking the path away from it").c_str());
-                return false;
-            }
-            // ENOENT is nothing to remove; anything else -- ECONNREFUSED above
-            // all, which is what a node with nobody behind it answers -- is a
-            // leftover.  unlink's own failure is left to bind() to report, which
-            // says which path and why in one message rather than two.
-            if (err != ENOENT)
-                if (unlink(path.c_str()) < 0) {}
-        }
-    }
-
-    m_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
-        return false;
-
-    // Deliberately no SO_REUSEADDR, no SO_REUSEPORT, no TCP_NODELAY and no
-    // TCP_DEFER_ACCEPT.  The first two mean nothing for a path the bind above
-    // has just made exclusive, and the last two are TCP-level options that
-    // would fail on this socket and buy nothing if they did not.
-    if (bind(m_listen_fd, reinterpret_cast<const struct sockaddr*>(&addr), addr_len) < 0)
-    {
-        LOG_ERROR(("server: --listen " + path + " could not be bound: " +
-                   std::strerror(errno)).c_str());
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
+        LOG_ERROR(("server: " + r.error).c_str());
         return false;
     }
-
-    // Before listen(), so there is no instant at which the node both accepts
-    // connections and carries whatever the umask made of it.
-    if (chmod(path.c_str(), S_IRUSR | S_IWUSR) < 0)
-    {
-        LOG_ERROR(("server: --listen " + path + " was bound but its mode could not be "
-                   "set to 0600 -- refusing rather than serving on a node whose "
-                   "permissions are whatever the umask left").c_str());
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        if (unlink(path.c_str()) < 0) {}
-        return false;
-    }
-
-    if (listen(m_listen_fd, 4096) < 0)
-    {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        if (unlink(path.c_str()) < 0) {}
-        return false;
-    }
+    m_listen_fd = r.fd;
 
     // Remembered so teardown() removes exactly the node this bind created, and
     // not whatever the configuration happens to say by then.  A runtime edited
@@ -1918,35 +1822,21 @@ bool server_instance::setup(event_loop& loop)
     const std::string listen_path(get_listen_path());
     if (!listen_path.empty())
     {
-        if (get_port() != 0)
+        // The shared set first — the -p conflict, --tls, and the path rules
+        // re-checked because the flag parser is not on the restore path.
+        if (const std::string msg = socketley::unix_sock::listen_config_refusal(
+                listen_path, get_port(), get_tls()); !msg.empty())
         {
-            LOG_ERROR("server: --listen and -p are two different listeners, and this "
-                      "runtime asks for both -- say which one it is");
+            LOG_ERROR(("server: " + msg).c_str());
             return false;
         }
+        // And the member only this runtime carries: --udp is a server's flag,
+        // so the pair can only be asked for here and the refusal stays here.
         if (m_udp)
         {
             LOG_ERROR("server: --listen names a stream socket and --udp asks for "
                       "datagrams -- a unix datagram listener is a different thing "
                       "and this is not it");
-            return false;
-        }
-        if (get_tls())
-        {
-            LOG_ERROR("server: --tls encrypts a listener against the network, and a "
-                      "unix socket is not on one -- the permissions on the socket "
-                      "node are what restrict it.  Refusing rather than spending a "
-                      "handshake on a peer that cannot be anywhere else");
-            return false;
-        }
-        // Re-checked here for the same reason as above: the flag parser is not
-        // on the restore path.  sun_path truncates silently.
-        struct sockaddr_un probe{};
-        if (listen_path.size() >= sizeof(probe.sun_path) || listen_path[0] != '/')
-        {
-            LOG_ERROR(("server: --listen \"" + listen_path +
-                       "\" is not an absolute path shorter than " +
-                       std::to_string(sizeof(probe.sun_path)) + " bytes").c_str());
             return false;
         }
     }
