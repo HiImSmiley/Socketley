@@ -161,7 +161,13 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 // and try_create(), and removing the duplicate create() took it with it.
 bool runtime_manager::valid_name(std::string_view name)
 {
-    if (name.empty() || name.size() > 128 || name[0] == '.')
+    // A leading '-' is refused for the same class of reason as a leading '.':
+    // not because the string is malformed, but because the CLI can never
+    // address it again.  `create client --help` made a runtime called
+    // "--help", and then `remove --help` parses as a flag and `remove <id>`
+    // does not exist -- so it could be created and never deleted, and it sat
+    // in `ls` until its state file was removed by hand.
+    if (name.empty() || name.size() > 128 || name[0] == '.' || name[0] == '-')
         return false;
     for (char c : name)
     {
