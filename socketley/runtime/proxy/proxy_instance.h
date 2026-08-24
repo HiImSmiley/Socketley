@@ -1171,6 +1171,11 @@ private:
     };
 
     int m_listen_fd = -1;
+    // The path the CURRENT listener actually bound, empty for a TCP one.
+    // Deliberately not get_listen_path(): teardown() has to unlink exactly the
+    // node this run created, and the configuration may have been edited
+    // between start and stop.  Same member, same reason, as the server's.
+    std::string m_bound_listen_path;
     std::unique_ptr<accept_op> m_accept;
     event_loop* m_loop = nullptr;
     bool m_multishot_active = false;

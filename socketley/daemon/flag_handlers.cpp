@@ -1,5 +1,6 @@
 #include "flag_handlers.h"
 #include "../shared/runtime_instance.h"
+#include "../shared/unix_listener.h"
 #include "../shared/lua_context.h"
 #include "../shared/tls_context.h"
 #include <iostream>
@@ -46,6 +47,10 @@ static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
     return true;
 }
 
+// Defined further down, beside validate_listen_value; declared here because
+// the common create and edit parsers dispatch to it.
+static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i);
+
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script)
 {
@@ -67,6 +72,16 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         //
         // Create-time only — see parse_common_edit_flags.
         //
+        // ─── An AF_UNIX listener instead of a port ──────────────────────────
+        //
+        // Here rather than in the per-type parsers, for the reason
+        // --out-of-process taught (see the comment above): a flag three of the
+        // four types accept, kept in three switches, is three copies that
+        // drift.  parse_listen_flag itself refuses the client, with a pointer
+        // at -t unix:, which is the connect side of the same socket.
+        case fnv1a("--listen"):
+            return parse_listen_flag(instance, pa, i);
+
         // Taken here so it is not an unknown flag, and acted on nowhere but the
         // pre-scan in daemon_handler, which is the only place that sees the
         // whole command line before --lua is executed.
@@ -516,17 +531,12 @@ std::string validate_listen_value(std::string_view value, std::string& out)
     const std::string_view path = value.substr(5);
     if (path.empty())
         return "no socket path after the unix: prefix";
-    if (path[0] != '/')
-        return "the socket path must be absolute (got \"" + std::string(path) + "\")";
 
-    struct sockaddr_un probe{};
-    if (path.size() >= sizeof(probe.sun_path))
-        return "the socket path is " + std::to_string(path.size()) +
-               " bytes and the kernel's limit is " +
-               std::to_string(sizeof(probe.sun_path) - 1) +
-               " -- it would be truncated to a different socket";
-    if (path.find('\0') != std::string_view::npos)
-        return "the socket path contains a NUL byte";
+    // The path rules themselves — absolute, under sun_path, no NUL — are
+    // shared/unix_listener.h's, the same ones every setup() re-asks on the
+    // restore and import paths this parser never sees.
+    if (std::string why = socketley::unix_sock::path_refusal(path); !why.empty())
+        return why;
 
     out.assign(path);
     return {};
@@ -534,6 +544,16 @@ std::string validate_listen_value(std::string_view value, std::string& out)
 
 static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i)
 {
+    // A client dials out and listens on nothing, so the flag cannot mean
+    // anything on one — but the thing the operator probably wants exists, and
+    // the refusal says where it is rather than "unknown flag".
+    if (rt->get_type() == runtime_client)
+    {
+        std::cout << "--listen does not apply to a client: a client dials out"
+                     " and has no listener.  The connect side of a unix socket"
+                     " is -t unix:/path/to.sock\n";
+        return 1;
+    }
     if (i + 1 >= pa.count)
     {
         std::cout << "--listen requires an address (unix:/path/to.sock)\n";
@@ -555,8 +575,6 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
 {
     switch (pa.hashes[i])
     {
-        case fnv1a("--listen"):
-            return parse_listen_flag(srv, pa, i);
 
         case fnv1a("--mode"):
         {
@@ -673,7 +691,23 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
                 std::cout << "-t requires a target address\n";
                 return 1;
             }
-            cli->set_target(pa.args[++i]);
+            // A unix: target is judged now, not at dial time: the path rules
+            // are the listener's (shared/unix_listener.h), and this is the
+            // last point at which the operator is told which socket they
+            // actually asked for.  Anything else stays a free-form host:port
+            // — hostnames cannot be validated here.
+            ++i;
+            if (std::string_view v = pa.args[i]; v.starts_with("unix:"))
+            {
+                if (std::string why =
+                        socketley::unix_sock::path_refusal(v.substr(5));
+                    !why.empty())
+                {
+                    std::cout << "-t: " << why << "\n";
+                    return 1;
+                }
+            }
+            cli->set_target(pa.args[i]);
             return 0;
         }
         case fnv1a("--mode"):
@@ -1105,6 +1139,19 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             std::cout << "where a runtime runs can only be set when it is created\n";
             return 1;
 
+        // Same rule as `-p`, and for a sharper reason: a running runtime is
+        // bound to the socket node it has, so moving it would mean binding a
+        // second path underneath whatever is already connected and leaving the
+        // first node for a teardown that never comes.  Common rather than
+        // per-type for the --out-of-process reason: three switches, one flag.
+        case fnv1a("--listen"):
+            if (is_running)
+            {
+                std::cout << "cannot change the listen socket while running\n";
+                return 1;
+            }
+            return parse_listen_flag(instance, pa, i);
+
         // Editable, unlike --daemon-process above, and refused while running
         // like -p below.  The two are not the same request: --daemon-process
         // would move a configured runtime between address spaces underneath
@@ -1377,18 +1424,6 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
 {
     switch (pa.hashes[i])
     {
-        // Same rule as `-p` above it, and for a sharper reason: a running
-        // server is bound to the socket node it has, so moving it would mean
-        // binding a second path underneath whatever is already connected and
-        // leaving the first node for a teardown that never comes.
-        case fnv1a("--listen"):
-            if (is_running)
-            {
-                std::cout << "cannot change the listen socket while running\n";
-                return 1;
-            }
-            return parse_listen_flag(srv, pa, i);
-
         case fnv1a("--mode"):
         {
             if (i + 1 >= pa.count)
@@ -1519,7 +1554,19 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
                 std::cout << "-t requires a target address\n";
                 return 1;
             }
-            cli->set_target(pa.args[++i]);
+            // The same judgment as create's -t, for the same reason.
+            ++i;
+            if (std::string_view v = pa.args[i]; v.starts_with("unix:"))
+            {
+                if (std::string why =
+                        socketley::unix_sock::path_refusal(v.substr(5));
+                    !why.empty())
+                {
+                    std::cout << "-t: " << why << "\n";
+                    return 1;
+                }
+            }
+            cli->set_target(pa.args[i]);
             return 0;
         }
         case fnv1a("--mode"):

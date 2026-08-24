@@ -6,6 +6,7 @@
 #include "../../shared/lua_context.h"
 #include "../../shared/logging.h"
 #include "../../shared/invariants.h"
+#include "../../shared/unix_listener.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -106,19 +107,12 @@ static bool backend_connect_addr(const backend_info& b,
     if (b.is_unix)
     {
         // configure_unix_backend has already refused a path that would not
-        // fit, so this cannot truncate.  size() + 1 bytes, so the terminator
-        // goes with it: sun_path is a C string to the kernel, and copying the
-        // NUL is what makes this correct whether or not the caller's buffer
-        // arrived zeroed.
-        auto* un = reinterpret_cast<struct sockaddr_un*>(&out);
-        un->sun_family = AF_UNIX;
-        std::memcpy(un->sun_path, b.unix_path.c_str(), b.unix_path.size() + 1);
-        // offsetof rather than sizeof: passing the whole 110-byte structure
-        // works, but the kernel then compares the full sun_path against a bound
-        // socket's, and a length that stops at the terminator is what makes the
-        // address say exactly what was configured.
-        len = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) +
-                                     b.unix_path.size() + 1);
+        // fit, so this cannot truncate.  The byte-for-byte address rules —
+        // the copied terminator, offsetof rather than sizeof for the length —
+        // are shared/unix_listener.h's, stated there once for both sides of a
+        // unix socket.
+        len = socketley::unix_sock::fill_addr(
+            b.unix_path, *reinterpret_cast<struct sockaddr_un*>(&out));
         return true;
     }
 
@@ -1070,48 +1064,18 @@ inline void proxy_instance::tune_socket(int fd)
 static bool configure_unix_backend(backend_info& b, std::string_view path,
                                    std::string_view where)
 {
-    if (path.empty())
+    // The path rules are shared/unix_listener.h's now — absoluteness matters
+    // here for two reasons of this runtime's own, kept because the shared text
+    // cannot know them: a relative path is resolved against the daemon's
+    // working directory, which is not something an operator writing a flag can
+    // see, and the connection pool keys a unix backend as (path, 0) — a
+    // leading '/' is what makes that key unable to collide with a hostname's.
+    // The same rule is also what refuses a leading NUL, which is how Linux
+    // spells an abstract socket; see the header for why that is a decision.
+    if (const std::string why = socketley::unix_sock::path_refusal(path);
+        !why.empty())
     {
-        LOG_ERROR(("proxy backend " + std::string(where) +
-                   ": no socket path").c_str());
-        return false;
-    }
-
-    // Absolute, and this is not tidiness.  Two things rest on it: a relative
-    // path is resolved against the daemon's working directory, which is not
-    // something an operator writing a flag can see, and the connection pool
-    // keys a unix backend as (path, 0) — a leading '/' is what makes that key
-    // unable to collide with a hostname's.  A leading NUL, which is how Linux
-    // spells an abstract socket, is refused by the same test and deliberately:
-    // an abstract name is in no filesystem and so is bounded by nothing but the
-    // network namespace.
-    if (path[0] != '/')
-    {
-        LOG_ERROR(("proxy backend " + std::string(where) +
-                   ": the socket path must be absolute").c_str());
-        return false;
-    }
-
-    // sun_path is 108 bytes including its terminator, and the kernel truncates
-    // silently.  A trimmed path names a different socket — very possibly one
-    // that exists — so this refuses rather than pointing the proxy at whatever
-    // the first 107 bytes happen to reach.
-    struct sockaddr_un probe{};
-    if (path.size() >= sizeof(probe.sun_path))
-    {
-        LOG_ERROR(("proxy backend " + std::string(where) + ": the socket path is " +
-                   std::to_string(path.size()) + " bytes, and the kernel's limit is " +
-                   std::to_string(sizeof(probe.sun_path) - 1) +
-                   " -- it would be truncated to a different socket").c_str());
-        return false;
-    }
-
-    // A NUL inside the path would end it early for the kernel and not for us,
-    // which is the truncation above wearing a different hat.
-    if (path.find('\0') != std::string_view::npos)
-    {
-        LOG_ERROR(("proxy backend " + std::string(where) +
-                   ": the socket path contains a NUL byte").c_str());
+        LOG_ERROR(("proxy backend " + std::string(where) + ": " + why).c_str());
         return false;
     }
 
@@ -1506,6 +1470,23 @@ bool proxy_instance::setup(event_loop& loop)
     if (m_backends.empty())
         return false;
 
+    // ─── --listen unix:/path/to.sock ────────────────────────────────────────
+    //
+    // Judged here rather than only in the flag parser, for the server's
+    // reason: setup() is the one function every route to a listening socket
+    // passes through — create, restore, a worker's config frame, import, and
+    // a restart after edit.  Before the TLS block below, so a doomed
+    // configuration is refused without loading certificates it may not use.
+    // --shards with --listen is not asked here: shards_config_refusal owns
+    // that pair, on every one of those paths.
+    const std::string listen_path(get_listen_path());
+    if (const std::string msg = socketley::unix_sock::listen_config_refusal(
+            listen_path, get_port(), get_tls()); !msg.empty())
+    {
+        LOG_ERROR(("proxy: " + msg).c_str());
+        return false;
+    }
+
     // ── TLS ─────────────────────────────────────────────────────────────────
     //
     // Certificates are read and parsed here, at setup, before a single
@@ -1610,109 +1591,129 @@ bool proxy_instance::setup(event_loop& loop)
     // Pre-build prefix once to avoid per-request allocation
     m_prefix = "/" + std::string(get_name()) + "/";
 
-    uint16_t port = get_port();
-    if (port == 0)
-        port = 8080;
-
-    // SOCK_CLOEXEC: in the daemon this listener belongs to one proxy and must
-    // not reach any worker the daemon forks for another; in a worker it is the
-    // only listener there is, opened after the exec from the config frame, so
-    // the flag costs it nothing.  Same reasoning as the server's listener.
-    m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
-        return false;
-
-    int opt = 1;
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
-    //
-    // This set it with a one-second timeout, "eliminating the empty-accept +
-    // read round-trip on the hot path".  setup_tcp_listener in
-    // server_instance.cpp carries the full argument and the measurement behind
-    // it; what follows is only what is different about a proxy.
-    //
-    // The option was removed from the server and left here and in
-    // cache_instance, which is the whole of why this comment exists.  Measured
-    // on this tree before the removal, one silent client, server-side state
-    // 0.4 s after connect:
-    //
-    //     server   ESTAB       (already fixed)
-    //     proxy    SYN-RECV
-    //     cache    SYN-RECV
-    //
-    // A CLIENT-SPEAKS-FIRST PROTOCOL DOES NOT MAKE IT FREE.  It is the obvious
-    // objection here — an HTTP proxy is answered by a request, so the deferral
-    // never delays anything real — and it answers the wrong half.  The delay is
-    // the smaller half.  A connection still in SYN-RECV is a request sock
-    // rather than a socket, and when the listener closes the kernel drops it
-    // with no FIN and no RST; the client is left ESTABLISHED against a peer that
-    // no longer exists, and nothing on an accepted proxy connection sets
-    // SO_KEEPALIVE, so it holds that dead socket until it next writes.  That
-    // window is not rare for a proxy: it is every connection between the accept
-    // and the request, which is a whole round trip on a real network, and a
-    // health checker or a load balancer that opens a connection and stops there
-    // sits in it indefinitely.
-    //
-    // It is also the one state in which this runtime cannot see or account for
-    // a connection at all — not in stats, not in a count, not to a Lua hook —
-    // and the accept-path work removed in that trade is work the proxy has to
-    // do the moment the request arrives regardless.
-    //
-    // WHAT IT COSTS HERE, measured rather than assumed by symmetry with the
-    // server's -17%.  Interleaved A/B, one build against the other, 2,000
-    // connections a run so the box's 28,231 ephemeral ports are not what is
-    // being timed -- the first measurement of the server's cost was wrong for
-    // exactly that reason:
-    //
-    //     connect storm      (`server burst`, no client ever speaks)
-    //         with 98,255/s    without 81,054/s    -22.7%  +/-18.1% CI95
-    //     client speaks first (connect, GET, read the answer, close)
-    //         with 16,859/s    without 17,993/s     +5.5%  +/- 5.6% CI95
-    //
-    // Fifteen pairs each, two daemons side by side, arms alternating which one
-    // leads, every run 2,000 connections with zero failures, and no run started
-    // while more than 12,000 sockets were in TIME-WAIT.  The paired median and
-    // not the mean, because consecutive bursts against ONE daemon decline
-    // within a sequence -- 102,466 then 78,513 then 66,305 at only 257 sockets
-    // in TIME-WAIT, so that is the runtime and not the port pool -- and pairing
-    // with an alternating lead is what keeps that off one arm.
-    //
-    // THE TWO NUMBERS DISAGREE, AND THE SECOND ONE IS THIS LISTENER'S WORKLOAD.
-    // A storm of connections in which nobody ever speaks is exactly the case
-    // the deferral optimises: connect() returns on the SYN-ACK and this runtime
-    // is not involved at all.  It is not a case an HTTP proxy has.  Every real
-    // client -- a browser, a health checker, curl, another proxy -- writes its
-    // request immediately, and then there is nothing left to defer: the option
-    // saves one accept-then-read round inside the ring and nothing on the wire.
-    // Measured on that shape it is worth nothing here this instrument can tell
-    // from zero, and the point estimate is on the other side of it.
-    //
-    // The server's -17% was taken with the first instrument, and there the
-    // connect storm is a shape that runtime genuinely sees: a client that
-    // connects and waits to be greeted is the whole reason that fix was made.
-    // The trade was real there.  It is not the same trade here, which is what
-    // measuring it rather than assuming symmetry was for.
-    //
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    if (!listen_path.empty())
     {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
+        // The mechanism — the stale-node probe, the bind, the 0600, the
+        // listen — is shared/unix_listener.h's, one implementation for every
+        // runtime that listens.  Everything below the branch is the same for
+        // both families: one accept chain, one set of connection slots.
+        auto r = socketley::unix_sock::bind_listener(listen_path);
+        if (r.fd < 0)
+        {
+            LOG_ERROR(("proxy: " + r.error).c_str());
+            return false;
+        }
+        m_listen_fd = r.fd;
+        // Remembered so teardown() removes exactly the node this bind created,
+        // and not whatever the configuration says by then.
+        m_bound_listen_path = listen_path;
     }
-
-    if (listen(m_listen_fd, 4096) < 0)
+    else
     {
-        close_tracked(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
+        uint16_t port = get_port();
+        if (port == 0)
+            port = 8080;
+
+        // SOCK_CLOEXEC: in the daemon this listener belongs to one proxy and must
+        // not reach any worker the daemon forks for another; in a worker it is the
+        // only listener there is, opened after the exec from the config frame, so
+        // the flag costs it nothing.  Same reasoning as the server's listener.
+        m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (m_listen_fd < 0)
+            return false;
+
+        int opt = 1;
+        setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+        setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+        // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
+        //
+        // This set it with a one-second timeout, "eliminating the empty-accept +
+        // read round-trip on the hot path".  setup_tcp_listener in
+        // server_instance.cpp carries the full argument and the measurement behind
+        // it; what follows is only what is different about a proxy.
+        //
+        // The option was removed from the server and left here and in
+        // cache_instance, which is the whole of why this comment exists.  Measured
+        // on this tree before the removal, one silent client, server-side state
+        // 0.4 s after connect:
+        //
+        //     server   ESTAB       (already fixed)
+        //     proxy    SYN-RECV
+        //     cache    SYN-RECV
+        //
+        // A CLIENT-SPEAKS-FIRST PROTOCOL DOES NOT MAKE IT FREE.  It is the obvious
+        // objection here — an HTTP proxy is answered by a request, so the deferral
+        // never delays anything real — and it answers the wrong half.  The delay is
+        // the smaller half.  A connection still in SYN-RECV is a request sock
+        // rather than a socket, and when the listener closes the kernel drops it
+        // with no FIN and no RST; the client is left ESTABLISHED against a peer that
+        // no longer exists, and nothing on an accepted proxy connection sets
+        // SO_KEEPALIVE, so it holds that dead socket until it next writes.  That
+        // window is not rare for a proxy: it is every connection between the accept
+        // and the request, which is a whole round trip on a real network, and a
+        // health checker or a load balancer that opens a connection and stops there
+        // sits in it indefinitely.
+        //
+        // It is also the one state in which this runtime cannot see or account for
+        // a connection at all — not in stats, not in a count, not to a Lua hook —
+        // and the accept-path work removed in that trade is work the proxy has to
+        // do the moment the request arrives regardless.
+        //
+        // WHAT IT COSTS HERE, measured rather than assumed by symmetry with the
+        // server's -17%.  Interleaved A/B, one build against the other, 2,000
+        // connections a run so the box's 28,231 ephemeral ports are not what is
+        // being timed -- the first measurement of the server's cost was wrong for
+        // exactly that reason:
+        //
+        //     connect storm      (`server burst`, no client ever speaks)
+        //         with 98,255/s    without 81,054/s    -22.7%  +/-18.1% CI95
+        //     client speaks first (connect, GET, read the answer, close)
+        //         with 16,859/s    without 17,993/s     +5.5%  +/- 5.6% CI95
+        //
+        // Fifteen pairs each, two daemons side by side, arms alternating which one
+        // leads, every run 2,000 connections with zero failures, and no run started
+        // while more than 12,000 sockets were in TIME-WAIT.  The paired median and
+        // not the mean, because consecutive bursts against ONE daemon decline
+        // within a sequence -- 102,466 then 78,513 then 66,305 at only 257 sockets
+        // in TIME-WAIT, so that is the runtime and not the port pool -- and pairing
+        // with an alternating lead is what keeps that off one arm.
+        //
+        // THE TWO NUMBERS DISAGREE, AND THE SECOND ONE IS THIS LISTENER'S WORKLOAD.
+        // A storm of connections in which nobody ever speaks is exactly the case
+        // the deferral optimises: connect() returns on the SYN-ACK and this runtime
+        // is not involved at all.  It is not a case an HTTP proxy has.  Every real
+        // client -- a browser, a health checker, curl, another proxy -- writes its
+        // request immediately, and then there is nothing left to defer: the option
+        // saves one accept-then-read round inside the ring and nothing on the wire.
+        // Measured on that shape it is worth nothing here this instrument can tell
+        // from zero, and the point estimate is on the other side of it.
+        //
+        // The server's -17% was taken with the first instrument, and there the
+        // connect storm is a shape that runtime genuinely sees: a client that
+        // connects and waits to be greeted is the whole reason that fix was made.
+        // The trade was real there.  It is not the same trade here, which is what
+        // measuring it rather than assuming symmetry was for.
+        //
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+        {
+            close_tracked(m_listen_fd);
+            m_listen_fd = -1;
+            return false;
+        }
+
+        if (listen(m_listen_fd, 4096) < 0)
+        {
+            close_tracked(m_listen_fd);
+            m_listen_fd = -1;
+            return false;
+        }
     }
 
     // A fresh accept request for this run.  The previous one may still be owed
@@ -1855,6 +1856,18 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         shutdown(m_listen_fd, SHUT_RDWR);
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
+    }
+
+    // The socket node, for a unix listener: closing the descriptor does not
+    // unlink the path, so a stopped proxy would otherwise leave a node the
+    // next start meets as its own leftover.  setup's shared bind probes those
+    // and recovers, but only a start does — an operator's `stop` should not
+    // need one to clean up after.  Exactly the node THIS run bound, which is
+    // why the path was remembered rather than re-read from the configuration.
+    if (!m_bound_listen_path.empty())
+    {
+        if (unlink(m_bound_listen_path.c_str()) < 0) {}
+        m_bound_listen_path.clear();
     }
 
     // Drain: flush pending write queues before closing
@@ -2599,7 +2612,11 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
             }
         }
 
-        tune_socket(client_fd);
+        // Everything tune_socket sets is TCP-level, so a client accepted off a
+        // unix listener has nothing to hear from it — same reasoning, and the
+        // same cost argument, as the backend connect's family guard.
+        if (m_bound_listen_path.empty())
+            tune_socket(client_fd);
 
         // Auth check: reject before allocating connection state
         if (!invoke_on_auth(client_fd))

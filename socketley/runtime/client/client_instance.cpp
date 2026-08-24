@@ -1,4 +1,5 @@
 #include "client_instance.h"
+#include "../../shared/unix_listener.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
 #include "../../shared/tls_context.h"
@@ -130,6 +131,37 @@ bool client_instance::try_connect()
         port = 8000;
 
     auto target = get_target();
+
+    // ─── -t unix:/path — the connect side of --listen unix: ─────────────────
+    //
+    // The address rules are shared/unix_listener.h's, the same ones the
+    // listener binds with; setup() has already refused a path that fails them
+    // and the --udp/--tls pairs.  No resolver, no cached-address dance: the
+    // path IS the address.  No tune_client_socket either — everything it sets
+    // is a TCP-level option or a TCP keepalive timer, and a unix peer that
+    // goes away is reported by the socket itself, not probed for.
+    if (target.starts_with("unix:"))
+    {
+        const std::string_view upath = target.substr(5);
+        m_conn->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (m_conn->fd < 0)
+            return false;
+
+        struct sockaddr_un uaddr{};
+        const socklen_t ulen = socketley::unix_sock::fill_addr(upath, uaddr);
+        // A non-blocking AF_UNIX connect is not TCP's: it either completes
+        // now or fails now — EAGAIN (a full backlog) included, since unlike
+        // EINPROGRESS nothing will finish it later.  A failure here is what
+        // the reconnect machinery exists for.
+        if (connect(m_conn->fd, reinterpret_cast<struct sockaddr*>(&uaddr), ulen) < 0)
+        {
+            close_tracked(m_conn->fd);
+            m_conn->fd = -1;
+            return false;
+        }
+        goto connected;
+    }
+
     if (!target.empty())
     {
         auto colon = target.rfind(':');
@@ -573,6 +605,39 @@ bool client_instance::setup(event_loop& loop)
     // state.  None of them may fall through to a cleartext dial: a client that
     // asked for encryption and connected in the clear is the one outcome the
     // operator cannot see, because `inspect` would go on reporting TLS.
+    // ─── -t unix:/path — the connect side of --listen unix: ─────────────────
+    //
+    // Judged here rather than only in the flag parser, for the listener's
+    // reason: setup() is on the restore and import paths the parser never
+    // sees.  Before the TLS block, so a doomed configuration is refused
+    // without loading certificates it may not use.
+    if (const std::string_view target = get_target(); target.starts_with("unix:"))
+    {
+        if (const std::string why =
+                socketley::unix_sock::path_refusal(target.substr(5));
+            !why.empty())
+        {
+            LOG_ERROR(("client: -t: " + why).c_str());
+            return false;
+        }
+        if (m_udp)
+        {
+            LOG_ERROR("client: -t unix: names a stream socket and --udp asks "
+                      "for datagrams -- a unix datagram dial is a different "
+                      "thing and this is not it");
+            return false;
+        }
+        if (get_tls())
+        {
+            LOG_ERROR("client: --tls encrypts a dial against the network, and "
+                      "a unix socket is not on one -- the permissions on the "
+                      "socket node are what restrict it.  Refusing rather than "
+                      "spending a handshake on a peer that cannot be anywhere "
+                      "else");
+            return false;
+        }
+    }
+
     m_tls.reset();
     if (get_tls())
     {

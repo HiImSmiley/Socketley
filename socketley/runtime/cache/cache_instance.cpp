@@ -9,6 +9,7 @@
 #include "../../shared/lua_context.h"
 #include "../../shared/logging.h"
 #include "../../shared/invariants.h"
+#include "../../shared/unix_listener.h"
 #include "../../cli/command_hashing.h"
 #include "../../shared/shard_target.h"
 
@@ -595,6 +596,39 @@ bool cache_instance::setup(event_loop& loop)
     if (!load_shard_set())
         return false;
 
+    // ─── --listen unix:/path/to.sock ────────────────────────────────────────
+    //
+    // Judged here rather than only in the flag parser, for the server's
+    // reason: setup() is the one function every route to a listening socket
+    // passes through — create, restore, a worker's config frame, import, and
+    // a restart after edit.  Before the TLS block, so a doomed configuration
+    // is refused without loading certificates it may not use.  --shards with
+    // --listen is not asked here: shards_config_refusal owns that pair.
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        // The shared set — the -p conflict, --tls, and the path rules
+        // re-checked because the flag parser is not on the restore path.
+        if (const std::string msg = socketley::unix_sock::listen_config_refusal(
+                listen_path, get_port(), get_tls()); !msg.empty())
+        {
+            LOG_ERROR(("cache: " + msg).c_str());
+            return false;
+        }
+        // And the member only this runtime carries.  --cluster advertises
+        // base+1+i out of a port FORMULA (see shard_port()), and a path has
+        // no successor to compute — every advertised address would be one
+        // nothing answers on.
+        if (m_cluster_forced)
+        {
+            LOG_ERROR("cache: --listen and --cluster cannot be combined -- "
+                      "CLUSTER SLOTS advertises base+1..base+N ports computed "
+                      "from the base, and a unix path has no successor to "
+                      "compute.  Use -p for a clustered cache");
+            return false;
+        }
+    }
+
     // ── TLS listener ────────────────────────────────────────────────────────
     //
     // Certificates are read and parsed here, at setup, before a single
@@ -637,7 +671,24 @@ bool cache_instance::setup(event_loop& loop)
 
     const uint16_t port = m_base_port;
 
-    if (!open_listener(port, /*reuseport=*/true, m_listen_fd))
+    if (!listen_path.empty())
+    {
+        // The mechanism — the stale-node probe, the bind, the 0600, the
+        // listen — is shared/unix_listener.h's, one implementation for every
+        // runtime that listens.  Everything below the branch is the same for
+        // both families: one accept chain, one client table.
+        auto r = socketley::unix_sock::bind_listener(listen_path);
+        if (r.fd < 0)
+        {
+            LOG_ERROR(("cache: " + r.error).c_str());
+            return false;
+        }
+        m_listen_fd = r.fd;
+        // Remembered so teardown() removes exactly the node this bind
+        // created, and not whatever the configuration says by then.
+        m_bound_listen_path = listen_path;
+    }
+    else if (!open_listener(port, /*reuseport=*/true, m_listen_fd))
         return false;
 
     // ── The per-shard port ──────────────────────────────────────────────────
@@ -841,6 +892,17 @@ void cache_instance::teardown(event_loop& /*loop*/)
         shutdown(m_cluster_listen_fd, SHUT_RDWR);
         close_tracked(m_cluster_listen_fd);
         m_cluster_listen_fd = -1;
+    }
+
+    // The socket node, for a unix listener: closing the descriptor does not
+    // unlink the path, so a stopped cache would otherwise leave a node the
+    // next start meets as its own leftover.  Exactly the node THIS run bound,
+    // which is why the path was remembered rather than re-read from the
+    // configuration.
+    if (!m_bound_listen_path.empty())
+    {
+        if (unlink(m_bound_listen_path.c_str()) < 0) {}
+        m_bound_listen_path.clear();
     }
 
     // Drain: flush pending write queues with blocking writes
@@ -1379,8 +1441,15 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
             goto cache_resubmit_accept;
         }
 
-        int opt = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        // TCP-level, so a client accepted off a unix listener has nothing to
+        // hear from it — the call would fail rather than do harm, but it is a
+        // syscall per accept spent on nothing.  The cluster listener is TCP
+        // by construction (--cluster and --listen are refused together).
+        if (m_bound_listen_path.empty() || from_cluster)
+        {
+            int opt = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        }
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
 
