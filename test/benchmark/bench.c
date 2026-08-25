@@ -834,6 +834,12 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
     r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
+    /* Same family as bench_proxy_tcp's warm_until: on a timed run the count is
+     * a cap, not an estimate, so gating on it here left the latency log empty
+     * while the throughput (ungated r.success) looked fine. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? start + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
 
     for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
@@ -842,7 +848,7 @@ static struct run_result bench_server_msg(struct bench_config *cfg)
         int64_t t1 = time_ns();
 
         r.success++;
-        if (i >= warmup)
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup))
             lat_record(&r.latencies, t1 - t0);
     }
 
@@ -956,6 +962,17 @@ static void *server_concurrent_worker(void *arg)
      * the per-operation timestamp are what the counted phase needs.  Both sides
      * of this were separate improvements to the same loop. */
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    /* The warm-up has to be measured in whatever unit ends the run — the same
+     * fact bench_proxy_tcp states over its own warm_until.  A timed run is
+     * given an operation cap, not an estimate, so "the first 10% of num_ops"
+     * against the harness's 1e8 cap is ten million round trips that never
+     * happen: counted stays 0 in every slot, conc_finalize skips them all, and
+     * the whole concurrent measurement publishes rate 0.  The base is this
+     * thread's own post-barrier clock, so what is skipped is this thread's own
+     * ramp. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? time_ns() + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
     for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         if (send_all(fd, msg, cfg->msg_size + 1) != cfg->msg_size + 1) break;
@@ -966,7 +983,7 @@ static void *server_concurrent_worker(void *arg)
          * barrier: the first operations of a run pay for a cold accept path
          * and a cold connection, and charging the rest of the run for them is
          * the one part of the old figure that never averages out. */
-        if (i >= warmup) {
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup)) {
             if (a->slot->counted == 0) a->slot->t_open = t0;
             a->slot->counted++;
             a->slot->t_close = t1;
@@ -1365,6 +1382,15 @@ static void *proxy_concurrent_worker(void *arg)
      * why the version without this measured socket buffers. */
     int local = 0;
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    /* The warm-up has to be measured in whatever unit ends the run — see
+     * bench_proxy_tcp, whose warm_until this mirrors, and the server worker
+     * for what a count-based warmup did to a timed run: against the harness's
+     * 1e8 cap the count is ten million round trips that never happen, every
+     * slot finishes with counted 0, and the concurrent path publishes rate 0.
+     * This path had never produced a number at all until this line. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? time_ns() + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
     for (int i = 0; i < cfg->num_ops; i++) {
         if (deadline_passed()) break;
         int64_t t0 = time_ns();
@@ -1376,7 +1402,7 @@ static void *proxy_concurrent_worker(void *arg)
          * request per connection is what opens the backend connection, and
          * `proxy concurrent` run 1 was systematically 22% slower than the rest
          * for exactly that reason. */
-        if (i >= warmup) {
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup)) {
             if (a->slot->counted == 0) a->slot->t_open = t0;
             a->slot->counted++;
             a->slot->t_close = t1;
@@ -1968,6 +1994,12 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
     r.expected = (cfg->duration_ms > 0) ? 0 : cfg->num_ops;
 
     int64_t start = time_ns();
+    /* Same family as bench_proxy_tcp's warm_until: on a timed run the count is
+     * a cap, not an estimate, so gating on it here left the latency log empty
+     * while the throughput (ungated r.success) looked fine. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? start + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
 
     for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
@@ -1980,7 +2012,7 @@ static struct run_result bench_ws_echo(struct bench_config *cfg)
         int64_t t1 = time_ns();
 
         r.success++;
-        if (i >= warmup)
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup))
             lat_record(&r.latencies, t1 - t0);
     }
 
@@ -2022,6 +2054,13 @@ static void *ws_concurrent_worker(void *arg)
      * the per-operation timestamp are what the counted phase needs.  Both sides
      * of this were separate improvements to the same loop. */
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+    /* The warm-up has to be measured in whatever unit ends the run — see
+     * bench_proxy_tcp and the server worker: on a timed run the count-based
+     * warmup is 10% of an operation cap that never happens, so every slot
+     * finished with counted 0 and the concurrent rate published as 0. */
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? time_ns() + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
     for (int i = 0; bench_op_continue(i, cfg); i++) {
         int64_t t0 = time_ns();
         int fd = tcp_connect(cfg->host, cfg->port);
@@ -2031,7 +2070,7 @@ static void *ws_concurrent_worker(void *arg)
         close(fd);
         if (!ok) continue;
         local++;
-        if (i >= warmup) {
+        if (warm_until ? (t1 >= warm_until) : (i >= warmup)) {
             /* Keyed off the first counted operation, not off i == warmup: this
              * loop skips failed connects, so an index-triggered open can be
              * stepped over entirely, leaving t_open at 0 and the thread's rate
