@@ -84,11 +84,42 @@ namespace lua_deadline
 // is never what decides when a runaway is caught.
 //
 // The real cost of having a hook at all is elsewhere and is not tunable by this
-// number: LuaJIT drops the state to the interpreter while a count or line hook
-// is installed, because a compiled trace does not call back out.  That is the
-// price of being able to interrupt a `while true do end` at all — a trace with
-// no hook in it cannot be stopped from inside — and it is why installing
-// nothing when the deadline is off is worth the branch.
+// number — but it is NOT what this comment said until it was measured, and the
+// difference matters, so both halves are written down here.
+//
+// What was claimed: LuaJIT drops the state to the interpreter while a count or
+// line hook is installed, because a compiled trace does not call back out.
+//
+// What is true on this build (LuaJIT 2.1.1767980792, measured 2026-08-25, three
+// runs of the same 12.8M-iteration Lua loop in one process):
+//
+//     lua_context's library set, no hook            497 / 454 / 480 ms
+//     + luaopen_jit, no hook                        120 / 120 / 120 ms
+//     + luaopen_jit AND this hook                   120 / 134 / 120 ms
+//     lua_context's set AND this hook  <- default   644 / 660 / 624 ms
+//
+// A count hook does not stop trace compilation: the third row is the second
+// row.  What it does cost is the hooked dispatch path, which checks on every
+// VM instruction rather than every hook_count of them — lj_vm_inshook is
+// 10.75% of the worker's CPU in a profile of a compute-shaped callback, and
+// costs 15.1% of throughput end to end (bench_lua_share.sh --lua
+// echo_compute.lua: 11772/12107 msg/s with the hook against 13361/14124
+// without, non-overlapping).  Against a callback-shaped script it is not
+// resolvable at all: echo.lua measured 42581/43130 against 42571/42644.
+//
+// The fourth row is 5.2-5.5x the second, and the reason is the *library*, not
+// the hook — see the note at open_libraries in the constructor below.  The
+// deadline is not what makes Lua slow here; not opening LuaJIT's own jit
+// library is.
+//
+// The claim above is still the reason the mechanism cannot simply be kept
+// alongside a compiled trace, and that half survives measurement: with
+// luaopen_jit called, a 300 ms deadline stopped `while true do end` never,
+// against 300.2 ms without it, and `for i = 1, 1e18 do h = h + 1 end` never,
+// against 300.1 ms — a hard ceiling inside the hook did not help either,
+// because the hook is not reached from inside a trace.  So installing nothing
+// when the deadline is off is still worth the branch, and turning the compiler
+// on is a decision about the deadline rather than about performance.
 static constexpr int hook_count = 10000;
 
 // ── The armed invocation ────────────────────────────────────────────────────
@@ -317,6 +348,39 @@ void lua_context::install_deadline_hook()
 
 lua_context::lua_context()
 {
+    // ─── THE MISSING LIBRARY, AND WHY IT IS STILL MISSING ───────────────────
+    //
+    // `jit` is not in this list, and LuaJIT's trace compiler is therefore never
+    // initialised in this process: luaopen_jit is not even linked into the
+    // binary (nm finds no such symbol), because nothing references it and the
+    // linker leaves lib_jit.o in the archive.  Every Lua callback this daemon
+    // has ever run has run in the interpreter.
+    //
+    // That is not free.  Measured 2026-08-25 on one hot loop, three runs:
+    // adding luaopen_jit takes 497/454/480 ms down to 120/120/120 — 3.8-4.1x —
+    // and against what the daemon actually runs today (this set plus the
+    // deadline hook, 644/660/624 ms) it is 5.2-5.5x.  A profile of a
+    // compute-shaped callback confirms it from the other side: not one sample
+    // in an anonymous executable mapping, and the hot symbols are lj_BC_* and
+    // lj_ffh_* — bytecode dispatch, no compiled code anywhere.
+    //
+    // sol::lib::jit does NOT do this.  Passed to open_libraries it leaves the
+    // global `jit` nil and the compiler off; so does calling
+    // luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE|LUAJIT_MODE_ON) by hand, which
+    // returns 1 to say it accepted the mode and then changes nothing measurable
+    // (453/455/468 ms).  The compiler needs luaopen_jit's own initialiser, and
+    // there is no narrower way in.
+    //
+    // It stays out because of what it costs, not because nobody noticed: with
+    // the compiler on, a runaway callback can no longer be stopped.  See the
+    // measured 2x2 at hook_count above — `while true do end` and a counted
+    // for-loop both ran forever against a 300 ms deadline that stops both in
+    // 300.1 ms today.  lua_deadline exists because that failure takes the whole
+    // daemon with it, not one runtime.
+    //
+    // So this is a live trade-off with both sides priced, and not an oversight:
+    // 5.2-5.5x on compute-shaped scripts against the only mechanism that can
+    // interrupt one.  Anyone changing this line should read lua_deadline first.
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
                          sol::lib::math, sol::lib::os, sol::lib::io,
                          sol::lib::package);
