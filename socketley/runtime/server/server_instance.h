@@ -1083,6 +1083,7 @@ private:
     static constexpr uint32_t BUF_SIZE = 16384;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
+    bool m_recv_bundle{false};
     bool m_send_zc{false};
     bool m_direct_accept{false};
 

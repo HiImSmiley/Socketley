@@ -1919,6 +1919,13 @@ bool server_instance::setup(event_loop& loop)
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    // Bundled recv: one completion carries as many provided buffers as the
+    // socket queue could fill.  Probed by a real submission inside
+    // recv_bundle_enabled() and off under SOCKETLEY_RECV_BUNDLE=0, which is
+    // also the A/B switch -- same binary, same pool geometry, only the arm
+    // differs.  Measured on the cache: nothing at 1 KB buffers, +48% at 2 KB,
+    // and it flattens the buffer-size curve rather than moving its peak.
+    m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();
     // Not send_zc_supported(): the kernel having the opcode is not the
     // question.  A pending zero-copy notification is not a cancellable request
     // and only the peer can release it, so it would hold this instance in
@@ -2507,13 +2514,13 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_read:
         case op_read_provided:
         case op_recv_multishot:
+        case op_recv_multishot_bundle:
         case op_write:
         case op_writev:
         case op_send_zc:
         case op_send_zc_notif:
         {
-            const bool is_read = (req->type == op_read || req->type == op_read_provided
-                                  || req->type == op_recv_multishot);
+            const bool is_read = is_read_op(req->type);
 
             // The descriptor says where to look; the request address and the
             // generation say whether what we found is who submitted it.  An
@@ -2747,23 +2754,31 @@ inline void server_instance::remove_active_fd(int fd)
 
 inline void server_instance::submit_conn_read(server_connection* conn)
 {
-    bool queued;
+    // Bundle first, plain multishot behind it.  A refused bundle is not an
+    // error -- the group's cursor may have tripped -- and the plain arm serves
+    // the same bytes one buffer per completion.  Both are consumed through
+    // for_each_cqe_buf, which cannot tell them apart.
+    bool queued = false;
     if (conn->direct_fd)
     {
-        if (m_recv_multishot)
+        if (m_recv_bundle)
+            queued = m_loop->submit_recv_multishot_bundle_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (m_use_provided_bufs)
+        else if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else
+        else if (!queued)
             queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
     }
     else
     {
-        if (m_recv_multishot)
+        if (m_recv_bundle)
+            queued = m_loop->submit_recv_multishot_bundle(conn->fd, BUF_GROUP_ID, &conn->read_req);
+        if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
-        else if (m_use_provided_bufs)
+        else if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
-        else
+        else if (!queued)
             queued = m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
     }
 
@@ -3747,7 +3762,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!conn))
         return;
 
-    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
     // For multishot recv, the read remains pending as long as MORE flag is set
@@ -3814,20 +3829,18 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // same buffer it always did and knows nothing about TLS.
     if (is_provided)
     {
-        // Extract buffer ID from CQE flags
-        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-        char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-        if (SOCKETLEY_LIKELY(buf_ptr != nullptr))
-        {
+        // Reading the buffer id straight out of the CQE flags was correct only
+        // while every completion carried exactly one buffer.  A bundle names
+        // only its FIRST, so that form silently dropped every buffer after it
+        // -- both the bytes and the buffer itself, which the group never got
+        // back.  for_each_cqe_buf is the loop's rule for naming and slicing
+        // them; what stays here is where the bytes go.
+        m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
-                tls_feed(conn, buf_ptr, static_cast<size_t>(cqe->res));
+                tls_feed(conn, p, static_cast<size_t>(n));
             else
-                conn->partial.append(buf_ptr, cqe->res);
-            // Back to the group whatever the session made of it: the group is
-            // shared with every other server on this loop, and one failed
-            // handshake is no reason to starve them.
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
-        }
+                conn->partial.append(p, n);
+        });
     }
     else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {

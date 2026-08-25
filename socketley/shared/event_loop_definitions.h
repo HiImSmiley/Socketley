@@ -360,6 +360,28 @@ inline const char* io_op_name(uint8_t t)
     }
 }
 
+// ─── Is this completion a multishot receive? ────────────────────────────────
+//
+// A predicate rather than a comparison at each site, because "which op types
+// are a multishot recv" is exactly the kind of fact a new op type makes stale
+// everywhere at once.  Adding op_recv_multishot_bundle without this cost a
+// hang: the server checked `type == op_recv_multishot` in three places, the
+// bundle completion matched none of them, and every read it carried was
+// dropped -- an echo server that accepted connections and answered nothing.
+//
+// A site that genuinely means "the plain variant only" should say so and name
+// why; there is no such site today.
+constexpr bool is_multishot_recv_op(op_type t)
+{
+    return t == op_recv_multishot || t == op_recv_multishot_bundle;
+}
+
+// Every op that delivers received bytes, however it was armed.
+constexpr bool is_read_op(op_type t)
+{
+    return t == op_read || t == op_read_provided || is_multishot_recv_op(t);
+}
+
 struct io_request
 {
     io_handler* owner;

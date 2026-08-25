@@ -1568,6 +1568,27 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    // ─── THE PROXY DELIBERATELY DOES NOT BUNDLE ─────────────────────────────
+    //
+    // Not an oversight, and not because bundles would not pay here -- the
+    // buffer sweep says a 64 KB payload through this proxy runs 3,597 -> 7,524
+    // msgs/s across 1..64 KB buffers, so it is squarely a runtime that feels
+    // receive granularity.
+    //
+    // It is the shape of handle_read.  The cache and the server APPEND each
+    // slice to conn->partial, so a completion carrying k buffers is k appends
+    // and nothing downstream can tell.  This runtime instead takes ONE
+    // contiguous `char* read_data` out of the completion and carries that
+    // pointer through classification, HTTP framing and the forward -- code that
+    // has no way to express "and then continue in a different buffer".  A
+    // bundle would hand it k discontiguous buffers and it would forward the
+    // first and silently drop the rest.
+    //
+    // Coalescing them into one buffer first would work and would also undo the
+    // point: bundles remove a copy's worth of kernel work per message, and
+    // reassembling in userspace puts a copy back.  Arming this needs
+    // handle_read to become span-aware, which is its own change with its own
+    // measurement -- not a flag flip.
     // Not send_zc_supported(): the kernel having the opcode is not the
     // question.  A pending zero-copy notification is not a cancellable request
     // and only the peer can release it, so it would hold this instance in
@@ -2880,7 +2901,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
     auto* conn = entry.client;
 
-    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
     if (!is_multishot_recv)
@@ -3789,7 +3810,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         return;
     }
 
-    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
     if (!is_multishot_recv)
@@ -8040,7 +8061,7 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
         conn->pool_abandoned = true;
 
     // Still armed — the completion that ends the read is yet to come.
-    if (req->type == op_recv_multishot && (cqe->flags & IORING_CQE_F_MORE))
+    if (is_multishot_recv_op(req->type) && (cqe->flags & IORING_CQE_F_MORE))
         return;
 
     conn->read_pending = false;

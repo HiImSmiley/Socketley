@@ -432,6 +432,49 @@ public:
         return group_id < MAX_BUF_GROUPS ? m_buf_rings[group_id].buf_size : 0;
     }
 
+    // ── Every buffer of this completion, sliced and returned ────────────────
+    //
+    // The rule four runtimes would otherwise each have to remember, in one
+    // place.  A bundle CQE names only its FIRST buffer; the rest follow in the
+    // ring's consumption order, which only this loop's cursor knows.  The bytes
+    // are packed contiguously, every buffer full except possibly the last.  And
+    // a buffer whose pointer fails to resolve must STILL advance `remaining`,
+    // or every later slice is shifted by its length -- a silent corruption that
+    // looks like a protocol bug three layers up.
+    //
+    // `fn(char* data, uint32_t len)` gets each slice; what a runtime does with
+    // bytes is its own business and stays in the runtime.  Returning the buffer
+    // is not: a buffer left unreturned is one the group has permanently lost,
+    // so it happens here, on every path, including the failed pointer.
+    //
+    // Identical for a plain provided read, a non-bundled multishot and a
+    // bundle -- for the first two the count is one and this is the same single
+    // append it always was.
+    template <typename F>
+    void for_each_cqe_buf(uint16_t group_id, const struct io_uring_cqe* cqe, F&& fn)
+    {
+        if (!cqe || cqe->res <= 0)
+            return;
+        const uint32_t buf_sz = buf_ring_buf_size(group_id);
+        const uint32_t nbufs  = cqe_buf_count();
+        uint32_t remaining    = static_cast<uint32_t>(cqe->res);
+        for (uint32_t i = 0; i < (nbufs ? nbufs : 1u) && remaining; i++)
+        {
+            // nbufs of zero cannot happen for a buffered completion; the CQE's
+            // own id keeps even that case from touching buffer 0 by accident.
+            const uint16_t buf_id = nbufs
+                ? cqe_buf_id(i)
+                : static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+            const uint32_t take = (buf_sz && remaining > buf_sz) ? buf_sz : remaining;
+            if (char* p = get_buf_ptr(group_id, buf_id))
+            {
+                fn(p, take);
+                return_buf(group_id, buf_id);
+            }
+            remaining -= take;
+        }
+    }
+
     // Zero-copy send: kernel DMAs directly from user buffer.
     // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
     // Buffer must stay alive until NOTIF CQE arrives.

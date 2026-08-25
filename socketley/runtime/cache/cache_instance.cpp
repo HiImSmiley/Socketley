@@ -1979,8 +1979,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
     auto* conn = m_conn_idx[fd];
 
-    bool is_multishot_recv = (req->type == op_recv_multishot ||
-                              req->type == op_recv_multishot_bundle);
+    bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
     // For multishot recv, the read remains pending as long as MORE flag is set
@@ -2081,39 +2080,19 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // always did and knows nothing about TLS.
     if (is_provided)
     {
-        // One completion may carry several buffers: a bundled recv packs the
-        // socket queue into consecutive ring buffers, every one full except
-        // possibly the last, and the CQE names only the FIRST of them.  The
-        // loop's span API names them all; for a plain provided read or
-        // non-bundled multishot the count is one and this is the same single
-        // append it always was.
-        const uint32_t buf_sz = m_loop->buf_ring_buf_size(BUF_GROUP_ID);
-        const uint32_t nbufs  = m_loop->cqe_buf_count();
-        uint32_t remaining    = static_cast<uint32_t>(cqe->res);
-        for (uint32_t i = 0; i < (nbufs ? nbufs : 1u); i++)
-        {
-            // nbufs of zero cannot happen for a buffered completion; the CQE's
-            // own id keeps even that case from touching buffer 0 by accident.
-            const uint16_t buf_id = nbufs
-                ? m_loop->cqe_buf_id(i)
-                : static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-            const uint32_t take = (buf_sz && remaining > buf_sz) ? buf_sz : remaining;
-            char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-            if (buf_ptr)
-            {
-                if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
-                    tls_feed(conn, buf_ptr, static_cast<size_t>(take));
-                else
-                    conn->partial.append(buf_ptr, take);
-                // Back to the group whatever the session made of it: the group
-                // is shared with every other cache on this loop, and one failed
-                // handshake is no reason to starve them.
-                m_loop->return_buf(BUF_GROUP_ID, buf_id);
-            }
-            // Advance past the slice whether or not the pointer resolved, so a
-            // skipped buffer cannot shift every later slice's length.
-            remaining -= take;
-        }
+        // How a completion's buffers are named and sliced is the loop's rule,
+        // not this runtime's -- see for_each_cqe_buf.  What stays here is the
+        // only part that is actually the cache's: where the bytes go.  The
+        // buffer goes back to the group whatever the TLS session made of it,
+        // and that happens inside the helper, because the group is shared with
+        // every other cache on this loop and one failed handshake is no reason
+        // to starve them.
+        m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) {
+            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+                tls_feed(conn, p, static_cast<size_t>(n));
+            else
+                conn->partial.append(p, n);
+        });
         SKL_TRACE_ADD(conn, bytes_read, cqe->res);
         SKL_TRACE_ADD(conn, reads, 1);
     }
