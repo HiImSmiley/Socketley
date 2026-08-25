@@ -7527,6 +7527,19 @@ worker, because it is a walk of tables that exist only there. It crosses the
 control socket when it changes, and for a runtime with no traffic that is never:
 an idle worker sends nothing and wakes for nothing.
 .PP
+Until the first such report has arrived,
+.B stats
+prints
+.B worker_report:none
+in place of those figures. The window is ordinarily the first fraction of a
+second after a start; a runtime that shows it while serving traffic has a
+worker that is alive but not publishing \(em wedged, or its frames being lost
+\(em and that line is the difference between "no data" and "no traffic". Earlier
+releases printed the placeholder's own untouched figures instead:
+.B keys:0
+from a store no command had ever reached, indistinguishable from a running
+cache that nobody had used.
+.PP
 .B "And which process it is."
 .B stats
 prints
