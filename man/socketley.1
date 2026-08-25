@@ -4162,9 +4162,16 @@ installs no hook and also opens LuaJIT's
 library, which is the only thing that turns the trace compiler on at all:
 without it every Lua callback this daemon runs is interpreted. On that same
 arithmetic callback the difference is 11722 messages a second bounded against
-28085 unbounded, at 85.2 against 30.3 microseconds of worker CPU each. A
-callback that only answers a message gains nothing from it \(em the compiler
-pays for loops, and there is no loop to compile.
+28085 unbounded, at 85.2 against 30.3 microseconds of worker CPU each.
+.PP
+A callback that only answers a message gains very little, because there is
+almost no loop to compile. On the echo fixture the two arms do not separate in
+throughput at all \(em 42850 and 43929 messages a second bounded against 43577
+and 44350 unbounded, an arm-to-arm gap smaller than the spread inside either
+arm. What does separate is Lua's own share of the worker's CPU, 5.2 and 5.1%
+against 3.9 and 4.0%, which is the compiler doing a little work on two
+bytecodes. Round it to about 1% end to end, against 2.4x on a callback that
+computes.
 .PP
 .B What 0 gives up.
 A compiled trace does not call an instruction hook back, so with the compiler
@@ -6376,7 +6383,7 @@ milliseconds. Default
 .BR 10000 ;
 .B 0
 switches the bound off entirely and turns LuaJIT's trace compiler on with it,
-which is worth about 2.4x on a callback that computes and nothing on one that
+which is worth about 2.4x on a callback that computes and about 1% on one that
 does not. See
 .BR "Callback Deadline" ,
 which prices both halves of that trade.
