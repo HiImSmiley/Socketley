@@ -2074,6 +2074,19 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
+    // Wire bytes in.  Three runtimes fed this counter from their completion
+    // handlers and the cache forgot, so `stats` printed bytes_in:0 for a cache
+    // that had just served hundreds of commands — in every mode.  There is no
+    // shared chokepoint to route this through: what a completion contributes is
+    // already decided by the branches above (errors and ENOBUFS returned, and a
+    // bundle's res is the byte total across its buffers, which is also what the
+    // trace lines below record), and WHICH completions are a runtime's wire
+    // traffic is a per-runtime decision that already diverges — the proxy
+    // counts its client side only, and its bytes_out at enqueue.  This
+    // handler is the cache's own chokepoint: every client read of all four
+    // recv shapes lands here and nowhere else.
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
     // On a TLS connection these bytes are ciphertext and tls_feed is what puts
     // plaintext into partial; everything below this point — RESP detection, the
     // line parser, every command handler — reads exactly the same buffer it
@@ -2269,6 +2282,12 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         }
         return;
     }
+
+    // Wire bytes out, counted per completed send — a short write's remainder
+    // completes again and is counted then, and the zero-copy NOTIF returned
+    // above before reaching here.  See the bytes_in note in handle_read() for
+    // why this is the site and not a shared helper.
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     // Short write handling: resubmit remaining bytes
     if (!conn->zc_notif_pending && conn->write_batch_count > 0)
@@ -7425,6 +7444,11 @@ void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_co
         return;
     }
 
+    // Replication bytes are this runtime's wire traffic too — the server
+    // counts its upstream links the same way.  See the bytes_in note in
+    // handle_read() for why the counting lives in each handler.
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
     // A short write is normal; only the acknowledged prefix may be dropped.
     size_t written = std::min(static_cast<size_t>(cqe->res), f.in_flight);
     f.out.erase(0, written);
@@ -7836,6 +7860,10 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         m_master.reset();
         return;
     }
+
+    // The replication stream from the leader is wire traffic in.  See the
+    // bytes_in note in handle_read() for why the counting lives here.
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     link.partial.append(link.buf, cqe->res);
 

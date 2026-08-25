@@ -617,14 +617,20 @@ public:
                 // on every turn and the only way to have no recv standing is a
                 // submission the ring refused, which the next turn resubmits.
 
-                // Cleared whether or not a frame went out.  push_stats()
+                // Cleared when nothing remains to publish.  push_stats()
                 // answers "was any of this new", and a turn whose work produced
                 // nothing a reader can see is a turn with nothing left to
                 // publish — asking again in 250 ms would only rebuild the same
                 // string and compare it against itself.  The next completion
                 // sets the flag again.
-                push_stats();
-                stats_dirty = false;
+                //
+                // NOT cleared for a frame the writer refused: the figures are
+                // still owed, and the flag staying up is what brings this loop
+                // back at the publish rate to retry — an idle worker with a
+                // clear flag waits idle_wait_ms, which for a runtime that has
+                // gone quiet after a burst is a report the daemon never gets.
+                if (push_stats())
+                    stats_dirty = false;
                 last_stats  = now;
             }
 
@@ -836,13 +842,21 @@ private:
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
+    // True when nothing remains to publish — either the frame was queued or
+    // there was nothing to say.  False only for a frame the writer REFUSED,
+    // which the caller must keep its dirty flag armed for: the refusal used to
+    // be swallowed here after m_last_pub had already been updated, so the lost
+    // frame was recorded as delivered and was never resent until a counter
+    // happened to move again — for a cache that went idle after a burst, never.
+    // The daemon then held the previous report indefinitely, with nothing in
+    // any log but frame_writer's one backlog warning.
     bool push_stats()
     {
         // No runtime, so nothing published and nothing changed — and reporting
-        // "changed" here would hold the interval at its floor for a worker that
-        // has nothing to say.
+        // "still owed" here would hold the interval at its floor for a worker
+        // that has nothing to say.
         if (!m_rt)
-            return false;
+            return true;
 
         // On the event-loop thread, which is the only thread allowed to walk
         // the proxy's connection tables.  Everything that leaves this process
@@ -918,18 +932,24 @@ private:
             || s.bytes_out          != m_last_pub.bytes_out
             || s.active_connections != m_last_pub.active_connections
             || s.detail             != m_last_pub.detail;
-        m_last_pub  = s;
-        m_have_last = true;
 
         // Only when it changed.  The daemon's copy is a copy of the last thing
         // that was true, and re-sending it says nothing that its own record does
         // not already say — which is exactly why the heartbeat could be removed
         // and not merely slowed down.
         if (!changed)
-            return false;
+            return true;
 
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::stats,
-                                                 worker_proto::encode_stats(s)))) {}
+                                                 worker_proto::encode_stats(s))))
+            return false;
+
+        // Committed only once the frame is actually queued.  Recording it
+        // before the write is what made a refused frame permanent: the next
+        // interval compared against figures the daemon never received, found
+        // them equal, and had nothing left to resend.
+        m_last_pub  = std::move(s);
+        m_have_last = true;
         return true;
     }
 

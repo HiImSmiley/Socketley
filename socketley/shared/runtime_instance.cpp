@@ -1118,6 +1118,23 @@ std::string runtime_instance::get_stats() const
     if (worker_backed())
         return stats_prefix() + stat_detail_snapshot();
 
+    // Out of process, running, and not one report has ever landed.  This is the
+    // placeholder between the fork and the worker's first stats frame — or
+    // beyond it, for a worker that wedged before publishing or whose frames are
+    // being lost.  Falling through to the branch below walks THIS instance's
+    // own empty containers and prints their zeros as though the worker had
+    // answered: keys:0 from a store no command has ever reached, unlabelled and
+    // indistinguishable from a running cache with no traffic.  Say what is
+    // actually known instead — the daemon-side counters, and the fact that no
+    // report exists.
+    //
+    // Not in a worker process: there this object may be a replica — the record
+    // of a runtime living elsewhere, out of process by definition — and its
+    // callers already treat the base text as the answer for "not mine".
+    if (is_out_of_process() && !in_worker_process()
+        && get_state() == runtime_running)
+        return stats_prefix() + "worker_report:none\n";
+
     return stats_prefix() + stats_ring() + stats_extra();
 }
 

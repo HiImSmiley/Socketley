@@ -1285,7 +1285,20 @@ void proxy_supervisor::apply_stats(const std::string& payload)
 {
     worker_proto::stats_wire s;
     if (!worker_proto::decode_stats(payload, s))
+    {
+        // Not a silent return: a frame that will not decode means every later
+        // one from this worker is suspect too, and the placeholder freezes on
+        // its last good report — or, if this was the first, never reports and
+        // `stats` says worker_report:none for a runtime that is serving.  A
+        // reading like that was measured once with nothing at all in the log
+        // to distinguish it from a quiet cache.
+        const std::string msg =
+            "proxy supervisor: stats frame did not decode ("
+            + std::to_string(payload.size())
+            + " bytes); worker figures held at last good report";
+        LOG_WARN(msg.c_str());
         return;
+    }
 
     // Kept, not applied.  This used to write the six figures straight into the
     // placeholder, which was right while a placeholder stood for exactly one
