@@ -1225,7 +1225,12 @@ private:
     // Provided buffer ring — 64KB buffers for high throughput
     static constexpr uint16_t BUF_GROUP_ID = 2;
     static constexpr uint32_t BUF_COUNT = 512;
-    static constexpr uint32_t BUF_SIZE = PROXY_READ_BUF_SIZE;
+    // Decoupled from PROXY_READ_BUF_SIZE deliberately.  That constant also
+    // sizes a per-connection `char read_buf[]` on the NON-multishot path, so
+    // tying the ring to it makes any buffer-size experiment two experiments at
+    // once whose results cannot be told apart afterwards.  The value is the
+    // same today; only the coupling is gone.
+    static constexpr uint32_t BUF_SIZE = 65536;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_send_zc{false};
