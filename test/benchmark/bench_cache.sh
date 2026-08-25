@@ -714,28 +714,60 @@ test_persistence() {
 }
 
 # Test 6: Large value throughput (multiple sizes)
+#
+# Routed through cache_pipe_measure like tests 7-10, and for the reason the
+# header of this file gives: the old fixed 2000 SETs per run were a 0.28 ms
+# window at 64 B and 3.0 ms at 4 KB — the five-millisecond scale the header
+# condemns — and with 3 rounds under Student t that came out as a CI95 of
+# ±61..±107%, wider than any effect worth chasing.  The probe sizes the count
+# to CACHE_PIPE_TARGET_MS instead, and the row prints the window it achieved.
+#
+# The keyspace stays at 2000 keys whatever count the probe picks: the measured
+# stream cycles i % 2000, so every run overwrites the same keys in place and
+# the store holds a flat 2000*size bytes.  Store growth and persistence were
+# both ruled out for the old version; cycling keeps both rulings true.
+#
+# The count floor and cap scale with the value size, in bytes rather than ops:
+# the defaults are tuned for short commands, and at 4 KB the 200k-op floor
+# alone would be an 820 MB command stream.  The floor holds the probe's first
+# stream near 13 MB at every size; the cap holds the largest stream a run can
+# write near 512 MB (~131k ops at 4 KB), which this box's 11 GiB carries but a
+# smaller one might not.  A cap-bound run gets a shorter window than the
+# target and says so in its printed harness share.
 test_large_values() {
     local value_sizes=(64 256 1024 4096)
-    local ops_per_size=2000
     local test_name="cache_large_values"
 
     log_section "Test: Large Value Throughput"
 
+    ensure_clean
+    wait_for_port_free $CACHE_PORT
+    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
+    sleep 0.5
+
+    local size min_ops max_ops mkval prog setup
     for size in "${value_sizes[@]}"; do
-        ensure_clean
-        wait_for_port_free $CACHE_PORT
-        socketley_cmd create cache bench_cache -p $CACHE_PORT -s
-        wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; continue; }
-        sleep 0.5
+        # The value is baked into the program text — cache_pipe_measure passes
+        # only -v n.  sprintf's width builds it in one step.
+        mkval='v = sprintf("%'"$size"'s", ""); gsub(/ /, "x", v);'
+        prog='BEGIN{ '"$mkval"' for (i = 0; i < n; i++) printf "SET key%d %s\n", i % 2000, v }'
+        # Every measured run starts from the same store: all 2000 keys already
+        # present at this size, so run 1 pays the same overwrite the rest do.
+        setup='BEGIN{ '"$mkval"' for (i = 0; i < 2000; i++) printf "SET key%d %s\n", i, v }'
 
-        append_result
-        bench_run -j -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size >> "$RESULTS_FILE"
-        bench_run -r 3 cache set 127.0.0.1 $CACHE_PORT $ops_per_size $size
+        min_ops=$(( 12800000 / size ))
+        max_ops=$(( 536870912 / size ))
+        [[ $max_ops -gt $CACHE_PIPE_MAX_OPS ]] && max_ops=$CACHE_PIPE_MAX_OPS
 
-        socketley_cmd stop bench_cache
-        sleep 0.5
-        socketley_cmd remove bench_cache
+        CACHE_PIPE_MIN_OPS=$min_ops CACHE_PIPE_MAX_OPS=$max_ops \
+            cache_pipe_report "$test_name" "SET ${size}B" "set_${size}b_ops_sec" \
+                "$prog" "$setup"
     done
+
+    socketley_cmd stop bench_cache
+    sleep 0.5
+    socketley_cmd remove bench_cache
 }
 
 # Tests 7-10: pipelined data-structure throughput.
