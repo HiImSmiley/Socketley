@@ -68,6 +68,11 @@ while [[ $# -gt 0 ]]; do
         --secs)    SECS=$2;    shift 2 ;;
         --reps)    REPS=$2;    shift 2 ;;
         --skip-relink) SKIP_RELINK=1; shift ;;
+        # The fixture is a parameter because the hook's cost is a property of
+        # the script, not of the runtime: see echo_compute.lua.  Give each
+        # fixture its own OUT_DIR so two runs do not overwrite each other's
+        # perf.data.
+        --lua)     ECHO_LUA=$2; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -78,6 +83,24 @@ done
 [[ -x $BIN_STRIPPED ]] || { echo "no Release binary at $BIN_STRIPPED" >&2; exit 1; }
 [[ -x $ECHOLOAD ]] || { echo "no echoload at $ECHOLOAD (set ECHOLOAD=)" >&2; exit 1; }
 [[ -f $ECHO_LUA ]] || { echo "no echo.lua at $ECHO_LUA" >&2; exit 1; }
+
+# perf itself.  The distro wrapper /usr/bin/perf dispatches on `uname -r` and
+# refuses outright when the running kernel has no linux-tools package -- which
+# is the state after a kernel upgrade the tools have not caught up with (here:
+# running 7.0.0-30, tools installed for 7.0.0-28).  A perf built for a nearby
+# kernel samples cpu-clock fine, so fall back to the newest one installed
+# rather than reporting "no perf" on a box that has three of them.
+PERF="${PERF:-}"
+if [[ -z $PERF ]]; then
+    if perf --version >/dev/null 2>&1; then
+        PERF=perf
+    else
+        PERF=$(ls -d /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf 2>/dev/null \
+               | sort -V | tail -1 || true)
+        [[ -n $PERF && -x $PERF ]] || { echo "no usable perf (set PERF=)" >&2; exit 1; }
+        echo "[perf] /usr/bin/perf declines kernel $(uname -r); using $PERF"
+    fi
+fi
 
 paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)
 if [[ $paranoid -gt 1 ]]; then
@@ -159,7 +182,21 @@ relink_syms() {
         echo "[relink] WARNING: .text differs from shipped Release -- the profile"
         echo "         is of the -syms binary only; say so in the report."
     fi
-    nm "$BIN" | grep -q lj_str_new || { echo "relink produced no LuaJIT symbols" >&2; exit 1; }
+    # Not a pipeline: this check failed once against a binary that provably had
+    # the symbol (lj_str_new was present in nm's output when the same command
+    # was rerun by hand, 240 times, all clean).  SIGPIPE is ruled out -- only
+    # 25 KB follow the match and the pipe buffer is 64 KB -- so the mechanism is
+    # NOT established.  Capturing nm separately means the next failure prints
+    # nm's own exit status and stderr instead of asserting a conclusion.
+    local nm_out nm_rc
+    nm_out=$(nm "$BIN" 2>&1) && nm_rc=0 || nm_rc=$?
+    if [[ $nm_rc -ne 0 ]]; then
+        echo "nm $BIN failed (rc=$nm_rc): $(head -3 <<<"$nm_out")" >&2; exit 1
+    fi
+    if ! grep -q '\blj_str_new$' <<<"$nm_out"; then
+        echo "relink produced no LuaJIT symbols ($(wc -l <<<"$nm_out") symbols, $(grep -c '\blj_' <<<"$nm_out" || true) lj_*)" >&2
+        exit 1
+    fi
 }
 
 # ─── One rep: daemon up, load on, profile, tear down ────────────────────────
@@ -208,7 +245,7 @@ run_rep() {
 
     local cpu0 cpu1
     cpu0=$(proc_cpu_s "$wpid")
-    perf record -q -e cpu-clock -F 997 --call-graph dwarf,16384 \
+    "$PERF" record -q -e cpu-clock -F 997 --call-graph dwarf,16384 \
         -p "$wpid" -o "$OUT_DIR/perf_$tag.data" -- sleep $PROF_SECS
     cpu1=$(proc_cpu_s "$wpid")
 
@@ -235,7 +272,7 @@ run_rep() {
 # user_rest: everything else in userspace
 report_rep() {
     local tag=$1
-    perf report -i "$OUT_DIR/perf_$tag.data" --stdio --no-children -g none \
+    "$PERF" report -i "$OUT_DIR/perf_$tag.data" --stdio --no-children -g none \
         --percent-limit 0 2>/dev/null | awk '
         /^#/ || NF < 4 { next }
         {
@@ -256,7 +293,7 @@ report_rep() {
 
 inclusive_rep() {  # floor, not ceiling: DWARF dies inside LuaJIT asm frames
     local tag=$1
-    perf report -i "$OUT_DIR/perf_$tag.data" --stdio --children \
+    "$PERF" report -i "$OUT_DIR/perf_$tag.data" --stdio --children \
         --percent-limit 0.2 2>/dev/null \
         | grep -E 'invoke_on_client_message|invoke_on_message|lua_send_to' \
         | head -6 || true
