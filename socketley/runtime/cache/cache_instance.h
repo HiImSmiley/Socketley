@@ -983,6 +983,42 @@ private:
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 3;
+    // ─── MEASURED, 2026-08-25, AND 4096 IS NOT THE OPTIMUM ──────────────────
+    //
+    // 4096 stood here unexamined since the first commit.  Crossed against
+    // buffer size, RECVSEND_BUNDLE and the allocator, twenty arms alive at
+    // once, every cell paired against 4K/bundle-on/glibc inside one tool
+    // invocation with the order flipped per round.  glibc, ops/s:
+    //
+    //            16 KB values, P=8          64 B values, P=128
+    //          bundle off   bundle on     bundle off   bundle on
+    //   1 KB      61,107      57,303      2,368,462   2,456,763
+    //   2 KB      81,354     120,820      2,626,029   3,088,313
+    //   4 KB     107,937     120,295      2,578,310   3,241,110
+    //   8 KB     123,381     130,851      2,928,423   2,920,642
+    //  16 KB     120,576     135,002      3,301,223   3,104,270
+    //
+    // The reference against ITSELF spread -5.7..+14.0% (P=8) and -3.5..+9.9%
+    // (P=128), so single steps are inside the noise and only large effects and
+    // monotone runs mean anything.  What survives that bar:
+    //
+    //   - 1 KB is a real penalty and bundles do not rescue it (-6%): at that
+    //     granularity the cost is per BUFFER, and a bundle removes cost per
+    //     COMPLETION.
+    //   - Bundling's clearest win is 2 KB, +48%, which lifts 2 KB level with
+    //     4 KB.  It flattens the curve rather than moving its peak.
+    //   - Bundle-on rises monotonically 4K -> 8K -> 16K (120,295 / 130,851 /
+    //     135,002).  Each step alone is inside the band; three in one
+    //     direction are not nothing.
+    //
+    // 4096 is therefore KEPT under protest, not confirmed.  Raising it costs
+    // nothing in memory here only if BUF_COUNT falls with it (this sweep held
+    // every runtime at constant total), and the case for 8-16 KB needs more
+    // rounds than five to clear a 14% band.  Do that before changing it.
+    //
+    // The allocator does not matter: mimalloc and jemalloc were measured in
+    // every cell and neither produced an effect that survived the control.
+    // An earlier +19.7% at P=128 did NOT reproduce here.
     static constexpr uint32_t BUF_COUNT = 512;
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
