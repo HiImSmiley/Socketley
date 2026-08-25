@@ -21,6 +21,24 @@ struct buf_ring_pool
     char* base{nullptr};
     uint32_t buf_count{0};
     uint32_t buf_size{0};
+
+    // ── Consumption cursor ──────────────────────────────────────────────────
+    // How many ring entries the kernel has consumed, counted at dispatch.  The
+    // kernel takes entries strictly in the order they were provided, and every
+    // provision goes through setup_buf_ring()/return_buf() — so the entry at
+    // (consumed & (buf_count-1)) in the ring's own memory names the next buffer
+    // the kernel will hand out.  That is the only way to name buffers 2..k of a
+    // BUNDLE completion: the CQE carries the FIRST buffer id and nothing else
+    // (measured — with buffers provided in the order 5,2,7,... a 600-byte
+    // bundle reported bid 5 and packed the rest into 2 and 7).
+    //
+    // cursor_ok is the tripwire.  Every buffered completion's reported first
+    // bid is compared against the cursor's prediction; a mismatch means the
+    // ordering assumption broke, the mismatch is logged once, and bundles stop
+    // being armed for this group — non-bundle completions never need the
+    // cursor, so they continue on the CQE's own bid.
+    uint32_t consumed{0};
+    bool     cursor_ok{true};
 };
 
 class event_loop
@@ -364,6 +382,56 @@ public:
     bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
     bool recv_multishot_supported() const;
 
+    // ── Bundled multishot recv ──────────────────────────────────────────────
+    // IORING_RECVSEND_BUNDLE: one completion carries as many provided buffers
+    // as the socket queue could fill, instead of one completion per buffer.
+    // What it removes is kernel work per received byte — the task_work, the
+    // dispatch pass and the buffer-ring head advance that each extra CQE costs
+    // — and it removes it on the one side userspace batching cannot reach: the
+    // kernel picks receive granularity, not us.
+    //
+    // The completion is consumed differently, and a handler that arms this MUST
+    // consume it through cqe_buf_count()/cqe_buf_id() rather than the CQE's own
+    // buffer id: the CQE names only the FIRST buffer, the rest follow in the
+    // buffer ring's consumption order, and only the loop's cursor knows that
+    // order.  Bytes are packed contiguously — every buffer full except possibly
+    // the last (measured on this kernel; the probe is in the survey commit).
+    //
+    // Falls back to false when the kernel lacks the flag (probed by a real
+    // submission once, never inferred from a version), when SOCKETLEY_RECV_BUNDLE=0,
+    // or when the group's cursor has tripped.  The caller then arms the plain
+    // multishot variant, whose completions it must handle anyway — a bundle
+    // completion of one buffer and a plain completion look identical to a
+    // consumer of the span API.
+    bool submit_recv_multishot_bundle(int fd, uint16_t group_id, io_request* req);
+    bool submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
+
+    // Whether arming a bundle is worth attempting: kernel support (functionally
+    // probed once, lazily) AND not disabled by SOCKETLEY_RECV_BUNDLE=0.
+    // Per-group cursor health is checked by the submit itself.
+    bool recv_bundle_enabled() const;
+
+    // ── The buffers of the completion currently being dispatched ────────────
+    // Valid only inside on_cqe, and only for a completion carrying
+    // IORING_CQE_F_BUFFER.  count is 1 for every non-bundle operation; for a
+    // bundle it is how many buffers the kernel packed into this completion.
+    // cqe_buf_id(i) is the i-th buffer in packing order; the i-th holds
+    // min(buf_size, res - i*buf_size) bytes.  The handler returns each id with
+    // return_buf() exactly as before — the snapshot is taken before dispatch,
+    // so returning early entries cannot corrupt later ones.
+    uint32_t cqe_buf_count() const { return m_cqe_buf_count; }
+    uint16_t cqe_buf_id(uint32_t i) const
+    {
+        return i < m_cqe_buf_count ? m_cqe_bids[i] : 0;
+    }
+    // The pool geometry a consumer needs to slice a bundle's bytes.  From the
+    // pool rather than the runtime's own constant, because a second instance of
+    // a type runs on whatever geometry the first one created.
+    uint32_t buf_ring_buf_size(uint16_t group_id) const
+    {
+        return group_id < MAX_BUF_GROUPS ? m_buf_rings[group_id].buf_size : 0;
+    }
+
     // Zero-copy send: kernel DMAs directly from user buffer.
     // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
     // Buffer must stay alive until NOTIF CQE arrives.
@@ -706,6 +774,30 @@ private:
     // outside a dispatch.
     uint32_t m_cqe_target{IO_TARGET_NONE};
     uint32_t m_cqe_target2{IO_TARGET_NONE};
+
+    // ── Buffered-completion decode, dispatch-scoped like m_cqe_target ───────
+    // Filled by decode_cqe_bufs() before the handler runs, cleared after.  The
+    // snapshot is copied out of the buffer ring's entry array up front because
+    // the handler returns buffers as it consumes them, and a return writes at
+    // the ring's tail — which can wrap onto the very entries a long bundle is
+    // still reading.  MAX_CQE_BUFS bounds a bundle by construction: a
+    // completion cannot carry more buffers than the group holds, and no group
+    // here holds more than 1024.  A group configured larger simply never arms
+    // bundles (setup_buf_ring says so).
+    static constexpr uint32_t MAX_CQE_BUFS = 1024;
+    uint16_t m_cqe_bids[MAX_CQE_BUFS];
+    uint32_t m_cqe_buf_count{0};
+    const struct io_uring_cqe* m_cqe_current{nullptr};
+    // Advance the group cursor for one buffered completion and snapshot the
+    // buffer ids it consumed.  Called for EVERY completion carrying
+    // IORING_CQE_F_BUFFER, bundle or not — the cursor only stays truthful if
+    // every consumption passes this one chokepoint, and dispatch_cqe is the one
+    // place every completion already goes.
+    void decode_cqe_bufs(const struct io_uring_cqe* cqe, const io_request* req,
+                         uint8_t rtype);
+    // Kernel support for IORING_RECVSEND_BUNDLE, established by one real
+    // submission on a throwaway ring the first time anyone asks.
+    static bool probe_recv_bundle();
 
     static constexpr uint16_t MAX_BUF_GROUPS = 8;
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};

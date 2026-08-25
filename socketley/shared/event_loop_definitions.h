@@ -315,10 +315,16 @@ enum op_type : uint8_t
     // reports to the splice handler rather than to the connect one, and because
     // "waiting to splice" and "splicing" have to be told apart in a breakdown:
     // one of them costs a kernel thread and the other does not.
-    op_splice_poll           = 21
+    op_splice_poll           = 21,
+    // Multishot recv with IORING_RECVSEND_BUNDLE: one completion may carry the
+    // contents of SEVERAL provided buffers, packed contiguously in the buffer
+    // ring's consumption order.  A separate kind because the completion is
+    // consumed differently — the CQE names only the FIRST buffer, and the rest
+    // are known to the loop's per-group cursor, not to the completion.
+    op_recv_multishot_bundle = 22
 };
 
-inline constexpr uint8_t op_type_count = 22;
+inline constexpr uint8_t op_type_count = 23;
 
 // For diagnostics only.  A count of outstanding operations says an owner cannot
 // be released yet; the kind says why, which is the difference between reading a
@@ -349,6 +355,7 @@ inline const char* io_op_name(uint8_t t)
         case op_poll:                    return "poll";
         case op_poll_abort:              return "poll-abort";
         case op_splice_poll:             return "splice-poll";
+        case op_recv_multishot_bundle:   return "recv-multishot-bundle";
         default:                         return "unknown";
     }
 }

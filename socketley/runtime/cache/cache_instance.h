@@ -987,6 +987,11 @@ private:
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
+    // Bundled multishot recv: one completion per burst instead of one per
+    // 4 KB buffer.  Only a preference — a submit refused (cursor tripped, SQ
+    // full) falls back to the plain multishot arm, and handle_read consumes
+    // both through the loop's span API so the two are indistinguishable there.
+    bool m_recv_bundle{false};
     bool m_send_zc{false};
 
     // Periodic TTL sweep timer

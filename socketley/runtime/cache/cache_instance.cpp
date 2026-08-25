@@ -273,11 +273,12 @@ bool cache_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
                 continue;
 
             // A read that came out of the provided-buffer ring still holds one
-            // even when it is only reporting its own cancellation.  Hand it
-            // back, or every restart costs the ring a few buffers for good.
+            // even when it is only reporting its own cancellation — and a
+            // bundled read may hold several, which only the dispatching loop
+            // can name.  Hand them back, or every restart costs the ring a few
+            // buffers for good.
             if ((cqe->flags & IORING_CQE_F_BUFFER) && m_retired_loop)
-                m_retired_loop->return_buf(BUF_GROUP_ID,
-                                           static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+                m_retired_loop->return_cqe_buf(cqe, req);
 
             // More to come: a multishot read keeps delivering until it reports
             // without this flag, and a zero-copy send answers twice — once for
@@ -783,6 +784,10 @@ bool cache_instance::setup(event_loop& loop)
     }
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    // Probed by a real submission inside recv_bundle_enabled(), and off under
+    // SOCKETLEY_RECV_BUNDLE=0 — which is also the A/B switch: same binary,
+    // same pool geometry, only the arm differs.
+    m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();
     // Not send_zc_supported(): the kernel having the opcode is not the
     // question.  A pending zero-copy notification is not a cancellable request
     // and only the peer can release it, so it would hold this instance in
@@ -1247,6 +1252,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_read:
         case op_read_provided:
         case op_recv_multishot:
+        case op_recv_multishot_bundle:
             handle_read(cqe, req);
             break;
         case op_write:
@@ -1541,23 +1547,31 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
         return false;
 
     conn->read_pending = true;
-    bool queued;
+    bool queued = false;
     if (conn->direct_fd)
     {
-        if (m_recv_multishot)
+        // Bundle first, plain multishot behind it.  A refused bundle is not an
+        // error: the group's cursor may have tripped, and the plain arm serves
+        // the same bytes one buffer per completion.  (When the refusal was the
+        // SQ, the fallback is refused too and the caller handles it as ever.)
+        if (m_recv_bundle)
+            queued = m_loop->submit_recv_multishot_bundle_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
+        if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (m_use_provided_bufs)
+        else if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else
+        else if (!queued)
             queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
     else
     {
-        if (m_recv_multishot)
+        if (m_recv_bundle)
+            queued = m_loop->submit_recv_multishot_bundle(fd, BUF_GROUP_ID, &conn->read_req);
+        if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-        else if (m_use_provided_bufs)
+        else if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        else
+        else if (!queued)
             queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
 
@@ -1965,7 +1979,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
     auto* conn = m_conn_idx[fd];
 
-    bool is_multishot_recv = (req->type == op_recv_multishot);
+    bool is_multishot_recv = (req->type == op_recv_multishot ||
+                              req->type == op_recv_multishot_bundle);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
     // For multishot recv, the read remains pending as long as MORE flag is set
@@ -1981,12 +1996,11 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        // Return provided buffer if kernel allocated one before error
+        // Return provided buffer(s) if kernel allocated any before the error.
+        // Through the loop, which knows whether this completion was a bundle
+        // carrying more buffers than the one the CQE names.
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
-        {
-            uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
-        }
+            m_loop->return_cqe_buf(cqe, req);
 
         // ENOBUFS: buffer pool exhausted — fall back to regular read
         if (is_provided && cqe->res == -ENOBUFS)
@@ -2067,21 +2081,41 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // always did and knows nothing about TLS.
     if (is_provided)
     {
-        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-        char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-        if (buf_ptr)
+        // One completion may carry several buffers: a bundled recv packs the
+        // socket queue into consecutive ring buffers, every one full except
+        // possibly the last, and the CQE names only the FIRST of them.  The
+        // loop's span API names them all; for a plain provided read or
+        // non-bundled multishot the count is one and this is the same single
+        // append it always was.
+        const uint32_t buf_sz = m_loop->buf_ring_buf_size(BUF_GROUP_ID);
+        const uint32_t nbufs  = m_loop->cqe_buf_count();
+        uint32_t remaining    = static_cast<uint32_t>(cqe->res);
+        for (uint32_t i = 0; i < (nbufs ? nbufs : 1u); i++)
         {
-            if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
-                tls_feed(conn, buf_ptr, static_cast<size_t>(cqe->res));
-            else
-                conn->partial.append(buf_ptr, cqe->res);
-            SKL_TRACE_ADD(conn, bytes_read, cqe->res);
-            SKL_TRACE_ADD(conn, reads, 1);
-            // Back to the group whatever the session made of it: the group is
-            // shared with every other cache on this loop, and one failed
-            // handshake is no reason to starve them.
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            // nbufs of zero cannot happen for a buffered completion; the CQE's
+            // own id keeps even that case from touching buffer 0 by accident.
+            const uint16_t buf_id = nbufs
+                ? m_loop->cqe_buf_id(i)
+                : static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+            const uint32_t take = (buf_sz && remaining > buf_sz) ? buf_sz : remaining;
+            char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
+            if (buf_ptr)
+            {
+                if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+                    tls_feed(conn, buf_ptr, static_cast<size_t>(take));
+                else
+                    conn->partial.append(buf_ptr, take);
+                // Back to the group whatever the session made of it: the group
+                // is shared with every other cache on this loop, and one failed
+                // handshake is no reason to starve them.
+                m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            }
+            // Advance past the slice whether or not the pointer resolved, so a
+            // skipped buffer cannot shift every later slice's length.
+            remaining -= take;
         }
+        SKL_TRACE_ADD(conn, bytes_read, cqe->res);
+        SKL_TRACE_ADD(conn, reads, 1);
     }
     else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {

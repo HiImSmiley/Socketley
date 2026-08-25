@@ -856,8 +856,90 @@ inline void event_loop::disarm(uint32_t token, uint8_t type,
 inline void event_loop::drop_completion(const struct io_uring_cqe* cqe, const io_request* req)
 {
     if (__builtin_expect((cqe->flags & IORING_CQE_F_BUFFER) != 0, 0))
-        return_buf(req->buf_group,
-                   static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+    {
+        // A bundle completion carries several buffers and names only the first;
+        // the rest are in the dispatch-scoped snapshot.  Returning just the
+        // named one would leak the others — k-1 buffers gone from a pool every
+        // instance of the runtime type shares.  The snapshot only answers for
+        // the completion currently being dispatched, which is the only
+        // completion any caller of this function can legitimately hold.
+        if (cqe == m_cqe_current && m_cqe_buf_count > 1)
+            return_bufs_batch(req->buf_group, m_cqe_bids, m_cqe_buf_count);
+        else
+            return_buf(req->buf_group,
+                       static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
+    }
+}
+
+// ── The consumption cursor's one chokepoint ─────────────────────────────────
+// Called for every completion carrying IORING_CQE_F_BUFFER, bundle or not.
+// The kernel consumes buffer-ring entries strictly in provision order and this
+// loop dispatches completions in posting order, so the entry at
+// (consumed & mask) in the ring's own memory must name the buffer this
+// completion reports first.  That prediction is checked on EVERY buffered
+// completion — one indexed load and one compare — and a mismatch is the
+// ordering assumption breaking, which is answered by disabling bundles for the
+// group rather than by silently appending the wrong buffer's bytes.
+//
+// The ids are snapshotted before the handler runs because the handler returns
+// buffers as it consumes them, and a return writes at the ring's tail, which
+// can wrap onto the very entries a long bundle is still reading.
+inline void event_loop::decode_cqe_bufs(const struct io_uring_cqe* cqe,
+                                        const io_request* req, uint8_t rtype)
+{
+    m_cqe_current = cqe;
+    const uint16_t first =
+        static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+    m_cqe_bids[0]   = first;
+    m_cqe_buf_count = 1;
+
+    const uint16_t group = req->buf_group;
+    if (__builtin_expect(group >= MAX_BUF_GROUPS, 0))
+        return;
+    auto& pool = m_buf_rings[group];
+    if (__builtin_expect(!pool.ring || !pool.cursor_ok, 0))
+        return;
+
+    uint32_t count = 1;
+    if (rtype == op_recv_multishot_bundle && cqe->res > 0 &&
+        static_cast<uint32_t>(cqe->res) > pool.buf_size)
+    {
+        count = (static_cast<uint32_t>(cqe->res) + pool.buf_size - 1) / pool.buf_size;
+        // Unreachable: a completion cannot carry more buffers than the group
+        // holds, and submit_recv_multishot_bundle refuses groups larger than
+        // the snapshot.  Clamped anyway, because the alternative to a clamp is
+        // writing past m_cqe_bids on arithmetic this function does not control.
+        if (__builtin_expect(count > MAX_CQE_BUFS, 0))
+            count = MAX_CQE_BUFS;
+    }
+
+    const uint32_t mask = pool.buf_count - 1;
+    if (__builtin_expect(
+            static_cast<uint16_t>(pool.ring->bufs[pool.consumed & mask].bid)
+                != first, 0))
+    {
+        // The cursor no longer describes the kernel's consumption.  Said once,
+        // then bundles stop being armed for this group; a count of one needs no
+        // cursor, so everything non-bundle continues on the CQE's own id.  The
+        // cursor is deliberately not advanced past an entry it cannot vouch
+        // for.
+        pool.cursor_ok = false;
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "buffer group %u: consumption cursor predicted buffer %u, kernel "
+            "reported %u; bundled recv disabled for this group",
+            static_cast<unsigned>(group),
+            static_cast<unsigned>(pool.ring->bufs[pool.consumed & mask].bid),
+            static_cast<unsigned>(first));
+        LOG_ERROR(msg);
+        return;
+    }
+
+    for (uint32_t i = 1; i < count; i++)
+        m_cqe_bids[i] = static_cast<uint16_t>(
+            pool.ring->bufs[(pool.consumed + i) & mask].bid);
+    pool.consumed += count;
+    m_cqe_buf_count = count;
 }
 
 void event_loop::return_cqe_buf(const struct io_uring_cqe* cqe, const io_request* req)
@@ -1361,6 +1443,14 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         const uint32_t rt1 = req->armed_target;
         const uint32_t rt2 = req->armed_target2;
 
+        // Before the owner check, not after: a dropped completion consumed its
+        // buffers exactly like a delivered one, and both the drop path and the
+        // handler read the snapshot this fills.  No branch hint — on a loop
+        // serving provided-buffer recvs these are the majority of completions,
+        // on any other loop they are rare, and this function serves both.
+        if ((cqe->flags & IORING_CQE_F_BUFFER) != 0)
+            decode_cqe_bufs(cqe, req, rtype);
+
         // What close_fd() discounts while the handler runs — see there.  Only
         // for a completion that is the operation's last: with
         // IORING_CQE_F_MORE the submission stays armed and is going to resolve
@@ -1451,6 +1541,8 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
 
         m_cqe_target  = IO_TARGET_NONE;
         m_cqe_target2 = IO_TARGET_NONE;
+        m_cqe_buf_count = 0;
+        m_cqe_current   = nullptr;
 
         // IORING_CQE_F_MORE means the submission is still armed and will
         // complete again; without it this was its last completion, delivered or
@@ -2225,6 +2317,123 @@ bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* re
     req->type = op_recv_multishot;
     req->buf_group = static_cast<uint8_t>(group_id);
     arm(req, raw_target(fd));
+    return true;
+}
+
+// Kernel support for IORING_RECVSEND_BUNDLE, established the only way that
+// counts: a real bundled submission on a throwaway ring, completed against a
+// socketpair.  io_uring_register_probe cannot answer this — the flag is not an
+// opcode — and a version number has already lied to this tree once (dpkg said
+// liburing 2.5 while the headers were 2.15).
+bool event_loop::probe_recv_bundle()
+{
+    struct io_uring r;
+    if (io_uring_queue_init(8, &r, 0) < 0)
+        return false;
+
+    bool ok = false;
+    int  e  = 0;
+    struct io_uring_buf_ring* br = io_uring_setup_buf_ring(&r, 4, 0, 0, &e);
+    char bufs[4][64];
+    int  sv[2] = { -1, -1 };
+    if (br && ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0)
+    {
+        for (int i = 0; i < 4; i++)
+            io_uring_buf_ring_add(br, bufs[i], 64, static_cast<uint16_t>(i),
+                                  io_uring_buf_ring_mask(4), i);
+        io_uring_buf_ring_advance(br, 4);
+
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&r);
+        if (sqe)
+        {
+            io_uring_prep_recv_multishot(sqe, sv[0], nullptr, 0, 0);
+            sqe->ioprio |= IORING_RECVSEND_BUNDLE;
+            sqe->flags  |= IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 0;
+            io_uring_submit(&r);
+
+            char payload[100] = {};
+            if (::write(sv[1], payload, sizeof(payload)) < 0) {}
+
+            struct io_uring_cqe* cqe = nullptr;
+            struct __kernel_timespec ts = { 0, 200 * 1000 * 1000 };
+            if (io_uring_wait_cqe_timeout(&r, &cqe, &ts) == 0 && cqe)
+            {
+                // A kernel without the flag answers the submission -EINVAL; one
+                // with it delivers the bytes.  Anything else — a timeout, an
+                // unexpected error — is treated as "no", because arming a mode
+                // this probe could not see working is how a probe becomes a
+                // version number.
+                ok = cqe->res == static_cast<int>(sizeof(payload));
+                io_uring_cqe_seen(&r, cqe);
+            }
+        }
+    }
+    if (sv[0] >= 0) ::close(sv[0]);
+    if (sv[1] >= 0) ::close(sv[1]);
+    if (br) io_uring_free_buf_ring(&r, br, 4, 0);
+    io_uring_queue_exit(&r);
+    return ok;
+}
+
+bool event_loop::recv_bundle_enabled() const
+{
+    // Read and probed once: neither the kernel nor the environment changes
+    // under a running process.
+    static const bool enabled = [] {
+        const char* e = getenv("SOCKETLEY_RECV_BUNDLE");
+        if (e && e[0] == '0' && e[1] == '\0')
+            return false;
+        return probe_recv_bundle();
+    }();
+    return enabled;
+}
+
+bool event_loop::submit_recv_multishot_bundle(int fd, uint16_t group_id, io_request* req)
+{
+    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+        return false;
+    auto& pool = m_buf_rings[group_id];
+    // A tripped cursor cannot name a bundle's buffers, and a group larger than
+    // the snapshot could overflow it.  False here is not an error — the caller
+    // arms the plain multishot variant, which every consumer of the span API
+    // handles identically.
+    if (!pool.cursor_ok || pool.buf_count > MAX_CQE_BUFS)
+        return false;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
+    sqe->ioprio |= IORING_RECVSEND_BUNDLE;
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = group_id;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_recv_multishot_bundle;
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req, raw_target(fd));
+    return true;
+}
+
+bool event_loop::submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
+{
+    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+        return false;
+    auto& pool = m_buf_rings[group_id];
+    if (!pool.cursor_ok || pool.buf_count > MAX_CQE_BUFS)
+        return false;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_recv_multishot(sqe, fixed_idx, nullptr, 0, 0);
+    sqe->ioprio |= IORING_RECVSEND_BUNDLE;
+    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
+    sqe->buf_group = group_id;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_recv_multishot_bundle;
+    req->buf_group = static_cast<uint8_t>(group_id);
+    arm(req, fixed_target(fixed_idx));
     return true;
 }
 
