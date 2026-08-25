@@ -222,6 +222,15 @@ run_rep() {
     local envs=()
     [[ $arm == nohook ]] && envs=(SOCKETLEY_LUA_TIMEOUT_MS=0)
 
+    # Each rep gets an empty state directory.  The reps share one RUN_HOME, and
+    # a daemon persists its runtimes there and restores them on the next start,
+    # so rep 2 met a lua_share_srv the daemon had brought back from rep 1 and
+    # `create` refused it -- "runtime already exists", mid-run, after two arms
+    # had already been measured.  Loud rather than silent, but the reps are only
+    # independent if nothing survives between them.
+    rm -rf "$RUN_HOME"
+    mkdir -p "$RUN_HOME"
+
     HOME="$RUN_HOME" env "${envs[@]}" "$BIN" daemon >"$OUT_DIR/daemon_$tag.log" 2>&1 &
     DAEMON_PID=$!
     local i
