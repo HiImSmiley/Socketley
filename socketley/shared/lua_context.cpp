@@ -2445,7 +2445,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // previously get. That is the judgement: this is output, not diagnosis —
     // the failures a script must never lose are the callback errors below,
     // and those are ERROR and survive every level but silence.
-    sk["log"] = [owner](std::string msg) {
+    sk["log"] = [owner](std::string_view msg) {
         std::string line = lua_diag::tag(owner->get_name());
         line += ' ';
         line += msg;
@@ -2910,8 +2910,8 @@ void lua_context::register_bindings(runtime_instance* owner)
     // goes nowhere.  That was fixed for the CLI when the deliver frame was
     // added and left standing here, so since 2313c26 made the worker the
     // default it was the ordinary case for a script.
-    sk["send"] = [owner](std::string name,
-                         std::string msg) -> api_result {
+    sk["send"] = [owner](std::string_view name,
+                         std::string_view msg) -> api_result {
         auto* mgr = owner->get_runtime_manager();
         if (!mgr)
             return api_why("this runtime has no runtime manager");
@@ -3154,7 +3154,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // Answering nil would be indistinguishable from a document that really did
     // decode to nil, which is the ambiguity this file's whole return contract
     // exists to remove.
-    sk["json_decode"] = [this](std::string str)
+    sk["json_decode"] = [this](std::string_view str)
                         -> api_result {
         const char* p = str.data();
         const char* end = p + str.size();
@@ -3663,7 +3663,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // connection table, and under --shards that is a quarter of the clients on
     // four shards -- delivered, reported as done, and wrong by nothing.
     // Unsharded the two are the same call.  See runtime_instance::broadcast_all.
-    self["broadcast"] = [owner](std::string msg) {
+    self["broadcast"] = [owner](std::string_view msg) {
         owner->broadcast_all(msg);
     };
     // ─── THE SAME CONTRACT AT THE OTHER DOOR ────────────────────────────────
@@ -3680,7 +3680,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // scripts affected are the ones that now have an answer where they had
     // silence.
     self["send"] = [owner, this](int client_id,
-                                 std::string msg) -> api_result {
+                                 std::string_view msg) -> api_result {
         if (owner->is_udp())
             return api_why("a UDP server has no connection to send to; use "
                            "self.broadcast");
@@ -3727,10 +3727,10 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     };
 
     // Owner-targeted sending (sub-server → owner's clients)
-    self["owner_send"] = [owner](int client_id, std::string msg) -> bool {
+    self["owner_send"] = [owner](int client_id, std::string_view msg) -> bool {
         return static_cast<server_instance*>(owner)->owner_send(client_id, msg);
     };
-    self["owner_broadcast"] = [owner](std::string msg) -> bool {
+    self["owner_broadcast"] = [owner](std::string_view msg) -> bool {
         return static_cast<server_instance*>(owner)->owner_broadcast(msg);
     };
 
@@ -3779,7 +3779,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // as `filters` and `routes` are read — and a keyed table, which reaches
     // nobody at all, is named rather than treated as an empty list.
     self["multicast"] = [owner](sol::table ids,
-                                std::string msg) -> api_result {
+                                std::string_view msg) -> api_result {
         std::vector<int> fds;
         for (size_t i = 1;; ++i)
         {
@@ -3831,14 +3831,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
 
     // Upstream actions
     self["upstream_send"] = [owner](int conn_id,
-                                    std::string msg) -> api_result {
+                                    std::string_view msg) -> api_result {
         if (static_cast<server_instance*>(owner)->lua_upstream_send(conn_id, msg))
             return api_yes();
         return api_why("upstream " + std::to_string(conn_id)
                        + " is not connected — self.upstreams() lists the ones "
                          "that are");
     };
-    self["upstream_broadcast"] = [owner](std::string msg) {
+    self["upstream_broadcast"] = [owner](std::string_view msg) {
         static_cast<server_instance*>(owner)->lua_upstream_broadcast(msg);
     };
     self["upstreams"] = [owner, this]() -> sol::table {
@@ -3872,7 +3872,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // empty is what a misspelled name looks like once its last real member has
     // left, and a bool cannot tell that from a group that is full.
     self["group_send"] = [owner](std::string group,
-                                 std::string msg) -> api_result {
+                                 std::string_view msg) -> api_result {
         if (group.empty()) return api_why("the group name is empty");
         return api_count(static_cast<server_instance*>(owner)->lua_group_send(group, msg));
     };
@@ -3958,7 +3958,7 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
     // no-ops behind it: a client that has not connected yet, one whose server
     // has dropped it, and one created --mode in, which does not send at all.
     self["send"] = [owner, this](
-                                 std::string msg) -> api_result {
+                                 std::string_view msg) -> api_result {
         if (owner->lua_send(msg))
             return api_yes();
         return api_why(q(m_owner_name) + " is not connected to its server, "
