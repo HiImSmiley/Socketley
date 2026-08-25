@@ -33,18 +33,38 @@ append_result() {
     fi
 }
 
-# Extract ops/sec for a test from redis-benchmark -q output
-# Lines look like: "SET: 188679.25 requests per second, p50=0.135 msec"
+# Extract ops/sec for a test from redis-benchmark -q output.
+#
+# redis-benchmark draws a live progress counter with CARRIAGE RETURNS and no
+# newline, so the final result shares one line with it:
+#
+#   " \rSET: rps=0.0 (overall: -nan) ... \r      \rSET: 6666666.50 requests per second,"
+#
+# Two traps, both of which have fired here:
+#
+#  1. Stripping only [ \t] leaves the line starting with \r, so "^SET:" does not
+#     match and the whole reading vanishes.  The harness then recorded 0 -- and
+#     summary_20260825_061125.md reports socketley_ops:0 against redis at
+#     pipeline 100 for all six operations because of it.  The cache was fine:
+#     the same redis-benchmark invocation reads 6,666,666 SET/s and 10,000,000
+#     GET/s when the line is parsed correctly.
+#
+#  2. Taking the FIRST number on the line takes the progress counter's rps=0.0
+#     rather than the result.  Take the LAST match.
 get_ops() {
     local file=$1 test=$2
-    grep "requests per second" "$file" | \
+    tr '\r' '\n' < "$file" | grep "requests per second" | \
     awk -v t="$test" '{
-        gsub(/^[ \t]+/, "", $0)
+        gsub(/^[ \t\r]+/, "", $0)
         if ($0 ~ "^"t":") {
-            match($0, /[0-9]+\.[0-9]+ requests/)
-            s = substr($0, RSTART, RLENGTH)
-            split(s, a, " ")
-            print a[1]
+            n = ""
+            while (match($0, /[0-9]+\.[0-9]+ requests/)) {
+                s = substr($0, RSTART, RLENGTH)
+                split(s, a, " ")
+                n = a[1]
+                $0 = substr($0, RSTART + RLENGTH)
+            }
+            if (n != "") print n
         }
     }'
 }
@@ -52,13 +72,11 @@ get_ops() {
 # Extract p50 latency
 get_p50() {
     local file=$1 test=$2
-    grep "requests per second" "$file" | \
+    tr '\r' '\n' < "$file" | grep "requests per second" | \
     awk -v t="$test" '{
-        gsub(/^[ \t]+/, "", $0)
-        if ($0 ~ "^"t":") {
-            match($0, /p50=[0-9.]+/)
+        gsub(/^[ \t\r]+/, "", $0)
+        if ($0 ~ "^"t":" && match($0, /p50=[0-9.]+/))
             print substr($0, RSTART+4, RLENGTH-4)
-        }
     }'
 }
 
@@ -90,7 +108,15 @@ run_bench_median() {
         timeout "$BENCH_TIMEOUT_REDIS" redis-benchmark -p "$port" -c $CLIENTS -n "$requests" -P "$pipeline" \
             -t "$TESTS" -r 100000 -q --precision 3 2>/dev/null | sed 's/.*\r//' > "$f"
         if [[ ${PIPESTATUS[0]} -eq 124 ]]; then
+            # A timeout must not become a NUMBER.  On 2026-08-25 this run timed
+            # out once for socketley at P=100 and the summary then reported
+            # socketley_ops:0 against redis at 2.1M for all six operations --
+            # which reads as a total failure of the cache and was nothing of the
+            # kind: the same invocation completes in 2.0 s.  An empty result
+            # file is left deliberately AND the marker below travels with it, so
+            # a reader sees "no measurement" rather than "zero".
             log_bench "TIMEOUT" "redis-benchmark $label P=$pipeline run $i"
+            echo "BENCH_TIMEOUT" > "$f.timeout"
         fi
         files+=("$f")
         [[ $runs -gt 1 ]] && log_info "  Run $i/$runs done" >&2

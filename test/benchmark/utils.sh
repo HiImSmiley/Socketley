@@ -689,7 +689,7 @@ BENCH_LOG="${RESULTS_DIR}/bench_${TIMESTAMP}.log"
 BENCH_TIMEOUT_CMD=180         # per socketley_bench invocation
 BENCH_TIMEOUT_NC=180          # per nc pipeline
 BENCH_TIMEOUT_K6=180          # per k6 run
-BENCH_TIMEOUT_REDIS=180       # per redis-benchmark run
+BENCH_TIMEOUT_REDIS=${BENCH_TIMEOUT_REDIS:-600}       # per redis-benchmark run; 180 was hit once by a transient stall that then reported as 0
 # How long a run measuring a socketley *server* runtime should last.
 #
 # Longer than anything the proxy benchmarks use, and it is not caution.  A

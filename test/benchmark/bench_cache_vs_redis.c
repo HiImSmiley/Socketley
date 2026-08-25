@@ -39,6 +39,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -60,18 +61,50 @@ static long long thread_cpu_us(void)
          + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
 }
 
-static int connect_to(const char* host, int port)
+/* An arm is either a TCP port or a unix socket path.  Both ends of the
+ * comparison speak both -- Redis has had `unixsocket` forever and socketley
+ * gained `--listen unix:` on 2026-08-25 -- so unix-vs-unix is a fair fight and
+ * not a trick.
+ *
+ * It is also the only fight that can separate us.  Over TCP loopback both arms
+ * spend ~89% of their time in the same kernel network path (netfilter alone is
+ * 9.24% here), which is why a cache at 106,213 and Redis at 108,342 once read
+ * as a tie: neither number was about the server.  A unix socket cuts that
+ * shared part away and leaves the ~11% where the implementations differ. */
+typedef struct { const char* host; int port; const char* upath; } endpoint;
+
+static int connect_ep(const endpoint* ep)
 {
+    if (ep->upath)
+    {
+        struct sockaddr_un ua;
+        memset(&ua, 0, sizeof(ua));
+        ua.sun_family = AF_UNIX;
+        /* sun_path is 108 bytes and truncation is SILENT, which would connect
+         * to a different socket than the caller named. */
+        if (strlen(ep->upath) >= sizeof(ua.sun_path)) return -1;
+        strncpy(ua.sun_path, ep->upath, sizeof(ua.sun_path) - 1);
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        if (connect(fd, (struct sockaddr*)&ua, sizeof(ua)) < 0) { close(fd); return -1; }
+        return fd;   /* no TCP_NODELAY: there is no Nagle on AF_UNIX */
+    }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int opt = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {}
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
+    addr.sin_port = htons((uint16_t)ep->port);
+    inet_pton(AF_INET, ep->host, &addr.sin_addr);
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     return fd;
+}
+
+static int connect_to(const char* host, int port)
+{
+    endpoint ep = { host, port, NULL };
+    return connect_ep(&ep);
 }
 
 static int send_all(int fd, const char* buf, size_t len)
@@ -184,6 +217,7 @@ typedef struct
 {
     const char* host;
     int port;
+    const char* upath;      /* non-NULL: an AF_UNIX arm; port is then unused */
     int tid;
     int depth;
     long long ops;      /* timed ops target */
@@ -248,7 +282,8 @@ static void* worker(void* arg)
     worker_args* a = (worker_args*)arg;
     a->failed = 1;
 
-    int fd = connect_to(a->host, a->port);
+    endpoint aep = { a->host, a->port, a->upath };
+    int fd = connect_ep(&aep);
     if (fd < 0) { pthread_barrier_wait(a->barrier); return NULL; }
 
     char* value = malloc((size_t)a->val_size);
@@ -314,7 +349,8 @@ typedef struct
     int refused;
 } arm_result;
 
-static arm_result run_arm(const char* host, int port, int clients, int depth,
+static arm_result run_arm(const char* host, int port, const char* upath,
+                          int clients, int depth,
                           long long ops_per_thread, int val_size, int is_get)
 {
     arm_result r = {0};
@@ -325,7 +361,7 @@ static arm_result run_arm(const char* host, int port, int clients, int depth,
 
     for (int i = 0; i < clients; i++)
     {
-        wa[i] = (worker_args){ host, port, i, depth, ops_per_thread,
+        wa[i] = (worker_args){ host, port, upath, i, depth, ops_per_thread,
                                val_size, is_get, 0,0,0,0,0, &barrier };
         pthread_create(&th[i], NULL, worker, &wa[i]);
     }
@@ -407,7 +443,7 @@ int main(int argc, char** argv)
         default:
             fprintf(stderr, "usage: %s [-H host] [-P depth] [-c clients] "
                     "[-n ops/thread] [-v valsize] [-t set|get] [-r rounds] "
-                    "<socketley_port> <redis_port>\n", argv[0]);
+                    "<socketley_port|unix:path> <redis_port|unix:path>\n", argv[0]);
             return 1;
         }
     }
@@ -418,8 +454,20 @@ int main(int argc, char** argv)
                 "<socketley_port> <redis_port>\n", argv[0]);
         return 1;
     }
-    int port_a = atoi(argv[optind]);      /* socketley */
-    int port_b = atoi(argv[optind + 1]);  /* redis */
+    /* Each arm is "<port>" or "unix:<path>".  Mixing them is allowed and is
+     * sometimes exactly the question ("what does the transport cost us"), but
+     * a Redis comparison must use the SAME transport on both sides or it is
+     * not a comparison. */
+    const char* arg_a = argv[optind];
+    const char* arg_b = argv[optind + 1];
+    const char* upath_a = strncmp(arg_a, "unix:", 5) == 0 ? arg_a + 5 : NULL;
+    const char* upath_b = strncmp(arg_b, "unix:", 5) == 0 ? arg_b + 5 : NULL;
+    int port_a = upath_a ? 0 : atoi(arg_a);
+    int port_b = upath_b ? 0 : atoi(arg_b);
+    if (!upath_a && port_a <= 0) { fprintf(stderr, "arm A: not a port or unix:<path>: %s\n", arg_a); return 1; }
+    if (!upath_b && port_b <= 0) { fprintf(stderr, "arm B: not a port or unix:<path>: %s\n", arg_b); return 1; }
+    if ((upath_a != NULL) != (upath_b != NULL))
+        fprintf(stderr, "  WARNING: the two arms use DIFFERENT transports; this measures the transport, not the servers\n");
 
     printf("\n  RESP %s throughput — depth %d, %d client thread(s), "
            "%lld ops/thread/round, %dB values, %d round(s)\n",
@@ -439,13 +487,13 @@ int main(int argc, char** argv)
         printf("  round %d (%s first):\n", round + 1, a_first ? "socketley" : "redis");
         if (a_first)
         {
-            a = run_arm(host, port_a, clients, depth, ops, val_size, is_get);
-            b = run_arm(host, port_b, clients, depth, ops, val_size, is_get);
+            a = run_arm(host, port_a, upath_a, clients, depth, ops, val_size, is_get);
+            b = run_arm(host, port_b, upath_b, clients, depth, ops, val_size, is_get);
         }
         else
         {
-            b = run_arm(host, port_b, clients, depth, ops, val_size, is_get);
-            a = run_arm(host, port_a, clients, depth, ops, val_size, is_get);
+            b = run_arm(host, port_b, upath_b, clients, depth, ops, val_size, is_get);
+            a = run_arm(host, port_a, upath_a, clients, depth, ops, val_size, is_get);
         }
         print_arm("socketley", &a);
         print_arm("redis", &b);
