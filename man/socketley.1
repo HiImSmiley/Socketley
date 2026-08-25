@@ -4145,14 +4145,45 @@ in the daemon's environment; see
 .BR ENVIRONMENT .
 .PP
 .B What it costs.
-LuaJIT runs a state in the interpreter while an instruction hook is installed,
-so a callback whose cost is its own arithmetic loses the JIT. Measured on the
-dev VM at 20000 round trips: an ordinary callback that answers a message showed
-no difference above the run\-to\-run noise, while a callback doing 2000
-arithmetic operations per message ran at 80% of its unhooked rate. Setting the
-bound to
+Not the JIT, which is what this said before it was measured. On this build
+LuaJIT compiles traces with a count hook installed; what the hook costs is the
+hooked dispatch path, which checks on every VM instruction instead of every ten
+thousandth. Measured at 64 bytes on one connection: a callback that merely
+answers a message showed no difference above the run\-to\-run noise \(em 42581
+and 43130 messages a second with the hook against 42571 and 42644 without \(em
+while one doing about 1300 arithmetic operations per message ran at 85% of its
+unhooked rate.
+.PP
+.B What 0 buys.
+Setting the bound to
 .B 0
-installs no hook and restores the JIT exactly.
+installs no hook and also opens LuaJIT's
+.B jit
+library, which is the only thing that turns the trace compiler on at all:
+without it every Lua callback this daemon runs is interpreted. On that same
+arithmetic callback the difference is 11722 messages a second bounded against
+28085 unbounded, at 85.2 against 30.3 microseconds of worker CPU each. A
+callback that only answers a message gains nothing from it \(em the compiler
+pays for loops, and there is no loop to compile.
+.PP
+.B What 0 gives up.
+A compiled trace does not call an instruction hook back, so with the compiler
+on a runaway callback cannot be interrupted at all. Measured:
+.B "while true do end"
+against a 300 millisecond deadline stopped in 300.2 milliseconds with the
+compiler off and never with it on, and a hard ceiling inside the hook did not
+help either, because the hook is not reached from inside a trace. That is why
+the two are one setting rather than two knobs that can disagree.
+.PP
+The blast radius is one runtime rather than the daemon. Measured with a server
+whose callback never returns: its own worker process sat at 83% of a core while
+a second server on the same daemon went on echoing and the daemon went on
+answering
+.BR ps .
+A runaway in the script's top level is still refused outright whatever
+.B callback_timeout_ms
+says, because the top level runs under the daemon's default before the script's
+own declaration has been read.
 .PP
 .B What it does not bound.
 A callback stopped at its deadline has still held the loop for that long, so a
@@ -6344,8 +6375,11 @@ How long one Lua callback invocation may hold the event\-loop thread, in
 milliseconds. Default
 .BR 10000 ;
 .B 0
-switches the bound off entirely. See
-.BR "Callback Deadline" .
+switches the bound off entirely and turns LuaJIT's trace compiler on with it,
+which is worth about 2.4x on a callback that computes and nothing on one that
+does not. See
+.BR "Callback Deadline" ,
+which prices both halves of that trade.
 .IP
 This is the default for every script that does not declare its own
 .B callback_timeout_ms

@@ -346,6 +346,45 @@ void lua_context::install_deadline_hook()
     lua_deadline::install(m_lua.lua_state(), m_deadline_ms);
 }
 
+// ─── The trace compiler, tied to the deadline, because it is one decision ───
+//
+// LuaJIT's compiler is initialised by luaopen_jit and by nothing else — see the
+// note at open_libraries for what else was tried and measured not to work.
+// Opening it is worth 3.8-4.1x on a hot loop, and 5.2-5.5x against what this
+// daemon runs today.
+//
+// It is opened exactly when no hook is installed, because those are the same
+// decision rather than two.  A compiled trace does not call a hook back, so
+// with the compiler on a runaway callback cannot be interrupted: measured,
+// `while true do end` against a 300 ms deadline stops in 300.2 ms as this tree
+// stands and never once luaopen_jit has been called.  Coupling it to a limit of
+// 0 therefore adds NO new failure mode — at 0 there is no hook to defeat, so an
+// operator who has already decided against the deadline gets the compiler with
+// it, and nobody on the default is affected at all.
+//
+// One direction, once.  There is no supported way back: luajit.h is not
+// vendored, so LUAJIT_MODE_ENGINE|LUAJIT_MODE_OFF would mean hand-written
+// constants against a header this tree does not carry.  So this is called from
+// the one point where m_deadline_ms is final — after the script's top level has
+// run and its `callback_timeout_ms`, if it declared one, has been read.  A
+// script cannot raise the deadline after the compiler is on, because there is
+// nowhere left to raise it from; `reload-lua` builds a fresh lua_context
+// (runtime_instance::reload_lua_script) rather than reusing this state, so a
+// reloaded script cannot inherit a compiler its own deadline forbids either.
+void lua_context::enable_jit_if_unbounded()
+{
+    if (m_deadline_ms != 0)
+        return;
+
+    // luaopen_jit is a module opener and leaves its table on the stack.
+    // Restoring the top is right where popping a count is merely correct today:
+    // the count is LuaJIT's to change, and this file would have to notice.
+    lua_State* L  = m_lua.lua_state();
+    const int  top = lua_gettop(L);
+    luaopen_jit(L);
+    lua_settop(L, top);
+}
+
 lua_context::lua_context()
 {
     // ─── THE MISSING LIBRARY, AND WHY IT IS STILL MISSING ───────────────────
@@ -939,6 +978,13 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
             install_deadline_hook();
         }
     }
+
+    // m_deadline_ms is final here, in both branches above: the script either
+    // declared `callback_timeout_ms` or left the daemon's default standing.
+    // That is what makes this the place to decide about the compiler, and it is
+    // deliberately outside the block above so that a script which declares
+    // nothing is decided too.  See enable_jit_if_unbounded.
+    enable_jit_if_unbounded();
 
     m_on_start = m_lua["on_start"];
     m_on_stop = m_lua["on_stop"];

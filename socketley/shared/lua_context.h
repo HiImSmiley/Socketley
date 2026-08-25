@@ -545,6 +545,12 @@ private:
     // run, because that is when a `callback_timeout_ms` global becomes readable.
     void install_deadline_hook();
 
+    // Open LuaJIT's jit library — and with it the trace compiler — if and only
+    // if this context runs without a deadline hook.  Called once, from the
+    // point in load_script where m_deadline_ms is final.  See the definition
+    // for why the two are one decision and why there is no way back.
+    void enable_jit_if_unbounded();
+
     void register_bindings(runtime_instance* owner);
 
     // One load-time refusal: into the daemon's log, naming this runtime, and
