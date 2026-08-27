@@ -67,6 +67,13 @@ sudo apt install build-essential libssl-dev libluajit-5.1-dev git
 # only if it needs to — it exits immediately if your liburing is already good.
 bash scripts/install-liburing.sh
 
+# The two static archives this tree links but does not track. Both are covered
+# by the `*.a` rule in .gitignore, so a fresh clone has the headers and neither
+# archive, and the build ends in `cannot find -lluajit`. Note that the apt
+# package above is not a drop-in: it installs libluajit-5.1.a and premake links
+# -lluajit, so the name never matches. This script settles both.
+./bin/build-thirdparty.sh
+
 # Build
 ./bin/premake5 gmake2
 cd make && make config=release_x64 -j$(nproc)

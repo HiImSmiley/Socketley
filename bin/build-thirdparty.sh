@@ -32,12 +32,40 @@ build_liburing() {
 
 build_luajit() {
   echo "== luajit"
-  if [ -f "$ROOT/thirdparty/luajit/libluajit.a" ]; then
+  local dest="$ROOT/thirdparty/luajit/libluajit.a"
+  if [ -f "$dest" ]; then
     echo "   already present, left alone"
-  else
-    echo "   NOT AUTOMATED.  libluajit.a is built out of tree here; copy it from"
-    echo "   another worktree: cp <other>/thirdparty/luajit/libluajit.a $ROOT/thirdparty/luajit/"
+    return 0
   fi
+
+  # This used to print "NOT AUTOMATED" and tell the reader to copy the archive
+  # from another worktree.  A fresh clone has no other worktree, so the one
+  # person the script exists for was the one it could not help -- and the README
+  # sent them straight from `apt install libluajit-5.1-dev` into a build that
+  # ends in `cannot find -lluajit`.
+  #
+  # The distribution package is not a drop-in for that: premake links -lluajit
+  # and Ubuntu installs libluajit-5.1.a, so the name never matches however many
+  # -dev packages are present.  release.yml has always known this and copied the
+  # file across by hand; that step lives here now, where the documented build
+  # can reach it.
+  local sys
+  sys=$(find /usr/lib /usr/local/lib -name 'libluajit-5.1.a' 2>/dev/null | head -1)
+  if [ -n "$sys" ]; then
+    cp "$sys" "$dest"
+    echo "   copied from $sys ($(stat -c%s "$dest") bytes)"
+    return 0
+  fi
+
+  echo "   no system libluajit-5.1.a found, building from source"
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git "$tmp" >/dev/null 2>&1 \
+    || { echo "   FAILED: could not clone LuaJIT"; return 2; }
+  ( cd "$tmp" && make -j"$(nproc)" >/dev/null 2>&1 ) \
+    || { echo "   FAILED: LuaJIT build"; return 2; }
+  cp "$tmp/src/libluajit.a" "$dest"
+  echo "   built from source ($(stat -c%s "$dest") bytes)"
 }
 
 case "$WHAT" in
