@@ -23,8 +23,13 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
@@ -38,6 +43,12 @@ struct result
 {
     int exit_code;     // 0 = success, 1 = bad input, 2 = fatal, -1 = connect failed
     std::string data;  // response payload (may be empty on success)
+
+    // The question every caller asks first, spelled once.  Not operator bool,
+    // deliberately: `if (r)` reads as "got a response", and a result whose
+    // exit_code is 1 IS a response — the daemon's refusal, with the reason in
+    // `data`.  ok() asks the narrower question.
+    bool ok() const { return exit_code == 0; }
 };
 
 // ── Socket path resolution ──────────────────────────────────────────
@@ -210,9 +221,19 @@ inline result show(const std::string& name)
     return command("show " + name);
 }
 
+// Stop, then start.  Two IPC round trips, because that is what a restart is:
+// the daemon has no `restart` command — the CLI's is the same two commands —
+// and this function used to send one anyway, so every call was answered
+// "unknown command: restart" from the day it was written.  The stop's answer
+// is read before the start goes out, exactly as the CLI does it: a restart of
+// a name the daemon does not hold reports the stop's refusal, not a second
+// refusal from a start that was never going to succeed.
 inline result restart(const std::string& name)
 {
-    return command("restart " + name);
+    result r = command("stop " + name);
+    if (r.exit_code != 0)
+        return r;
+    return command("start " + name);
 }
 
 inline result reload(const std::string& name)
@@ -235,9 +256,35 @@ inline result owner(const std::string& name)
     return command("owner " + name);
 }
 
+// "who is serving this socket" — version, pid, and the exact executable path,
+// read fresh from /proc on the daemon side.  The reply is
+// `socketley-daemon <version> <pid> <dev:inode> <path>`, and the path goes
+// last because a path may contain spaces.
+inline result ping()
+{
+    return command("ping");
+}
+
+// The daemon's version string, extracted from ping().  There is no `version`
+// IPC command and never was — this function used to send one and was answered
+// "unknown command: version" against every daemon ever shipped.  The CLI's
+// `socketley version` prints the CLI's own compile-time version; a Tier-1
+// client has no compile-time version to print, so the daemon's answer is the
+// only honest one available here.
 inline result version()
 {
-    return command("version");
+    result r = ping();
+    if (r.exit_code != 0)
+        return r;
+
+    // "socketley-daemon 1.1.0 <pid> <dev:inode> <path>" -> "1.1.0"
+    constexpr std::string_view prefix = "socketley-daemon ";
+    if (r.data.rfind(prefix, 0) != 0)
+        return {2, "unrecognised ping reply: " + r.data};
+    const size_t start = prefix.size();
+    const size_t end   = r.data.find(' ', start);
+    r.data = r.data.substr(start, end == std::string::npos ? end : end - start);
+    return r;
 }
 
 inline result add(const std::string& path, const std::string& flags = "")
@@ -246,6 +293,15 @@ inline result add(const std::string& path, const std::string& flags = "")
     if (!flags.empty())
         cmd += " " + flags;
     return command(cmd);
+}
+
+// Create a runtime from a JSON document — the inverse of show(), whose output
+// is accepted here unchanged.  Not named `import`: that is a context-sensitive
+// keyword in C++20 modules, and a header cannot know it will never be included
+// in one.
+inline result import_runtime(const std::string& name, const std::string& json)
+{
+    return command("import " + name + " " + json);
 }
 
 inline result daemon_name()
@@ -259,35 +315,141 @@ inline result cluster_dir()
 }
 
 // ── Cluster ──────────────────────────────────────────────────────────
+//
+// A daemon in cluster mode publishes itself into the cluster directory as
+// `<name>.json` — host, heartbeat, and its runtime table — and discovers its
+// peers by reading the same directory.  The roster is files, not IPC: there
+// are no `cluster ls`-style daemon commands, and the functions below used to
+// send them anyway, so every call was answered "unknown command: cluster"
+// against every daemon ever shipped.  What the daemon does answer over IPC is
+// cluster_status(); the rest reads the directory, exactly as the CLI does.
+//
+// A peer whose heartbeat (unix seconds, `"heartbeat":` in its file) is more
+// than 10 seconds old is stale — cluster_ls() lists it anyway, because a name
+// that has stopped beating is an answer too, and the caller has the timestamp.
 
+namespace detail {
+
+// One line of "key:value" out of a cluster-status reply.
+inline std::string status_field(std::string_view status, std::string_view key)
+{
+    std::string needle(key);
+    needle += ':';
+    size_t pos = 0;
+    while (pos < status.size())
+    {
+        const size_t eol = status.find('\n', pos);
+        std::string_view line = status.substr(
+            pos, eol == std::string_view::npos ? std::string_view::npos : eol - pos);
+        if (line.size() >= needle.size() && line.substr(0, needle.size()) == needle)
+            return std::string(line.substr(needle.size()));
+        if (eol == std::string_view::npos)
+            break;
+        pos = eol + 1;
+    }
+    return {};
+}
+
+} // namespace detail
+
+// `cluster:on|off`, `name:`, `dir:`, `host:`, and — when the daemon asked for
+// cluster mode and was refused, e.g. its name was already taken — `error:`.
+inline result cluster_status()
+{
+    return command("cluster-status");
+}
+
+// The daemons publishing into this cluster's directory, one name per line,
+// stale ones included.  {1, reason} when this daemon is not in cluster mode.
 inline result cluster_ls()
 {
-    return command("cluster ls");
+    result st = cluster_status();
+    if (st.exit_code != 0)
+        return st;
+    if (detail::status_field(st.data, "cluster") != "on")
+    {
+        std::string err = detail::status_field(st.data, "error");
+        return {1, err.empty()
+            ? std::string("daemon is not in cluster mode (start it with "
+                          "--name <n> --cluster <dir>)")
+            : "cluster mode is off: " + err};
+    }
+
+    const std::string dir = detail::status_field(st.data, "dir");
+    DIR* d = opendir(dir.c_str());
+    if (!d)
+        return {2, "cannot read cluster directory " + dir};
+
+    std::string names;
+    while (struct dirent* e = readdir(d))
+    {
+        std::string_view f(e->d_name);
+        // The ".json" test also keeps half-written files out: publish() writes
+        // "<name>.json.tmp" and renames it into place.
+        if (f.size() < 6 || f.substr(f.size() - 5) != ".json")
+            continue;
+        if (!names.empty())
+            names += '\n';
+        names.append(f.substr(0, f.size() - 5));
+    }
+    closedir(d);
+    return {0, std::move(names)};
 }
+
+// The raw published JSON for one daemon: daemon, host, heartbeat, pid, and a
+// `runtimes` array of {name, type, group, port, state, connections}.  Returned
+// unparsed, deliberately: the format belongs to the daemon's publisher, and a
+// second parser in this header is a second thing that drifts.
+inline result cluster_show(const std::string& name)
+{
+    result st = cluster_status();
+    if (st.exit_code != 0)
+        return st;
+    if (detail::status_field(st.data, "cluster") != "on")
+        return {1, "daemon is not in cluster mode (start it with "
+                   "--name <n> --cluster <dir>)"};
+
+    const std::string dir = detail::status_field(st.data, "dir");
+    std::ifstream f(dir + "/" + name + ".json");
+    if (!f.is_open())
+        return {1, "no daemon named " + name + " publishes into " + dir};
+
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return {0, ss.str()};
+}
+
+// The three below are CLI renderings over the same files — a cross-daemon
+// runtime table, a group filter, a live-updating terminal view.  A library
+// has no terminal to render into, so they refuse with the recipe instead of
+// asking the daemon a question it has never answered.
 
 inline result cluster_ps()
 {
-    return command("cluster ps");
+    return {1, "cluster ps is a CLI rendering: read cluster_ls() and each "
+               "peer's cluster_show(name), and aggregate the `runtimes` "
+               "arrays -- every field the table shows is in the JSON"};
 }
 
 inline result cluster_group(const std::string& group)
 {
-    return command("cluster group " + group);
-}
-
-inline result cluster_show(const std::string& name)
-{
-    return command("cluster show " + name);
+    return {1, "cluster group is a CLI rendering: read each peer's "
+               "cluster_show(name) and filter its `runtimes` array by "
+               "\"group\":\"" + group + "\""};
 }
 
 inline result cluster_stats(const std::string& name)
 {
-    return command("cluster stats " + name);
+    return {1, "cluster stats is a CLI rendering: cluster_show(\"" + name +
+               "\") carries the published figures, and stats(<runtime>) asks "
+               "a local runtime directly"};
 }
 
 inline result cluster_watch()
 {
-    return command("cluster watch");
+    return {1, "cluster watch is a terminal view: poll cluster_ls()/"
+               "cluster_show() yourself -- peers republish every few seconds "
+               "and a heartbeat more than 10s old is stale"};
 }
 
 inline result dashboard()
@@ -484,6 +646,36 @@ inline result cache_hgetall(const std::string& cache_name, const std::string& ke
 inline result cache_keys(const std::string& cache_name, const std::string& pattern = "*")
 {
     return command("action " + cache_name + " keys " + pattern);
+}
+
+inline result cache_mget(const std::string& cache_name,
+                         const std::vector<std::string>& keys)
+{
+    if (keys.empty())
+        return {1, "mget needs at least one key"};
+    std::string cmd = "action " + cache_name + " mget";
+    for (const auto& k : keys)
+    {
+        cmd += ' ';
+        cmd += k;
+    }
+    return command(cmd);
+}
+
+inline result cache_mset(const std::string& cache_name,
+                         const std::vector<std::pair<std::string, std::string>>& kvs)
+{
+    if (kvs.empty())
+        return {1, "mset needs at least one key/value pair"};
+    std::string cmd = "action " + cache_name + " mset";
+    for (const auto& [k, v] : kvs)
+    {
+        cmd += ' ';
+        cmd += k;
+        cmd += ' ';
+        cmd += v;
+    }
+    return command(cmd);
 }
 
 // ── Cache: admin ────────────────────────────────────────────────────
