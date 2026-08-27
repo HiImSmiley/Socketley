@@ -402,7 +402,7 @@ still want it to themselves.
   Distributions carrying 2.7 or later (Debian 13, Fedora 40+, Arch) need no
   extra step. A binary built this way needs liburing 2.6+ at *run* time, which
   is why the `.deb` depends on `liburing2 (>= 2.6)`.
-- libssl-dev (TLS on server listeners, and WebSocket handshake hashing)
+- libssl-dev (TLS on every role that has a handshake, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
 
 ### Toolchain

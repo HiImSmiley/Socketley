@@ -56,8 +56,11 @@
         <li><a href="#cluster-group">group / stats</a></li>
       </ul></li>
       <li><a href="#utilities-api">Utilities</a><ul>
-        <li><a href="#util-timers">set_timeout / set_interval</a></li>
-        <li><a href="#util-subscribe">subscribe</a></li>
+        <li><a href="#util-set-timeout">set_timeout / set_interval</a></li>
+        <li><a href="#util-clear-timeout">clear_timeout / clear_interval</a></li>
+        <li><a href="#util-subscribe">subscribe / unsubscribe</a></li>
+        <li><a href="#util-json">json_encode / json_decode</a></li>
+        <li><a href="#util-pipe">pipe</a></li>
         <li><a href="#util-http">http</a></li>
       </ul></li>
     </ul>
@@ -458,12 +461,53 @@ socketley.log(<span class="st">"best backend: "</span> .. best.host .. <span cla
 <span class="kw">end</span>)</code></pre>
 </div>
 
+<div class="method-card" id="util-clear-timeout">
+<div class="method-header"><span class="method-name">socketley.clear_timeout</span><span class="method-sig">(id) &rarr; bool</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Cancel a pending one-shot timer by the id <code>set_timeout</code> returned. <code>socketley.clear_interval(id)</code> is the same call for a repeating one. Cancelling <em>withdraws</em> the timer rather than muting it, so a cancelled interval stops costing anything.</div>
+<pre><code><span class="kw">local</span> id = socketley.set_interval(<span class="nb">1000</span>, tick)
+socketley.set_timeout(<span class="nb">10000</span>, <span class="kw">function</span>()
+    socketley.clear_interval(id)
+<span class="kw">end</span>)</code></pre>
+</div>
+
+<div class="method-card" id="util-json">
+<div class="method-header"><span class="method-name">socketley.json_encode</span><span class="method-sig">(value) &rarr; string | false, why</span><span class="badge badge-all">all</span></div>
+<div class="method-desc">Encode a Lua value as JSON. <code>socketley.json_decode(str)</code> is the inverse and returns a Lua value. Both return <code>false</code> and a reason rather than raising, so a malformed payload from the network does not take the callback down.</div>
+<pre><code><span class="kw">local</span> body = socketley.json_encode({ ok = <span class="kw">true</span>, n = <span class="nb">3</span> })
+
+<span class="kw">local</span> v, why = socketley.json_decode(msg)
+<span class="kw">if</span> <span class="kw">not</span> v <span class="kw">then</span>
+    socketley.log(<span class="st">"bad payload: "</span> .. why)
+    <span class="kw">return</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="method-card" id="util-pipe">
+<div class="method-header"><span class="method-name">socketley.pipe</span><span class="method-sig">(src_name, src_fd, dst_name[, dst_fd]) &rarr; true | false, why</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Two operations, and <strong>the argument count is which one you get</strong>.
+<ul>
+<li><strong>Four arguments &mdash; a pipe.</strong> Joins two connections of <em>one</em> server: bytes arriving on either go straight out of the other. Both descriptors must belong to the server whose script is calling, so call it from that server's own script.</li>
+<li><strong>Three arguments &mdash; a route.</strong> Hands the connection to another <em>runtime</em>, which then decides what to do with it. There is no destination descriptor in this, because there is no pairing to make.</li>
+</ul>
+Asking for the combination that does not exist &mdash; four arguments across two runtimes, or three within one &mdash; is refused by name rather than quietly served as the other one.</div>
+<div class="info-box">The fourth argument used to be accepted and ignored across runtimes, so <code>socketley.pipe("a", 3, "b", 7)</code> returned <code>true</code> and never looked at <code>7</code>. A script that had gone to the trouble of obtaining descriptor 7 was told it had joined 3 to 7; it had not.</div>
+<pre><code><span class="cm">-- pipe: two connections of this server</span>
+socketley.pipe(self.name, fd_a, self.name, fd_b)
+
+<span class="cm">-- route: give the connection to another runtime</span>
+socketley.pipe(self.name, fd, <span class="st">"backend-server"</span>)</code></pre>
+</div>
+
 <div class="method-card" id="util-subscribe">
 <div class="method-header"><span class="method-name">socketley.subscribe</span><span class="method-sig">(cache_name, channel, fn)</span><span class="badge badge-all">all</span></div>
 <div class="method-desc">Subscribe to messages published on a cache runtime's channel. <code>fn(channel, message)</code> fires on each publish. Enables cross-runtime pub/sub without TCP connections.</div>
-<pre><code>socketley.subscribe(<span class="st">"mycache"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(channel, msg)
+<pre><code><span class="kw">local</span> sub = socketley.subscribe(<span class="st">"mycache"</span>, <span class="st">"events"</span>, <span class="kw">function</span>(channel, msg)
     socketley.log(<span class="st">"["</span> .. channel .. <span class="st">"] "</span> .. msg)
-<span class="kw">end</span>)</code></pre>
+<span class="kw">end</span>)
+
+<span class="cm">-- later: end it</span>
+socketley.unsubscribe(sub)</code></pre>
+<div class="info-box"><strong><code>socketley.unsubscribe(subscription_id)</code></strong> ends a subscription, taking the id <code>subscribe</code> returned. Without it a subscription could be started and never stopped.</div>
 </div>
 
 <div class="method-card" id="util-http">
