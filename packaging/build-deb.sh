@@ -46,6 +46,76 @@ chmod 755 "$PKG_DIR/usr/share/socketley/socketley-help.sh"
 # Service file
 cp "$SCRIPT_DIR/socketley.service" "$PKG_DIR/usr/lib/systemd/system/"
 
+# Copyright file
+#
+# Debian policy 12.5 makes /usr/share/doc/<pkg>/copyright mandatory, and until
+# this was added the package shipped without one.  That was not only a policy
+# break: the binary statically links LuaJIT and compiles in sol2, both MIT, and
+# MIT requires its notice to accompany the distribution.  A .deb with no
+# copyright file distributed both of them with no notice at all.
+#
+# Assembled from the licence files in thirdparty/ rather than restated here, so
+# a vendored component that is updated cannot leave a stale notice behind.  A
+# missing licence file is a hard error for the same reason.
+mkdir -p "$PKG_DIR/usr/share/doc/socketley"
+COPYRIGHT="$PKG_DIR/usr/share/doc/socketley/copyright"
+
+cat > "$COPYRIGHT" << 'HEADER'
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: socketley
+Source: https://github.com/HiImSmiley/Socketley
+
+Files: *
+Copyright: Socketley contributors
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ .
+     http://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ .
+ The complete text is at /usr/share/common-licenses/Apache-2.0
+
+HEADER
+
+# Only what actually reaches the binary.  doctest is vendored but test-only and
+# is in no shipped artefact, so it is deliberately not listed here -- it is
+# covered by THIRD_PARTY_NOTICES.md in the source distribution instead.
+emit_notice() {
+    local name="$1" what="$2" path="$PROJECT_ROOT/$3"
+    if [ ! -f "$path" ]; then
+        echo "error: licence file missing: $3" >&2
+        exit 1
+    fi
+    {
+        echo "-------------------------------------------------------------------------------"
+        echo "$name -- $what"
+        echo "-------------------------------------------------------------------------------"
+        echo
+        cat "$path"
+        echo
+    } >> "$COPYRIGHT"
+}
+
+echo "The binary in this package includes or links the following components." \
+    >> "$COPYRIGHT"
+echo >> "$COPYRIGHT"
+
+emit_notice "LuaJIT"   "statically linked into /usr/bin/socketley" \
+    thirdparty/luajit/COPYRIGHT
+emit_notice "sol2"     "header-only, compiled into /usr/bin/socketley" \
+    thirdparty/sol2/LICENSE.txt
+emit_notice "liburing" "dynamically linked (see Depends: liburing2)" \
+    thirdparty/liburing/LICENSE
+
+chmod 644 "$COPYRIGHT"
+
 # Control file
 #
 # `Depends: liburing2` — with no version — was a package that installed cleanly
