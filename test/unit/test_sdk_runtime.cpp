@@ -191,6 +191,40 @@ TEST_CASE("client wrapper dials a unix listener with the -t spelling")
     CHECK(got.find("pong ping") != std::string::npos);
 }
 
+TEST_CASE("start() refuses instead of serving nothing when the port is taken")
+{
+    // Hold the port WITHOUT SO_REUSEPORT, so the wrapper's bind must fail.
+    int holder = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(holder >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(25894);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(holder, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(::listen(holder, 1) == 0);
+
+    // The old void start() entered the loop with the runtime already failed
+    // and blocked forever, silently.  The contract now: return false, do not
+    // enter the loop.  Run it in a thread so a regression fails the assert
+    // below instead of hanging the suite.
+    socketley::server srv(static_cast<uint16_t>(25894));
+    std::atomic<bool> returned{false};
+    std::atomic<bool> result{true};
+    std::thread t([&] { result = srv.start(); returned = true; });
+
+    for (int i = 0; i < 200 && !returned; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    CHECK(returned.load());          // it came back at all
+    CHECK_FALSE(result.load());      // and said no
+    CHECK(srv.state() == runtime_failed);
+
+    if (!returned)                   // regression path: unblock via stop()
+        srv.stop();
+    t.join();
+    ::close(holder);
+}
+
 TEST_CASE("cache wrapper store operations work without the network")
 {
     socketley::cache c(static_cast<uint16_t>(25891));

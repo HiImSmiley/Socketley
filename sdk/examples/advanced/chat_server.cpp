@@ -78,6 +78,5 @@ int main()
         printf("[-] %s\n", nick.c_str());
     });
 
-    srv.start();
-    return 0;
+    return srv.start() ? 0 : 2;
 }

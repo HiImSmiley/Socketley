@@ -124,6 +124,5 @@ int main()
     });
 
     printf("chatd: rooms on :9000 (TCP and WebSocket)\n");
-    srv.start();
-    return 0;
+    return srv.start() ? 0 : 2;
 }

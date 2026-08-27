@@ -18,6 +18,5 @@ int main()
      .resp()
      .max_memory(256 * 1024 * 1024)
      .eviction(evict_allkeys_lru);
-    c.start();
-    return 0;
+    return c.start() ? 0 : 2;
 }

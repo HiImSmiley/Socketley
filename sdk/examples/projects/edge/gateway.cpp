@@ -44,6 +44,5 @@ int main()
     });
 
     printf("edge-gw: https on :8443 -> unix:/tmp/edge-app.sock\n");
-    gw.start();
-    return 0;
+    return gw.start() ? 0 : 2;
 }

@@ -19,6 +19,5 @@ int main()
       .backend("127.0.0.1:9002")
       .protocol(protocol_tcp)
       .strategy(strategy_round_robin);
-    px.start();
-    return 0;
+    return px.start() ? 0 : 2;
 }

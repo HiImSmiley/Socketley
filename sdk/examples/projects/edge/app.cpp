@@ -28,6 +28,5 @@ int main()
        .http_cache();
 
     printf("edge-app: serving ./public on unix:/tmp/edge-app.sock\n");
-    app.start();
-    return 0;
+    return app.start() ? 0 : 2;
 }

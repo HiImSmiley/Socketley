@@ -147,11 +147,25 @@ public:
     bool load(std::string_view path = "")      { return path.empty() ? cch()->load_from(cch()->get_persistent()) : cch()->load_from(path); }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
-    void start() {
-        if (!m_loop.init()) return;
+    // Blocks serving until stop().  False when the runtime never started -- a
+    // taken port, a refused TLS or listener configuration -- and then the loop
+    // is not entered at all.  The old signature ran the loop anyway: a wrapper
+    // whose runtime had failed blocked forever serving nothing, with no line
+    // of output, until a signal arrived.  The refusal reason, when the runtime
+    // produced one, is in the log already; the LOG_ERROR here is for the paths
+    // that produce none (a TCP bind failure returns false silently).
+    bool start() {
+        if (!m_loop.init()) return false;
         detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
-        m_mgr.start(m_name, m_loop);
+        if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
+            LOG_ERROR((std::string(raw()->get_name()) +
+                       ": did not reach running; not entering the event loop. "
+                       "The refusal reason, if any, is logged above -- a silent "
+                       "one is a TCP bind/listen failure (port taken?)").c_str());
+            m_loop.shutdown_ring();
+            return false;
+        }
         m_loop.run();
         // Still with a live ring: stopping a runtime submits — teardown()
         // cancels what is attached to its descriptors and withdraws its own
@@ -161,6 +175,7 @@ public:
         // m_loop, so a ring still open at that point would let the kernel go on
         // writing into the buffers of connections the manager is freeing.
         m_loop.shutdown_ring();
+        return true;
     }
     void stop() { m_loop.request_stop(); }
 

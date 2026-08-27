@@ -37,6 +37,5 @@ int main()
         printf("[-] fd %d\n", fd);
     });
 
-    srv.start();
-    return 0;
+    return srv.start() ? 0 : 2;
 }

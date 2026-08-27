@@ -29,6 +29,5 @@ int main()
         printf("disconnected\n");
     });
 
-    cli.start();
-    return 0;
+    return cli.start() ? 0 : 2;
 }

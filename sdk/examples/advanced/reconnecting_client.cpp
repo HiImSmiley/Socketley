@@ -39,6 +39,5 @@ int main()
         cli.send("ping\n");
     });
 
-    cli.start();
-    return 0;
+    return cli.start() ? 0 : 2;
 }
