@@ -6,15 +6,21 @@
 #
 # Since 8399bee a runtime created without --daemon-process lives in a worker
 # process, and that is the DEFAULT.  A worker holds one runtime and no map of
-# runtimes, so twelve calls of the management API have nothing to answer from:
+# runtimes, so twelve calls of the management API had nothing to answer from:
 #
 #     socketley.create  .start  .stop  .remove  .send  .list  .get  .pipe
 #     socketley.cluster.daemons  .runtimes  .group  .stats
 #
-# They are refused rather than answered, which is the right interim choice —
+# They were refused rather than answered, which was the right interim choice —
 # an empty list() from a worker is indistinguishable from a daemon with nothing
-# in it — and the wrong end state, because a third of the scripting API is then
-# missing from the default mode and a script only finds out at runtime.
+# in it — and the wrong end state, because a third of the scripting API was
+# then missing from the default mode and a script only found out at runtime.
+#
+# Eleven of the twelve are closed.  Seven read the map and are answered from a
+# replica the daemon pushes; four CHANGE it and are asked of the daemon over a
+# socket of the worker's own, waiting for the answer.  What is left is
+# socketley.pipe across two runtimes, and self.route() beside it: those two
+# move a CONNECTION, which no map supplies, and they are still refused.
 #
 # This file is the definition of done for closing that.  One script, two
 # runtimes, one assertion per call asserted twice:
@@ -49,7 +55,10 @@
 # ─── THE ORACLES THAT ARE NOT THE SCRIPT'S OWN WORD ─────────────────────────
 #
 # Four of the twelve change the world, and a script grading its own return
-# value proves nothing about whether anything happened.  So:
+# value proves nothing about whether anything happened.  That is sharper now
+# than when it was written: these four USED to be refused in a worker, so the
+# oracle below was a negative one, and un-refusing them without also inverting
+# it would have left a green file asserting the opposite of what it says.  So:
 #
 #   * create/start   `ls` must show the child, running, on the port the script
 #                    asked for — from outside the daemon, over the CLI.
@@ -101,9 +110,10 @@
 # processes that is fd passing, which is a separate project, so its worker arm
 # is expected to stay a refusal for good.  Its assertion is therefore not
 # parity but specificity: the refusal must say THAT, rather than share the
-# generic "reaches for the runtime map" text with the other eleven.  An
-# operator told the generic message would go looking for a map that, for this
-# one call, is not what is missing.
+# generic "reaches for the runtime map" text.  An operator told the generic
+# message would go looking for a map that, for this one call, is not what is
+# missing — and every other call on this table now answers from one, so that
+# reading is more inviting than ever.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -197,20 +207,25 @@ par() {
 # not a target, it is a permanent red that teaches everyone to ignore the file.
 # What is asserted instead is that the refusal names the right missing thing.
 #
-# Three families end up here and they are refused for two different reasons:
+# ONE family is left here, and it used to be two.  The list is worth keeping
+# because the family that left did so within a release of this file calling it
+# refused "for good":
 #
-#   create/start/stop/remove   they CHANGE the map.  Being handed a copy of it
-#                              is not permission to alter it, and answering
-#                              them against the worker's own copy is worse than
-#                              refusing — see the negative oracle further down,
-#                              which checks that nothing was built out there.
 #   pipe, self.route           they move a CONNECTION.  Not a map problem at
 #                              all; what is missing is a channel between two
 #                              runtimes, and the mechanism for it already
 #                              exists unwired in shared/conn_transfer.h.
+#   create/start/stop/remove   GONE from here — see the par() assertions below.
+#                              They change the map, and the argument was that
+#                              being handed a copy of it is not permission to
+#                              alter it.  That is true and was never the
+#                              question: the calls do not alter the copy, they
+#                              ask the process holding the original, over a
+#                              socket the worker was given for it.
 #
-# A refusal that names the wrong one is not a cosmetic fault: it tells its
-# reader to wait for a delivery that will not fix their call.
+# A refusal that names the wrong missing thing is not a cosmetic fault: it
+# tells its reader to wait for a delivery that will not fix their call.  So is
+# a test file that calls a refusal permanent.
 refused() {
     local call=$1 oop=$2 needle=$3; shift 3
     case "$oop" in
@@ -675,9 +690,11 @@ ctl "socketley.pipe()" "$IN_pipe" \
     "in the daemon this reaches both runtimes and answers about the descriptor;" \
     "4242 is deliberately not an open connection of either"
 # The one asymmetry that is not a defect.  fd passing across processes is a
-# separate project, so this stays a refusal — but sharing the other eleven's
-# text sends the reader after a runtime map, and a runtime map is not what is
-# missing here.
+# separate project, so this stays a refusal — but wearing the generic "reaches
+# for the runtime map" text sends the reader after a runtime map, and a runtime
+# map is not what is missing here.  Sharper now that the other eleven answer:
+# every other call on this table works in a worker, so the reason this one does
+# not is the only thing its message has left to carry.
 case "$OOP_pipe" in
     REFUSED:*descriptor*|REFUSED:*file\ descriptor*) pass ;;
     *) fail "socketley.pipe() in a worker is refused as fd passing, by name" \
@@ -718,57 +735,66 @@ IN_start=$(field "$IN_MAKE" start);   OOP_start=$(field "$OOP_MAKE" start)
 
 ctl "socketley.create()" "$IN_create" "true" \
     "a name that is free and a port that is free is a create that succeeds"
-refused "socketley.create()" "$OOP_create" "CHANGES the runtime map" \
-    "create/start/stop/remove are refused for good: the map is coming, and" \
-    "being told what it holds is not permission to alter it"
+par create "$OOP_create" "$IN_create"
 
 ctl "socketley.start()" "$IN_start" "true" \
     "a runtime that exists and is not running is a start that succeeds"
-refused "socketley.start()" "$OOP_start" "CHANGES the runtime map"
+par start "$OOP_start" "$IN_start"
 
 for _ in $(seq 1 30); do [ -n "$(row par_in_kid)" ] && break; sleep 0.1; done
 IN_ROW=$(row par_in_kid)
-OOP_ROW=$(row par_oop_kid)
 
 ctl "the child the in-daemon arm made is really there" \
     "$IN_ROW" "$IN_KID_PORT/up" \
     "the script's own 'true' is not evidence that anything was built; this is"
 
-# ── The negative oracle, and `ls` alone cannot make it ──────────────────────
+# ── The oracle, which was a NEGATIVE one and is now a positive one ─────────
 #
-# The worker arm must have built NOTHING.  The obvious check is that `ls` does
-# not list par_oop_kid — and on its own it is worthless here, because the
-# failure it is supposed to catch is invisible to `ls` by construction.
+# It used to assert that the worker arm had built nothing, and the interesting
+# half of it survives the inversion unchanged: `ls` on its own cannot make
+# either claim.
 #
-# Un-refuse create in a worker and it runs against the worker's own manager:
-# mgr->create(), set_event_loop() with THIS WORKER'S ring, mgr->start() on it.
-# That builds a real runtime, bound and serving, inside the worker process —
-# and the daemon never hears about it, so `ls` shows nothing whether the call
-# was refused or whether it silently succeeded behind the daemon's back.  The
-# two states are identical in the CLI.
+# The reason is the failure mode this whole feature is built against.  Answer
+# create inside a worker, against the worker's own manager — mgr->create(),
+# set_event_loop() with THIS WORKER'S ring, mgr->start() on it — and you get a
+# real runtime, bound and serving, inside the worker process, which the daemon
+# never hears about.  `ls` shows nothing.  A REFUSED create also shows nothing.
+# The two are identical in the CLI, and neither is what is wanted.
 #
-# The port is what tells them apart.  A child built out there is LISTENING on
-# self.port + 10, so the kernel can be asked directly.  The in-daemon arm is
-# the control for the check itself: its own child must be listening, or a
-# probe that can see nothing anywhere would pass this vacuously.
+# So both halves are asked, and they are asked for opposite reasons:
+#
+#   ls lists it        the create reached the DAEMON's map.  A create answered
+#                      locally fails this, however loudly it returned true.
+#   the port answers   the runtime is really serving.  runtime_instance::start
+#                      stores `running` and returns true for an out-of-process
+#                      placeholder with no child forked, so `ls` saying Up is
+#                      not evidence that anything is bound.
+#
+# The in-daemon arm is the control for the probe itself: its own child must be
+# listening, or a probe that can see nothing anywhere would pass vacuously.
 listening() { ss -ltnH 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { f=1 } END { print f?"yes":"no" }'; }
 
 if [ "$(listening "$IN_KID_PORT")" = "yes" ]; then pass; else
     fail "control: the in-daemon arm's child is actually listening" \
          "nothing is bound on $IN_KID_PORT" \
-         "the port probe below is the only thing that can see a runtime built" \
-         "inside a worker, and if it cannot see this one it can see nothing"
+         "the port probe below is what tells a runtime that is SERVING from one" \
+         "whose placeholder merely says so, and if it cannot see this one it" \
+         "can see nothing"
 fi
 
-if [ -z "$OOP_ROW" ] && [ "$(listening "$OOP_KID_PORT")" = "no" ]; then
+for _ in $(seq 1 30); do [ -n "$(row par_oop_kid)" ] && break; sleep 0.1; done
+OOP_ROW=$(row par_oop_kid)
+
+if [ -n "$OOP_ROW" ] && [ "$(listening "$OOP_KID_PORT")" = "yes" ]; then
     pass
 else
-    fail "the worker arm built nothing, in the map or behind the daemon's back" \
+    fail "the child the worker arm made is in the DAEMON's map and serving" \
          "ls says '${OOP_ROW:-<nothing>}', and $OOP_KID_PORT is $(listening "$OOP_KID_PORT") bound" \
-         "a create answered inside a worker builds a runtime in that process:" \
-         "serving, unpersisted, absent from ls, and gone at the next restart." \
-         "That is the state this refusal exists to prevent, and the port is the" \
-         "only place it is visible from out here"
+         "the script's own 'true' is not evidence: a create answered inside the" \
+         "worker would return true having built a runtime in that process —" \
+         "serving, unpersisted, absent from ls, gone at the next restart — and" \
+         "a create that flipped a placeholder would show Up and bind nothing." \
+         "Both halves are needed to rule out both"
 fi
 
 # ─── unmake: stop + remove, same treatment ──────────────────────────────────
@@ -779,15 +805,11 @@ IN_remove=$(field "$IN_UNMAKE" remove); OOP_remove=$(field "$OOP_UNMAKE" remove)
 
 ctl "socketley.stop()" "$IN_stop" "true" \
     "a runtime that is running is a stop that succeeds"
-refused "socketley.stop()" "$OOP_stop" "CHANGES the runtime map" \
-    "answered against a placeholder, stop() stores 'stopped' and returns true" \
-    "having signalled nobody — see runtime_instance.cpp's out-of-process branch"
+par stop "$OOP_stop" "$IN_stop"
 
 ctl "socketley.remove()" "$IN_remove" "true" \
     "a runtime that exists is a remove that succeeds"
-refused "socketley.remove()" "$OOP_remove" "CHANGES the runtime map" \
-    "answered in a worker it would drop that process's own copy and leave the" \
-    "runtime in the daemon, which is a divergence nothing would report"
+par remove "$OOP_remove" "$IN_remove"
 
 for _ in $(seq 1 30); do [ -z "$(row par_in_kid)" ] && break; sleep 0.1; done
 
@@ -815,10 +837,24 @@ gone_after() {
 gone_after "the child the in-daemon arm removed is really gone" \
            "$IN_ROW" "$(row par_in_kid)"
 
-# No worker counterpart, and its absence is the point.  The worker arm never
-# made a child — that is asserted above, by the port probe — so there is
-# nothing here to remove and an assertion about removing it would be green
-# because nothing happened, which this file does not count as coverage.
+# And the worker counterpart, which did not exist while the worker arm could
+# not make a child.  It is the same assertion for the same reason, and the
+# BEFORE guard in gone_after() is what stops it passing on a build where the
+# create never worked: an assertion that is green because nothing happened is
+# not coverage of the thing that was supposed to happen.
+for _ in $(seq 1 30); do [ -z "$(row par_oop_kid)" ] && break; sleep 0.1; done
+gone_after "the child the worker arm removed is really gone" \
+           "$OOP_ROW" "$(row par_oop_kid)"
+
+# The port too, for the reason the create oracle gives: a remove that took the
+# row out of the map and left the child running is a listener nothing in the
+# CLI can find, which is the worse half of the same failure.
+if [ "$(listening "$OOP_KID_PORT")" = "no" ]; then pass; else
+    fail "the worker arm's removed child stopped serving" \
+         "$OOP_KID_PORT is still bound after remove() answered true" \
+         "the row is gone from ls, so nothing in the CLI names this process any" \
+         "more — a remove that leaves the listener up is a leak with no handle"
+fi
 
 # ─── the send oracle: bytes on a real connection ────────────────────────────
 #

@@ -85,36 +85,53 @@ daemon_start "$BIN"
 # the failed runtime and not absence of output.
 "$BIN" create server upsrv -p "$SRV_PORT" -s >/dev/null 2>&1 || true
 
-# The failure: a script whose top level reaches for the cross-runtime management
-# API.  In a worker that API is refused by name, the script does not load, and
-# the worker exits saying so — which is a failure NOTHING on the daemon side can
-# decide in advance, because the daemon only compiles and discards a worker's
-# script.  Created without -s on purpose: `create -s` unwinds a runtime whose
+# The failure: a script whose top level raises.  The script does not load, the
+# worker exits saying so, and the runtime is left `failed` — which is a failure
+# NOTHING on the daemon side can decide in advance, because the daemon only
+# compiles and discards a worker's script.
+#
+# FOUR earlier triggers stopped working, and the pattern in them is the point.
+#
+#   --tls on a UDP client   a question about two flags, so it moved to where
+#                           every other impossible TLS combination is answered
+#                           and is now refused at create.
+#   a port conflict         not a failure at all: the listener sets
+#                           SO_REUSEPORT, so a second runtime binds the same
+#                           port and both come up.
+#   socketley.list()        stopped raising the day a worker was handed the
+#                           runtime map.  Watched, not predicted: 7/12.
+#   socketley.create()      stopped raising the day the four map calls were
+#                           given a socket to travel on.  Watched: 7/12 again,
+#                           the same five assertions, about `ps` output that
+#                           was never the subject either time.
+#
+# The third and fourth were both chosen by the same reasoning, and the fourth
+# wrote that reasoning down: pick from the half of the API that is refused
+# PERMANENTLY rather than the half waiting on a transport, because "there is no
+# build in which this call starts working" is exactly the property this line
+# needs.  It said that about socketley.create.  It was wrong within a release.
+#
+# So the trigger stops being a call at all.  A top-level `error()` cannot start
+# working: it is not a capability the worker is missing, it is the script
+# saying no.  It has the two properties this file actually needs and nothing
+# else:
+#
+#   the daemon cannot know     it COMPILES, so the placeholder's compile-and-
+#                              discard check passes and `create` exits 0.  Only
+#                              running the top level reveals it, and that
+#                              happens in the worker.
+#   nothing is half-built      it raises on the first line, so no runtime is
+#                              created on either path.
+#
+# Created without -s on purpose, as above: `create -s` unwinds a runtime whose
 # start fails and leaves nothing behind, and a runtime that does not exist is
 # not the case under test.
 #
-# THREE earlier triggers stopped working, and why is worth keeping.  `--tls` on
-# a UDP client was a question about two flags, so it moved to where every other
-# impossible TLS combination is answered and is now refused at create.  A port
-# conflict is not a failure at all here: the listener sets SO_REUSEPORT, so a
-# second runtime binds the same port and both come up.  And socketley.list(),
-# which is what stood on this line, stopped raising the day a worker was handed
-# the runtime map — it answers out there now, the script loads, brokencli comes
-# up `running`, and five assertions below go red about `ps` output that was
-# never the subject.  Watched, not predicted: 7/12.
-#
-# So the trigger has to come from the half of the API that is refused
-# PERMANENTLY, not the half that is waiting on a transport.  socketley.create
-# changes the runtime map, and a worker being handed a copy of that map is not
-# permission to alter it — there is no build in which this call starts working
-# from out here, which is exactly the property this line needs.  It raises
-# before it builds anything, so no runtime is created on either path.
-#
-# What is left is a failure that genuinely cannot be known until the process
-# that will serve the runtime tries, which is the only honest kind for this
-# file.
+# Measured on the build this was written against: create exits 0, start exits
+# 1, and `ls` three seconds later shows brokencli Failed with the script's own
+# raise in the daemon log above `proxy worker refused its configuration`.
 BROKEN_LUA="$(mktemp "${TMPDIR:-/tmp}/psfailed-XXXXXX.lua")"
-printf 'socketley.create("server", "psfailed_never_built", { port = 0 })\n' > "$BROKEN_LUA"
+printf 'error("psfailed: a deliberate top-level raise, so only the worker can know")\n' > "$BROKEN_LUA"
 "$BIN" create server brokencli -p "$BROKEN_PORT" --lua "$BROKEN_LUA" >/dev/null 2>&1 || true
 "$BIN" start brokencli >/dev/null 2>&1 || true
 sleep 3
