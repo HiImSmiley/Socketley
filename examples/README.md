@@ -123,6 +123,10 @@ own daemon, on its own socket, and removes what it made on the way out.
   `on_http_request`, TLS termination, health checks, a circuit breaker and
   retries, and states plainly what it cannot do: the links live in a Lua table,
   so they do not survive a restart and would not survive `--shards` either
+- `chat-room/` - a browser chat where one runtime on one port serves the page,
+  the WebSocket and a plain TCP client, and the handler does not know which is
+  which. Ships its own RFC 6455 client so `run.sh` can verify the socket without
+  a browser
 
 ### Cluster
 - `docker-compose.yml` - three daemons in three containers sharing a volume;

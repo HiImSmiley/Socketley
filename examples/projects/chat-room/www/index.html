@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>socketley chat</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+         background:#111418; color:#d7dde5; display:flex; flex-direction:column; height:100vh; }
+  header { padding:.7rem 1rem; border-bottom:1px solid #222933; color:#8b98a9; }
+  header b { color:#d7dde5; }
+  #log { flex:1; overflow-y:auto; padding:1rem; white-space:pre-wrap; word-break:break-word; }
+  #log div { padding:.1rem 0; }
+  #log .sys { color:#7d8aa0; }
+  form { display:flex; gap:.5rem; padding:.75rem 1rem; border-top:1px solid #222933; }
+  input { flex:1; background:#171c22; border:1px solid #2a323d; color:inherit;
+          font:inherit; padding:.5rem .7rem; border-radius:4px; }
+  input:focus { outline:none; border-color:#3d6b9e; }
+  button { background:#2b5b8a; border:0; color:#fff; font:inherit;
+           padding:.5rem 1rem; border-radius:4px; cursor:pointer; }
+  #state { float:right; }
+</style>
+</head>
+<body>
+<header><b>socketley chat</b> &mdash; try <code>/nick name</code>, <code>/who</code>, <code>/quit</code>
+  <span id="state">connecting&hellip;</span></header>
+<div id="log"></div>
+<form id="f" autocomplete="off">
+  <input id="i" placeholder="say something" autofocus>
+  <button>send</button>
+</form>
+<script>
+// Same host, same port.  The server detects the Upgrade and hands this
+// connection to on_websocket; no separate port and no flag.
+const ws    = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/");
+const log   = document.getElementById("log");
+const state = document.getElementById("state");
+
+function add(text) {
+    const d = document.createElement("div");
+    if (text.startsWith("* ")) d.className = "sys";
+    d.textContent = text;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+}
+
+ws.onopen    = () => { state.textContent = "connected"; };
+ws.onclose   = () => { state.textContent = "disconnected"; add("* connection closed"); };
+ws.onerror   = () => { state.textContent = "error"; };
+ws.onmessage = e => e.data.split("\n").filter(Boolean).forEach(add);
+
+document.getElementById("f").addEventListener("submit", e => {
+    e.preventDefault();
+    const i = document.getElementById("i");
+    if (i.value.trim() && ws.readyState === WebSocket.OPEN) { ws.send(i.value); i.value = ""; }
+});
+</script>
+</body>
+</html>
