@@ -165,6 +165,34 @@ daemon_stop() {
             echo "  --- invariant violations from this test's daemon ---"
             grep -F '[invariant]' "$SOCKETLEY_DLOG" | sort | uniq -c | head -20
         fi
+
+        # ── and what the sanitizers said, for the same reason ───────────────
+        #
+        # A Sanitize build compiles with -fno-sanitize-recover=all, so an ASan
+        # or UBSan finding kills the process: the daemon dies, the next CLI call
+        # fails, and the test goes red.  Those are already visible.
+        #
+        # LeakSanitizer is not.  It runs at exit, and the daemon exits cleanly
+        # on the SIGTERM above -- measured, "daemon stopped" then status 0 -- so
+        # LSan does run and does report.  It reports to the daemon's stderr,
+        # which is this log, and it signals through the exit status, which the
+        # `wait ... || true` twenty lines up deliberately discards because a
+        # daemon killed in cleanup is not a failure.  Then the tmpdir goes.
+        #
+        # So a leak in the daemon passed the whole Sanitize suite without
+        # leaving a trace anywhere, which makes the leak half of that suite an
+        # assertion that cannot fail.  Verified before writing this: a program
+        # built with these flags reports `LeakSanitizer: detected memory leaks`
+        # and exits non-zero, and this tree's own daemon exits 0 at idle.
+        #
+        # Printed, not asserted, exactly as the invariant block above: what a
+        # leak means is the job's decision, and turning 102 tests red from one
+        # library function is how a useful check gets switched off.
+        if grep -qE 'Sanitizer:|runtime error:' "$SOCKETLEY_DLOG" 2>/dev/null; then
+            echo "  --- sanitizer reports from this test's daemon ---"
+            grep -E 'Sanitizer:|runtime error:' "$SOCKETLEY_DLOG" \
+                | sed 's/^==[0-9]*==//' | sort | uniq -c | head -20
+        fi
     fi
 
     # SOCKETLEY_KEEP_TMPD keeps the run's socket, state directory and daemon.log
