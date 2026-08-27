@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(socketley_sdk CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "Socketley requires Linux (io_uring, kernel 5.11+)")
+    message(FATAL_ERROR "Socketley requires Linux (io_uring, kernel 5.19+)")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)

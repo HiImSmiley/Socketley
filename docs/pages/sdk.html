@@ -8,14 +8,15 @@
         <li><a href="#sdk-t1-result">Result Type</a></li>
         <li><a href="#sdk-t1-runtime">Runtime Management</a></li>
         <li><a href="#sdk-t1-send">Send Behavior</a></li>
+        <li><a href="#sdk-t1-daemon">Daemon &amp; Cluster</a></li>
         <li><a href="#sdk-t1-cache">Cache Operations</a></li>
         <li><a href="#sdk-t1-action">Action Commands</a></li>
         <li><a href="#sdk-t1-raw">Raw Command</a></li>
-        <li><a href="#sdk-t1-socket">Socket Path</a></li>
+        <li><a href="#sdk-t1-socket">Socket Path Resolution</a></li>
       </ul></li>
       <li><a href="#sdk-t2">Tier 2: Embed Engine</a><ul>
         <li><a href="#sdk-t2-build">Build &amp; Link</a></li>
-        <li><a href="#sdk-t2-wrappers">Wrapper Classes</a></li>
+        <li><a href="#sdk-t2-wrappers">High-Level Wrapper Classes</a></li>
         <li><a href="#sdk-t2-eventloop">event_loop</a></li>
         <li><a href="#sdk-t2-manager">runtime_manager</a></li>
         <li><a href="#sdk-t2-base">runtime_instance (Base)</a></li>
@@ -29,7 +30,7 @@
           <li><a href="#sdk-t2-cache-ttl">TTL</a></li>
           <li><a href="#sdk-t2-cache-pubsub">Pub/Sub</a></li>
           <li><a href="#sdk-t2-cache-mgmt">Management</a></li>
-          <li><a href="#sdk-t2-cache-textproto">Text Protocol</a></li>
+          <li><a href="#sdk-t2-cache-textproto">Text-Protocol Command Reference</a></li>
         </ul></li>
         <li><a href="#sdk-t2-proxy">proxy_instance</a></li>
         <li><a href="#sdk-t2-client">client_instance</a></li>
@@ -41,7 +42,7 @@
         <li><a href="#sdk-t3-managed">Managed Mode</a></li>
       </ul></li>
       <li><a href="#sdk-patterns">Patterns &amp; Best Practices</a><ul>
-        <li><a href="#sdk-pat-mixed">Mixed (Tier 2 + 3)</a></li>
+        <li><a href="#sdk-pat-mixed">Mixed: Tier 2 + Tier 3</a></li>
         <li><a href="#sdk-pat-signals">Signal Handling</a></li>
         <li><a href="#sdk-pat-lua">Lua Integration</a></li>
         <li><a href="#sdk-pat-choosing">Choosing a Tier</a></li>
@@ -67,6 +68,7 @@
 <div class="info-box"><strong>Tiers 1 and 3 are fully self-contained.</strong> Copy the header anywhere, compile with <code>g++ -std=c++17</code>, and you're done &mdash; no library to link, no repo needed. Tier 2 requires building from source.</div>
 
 <h3 id="sdk-install">Installation</h3>
+<p><strong>Requirements</strong> (same as the daemon build): Linux 5.19+ (io_uring multishot accept), GCC 12+ (C++23 for Tier 2; Tiers 1 and 3 need only C++17), liburing <strong>2.7 or newer</strong> to build (Ubuntu 24.04's <code>liburing-dev</code> is 2.5 &mdash; use <code>bash scripts/install-liburing.sh</code>; a built binary needs 2.6+ at run time), and <code>libssl-dev</code>.</p>
 <h4>Tier 1 &amp; 3 (header-only)</h4>
 <p>Copy the header files from the SDK directory. No build step required:</p>
 <pre><code><span class="cm"># Copy headers to your project</span>
@@ -100,7 +102,8 @@ cp -r include/linux/socketley/ /your/project/include/</code></pre>
     });
     srv.<span class="fn">start</span>();
 }
-<span class="cm">// g++ -std=c++23 app.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto</span></code></pre>
+<span class="cm">// g++ -std=c++23 app.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \\</span>
+<span class="cm">//     -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit</span></code></pre>
 
 <p><strong>Tier 3</strong> &mdash; Register with daemon:</p>
 <pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/attach.h&gt;</span>
@@ -128,7 +131,10 @@ cp -r include/linux/socketley/ /your/project/include/</code></pre>
 <pre><code><span class="kw">struct</span> result {
     <span class="kw">int</span>         exit_code;  <span class="cm">// 0 = success, 1 = bad input, 2 = fatal, -1 = connect failed</span>
     std::string data;       <span class="cm">// response body from daemon</span>
+
+    <span class="kw">bool</span> <span class="fn">ok</span>() <span class="kw">const</span>;        <span class="cm">// exit_code == 0</span>
 };</code></pre>
+<p>Deliberately not <code>operator bool</code>: a result with <code>exit_code&nbsp;1</code> <em>is</em> a response &mdash; the daemon's refusal, with the reason in <code>data</code>. <code>ok()</code> asks the narrower question.</p>
 </div>
 
 <h3 id="sdk-t1-runtime">Runtime Management</h3>
@@ -178,36 +184,6 @@ cp -r include/linux/socketley/ /your/project/include/</code></pre>
 </div>
 <p class="method-sig">result remove(const std::string&amp; name)</p>
 <p class="method-desc">Remove a stopped runtime permanently. Deletes its persisted state.</p>
-</div>
-
-<h4 id="sdk-t1-send">Send Behavior</h4>
-<p>The <code>send</code> method behaves differently depending on the runtime type:</p>
-
-<div class="method-card" id="sdk-ctl-send">
-<div class="method-header">
-  <span class="method-name">send</span>
-  <span class="badge badge-tier1">Tier 1</span>
-</div>
-<p class="method-sig">result send(const std::string&amp; name, const std::string&amp; message)</p>
-<p class="method-desc">Send a text message to a runtime. Behavior depends on the runtime type:</p>
-<table>
-<thead><tr><th>Runtime</th><th>Behavior</th></tr></thead>
-<tbody>
-<tr><td><strong>Server</strong> (mode != in)</td><td>Broadcasts to all connected clients</td></tr>
-<tr><td><strong>Client</strong> (mode != in)</td><td>Sends to the connected remote server</td></tr>
-<tr><td><strong>Cache</strong></td><td>Not supported &mdash; returns error</td></tr>
-<tr><td><strong>Proxy</strong></td><td>Not supported &mdash; returns error</td></tr>
-</tbody>
-</table>
-<pre><code><span class="cm">// Server: broadcasts "hello" to all connected clients</span>
-socketley::ctl::<span class="fn">send</span>(<span class="st">"my_server"</span>, <span class="st">"hello"</span>);
-
-<span class="cm">// Client: sends "hello" to the remote server</span>
-socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>, <span class="st">"hello"</span>);
-
-<span class="cm">// Cache/Proxy: returns error (exit_code != 0)</span>
-<span class="kw">auto</span> r = socketley::ctl::<span class="fn">send</span>(<span class="st">"my_cache"</span>, <span class="st">"hello"</span>);
-<span class="cm">// r.exit_code == 1</span></code></pre>
 </div>
 
 <div class="method-card" id="sdk-ctl-ls">
@@ -272,6 +248,97 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 </div>
 <p class="method-sig">result edit(const std::string&amp; name, const std::string&amp; flags)</p>
 <p class="method-desc">Edit runtime flags on a stopped runtime. Takes the same flags as <code>create</code>.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-restart">
+<div class="method-header">
+  <span class="method-name">restart</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result restart(const std::string&amp; name)</p>
+<p class="method-desc">Stop, then start &mdash; two IPC round trips, exactly what the CLI's <code>restart</code> does. The stop's answer is read before the start goes out, so restarting a name the daemon does not hold reports <code>runtime not found</code> once, from the stop.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-import">
+<div class="method-header">
+  <span class="method-name">import_runtime</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result import_runtime(const std::string&amp; name, const std::string&amp; json)</p>
+<p class="method-desc">Create a runtime from a JSON document &mdash; the inverse of <code>show()</code>, whose output is accepted unchanged. (Not named <code>import</code>: that is a context-sensitive keyword in C++20 modules.)</p>
+</div>
+
+<h3 id="sdk-t1-send">Send Behavior</h3>
+<p>The <code>send</code> method behaves differently depending on the runtime type:</p>
+
+<div class="method-card" id="sdk-ctl-send">
+<div class="method-header">
+  <span class="method-name">send</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result send(const std::string&amp; name, const std::string&amp; message)</p>
+<p class="method-desc">Send a text message to a runtime. Behavior depends on the runtime type:</p>
+<table>
+<thead><tr><th>Runtime</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td><strong>Server</strong> (mode != in)</td><td>Broadcasts to all connected clients</td></tr>
+<tr><td><strong>Client</strong> (mode != in)</td><td>Sends to the connected remote server</td></tr>
+<tr><td><strong>Cache</strong></td><td>Not supported &mdash; returns error</td></tr>
+<tr><td><strong>Proxy</strong></td><td>Not supported &mdash; returns error</td></tr>
+</tbody>
+</table>
+<pre><code><span class="cm">// Server: broadcasts "hello" to all connected clients</span>
+socketley::ctl::<span class="fn">send</span>(<span class="st">"my_server"</span>, <span class="st">"hello"</span>);
+
+<span class="cm">// Client: sends "hello" to the remote server</span>
+socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>, <span class="st">"hello"</span>);
+
+<span class="cm">// Cache/Proxy: returns error (exit_code != 0)</span>
+<span class="kw">auto</span> r = socketley::ctl::<span class="fn">send</span>(<span class="st">"my_cache"</span>, <span class="st">"hello"</span>);
+<span class="cm">// r.exit_code == 1</span></code></pre>
+</div>
+
+<h3 id="sdk-t1-daemon">Daemon &amp; Cluster</h3>
+
+<div class="method-card" id="sdk-ctl-ping">
+<div class="method-header">
+  <span class="method-name">ping</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result ping()</p>
+<p class="method-desc">Who is serving this socket: <code>socketley-daemon &lt;version&gt; &lt;pid&gt; &lt;dev:inode&gt; &lt;path&gt;</code>, the executable path read fresh from <code>/proc</code> on the daemon side. The path goes last because a path may contain spaces; the inode is what distinguishes two builds carrying the same version string.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-version">
+<div class="method-header">
+  <span class="method-name">version</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result version()</p>
+<p class="method-desc">The daemon's version string, extracted from <code>ping()</code>. There is no <code>version</code> IPC command &mdash; the CLI's <code>socketley version</code> prints the <em>CLI's</em> compile-time version, and a header-only client has none, so the daemon's answer is the only honest one available.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-daemon-name">
+<div class="method-header">
+  <span class="method-name">daemon_name / cluster_dir / dashboard</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result daemon_name() &nbsp;&middot;&nbsp; result cluster_dir() &nbsp;&middot;&nbsp; result dashboard()</p>
+<p class="method-desc">The daemon's <code>--name</code>, its cluster directory, and the dashboard URL (an error when no metrics endpoint is configured).</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cluster">
+<div class="method-header">
+  <span class="method-name">cluster_status / cluster_ls / cluster_show</span>
+  <span class="badge badge-tier1">Tier 1</span>
+</div>
+<p class="method-sig">result cluster_status() &nbsp;&middot;&nbsp; result cluster_ls() &nbsp;&middot;&nbsp; result cluster_show(const std::string&amp; name)</p>
+<p class="method-desc">A daemon in cluster mode publishes itself into the cluster directory as <code>&lt;name&gt;.json</code> &mdash; host, heartbeat, pid, and its runtime table &mdash; and discovers peers by reading the same directory. <strong>The roster is files, not IPC.</strong> <code>cluster_status()</code> is the one real daemon command (<code>cluster:on|off</code>, <code>name:</code>, <code>dir:</code>, <code>host:</code>, and <code>error:</code> when cluster mode was refused). <code>cluster_ls()</code> lists the publishing daemons, one name per line, stale ones included &mdash; a heartbeat more than 10&nbsp;s old is stale, and the timestamp is in the JSON. <code>cluster_show(name)</code> returns that daemon's published JSON <em>raw</em>, deliberately: the format belongs to the publisher, and a second parser in the header would be a second thing that drifts.</p>
+<pre><code><span class="kw">auto</span> peers = socketley::ctl::<span class="fn">cluster_ls</span>();
+<span class="cm">// "edge-1\nedge-2\nstore-1"</span>
+<span class="kw">auto</span> one = socketley::ctl::<span class="fn">cluster_show</span>(<span class="st">"edge-1"</span>);
+<span class="cm">// {"daemon":"edge-1","host":"...","heartbeat":1787829747,"runtimes":[...]}</span></code></pre>
+<p class="method-desc"><code>cluster_ps()</code>, <code>cluster_group()</code>, <code>cluster_stats()</code> and <code>cluster_watch()</code> exist but refuse immediately with a recipe: they are CLI <em>renderings</em> over the same files (a cross-daemon table, a group filter, a live terminal view), and a library has no terminal to render into. Aggregate <code>cluster_show()</code>'s <code>runtimes</code> arrays instead.</p>
 </div>
 
 <h3 id="sdk-t1-cache">Cache Operations</h3>
@@ -605,6 +672,26 @@ socketley::ctl::<span class="fn">send</span>(<span class="st">"my_client"</span>
 <p class="method-desc">Get all keys matching a glob pattern. Returns newline-separated key names.</p>
 </div>
 
+<div class="method-card" id="sdk-ctl-cache-mget">
+<div class="method-header">
+  <span class="method-name">cache_mget</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_mget(const std::string&amp; cache_name, const std::vector&lt;std::string&gt;&amp; keys)</p>
+<p class="method-desc">Get several keys in one round trip. Returns newline-separated values (<code>nil</code> for a missing key). An empty key list is refused locally, before any IPC.</p>
+</div>
+
+<div class="method-card" id="sdk-ctl-cache-mset">
+<div class="method-header">
+  <span class="method-name">cache_mset</span>
+  <span class="badge badge-tier1">Tier 1</span>
+  <span class="badge badge-cache">Cache</span>
+</div>
+<p class="method-sig">result cache_mset(const std::string&amp; cache_name, const std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;&amp; kvs)</p>
+<p class="method-desc">Set several key/value pairs in one round trip. Returns <code>"ok"</code>. An empty list is refused locally.</p>
+</div>
+
 <h3 id="sdk-t1-action">Action Commands</h3>
 <p>All <code>cache_*</code> functions above are convenience wrappers around <code>action</code> subcommands. You can also call them directly via <code>command()</code> for maximum flexibility:</p>
 <pre><code><span class="cm">// These two are equivalent:</span>
@@ -736,9 +823,9 @@ printf(<span class="st">"token = %s\n"</span>, r.data.c_str()); <span class="cm"
 <p>Tier 2 embeds the full socketley engine &mdash; io_uring event loop, runtime manager, and all four runtime types &mdash; directly in your own binary. Maximum performance (no IPC overhead), full control over the event loop.</p>
 
 <h3 id="sdk-t2-build">Build &amp; Link</h3>
-<div class="warn-box"><strong>Build requirement:</strong> Tier 2 requires the socketley source tree and <code>libsocketley_sdk.a</code>.<br>
-<code>g++ -std=c++23 app.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto</code><br>
-Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> to build without it.</div>
+<div class="warn-box"><strong>Build requirement:</strong> Tier 2 requires the socketley source tree and <code>libsocketley_sdk.a</code> (build it with <code>./bin/premake5 gmake2 &amp;&amp; cd make &amp;&amp; make config=release_x64 socketley_sdk</code>).<br>
+<code>g++ -std=c++23 app.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit</code><br>
+The sol2/LuaJIT include paths and <code>-lluajit</code> are not optional extras: <code>core.h</code> pulls the Lua context in by default. To build without Lua, define <code>SOCKETLEY_NO_LUA</code> and link <code>libsocketley_sdk_nolua.a</code> instead.</div>
 
 <table>
 <thead><tr><th>Header</th><th>Provides</th></tr></thead>
@@ -752,9 +839,27 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
 </table>
 
 <h3 id="sdk-t2-wrappers">High-Level Wrapper Classes</h3>
-<p>The recommended way to use Tier 2. Each wrapper manages its own event loop, runtime manager, and signal handlers internally. All config methods return <code>*this</code> for chaining. <code>start()</code> blocks until SIGINT/SIGTERM.</p>
+<p>The recommended way to use Tier 2. Each wrapper manages its own event loop, runtime manager, and signal handlers internally. All config methods return <code>*this</code> for chaining. <code>start()</code> blocks until SIGINT/SIGTERM &mdash; and <strong>returns <code>bool</code></strong>: <code>false</code> when the runtime never started (a taken port, a refused TLS or listener configuration), in which case the event loop is not entered at all.</p>
 
 <div class="warn-box"><strong>One <code>start()</code> per process</strong> &mdash; the signal handler points to one event loop. For multi-runtime in a single process, use the <a href="#sdk-t2-eventloop">raw API</a> below.</div>
+
+<p><strong>Every wrapper constructor takes an optional runtime name</strong> (<code>server(9000, "web")</code>), which appears in logs and stats &mdash; and on a proxy is load-bearing: see the proxy card. <strong>Three wrappers also take an AF_UNIX listener path instead of a port</strong> (<code>server("unix:/run/app.sock")</code>, with or without the <code>unix:</code> prefix) &mdash; the <code>--listen unix:</code> feature. Port and path are alternatives, never both, which is why the path is a constructor and not a setter. <code>tls()</code> does not combine with a unix listener: the socket node's permissions are what restrict it.</p>
+
+<p><strong>All four wrappers share:</strong></p>
+<table>
+<thead><tr><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>cpus(spec)</code></td><td>Pin the wrapper's I/O thread: <code>"max"</code>, <code>"0-3"</code>, <code>"0,2,5"</code> &mdash; the <code>--cpus</code> spellings. A spec that does not parse is logged and ignored.</td></tr>
+<tr><td><code>sqpoll(bool)</code></td><td>Ask for (or decline) an SQPOLL submission poller on the wrapper's ring. A request &mdash; the kernel may refuse, and <code>start()</code> logs one line if it does. Must be called before <code>start()</code>.</td></tr>
+<tr><td><code>owner(name)</code> / <code>child_policy(p)</code></td><td>Ownership hierarchy, as in the daemon</td></tr>
+<tr><td><code>start()</code> &rarr; <code>bool</code></td><td>Run the loop; blocks. <code>false</code> = runtime never reached <code>running</code>, loop not entered</td></tr>
+<tr><td><code>stop()</code></td><td>Request the event loop to stop (callable from any thread or callback)</td></tr>
+<tr><td><code>instance()</code> / <code>manager()</code> / <code>loop()</code></td><td>Escape hatches to the raw API</td></tr>
+<tr><td><code>state()</code>, <code>name()</code>, <code>port()</code>, <code>stats()</code>, <code>connection_count()</code>, <code>get_listen_path()</code>, &hellip;</td><td>Introspection; each config setter has a matching getter</td></tr>
+</tbody>
+</table>
+
+<div class="info-box"><strong>No <code>shards()</code>, deliberately.</strong> A shard is a worker <em>process</em> forked by the daemon; an embedded wrapper is in-process by construction, and <code>shards_config_refusal</code> refuses any in-process runtime claiming more than one. Sharding an SDK service means running N processes of your binary; on a TCP port they can share it via <code>SO_REUSEPORT</code>.</div>
 
 <div class="method-card" id="sdk-wrap-server">
 <div class="method-header">
@@ -762,41 +867,44 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-server">Server</span>
 </div>
-<p class="method-sig">server(uint16_t port)</p>
-<p class="method-desc">High-level TCP/UDP server. Handles event loop, signal handlers, and lifecycle internally.</p>
+<p class="method-sig">server(uint16_t port, std::string_view name = "_sdk_server")</p>
+<p class="method-sig">server(std::string_view unix_path, std::string_view name = "_sdk_server")</p>
+<p class="method-desc">High-level TCP/UDP/HTTP/WebSocket server. Handles event loop, signal handlers, and lifecycle internally.</p>
 
 <h4>Config (chainable)</h4>
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><code>tls(cert, key)</code></td><td>Enable TLS with certificate and key paths</td></tr>
+<tr><td><code>tls(cert, key)</code></td><td>Terminate TLS on the listener (TCP port only, not a unix listener)</td></tr>
+<tr><td><code>client_ca(ca)</code></td><td>Mutual TLS: the CA that certificates presented <em>by clients</em> must be signed by. Needs <code>tls()</code> as well. (<code>tls_ca(ca)</code> is the older spelling, kept; it also switches TLS on.)</td></tr>
 <tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
-<tr><td><code>rate_limit(r)</code></td><td>Per-connection rate limit (msg/sec)</td></tr>
-<tr><td><code>global_rate_limit(r)</code></td><td>Shared rate limit across all connections</td></tr>
+<tr><td><code>rate_limit(r)</code> / <code>global_rate_limit(r)</code></td><td>Per-connection / shared rate limit (msg/sec)</td></tr>
 <tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle clients after <em>s</em> seconds</td></tr>
+<tr><td><code>log_file(path)</code></td><td>Log traffic to a file</td></tr>
 <tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
-<tr><td><code>mode(m)</code></td><td><code>mode_inout</code>, <code>mode_in</code>, <code>mode_out</code>, <code>mode_master</code></td></tr>
+<tr><td><code>mode(m)</code></td><td><code>mode_inout</code> (default), <code>mode_in</code>, <code>mode_out</code>, <code>mode_master</code> &mdash; <strong>read the relay warning below</strong></td></tr>
 <tr><td><code>udp()</code></td><td>Switch to UDP mode</td></tr>
-<tr><td><code>http_dir(path)</code></td><td>Serve static files from directory</td></tr>
-<tr><td><code>http_cache()</code></td><td>Enable in-memory HTTP file cache</td></tr>
-<tr><td><code>upstream(addr)</code></td><td>Add an upstream connection target</td></tr>
-<tr><td><code>master_pw(pw)</code></td><td>Set master mode password</td></tr>
-<tr><td><code>drain()</code></td><td>Enable graceful shutdown (finish pending writes)</td></tr>
+<tr><td><code>http_dir(path)</code> / <code>http_cache()</code></td><td>Serve static files over HTTP / with the in-memory response cache</td></tr>
+<tr><td><code>upstream(addr)</code> / <code>clear_upstreams()</code></td><td>Outbound upstream connections this server dials and holds. A malformed address is logged and ignored.</td></tr>
+<tr><td><code>master_pw(pw)</code> / <code>master_forward(bool)</code></td><td>Master-mode password / forwarding</td></tr>
+<tr><td><code>drain()</code></td><td>Graceful shutdown: finish pending writes</td></tr>
 <tr><td><code>group(g)</code></td><td>Tag for dynamic proxy backend discovery</td></tr>
-<tr><td><code>tick_interval(ms)</code></td><td>Set periodic tick interval in milliseconds</td></tr>
+<tr><td><code>tick_interval(ms)</code></td><td>Periodic tick interval</td></tr>
 </tbody>
 </table>
+
+<div class="warn-box"><strong>The default mode makes the server a hub.</strong> In <code>mode_inout</code> every inbound line is relayed raw to every <em>other</em> connected client, on top of whatever <code>on_message</code> does with it &mdash; two clients on an "echo server" each see the other's traffic. A Lua script that defines a message handler suppresses the relay; a C++ <code>on_message</code> callback does <em>not</em>. A server whose <code>on_message</code> IS the protocol wants <code>mode(mode_in)</code>.</div>
 
 <h4>Callbacks (chainable)</h4>
 <table>
 <thead><tr><th>Method</th><th>Signature</th></tr></thead>
 <tbody>
-<tr><td><code>on_start(cb)</code></td><td><code>void()</code></td></tr>
-<tr><td><code>on_stop(cb)</code></td><td><code>void()</code></td></tr>
-<tr><td><code>on_connect(cb)</code></td><td><code>void(int fd)</code></td></tr>
-<tr><td><code>on_disconnect(cb)</code></td><td><code>void(int fd)</code></td></tr>
+<tr><td><code>on_start(cb)</code> / <code>on_stop(cb)</code></td><td><code>void()</code></td></tr>
+<tr><td><code>on_connect(cb)</code> / <code>on_disconnect(cb)</code></td><td><code>void(int fd)</code></td></tr>
 <tr><td><code>on_message(cb)</code></td><td><code>void(int fd, string_view msg)</code></td></tr>
 <tr><td><code>on_tick(cb)</code></td><td><code>void(double dt_ms)</code></td></tr>
+<tr><td><code>on_auth(cb)</code></td><td><code>bool(int fd)</code> &mdash; return <code>false</code> to refuse the connection</td></tr>
+<tr><td><code>on_websocket(cb)</code></td><td><code>void(int fd, const server_instance::ws_headers_result&amp;)</code> &mdash; fires on WebSocket upgrade; the struct carries <code>cookie</code>, <code>origin</code>, <code>protocol</code>, <code>auth</code></td></tr>
 </tbody>
 </table>
 
@@ -804,42 +912,25 @@ Add <code>-lluajit</code> if using Lua, or define <code>SOCKETLEY_NO_LUA</code> 
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><code>send(fd, msg)</code></td><td>Send message to a specific client</td></tr>
-<tr><td><code>broadcast(msg)</code></td><td>Send to all connected clients</td></tr>
-<tr><td><code>disconnect(fd)</code></td><td>Disconnect a client</td></tr>
-<tr><td><code>peer_ip(fd)</code></td><td>Get client's IP address</td></tr>
-<tr><td><code>clients()</code></td><td>Get vector of all connected client fds</td></tr>
-<tr><td><code>multicast(fds, msg)</code></td><td>Send to a subset of clients</td></tr>
-<tr><td><code>set_data(fd, k, v)</code></td><td>Set per-connection metadata</td></tr>
-<tr><td><code>get_data(fd, k)</code></td><td>Get per-connection metadata</td></tr>
-</tbody>
-</table>
-
-<h4>Lifecycle &amp; Escape Hatches</h4>
-<table>
-<thead><tr><th>Method</th><th>Description</th></tr></thead>
-<tbody>
-<tr><td><code>start()</code></td><td>Initialize event loop, install signal handlers, run &mdash; blocks until SIGINT/SIGTERM</td></tr>
-<tr><td><code>stop()</code></td><td>Request the event loop to stop</td></tr>
-<tr><td><code>instance()</code></td><td>Access the underlying <code>server_instance*</code></td></tr>
-<tr><td><code>manager()</code></td><td>Access the underlying <code>runtime_manager&amp;</code></td></tr>
-<tr><td><code>loop()</code></td><td>Access the underlying <code>event_loop&amp;</code></td></tr>
+<tr><td><code>send(fd, msg)</code> / <code>broadcast(msg)</code> / <code>multicast(fds, msg)</code></td><td>Send to one / all / a subset of clients</td></tr>
+<tr><td><code>disconnect(fd)</code> / <code>peer_ip(fd)</code> / <code>clients()</code></td><td>Connection control and introspection</td></tr>
+<tr><td><code>set_data(fd, k, v)</code> / <code>get_data(fd, k)</code> / <code>del_data(fd, k)</code></td><td>Per-connection metadata; vanishes with the connection</td></tr>
+<tr><td><code>join_group(fd, g)</code> / <code>leave_group(fd, g)</code> / <code>group_send(g, msg)</code></td><td>Multicast groups (rooms)</td></tr>
+<tr><td><code>pipe(fd_a, fd_b)</code> / <code>unpipe(fd)</code></td><td>Zero-copy pairing of two connections</td></tr>
+<tr><td><code>upstream_send(id, msg)</code> / <code>upstream_broadcast(msg)</code> / <code>upstreams()</code></td><td>Talk to the configured upstreams</td></tr>
+<tr><td><code>ws_headers(fd)</code></td><td>The upgrade headers of a WebSocket connection</td></tr>
+<tr><td><code>rebuild_http_cache()</code></td><td>Re-scan <code>http_dir</code> into the response cache</td></tr>
 </tbody>
 </table>
 
 <pre><code>socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+srv.<span class="fn">mode</span>(mode_in);   <span class="cm">// on_message IS the protocol -- relay off</span>
 
-srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
-    printf(<span class="st">"client %d connected\n"</span>, fd);
-});
 srv.<span class="fn">on_message</span>([&amp;](<span class="kw">int</span> fd, std::string_view msg) {
     srv.<span class="fn">send</span>(fd, <span class="st">"echo: "</span> + std::string(msg));
 });
-srv.<span class="fn">on_disconnect</span>([](<span class="kw">int</span> fd) {
-    printf(<span class="st">"client %d disconnected\n"</span>, fd);
-});
 
-srv.<span class="fn">start</span>();</code></pre>
+<span class="kw">return</span> srv.<span class="fn">start</span>() ? <span class="nb">0</span> : <span class="nb">2</span>;</code></pre>
 </div>
 
 <div class="method-card" id="sdk-wrap-client">
@@ -848,46 +939,36 @@ srv.<span class="fn">start</span>();</code></pre>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-client">Client</span>
 </div>
-<p class="method-sig">client(std::string_view host, uint16_t port)</p>
-<p class="method-desc">High-level TCP/UDP client with optional auto-reconnect.</p>
+<p class="method-sig">client(std::string_view host, uint16_t port, std::string_view name = "_sdk_client")</p>
+<p class="method-sig">client(std::string_view target, std::string_view name = "_sdk_client")</p>
+<p class="method-desc">High-level TCP/UDP client with optional auto-reconnect. The one-argument form is the <code>-t</code> spelling verbatim: <code>"host:port"</code>, or <code>"unix:/path/to.sock"</code> &mdash; the connect side of a server's <code>--listen unix:</code>, and the only way to dial a unix socket from the SDK.</p>
 
 <h4>Config (chainable)</h4>
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><code>tls()</code></td><td>Enable TLS</td></tr>
-<tr><td><code>tls_ca(ca)</code></td><td>Enable TLS with custom CA certificate</td></tr>
+<tr><td><code>tls()</code></td><td>Dial over TLS. Complete on its own: the host is pinned before the ClientHello and the chain is verified against the system trust store.</td></tr>
+<tr><td><code>tls_ca(ca)</code></td><td>Verify the peer against this CA instead of the system store</td></tr>
+<tr><td><code>client_cert(cert, key)</code></td><td>The certificate this client presents when the peer asks for one &mdash; the client half of mutual TLS. Needs <code>tls()</code> as well, and both halves or neither: half a pair is refused at start.</td></tr>
 <tr><td><code>reconnect(max)</code></td><td>Auto-reconnect: 0 = infinite, &gt;0 = max attempts</td></tr>
 <tr><td><code>mode(m)</code></td><td><code>client_mode_inout</code>, <code>client_mode_in</code>, <code>client_mode_out</code></td></tr>
-<tr><td><code>udp()</code></td><td>Switch to UDP mode</td></tr>
-<tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
-<tr><td><code>tick_interval(ms)</code></td><td>Set periodic tick interval</td></tr>
+<tr><td><code>udp()</code></td><td>Switch to UDP (refused together with <code>tls()</code>: that would be DTLS, which does not exist here)</td></tr>
+<tr><td><code>log_file(path)</code> / <code>write_file(path)</code></td><td>Log traffic / write received data to a file</td></tr>
+<tr><td><code>group(g)</code></td><td>Group tag</td></tr>
+<tr><td><code>lua(path)</code> / <code>tick_interval(ms)</code></td><td>Lua script / periodic tick</td></tr>
 </tbody>
 </table>
 
-<h4>Callbacks (chainable)</h4>
-<table>
-<thead><tr><th>Method</th><th>Signature</th></tr></thead>
-<tbody>
-<tr><td><code>on_start(cb)</code></td><td><code>void()</code></td></tr>
-<tr><td><code>on_stop(cb)</code></td><td><code>void()</code></td></tr>
-<tr><td><code>on_connect(cb)</code></td><td><code>void(int fd)</code></td></tr>
-<tr><td><code>on_disconnect(cb)</code></td><td><code>void(int fd)</code></td></tr>
-<tr><td><code>on_message(cb)</code></td><td><code>void(string_view msg)</code></td></tr>
-<tr><td><code>on_tick(cb)</code></td><td><code>void(double dt_ms)</code></td></tr>
-</tbody>
-</table>
+<h4>Callbacks, Actions &amp; Lifecycle</h4>
+<p>Callbacks as on the server, minus the connection-table ones: <code>on_start</code>, <code>on_stop</code>, <code>on_connect(int)</code>, <code>on_disconnect(int)</code>, <code>on_message(string_view)</code>, <code>on_tick(double)</code>. Action: <code>send(msg)</code>. No <code>idle_timeout()</code>: it reaps idle <em>inbound</em> connections, and a client's own connection is redialled the moment it drops.</p>
 
-<h4>Actions &amp; Lifecycle</h4>
-<p><code>send(msg)</code> &mdash; send to server. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
-
-<pre><code>socketley::client <span class="fn">cli</span>(<span class="st">"127.0.0.1"</span>, <span class="nb">9000</span>);
+<pre><code>socketley::client <span class="fn">cli</span>(<span class="st">"unix:/run/app.sock"</span>);
 cli.<span class="fn">reconnect</span>(<span class="nb">0</span>);  <span class="cm">// infinite reconnect</span>
 cli.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span>) { cli.<span class="fn">send</span>(<span class="st">"hello"</span>); });
 cli.<span class="fn">on_message</span>([](std::string_view msg) {
     printf(<span class="st">"%.*s\n"</span>, (<span class="kw">int</span>)msg.size(), msg.data());
 });
-cli.<span class="fn">start</span>();</code></pre>
+<span class="kw">return</span> cli.<span class="fn">start</span>() ? <span class="nb">0</span> : <span class="nb">2</span>;</code></pre>
 </div>
 
 <div class="method-card" id="sdk-wrap-proxy">
@@ -896,33 +977,51 @@ cli.<span class="fn">start</span>();</code></pre>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-proxy">Proxy</span>
 </div>
-<p class="method-sig">proxy(uint16_t port)</p>
-<p class="method-desc">High-level HTTP/TCP reverse proxy with round-robin or random load balancing.</p>
+<p class="method-sig">proxy(uint16_t port, std::string_view name = "_sdk_proxy")</p>
+<p class="method-sig">proxy(std::string_view unix_path, std::string_view name = "_sdk_proxy")</p>
+<p class="method-desc">High-level TCP/HTTP reverse proxy with load balancing, health checks, circuit breaker and retries.</p>
+
+<div class="warn-box"><strong>The name is the URL space.</strong> In <code>protocol_http</code> mode the runtime routes by path prefix <code>/&lt;name&gt;/</code> &mdash; a request that does not start with it is answered 404 before any backend is consulted, exactly as the daemon's named proxies behave. <code>proxy(8443, "gw")</code> serves <code>/gw/&hellip;</code>; the default name serves <code>/_sdk_proxy/&hellip;</code>. The prefix is stripped before the backend sees the path. <code>protocol_tcp</code> has no prefix (and no per-request anything).</div>
 
 <h4>Config (chainable)</h4>
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><code>backend(addr)</code></td><td>Add a backend target (call multiple times for load balancing)</td></tr>
+<tr><td><code>backend(addr)</code></td><td><code>"host:port"</code>, <code>"unix:/path/to.sock"</code>, or <code>"@group"</code> &mdash; every spelling <code>--backend</code> takes. Call repeatedly for load balancing; <code>clear_backends()</code> empties.</td></tr>
 <tr><td><code>strategy(s)</code></td><td><code>strategy_round_robin</code>, <code>strategy_random</code>, <code>strategy_lua</code></td></tr>
-<tr><td><code>protocol(p)</code></td><td><code>protocol_http</code> or <code>protocol_tcp</code></td></tr>
-<tr><td><code>tls(cert, key)</code></td><td>Enable TLS on the listen socket</td></tr>
-<tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
-<tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle connections after <em>s</em> seconds</td></tr>
-<tr><td><code>lua(path)</code></td><td>Load a Lua script (enables <code>strategy_lua</code>)</td></tr>
-<tr><td><code>group(g)</code></td><td>Group tag for discovery</td></tr>
+<tr><td><code>protocol(p)</code></td><td><code>protocol_tcp</code> (L4 relay) or <code>protocol_http</code> (per-request routing)</td></tr>
+<tr><td><code>tls(cert, key)</code></td><td>Terminate TLS on the listener</td></tr>
+<tr><td><code>client_ca(ca)</code></td><td>Mutual TLS on the listener: clients must present a certificate signed by this CA. Needs <code>tls()</code>.</td></tr>
+<tr><td><code>backend_ca(ca)</code></td><td>Trust store for the <em>backend</em> leg &mdash; and what turns that leg to TLS. Independent of the listener's <code>tls()</code>: a proxy has two legs.</td></tr>
+<tr><td><code>client_cert(cert, key)</code></td><td>The certificate this proxy presents to a backend that asks for one. Both halves or neither.</td></tr>
+<tr><td><code>sidecar()</code></td><td>The <code>--sidecar</code> defaults in one word: TCP health checks, circuit breaker (5 failures / 30 s), 2 retries, drain on stop. Each piece individually overridable below.</td></tr>
+<tr><td><code>health_check(t)</code> / <code>health_interval(s)</code> / <code>health_path(p)</code> / <code>health_threshold(n)</code></td><td>Backend health probing (<code>mesh_config::health_tcp</code> / <code>health_http</code>)</td></tr>
+<tr><td><code>circuit_threshold(n)</code> / <code>circuit_timeout(s)</code></td><td>Circuit breaker</td></tr>
+<tr><td><code>backend_timeout(s)</code></td><td>Seconds a backend may take to produce the first response byte; 0 = no deadline. On by default.</td></tr>
+<tr><td><code>retry_count(n)</code> / <code>retry_all(bool)</code></td><td>Retries against the next backend</td></tr>
+<tr><td><code>max_connections(n)</code> / <code>idle_timeout(s)</code> / <code>rate_limit(r)</code> / <code>global_rate_limit(r)</code></td><td>Limits</td></tr>
+<tr><td><code>drain()</code> / <code>log_file(path)</code> / <code>lua(path)</code> / <code>group(g)</code> / <code>tick_interval(ms)</code></td><td>As on the server</td></tr>
 </tbody>
 </table>
 
-<h4>Callbacks &amp; Lifecycle</h4>
-<p><code>on_start(cb)</code> / <code>on_stop(cb)</code>. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
+<h4>Hooks &amp; Callbacks</h4>
+<p><code>on_start</code>, <code>on_stop</code>, <code>on_connect(int)</code>, <code>on_disconnect(int)</code>, <code>on_tick(double)</code> as elsewhere &mdash; plus the byte-path hooks:</p>
+<div class="warn-box"><strong>The hook return contract is not the obvious one.</strong> <code>on_proxy_request(cb)</code> / <code>on_proxy_response(cb)</code> take <code>std::optional&lt;std::string&gt;(int fd, std::string_view data)</code>:<br>
+<code>return std::nullopt;</code> &mdash; <strong>DROP</strong>: the bytes are not forwarded.<br>
+<code>return std::string{};</code> &mdash; pass through unmodified (empty = "no edit").<br>
+<code>return std::string("&hellip;");</code> &mdash; forward this instead of the original.<br>
+A hook that returns <code>nullopt</code> meaning "no change" forwards nothing: on HTTP every request then dies at <code>backend_timeout</code> as a 504, and with <code>backend_timeout(0)</code> the client hangs. On <code>protocol_http</code> the request hook runs on the head and again on body chunks; on <code>protocol_tcp</code> on every read.</div>
 
-<pre><code>socketley::proxy <span class="fn">px</span>(<span class="nb">8080</span>);
-px.<span class="fn">backend</span>(<span class="st">"127.0.0.1:9001"</span>)
-  .<span class="fn">backend</span>(<span class="st">"127.0.0.1:9002"</span>)
-  .<span class="fn">protocol</span>(protocol_tcp)
-  .<span class="fn">strategy</span>(strategy_round_robin);
-px.<span class="fn">start</span>();</code></pre>
+<h4>Actions</h4>
+<p><code>peer_ip(fd)</code>, <code>close_client(fd)</code>, <code>clients()</code>, <code>backends()</code>, <code>backend_health()</code> (vector of <code>{status, address}</code>).</p>
+
+<pre><code><span class="cm">// TLS edge gateway in front of a unix-socket app -- serves /gw/...</span>
+socketley::proxy <span class="fn">gw</span>(<span class="nb">8443</span>, <span class="st">"gw"</span>);
+gw.<span class="fn">tls</span>(<span class="st">"cert.pem"</span>, <span class="st">"key.pem"</span>)
+  .<span class="fn">protocol</span>(protocol_http)
+  .<span class="fn">backend</span>(<span class="st">"unix:/tmp/edge-app.sock"</span>)
+  .<span class="fn">sidecar</span>();
+<span class="kw">return</span> gw.<span class="fn">start</span>() ? <span class="nb">0</span> : <span class="nb">2</span>;</code></pre>
 </div>
 
 <div class="method-card" id="sdk-wrap-cache">
@@ -931,36 +1030,53 @@ px.<span class="fn">start</span>();</code></pre>
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-cache">Cache</span>
 </div>
-<p class="method-sig">cache(uint16_t port)</p>
-<p class="method-desc">High-level Redis-compatible in-memory cache with optional persistence and replication.</p>
+<p class="method-sig">cache(uint16_t port, std::string_view name = "_sdk_cache")</p>
+<p class="method-sig">cache(std::string_view unix_path, std::string_view name = "_sdk_cache")</p>
+<p class="method-desc">High-level Redis-compatible in-memory cache with optional persistence and replication &mdash; and direct in-process access to the store, no network round trip.</p>
 
 <h4>Config (chainable)</h4>
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
 <tr><td><code>persistent(path)</code></td><td>Auto-save/load cache data to disk</td></tr>
-<tr><td><code>max_memory(bytes)</code></td><td>Set memory limit for cache store</td></tr>
-<tr><td><code>eviction(policy)</code></td><td><code>evict_none</code>, <code>evict_allkeys_lru</code>, <code>evict_allkeys_random</code></td></tr>
-<tr><td><code>resp()</code></td><td>Force RESP protocol mode (Redis-compatible binary protocol)</td></tr>
+<tr><td><code>max_memory(bytes)</code> / <code>eviction(policy)</code></td><td><code>evict_none</code>, <code>evict_allkeys_lru</code>, <code>evict_allkeys_random</code></td></tr>
+<tr><td><code>resp()</code></td><td>Force RESP protocol mode (Redis clients)</td></tr>
 <tr><td><code>mode(m)</code></td><td><code>cache_mode_readonly</code>, <code>cache_mode_readwrite</code>, <code>cache_mode_admin</code></td></tr>
-<tr><td><code>tls(cert, key)</code></td><td>Enable TLS on the listen socket</td></tr>
-<tr><td><code>max_connections(n)</code></td><td>Limit concurrent connections</td></tr>
-<tr><td><code>idle_timeout(s)</code></td><td>Disconnect idle connections after <em>s</em> seconds</td></tr>
-<tr><td><code>replicate(target)</code></td><td>Set replication target (<code>"host:port"</code>)</td></tr>
-<tr><td><code>lua(path)</code></td><td>Load a Lua script</td></tr>
-<tr><td><code>group(g)</code></td><td>Group tag for discovery</td></tr>
+<tr><td><code>tls(cert, key)</code></td><td>Terminate TLS on the cache's own listener. Real since the record layer landed on all four runtime types; an earlier revision of the SDK documented it as refused. What is still refused: half a key pair, and <code>tls()</code> together with <code>replicate()</code> &mdash; the replication link dials its leader in cleartext, so the pair would stream the whole dataset off a port the flags call encrypted.</td></tr>
+<tr><td><code>client_ca(ca)</code></td><td>Mutual TLS on the listener: a cache's <code>--ca</code> is the client CA for its own listener, exactly as a server's is. Needs <code>tls()</code>.</td></tr>
+<tr><td><code>replicate(target)</code></td><td>Replicate from a leader (<code>"host:port"</code>)</td></tr>
+<tr><td><code>max_connections(n)</code> / <code>idle_timeout(s)</code> / <code>rate_limit(r)</code> / <code>global_rate_limit(r)</code></td><td>Limits</td></tr>
+<tr><td><code>log_file(path)</code> / <code>drain()</code> / <code>lua(path)</code> / <code>group(g)</code> / <code>tick_interval(ms)</code></td><td>As on the server</td></tr>
+</tbody>
+</table>
+
+<h4>In-Process Store Access</h4>
+<p>These operate on the store directly &mdash; a function call, not a connection. They work before <code>start()</code> and alongside it (single-threaded discipline applies: call them from the loop's thread, i.e. from callbacks, or before the loop runs).</p>
+<table>
+<thead><tr><th>Group</th><th>Methods</th></tr></thead>
+<tbody>
+<tr><td>Strings</td><td><code>get</code>, <code>set</code>, <code>del</code></td></tr>
+<tr><td>Lists</td><td><code>lpush</code>, <code>rpush</code>, <code>lpop</code>, <code>rpop</code>, <code>llen</code></td></tr>
+<tr><td>Sets</td><td><code>sadd</code>, <code>srem</code>, <code>sismember</code>, <code>scard</code></td></tr>
+<tr><td>Hashes</td><td><code>hset</code>, <code>hget</code>, <code>hdel</code>, <code>hlen</code></td></tr>
+<tr><td>TTL</td><td><code>expire</code>, <code>ttl</code>, <code>persist</code></td></tr>
+<tr><td>Pub/Sub</td><td><code>publish(channel, msg)</code> &rarr; subscriber count</td></tr>
+<tr><td>Admin</td><td><code>size()</code>, <code>memory_used()</code>, <code>flush(path = "")</code>, <code>load(path = "")</code></td></tr>
+<tr><td>Raw</td><td><code>execute(line)</code> &mdash; the text protocol in-process: <code>execute("set k v")</code> &rarr; <code>"ok\n"</code>, newline and all</td></tr>
+<tr><td>Stats</td><td><code>stat_commands()</code>, <code>stat_hits()</code>, <code>stat_misses()</code>, <code>stat_expired()</code></td></tr>
 </tbody>
 </table>
 
 <h4>Callbacks &amp; Lifecycle</h4>
-<p><code>on_start(cb)</code> / <code>on_stop(cb)</code>. <code>start()</code> / <code>stop()</code> / <code>instance()</code> / <code>manager()</code> / <code>loop()</code>.</p>
+<p><code>on_start</code> / <code>on_stop</code> / <code>on_tick(double)</code> + <code>tick_interval(ms)</code>. A cache has no per-connection callbacks &mdash; the protocol is the interface.</p>
 
 <pre><code>socketley::cache <span class="fn">c</span>(<span class="nb">6379</span>);
 c.<span class="fn">persistent</span>(<span class="st">"/var/data/store.dat"</span>)
  .<span class="fn">resp</span>()
  .<span class="fn">max_memory</span>(<span class="nb">256</span> * <span class="nb">1024</span> * <span class="nb">1024</span>)
  .<span class="fn">eviction</span>(evict_allkeys_lru);
-c.<span class="fn">start</span>();</code></pre>
+c.<span class="fn">set</span>(<span class="st">"boot"</span>, <span class="st">"ok"</span>);          <span class="cm">// in-process, before the port is open</span>
+<span class="kw">return</span> c.<span class="fn">start</span>() ? <span class="nb">0</span> : <span class="nb">2</span>;</code></pre>
 </div>
 
 <h4>Raw Engine API</h4>
@@ -975,7 +1091,16 @@ c.<span class="fn">start</span>();</code></pre>
   <span class="badge badge-tier2">Tier 2</span>
 </div>
 <p class="method-sig">bool init()</p>
-<p class="method-desc">Initialize the io_uring ring with SQPOLL. Must be called before any other event_loop method. Returns false if io_uring setup fails (missing kernel support).</p>
+<p class="method-desc">Initialize the io_uring ring. Must be called before any other event_loop method. Returns false if io_uring setup fails (missing kernel support). SQPOLL is <em>opt-in</em>: <code>set_sqpoll(true)</code> before <code>init()</code>, or <code>SOCKETLEY_SQPOLL=1</code> in the environment &mdash; and a request, not a guarantee: the kernel may refuse, in which case the loop runs without a poller (<code>sqpoll_enabled()</code> says what the ring actually got, <code>sqpoll_requested()</code> what was asked). A ring's polling mode is fixed at creation and cannot change afterwards.</p>
+</div>
+
+<div class="method-card" id="sdk-el-config">
+<div class="method-header">
+  <span class="method-name">event_loop::set_sqpoll / set_cpus</span>
+  <span class="badge badge-tier2">Tier 2</span>
+</div>
+<p class="method-sig">void set_sqpoll(bool on) &nbsp;&middot;&nbsp; void set_cpus(const cpu_set_spec&amp; cpus)</p>
+<p class="method-desc">Ring configuration; both must be called <em>before</em> <code>init()</code>. <code>set_cpus</code> bounds the loop thread's CPU set (parse a spec string with <code>parse_cpu_set("0-3", online_cpu_count(), out, err)</code>); under SQPOLL the poller thread is pinned to the set's lowest member, because io_uring takes a CPU <em>number</em> for the poller, not a mask. The wrapper classes expose both as <code>cpus(spec)</code> and <code>sqpoll(bool)</code>.</p>
 </div>
 
 <div class="method-card" id="sdk-el-run">
@@ -1116,6 +1241,10 @@ c.<span class="fn">start</span>();</code></pre>
 <tr><td><code>set_target(string_view)</code></td><td>Target address (client type)</td></tr>
 <tr><td><code>set_group(string_view)</code></td><td>Group tag (for proxy backend discovery)</td></tr>
 <tr><td><code>set_log_file(string_view)</code></td><td>Log output path</td></tr>
+<tr><td><code>set_listen_path(string_view)</code></td><td>AF_UNIX listener path instead of a port (<code>--listen unix:</code>); port and path are alternatives, never both</td></tr>
+<tr><td><code>set_tick_interval(uint32_t ms)</code></td><td>Periodic tick interval for <code>on_tick</code></td></tr>
+<tr><td><code>set_cpus(const cpu_set_spec&amp;)</code> / <code>set_sqpoll(bool)</code></td><td>A <em>request</em>, checked against the ring the runtime is started on &mdash; a shared ring that does not match refuses the start. On a ring you create yourself, configure the <code>event_loop</code> instead.</td></tr>
+<tr><td><code>set_shards(uint32_t)</code></td><td>Worker-process shard count. Refused &gt;1 for any in-process runtime &mdash; a shard IS a worker process; meaningful only under the daemon.</td></tr>
 </tbody>
 </table>
 
@@ -1623,7 +1752,7 @@ srv-&gt;<span class="fn">set_on_tick</span>([](<span class="kw">double</span> dt
 </tbody>
 </table>
 
-<div class="info-box"><strong>Lua is the primary receive mechanism.</strong> Tier 1 SDK (IPC) cannot receive async push messages &mdash; it's request/response only. Use <code>socketley.subscribe()</code> in a Lua script attached to any runtime to react to published messages. See <a href="#addons-pubsub">Cross-Runtime Pub/Sub</a> for the full API.</div>
+<div class="info-box"><strong>Lua is the primary receive mechanism.</strong> Tier 1 SDK (IPC) cannot receive async push messages &mdash; it's request/response only. Use <code>socketley.subscribe()</code> in a Lua script attached to any runtime to react to published messages. See the Cross-Runtime Pub/Sub section of the Addons page for the full API.</div>
 
 <p><strong>Example:</strong> A server that broadcasts cache events to all TCP clients:</p>
 <pre><code><span class="cm">-- notify.lua (attach to a server runtime)</span>
@@ -1862,7 +1991,7 @@ std::string info = cache-&gt;<span class="fn">execute</span>(<span class="st">"D
   <span class="method-name">daemon_attach</span>
   <span class="badge badge-tier3">Tier 3</span>
 </div>
-<p class="method-sig">bool socketley::daemon_attach(const std::string&amp; name, const std::string&amp; type, uint16_t port)</p>
+<p class="method-sig">bool socketley::daemon_attach(const std::string&amp; name, const std::string&amp; type, uint16_t port, const std::string&amp; owner = "")</p>
 <p class="method-desc">Register the current process with the daemon. After calling, your process appears in <code>socketley ls</code>, <code>socketley stats</code>, and <code>socketley ps</code>. Automatically deregisters on <code>exit()</code> via <code>atexit()</code>.</p>
 <table>
 <thead><tr><th>Parameter</th><th>Description</th></tr></thead>
@@ -1870,9 +1999,19 @@ std::string info = cache-&gt;<span class="fn">execute</span>(<span class="st">"D
 <tr><td><code>name</code></td><td>Name to register under</td></tr>
 <tr><td><code>type</code></td><td><code>"server"</code>, <code>"client"</code>, <code>"proxy"</code>, or <code>"cache"</code></td></tr>
 <tr><td><code>port</code></td><td>Port your service is listening on</td></tr>
+<tr><td><code>owner</code></td><td>Optional: parent this entry under an existing runtime, as <code>attach &hellip; --owner</code> does. <code>socketley ls</code> shows the hierarchy, and the owner's child policy decides what happens to this entry when the owner goes.</td></tr>
 </tbody>
 </table>
-<p class="method-returns"><strong>Returns:</strong> <code>true</code> if daemon accepted the registration, <code>false</code> if daemon not running (service works standalone)</p>
+<p class="method-returns"><strong>Returns:</strong> <code>true</code> if daemon accepted the registration, <code>false</code> if daemon not running (service works standalone) or if it refused &mdash; <code>socketley::attach_error()</code> holds the refusal verbatim (empty after a success).</p>
+</div>
+
+<div class="method-card" id="sdk-attach-error">
+<div class="method-header">
+  <span class="method-name">attach_error</span>
+  <span class="badge badge-tier3">Tier 3</span>
+</div>
+<p class="method-sig">const std::string&amp; socketley::attach_error()</p>
+<p class="method-desc">Why the last <code>daemon_attach()</code> returned <code>false</code>: the daemon's refusal verbatim, or the connect failure. <code>daemon_attach()</code> returns <code>bool</code> because registering is usually best-effort ("run anyway, just unlisted") &mdash; this is for the cases where it is not.</p>
 </div>
 
 <div class="method-card" id="sdk-detach">
