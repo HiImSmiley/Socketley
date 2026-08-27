@@ -4,21 +4,31 @@ A high-performance Linux daemon and CLI that manages network runtimes (servers, 
 
 **[Documentation](https://hiimsmiley.github.io/Socketley/)**
 
-> **TLS: server listeners only.** A `server` runtime terminates TLS on its own
-> port — accept, handshake and record layer all driven by the io_uring event
-> loop, with OpenSSL behind a memory BIO pair so it never touches a socket.
-> Everything above it runs on the decrypted stream, so one listener serves
-> `https://` and `wss://` too. `--ca` adds mutual TLS.
+> **TLS, on every role that has a handshake to put it on.** All four runtime
+> types do:
 >
-> **No other role has a handshake behind it.** A client runtime's outbound
-> socket, a proxy's leg to its backends, and the mesh `--client-*` options are
-> all still cleartext, so those flags **fail closed** — refused when you set
-> them, refused again before the runtime starts. So is any incomplete server
-> configuration (`--tls` with no key pair, a certificate with no `--tls`, a key
-> that does not match its certificate): the runtime goes to `failed` and the
-> port is never bound. A flag that errors out costs you an afternoon; a flag
-> that silently serves cleartext on a port you were told was encrypted is a
-> breach.
+> - a **server** listener, so one port serves `https://` and `wss://` too
+> - a **cache** listener, which also refuses to replicate out of one in cleartext
+> - a **client**'s outbound socket, pinning the host from `-t` and verifying the
+>   chain against the system store
+> - a **proxy**, on *both* legs — its own listener and the connections it dials
+>   to its backends, with the backend handshake reused rather than repeated per
+>   request
+>
+> `--ca` adds mutual TLS on a listener; `--cert`/`--key` are the certificate a
+> client or proxy presents when a peer asks for one.
+>
+> **The one thing with no handshake behind it is a datagram socket.** `--tls`
+> with `--udp` would be DTLS, which is not implemented, and it is refused.
+>
+> **Everything incomplete fails closed** — refused when you type the flag, and
+> refused again before the runtime starts, including for configurations that
+> never came from a command line. `--tls` with no key pair, a certificate with
+> no `--tls`, a key that does not match its certificate, half of a client
+> certificate pair, a `--client-ca` on a role with no listener to receive one:
+> the runtime goes to `failed` and the port is never bound. A flag that errors
+> out costs you an afternoon; a flag that silently serves cleartext on a port
+> you were told was encrypted is a breach.
 
 ```bash
 socketley create server secure -p 9443 --tls --cert server.pem --key server-key.pem -s
@@ -91,9 +101,13 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Cache**:In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
+- **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime
+- **Process isolation**:Every runtime is a supervised worker process by default, so one runtime cannot take the daemon down with it; `--daemon-process` opts back in to sharing it
+- **Unix sockets**:`--listen unix:/path` on a listener and `--backend unix:/path` for a proxy's backends
+- **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run, and SQPOLL is a choice rather than always on
 - **Master mode**:One client claims master, broadcasts to all; optional forwarding
 - **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
-- **TLS/SSL**:Server listeners terminate TLS (incl. mutual TLS); every other role is refused — see the note at the top
+- **TLS/SSL**:Server, cache and proxy listeners terminate TLS (incl. mutual TLS); client runtimes and proxy backend legs dial over it — see the note at the top
 - **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
 - **io_uring**:Multishot accept, SQPOLL, provided buffers, writev coalescing
 - **State persistence**:Runtime configs saved as JSON, auto-restored on daemon restart
@@ -370,10 +384,13 @@ still want it to themselves.
 
 - Single-binary daemon + CLI communicating via Unix socket IPC
 - io_uring event loop (single-threaded, SQPOLL)
-- All runtimes managed in-process (no subprocess spawning)
+- Each runtime gets its own supervised worker process by default;
+  `--daemon-process` keeps it inside the daemon instead
 - FNV-1a hash switching for zero-allocation command dispatch
 - sol2/LuaJIT for Lua callbacks
-- Everything statically linked for portability
+- LuaJIT is statically linked; liburing, OpenSSL and the C++ runtime are
+  resolved from the host (`ldd` is the authority — see
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md))
 
 ## Requirements
 
@@ -409,4 +426,17 @@ entirely.
 
 ## License
 
-Apache 2.0
+Apache 2.0 — see [LICENSE](LICENSE).
+
+### Third-party components
+
+Socketley vendors and links against software under other licences, all of them
+permissive. The full list, with versions, licence texts and which components
+actually end up inside the shipped binary, is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+- **[LuaJIT](https://luajit.org/)** (MIT) — statically linked; the Lua runtime
+- **[sol2](https://github.com/ThePhD/sol2)** (MIT) — header-only; the C++/Lua binding
+- **[liburing](https://github.com/axboe/liburing)** (MIT) — dynamically linked; io_uring
+- **[doctest](https://github.com/doctest/doctest)** (MIT) — header-only; unit tests only
+- **[OpenSSL](https://openssl-library.org/)** (Apache-2.0) — dynamically linked; TLS
