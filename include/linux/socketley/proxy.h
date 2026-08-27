@@ -12,7 +12,13 @@ namespace socketley {
 //   px.start();
 class proxy {
 public:
-    explicit proxy(uint16_t port) : m_name("_sdk_proxy") {
+    // `name` is not cosmetic on a proxy: in protocol_http mode the runtime
+    // routes by path prefix "/<name>/" -- a GET that does not start with it is
+    // answered 404 before any backend is consulted, exactly as the daemon's
+    // named proxies behave.  So proxy(8443, "gw") serves /gw/..., and the
+    // default name serves /_sdk_proxy/....  protocol_tcp has no prefix.
+    explicit proxy(uint16_t port, std::string_view name = "_sdk_proxy")
+        : m_name(name) {
         m_mgr.create(runtime_proxy, m_name);
         auto* inst = raw();
         inst->set_port(port);
@@ -23,7 +29,8 @@ public:
     // Listen on an AF_UNIX socket instead of a TCP port — see the same
     // constructor on server for why this is a constructor and why tls() does
     // not combine with it.  Accepts the path with or without `unix:`.
-    explicit proxy(std::string_view unix_path) : m_name("_sdk_proxy") {
+    explicit proxy(std::string_view unix_path, std::string_view name = "_sdk_proxy")
+        : m_name(name) {
         m_mgr.create(runtime_proxy, m_name);
         auto* inst = raw();
         if (unix_path.rfind("unix:", 0) == 0)
@@ -107,6 +114,23 @@ public:
     proxy& on_disconnect(std::function<void(int)> cb)      { raw()->set_on_disconnect(std::move(cb)); return *this; }
     proxy& on_tick(std::function<void(double)> cb)         { raw()->set_on_tick(std::move(cb)); return *this; }
     proxy& tick_interval(uint32_t ms)                      { raw()->set_tick_interval(ms); return *this; }
+    // The byte-path hooks, and their return contract is NOT the obvious one:
+    //
+    //     return std::nullopt;      -> DROP: the bytes are not forwarded.
+    //     return std::string{};     -> pass through unmodified (empty = "no edit")
+    //     return std::string(...);  -> forward this instead of the original
+    //
+    // std::optional reads as "optionally return a replacement", which makes
+    // nullopt look like "no change" -- it is the opposite, and a hook written
+    // that way forwards nothing: on HTTP every request then runs into
+    // backend_timeout and answers 504, and with backend_timeout(0) the client
+    // hangs.  Measured here before this comment existed.  Note the asymmetry
+    // with a Lua on_proxy_request, whose refusal CLOSES the connection; the
+    // C++ drop leaves it open with the bytes swallowed.
+    //
+    // On protocol_http the request hook runs on the request head and again on
+    // body chunks; on protocol_tcp it runs on every read.  The response hook
+    // is the same contract on the backend-to-client direction.
     proxy& on_proxy_request(proxy_instance::proxy_hook cb) { prx()->set_on_proxy_request(std::move(cb)); return *this; }
     proxy& on_proxy_response(proxy_instance::proxy_hook cb){ prx()->set_on_proxy_response(std::move(cb)); return *this; }
 

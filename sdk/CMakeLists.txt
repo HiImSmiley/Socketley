@@ -119,4 +119,30 @@ if(SOCKETLEY_BUILD_EXAMPLES)
 
     add_executable(http_file_server examples/advanced/http_file_server.cpp)
     target_link_libraries(http_file_server PRIVATE socketley_sdk)
+
+    # ── Project examples (sdk/examples/projects/) ────────────────────
+    # Each directory is a small runnable project; see its README.md.
+
+    add_executable(jobqueue_jobd examples/projects/jobqueue/jobd.cpp)
+    target_link_libraries(jobqueue_jobd PRIVATE socketley_sdk)
+
+    # cross-platform: needs only the client header
+    add_executable(jobqueue_worker examples/projects/jobqueue/worker.cpp)
+    target_include_directories(jobqueue_worker PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include/windows")
+
+    add_executable(chatroom_chatd examples/projects/chatroom/chatd.cpp)
+    target_link_libraries(chatroom_chatd PRIVATE socketley_sdk)
+
+    add_executable(chatroom_cli examples/projects/chatroom/chat_cli.cpp)
+    target_include_directories(chatroom_cli PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include/windows")
+    find_package(Threads REQUIRED)
+    target_link_libraries(chatroom_cli PRIVATE Threads::Threads)
+
+    add_executable(edge_app examples/projects/edge/app.cpp)
+    target_link_libraries(edge_app PRIVATE socketley_sdk)
+
+    add_executable(edge_gateway examples/projects/edge/gateway.cpp)
+    target_link_libraries(edge_gateway PRIVATE socketley_sdk)
 endif()

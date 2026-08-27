@@ -12,7 +12,8 @@ namespace socketley {
 //   c.start();
 class cache {
 public:
-    explicit cache(uint16_t port) : m_name("_sdk_cache") {
+    explicit cache(uint16_t port, std::string_view name = "_sdk_cache")
+        : m_name(name) {
         m_mgr.create(runtime_cache, m_name);
         auto* inst = raw();
         inst->set_port(port);
@@ -23,7 +24,8 @@ public:
     // Listen on an AF_UNIX socket instead of a TCP port — see the same
     // constructor on server for why this is a constructor and why tls() does
     // not combine with it.  Accepts the path with or without `unix:`.
-    explicit cache(std::string_view unix_path) : m_name("_sdk_cache") {
+    explicit cache(std::string_view unix_path, std::string_view name = "_sdk_cache")
+        : m_name(name) {
         m_mgr.create(runtime_cache, m_name);
         auto* inst = raw();
         if (unix_path.rfind("unix:", 0) == 0)

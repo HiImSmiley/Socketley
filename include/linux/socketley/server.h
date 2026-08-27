@@ -18,7 +18,8 @@ namespace socketley {
 //   - start() blocks; for async patterns, use the raw API via instance()/loop()
 class server {
 public:
-    explicit server(uint16_t port) : m_name("_sdk_server") {
+    explicit server(uint16_t port, std::string_view name = "_sdk_server")
+        : m_name(name) {
         m_mgr.create(runtime_server, m_name);
         auto* inst = raw();
         inst->set_port(port);
@@ -34,7 +35,8 @@ public:
     // other constructor was given would be deciding that conflict itself.
     // tls() does not combine with this either: a unix socket is not on a
     // network, and the node's permissions are what restrict it.
-    explicit server(std::string_view unix_path) : m_name("_sdk_server") {
+    explicit server(std::string_view unix_path, std::string_view name = "_sdk_server")
+        : m_name(name) {
         m_mgr.create(runtime_server, m_name);
         auto* inst = raw();
         if (unix_path.rfind("unix:", 0) == 0)

@@ -37,11 +37,20 @@ int main()
         (void)srv.get_listen_path();
     }
 
-    // Server on an AF_UNIX listener (constructor overload)
+    // Server on an AF_UNIX listener (constructor overload), and a named one
     {
         socketley::server srv("unix:/tmp/_sdk_compile_test.sock");
         srv.sqpoll(false);
         srv.cpus("max");
+    }
+    {
+        socketley::server named(static_cast<uint16_t>(9001), "web");
+        (void)named.name();
+        socketley::proxy npx(static_cast<uint16_t>(8081), "gw");
+        (void)npx.name();
+        socketley::cache ncc(static_cast<uint16_t>(6380), "store");
+        socketley::client ncl("127.0.0.1", 9001, "feed");
+        (void)ncc.name(); (void)ncl.name();
     }
 
     // Client wrapper
@@ -87,7 +96,9 @@ int main()
           .on_disconnect([](int) { })
           .on_tick([](double) { })
           .tick_interval(500)
-          .on_proxy_request([](int, std::string_view) -> std::optional<std::string> { return std::nullopt; })
+          // Hook contract (see proxy.h): nullopt = drop, "" = unchanged,
+          // non-empty = replace.
+          .on_proxy_request([](int, std::string_view) -> std::optional<std::string> { return std::string{}; })
           .on_proxy_response([](int, std::string_view) -> std::optional<std::string> { return "modified"; });
 
         (void)px.instance();

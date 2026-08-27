@@ -13,7 +13,8 @@ namespace socketley {
 //   cli.start();
 class client {
 public:
-    client(std::string_view host, uint16_t port) : m_name("_sdk_client") {
+    client(std::string_view host, uint16_t port,
+           std::string_view name = "_sdk_client") : m_name(name) {
         m_mgr.create(runtime_client, m_name);
         auto* inst = raw();
         inst->set_target(std::string(host) + ":" + std::to_string(port));
@@ -25,7 +26,8 @@ public:
     // connect side of a server's `--listen unix:`.  This is the only way to
     // dial a unix socket from the SDK; the two-argument constructor always
     // builds `host:port`.
-    explicit client(std::string_view target) : m_name("_sdk_client") {
+    explicit client(std::string_view target,
+                    std::string_view name = "_sdk_client") : m_name(name) {
         m_mgr.create(runtime_client, m_name);
         auto* inst = raw();
         inst->set_target(target);
