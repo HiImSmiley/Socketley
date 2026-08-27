@@ -562,6 +562,11 @@ bool daemon_handler::setup()
     // file in the process.
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        // Which path, and why.  A daemon that cannot bind its IPC socket exits
+        // without serving anything, and "already in use" and "permission
+        // denied" want opposite things done about them.
+        LOG_ERROR(("ipc socket: " + std::string(addr.sun_path) + " could not be bound: " +
+                   std::string(std::strerror(errno))).c_str());
         // Raw close on purpose: the first submission this descriptor can ever
         // appear in is the accept at the bottom of this function, and the
         // failure paths do not reach it.  The number provably never entered the

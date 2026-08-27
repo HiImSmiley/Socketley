@@ -15,6 +15,7 @@
 
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -525,6 +526,8 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        LOG_ERROR(("cache: port " + std::to_string(port) + " could not be bound: " +
+                   std::string(std::strerror(errno))).c_str());
         close_tracked(fd);
         return false;
     }

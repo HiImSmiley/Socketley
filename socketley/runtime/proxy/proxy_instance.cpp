@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <cerrno>
 #include <cstdlib>
 #include <cstddef>
 #include <charconv>
@@ -1724,6 +1725,8 @@ bool proxy_instance::setup(event_loop& loop)
 
         if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
         {
+            LOG_ERROR(("proxy: port " + std::to_string(port) + " could not be bound: " +
+                       std::string(std::strerror(errno))).c_str());
             close_tracked(m_listen_fd);
             m_listen_fd = -1;
             return false;

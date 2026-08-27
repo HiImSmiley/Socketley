@@ -3,6 +3,7 @@
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/blocking_write.h"
+#include "../shared/logging.h"
 #include "../shared/version.h"
 
 #include <unistd.h>
@@ -53,6 +54,8 @@ bool metrics_endpoint::start(uint16_t port)
     // of these descriptors is the event loop's to hold.
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        LOG_ERROR(("metrics: port " + std::to_string(port) + " could not be bound: " +
+                   std::string(std::strerror(errno))).c_str());
         close(m_listen_fd);
         m_listen_fd = -1;
         return false;
