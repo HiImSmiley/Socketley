@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose something Socketley should be able to do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do that you cannot do today?
+      description: >
+        Describe the situation, not the solution. The most useful reports here
+        have been the ones that said what the operator was trying to achieve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would it look like?
+      description: A flag, a command, a Lua callback — whatever shape you have in mind.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area?
+      multiple: true
+      options:
+        - server runtime
+        - client runtime
+        - proxy runtime
+        - cache runtime
+        - Lua scripting
+        - clustering / sharding
+        - TLS
+        - CLI or daemon
+        - SDK
+        - documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What did you try instead?
+      description: >
+        Existing flags, a Lua script, another tool in front of it. If a
+        workaround exists and is merely awkward, say so — that is still useful.

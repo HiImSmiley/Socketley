@@ -1,0 +1,73 @@
+name: Bug report
+description: Something behaves differently from how it is documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do **not** use this form for a security problem — see
+        [SECURITY.md](https://github.com/HiImSmiley/Socketley/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect instead?
+      description: The behaviour you saw, and the documented behaviour you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        The exact commands, starting from a fresh daemon. A reproduction that
+        someone else can paste is worth more than a description of one.
+      render: shell
+      placeholder: |
+        socketley create server demo -p 9000 -s
+        printf 'hello\n' | nc localhost 9000
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Output of `socketley --version`, or the commit you built.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: >
+        Kernel (`uname -r`), liburing version, distribution, and how you
+        installed — `.deb`, `install.sh`, or a build from source.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log
+      description: >
+        Relevant output from the daemon. Several checks in this tree report to
+        the daemon's stderr rather than to the client, so this is often where
+        the answer is.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I checked the man page (`man socketley`) or `socketley --help`
+          required: true
+        - label: >
+            My liburing is 2.7 or newer at build time (Ubuntu 24.04's
+            `liburing-dev` is 2.5 and does not compile this tree)
+          required: false
