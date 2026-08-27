@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Integration test: a worker refuses the management API it cannot serve, by name.
+# Integration test: a worker refuses, by name, the calls it cannot serve.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
 # A runtime created without --daemon-process runs in its own process, and that
-# process cannot serve every call on the management API.  Each refusal used to
+# process cannot serve every call the API offers.  Each refusal used to
 # be a false, a nil or an empty table — which is precisely what a *successful*
 # call returns on a daemon with nothing in it.  A script could not tell "there
 # is nothing there" from "I cannot see anything from here", so it carried on
@@ -14,30 +14,46 @@
 # refusal is a Lua error rather than a return value: `if socketley.create(...)`
 # is how these are written and a false is what that already handles.
 #
-# ─── WHY THIS FILE PROBES socketley.stop AND NOT socketley.list ─────────────
+# ─── WHY THIS FILE PROBES socketley.pipe, AND WHAT IT PROBED BEFORE ─────────
 #
-# It probed .list, and .list is no longer refused: a worker is handed the
-# runtime map now, so list() answers out there and this file went red in five
-# places that were never about listing.  Watched, not assumed — 12/18 before
-# this change.
+# It has now been re-pointed twice, and the reason is the same both times: it
+# was written on a call that later stopped being refused.
 #
-# What is left refused splits in two, and only one half is a safe probe for a
-# test:
+#   .list   the worker was handed the runtime map, so list() answers out
+#           there.  Five assertions went red that were never about listing.
+#   .stop   the four map calls travel to the daemon now.  Six went red, and
+#           this file's own header had called them "permanently refused".
+#           Watched, not assumed — 12/18 before the re-point.
 #
-#   the map is coming     .list, .get, .send, socketley.cluster.*  — these stop
-#                         being refused as the transport lands, so a file
-#                         written on one of them has an expiry date.
-#   permanently refused   .create, .start, .stop, .remove change the map, and
-#                         being handed a copy of it is not permission to alter
-#                         it.  .pipe and self.route() move a connection, which
-#                         no map supplies.
+# That header was wrong on its own terms, and the correction is worth keeping
+# rather than quietly replacing: it argued that being handed a COPY of the map
+# is not permission to alter it, which is true and is not the question.  The
+# calls do not alter the copy; they ask the process that holds the original.
 #
-# So the probe is from the permanent half.  socketley.stop() on a name that
-# does not exist, specifically, rather than .create: the CONTROL arm of every
-# assertion here really executes the call in the daemon, and a create would
-# build a runtime — once per request in the filter below, which is hit twice.
-# stop() on a name nothing ever takes answers `false` plus a reason in the
-# daemon, raises in a worker, and creates nothing on either side.
+# So the split is not "reads come back, writes never do".  It is:
+#
+#   needs the map        .list, .get, .send, .create, .start, .stop, .remove
+#                        and socketley.cluster.*.  All of these are answered
+#                        in a worker now — the first three from the replica,
+#                        the four map calls over the control plane at
+#                        child_map_fd.  A file written on one of these has an
+#                        expiry date, and this one has expired twice.
+#   needs a CONNECTION   .pipe and self.route().  A connection does not travel
+#                        in a snapshot of anything: the descriptor has to be
+#                        passed with SCM_RIGHTS or its bytes relayed under a
+#                        reference.  shared/conn_transfer.h has both and
+#                        nothing is wired to it.
+#
+# The probe is from the second group, which is the only one whose refusal is
+# about the mechanism rather than about the transport.  It will expire too, on
+# the day conn_transfer is wired up, and that is the honest position for a file
+# like this to be in — what it must not do is claim a refusal is permanent.
+#
+# socketley.pipe on two names nothing in this file ever creates, specifically:
+# the CONTROL arm of every assertion here really executes the call in the
+# daemon, so the probe has to be one that changes nothing when it succeeds.
+# pipe() on absent names answers `false` plus "there is no runtime called ..."
+# in the daemon, raises in a worker, and touches nothing on either side.
 #
 # ─── THE TWO PLACES A REFUSAL LANDS ─────────────────────────────────────────
 #
@@ -101,7 +117,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Integration: a worker refuses the management API by name ==="
+echo "=== Integration: a worker refuses what it cannot serve, by name ==="
 
 daemon_start "$BIN"
 
@@ -114,14 +130,14 @@ cat > "$CB_LUA" <<'LUAEOF'
 filters = {
     function(req)
         if string.find(req.path, "/mgmt", 1, true) then
-            -- A name nothing in this file ever creates.  In the daemon this
+            -- Two names nothing in this file ever creates.  In the daemon this
             -- answers false plus a reason and changes nothing; in a worker it
             -- raises.  The reason is carried into the body because the control
             -- below checks for it: a bare `false` is also what a build with a
-            -- broken stop() returns, and the sentence is what tells them apart.
-            local ok, why = socketley.stop("mgmt_no_such_runtime")
+            -- broken pipe() returns, and the sentence is what tells them apart.
+            local ok, why = socketley.pipe("mgmt_no_such_src", 1, "mgmt_no_such_dst")
             return { status = 200,
-                     body = "stop=" .. tostring(ok) .. " why=" .. tostring(why) .. "\n" }
+                     body = "pipe=" .. tostring(ok) .. " why=" .. tostring(why) .. "\n" }
         end
         if string.find(req.path, "/ok", 1, true) then
             return { status = 200, body = "alive\n" }
@@ -133,7 +149,7 @@ LUAEOF
 # ── The top-level script ────────────────────────────────────────────────────
 TOP_LUA="$SOCKETLEY_TMPD/top.lua"
 cat > "$TOP_LUA" <<'LUAEOF'
-local ok, why = socketley.stop("top_no_such_runtime")
+local ok, why = socketley.pipe("top_no_such_src", 1, "top_no_such_dst")
 socketley.log("TOPLEVEL-SAW " .. tostring(ok) .. " " .. tostring(why))
 filters = {
     function(req)
@@ -187,15 +203,15 @@ fi
 # ── Control 2: the same call answers in process ─────────────────────────────
 MGMT_IN=$(body cb_in "$CB_IN_PORT" /mgmt)
 # Both halves, and the second is what makes this a control rather than a
-# formality.  `stop=false` alone is also what a build whose stop() is broken
+# formality.  `pipe=false` alone is also what a build whose pipe() is broken
 # returns; the reason naming the runtime is the evidence that the call ran, went
 # looking and answered about what it found.
 case "$MGMT_IN" in
-    *"stop=false"*"there is no runtime called"*) pass ;;
+    *"pipe=false"*"there is no runtime called"*) pass ;;
     *)
-        fail "control: socketley.stop answers in the daemon" \
+        fail "control: socketley.pipe answers in the daemon" \
              "/mgmt on the in-process proxy answered '$MGMT_IN'," \
-             "wanted 'stop=false why=there is no runtime called ...'" \
+             "wanted 'pipe=false why=there is no runtime called ...'" \
              "the refusal below cannot be attributed to the process boundary if" \
              "the call does not work on either side of it" ;;
 esac
@@ -206,19 +222,19 @@ MGMT_OOP_BODY=$(body cb_oop "$CB_OOP_PORT" /mgmt)
 if [ "$MGMT_OOP_CODE" = "500" ]; then pass; else
     fail "a management call in a worker is refused, not answered" \
          "/mgmt on the out-of-process proxy answered $MGMT_OOP_CODE '$MGMT_OOP_BODY'," \
-         "wanted 500 — a 200 means socketley.stop() answered in a worker, and" \
-         "the only answer it could give there is one about that process's own" \
-         "copy of the map: a placeholder flipped, and nothing actually stopped"
+         "wanted 500 — a 200 means socketley.pipe() answered in a worker, and" \
+         "there is no channel out there for it to have moved a connection over:" \
+         "the answer would be about descriptors this process alone can see"
 fi
 
 # ── Assertion 2: and the refusal says what and why ──────────────────────────
-if grep -q 'socketley\.stop() is refused in a worker process' \
+if grep -q 'socketley\.pipe() is refused in a worker process' \
         "$SOCKETLEY_DLOG" 2>/dev/null; then
     pass
 else
     fail "the refusal names the call and the reason" \
          "no such line in the daemon log" \
-         "wanted: socketley.stop() is refused in a worker process: ..." \
+         "wanted: socketley.pipe() is refused in a worker process: ..." \
          "last lines: $(tail -3 "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"
 fi
 if grep -q 'refused in a worker process.*--daemon-process' \
@@ -251,7 +267,7 @@ TOP_OOP_OUT=$("$BIN" create proxy top_oop \
 if [ "$TOP_OOP_RC" = "1" ]; then pass; else
     fail "create refuses a script the worker will not load" \
          "create exited $TOP_OOP_RC, wanted 1" \
-         "the script's top-level socketley.stop() cannot work in a worker, so the" \
+         "the script's top-level socketley.pipe() cannot work in a worker, so the" \
          "worker refuses the configuration — and create is what has to say so," \
          "because by the time the log says it the operator has been told 0" \
          "create said: ${TOP_OOP_OUT:-<nothing>}"
@@ -271,7 +287,7 @@ TOP_IN_STATE=$(state top_in)
 if [ "$TOP_OOP_STATE" = "failed" ]; then pass; else
     fail "a worker whose script will not load does not serve" \
          "top_oop is '$TOP_OOP_STATE', wanted 'failed'" \
-         "the script's top-level socketley.stop() cannot work in a worker, so the" \
+         "the script's top-level socketley.pipe() cannot work in a worker, so the" \
          "script did not load — and a proxy relaying with none of the filters," \
          "routes or callbacks the operator wrote is not the proxy they configured"
 fi

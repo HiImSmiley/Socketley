@@ -2598,46 +2598,45 @@ kept level in four places; neither is kept as a synonym, because a flag that no
 longer changes anything is a flag whose meaning has to be looked up to discover
 that it has none.
 .IP
-What this buys back is what only shared memory can give. Thirteen calls are
-refused inside a worker, and they fall into three groups that are refused for
-three different reasons \(em which matters, because only the first group comes
-back when a worker is handed the runtime map:
+What this buys back is now two calls, and it used to be thirteen. The list is
+kept as three groups because they were refused for three different reasons, and
+two of the three reasons have since been answered:
 .RS
 .TP
-.B Reads of the map
+.B Reads of the map \(em answered
 .BR socketley.send ,
 .BR .list ,
 .B .get
 and all four of
 .BR socketley.cluster .
-The map lives in the daemon and a worker has none, so answering here would
-return nothing \(em which is what a
-.I successful
-call returns on a daemon with nothing in it.
+The daemon pushes the worker a replica of the map and a snapshot of the cluster
+view, and these are answered out of them.
 .TP
-.B Changes to the map
+.B Changes to the map \(em answered
 .BR socketley.create ,
 .BR .start ,
 .BR .stop ,
 .BR .remove .
-Being told what the map holds is not permission to alter it, so these do
-.I not
-come back with it. Answered inside a worker they would act on that process's
-private copy: a runtime built inside the worker that the daemon never hears
-about, or a
-.B start
-and a
-.B stop
-that flip a placeholder and bind nothing.
+Not out of the replica \(em being told what the map holds is not permission to
+alter it. They are asked of the daemon over a socket of the worker's own and
+they wait for the answer, so
+.B "if socketley.create(...) then"
+branches on what happened rather than on what was accepted. What that costs was
+measured: 9.95, 10.20 and 10.52 microseconds over three runs of 20000, on a path
+a script reaches deliberately and never per message.
+.IP
+The refusal still exists for one case: a worker forked by a daemon that has no
+such socket \(em an older build, or one that could not create it. It says so.
 .TP
-.B Moving a connection
+.B Moving a connection \(em still refused
 .B socketley.pipe
-and
+across two runtimes, and
 .BR self.route() .
-Not a map problem at all \(em see the note under the Lua API below.
+Not a map problem at all \(em see the note under the Lua API below. These are
+the two calls this flag still buys back.
 .RE
 .IP
-At a script's top level any of those refusals leaves the runtime
+At a script's top level either of those refusals leaves the runtime
 .BR failed .
 And a cross\-runtime request costs about 50 microseconds more, measured, which a
 server doing
@@ -3574,25 +3573,35 @@ start (bool)               \-s
 .B daemon_process
 is the one to reach for when the handler named by
 .B config
-uses the cross\-runtime API \(em
-.BR socketley.create ,
-.BR .start ,
-.BR .stop ,
-.BR .remove ,
-.BR .send ,
-.BR .list ,
-.BR .get ,
-.BR .pipe ,
-anything under
-.BR socketley.cluster ,
-or
-.B self.route
-\(em because all of those act on the runtime map, which lives in the daemon and
-not in a worker. Without it the runtime still comes up: it is listed, it accepts
-connections, and every one of those calls raises inside its callbacks, is caught
-and logged, and nothing gets done. It cannot be added later either \(em
+uses
+.B socketley.pipe
+across two runtimes or
+.BR self.route .
+Those two move a
+.I connection,
+and a connection does not travel in a snapshot of anything; they are the two
+calls still refused in a worker. Without the flag the runtime still comes up \(em
+it is listed, it accepts connections \(em and either call raises inside its
+callbacks, is caught and logged, and nothing gets done. It cannot be added later
+either \(em
 .B edit
 refuses the flag \(em so a configuration that omits it has to be recreated.
+.PP
+The rest of the cross\-runtime API no longer needs it.
+.BR socketley.send ,
+.BR .list ,
+.B .get
+and
+.B socketley.cluster
+are answered from the replica map the daemon pushes; \(em
+.BR socketley.create ,
+.BR .start ,
+.BR .stop
+and
+.B .remove
+are asked of the daemon and wait for its answer. See
+.B \-\-daemon\-process
+above.
 .PP
 A key this list does not name is ignored in silence, and a flag this list does
 not reach \(em the whole health\-check, circuit\-breaker, retry and TLS families
@@ -4590,7 +4599,8 @@ self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly b
 self.unpipe(id)                    -- Remove pipe pairing for a client
 socketley.pipe(src, fd_a, src, fd_b)   -- Pair two connections of one server
 socketley.pipe(src, fd, dst)           -- Route a connection to another server
-                                   -- names other runtimes: needs --daemon-process
+                                   -- moves a connection, not a name: this form is
+                                   -- REFUSED in a worker, needs --daemon-process
 
 -- Server: per-connection metadata
 self.set_data(id, key, val)        -- Set string metadata on a connection (nil val deletes key)
@@ -5031,67 +5041,81 @@ forwarded messages only.
 These calls act on the runtime map, and the runtime map lives in the daemon. A
 runtime gets its own worker process unless it was created with
 .BR \-\-daemon\-process ,
-and a worker holds one runtime and no map \(em so each of them, and
-.B self.route()
-with them, is replaced there by a function that raises a Lua error naming the
-call, the reason and the way out:
-.PP
-.nf
-[lua lobby] on_start error: lobby.lua:13: socketley.list() is refused in a
-worker process: this call reaches for the runtime map, which lives in the
-daemon ... Create this runtime with \-\-daemon\-process, or move the call to
-one that has it.
-.fi
-.PP
-They are not offered and they do not quietly answer nothing. Returning
-.BR false ,
-.B nil
-or an empty table is what a
-.I successful
-call returns on a daemon with nothing in it, so neither the script nor the
-operator could tell the two apart.
-.PP
-.B The message differs by why, and the difference is not cosmetic.
-Read the sentence you got rather than assuming it is the one above: it says
-whether your call is waiting on something or is refused for good.
+so a script written against these is, by default, a script running somewhere the
+map is not. All but two of them work there anyway, and how they work differs:
 .RS
+.PP
+.BR socketley.send ,
+.BR .list ,
+.B .get
+and the four
+.B socketley.cluster
+calls are answered from a
+.I replica.
+The daemon pushes the worker a copy of the map and a snapshot of the cluster
+view, and refreshes both when they change.
 .PP
 .BR socketley.create ,
 .BR .start ,
 .BR .stop
 and
 .B .remove
-say they
 .I change
-the runtime map. A worker can be told what the map holds and still not be
-allowed to alter it, so these are not waiting on anything \(em they are refused
-out here permanently. Answered inside a worker they would act on that process's
-own copy:
-.B create
-would build a runtime inside the worker, bound and serving, that never reaches
-the daemon, the state file or
-.BR ls ;
-.B start
-and
-.B stop
-would store
-.B running
-or
-.B stopped
-on a placeholder and return
-.B true
-having bound and signalled nothing;
-.B remove
-would drop the local copy and leave the runtime in the daemon. Making them work
-from a worker means a synchronous round trip inside a Lua callback, which would
-block the loop serving every connection that worker holds \(em and this project
-settled that question the other way when it built the asynchronous request
-channel.
+the map, and a copy is not the thing to change. They are asked of the daemon
+instead, over a socket the worker holds for exactly this, and they wait for the
+answer \(em so
+.B "if socketley.create(...) then"
+tests what happened. The wait is what makes them honest and it is bounded: 9.95,
+10.20 and 10.52 microseconds over three runs of 20000 for a call that does not
+fork anything, and at most five seconds for one that does. They are made in
+.B on_start
+or on a rare control message, never per request, which is what makes a wait
+affordable at all \(em see
+.B socketley.http()
+in the same table, which blocks the same loop for a network round trip.
 .PP
+The answers are the daemon's own, word for word what the same call says in the
+daemon:
+.B "there is no runtime called \(dqx\(dq" ,
+.B "\(dqx\(dq is already running" ,
+.BR "a runtime called \(dqx\(dq already exists" .
+A script cannot tell from them which process it is running in, which is the
+point.
+.RE
+.PP
+.B Two calls are still refused there, and they raise rather than answer.
 .B socketley.pipe
+across two runtimes, and
+.BR self.route() .
+Returning
+.BR false ,
+.B nil
+or an empty table would be what a
+.I successful
+call returns when there is nothing to find, so neither the script nor the
+operator could tell the two apart. The raise names the call, the reason and the
+way out:
+.PP
+.nf
+[lua lobby] on_start error: lobby.lua:13: socketley.pipe() is refused in a
+worker process: a pipe hands an open file descriptor from one runtime to
+another, and a connection cannot be handed to another process the way a name
+or a port can ... To pair two connections of this same server, call
+self.pipe(fd_a, fd_b) ... to route a connection to another runtime, create
+both with \-\-daemon\-process.
+.fi
+.PP
+There is a third message, and it is the one to read carefully if you meet it.
+.BR socketley.create ,
+.BR .start ,
+.BR .stop
 and
-.B self.route()
-say something else again; see below.
+.B .remove
+raise in a worker that was forked
+.I without
+the socket they travel on \(em an older daemon, or one that could not create it.
+That message says so and tells you to restart the daemon. It is not the
+permanent refusal these four used to carry.
 .PP
 .B socketley.pipe
 is refused there too, and its message is a different one because its reason is
@@ -5186,15 +5210,18 @@ table provides read-only introspection into the full cluster topology.
 All functions return empty tables when not in cluster mode, so scripts work in
 both standalone and cluster setups without modification.
 .PP
-That last sentence holds for cluster mode being off. It does not hold for a
-runtime in a worker process, which is the default: the cluster view is the
-runtime map plus what discovery has heard, and a worker has neither, so all four
-of these are replaced there by the same raise the management API gets. See
-.B "Runtime Management API"
-above. A script that must run
-.B socketley.cluster
-needs
-.BR \-\-daemon\-process .
+That last sentence holds for cluster mode being off, and it now holds in a
+worker process too: the daemon pushes each worker a snapshot of the cluster view
+before the frame that loads its script, and these four are answered from it.
+.PP
+One case is left. A daemon that is in no cluster has no view to push, and an
+empty table is what a
+.I successful
+call returns for a daemon alone in one \(em so with no view installed the four
+raise instead of answering, naming themselves. A daemon that
+.I joins
+a cluster after a worker's script has loaded leaves that script with the refusal
+until it is reloaded.
 .TP
 .B socketley.cluster.daemons() \(-> table
 Returns an array of daemon info tables. Each entry has:

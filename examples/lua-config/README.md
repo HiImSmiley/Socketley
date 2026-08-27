@@ -102,13 +102,14 @@ gateway and two clients, one handler branching on `self.name`.
 `master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`,
 `daemon_process`, `start`.
 
-`daemon_process = true` is what a runtime whose handler uses the cross-runtime
-API has to say — see [The cross-runtime API needs
-`--daemon-process`](#the-cross-runtime-api-needs---daemon-process) below for
-which calls those are. Omit it and the runtime is created, listed and
-connectable while every one of those calls raises inside its callbacks, is
-caught, logged, and does nothing; `edit` will not add the flag afterwards, so
-the runtime has to be recreated.
+`daemon_process = true` is what a runtime whose handler uses
+`socketley.pipe(src, fd, dst)` or `self.route()` has to say — see [The
+cross-runtime API in a
+worker](#the-cross-runtime-api-in-a-worker-two-calls-are-refused-the-rest-are-not)
+below, which also lists what no longer needs it. Omit it and the runtime is
+created, listed and connectable while those two calls raise inside its
+callbacks, are caught, logged, and do nothing; `edit` will not add the flag
+afterwards, so the runtime has to be recreated.
 
 An unrecognised key is ignored in silence. Flags this list does not reach — the
 health-check, circuit-breaker, retry and TLS families — cannot be set from a
@@ -262,42 +263,38 @@ no binary module ships with socketley, and `package.cpath` is left at its
 default — the require fails the script load and the runtime is left `failed`.
 `socketley.json_encode` needs nothing installed.
 
-### The cross-runtime API needs `--daemon-process`
+### The cross-runtime API in a worker: two calls are refused, the rest are not
 
 `socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe`, everything
 under `socketley.cluster`, and `self.route()` all act on the runtime map, which
-lives in the daemon. A runtime gets its own worker process unless it was
-created with `--daemon-process`, and a worker has no map — so each of these
-raises a Lua error there naming the call and the way out.
+lives in the daemon — and a runtime gets its own worker process unless it was
+created with `--daemon-process`. So by default a script calling these is running
+somewhere the map is not.
 
-From a configuration file that flag is the `daemon_process = true` key on the
-runtime's entry; from the command line it is `--daemon-process` on `create`.
+All but one of them work there anyway, and **how** differs by group:
 
-At a script's top level that fails the load and the `create` is refused, which
-is loud. Inside a callback it is caught and logged and the runtime carries on —
-`ls` green, connections accepted, and none of the work done. That second case
-is the one to watch for.
-
-**Read the message you got — there are three of them, and they mean different
-things.** Only the first group is waiting on something.
-
-| group | calls | comes back when a worker has the map? |
+| group | calls | in a worker |
 |---|---|---|
-| read the map | `.send` `.list` `.get`, all of `socketley.cluster` | yes |
-| change the map | `.create` `.start` `.stop` `.remove` | **no** |
-| move a connection | `.pipe`, `self.route()` | **no** |
+| read the map | `.send` `.list` `.get`, all of `socketley.cluster` | answered from a replica the daemon pushes |
+| change the map | `.create` `.start` `.stop` `.remove` | asked of the daemon, and they **wait** for the answer |
+| move a connection | `.pipe(src,fd,dst)`, `self.route()` | **refused** |
 
-The four that **change** the map are refused permanently. Being told what the
-map holds is not permission to alter it, and answering them inside a worker
-would act on that process's private copy: `create` would build a runtime inside
-the worker — bound, serving, and unknown to the daemon, the state file and `ls`
-— while `start` and `stop` would store a state on a placeholder and return
-`true` having bound and signalled nothing. Doing it properly needs a synchronous
-round trip inside a Lua callback, which would block the loop serving every
-connection that worker holds; this project settled that question the other way
-when it built the asynchronous request channel.
+The four that **change** the map do not touch the replica — being told what the
+map holds is not permission to alter it. They travel: the request goes to the
+daemon over a socket the worker holds for exactly this, the daemon acts on the
+map it holds, and the answer comes back before the Lua call returns. So
+`if socketley.create(...) then` branches on what happened rather than on what
+was accepted, and what it says is the daemon's own wording — a script cannot
+tell which process it is running in from the reason it is given.
 
-The two that **move a connection** are not a map problem at all. `socketley.pipe`
+They block the worker's event loop while they wait, which is affordable for one
+reason: these are written in `on_start` or on a rare control message, never per
+request. Measured at about 10 µs for a call that forks nothing, and bounded at
+five seconds for one that does. `socketley.http()` on the same table blocks the
+same loop for a network round trip and is three orders of magnitude longer.
+
+The two that **move a connection** are not a map problem at all, and are the two
+that are still refused. `socketley.pipe`
 hands an **open file descriptor** from one runtime to another, and a descriptor
 does not travel in a snapshot the way a name or a port does — it has to be passed
 with `SCM_RIGHTS`, or its bytes relayed under a reference that means the same

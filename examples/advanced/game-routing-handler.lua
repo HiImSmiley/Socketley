@@ -8,20 +8,21 @@
 -- `daemon_process = true`; a `create` command line says so with
 -- `--daemon-process`.  Do not drop it.
 --
--- A runtime gets its own worker process unless that flag is given, and a
--- worker holds one runtime and no runtime map.  Everything this file does
--- reaches for that map: socketley.create, socketley.start, socketley.get,
--- socketley.list, and self.route -- which names another runtime and so counts
--- as reaching for it too.  In a worker every one of them raises.
+-- self.route is why, and it is the ONLY reason left.  A route moves a
+-- CONNECTION into another runtime's tables, and a connection does not travel
+-- in a snapshot of anything; it is one of the two calls still refused in a
+-- worker.  The rest of what this file does no longer needs the flag:
+-- socketley.get and .list are answered from the replica map the daemon pushes,
+-- and socketley.create and .start are asked of the daemon and wait for its
+-- answer.  Those four used to raise here too.
 --
 -- The raise is caught and logged wherever a callback runs, which is what makes
 -- this worth a paragraph rather than a footnote: without the flag the lobby
 -- comes up looking perfectly healthy.  `ls` is green, the port accepts
--- connections, on_start reports "creating game modes..." -- and no game mode
--- exists, "join rapid" answers nothing at all, and the only sign is a line in
--- the daemon's log.  Measured both ways: without the flag, zero sub-servers
--- and no reply; with it, chess-rapid and chess-blitz running and "join rapid"
--- answered by the rapid handler.
+-- connections, the game modes are created and running -- and "join rapid"
+-- answers nothing at all, because the route is the step that fails, and the
+-- only sign is a line in the daemon's log.  Measured both ways: without the
+-- flag, no reply; with it, "join rapid" answered by the rapid handler.
 --
 -- It cannot be added afterwards -- `edit` rejects it, because honouring it
 -- would mean moving a configured runtime between address spaces underneath
