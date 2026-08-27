@@ -109,9 +109,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       - name: Build (Sanitize)
@@ -201,9 +199,7 @@ jobs:
           # where the error names the cause.
           sudo apt-get install -y $APT_PACKAGES clang-18 libclang-rt-18-dev
           clang++-18 --version
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       # Carry-over.  The key rotates per run so each night writes a new entry;
@@ -814,9 +810,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       - name: Build (Debug + invariants, warn-only)
@@ -925,9 +919,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       - name: Build (Release)
@@ -990,9 +982,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       - name: Build (TSan)
@@ -1044,9 +1034,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
           bash scripts/install-liburing.sh
 
       - name: Build (Release) and fail on any warning

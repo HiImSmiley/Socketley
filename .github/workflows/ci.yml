@@ -99,9 +99,7 @@ jobs:
           # and a half-installed toolchain should fail here where the error is
           # legible rather than three steps later.
           clang++-18 --version
-          luajit_a="$(find /usr/lib -name 'libluajit-5.1.a' | head -1)"
-          test -n "$luajit_a" || { echo "libluajit-5.1.a not found"; exit 1; }
-          cp "$luajit_a" thirdparty/luajit/libluajit.a
+          bash bin/build-thirdparty.sh luajit
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh

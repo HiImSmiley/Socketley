@@ -21,8 +21,9 @@ jobs:
           # at event_loop.cpp — so every tag pushed since 2026-07-28 failed here.
           sudo apt-get install -y build-essential libssl-dev \
             netcat-openbsd bc libluajit-5.1-dev
-          cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" \
-            thirdparty/luajit/libluajit.a
+
+      - name: Vendored static archives
+        run: bash bin/build-thirdparty.sh luajit
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh

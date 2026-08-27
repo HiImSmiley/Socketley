@@ -75,8 +75,11 @@ RUN LIBURING_TAG="$LIBURING_TAG" LIBURING_JOBS="$BUILD_JOBS" \
 WORKDIR /src
 COPY . .
 
-# Copy system libluajit into thirdparty (same trick as CI)
-RUN cp "$(find /usr/lib -name 'libluajit-5.1.a' | head -1)" thirdparty/luajit/libluajit.a
+# The static archives this tree links but does not track.  This line used to say
+# "same trick as CI" and copy libluajit-5.1.a by hand -- one of nine hand-written
+# copies of the same three commands, and one of the two that had no error check.
+# scripts/install-liburing.sh already ended that argument for the other archive.
+RUN bash bin/build-thirdparty.sh luajit
 
 RUN ./bin/premake5 gmake2 && cd make && make config=release_x64 -j"$BUILD_JOBS"
 
