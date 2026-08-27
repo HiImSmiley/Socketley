@@ -710,6 +710,31 @@ public:
         if (m_rt && m_rt->get_state() == runtime_running)
             m_rt->stop(m_loop);
 
+        // ── and the cancellations it just submitted have to be reaped here ──
+        //
+        // stop() reaches lua_context::cancel_timers(), which severs every armed
+        // timer: it nulls the timer's `ctx`, submits a timeout-remove, and hands
+        // the object to its own on_cqe, whose terminal branch is `delete this`.
+        // That is the only thing that frees a lua_timer, and it needs the
+        // completion to arrive.
+        //
+        // Below, the only draining is `while m_writer.send_in_flight()`, so on a
+        // shutdown where the writer has nothing queued the ring is closed with
+        // those cancellations still in the queue and every armed timer stays
+        // allocated.  Measured on this branch with a sharded scripted proxy:
+        // 10 worker processes, each leaking 176 bytes in 2 allocations -- the
+        // lua_timer and the shared_ptr<bool> it holds a reference to.
+        //
+        // Unconditional, and here rather than folded into the writer's loop,
+        // because the two wait for different things: that one waits for a send
+        // to leave, this one for cancellations the kernel posts immediately.
+        // A millisecond apiece and a bound of ten, for the same reason the loop
+        // below is bounded -- a worker that will not finish unwinding is killed
+        // by the supervisor five seconds after the SIGTERM regardless.
+        for (int i = 0; i < 10; ++i)
+            if (m_loop.poll_completions(1) == 0)
+                break;
+
         // ── The links come off the ring before the ring goes ───────────────
         //
         // Each of them holds a standing recv, may hold an in-flight send, and
