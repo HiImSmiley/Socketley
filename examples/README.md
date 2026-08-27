@@ -8,10 +8,12 @@ This directory contains practical examples demonstrating all features of socketl
 examples/
 ├── basic/              # Getting started, minimal setups
 ├── server-client/      # Server-client communication patterns
+├── server/             # Server flags, and the Lua handlers you attach to one
 ├── proxy/              # HTTP/TCP proxy configurations
-├── cache/              # Caching with persistence
+├── cache/              # Caching, persistence, sharding
 ├── lua-config/         # Lua configuration and scripting
-├── managed/            # Managed external binaries (C++ SDK)
+├── cluster/            # Several daemons discovering each other
+├── managed/            # Binaries the daemon supervises, via `socketley add`
 ├── udp/                # UDP server/client examples
 └── advanced/           # Complex multi-runtime setups
 ```
@@ -53,7 +55,13 @@ examples/
 - `auth-token.lua`, `auth-ip-allowlist.lua` - connection authorisation
 - `rate-limit.lua`, `session-ids.lua`, `websocket-session.lua` - per-connection state
 - `upstream-hub.lua`, `service-discovery.lua` - upstream and discovery patterns
-- `http-dashboard.lua` - HTTP + WebSocket dashboard
+- `http-dashboard.lua` - HTTP + WebSocket dashboard, serving `http-dashboard/`
+- `redis-session.lua` - distributed sessions against an **external** Redis via
+  `redis-lua`; needs a luarocks install, and an unresolvable `require` fails the
+  script load so the runtime never serves
+- `message-counter.lua` - counting in `on_message`, and what its own rate figure
+  is worth given `os.time()` resolves to one second
+- `README.md` - what each of the above is, and the handler-vs-configuration trap
 
 ### Proxy
 - `http-proxy.sh` - Basic HTTP reverse proxy
@@ -90,7 +98,11 @@ and never called — see `lua-config/README.md`.
   `create ... --lua`
 
 ### Managed External Runtimes
-- `echo-service.cpp` - Minimal C++ echo server using the SDK
+`socketley add` registers a binary you built yourself, and the daemon then
+supervises it like any other runtime. Most of the programs here are plain
+sockets — only the two marked below reach for the SDK wrapper.
+
+- `echo-service.cpp` - Minimal C++ echo server, plain sockets
 - `01-add-and-run.sh` - Register and start a managed binary
 - `02-auto-restart.sh` - Daemon auto-restarts crashed binaries
 - `03-stop-start-cycle.sh` - Full lifecycle: add, stop, start, remove
@@ -101,6 +113,14 @@ and never called — see `lua-config/README.md`.
 
 ### UDP
 - `udp-echo.sh` - Fire-and-forget UDP messaging
+
+### Cluster
+- `docker-compose.yml` - three daemons in three containers sharing a volume;
+  this is the real shape of cluster mode
+- `01-local-cluster.sh` - the same topology **simulated** on one machine, which
+  is why every command in it carries its own `SOCKETLEY_SOCKET`
+- `README.md` - what discovery resolves, and what it is not (no leader, no
+  quorum, and a partition nobody reports)
 
 ### Advanced
 - `io-tuning.sh` - `--cpus` and `--sqpoll`: where a runtime's I/O runs, and
