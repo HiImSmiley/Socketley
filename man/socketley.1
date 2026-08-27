@@ -706,20 +706,29 @@ cannot be changed while the runtime is running \(em stop the runtime first.
 .PP
 .B Identity fields:
 .TS
-l l.
+l lw(56).
 name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
-type	Runtime type: server, client, proxy, cache (read-only, ignored on import)
+type	T{
+.ad l
+Runtime type: server, client, proxy, cache (read-only, ignored on import)
+T}
 was_running	Internal daemon state (ignored on import)
 .TE
 .PP
 .B Common fields (all types):
 .TS
-l l l.
+l l lw(42).
 Field	Type	Description
 _
-port	number	Listener/connection port \fB(requires restart)\fR
-listen	string	"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server/proxy/cache; requires restart)\fR
+port	number	T{
+.ad l
+Listener/connection port \fB(requires restart)\fR
+T}
+listen	string	T{
+.ad l
+"unix:/abs/path.sock" \(em an AF_UNIX listener instead of a port \fB(server/proxy/cache; requires restart)\fR
+T}
 log_file	string	State transition log file path
 write_file	string	Message write file path
 lua_script	string	Lua script path (absolute)
@@ -727,14 +736,38 @@ bash_output	bool	Output messages to stdout
 bash_prefix	bool	Prefix messages with [name]
 bash_timestamp	bool	Prefix messages with [HH:MM:SS]
 max_connections	number	Max concurrent connections (0 = unlimited)
-rate_limit	number	Messages/sec per connection (0 = unlimited)
-global_rate_limit	number	Messages/sec across all connections (0 = unlimited)
-idle_timeout	number	Close idle connections after N seconds (0 = disabled)
-drain	bool	Graceful shutdown (flush writes before close)
-tls	bool	Terminate TLS on the listener \fB(server, proxy)\fR; dial TLS \fB(client)\fR
-cert_path	string	PEM certificate \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the certificate it presents
-key_path	string	PEM private key \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the key for cert_path
-ca_path	string	Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends; on a \fBclient\fR, the trust store for its target
+rate_limit	number	T{
+.ad l
+Messages/sec per connection (0 = unlimited)
+T}
+global_rate_limit	number	T{
+.ad l
+Messages/sec across all connections (0 = unlimited)
+T}
+idle_timeout	number	T{
+.ad l
+Close idle connections after N seconds (0 = disabled)
+T}
+drain	bool	T{
+.ad l
+Graceful shutdown (flush writes before close)
+T}
+tls	bool	T{
+.ad l
+Terminate TLS on the listener \fB(server, proxy)\fR; dial TLS \fB(client)\fR
+T}
+cert_path	string	T{
+.ad l
+PEM certificate \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the certificate it presents
+T}
+key_path	string	T{
+.ad l
+PEM private key \fB(server, proxy; needs tls)\fR; on a \fBclient\fR, the key for cert_path
+T}
+ca_path	string	T{
+.ad l
+Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends; on a \fBclient\fR, the trust store for its target
+T}
 target	string	Client target host:port \fB(requires restart)\fR
 cache_name	string	Connected cache runtime name
 group	string	Group tag for dynamic proxy discovery
@@ -763,22 +796,34 @@ reconnect	number	Auto-reconnect max attempts (-1=off, 0=infinite)
 .PP
 .B Proxy fields:
 .TS
-l l l.
+l l lw(42).
 Field	Type	Description
 _
 protocol	string	"http" or "tcp" \fB(requires restart)\fR
 strategy	string	"round-robin", "random", or "lua"
-backends	array	List of backend addresses ["ip:port", "@group", ...]
+backends	array	T{
+.ad l
+List of backend addresses ["ip:port", "@group", ...]
+T}
 health_check	string	"tcp" or "http" (empty = disabled)
-health_interval	number	Health check interval in seconds (default 5)
+health_interval	number	T{
+.ad l
+Health check interval in seconds (default 5)
+T}
 health_path	string	HTTP health check path (default "/health")
 health_threshold	number	Failures to mark unhealthy (default 3)
 circuit_threshold	number	Errors to open circuit (default 5)
 circuit_timeout	number	Seconds before half-open (default 30)
-backend_timeout	number	Seconds for the first response byte (default 2, 0 = off)
+backend_timeout	number	T{
+.ad l
+Seconds for the first response byte (default 2, 0 = off)
+T}
 retry	number	Retry count (0 = disabled)
 retry_all	bool	Also retry non-idempotent methods
-client_ca	string	CA for certificates clients present \fB(needs tls)\fR
+client_ca	string	T{
+.ad l
+CA for certificates clients present \fB(needs tls)\fR
+T}
 client_cert	string	Client certificate presented to backends
 client_key	string	Its private key (both or neither)
 sidecar	bool	Enable sidecar defaults
@@ -786,7 +831,7 @@ sidecar	bool	Enable sidecar defaults
 .PP
 .B Cache fields:
 .TS
-l l l.
+l l lw(42).
 Field	Type	Description
 _
 persistent_path	string	Persistence file path
@@ -794,7 +839,10 @@ cache_mode	string	"readonly", "readwrite", or "admin"
 resp_forced	bool	Force RESP2 protocol \fB(requires restart)\fR
 replicate_target	string	Leader host:port \fB(requires restart)\fR
 max_memory	number	Max memory in bytes (0 = unlimited)
-eviction	string	"noeviction", "allkeys-lru", "allkeys-random"
+eviction	string	T{
+.ad l
+"noeviction", "allkeys-lru", "allkeys-random"
+T}
 .TE
 .PP
 .B Example JSON (server):
@@ -3279,11 +3327,14 @@ and implement whichever callbacks you need using any Lua DB library
 .PP
 .TS
 tab(|);
-l l l.
+l l lw(30).
 Callback|Signature|When called
 _
 on_miss(key)|\(-> value [, ttl_seconds]|GET returns nil \(em fetch from DB
-on_write(key, value, ttl)|\(-> nothing|After successful SET/SETEX/SETNX/MSET
+on_write(key, value, ttl)|\(-> nothing|T{
+.ad l
+After successful SET/SETEX/SETNX/MSET
+T}
 on_delete(key)|\(-> nothing|After DEL \(em delete from DB
 on_expire(key)|\(-> nothing|After TTL sweep removes key
 .TE
