@@ -315,8 +315,8 @@ nothing_measured() {
 #
 # The load phase runs alone, so the collision was not with another harness --
 # it was with something still holding a port out of a window a suite had
-# claimed.  CLAUDE.md also hands agents blocks at 21000-23999 by hand, which is
-# the same range from a third direction.
+# claimed.  Concurrent runs on this box are also handed blocks at 21000-23999 by
+# hand, which is the same range arriving from a third direction.
 #
 # Sited here because all seven harnesses source this file and none of them has
 # to know about it.  lib_ports.sh is idempotent -- it returns immediately when

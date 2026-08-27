@@ -84,14 +84,9 @@ test/benchmark/results/
 # Packages
 *.deb
 *.rpm
-# Project files
+# Local-only project file.  Not CONTRIBUTING.md, which used to be ignored
+# beside it and is the one file a public repository is expected to carry.
 CLAUDE.md
-CONTRIBUTING.md
-
-# Agent worktrees.  git checkouts of this repository living inside it; adding
-# them would commit a copy of the tree to itself.  Only worktrees/ — anything
-# else under .claude/ is ordinary project configuration and stays trackable.
-.claude/worktrees/
 
 # IDE and editor
 .vscode/
@@ -105,10 +100,14 @@ CONTRIBUTING.md
 *.gcno
 *.gcov
 
-# Agent scratch, not project configuration.  `.claude/worktrees/` holds live
-# git worktrees -- 2.1 GiB of them at the time of writing -- and the lock file
-# belongs to whatever is running, not to the tree.  `.claude/skills/` is left
-# tracked-able on purpose: if it ever holds something the project shares, that
-# is a decision to make deliberately rather than one this line takes away.
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+# Agent scratch, none of it project configuration.  `.claude/worktrees/` holds
+# live git worktrees -- 2.1 GiB of them at the time of writing -- the lock file
+# belongs to whatever is running, and RESUME.md is one session's state.
+#
+# The whole directory rather than a list of its parts: two separate rules used
+# to cover worktrees/ and the lock file while disagreeing in their comments
+# about whether the rest was trackable, and RESUME.md fell through the gap
+# between them.  Erring closed means anything here that the project genuinely
+# wants to share has to be added with an explicit `git add -f`, which is the
+# deliberate decision the old comment asked for and did not enforce.
+.claude/

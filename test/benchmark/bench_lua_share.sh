@@ -133,7 +133,9 @@ DAEMON_PID=""
 LOAD_PID=""
 
 # Sweep by exact exe path -- and it is the -syms path, which nothing else on
-# this box runs.  Never pgrep -f (CLAUDE.md: it has killed the killer).
+# this box runs.  Never pgrep -f: it matches the whole command line, so it also
+# matches the shell that merely carries the string in its own arguments -- which
+# is the one doing the matching.  It has killed the killer here.
 sweep_mine() {
     local p exe
     for p in $(pgrep -x socketley-syms 2>/dev/null || true); do

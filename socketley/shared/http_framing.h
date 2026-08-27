@@ -355,8 +355,9 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
 //
 // It does not collect the headers.  The server needs the name/value pairs for
 // its Lua API and the proxy does not, and folding that in would have made this
-// a parse loop rather than a decision — the one shape the note in CLAUDE.md
-// says gets reverted.  Callers walk the block themselves for whatever else they
+// a parse loop rather than a decision, which is the shape that gets reverted:
+// extract the decision, not the function.  Callers walk the block themselves for
+// whatever else they
 // want out of it; they take the framing answer from here.
 //
 // It does not decide whether the connection survives.  That is a separate

@@ -3,8 +3,8 @@
 // The AF_UNIX rules, stated once.
 //
 // Three decisions live here, because each used to have more than one home and
-// this tree has counted what that costs (see CLAUDE-adjacent history in
-// shared/: conn_reachability.h, http_framing.h).  Before this header the path
+// this tree has counted what that costs — the same pattern as its neighbours in
+// shared/: conn_reachability.h, http_framing.h.  Before this header the path
 // rules were decided in three places (the flag parser, the server's setup
 // re-check, the proxy's backend configuration), the sockaddr_un construction
 // in two (the server's bind, the proxy's connect), and the listener mechanism
