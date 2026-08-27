@@ -242,8 +242,6 @@ static void test_burst_connections(const char* host, int port, int count)
             close(fds[i]);
     }
 
-    long long end = get_time_us();
-
     double connect_time = (connected - start) / 1000000.0;
     double rate = success / connect_time;
 

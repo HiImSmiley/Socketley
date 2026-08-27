@@ -110,7 +110,23 @@ setup)
 
 sweep)
     shift
-    exec "$BENCH_DIR/bench_cache_vs_redis" "$@" "$CACHE_PORT" "$REDIS_PORT"
+    # Built on demand rather than committed.  A prebuilt ELF used to be tracked
+    # here beside its own source, so the repository shipped a binary compiled on
+    # somebody's machine against that machine's libc, and running a sweep on any
+    # other one executed it.  The compile line was already written down in the
+    # first thirty lines of the .c file; it just was not being used.
+    #
+    # Rebuilt when the source is newer than the binary, so editing the generator
+    # cannot leave a sweep measuring the previous version -- which is the failure
+    # this is really guarding against, not the missing file.
+    BENCH_SRC="$BENCH_DIR/bench_cache_vs_redis.c"
+    BENCH_BIN="$BENCH_DIR/bench_cache_vs_redis"
+    if [ ! -x "$BENCH_BIN" ] || [ "$BENCH_SRC" -nt "$BENCH_BIN" ]; then
+        echo "building $(basename "$BENCH_BIN")" >&2
+        cc -O3 -Wall -Wextra -o "$BENCH_BIN" "$BENCH_SRC" -lpthread \
+            || { echo "FATAL: could not build $BENCH_SRC" >&2; exit 2; }
+    fi
+    exec "$BENCH_BIN" "$@" "$CACHE_PORT" "$REDIS_PORT"
     ;;
 
 genclient)

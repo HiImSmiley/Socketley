@@ -81,6 +81,14 @@ __pycache__/
 # Benchmark results
 test/benchmark/results/
 
+# Compiled benchmark helpers.  Both were tracked as prebuilt ELF binaries beside
+# their own sources, since the initial commit -- so the repository shipped
+# executables built on one machine against that machine's libc, and
+# bench_generator.sh exec'd one of them rather than building it.  Each .c file
+# has carried its own compile line in its header comment the whole time.
+test/benchmark/bench_cache_vs_redis
+test/benchmark/bench_client
+
 # Packages
 *.deb
 *.rpm

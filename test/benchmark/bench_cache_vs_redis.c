@@ -101,12 +101,6 @@ static int connect_ep(const endpoint* ep)
     return fd;
 }
 
-static int connect_to(const char* host, int port)
-{
-    endpoint ep = { host, port, NULL };
-    return connect_ep(&ep);
-}
-
 static int send_all(int fd, const char* buf, size_t len)
 {
     size_t total = 0;
