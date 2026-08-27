@@ -13,7 +13,7 @@
         <li><a href="#xsdk-ws-types">Types</a></li>
       </ul></li>
       <li><a href="#xsdk-cache">cache_client</a><ul>
-        <li><a href="#xsdk-cache-connect">connect</a></li>
+        <li><a href="#xsdk-cache-connect">Connection: connect / close / reconnect</a></li>
         <li><a href="#xsdk-cache-strings">Strings</a></li>
         <li><a href="#xsdk-cache-multikey">Multi-Key</a></li>
         <li><a href="#xsdk-cache-lists">Lists</a></li>
@@ -44,9 +44,13 @@
 </tbody>
 </table>
 
+<div class="warn-box"><strong>Cleartext TCP only.</strong> Neither client speaks TLS &mdash; there is no OpenSSL behind them, by design (zero dependencies). A server or cache started with <code>--tls</code> cannot be reached by these headers; terminate TLS in front (a socketley proxy does this) or use a cleartext listener on a trusted network. They dial <code>host:port</code> only &mdash; no <code>unix:</code> targets, which would not exist on the platforms these headers are for.</div>
+
 <div class="info-box"><strong>Zero external dependencies.</strong> Both headers are fully self-contained. The WebSocket client embeds its own SHA-1 and Base64 implementations for the handshake &mdash; no OpenSSL needed. <code>#ifdef _WIN32</code> handles Winsock vs POSIX internally.</div>
 
 <p>Both headers ship in <code>include/windows/socketley/</code> and <code>include/darwin/socketley/</code> (byte-identical). Use whichever include path you prefer.</p>
+
+<p>Two runnable programs in the repo are built on exactly these headers: <code>sdk/examples/projects/jobqueue/worker.cpp</code> (a queue worker on <code>cache_client.h</code>) and <code>sdk/examples/projects/chatroom/chat_cli.cpp</code> (a terminal chat client on <code>ws_client.h</code>) &mdash; each compiles with one <code>-I</code> flag and nothing else.</p>
 
 <h3 id="xsdk-install">Installation</h3>
 <p>Copy the headers into your project&rsquo;s include path:</p>
@@ -182,7 +186,7 @@ cp -r include/windows/socketley/ /your/project/include/</code></pre>
 <p><code>#include &lt;socketley/cache_client.h&gt;</code> &mdash; TCP client for the cache text protocol.</p>
 <p>Non-copyable, movable. Destructor calls <code>close()</code> automatically.</p>
 
-<h3 id="xsdk-cache-connect">connect</h3>
+<h3 id="xsdk-cache-connect">Connection: connect / close / reconnect</h3>
 <div class="method-card">
 <div class="method-header">
   <span class="method-name">cache_client::connect</span>

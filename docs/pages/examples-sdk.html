@@ -34,6 +34,11 @@
       <li><a href="#exsdk-mixed">Mixed: Engine + Attach</a><ul>
         <li><a href="#exsdk-fullstack">Full Stack</a></li>
       </ul></li>
+      <li><a href="#exsdk-projects">Project Examples</a><ul>
+        <li><a href="#exsdk-proj-jobqueue">jobqueue</a></li>
+        <li><a href="#exsdk-proj-chatroom">chatroom</a></li>
+        <li><a href="#exsdk-proj-edge">edge</a></li>
+      </ul></li>
     </ul>
 <div id="content-examples-sdk" class="content" style="display:none">
 
@@ -511,6 +516,7 @@
 <!-- ── Tier 2: Embedded Engine Examples ── -->
 <h2 id="exsdk-tier2">Tier 2: Embedded Engine</h2>
 <p>These examples embed the full io_uring engine in a standalone binary. No daemon needed.</p>
+<div class="info-box"><strong><code>mode(mode_in)</code> appears in every server example, deliberately.</strong> The wrapper's default (<code>mode_inout</code>) makes the server a hub that relays every inbound line raw to every other client, on top of what <code>on_message</code> sends &mdash; correct for a relay, double delivery for a protocol. See the server card on the SDK page.</div>
 
 <div class="method-card" id="exsdk-wrapper-echo">
 <div class="method-header">
@@ -526,6 +532,10 @@
 <span class="kw">int</span> <span class="fn">main</span>()
 {
     socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
 
     srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
         printf(<span class="st">"client %d connected\n"</span>, fd);
@@ -544,7 +554,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 echo_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o echo_server</code></pre>
+<pre><code>g++ -std=c++23 echo_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o echo_server</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
 </div>
@@ -581,7 +592,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 client.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o client</code></pre>
+<pre><code>g++ -std=c++23 client.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o client</code></pre>
 <p><strong>Test:</strong> Start an echo server on port 9000 first, then run the client.</p>
 </div>
 
@@ -606,7 +618,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 proxy.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o proxy</code></pre>
+<pre><code>g++ -std=c++23 proxy.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o proxy</code></pre>
 </div>
 
 <div class="method-card" id="exsdk-wrapper-cache">
@@ -630,7 +643,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 cache.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o cache</code></pre>
+<pre><code>g++ -std=c++23 cache.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o cache</code></pre>
 <p><strong>Test:</strong> Use <code>redis-benchmark</code> or <code>redis-cli</code> against port 6379.</p>
 </div>
 
@@ -649,6 +663,10 @@
 <span class="kw">int</span> <span class="fn">main</span>()
 {
     socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
 
     srv.<span class="fn">on_start</span>([] {
         printf(<span class="st">"chat server ready on port 9000\n"</span>);
@@ -699,7 +717,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 chat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat_server</code></pre>
+<pre><code>g++ -std=c++23 chat_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chat_server</code></pre>
 <p><strong>Test:</strong> Open multiple terminals with <code>nc 127.0.0.1 9000</code>. Try <code>/nick Alice</code>, <code>/who</code>, then type messages.</p>
 </div>
 
@@ -743,7 +762,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 reconnecting_client.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o reconnecting_client</code></pre>
+<pre><code>g++ -std=c++23 reconnecting_client.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o reconnecting_client</code></pre>
 <p><strong>Test:</strong> Start an echo server, run the client, then kill and restart the server &mdash; the client reconnects automatically.</p>
 </div>
 
@@ -753,7 +773,7 @@
   <span class="badge badge-tier2">Tier 2</span>
   <span class="badge badge-server">Server</span>
 </div>
-<p class="method-desc">A server that disconnects idle clients after 30 seconds. Uses <code>set_data</code>/<code>get_data</code> for last-seen timestamps, <code>on_tick</code> for periodic checks, and <code>idle_timeout</code> as a network-level backup.</p>
+<p class="method-desc">A server that warns and disconnects idle clients after 30 seconds of application-level silence, checked from <code>on_tick</code> against <code>set_data</code>/<code>get_data</code> last-seen timestamps &mdash; with <code>idle_timeout(60)</code> as the transport-level backstop, deliberately looser so the application logic fires first.</p>
 
 <pre><code><span class="kw">#include</span> <span class="st">&lt;socketley/server.h&gt;</span>
 <span class="kw">#include</span> <span class="st">&lt;cstdio&gt;</span>
@@ -768,6 +788,10 @@
 <span class="kw">int</span> <span class="fn">main</span>()
 {
     socketley::server <span class="fn">srv</span>(<span class="nb">9000</span>);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
     <span class="kw">constexpr long</span> idle_limit = <span class="nb">30</span>;
 
     srv.<span class="fn">tick_interval</span>(<span class="nb">1000</span>);
@@ -810,7 +834,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 heartbeat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o heartbeat_server</code></pre>
+<pre><code>g++ -std=c++23 heartbeat_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o heartbeat_server</code></pre>
 <p><strong>Test:</strong> Connect with <code>nc 127.0.0.1 9000</code> and wait 30 seconds without sending data.</p>
 </div>
 
@@ -828,6 +853,10 @@
 <span class="kw">int</span> <span class="fn">main</span>()
 {
     socketley::server <span class="fn">srv</span>(<span class="nb">9443</span>);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
 
     srv.<span class="fn">tls</span>(<span class="st">"cert.pem"</span>, <span class="st">"key.pem"</span>)
        .<span class="fn">max_connections</span>(<span class="nb">10000</span>)
@@ -854,7 +883,8 @@
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 tls_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o tls_server</code></pre>
+<pre><code>g++ -std=c++23 tls_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o tls_server</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code><span class="cm"># Generate self-signed cert:</span>
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj <span class="st">"/CN=localhost"</span>
@@ -901,7 +931,8 @@ openssl s_client -connect 127.0.0.1:9443 -quiet &lt;&lt;&lt; <span class="st">"h
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 http_file_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o http_file_server</code></pre>
+<pre><code>g++ -std=c++23 http_file_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o http_file_server</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>mkdir -p ./public &amp;&amp; echo <span class="st">"&lt;h1&gt;Hello&lt;/h1&gt;"</span> &gt; ./public/index.html
 curl http://127.0.0.1:8080/index.html</code></pre>
@@ -965,7 +996,8 @@ curl http://127.0.0.1:8080/index.html</code></pre>
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 04_echo_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o echo_server</code></pre>
+<pre><code>g++ -std=c++23 04_echo_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o echo_server</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 9000</code></pre>
 </div>
@@ -1025,7 +1057,8 @@ curl http://127.0.0.1:8080/index.html</code></pre>
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 05_multi_runtime.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o multi_runtime</code></pre>
+<pre><code>g++ -std=c++23 05_multi_runtime.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o multi_runtime</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>echo <span class="st">"cache set foo bar"</span> | nc -q1 127.0.0.1 9000
 echo <span class="st">"cache get foo"</span>     | nc -q1 127.0.0.1 9000  <span class="cm"># returns "bar"</span>
@@ -1085,7 +1118,8 @@ echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span 
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 06_chat_server.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chat_server</code></pre>
+<pre><code>g++ -std=c++23 06_chat_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chat_server</code></pre>
 <p><strong>Test:</strong> Open multiple terminals with <code>nc 127.0.0.1 9000</code>. Messages from one client appear on all others.</p>
 </div>
 
@@ -1153,7 +1187,8 @@ echo <span class="st">"set baz qux"</span>       | nc -q1 127.0.0.1 6379  <span 
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 07_proxy_lb.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o proxy_lb</code></pre>
+<pre><code>g++ -std=c++23 07_proxy_lb.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o proxy_lb</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [backend1] hello</span>
 echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm"># [backend2] hello</span>
@@ -1252,6 +1287,10 @@ echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm">#
     <span class="kw">constexpr uint16_t</span> PORT = <span class="nb">7070</span>;
 
     socketley::server <span class="fn">srv</span>(PORT);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
 
     srv.<span class="fn">on_connect</span>([](<span class="kw">int</span> fd) {
         fprintf(stderr, <span class="st">"[chat] client %d joined\n"</span>, fd);
@@ -1272,8 +1311,8 @@ echo <span class="st">"hello"</span> | nc -q1 127.0.0.1 8080  <span class="cm">#
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++17 -O2 chat_server.cpp -Iinclude/linux \
-    -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat_server</code></pre>
+<pre><code>g++ -std=c++23 -O2 chat_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chat_server</code></pre>
 <p><strong>Usage:</strong></p>
 <pre><code><span class="cm"># Register and start</span>
 socketley add ./chat_server --name chat -s
@@ -1311,6 +1350,10 @@ socketley remove chat</code></pre>
     <span class="kw">int</span> total = <span class="nb">0</span>;
 
     socketley::server <span class="fn">srv</span>(PORT);
+    <span class="cm">// on_message IS the protocol -- turn the mode_inout relay off,</span>
+    <span class="cm">// or every inbound line is also copied raw to every other client</span>
+    srv.<span class="fn">mode</span>(mode_in);
+
 
     srv.<span class="fn">on_connect</span>([&amp;](<span class="kw">int</span> fd) {
         ++total;
@@ -1333,8 +1376,8 @@ socketley remove chat</code></pre>
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++17 -O2 counter_server.cpp -Iinclude/linux \
-    -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o counter_server</code></pre>
+<pre><code>g++ -std=c++23 -O2 counter_server.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o counter_server</code></pre>
 <p><strong>Usage:</strong></p>
 <pre><code>socketley add ./counter_server --name counter -s
 
@@ -1425,13 +1468,50 @@ socketley remove counter</code></pre>
 }</code></pre>
 
 <p><strong>Compile:</strong></p>
-<pre><code>g++ -std=c++23 09_full_stack.cpp -I. -Iinclude/linux -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o full_stack</code></pre>
+<pre><code>g++ -std=c++23 09_full_stack.cpp -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
+    -Lbin/Release -Lthirdparty/luajit -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o full_stack</code></pre>
 <p><strong>Test:</strong></p>
 <pre><code>socketley ls                                     <span class="cm"># shows app_srv + app_cache</span>
 echo <span class="st">"hello"</span>         | nc -q1 127.0.0.1 9000    <span class="cm"># broadcast</span>
 echo <span class="st">"cache set k v"</span> | nc -q1 127.0.0.1 9000    <span class="cm"># cache through server</span>
 echo <span class="st">"get k"</span>          | nc -q1 127.0.0.1 6379    <span class="cm"># direct cache: "v"</span></code></pre>
 <p><strong>Key concept:</strong> <code>daemon_attach()</code> registers one name via <code>atexit()</code>. For additional runtimes, use <code>socketley::ctl::command("attach ...")</code> and manually clean up on shutdown.</p>
+</div>
+
+<!-- ── Project Examples ── -->
+<h2 id="exsdk-projects">Project Examples</h2>
+<p>The snippets above each show one call. <code>sdk/examples/projects/</code> holds three <strong>runnable multi-file projects</strong>, each with its own README, build lines, and a walkthrough that has been executed end to end. They are also where the newer SDK surface lives in working form: unix-path constructors, the proxy name-prefix rule, the hook contract, <code>sidecar()</code>, and the cross-platform client headers doing real work.</p>
+
+<div class="method-card" id="exsdk-proj-jobqueue">
+<div class="method-header">
+  <span class="method-name">jobqueue</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-cache">Cache</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A working job queue service: a cache (the queue) and a server (the submit API) on <strong>one event loop in one process</strong> via the raw API &mdash; the wrapper classes each own a loop, so multi-runtime means raw. The submit handler calls the cache directly: a function call, not IPC. The worker that drains the queue is built on the cross-platform <code>cache_client.h</code> and compiles unchanged on Linux, Windows and macOS. Persistence makes the queue survive a restart; the polling interval is named as the latency floor it is.</p>
+<p><code>sdk/examples/projects/jobqueue/</code> &mdash; <code>jobd.cpp</code>, <code>worker.cpp</code>, <code>README.md</code></p>
+</div>
+
+<div class="method-card" id="exsdk-proj-chatroom">
+<div class="method-header">
+  <span class="method-name">chatroom</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">Rooms via multicast groups (<code>join_group</code>/<code>group_send</code>), presence via per-connection data, the tick as a janitor &mdash; and <strong>one port serving two transports</strong>: <code>nc</code> and WebSocket clients share a room, because the server decodes frames before <code>on_message</code>. The terminal client is a real RFC 6455 handshake on the cross-platform <code>ws_client.h</code>. <code>mode(mode_in)</code> is load-bearing here and the README says why.</p>
+<p><code>sdk/examples/projects/chatroom/</code> &mdash; <code>chatd.cpp</code>, <code>chat_cli.cpp</code>, <code>README.md</code></p>
+</div>
+
+<div class="method-card" id="exsdk-proj-edge">
+<div class="method-header">
+  <span class="method-name">edge</span>
+  <span class="badge badge-tier2">Tier 2</span>
+  <span class="badge badge-proxy">Proxy</span>
+  <span class="badge badge-server">Server</span>
+</div>
+<p class="method-desc">A TLS-terminating gateway in front of an application server that <strong>has no port at all</strong>: the app listens on <code>unix:/tmp/edge-app.sock</code> (the unix-path constructor), the proxy terminates TLS, routes per request under its name prefix (<code>proxy(8443, "gw")</code> serves <code>/gw/&hellip;</code>), health-checks the backend with <code>sidecar()</code>, and logs each request head from <code>on_proxy_request</code> &mdash; returning the empty string, because <code>nullopt</code> would drop the request.</p>
+<p><code>sdk/examples/projects/edge/</code> &mdash; <code>app.cpp</code>, <code>gateway.cpp</code>, <code>public/</code>, <code>README.md</code></p>
 </div>
 
 </div><!-- #content-examples-sdk -->

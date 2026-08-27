@@ -12,11 +12,16 @@
       <li><a href="#exx-patterns">Patterns</a><ul>
         <li><a href="#exx-reconnect">Reconnection</a></li>
       </ul></li>
+      <li><a href="#exx-projects">Project Clients</a><ul>
+        <li><a href="#exx-proj-worker">Queue Worker</a></li>
+        <li><a href="#exx-proj-chat">Chat Client</a></li>
+      </ul></li>
     </ul>
 <div id="content-examples-sdk-cross" class="content" style="display:none">
 
 <!-- ── WebSocket Examples ── -->
 <h2 id="exx-ws">WebSocket Examples</h2>
+<div class="warn-box"><strong>Cleartext TCP only.</strong> The cross-platform headers do not speak TLS &mdash; a server or cache started with <code>--tls</code> cannot be reached by them. See the Cross-Platform SDK page for the reasoning and the workaround (terminate TLS in front).</div>
 
 <h3 id="exx-ws-echo">Echo Client</h3>
 <p>Connect to a Socketley server in WebSocket mode, send a message, and print the response:</p>
@@ -272,5 +277,15 @@ g++ -std=c++17 -I include/windows echo_client.cpp -o echo_client</code></pre>
 }</code></pre>
 
 <div class="info-box"><strong>Reconnect preserves parameters.</strong> <code>reconnect()</code> reuses the host, port, mode, and path from the last <code>connect()</code> call. No need to store them separately.</div>
+
+<!-- ── Project Clients ── -->
+<h2 id="exx-projects">Project Clients</h2>
+<p>Two of the repo's project examples have their client side built on exactly these headers &mdash; complete programs, not snippets, each compiling with a single <code>-I</code> flag on all three platforms:</p>
+
+<h3 id="exx-proj-worker">Queue Worker (<code>cache_client.h</code>)</h3>
+<p><code>sdk/examples/projects/jobqueue/worker.cpp</code> &mdash; drains a socketley cache used as a job queue: <code>lpop</code> in a loop, <code>is_nil()</code> to tell an empty queue from a broken connection, <code>reconnect()</code> with backoff when the connection drops, and <code>incr("jobs_done")</code> so progress is readable from anywhere that can reach the port. The polling interval is named as the latency floor it is; the README points at <code>subscribe()</code> for push-based waking.</p>
+
+<h3 id="exx-proj-chat">Chat Client (<code>ws_client.h</code>)</h3>
+<p><code>sdk/examples/projects/chatroom/chat_cli.cpp</code> &mdash; a terminal chat client with a real RFC 6455 handshake: one thread in <code>recv()</code> printing frames (ping/pong is answered inside <code>recv()</code>, so the loop is just messages), the main thread reading stdin and <code>send()</code>ing. Members arriving over <code>nc</code> and over this client share a room on one port, because the server decodes WebSocket frames before its room logic runs.</p>
 
 </div><!-- #content-examples-sdk-cross -->
