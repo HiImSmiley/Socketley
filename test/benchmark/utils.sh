@@ -512,7 +512,7 @@ format_duration() {
 # success=2000.  Grouped by test and by day -- the grouping that is supposed to
 # isolate measurement noise -- that is a 10.7x spread, and it was read as one
 # until the timestamps were laid against the log: the fast one was taken nine
-# seconds after b80eae0, "The two HTTP proxy benchmarks were comparing two bash
+# seconds after 3032189, "The two HTTP proxy benchmarks were comparing two bash
 # fork rates".  The three slow numbers measured bash forking a subshell and a
 # `date` per request.  The fast one measured the proxy.
 #

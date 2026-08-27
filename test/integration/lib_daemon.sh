@@ -342,7 +342,7 @@ daemon_sweep() {
 # substitution's, so when cmd fails the file ends at that line: no assertion, no
 # `Results`, no `OK`/`FAILED`.  What a broken test_cache.sh printed was
 #
-#     FAIL [cache created]: create refused, exit 2 …    <- ba7a147 added this
+#     FAIL [cache created]: create refused, exit 2 …    <- c76e965 added this
 #     FAIL [SET]: got '', expected 'ok'
 #     … 20 more …
 #     (nothing — the file is gone, at `TTL=$(send_cmd 'ttl ttlkey')`)

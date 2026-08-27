@@ -1428,7 +1428,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
 #ifndef SOCKETLEY_NO_LUA
     // ─── The Lua handler ────────────────────────────────────────────────────
     //
-    // Protected, like every other callback in this tree since 07baee7..b868bb5,
+    // Protected, like every other callback in this tree since 2a1e135..df02e6f,
     // and this was the last one to come across.  It used to be a sol::function
     // called inside `try { ... } catch (const std::exception&)`, and the result
     // was read with no check at all:
@@ -1439,7 +1439,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
     // handler throws AND the throw unwinds out of the interpreter, which it does
     // not in this repository's Sanitize configuration — so the one diagnostic
     // this path had was dead in the build the nightly job uses.  And reading
-    // index 0 without asking valid() is the read b868bb5 records the cost of on
+    // index 0 without asking valid() is the read df02e6f records the cost of on
     // the cache path: on a failed call index 0 is the error object.
     //
     // A raise is answered with 500, not with the fall-through below.  `return
@@ -3503,7 +3503,7 @@ reparse:
         // one: "Host: x\nContent-Length: 38\r\n" splits on CRLF into ONE line
         // whose name is Host, so the Content-Length is never seen, the body is
         // taken as empty, and the 38 bytes behind it are read as the NEXT
-        // request.  Measured on ada6f1c: two answers to one message, the second
+        // request.  Measured on c218738: two answers to one message, the second
         // one the client's to choose.  The proxy has refused this since it
         // learned to; the server did not, and the two sit in the same pipeline.
         //
@@ -3554,7 +3554,7 @@ reparse:
         // shape it did not know about resolved the same way — length zero, body
         // empty, and whatever followed read as the next request on the
         // connection.  Four of those shapes were measured against this server
-        // and the proxy side by side on one binary (ada6f1c), one write each,
+        // and the proxy side by side on one binary (c218738), one write each,
         // with a distinct file behind the smuggled request:
         //
         //     Content-Length : 38          proxy 400   server 2 answers, leaked

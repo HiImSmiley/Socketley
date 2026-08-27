@@ -8,9 +8,9 @@
 # command to".  Any AF_UNIX listener on that path collects the answer yes.
 #
 # The test side of this tree stopped identifying by the wrong property a while
-# ago.  c1875e3 rewrote lib_daemon.sh to find a daemon by the inode of the
+# ago.  81dcf4a rewrote lib_daemon.sh to find a daemon by the inode of the
 # socket it serves rather than by the process's name, because a binary copied
-# under another name was being reported dead while it was serving.  101f7b6
+# under another name was being reported dead while it was serving.  f6670f8
 # gave a cluster node an identity triple so it could tell "me, again" from
 # "somebody else".  Production still asked connect().
 #

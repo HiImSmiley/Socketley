@@ -33,7 +33,7 @@
 #
 # `|| true` used to be half-defensible.  Every test shared one socket, so some
 # other daemon might already hold the name and `runtime already exists` was
-# noise no test could prevent.  Since ad06685 each test brings up its own daemon
+# noise no test could prevent.  Since 3ffde3c each test brings up its own daemon
 # on its own socket with its own state directory, and the runtime table starts
 # empty.  On that daemon a refused create can only mean the test's own setup is
 # wrong or the binary is — both worth a red line, neither worth hiding.

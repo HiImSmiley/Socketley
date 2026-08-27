@@ -4,7 +4,7 @@
 #
 # ─── WHAT THIS IS FOR ───────────────────────────────────────────────────────
 #
-# Since 2313c26 a runtime created without --daemon-process lives in a worker
+# Since 8399bee a runtime created without --daemon-process lives in a worker
 # process, and that is the DEFAULT.  A worker holds one runtime and no map of
 # runtimes, so twelve calls of the management API have nothing to answer from:
 #
@@ -581,7 +581,7 @@ ctl "socketley.get()" "$IN_get" "server/running/$PEER_PORT/1/nil" \
 #           does not promise, and would be red on a correct build.
 #   CEILING The behaviour this replaced was the two-second health tick, which is
 #           8x.  A deadline at or above that passes on the very regression the
-#           assertion exists to catch, and 38e343d is one revert away.
+#           assertion exists to catch, and 5fee09c is one revert away.
 #
 # 4x sits between them: twice the worst case the design promises, half the
 # interval of the bug it guards against.  Measured on this tree it converges far

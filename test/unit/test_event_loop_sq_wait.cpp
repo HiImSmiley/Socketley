@@ -15,7 +15,7 @@
 
 // ─── WHY THIS FILE IS A UNIT TEST AND NOT AN INTEGRATION ONE ────────────────
 //
-// 57d4add made get_sqe() wait for the SQPOLL thread instead of reporting a full
+// d2d3255 made get_sqe() wait for the SQPOLL thread instead of reporting a full
 // submission queue as a permanent failure, and left two things written down as
 // reasoning rather than as results.  Its own commit message says so:
 //
@@ -54,7 +54,7 @@
 // than a claim: BOTH ARMS COME OUT OF ONE BINARY.  With the wrapper passing
 // through, get_sqe() is the fixed code exactly as shipped; with it answering
 // -EINVAL, the wait is a no-op and get_sqe_when_full() degrades to precisely
-// what stood there before 57d4add -- submit once, retry once, refuse.  Nothing
+// what stood there before d2d3255 -- submit once, retry once, refuse.  Nothing
 // is rebuilt between the two, so nothing but that one decision differs.
 
 namespace
@@ -127,7 +127,7 @@ struct counting_handler : io_handler
 // when the ring has a poller, because without one io_uring_submit() is a real
 // syscall that always makes room.  An arm that quietly loses SQPOLL therefore
 // looks exactly like a build in which nothing can go wrong, which is the
-// failure mode 57d4add called out by name.  Checked, never assumed.
+// failure mode d2d3255 called out by name.  Checked, never assumed.
 bool start_ring(event_loop& loop)
 {
     loop.set_sqpoll(true);
@@ -430,7 +430,7 @@ TEST_CASE("teardown of more connections than the ring is deep loses no cancel")
             << " sq_exhausted=" << fixed.exhausted_delta
             << " leaked=" << fixed.leaked << "/" << CONNECTIONS);
 
-    // ── the same run with 57d4add's one line taken back out ──
+    // ── the same run with d2d3255's one line taken back out ──
     //
     // The wrapper answering -EINVAL makes the wait a no-op, which leaves
     // get_sqe_when_full() doing what it did before that commit: submit, retry

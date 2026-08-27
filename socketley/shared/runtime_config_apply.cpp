@@ -150,7 +150,7 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             // >= 0)`.  Writer and reader disagreed about what 0 meant, and only
             // the worker path reads it back — which is why an in-daemon client
             // reconnected in about a second and a worker one, the default since
-            // 2313c26, never did.
+            // 8399bee, never did.
             if (cfg.reconnect >= 0) cli.set_reconnect(cfg.reconnect);
             break;
         }

@@ -277,7 +277,7 @@ assert_eq "a hook that returns nothing forwards the bytes unchanged" \
     "read off the backend's own record of what arrived, so a hook that" \
     "silently rewrote the bytes fails here rather than passing quietly." \
     "This is the observer shape -- log(data) and nothing else -- and it" \
-    "read as nil until 60c73fd, which emptied every connection through it"
+    "read as nil until 57a2e1e, which emptied every connection through it"
 assert_eq "...and the backend's answer comes back to the client" \
           "BACKEND-SAID-HELLO" "$OUT"
 

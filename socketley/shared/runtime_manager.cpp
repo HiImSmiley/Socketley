@@ -862,7 +862,7 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     // ─── And only a runtime that is running ─────────────────────────────────
     //
     // A runtime that is not running executes no script.  That is the sentence
-    // ebb6897 established for the timers and that severing subscriptions at
+    // 23e5181 established for the timers and that severing subscriptions at
     // `stop` extended to this API — but severing at `stop` can only answer for
     // a runtime that stopped, and there is a second way to be not-running with
     // live registrations: never having started.  A script's top level runs when

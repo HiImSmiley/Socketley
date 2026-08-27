@@ -41,7 +41,7 @@
 //       completion it can produce moves this exchange forward is a different
 //       question, and it is the one that matters.
 //
-//       The pair that leaked 26 connections on 2026-08-01 (6f7b9e2) passed (1)
+//       The pair that leaked 26 connections on 2026-08-01 (79c28b9) passed (1)
 //       for exactly that reason.  A client sent `Connection: close`, was
 //       answered, and half-closed.  The proxy held the pair open for an answer
 //       that had already been delivered, and (1) saw the backend's idle
@@ -187,7 +187,7 @@
 //
 // Eight is therefore an absolute cushion and not a ratio — room for a legitimate
 // shape the measurement did not reach — and it is chosen against the defect from
-// the other side as well.  The end-of-stream re-arm 6f7b9e2 removed reaches
+// the other side as well.  The end-of-stream re-arm 79c28b9 removed reaches
 // twelve iterations inside a single program of the existing corpus, so a limit
 // of eight is reported by a plain corpus replay rather than only by a load test;
 // a limit of sixteen would have been quiet on every seed in the tree.  In a

@@ -211,7 +211,7 @@ fi
 # against a correctly built binary.  ASan cannot see it: the older class was the
 # smaller of the two, so every write landed inside the allocation.
 #
-# It had happened before and was not recognised as a cause — 75afc3a adopted a
+# It had happened before and was not recognised as a cause — 9f3f2a4 adopted a
 # seed literally named stale_binary_artifact-f57f22fc, "produced by a libFuzzer
 # binary built five proxy commits before it was replayed", and left the build
 # that produced it alone.

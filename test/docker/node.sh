@@ -26,7 +26,7 @@
 #     sleep 1 &&
 #     socketley daemon --name api1 --cluster /cluster && ...
 #
-# and the second line is not a second daemon.  Since 97d236d `daemon --name`
+# and the second line is not a second daemon.  Since 3295e9a `daemon --name`
 # and `daemon --cluster` are configuration commands against a daemon that is
 # already up, and like every other CLI command they auto-start a detached
 # daemon of their own when the socket does not answer.  So that `sleep 1` was a
@@ -39,7 +39,7 @@
 # The daemon prints "daemon started" after the IPC socket is bound and after
 # persisted state is restored, so it means serving rather than alive.  Waiting
 # for that line removes the race instead of widening it, which is what
-# ad06685 did for the shell cluster tests.
+# 3ffde3c did for the shell cluster tests.
 set -eu
 
 : "${NODE_NAME:?NODE_NAME must be set}"

@@ -51,7 +51,7 @@
 # on the client leg is still armed from before the hold, so that full close
 # delivers a completion and the pair is torn down by the ordinary route — after
 # the exchange this test is about, but well before the descriptors are counted.
-# The leak adadd79 recorded was measured on test_proxy_group_keepalive_load,
+# The leak 8ed0bb4 recorded was measured on test_proxy_group_keepalive_load,
 # whose clients do stay alive, and that is where it is still visible.
 #
 # Left as it stands rather than rewritten: making it discriminate needs a client

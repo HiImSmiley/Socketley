@@ -83,7 +83,7 @@ test_burst_connections() {
 #
 # An echoing backend, because a plain server runtime answers nothing in any
 # --mode and the loop would otherwise time its own writes -- the same reason
-# 6c6f841 gave the overhead test one.  --mode in as before: echo.lua replies to
+# 4f56712 gave the overhead test one.  --mode in as before: echo.lua replies to
 # the sender itself, so the mode only decides whether the message is ALSO
 # relayed, and here it should not be.
 test_single_client_throughput() {

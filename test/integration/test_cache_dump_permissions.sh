@@ -5,7 +5,7 @@
 #
 # cache_store::save_v2() created its file with a literal 0644, so every account
 # on the machine could read whatever the application had cached.  Measured on
-# 1df25e8, one SET and a second uid:
+# 1ed0aa2, one SET and a second uid:
 #
 #     SET session_token abc-super-secret
 #     uid nobody: strings c1.rdb  ->  session_token

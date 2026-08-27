@@ -330,7 +330,7 @@ fi
 # ...and it arrived at the call site as a failure, not only at the hook.
 #
 # Two different claims, and the second is the one that has to be re-checked
-# every time the invocation sites move.  07baee7..b868bb5 replaced every
+# every time the invocation sites move.  2a1e135..df02e6f replaced every
 # `catch (const sol::error&)` in this tree with a protected call whose
 # `!valid()` branch reports — a deadline is raised as an ordinary Lua error, so
 # it has to travel that same route and be diagnosed there, with the script and
@@ -428,7 +428,7 @@ fi
 
 # ── 5b. The proxy byte hooks, whose contract has four cases ─────────────────
 #
-# on_proxy_request tells four outcomes apart, and 6710699/dcf2791 settled the
+# on_proxy_request tells four outcomes apart, and 213143c/bccfbea settled the
 # newest of them: an error refuses the request and closes, an explicit nil
 # drops, a string replaces, and RETURNING NOTHING AT ALL forwards the bytes
 # unchanged — because a hook that only watches traffic ends without a return
@@ -505,7 +505,7 @@ if grep -q "PAYLOAD-THROUGH-SPIN" "$PX_SEEN" 2>/dev/null; then
     fail "a stopped byte hook refuses rather than forwarding unchanged" \
          "the backend received the payload anyway" \
          "a stopped hook must land in the !r.valid() refusal, NOT in the" \
-         "'returned nothing, forward unchanged' case dcf2791 documents —" \
+         "'returned nothing, forward unchanged' case bccfbea documents —" \
          "forwarding a request whose policy hook never finished deciding is" \
          "the admission the hook was written to prevent"
 else pass; fi
@@ -517,7 +517,7 @@ if grep -q "PAYLOAD-THROUGH-WATCH" "$PX_SEEN2" 2>/dev/null; then pass; else
     fail "control: a hook that returns nothing still forwards unchanged" \
          "the backend behind dl_px2 saw: $(cat "$PX_SEEN2" 2>/dev/null | tr -d '\0' | head -c 80)" \
          "an observer hook ends without a return and its bytes must go through" \
-         "— that is the contract dcf2791 wrote down, and arming a deadline" \
+         "— that is the contract bccfbea wrote down, and arming a deadline" \
          "around the call must not have disturbed it"
 fi
 
@@ -547,7 +547,7 @@ esac
 
 # ── 7. A callback_timeout_ms that is not a number ───────────────────────────
 #
-# The global is read out of a table the script controls, and 091e6d9 is the
+# The global is read out of a table the script controls, and f956524 is the
 # commit that made every such read in this tree the checked form after an
 # unchecked one took the daemon down with std::terminate.  This one is checked,
 # and the assertion is on the behaviour rather than the spelling: a value that

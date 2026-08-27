@@ -2,7 +2,7 @@
 //
 // ─── THE liburing FLOOR, CHECKED WHERE IT IS LEGIBLE ─────────────────────────
 //
-// Since 6c5c110 (2026-07-28) the event loop names three things that liburing 2.5
+// Since 5593ee1 (2026-07-28) the event loop names three things that liburing 2.5
 // — the release Ubuntu 24.04 ships, and the one `apt install liburing-dev` used
 // to hand every contributor — does not declare at all:
 //

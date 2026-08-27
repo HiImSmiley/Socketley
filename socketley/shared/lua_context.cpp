@@ -261,7 +261,7 @@ long remaining_ms() noexcept
 // interpreter — which it does not in the Sanitize build, so the diagnostic was
 // dead in exactly the configuration the nightly job uses.
 //
-// 07baee7..b868bb5 removed every one of those catches and made the calls
+// 2a1e135..df02e6f removed every one of those catches and made the calls
 // protected, so a deadline now arrives at the call site as an invalid result
 // and IS reported there, in both builds, with the script and line attached —
 // which this line cannot know.  That is the primary report now, and it is the
@@ -537,7 +537,7 @@ struct lua_timer : io_handler
         // see the destructor) has nothing left to run, and fn is nil by then.
         //
         // The scope brackets the call and nothing else: a deadline that expires
-        // in here comes back as an invalid result, and b62d58d's branch below
+        // in here comes back as an invalid result, and a0ffcd5's branch below
         // is already the right place for it to be reported.
         {
             lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
@@ -574,7 +574,7 @@ struct lua_timer : io_handler
 
 // ─── Severing one timer from its context ───────────────────────────────────
 //
-// c1f45ba built this in ~lua_context and 1928eb4/ebb6897 generalised it to
+// b74487c built this in ~lua_context and 23e5181 generalised it to
 // cancel_timers(); it is one function now because clear_timeout and
 // clear_interval need exactly it and used to perform a weaker thing instead.
 //
@@ -782,7 +782,7 @@ static void api_diag(runtime_instance* owner, const std::string& msg)
 //
 // `true` when it happened; `false, "<reason>"` when it did not.
 //
-// 7b951e3 fixed the calls that took a value, altered it and reported success.
+// 721a97f fixed the calls that took a value, altered it and reported success.
 // This is the same defect one step along: the call answers, and the answer
 // carries nothing.  `socketley.start("web")` returned a bare `false` for a
 // runtime that does not exist, for one that is already running, for one whose
@@ -964,12 +964,12 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     //
     // TWO READS, AND BOTH FORMS ARE DELIBERATE.
     //
-    // `.get<sol::optional<int>>()` is the checked read 091e6d9 replaced every
+    // `.get<sol::optional<int>>()` is the checked read f956524 replaced every
     // bare `sol::optional<T> x = tbl[k]` in this tree with.  The bare form runs
     // an unconditional conversion, and sol2's safety checks follow NDEBUG — on
     // in every Debug and Sanitize build, off in Release — so what it does with
     // a value it cannot convert is a property of the build rather than of the
-    // code.  091e6d9 has the case that cost a daemon: an ABSENT key read as
+    // code.  f956524 has the case that cost a daemon: an ABSENT key read as
     // sol::optional<std::string> inside socketley.create's binding, throwing
     // across the Lua C boundary into std::terminate.
     //
@@ -977,7 +977,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     // Sanitize, `callback_timeout_ms = "soon"` through `create --lua`: it
     // answered nullopt and the diagnostic below fired, the same as the checked
     // form.  The guard above is why — sol::object first, so the key is known to
-    // be present, which is the case 091e6d9 was about.  So this is not a crash
+    // be present, which is the case f956524 was about.  So this is not a crash
     // being fixed; it is the one read in this file that would otherwise be
     // spelled differently from every other read in the file, resting on a
     // measurement of which type pairs sol2 happens to throw on.  That is not a
@@ -1380,7 +1380,7 @@ void lua_context::settle_subscriptions()
 // End every subscription this context holds, leaving the context itself alive.
 //
 // The other half of cancel_timers(), and it exists for the sentence that one is
-// written under: a stopped runtime must execute no script.  ebb6897 severed the
+// written under: a stopped runtime must execute no script.  23e5181 severed the
 // timers at `stop` and left this standing, so a registration went on living as
 // long as the interpreter did — and only `remove` destroys that — which meant a
 // PUBLISH on the linked cache was delivered to a runtime `ls` reported as
@@ -1599,7 +1599,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     // ─── The three optional keys, checked ───────────────────────────────────
     //
     // These were the last `sol::optional<T> x = tbl[k]` reads in this file, the
-    // form 091e6d9 replaced everywhere else after one of them took the daemon
+    // form f956524 replaced everywhere else after one of them took the daemon
     // down: the converting constructor runs an unconditional conversion, sol2's
     // safety checks follow NDEBUG, and a key that is absent or of another type
     // throws across the Lua C boundary into std::terminate.  Honestly: this
@@ -2908,7 +2908,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // placeholder reaches an object that has the name, the port and the state
     // and not one connection: it succeeds, it returns true, and the message
     // goes nowhere.  That was fixed for the CLI when the deliver frame was
-    // added and left standing here, so since 2313c26 made the worker the
+    // added and left standing here, so since 8399bee made the worker the
     // default it was the ordinary case for a script.
     sk["send"] = [owner](std::string_view name,
                          std::string_view msg) -> api_result {
@@ -2970,7 +2970,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.get(name) → table {name, type, state, port, connections, owner} or nil
     //
     // reported_connection_count(), not get_connection_count(): `name` is some
-    // OTHER runtime, and since 2313c26 another runtime is normally one in a
+    // OTHER runtime, and since 8399bee another runtime is normally one in a
     // worker process, whose connections this object does not hold.  The three
     // calls in this file that ask about another runtime are the three that had
     // to change; every self.connections() below asks its own object in its own

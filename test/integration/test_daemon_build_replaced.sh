@@ -2,7 +2,7 @@
 # Integration test: a daemon still running an executable that has since been
 # rebuilt says so.
 #
-# b1aa7d5 made `socketley version` report a daemon on the socket whose version
+# 62e6bb1 made `socketley version` report a daemon on the socket whose version
 # differs from the CLI's.  It compares
 #
 #     dver != SOCKETLEY_VERSION
@@ -27,7 +27,7 @@
 #   same path, daemon's deleted   the rebuild unlinked it.  Certain.  Report it.
 #   different paths               SAY NOTHING.
 #
-# The last is not a nicety.  c1875e3 exists because a binary copied under
+# The last is not a nicety.  81dcf4a exists because a binary copied under
 # another name was being misidentified, and comparing inodes across different
 # paths would reintroduce exactly that: every agent in this tree runs the CLI
 # from a copy while a daemon runs from the original, and a build report on each
@@ -158,7 +158,7 @@ ERR=$("$ALTDIR/socketley" version 2>&1 >/dev/null || true)
 if [ -z "$ERR" ]; then ok; else
     bad "a CLI run from a different path than the daemon's says nothing" \
         "a copy of the binary elsewhere on disk is not evidence that the" \
-        "daemon's build is stale; c1875e3 is what happens when a copy is" \
+        "daemon's build is stale; 81dcf4a is what happens when a copy is" \
         "misidentified.  stderr was:" \
         "  $ERR"
 fi
@@ -168,7 +168,7 @@ daemon_isolate buildswap2
 
 # ─── 4. a daemon too terse to answer is not accused ──────────────────────────
 #
-# A daemon built between b1aa7d5 and this change answers `ping` with the prefix,
+# A daemon built between 62e6bb1 and this change answers `ping` with the prefix,
 # a version and a pid, and nothing after it.  That is a real thing that can be
 # running on somebody's machine, and being terse is not the same as being a
 # different build.  The stand-in is a listener replying exactly that frame.

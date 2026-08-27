@@ -18,7 +18,7 @@
 #
 #     zombie ticks: 41   zombie subs: 1
 #
-# — the exact defect ebb6897 fixed, at full rate, on a runtime `ls` reports as
+# — the exact defect 23e5181 fixed, at full rate, on a runtime `ls` reports as
 # Stopped, reachable again through a door the severance does not close.  Forty
 # one is not a leak; it is a script running.
 #
@@ -27,7 +27,7 @@
 # The timers and the subscriptions are asserted together on purpose.  They are
 # severed by the same call for the same sentence, and a fix applied to the one
 # it was found through would leave the other half of a single rule behind — and
-# leave it in the API whose bill ebb6897 already measured once.  So the test
+# leave it in the API whose bill 23e5181 already measured once.  So the test
 # arms both from the same handler and reads both answers.
 #
 # ─── AND IT LIFTS ───────────────────────────────────────────────────────────

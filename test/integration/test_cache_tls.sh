@@ -80,7 +80,7 @@
 # A token names an OBSERVATION.  What it is worth is this file's judgement, and
 # it splits three ways:
 #
-#   * the three timeouts are NOT MEASURABLE, in the words d1fa885 and
+#   * the three timeouts are NOT MEASURABLE, in the words 2959e6b and
 #     test_proxy_group_keepalive_load.sh already use.  Six probes here carry a
 #     fixed client budget (10 s, 8 s, 5 s, 8 s, 6 s, 8 s) while the handshake
 #     they are waiting on measures 0.01 s on a quiet box, against a

@@ -81,7 +81,7 @@ concurrency:
 
 env:
   # liburing is deliberately absent from this list.  ubuntu-24.04 packages 2.5,
-  # this tree has needed >= 2.7 since 6c5c110 (2026-07-28), and every job below
+  # this tree has needed >= 2.7 since 5593ee1 (2026-07-28), and every job below
   # installed 2.5 and then failed to build — the Nightly was red from that day
   # until 2026-08-01.  Each job runs scripts/install-liburing.sh instead, which
   # is also what the Dockerfile, CI and the release job use.
@@ -240,7 +240,7 @@ jobs:
         # stay that way: the script runs each target twice, libFuzzer then the
         # GCC replay driver, and a target whose replay binary is missing is a
         # failure, not a skip.  fuzz_event_loop was added to run_fuzz.sh in
-        # 3a7052c and never added here, so every run of this job since has ended
+        # 683e981 and never added here, so every run of this job since has ended
         # with
         #     FAIL fuzz_event_loop: bin/Sanitize/fuzz_event_loop does not exist
         # and would have exited 1 on that alone.  Nobody saw it because the job
@@ -303,7 +303,7 @@ jobs:
         # REQUIRE_LIBFUZZER=1 here as well as at build time.  The build step
         # proves the binaries were produced; this proves they were actually run.
         #
-        # CLOSED 2026-07-31 (commit 5061394): fuzz_http_request used to fail
+        # CLOSED 2026-07-31 (commit 6be69e7): fuzz_http_request used to fail
         # immediately, on a seed.  Two findings in
         # proxy_instance::parse_http_request_line, both of them reachable from
         # the network by an unauthenticated client:
@@ -527,7 +527,7 @@ jobs:
         #     check_backend_pool() reports at filing time — the first walk that
         #     sees a socket in the pool which was not in it before — so what a
         #     backend does to an already-filed socket is no longer charged to
-        #     the filing.  Reverting efdbabd's `unknown` past a bounded end
+        #     the filing.  Reverting 4da85cf's `unknown` past a bounded end
         #     brings the finding straight back on proxy/response_with_a_tail.
         #   * crosstalk — CLOSED 2026-08-01, in the harness.  The harness backend
         #     answered an unread request late, on a socket that had since been
@@ -555,7 +555,7 @@ jobs:
         #     also goes out unmarked, because an older id on it is a mismatch
         #     this end invented.  Neither touches the case the defect is in: an
         #     answer volunteered onto a genuinely quiet socket still carries
-        #     last_id, so reverting ed07f12's destroy-on-readable branch brings
+        #     last_id, so reverting bbf4e9f's destroy-on-readable branch brings
         #     crosstalk straight back on proxy/pooled_socket_speaks_unbidden.
         #     THE DISCRIMINATOR, if this id fires again: read the probe's result
         #     first.  r>0 is the defect back.  EAGAIN is the harness.
@@ -594,9 +594,9 @@ jobs:
         #
         # THE SHAPE THAT WAS UNDIAGNOSED IS NO LONGER REACHED, and its entry is
         # gone rather than reworded.  It was client-closed-without-answer with
-        # nothing at all on the client's wire, and 1eb7d53 left it here with the
+        # nothing at all on the client's wire, and ea8b096 left it here with the
         # sentence "whether the proxy owes a 502 there has not been settled".
-        # ea10b66 settled it and shipped the answer: a backend that refused gets
+        # a359d47 settled it and shipped the answer: a backend that refused gets
         # 502, a shortage belonging to this machine (EADDRNOTAVAIL, EMFILE,
         # ENOBUFS, ENOMEM, ENFILE, EADDRINUSE) gets 503, no backend at all gets
         # 503, and TCP mode closes in silence because there is no request and no
@@ -640,7 +640,7 @@ jobs:
         # 37 bytes, 7 and 13 at 71, 20 at 112, and seed 3 at 112 over a 60 s
         # budget.
         # THE QUESTION THIS ENTRY USED TO CARRY IS ANSWERED, and the answer is
-        # neither of the two it offered.  ea10b66 traced it: those bytes are not
+        # neither of the two it offered.  a359d47 traced it: those bytes are not
         # a response.  http_response_scan_chunk finds no CRLFCRLF in them, so
         # headers_parsed is false and `unknown` is false — the proxy is in "the
         # rest of this header block is still coming" state, not in
@@ -651,10 +651,10 @@ jobs:
         # responses stream.  It cannot answer the second request either: a
         # status line written behind those bytes lands at an offset the proxy
         # has itself established is not a message boundary, the client-side twin
-        # of the fault efdbabd fixed in the pool direction, and response_started
+        # of the fault 4da85cf fixed in the pool direction, and response_started
         # bars it.  So the answering policy exists and this shape escapes it on
         # purpose.
-        # WHAT IS PAID INSTEAD is the breaker charge ea10b66 added: the client
+        # WHAT IS PAID INSTEAD is the breaker charge a359d47 added: the client
         # on that request is lost and nothing can be done for it, and the next
         # one is routed somewhere else.  The id stays open because bounding how
         # many clients a loss happens to is not removing the loss.
@@ -684,7 +684,7 @@ jobs:
         #
         # WATCHED BOTH WAYS, because a split nobody has seen fall on either side
         # proves nothing.  With every error answer the proxy writes suppressed —
-        # 1eb7d53's method, send_error returning without queuing — the 0-byte arm
+        # ea8b096's method, send_error returning without queuing — the 0-byte arm
         # aborts on its own words: "sent 1 complete request(s) and received 0
         # bytes before the proxy closed it (0 bytes in total on this
         # connection)", under client-closed-without-answer itself and with no
@@ -729,7 +729,7 @@ jobs:
         # the default proxy configuration — only the operation stream differs —
         # so 64 seeds are 64 programs against one proxy, and a defect that lives
         # in another configuration is invisible to all of them however long they
-        # are mutated.  6de09db is that defect: a half-closed client losing its
+        # are mutated.  1ab3141 is that defect: a half-closed client losing its
         # answer on --backend-timeout 0, where the predicate deciding whether an
         # answer was owed rested on a flag arm_response_deadline() never sets
         # when the deadline is off, and with no deadline there is no sweep to
@@ -747,7 +747,7 @@ jobs:
         # max-connections and idle-timeout all default to 0, so the corpus
         # already runs with them off on every seed.
         #
-        # Measured: with the predicate of 6de09db put back as it was, the
+        # Measured: with the predicate of 1ab3141 put back as it was, the
         # default run stays green and the backend-timeout=0 entry fails on
         # proxy/client_fin_after_a_whole_request.  That is the whole point of
         # the entry, and it is why FUZZ_PROXY_MATRIX must not be emptied here.

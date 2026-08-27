@@ -147,7 +147,7 @@ socketley_paths socketley_paths::resolve()
     //     B: remove collide_srv                     A's state file is deleted
     //
     // Two daemons serving one port and each able to delete the other's runtimes,
-    // silently.  test_cluster.sh worked around this in 101f7b6 by giving its
+    // silently.  test_cluster.sh worked around this in f6670f8 by giving its
     // nodes separate HOMEs rather than separate sockets; the cause was never
     // fixed.
     //

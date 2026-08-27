@@ -33,7 +33,7 @@ daemon_isolate drain
 # lib_ports.sh:99 runs `exec 9>lockfile 2>/dev/null`; an exec with no command
 # applies both redirections to the shell, so sourcing it discards this file's
 # stderr for the rest of the run.  Put back — a failure that reports nothing but
-# its own existence is most of an hour.  Fixed on fix/p0-crashes as b72a776,
+# its own existence is most of an hour.  Fixed on fix/p0-crashes as 2eab0cf,
 # which has not reached main.
 exec 2>&1
 
@@ -128,7 +128,7 @@ else bad "in-daemon: --drain delivers more than a bare stop" \
 
 # ── And that it is not a daemon-only feature ────────────────────────────────
 #
-# The worker is the default since 2313c26.  A drain that only worked in the
+# The worker is the default since 8399bee.  A drain that only worked in the
 # daemon would be invisible to almost every user, and --reconnect was exactly
 # that until this week, so it is asserted rather than assumed.
 if [ "$W_ON" -gt $((D_ON * 4 / 5)) ]; then ok

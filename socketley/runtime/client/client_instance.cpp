@@ -976,7 +976,7 @@ resubmit:
 // shared/conn_reachability.h exists to refuse: an armed read is ended by the
 // peer sending something or by the socket ending, and a connection that is
 // `closing` is one whose peer has already gone.  It cost the cache a stranded
-// connection (78c9ecc) and the server one too, and here the stakes are higher
+// connection (87d2c9d) and the server one too, and here the stakes are higher
 // per occurrence rather than lower — a client has exactly one connection, so a
 // stranded one means the whole runtime sits connected and deaf and, with
 // --reconnect configured, never dials again, because drop_connection() is the

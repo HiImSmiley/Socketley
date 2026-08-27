@@ -331,7 +331,7 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
 //
 // Which is exactly what this tree had.  proxy_instance::parse_http_request_line
 // carried these rules and server_instance did not, so the same bytes measured
-// against both on one binary (ada6f1c, ports 21440-21442):
+// against both on one binary (c218738, ports 21440-21442):
 //
 //     Content-Length : N   (space before the colon)  proxy 400   server 2x200
 //     duplicate Content-Length                       proxy 400   server 2x200

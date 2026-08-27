@@ -140,7 +140,7 @@ RSS_BOUND_KB=24576
 # and only the first one is excused here.
 #
 # NOT ASSERTED IS NOT `NOT MEASURABLE`.  This file already carries herr() below,
-# from d1fa885, for a claim this RUN could not put and might put next time.  This
+# from 2959e6b, for a claim this RUN could not put and might put next time.  This
 # is the other thing: this BUILD cannot answer this question and never will, so
 # retrying changes nothing.  They are counted in separate columns, and only
 # herr() ends the run non-zero — a job that is red every single night for a
@@ -196,7 +196,7 @@ herr() {
 # ever, and it does not.  Two columns, deliberately, so the summary line says
 # which of the two happened without anyone reading the log.
 #
-# The vocabulary is test_abrupt_client_abort.sh's, from 4414780, and not a third
+# The vocabulary is test_abrupt_client_abort.sh's, from 3e153bf, and not a third
 # one invented here.
 not_asserted() {  # label reason
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))

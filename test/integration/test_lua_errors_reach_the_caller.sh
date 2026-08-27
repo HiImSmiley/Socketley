@@ -175,7 +175,7 @@ esac
 
 # ── reload-lua, for a runtime in a worker ───────────────────────────────────
 #
-# The other half, and the one be1c057 left open by name: the daemon's copy of an
+# The other half, and the one 185c46f left open by name: the daemon's copy of an
 # out-of-process runtime is a placeholder, the script belongs to the worker, and
 # the worker had no frame in which to say the reload had failed.  It logged a
 # WARN and the command still exited 0.

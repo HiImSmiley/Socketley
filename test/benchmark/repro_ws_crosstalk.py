@@ -33,7 +33,7 @@ matters is the mode comparison, same binary and workload back to back:
 The failure needs the two connection kinds alternating on one thread; upgrades
 alone are clean, and so are senders and upgraders in separate thread pools.
 
-From 87bc282, the first implementation commit.
+From 2a94cf2, the first implementation commit.
 
 Usage: repro_ws_crosstalk.py [PORT] [ROUNDS]
 Exits 1 if relay bytes ever preceded a handshake response.

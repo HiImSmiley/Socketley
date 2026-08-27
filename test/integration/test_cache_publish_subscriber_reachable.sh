@@ -10,7 +10,7 @@
 #
 # That is, on its face, exactly the shape shared/conn_reachability.h exists to
 # refuse — a `closing` connection deferring to an armed read, which is the
-# defect fixed in the cache as 78c9ecc and in the server as ceaa3f2.  It is also
+# defect fixed in the cache as 87d2c9d and in the server as 86877cc.  It is also
 # the shape on_cqe's chokepoint cannot see, because publish() runs on the
 # PUBLISHER's completion and the connection it gives up on is a subscriber's.
 #

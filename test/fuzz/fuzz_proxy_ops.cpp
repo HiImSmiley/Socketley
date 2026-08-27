@@ -16,15 +16,15 @@
 //
 //   * a group gateway that gave up on a backend handshake by closing the client
 //     without writing one byte to it — no status, no framing error, nothing a
-//     client can tell apart from the proxy dying (84d624c);
+//     client can tell apart from the proxy dying (17ad1f1);
 //   * a backend socket pooled somewhere other than a message boundary, so the
 //     next borrower read the tail of a stranger's response as the head of its
-//     own — nine separate ways of reaching it (70a8c6a), and then a tenth from
-//     the teardown paths (984dadc);
+//     own — nine separate ways of reaching it (443c5fc), and then a tenth from
+//     the teardown paths (7dc9ec8);
 //   * a pooled connection the backend had already closed, which cost the client
-//     its request and told it nothing (984dadc);
+//     its request and told it nothing (7dc9ec8);
 //   * an @group gateway opening a fresh TCP connection for every single
-//     request, because the pool key could not express a group member (decdb7d).
+//     request, because the pool key could not express a group member (abdb2b4).
 //
 // Every one of those needs a *history* — connect, request, answer, pool, change
 // the membership, request again, abort in the middle — and none is a function of
@@ -40,8 +40,8 @@
 // every one of them a clean run.
 //
 //  A. NO CLIENT IS EVER CLOSED WITHOUT AN ANSWER once it has sent a complete
-//     request.  `client-closed-without-answer`.  This is exactly what 84d624c
-//     and 984dadc fixed, and it is invisible from inside the proxy: every
+//     request.  `client-closed-without-answer`.  This is exactly what 17ad1f1
+//     and 7dc9ec8 fixed, and it is invisible from inside the proxy: every
 //     counter is happy, no error is recorded anywhere, and the only party that
 //     finds out is the client.  So it is checked from the client's socket —
 //     the connection was closed by the far end, this client had a whole request
@@ -125,7 +125,7 @@
 //
 //   (1) / (1b) REACHABILITY AND PROGRESS-REACHABILITY, over a pair.  (1) is old:
 //     nothing in flight on either half means no completion is coming.  (1b) is
-//     the sharpening 6f7b9e2 proved was needed — a client that has half-closed
+//     the sharpening 79c28b9 proved was needed — a client that has half-closed
 //     and is owed no answer is dead however much the ring has armed on its
 //     backend, because a backend's idle multishot read completes only if the
 //     backend sends, and a backend with no request outstanding never does.  That
@@ -440,7 +440,7 @@ const char* backend_shape_name(int s)
 //
 // Every seed in this corpus starts from the default proxy configuration; only
 // the operation stream drifts.  That is a hole with a name on it: the defect
-// 6de09db fixed — a half-closed client losing its answer — was reachable only
+// 1ab3141 fixed — a half-closed client losing its answer — was reachable only
 // with --backend-timeout 0, because the predicate that decided whether an
 // answer was still owed rested on a flag arm_response_deadline() never sets
 // when the deadline is switched off.  Nothing in the corpus pins that value,
@@ -890,7 +890,7 @@ int build_request(int shape, int slot, std::string& out)
 
         case RQ_PIPELINED:
             // Two whole requests in one write.  The second must go through the
-            // framing checks rather than round the back of them (7a235aa), and
+            // framing checks rather than round the back of them (d6e548b), and
             // it must not be lost while the first is answered.
             append_request(out, alloc_id(slot), "GET", "/fuzz-proxy/p1", nullptr, nullptr);
             append_request(out, alloc_id(slot), "GET", "/fuzz-proxy/p2", nullptr, nullptr);
@@ -1446,7 +1446,7 @@ void client_report_close(world& w, client_sock& c)
         // ── the same loss, already decided, reported and not aborted ─────────
         //
         // Bytes did reach this client and then it was closed with nothing since
-        // its last request.  ea10b66 traced that shape and shipped the answer:
+        // its last request.  a359d47 traced that shape and shipped the answer:
         // the backend sent something this proxy cannot frame, those bytes were
         // forwarded, and from there the proxy owes neither of the two things it
         // could owe.  Not a Connection: close — http_response_scan_chunk never
@@ -1455,8 +1455,8 @@ void client_report_close(world& w, client_sock& c)
         // what makes responses stream, so there is no rewriter to hang it with.
         // Not an answer either — a status line written behind those bytes lands
         // at an offset the proxy has itself established is not a message
-        // boundary, the client-side twin of the fault efdbabd fixed in the pool
-        // direction, and response_started bars it.  The breaker charge ea10b66
+        // boundary, the client-side twin of the fault 4da85cf fixed in the pool
+        // direction, and response_started bars it.  The breaker charge a359d47
         // added is what is paid instead.
         //
         // The loss is real and this does not pretend otherwise: it is printed,
@@ -1477,7 +1477,7 @@ void client_report_close(world& w, client_sock& c)
         std::snprintf(msg, sizeof(msg),
                       "%s — the backend sent bytes this proxy cannot frame and they were "
                       "forwarded, so it can neither announce the close nor answer behind "
-                      "them (ea10b66); the client on that request is lost and the breaker "
+                      "them (a359d47); the client on that request is lost and the breaker "
                       "is charged for it",
                       fuzzrt::g_detail);
         fuzz_observe(msg, ::fuzz::current_data(), ::fuzz::current_size());
@@ -1949,7 +1949,7 @@ int backend_accept(world& w, int idx)
 // the two together are the whole of the crosstalk diagnosis: bytes waiting at
 // the proxy's end when a socket is borrowed are an answer nobody asked for, and
 // bytes waiting at the backend's end when an answer goes out are a request
-// nobody read.  The first is the defect ed07f12 fixed.  The second is this
+// nobody read.  The first is the defect bbf4e9f fixed.  The second is this
 // harness getting ahead of its own ledger, and it is what the two functions
 // below now account for instead of blaming the proxy for.
 size_t bsock_unread(const backend_sock& b)
@@ -2009,7 +2009,7 @@ void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
     // all cannot swallow the next real one.
     //
     // ASKED BEFORE resp_pending, and that ordering is the whole of the fourth
-    // shape 1eb7d53 recorded and left alone.  A request from behind this mark
+    // shape ea8b096 recorded and left alone.  A request from behind this mark
     // was on the wire before this end wrote anything at all, so it cannot have
     // been "handed to a socket carrying the tail of a previous response": there
     // was no previous response when the proxy sent it, and the tail the report
@@ -2179,7 +2179,7 @@ void bsock_respond(world& w, int idx, int shape)
         // With nothing unread, the socket really is quiet: this is an answer
         // volunteered onto a socket nobody is using, and marking it with
         // whoever asked last is what lets a client that receives it be told
-        // whose answer it got.  That is the defect ed07f12 fixed, and it is
+        // whose answer it got.  That is the defect bbf4e9f fixed, and it is
         // still marked, so it is still caught.
         //
         // With a request lying unread, it is not quiet at all: the proxy has an
@@ -2378,7 +2378,7 @@ std::unique_ptr<proxy_instance> make_instance(world& w)
             rt->add_backend("@fuzzgrp");
             break;
         case 3:
-            // The mixed shape 84d624c is about: a group entry beside a plain
+            // The mixed shape 17ad1f1 is about: a group entry beside a plain
             // backend, where a member's failure used to be charged to whatever
             // occupied the group's index.
             std::snprintf(addr, sizeof(addr), "127.0.0.1:%u", w.be[0].port);
@@ -2441,7 +2441,7 @@ std::unique_ptr<proxy_instance> make_instance(world& w)
     // way to reach run_request_filters: it is guarded by lua()->has_filters(),
     // so a proxy with no script does not make the call at all.  The script
     // answers 403 for one path and rewrites the headers of every other request,
-    // which are the chain's two vocabularies — see 7689b7a.
+    // which are the chain's two vocabularies — see 318be51.
     if (w.lua && g_lua_path && !g_lua_path->empty())
     {
         if (!rt->load_lua_script(*g_lua_path))
@@ -2526,7 +2526,7 @@ void check_struct_pools(proxy_instance* rt, bool deep)
 // in it while the harness backend's answer was unfinished.  That reported two
 // different things under one id.  One is the defect — release_to_pool() files a
 // socket in the middle of a message, because the proxy and the backend disagree
-// about where the message ended (efdbabd) — and the other is a backend starting
+// about where the message ended (4da85cf) — and the other is a backend starting
 // a NEW message, unbidden, on a socket the proxy had already filed correctly at
 // a boundary.  In the second the finding's own words are false: it says the
 // socket "was filed in the pool somewhere other than a message boundary", and
@@ -2582,7 +2582,7 @@ void check_struct_pools(proxy_instance* rt, bool deep)
 // exactly, which is precisely the artefact class, and they are silent now for a
 // reason rather than by exclusion.
 //
-// Nothing is lost.  The defect efdbabd fixed is a complete answer with the head
+// Nothing is lost.  The defect 4da85cf fixed is a complete answer with the head
 // of another behind it in one write: the proxy consumes all of it, so its
 // position is the end of both and complete_at is the end of the first, and the
 // difference between them is the report.  Checked by putting that fix back out

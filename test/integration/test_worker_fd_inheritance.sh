@@ -29,7 +29,7 @@
 #
 #   THE SOCKET.  A worker holding the daemon's IPC listener answers "is a daemon
 #   serving this socket" in the affirmative.  That question is asked by inode in
-#   lib_daemon.sh's daemon_pids, which c1875e3 rewrote precisely so that a
+#   lib_daemon.sh's daemon_pids, which 81dcf4a rewrote precisely so that a
 #   renamed binary copy could not make it say no; this made it say yes with no
 #   daemon in existence, which is the same false report arriving by the other
 #   door.  Measured on the broken build with both processes up, daemon_pids
@@ -368,7 +368,7 @@ fi
 if daemon_alive "$DSOCK"; then
     fail "nothing is left claiming to serve the dead daemon's socket" \
          "daemon_alive says a daemon is serving $DSOCK after kill -9 on $DPID" \
-         "this is the false report c1875e3 removed, arriving by a second route"
+         "this is the false report 81dcf4a removed, arriving by a second route"
 else
     pass
 fi

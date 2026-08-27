@@ -19,7 +19,7 @@
 # connection then sits in m_clients holding its descriptor, its fixed-file slot
 # and its pool entry until the runtime stops.
 #
-# This is 78c9ecc's mechanism, which was found and fixed in the cache.  The
+# This is 87d2c9d's mechanism, which was found and fixed in the cache.  The
 # server's read is armed the same way — submit_recv_multishot_fixed_file, a
 # multishot recv on a direct descriptor — and free_fixed_file_slot() in
 # event_loop.cpp already records why that particular operation is the one that
@@ -35,7 +35,7 @@
 # connection is always present to be damaged by a recycled descriptor number.
 #
 # HONEST ABOUT THE RATE.  Whether an individual abort lands in the window is
-# luck: measured on 20 consecutive rounds against 25552d9, the count of stranded
+# luck: measured on 20 consecutive rounds against 77fb675, the count of stranded
 # connections went 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 2 2 3 3 3 — three strandings in
 # 20 rounds, or about 15% per round.  What is not luck is that a stranded
 # connection never goes away, so the rounds accumulate: this file runs several

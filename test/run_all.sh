@@ -75,8 +75,8 @@ export HOME="$SUITE_HOME"
 # This was /tmp/socketley-test.sock — one path, shared by every run on the
 # machine — and a daemon was started on it for the whole suite to share.
 #
-# Nothing has driven that daemon since ad06685 gave each file its own.  Checked
-# rather than assumed: on 8d0658b, with the suite mid-run, the shared daemon's
+# Nothing has driven that daemon since 3ffde3c gave each file its own.  Checked
+# rather than assumed: on d5cbe4a, with the suite mid-run, the shared daemon's
 # state directory held nothing but `.adopted` and `ps -a` listed no runtime, and
 # every file in integration/ either calls daemon_isolate or exports a socket of
 # its own before its first CLI command.  What the shared daemon still did was

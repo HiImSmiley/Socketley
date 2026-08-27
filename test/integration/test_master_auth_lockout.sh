@@ -223,7 +223,7 @@ EOF
 # The two documented ways to authenticate a master.  The second one is the
 # configuration in which the lockout used to be absent.
 #
-# Through create_ok, not `|| true`.  This file was written after ba7a147 converted
+# Through create_ok, not `|| true`.  This file was written after c76e965 converted
 # the other 67 sites and simply missed the pass, so a refused create here was
 # discarded — in the one file in this directory whose subject is a security
 # guarantee.  A port already held, a name already taken, a Lua script the daemon

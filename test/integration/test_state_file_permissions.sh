@@ -18,7 +18,7 @@
 # The second line is why this is not merely disclosure.  The daemon restores
 # every runtime from these files at startup, so a writable record is a way to
 # choose what the daemon runs — the same escalation the IPC socket's 0666 was,
-# closed in 39152d9, arriving through the filesystem instead.
+# closed in 8e4cff7, arriving through the filesystem instead.
 #
 # ─── WHAT IS PINNED, AND WHY EACH ONE ───────────────────────────────────────
 #

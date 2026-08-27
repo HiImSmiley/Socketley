@@ -432,9 +432,9 @@ public:
     // rather than at each of the forty places that invoke one of these.
     //
     // The handle forwards and nothing else.  It does not look at the result and
-    // must not start: 07baee7..b868bb5 made every one of these a protected call
+    // must not start: 2a1e135..df02e6f made every one of these a protected call
     // whose caller checks valid() before reading anything, and a failed call
-    // still has a value at index 0 — the error object.  b868bb5 records what
+    // still has a value at index 0 — the error object.  df02e6f records what
     // that costs when the order is wrong: on_miss reads index 0 and writes it
     // into the cache, so a read-before-check would have stored a Lua error
     // message as the fetched value and served it as a hit for ever.

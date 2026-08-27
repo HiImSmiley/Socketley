@@ -1671,7 +1671,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         // script never came near this process, and the child sent it up as a
         // `start_err` frame before the `state` frame the wait above ended on.
         // Asking only the first would have covered the flag nobody passes:
-        // since 2313c26 a runtime is out of process unless it says otherwise,
+        // since 8399bee a runtime is out of process unless it says otherwise,
         // so the worker leg IS the ordinary `create -s`.
         std::string why = on_start_error(name);
 
@@ -3801,7 +3801,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     //     socketley show c | jq '.rate_limit = 5' | socketley import c   -> 0
     //     socketley show c                          -> "rate_limit": 5
     //
-    // which is the same shape as 4af38f0, where import could give a runtime a
+    // which is the same shape as 2cf7a4e, where import could give a runtime a
     // name create would have refused.  A validation that only guards one entrance
     // is a validation that is not there.
     //
@@ -4096,7 +4096,7 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         // ─── The child comes down here, or the reload never reaches it ──────
         //
         // Without this line `reload` did nothing at all to a runtime in a
-        // worker, which since 2313c26 is every runtime that did not ask
+        // worker, which since 8399bee is every runtime that did not ask
         // otherwise.  The two calls around it move the PLACEHOLDER's state to
         // stopped and back to running, and reconciliation is what turns a
         // placeholder's state into a live child — so reconciling only at the
@@ -5112,7 +5112,7 @@ void daemon_handler::reconcile_proxy_workers()
             // The supervisor does not care what kind of runtime it is
             // supervising — it forks, hands over a config frame, restarts and
             // reads stats back, and none of that reads the type.  It held a
-            // proxy_instance* it never dereferenced until ba86f38.
+            // proxy_instance* it never dereferenced until 1b5c046.
             if (!inst->is_out_of_process())
                 continue;
             if (inst->get_state() == runtime_running)

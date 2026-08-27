@@ -92,7 +92,7 @@ cycle() {
 # and the first counted cycle was charged for the six it had not paid for yet —
 # with the priming serve's own descriptors still open at the moment it was read.
 #
-# It made no difference while DAEMON_PID named a bash subshell (9b6e865): the
+# It made no difference while DAEMON_PID named a bash subshell (6a9c5c1): the
 # baseline and every later sample read the same 2136 kB whatever the daemon did.
 # Against the daemon it now reads, sampled every cycle on a Release build,
 # 4 cores, quiet machine, 2026-08-02:
@@ -133,7 +133,7 @@ echo "  baseline: $base_fd descriptors, ${base_rss} kB RSS (after $WARMUPS disca
 # THIRTY, up from twelve.  Not to make anything pass — the allowance is
 # untouched — but because twelve cycles cannot tell a fixed cost from a
 # per-cycle one.  That discriminator is division: a start-up cost spread over
-# more cycles shrinks as a percentage and a leak does not, which is how 8e18cbd
+# more cycles shrinks as a percentage and a leak does not, which is how e756c23
 # read runtime_churn_leak (60 cycles 227%, 180 cycles 230% — fixed).  With a
 # single before/after pair over twelve cycles there is nothing to divide.  A
 # cycle here costs about two seconds, so this buys eighteen more samples for

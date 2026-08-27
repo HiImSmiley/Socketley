@@ -40,7 +40,7 @@
 # breaker that works.
 #
 # So each backend counts the connections it accepts, and the count is the
-# discriminator — the third column, in the vocabulary d1fa885 gave
+# discriminator — the third column, in the vocabulary 2959e6b gave
 # test_restart_under_load.sh and test_proxy_group_keepalive_load.sh had first:
 #
 #     hits == 0                 FAIL.  Not a skip.  Nothing reached the backend,
@@ -51,7 +51,7 @@
 #     0 < hits < threshold      NOT MEASURABLE.  Too few charges could have been
 #                               accumulated for the absence of a 503 to mean
 #                               anything.  This run could not put the question.
-#     hits >= threshold, no 503 FAIL, and it is the defect ea10b66 found.
+#     hits >= threshold, no 503 FAIL, and it is the defect a359d47 found.
 #
 # NOT MEASURABLE still ends the run non-zero: an assertion that was never
 # evaluated has not passed.  It is counted in its own column so that "the

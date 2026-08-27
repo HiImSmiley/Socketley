@@ -1043,7 +1043,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
 // The third line is the one that matters.  Disclosure of a password is bad;
 // a world-writable file that the daemon reads back as a runtime definition is
 // the same privilege escalation that the IPC socket's 0666 was — the socket
-// was closed in 39152d9 and this is the same door in the filesystem.
+// was closed in 8e4cff7 and this is the same door in the filesystem.
 //
 // So the mode is stated, not inherited, and it is stated at creation rather
 // than fixed afterwards.  A chmod after the write has a window that is

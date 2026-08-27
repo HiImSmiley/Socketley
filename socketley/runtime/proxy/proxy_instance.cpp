@@ -3557,7 +3557,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
     //
     // RELAY MECHANISM.  Ordinary read and write, not splice.  A tunnel is idle
     // most of the time by nature, and a splice armed on a quiet socket costs an
-    // io-wq kernel thread for as long as the peer says nothing (df093ed: four
+    // io-wq kernel thread for as long as the peer says nothing (42e31ba: four
     // such connections burned 95.7% of a core, forty-eight burned two cores and
     // fifty threads).  The poll-first pattern that fixed it would apply here
     // too, but a multishot recv already IS a poll until data arrives, so it
@@ -3953,7 +3953,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // recovers it while the breaker refuses the requests that would
                 // prove the backend well.
                 //
-                // Reproduced on 8affb1f, so it predates the splice default
+                // Reproduced on 7611383, so it predates the splice default
                 // changing: it wedged on the 13th connection there.  It was
                 // invisible because splice was the only TCP path anybody took
                 // and the splice teardown does not consult the breaker at all —
@@ -4590,7 +4590,7 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // Transfer-Encoding among them — came out on the first request's header
     // block, having passed no check whatever, because the parser had correctly
     // seen that block as empty and looked at nothing.  It is the same mistake
-    // check_no_smuggling made about the same shape (86c825a), on the other side
+    // check_no_smuggling made about the same shape (ec9fc18), on the other side
     // of the seam.
     //
     // The npos fallback is unreachable: the caller only gets here on
@@ -5887,7 +5887,7 @@ void proxy_instance::discard_pooled(pooled_backend& pb, bool reset)
 
 // ─── the probe, for a socket that has a session ─────────────────────────────
 //
-// ed07f12 settled what a readable pooled socket means, and its answer does not
+// bbf4e9f settled what a readable pooled socket means, and its answer does not
 // survive being carried across a record layer unchanged.
 //
 // In cleartext the reasoning is airtight and needs nothing but the kernel: a
@@ -5903,7 +5903,7 @@ void proxy_instance::discard_pooled(pooled_backend& pb, bool reset)
 // it belongs to is over, either end may send KeyUpdate whenever it likes, and
 // close_notify is an alert.  None of those is the peer speaking unbidden in any
 // sense a client could be harmed by, and all three make recv() return a
-// positive number.  Keeping ed07f12's test would throw away a working
+// positive number.  Keeping bbf4e9f's test would throw away a working
 // connection every time a backend rotated a ticket — which is to say, on most
 // of them, which is to say TLS pooling would be pooling in name only.
 //
@@ -5919,7 +5919,7 @@ void proxy_instance::discard_pooled(pooled_backend& pb, bool reset)
 //   drain whatever ciphertext is on the socket into the record layer, then ask
 //   SSL_read whether anything comes out of it.
 //
-// and the four answers map onto ed07f12's four exactly:
+// and the four answers map onto bbf4e9f's four exactly:
 //
 //   nothing came out           the records were the peer's housekeeping — a
 //   (ssl_read -> 0)            ticket, a KeyUpdate, or a partial record still
@@ -5930,7 +5930,7 @@ void proxy_instance::discard_pooled(pooled_backend& pb, bool reset)
 //   application data           the defect.  Whatever this is, it is queued
 //   (ssl_read -> n > 0)        ahead of the next request's answer and the next
 //                              client would read it as its own.  Destroyed, for
-//                              the same reason ed07f12 destroys rather than
+//                              the same reason bbf4e9f destroys rather than
 //                              re-shelves: decrypting it does not put it back,
 //                              so the trap stays set for whoever comes next.
 //   close_notify, or a         the session is over, or the record layer cannot
@@ -7451,7 +7451,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
     // nothing else does.  The count is the argument: client_answer_owed() is
     // consulted at 2 places while this function is called at 86, across 15
     // functions, and this defect has been fixed four times at four different
-    // call sites -- 6de09db, 19d6003, 2ab585a, 9aa8e96 -- with the fuzzer
+    // call sites -- 1ab3141, 925c116, 5068af1, 8541684 -- with the fuzzer
     // finding a fifth.
     //
     // This CHECKS rather than decides, and the difference is the whole point.

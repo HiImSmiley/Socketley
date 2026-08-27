@@ -169,7 +169,7 @@ want tsan       && { build tsan     || RESULT[tsan]=BUILD_FAIL; }
 # without them: a CPPFLAGS that never reached the compiler produces a binary with
 # every check compiled out, runs the harnesses, and reports green -- which is
 # indistinguishable from a run where the invariants held.  This ran that way from
-# 52c55fa until now, reporting "3 passed, 0 failed" from a build with no checks
+# 0259912 until now, reporting "3 passed, 0 failed" from a build with no checks
 # in it.  invariants.h documents CPPFLAGS as the way to turn itself on; the
 # verification below is what makes the flag's arrival a fact rather than a hope.
 #
@@ -214,7 +214,7 @@ fi
 # translation unit is recompiled at link time while its cached SDK objects are
 # not, so the two disagree about the layout of the runtime they share, and what
 # the job reports is a defect that exists in neither build.  That is what the
-# 2026-08-13 client finding was, and the seed 75afc3a filed as
+# 2026-08-13 client finding was, and the seed 9f3f2a4 filed as
 # stale_binary_artifact-f57f22fc before it.  So the fuzz job builds what it is
 # about to run, like every other job here.
 #

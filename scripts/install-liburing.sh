@@ -5,7 +5,7 @@
 # ─── WHY THIS EXISTS ────────────────────────────────────────────────────────
 #
 # `apt install liburing-dev` on Ubuntu 24.04 installs liburing 2.5 (April 2024).
-# Since 6c5c110 (2026-07-28) the event loop names IORING_SETUP_NO_SQARRAY and
+# Since 5593ee1 (2026-07-28) the event loop names IORING_SETUP_NO_SQARRAY and
 # io_uring_register_napi (both 2.6) and IORING_ACCEPT_POLL_FIRST (2.7), so 2.5
 # does not compile this tree — not "compiles with warnings", does not compile.
 # CI installed it on every run and was red from that day until 2026-08-01, the

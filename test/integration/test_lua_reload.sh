@@ -10,7 +10,7 @@
 # accepting traffic, and reload-lua reported success.  Two places in the tree
 # state the contract that broke (proxy_worker's reload warning, and
 # cmd_reload_lua reading the route declaration back afterwards on the strength
-# of it), so it was written down twice and kept nowhere.  be1c057 builds the
+# of it), so it was written down twice and kept nowhere.  185c46f builds the
 # replacement first and swaps only on success.
 #
 # ─── WHY THE COUNTER ────────────────────────────────────────────────────────

@@ -376,7 +376,7 @@ else bad "phase3-restart" "the first request after a restart must handshake agai
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. A backend that speaks on an idle pooled socket.
 #
-# This is ed07f12's defect over an encrypted leg.  The backend answers, and then
+# This is bbf4e9f's defect over an encrypted leg.  The backend answers, and then
 # writes a second answer nobody asked for onto the same socket.  The proxy pools
 # that socket; the next request borrows it.  What is waiting on it is a TLS
 # record, and a record carrying application data looks exactly like a session

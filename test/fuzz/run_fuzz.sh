@@ -38,7 +38,7 @@
 #                      replayed over, ';'-separated (default: the three below).
 #                      Empty skips the sweep entirely — for a triage run only;
 #                      CI must not, because the sweep is the only thing holding
-#                      6de09db's predicate down.  See THE CONFIGURATION MATRIX.
+#                      1ab3141's predicate down.  See THE CONFIGURATION MATRIX.
 #   FUZZ_MATRIX_SECONDS  mutation budget per matrix entry (default 0 = replay
 #                      the seeds and stop).  Raise it for a manual dig into one
 #                      configuration; leaving it at 0 is what makes the sweep
@@ -85,7 +85,7 @@
 # are 64 programs against one proxy — and a defect that exists only in another
 # configuration is invisible to all 64 however long they are mutated.
 #
-# That is not hypothetical.  6de09db is a half-closed client losing its answer
+# That is not hypothetical.  1ab3141 is a half-closed client losing its answer
 # on a proxy running --backend-timeout 0: the predicate deciding whether an
 # answer was still owed rested on a flag that arm_response_deadline() never sets
 # when the deadline is switched off, and with no deadline there is no sweep to

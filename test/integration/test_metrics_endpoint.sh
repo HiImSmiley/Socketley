@@ -32,7 +32,7 @@ daemon_isolate metrics
 
 # lib_ports.sh:99 runs `exec 9>lockfile 2>/dev/null`; an exec with no command
 # applies both redirections to the shell, so sourcing it discards stderr for the
-# rest of the file.  Put back.  Fixed on fix/p0-crashes as b72a776, not on main.
+# rest of the file.  Put back.  Fixed on fix/p0-crashes as 2eab0cf, not on main.
 exec 2>&1
 
 # The collision described above, disarmed for this file's own daemon.  It is not

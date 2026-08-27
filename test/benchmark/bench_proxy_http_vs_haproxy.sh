@@ -12,7 +12,7 @@
 #
 # bench_proxy.sh does drive HTTP, but through a Python raw-socket backend, and
 # the 6329 req/s it reported is far more likely to be Python's ceiling than the
-# proxy's.  b80eae0 fixed that test's client and left the fixture question open
+# proxy's.  3032189 fixed that test's client and left the fixture question open
 # on purpose.  This is the answer to it.
 #
 # ─── THE BACKEND, WHICH IS THE REAL DECISION ────────────────────────────────

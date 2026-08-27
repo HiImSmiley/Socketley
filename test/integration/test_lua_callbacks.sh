@@ -22,7 +22,7 @@
 # reported exactly the same against a build with the Lua callback machinery
 # deleted.  A green suite is worth what its weakest file measures.
 #
-# ad06685 gave every test in this directory a daemon of its own, and with it
+# 3ffde3c gave every test in this directory a daemon of its own, and with it
 # $SOCKETLEY_DLOG — that daemon's stdout and stderr, the [lua] lines included.
 # The assertions read it now, and the gate is gone: a missing log is a failure,
 # not a reason to skip.

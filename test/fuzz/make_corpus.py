@@ -1290,15 +1290,15 @@ def client_seeds():
 # a defect in this file needed:
 #
 #   * a response the backend never finished, and a client that aborts on top of
-#     it                              (the socket pooled mid-answer, 70a8c6a)
+#     it                              (the socket pooled mid-answer, 443c5fc)
 #   * a socket answered, pooled, and then closed by the backend before the next
-#     request borrows it                                          (984dadc)
+#     request borrows it                                          (7dc9ec8)
 #   * a backend that accepts and never answers, and one whose handshake never
-#     completes, both given up on by the deadline sweep            (84d624c)
+#     completes, both given up on by the deadline sweep            (17ad1f1)
 #   * a group whose membership changes with a request in flight, and a group
-#     entry standing beside a plain backend                (decdb7d, 84d624c)
-#   * a request pipelined behind one that is still being answered     (7a235aa)
-#   * a filter that answers and a filter that forwards                (7689b7a)
+#     entry standing beside a plain backend                (abdb2b4, 17ad1f1)
+#   * a request pipelined behind one that is still being answered     (d6e548b)
+#   * a filter that answers and a filter that forwards                (318be51)
 #
 # The three leading bytes of an input are read as configuration *as well as* as
 # the first step, exactly as in the server and client programs: bits 0-2 of byte
@@ -1406,7 +1406,7 @@ def proxy_seeds():
 
     # The backend promises a body and stops; the client aborts on top of it.
     # Every teardown path then reaches the pool gate with half an answer on the
-    # socket, which is what 70a8c6a's tenth case looked like.
+    # socket, which is what 443c5fc's tenth case looked like.
     s["abort_mid_response"] = prog(
         px_head(SH_ONE),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
@@ -1466,7 +1466,7 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_CL_TE), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
-    # ── a pooled connection the backend had already closed (984dadc) ──
+    # ── a pooled connection the backend had already closed (7dc9ec8) ──
     s["pooled_socket_closed_by_backend"] = prog(
         px_head(SH_ONE),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
@@ -1494,7 +1494,7 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 0, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
-    # ── the deadline sweep (84d624c) ──
+    # ── the deadline sweep (17ad1f1) ──
 
     # A backlog nothing is accepted from: the handshake never completes, which
     # is the case the sweep has to withdraw by hand rather than hand to
@@ -1533,7 +1533,7 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_WHOLE), xop("ABORT", 0), xop("PUMP", 3),
         xop("DEADLINE"), xop("PUMP", 3), xop("STOP"))
 
-    # ── groups (decdb7d, 84d624c) ──
+    # ── groups (abdb2b4, 17ad1f1) ──
     s["group_exchange"] = prog(
         px_head(SH_GROUP, group=0x07),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
@@ -1603,7 +1603,7 @@ def proxy_seeds():
         xop("CONNECT", 0), xop("PUMP", 3), xop("REQUEST", 0, Q_WHOLE), xop("PUMP", 3),
         xop("BE_SERVE", 1, A_OK), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
-    # ── the filter chain (7689b7a) ──
+    # ── the filter chain (318be51) ──
     s["filter_answers_403"] = prog(
         px_head(SH_ONE, lua=True),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
@@ -1644,7 +1644,7 @@ def proxy_seeds():
         xop("REQUEST", 0, Q_NO_PREFIX), xop("PUMP", 3), xop("RECV", 0), xop("STOP"))
 
     # Only the body a request declared may follow it; what is left is the next
-    # request and has to go through the framing checks (7a235aa).
+    # request and has to go through the framing checks (d6e548b).
     s["body_then_pipelined_request"] = prog(
         px_head(SH_ONE),
         xop("START"), xop("CONNECT", 0), xop("PUMP", 3),
@@ -1720,7 +1720,7 @@ def proxy_seeds():
     # through reset_client_for_next_request -- and the detach is refused for a
     # `Connection: close` on either leg and for a spliced response, so those
     # three had no ending at all and the pair was held until the runtime
-    # stopped.  19d6003.
+    # stopped.  925c116.
     #
     # The FIN has to fall between the backend reading the request and answering
     # it, which is why this accepts and reads by hand instead of using BE_SERVE:
@@ -1832,7 +1832,7 @@ def proxy_seeds():
         xop("BE_SERVE", 0, A_OK), xop("BE_SERVE", 1, A_OK),
         xop("PUMP", 3), xop("RECV", 0), xop("STATS"), xop("STOP"))
 
-    # ── TLS, on each leg independently (e756810) ──
+    # ── TLS, on each leg independently (db237a9) ──
     #
     # The harness speaks OpenSSL directly at both ends; the certificate is
     # generated once into /dev/shm and is both what the proxy serves and what it

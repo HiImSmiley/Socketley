@@ -21,7 +21,7 @@
 # Twenty-nine lines above that test, the same function reads the `Upgrade`
 # token out of the same header with http_list_has_token() and cites the RFC for
 # doing so.  The correct helper was already in scope; this site predates it by
-# five months (ad8f1fd 2026-03-02 against 70a8c6a 2026-07-31) and was never
+# five months (cb0c76c 2026-03-02 against 443c5fc 2026-07-31) and was never
 # revisited, which is what an invariant kept at the call site does.
 #
 # ─── WHY FOUR CASES AND NOT TWO ─────────────────────────────────────────────

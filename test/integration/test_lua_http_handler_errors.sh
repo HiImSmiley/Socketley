@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
-# 07baee7..b868bb5 made every Lua callback in this tree a sol::protected_function
+# 2a1e135..df02e6f made every Lua callback in this tree a sol::protected_function
 # whose caller checks valid() before reading anything, because the
 # `catch (const sol::error&)` those calls used to sit inside only fires when
 # sol2's panic handler throws AND that throw unwinds out of the interpreter —
@@ -18,7 +18,7 @@
 # `guarded_protected`, and its call site in server_instance.cpp checked nothing
 # at all: `sol::object result = lua()->on_http_request()(lua_req)` reads index 0
 # of the result unconditionally.  On a failed protected call index 0 is the
-# ERROR OBJECT, which is the read b868bb5 records the cost of on the cache path
+# ERROR OBJECT, which is the read df02e6f records the cost of on the cache path
 # — on_miss stored a Lua error message as the fetched value and served it as a
 # hit for ever.
 #

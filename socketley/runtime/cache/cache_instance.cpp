@@ -7149,7 +7149,7 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             //
             // That rule rests on "a connection that is `closing` is one whose
             // peer has already gone".  True in the two defects it was written
-            // for — 78c9ecc here and ceaa3f2 in the server both marked the
+            // for — 87d2c9d here and 86877cc in the server both marked the
             // connection closing BECAUSE the peer reset, with the error already
             // consumed by a write, so nothing was left to complete the read.
             // Neither mark below has anything to do with the peer: one is this

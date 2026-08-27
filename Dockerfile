@@ -6,7 +6,7 @@
 # ─── ON LIBURING: WHY IT IS BUILT HERE INSTEAD OF INSTALLED ──────────────────
 #
 # This image used to `apt-get install liburing-dev` and that stopped producing a
-# binary on 2026-07-28.  Ubuntu 24.04 ships liburing 2.5, and since 6c5c110 the
+# binary on 2026-07-28.  Ubuntu 24.04 ships liburing 2.5, and since 5593ee1 the
 # event loop uses three things that release does not have at all:
 #
 #     IORING_SETUP_NO_SQARRAY     event_loop.cpp:853

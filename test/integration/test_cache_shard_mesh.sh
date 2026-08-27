@@ -9,7 +9,7 @@
 # is a RUNTIME check and not a compile-time one -- so there was no stale-binary
 # hazard here, only a name that kept it out of run_all.sh's `test_*.sh` glob.
 #
-# --shards on a cache landed in 56fd722, so the gate now opens and the test
+# --shards on a cache landed in 4ed9b13, so the gate now opens and the test
 # runs.  Renamed so the suite picks it up: a mesh that ships with a test nobody
 # runs is the same as a mesh with no test, and this file's whole argument is
 # that the correctness assertions cannot tell a working mesh from an absent one.

@@ -233,7 +233,7 @@ public:
     // the daemon used to do by calling into an instance.
     //
     // `socketley.send(name, msg)` broadcasts to a runtime's connections, and
-    // since 2313c26 those are normally held by a worker.  Called on the
+    // since 8399bee those are normally held by a worker.  Called on the
     // placeholder the call succeeds, returns true and delivers to the empty
     // tables of an object that serves nothing.  cmd_send() was fixed for
     // exactly this in the commit that added the deliver frame; the Lua binding

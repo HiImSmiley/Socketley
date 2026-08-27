@@ -29,7 +29,7 @@ daemon_isolate client_reconnect
 # lib_ports.sh:99 runs `exec 9>lockfile 2>/dev/null`, and an exec with no
 # command applies BOTH redirections to the shell -- so sourcing it sends this
 # file's stderr to /dev/null for the rest of the run.  Every file here inherits
-# that; it is fixed on fix/p0-crashes (b72a776) and that branch has not reached
+# that; it is fixed on fix/p0-crashes (2eab0cf) and that branch has not reached
 # main.  Put back, because a test whose error output is discarded reports "it
 # failed" and nothing else, which cost an hour of this file's own development.
 exec 2>&1

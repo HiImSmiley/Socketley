@@ -8,7 +8,7 @@
 # not exist rather than that it exists and is broken.  It cost an agent a
 # debugging detour in this tree; `ls` is the only place the state appears.
 #
-# 294f927 raised the price.  A worker whose script does not load now exits
+# 42db9b0 raised the price.  A worker whose script does not load now exits
 # `exit_config_refused` and the supervisor leaves the runtime `failed` instead
 # of forking five more copies of it — which is the right behaviour, and which
 # makes `failed` reachable by an ordinary configuration mistake rather than only

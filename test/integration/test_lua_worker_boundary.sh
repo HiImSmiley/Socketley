@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS PINS ─────────────────────────────────────────────────────────
 #
-# Since 2313c26 a runtime lives in a process of its own unless it was created
+# Since 8399bee a runtime lives in a process of its own unless it was created
 # with --daemon-process.  The daemon keeps a *placeholder* for it: an object
 # with the name, the port and the state, and not one connection, not one client
 # fd.  Three of the Lua management calls read that placeholder as though it were
@@ -24,15 +24,15 @@
 #                                 time — taking the daemon and every other
 #                                 runtime with it.
 #
-# 3d0fa26, a8def68 and f99f18c fixed those.  This file is what would have caught
-# them, and every assertion in it has been watched to fail against 4226037, the
+# 9695a8b, e3b7cbf and 14ef983 fixed those.  This file is what would have caught
+# them, and every assertion in it has been watched to fail against f2a2ea4, the
 # commit immediately before: see the commit message for the runs.
 #
 # ─── WHY THE ORACLES ARE WHAT THEY ARE ──────────────────────────────────────
 #
 # The connection figures are compared against `stats`, not against a number
 # written into this file.  `stats` reads reported_connection_count() — the
-# figure the worker pushes — and was already correct before the fix (e40631f),
+# figure the worker pushes — and was already correct before the fix (2296eac),
 # so it is an oracle that moves with the traffic and cannot be satisfied by a
 # binding that returns a constant.  A count asserted as a literal 3 would pass
 # against a build that answers 3 to everything; a count asserted as "whatever

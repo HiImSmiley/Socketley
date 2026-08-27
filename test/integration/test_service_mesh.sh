@@ -57,7 +57,7 @@ assert_ok() {
 # caller below is fed by a CLI command that is allowed to fail, and when one
 # does, $1 holds the reason — `no such runtime: mesh_proxy` — while "expected
 # 'protocol:tcp' in output" describes only the symptom.  Printing the pattern
-# and swallowing the cause is the same trade ba7a147 spent 70 call sites undoing.
+# and swallowing the cause is the same trade c76e965 spent 70 call sites undoing.
 assert_contains() {
     TOTAL=$((TOTAL+1))
     if grep -q "$2" <<<"$1"; then

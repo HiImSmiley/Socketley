@@ -91,7 +91,7 @@ OOP_RUNS=$(wc -l < "$MARK")
 assert_eq "$OOP_RUNS" "1" "out-of-process: the top level runs once, not twice"
 
 # The runtime the placeholder would have created if it had run the script.  The
-# worker cannot create it -- 294f927 refuses cross-runtime calls there -- so any
+# worker cannot create it -- 42db9b0 refuses cross-runtime calls there -- so any
 # appearance of this name means the daemon ran the top level.
 GHOST=$("$BIN" ls 2>/dev/null | grep -c "ghost_from_toplevel" || true)
 assert_eq "$GHOST" "0" "no runtime is created from inside the daemon's placeholder"

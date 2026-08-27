@@ -34,7 +34,7 @@
 // Reported only when both sides name the same path.  Comparing inodes across
 // different paths would say "your daemon is stale" to anyone running the CLI
 // from a copy while a daemon runs the original — which is how every agent in
-// this tree works, and it is the misidentification c1875e3 was written to
+// this tree works, and it is the misidentification 81dcf4a was written to
 // undo.  A message printed when nothing is wrong is how a message printed when
 // something is wrong gets ignored.
 static bool daemon_exe_was_replaced(const socketley::daemon_ident& id)

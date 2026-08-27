@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
-# ebb6897 fixed this for timers: `stop` severed the on_tick machinery and left
+# 23e5181 fixed this for timers: `stop` severed the on_tick machinery and left
 # every set_timeout and set_interval the script had armed, so a runtime the
 # operator had stopped went on executing script at full rate until the daemon
 # died.  socketley.subscribe was the other half of the same hole and was left
@@ -19,7 +19,7 @@
 # The handler even reads self.state as "stopped" and runs anyway.  That is not
 # untidy: socketley.subscribe callbacks call self.send, and self.send from a
 # stopped runtime delivers to clients of a runtime the operator has taken down
-# — the same sentence ebb6897 is written under, one API along.
+# — the same sentence 23e5181 is written under, one API along.
 #
 # ─── WHAT COMES BACK, AND WHAT DOES NOT ─────────────────────────────────────
 #
@@ -50,7 +50,7 @@
 # load and the publish — so this half is answered where the delivery is decided
 # rather than where the registration is made: runtime_manager::dispatch_publish
 # filtered on `lua() && !is_out_of_process()` and never on state.  The rule the
-# two halves share is one sentence, and it is the sentence ebb6897 was written
+# two halves share is one sentence, and it is the sentence 23e5181 was written
 # under: a runtime that is not running executes no script.
 set -euo pipefail
 

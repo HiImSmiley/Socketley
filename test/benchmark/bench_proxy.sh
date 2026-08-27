@@ -63,7 +63,7 @@ ensure_clean() {
 # ─── The HTTP fixture, and why it stopped being Python ──────────────────────
 #
 # Both HTTP rows used to drive a Python raw-socket backend with a Python load
-# generator, and reported about 8,000 req/sec.  b80eae0 had already replaced a
+# generator, and reported about 8,000 req/sec.  3032189 had already replaced a
 # bash client with http_load.py for exactly this reason and left the fixture
 # question open; this is the answer, and the answer is that the client was only
 # half of it.  Measured on one box, one afternoon, same proxy, same 40 concurrent

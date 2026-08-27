@@ -22,7 +22,7 @@
 //
 // THIS HAS BEEN FOUND TWICE, IN TWO RUNTIMES, WITH ONE MECHANISM
 //
-//   * cache (78c9ecc).  A client reset while its reply was being written: the
+//   * cache (87d2c9d).  A client reset while its reply was being written: the
 //     write took the ECONNRESET, marked the connection closing, and deferred to
 //     a multishot recv armed on a fixed file index.  The peer was gone and the
 //     reset had been consumed by the write, so it never reported.  11 of 50 runs

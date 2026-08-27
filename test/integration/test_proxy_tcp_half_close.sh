@@ -38,7 +38,7 @@
 # byte relay and charged EVERY clean backend close as a backend failure.  Five
 # of those — circuit_threshold — took the only backend out of rotation, and the
 # proxy answered every later client with an instant EOF from a backend that was
-# perfectly healthy.  Reproduced on 8affb1f, so it predates the half-close fix;
+# perfectly healthy.  Reproduced on 7611383, so it predates the half-close fix;
 # it stayed unreachable in practice only because splice was the default and the
 # splice teardown never consults the breaker.
 set -euo pipefail
@@ -299,7 +299,7 @@ assert_eq "$circ" "0" "no circuit opened by a backend closing cleanly"
 #
 # A client that aborts mid-exchange is the ordinary way to reach it, so a proxy
 # in front of a perfectly healthy backend opened its breaker after five of them
-# and answered every later client with an instant EOF.  Measured on 8affb1f
+# and answered every later client with an instant EOF.  Measured on 7611383
 # with a storm of RSTing connections: 5018 connections, 60 messages delivered,
 # 5012 clients given EPIPE and the circuit open — so this predates the
 # half-close work; it was unreachable in TCP mode only because splice was the

@@ -18,7 +18,7 @@
 # 0, 0 and 0.  Wall clock 69.0 / 69.3 / 70.9 s against 1.63 / 1.77 / 1.50 s,
 # because most of the old number is the client sitting in its own timeouts.
 #
-# Measured on 25552d9, clean Release binary, 2 MiB .txt, 200 connections of 20
+# Measured on 77fb675, clean Release binary, 2 MiB .txt, 200 connections of 20
 # requests, three runs: 31, 34 and 46 connections dead of 200, and 3762, 3724
 # and 3617 of 4000 requests answered.
 #
@@ -54,12 +54,12 @@
 # of body on the wire, same client, same box: .txt via splice 31/34/46 of 200
 # dead; .html via the read path 0 of 200.
 #
-# ─── WHY 25552d9 DID NOT FIX IT, THOUGH IT LOOKED LIKE IT HAD ───────────────
+# ─── WHY 77fb675 DID NOT FIX IT, THOUGH IT LOOKED LIKE IT HAD ───────────────
 #
-# 25552d9 keeps the response bytes and revalidates them with one statx, and in
+# 77fb675 keeps the response bytes and revalidates them with one statx, and in
 # doing so routes non-HTML files UNDER the 1 MiB cap to the read path instead of
 # splicing them.  That removes the stall for those files -- see
-# test_http_keepalive_no_stall.sh, which is red on 78c9ecc and green now -- but
+# test_http_keepalive_no_stall.sh, which is red on 87d2c9d and green now -- but
 # it is a side effect of a caching change, not a fix to the gap, and it stops at
 # the cap.  Above the cap, and above HTTP_REVAL_MAX_TOTAL (64 MiB) where
 # reval_take goes false for every file, the splice path and the gap are both

@@ -649,7 +649,7 @@ public:
     // The override is for a runtime that is not in this process.  Its
     // placeholder here has the name and the port but an empty store, so
     // answering from it would be confidently wrong — the same failure
-    // get_stats() had until 338341f.  The daemon sets this to the supervisor
+    // get_stats() had until 441823d.  The daemon sets this to the supervisor
     // that holds the control socket to the worker, and the channel then reaches
     // the real runtime without anything on the asking side changing.
     virtual request_sink* as_request_sink()

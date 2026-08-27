@@ -14,7 +14,7 @@
 # test_shard_lua_route.sh.  What THIS file asserts is that the door is open at
 # every one of the five places the rule is asked — create in both flag orders,
 # edit, import, and a state file that never sees a parser — because a rule
-# removed from four of five is the shape 4af38f0 was.
+# removed from four of five is the shape 2cf7a4e was.
 #
 # ─── WHAT IS BEING ASSERTED, AND WHICH BROKEN BUILD EACH ONE CATCHES ────────
 #
@@ -40,7 +40,7 @@
 #                                                still standing in cmd_edit.
 #   import shards onto a script      accepted.   Broken build: the same, through
 #                                                the door that never sees a flag
-#                                                parser — 4af38f0's shape.
+#                                                parser — 2cf7a4e's shape.
 #   a state file with both           starts.     Broken build: the last gate, in
 #                                                runtime_instance::start(), still
 #                                                refusing what every command

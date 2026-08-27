@@ -5,9 +5,9 @@
 #
 # In `--http DIR` disk mode a keep-alive client could send a request and get
 # nothing back at all -- no response, no FIN, no RST -- while the connection
-# stayed open.  Measured on 78c9ecc, default configuration, 2 KiB .txt, 400
+# stayed open.  Measured on 87d2c9d, default configuration, 2 KiB .txt, 400
 # connections of 20 requests, twice: 7930 and 7976 of 8000 answered, 5 and 2
-# connections dead.  On 25552d9 the same traffic is 8000 of 8000, twice, and
+# connections dead.  On 77fb675 the same traffic is 8000 of 8000, twice, and
 # runs in 0.20 s instead of 4.1 s.
 #
 # ─── THE MECHANISM, BECAUSE THE ASSERTION IS ONLY MEANINGFUL WITH IT ────────
@@ -36,7 +36,7 @@
 # same box: .txt via splice 31, 34 and 46 dead connections of 200; .html via
 # the read path 0 of 200.
 #
-# 25552d9 closed it for the file sizes this test uses by keeping the bytes and
+# 77fb675 closed it for the file sizes this test uses by keeping the bytes and
 # revalidating them, which routes small non-HTML files to the read path instead
 # of splicing them.  That is why this test passes now, and it is the thing it
 # pins: a change that sends small non-HTML files back to the splice path makes
@@ -60,7 +60,7 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   1  non-HTML, keep-alive, 400 connections x 20 requests.  This is the one
-#      that was red on 78c9ecc.  Catches any change that puts small non-HTML
+#      that was red on 87d2c9d.  Catches any change that puts small non-HTML
 #      files back on the splice path.
 #   2  HTML, same shape.  The read path.  Green before and after, so it is the
 #      control that says the traffic and the harness work -- if assertion 1
@@ -108,12 +108,12 @@ P=$((SL_PORT_BASE + 1610))
 "$BIN" create server hkans -p "$P" --http "$ROOT" -s >/dev/null
 
 # 400 connections of 20 requests.  400 rather than 20 because the failure rate
-# on 78c9ecc was 2 to 5 connections in 400: at 20 connections a red build
+# on 87d2c9d was 2 to 5 connections in 400: at 20 connections a red build
 # passes about 80% of the time, which is a test that reports the defect as
 # flakiness.  8000 requests of 2 KiB costs 0.2 s on a fixed build.
 # '|' rather than whitespace: the label has spaces in it and `set --` would
 # split it, which turned a FAIL line into "non-HTML(splice" the first time.
-for spec in "asset.txt|MARKER-TXT|non-HTML (the splice path before 25552d9)" \
+for spec in "asset.txt|MARKER-TXT|non-HTML (the splice path before 77fb675)" \
             "page.html|MARKER-HTML|HTML (read path, control)"; do
     IFS='|' read -r f marker label <<<"$spec"
     out=$("$CLIENT" "$P" 20 400 2000 "/$f" "$marker") && rc=0 || rc=$?

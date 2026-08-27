@@ -14,7 +14,7 @@
 # the RFC 9112 framing rules; server_instance carried a Content-Length lookup
 # and nothing else, so every shape it did not recognise resolved the same way —
 # length zero, body empty, and the bytes behind it read as the next request.
-# Measured on ada6f1c, one write per case, both runtimes on one binary:
+# Measured on c218738, one write per case, both runtimes on one binary:
 #
 #     case                          proxy   server
 #     Content-Length : N            400     2 answers, /secret.html served

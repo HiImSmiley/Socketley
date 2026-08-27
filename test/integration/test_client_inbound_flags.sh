@@ -124,7 +124,7 @@ else bad "edit still works on a server" "the guard reaches runtimes it should no
 #
 # This is the one that was still open after create and edit were closed: import
 # writes the config fields directly, so a validation living in the flag parser
-# is not on its path at all.  Same shape as 4af38f0, where import could give a
+# is not on its path at all.  Same shape as 2cf7a4e, where import could give a
 # runtime a name create would have refused.
 if command -v python3 >/dev/null 2>&1; then
     "$BIN" show cf_plain > "$SOCKETLEY_TMPD/c.json" 2>/dev/null || true

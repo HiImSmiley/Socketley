@@ -527,7 +527,7 @@ def rt_proxy(port, n, k, pay):
 
 def rt_server(port, n, k, pay):
     """A bare server consumes what it is sent: no echo to the sender, no relay
-    to the other clients — verified against both the current build and 14c432b,
+    to the other clients — verified against both the current build and 771e1fc,
     so this is what the runtime does, not a regression.  There is therefore no
     round trip to check here.  What this still proves is the part the test is
     about: the listener of *this* cycle is the one answering, on a port every

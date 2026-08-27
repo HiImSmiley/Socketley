@@ -890,7 +890,7 @@ private:
     void discard_pooled(pooled_backend& pb, bool reset);
     // Ask a pooled TLS socket whether anything is waiting on it that the next
     // borrower must not inherit.  See the definition — this is the whole of
-    // the TLS half of ed07f12's argument.
+    // the TLS half of bbf4e9f's argument.
     //
     // Returns true when the socket may be reused.  A false answer has already
     // discarded the entry.

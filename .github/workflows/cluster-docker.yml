@@ -2,7 +2,7 @@
 #
 # ─── WHY THIS IS ITS OWN FILE ───────────────────────────────────────────────
 #
-# test/docker/test_cluster_docker.sh existed since 97d236d and was invoked by
+# test/docker/test_cluster_docker.sh existed since 3295e9a and was invoked by
 # nothing: no workflow mentioned docker and test/run_all.sh does not glob it.
 # In the five months that followed, 167 commits landed — 35 in daemon/ or
 # runtime_manager.cpp — the proxy moved into its own process, all four runtime
