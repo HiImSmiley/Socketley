@@ -7,6 +7,7 @@ on:
 jobs:
   release:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: write
 
@@ -40,8 +41,23 @@ jobs:
           ./bin/Release/test_resp_parser
           ./bin/Release/test_name_resolver
           ./bin/Release/test_ws_parser
-          bash test/run_all.sh
-        timeout-minutes: 5
+          bash test/ci/assert_suite.sh suite-release.log
+        # 5 was right when it was written: the release job passed for v1.0.6
+        # through v1.0.9 in about 3m50s each.  The suite has grown since -- its
+        # own header says 141 sections and there are 162 now, ~32 minutes on a
+        # 16-core box -- so the step this guards would be killed mid-suite, and
+        # every tag pushed would fail here.  Nothing caught it because no tag has
+        # been pushed since v1.0.9 in March.
+        #
+        # 45 rather than a guess: nightly.yml gives run_all.sh 35 on this same
+        # runner and has been living with it.
+        #
+        # And assert_suite.sh rather than run_all.sh directly, for the reason
+        # that wrapper exists: run_all.sh exits 0 when it ran nothing at all, so
+        # a missing binary or a daemon that never came up would have shipped a
+        # release with a green check mark.  ci.yml has gone through the wrapper
+        # for exactly this since it was written; the release job never did.
+        timeout-minutes: 45
 
       - name: Build .deb package
         run: bash packaging/build-deb.sh "${GITHUB_REF_NAME#v}"
