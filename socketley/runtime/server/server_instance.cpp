@@ -1581,7 +1581,10 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 {
     m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
+    {
+        LOG_ERROR(("server: socket() failed: " + std::string(std::strerror(errno))).c_str());
         return false;
+    }
 
     int opt = 1;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1658,6 +1661,21 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
+        // ─── Say which port and why ─────────────────────────────────────────
+        //
+        // setup_unix_listener(), fifteen lines below and chosen from the same
+        // `if`, reports "--listen <path> could not be bound: <strerror>".  This
+        // path reported nothing at all, and the two are the only ways a server
+        // acquires a listener.
+        //
+        // What that silence cost is a whole sentence being untrue: the CLI
+        // answers `runtime <n> could not start: the worker did not accept its
+        // configuration (the reason is in the daemon log)`, and the daemon log
+        // then held only "proxy worker: proxy failed to start".  For the single
+        // most common startup failure there is -- a port already in use -- the
+        // message named a place to look and there was nothing there.
+        LOG_ERROR(("server: port " + std::to_string(port) + " could not be bound: " +
+                   std::string(std::strerror(errno))).c_str());
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
@@ -1665,6 +1683,8 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 
     if (listen(m_listen_fd, 4096) < 0)
     {
+        LOG_ERROR(("server: listen() on port " + std::to_string(port) + " failed: " +
+                   std::string(std::strerror(errno))).c_str());
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
         return false;
@@ -1868,6 +1888,8 @@ bool server_instance::setup(event_loop& loop)
 
         if (bind(m_udp_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
         {
+            LOG_ERROR(("server: UDP port " + std::to_string(port) + " could not be bound: " +
+                       std::string(std::strerror(errno))).c_str());
             close_tracked(m_udp_fd);
             m_udp_fd = -1;
             return false;
