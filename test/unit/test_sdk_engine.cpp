@@ -33,13 +33,24 @@ int main()
         (void)srv.instance();
         (void)srv.manager();
         (void)srv.loop();
+
+        (void)srv.get_listen_path();
+    }
+
+    // Server on an AF_UNIX listener (constructor overload)
+    {
+        socketley::server srv("unix:/tmp/_sdk_compile_test.sock");
+        srv.sqpoll(false);
+        srv.cpus("max");
     }
 
     // Client wrapper
     {
         socketley::client cli("127.0.0.1", 9000);
         cli.reconnect(5)
-           .tick_interval(2000);
+           .tick_interval(2000)
+           .group("web")
+           .sqpoll(false);
 
         cli.on_start([]{ })
            .on_stop([]{ })
@@ -51,14 +62,24 @@ int main()
         (void)cli.instance();
     }
 
+    // Client dialling a unix socket (the -t spelling)
+    {
+        socketley::client cli("unix:/tmp/_sdk_compile_test.sock");
+        (void)cli.instance();
+    }
+
     // Proxy wrapper
     {
         socketley::proxy px(8080);
         px.backend("127.0.0.1:9000")
+          .backend("unix:/tmp/_sdk_compile_backend.sock")
           .protocol(protocol_tcp)
           .strategy(strategy_round_robin)
           .max_connections(500)
-          .idle_timeout(60);
+          .idle_timeout(60)
+          .sidecar()
+          .drain()
+          .sqpoll(false);
 
         px.on_start([]{ })
           .on_stop([]{ })
@@ -81,7 +102,17 @@ int main()
          .resp()
          .mode(cache_mode_admin)
          .max_connections(200)
-         .idle_timeout(120);
+         .idle_timeout(120)
+         .log_file("/tmp/test.log")
+         .drain()
+         .sqpoll(false);
+        (void)c.get_listen_path();
+    }
+
+    // Cache on an AF_UNIX listener (constructor overload)
+    {
+        socketley::cache c("unix:/tmp/_sdk_compile_cache.sock");
+        (void)c.instance();
 
         c.on_start([]{ })
          .on_stop([]{ });

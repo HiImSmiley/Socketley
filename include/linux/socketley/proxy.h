@@ -20,7 +20,22 @@ public:
         inst->set_event_loop(&m_loop);
     }
 
+    // Listen on an AF_UNIX socket instead of a TCP port — see the same
+    // constructor on server for why this is a constructor and why tls() does
+    // not combine with it.  Accepts the path with or without `unix:`.
+    explicit proxy(std::string_view unix_path) : m_name("_sdk_proxy") {
+        m_mgr.create(runtime_proxy, m_name);
+        auto* inst = raw();
+        if (unix_path.rfind("unix:", 0) == 0)
+            unix_path.remove_prefix(5);
+        inst->set_listen_path(unix_path);
+        inst->set_runtime_manager(&m_mgr);
+        inst->set_event_loop(&m_loop);
+    }
+
     // ── Chainable config ────────────────────────────────────────────────
+    // `host:port`, `unix:/path/to.sock`, or `@group` — every spelling
+    // `--backend` takes.
     proxy& backend(std::string_view addr)  { prx()->add_backend(addr); return *this; }
     proxy& clear_backends()                { prx()->clear_backends(); return *this; }
     proxy& strategy(proxy_strategy s)      { prx()->set_strategy(s); return *this; }
@@ -51,6 +66,23 @@ public:
     proxy& log_file(std::string_view p)    { raw()->set_log_file(p); return *this; }
     proxy& lua(std::string_view path)      { raw()->load_lua_script(path); return *this; }
     proxy& group(std::string_view g)       { raw()->set_group(g); return *this; }
+    proxy& drain()                         { raw()->set_drain(true); return *this; }
+    // See server::cpus / server::sqpoll — same contract, this wrapper's loop.
+    proxy& cpus(std::string_view spec)     { detail::apply_cpus(m_loop, spec); return *this; }
+    proxy& sqpoll(bool on = true)          { m_loop.set_sqpoll(on); return *this; }
+
+    // `--sidecar`: the service-mesh defaults in one word — TCP health checks,
+    // circuit breaker (5 failures, 30s), 2 retries, drain on stop.  Sugar
+    // only: each piece can still be overridden by the setters below, and the
+    // values here are the flag handler's, not this header's own.
+    proxy& sidecar() {
+        prx()->set_health_check(mesh_config::health_tcp);
+        prx()->set_circuit_threshold(5);
+        prx()->set_circuit_timeout(30);
+        prx()->set_retry_count(2);
+        raw()->set_drain(true);
+        return *this;
+    }
 
     // ── Service mesh config (chainable) ─────────────────────────────────
     proxy& health_check(mesh_config::health_type t) { prx()->set_health_check(t); return *this; }
@@ -103,6 +135,7 @@ public:
     std::string_view get_cert_path()         { return raw()->get_cert_path(); }
     std::string_view get_key_path()          { return raw()->get_key_path(); }
     std::string_view get_ca_path()           { return raw()->get_ca_path(); }
+    std::string_view get_listen_path()       { return raw()->get_listen_path(); }
     std::string_view get_log_file()          { return raw()->get_log_file(); }
     uint32_t         get_max_connections()   { return raw()->get_max_connections(); }
     uint32_t         get_idle_timeout()      { return raw()->get_idle_timeout(); }
@@ -121,6 +154,7 @@ public:
     // ── Lifecycle ───────────────────────────────────────────────────────
     void start() {
         if (!m_loop.init()) return;
+        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
         m_loop.run();

@@ -45,5 +45,31 @@ inline void install_signal_handlers(event_loop* loop) {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
+// The wrappers' cpus(<spec>) — `max`, `0-3`, `0,2,5` — applied to the loop the
+// wrapper owns, which is where an embedded runtime's affinity lives: the
+// runtime-side set_cpus() is a *request* checked against the ring, and a ring
+// this wrapper creates itself has nobody to negotiate with.  A spec that does
+// not parse is logged and ignored rather than half-honoured — the SDK's
+// setters have no error channel (see server::upstream), and falling back to
+// "all" in silence is exactly the failure parse_cpu_set exists to name.
+inline void apply_cpus(event_loop& loop, std::string_view spec) {
+    cpu_set_spec set;
+    std::string err;
+    if (!parse_cpu_set(spec, online_cpu_count(), set, err)) {
+        LOG_WARN((std::string("cpus(\"") + std::string(spec) +
+                  "\") ignored: " + err).c_str());
+        return;
+    }
+    loop.set_cpus(set);
+}
+
+// After init(): SQPOLL is a request the kernel may refuse, and a wrapper user
+// who asked for a poller deserves one line saying they did not get one.
+inline void warn_if_sqpoll_denied(event_loop& loop) {
+    if (loop.sqpoll_requested() && !loop.sqpoll_enabled())
+        LOG_WARN("sqpoll(true): the kernel refused a submission poller; "
+                 "running without one");
+}
+
 } // namespace detail
 } // namespace socketley

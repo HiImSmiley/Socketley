@@ -26,6 +26,24 @@ public:
         inst->set_event_loop(&m_loop);
     }
 
+    // Listen on an AF_UNIX socket at this path instead of a TCP port — the
+    // `--listen unix:/run/app.sock` spelling, with or without the `unix:`
+    // prefix.  A constructor rather than a chainable setter because the two
+    // are alternatives, never both (setup() refuses a runtime that asks for a
+    // port and a path), and a setter that silently discarded the port the
+    // other constructor was given would be deciding that conflict itself.
+    // tls() does not combine with this either: a unix socket is not on a
+    // network, and the node's permissions are what restrict it.
+    explicit server(std::string_view unix_path) : m_name("_sdk_server") {
+        m_mgr.create(runtime_server, m_name);
+        auto* inst = raw();
+        if (unix_path.rfind("unix:", 0) == 0)
+            unix_path.remove_prefix(5);
+        inst->set_listen_path(unix_path);
+        inst->set_runtime_manager(&m_mgr);
+        inst->set_event_loop(&m_loop);
+    }
+
     // ── Chainable config ────────────────────────────────────────────────
     server& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
@@ -71,6 +89,15 @@ public:
     server& drain()                        { raw()->set_drain(true); return *this; }
     server& group(std::string_view g)      { raw()->set_group(g); return *this; }
     server& tick_interval(uint32_t ms)     { raw()->set_tick_interval(ms); return *this; }
+    // Where this wrapper's I/O thread may run: `max`, `0-3`, or `0,2,5` — the
+    // `--cpus` spellings.  Applied to the loop this wrapper owns; a spec that
+    // does not parse is logged and ignored (see detail::apply_cpus).
+    server& cpus(std::string_view spec)    { detail::apply_cpus(m_loop, spec); return *this; }
+    // Ask for (or decline) an SQPOLL submission poller on this wrapper's ring.
+    // A request: the kernel may refuse it, and start() logs one line if it
+    // does.  Must be called before start() — a ring's polling mode is fixed
+    // when the ring is created.
+    server& sqpoll(bool on = true)         { m_loop.set_sqpoll(on); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
     server& on_start(std::function<void()> cb)                              { raw()->set_on_start(std::move(cb)); return *this; }
@@ -127,6 +154,7 @@ public:
     std::string_view get_cert_path()     { return raw()->get_cert_path(); }
     std::string_view get_key_path()      { return raw()->get_key_path(); }
     std::string_view get_ca_path()       { return raw()->get_ca_path(); }
+    std::string_view get_listen_path()   { return raw()->get_listen_path(); }
     std::string_view get_log_file()      { return raw()->get_log_file(); }
     uint32_t         get_max_connections() { return raw()->get_max_connections(); }
     uint32_t         get_idle_timeout()  { return raw()->get_idle_timeout(); }
@@ -147,6 +175,7 @@ public:
     // ── Lifecycle ───────────────────────────────────────────────────────
     void start() {
         if (!m_loop.init()) return;
+        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
         m_loop.run();

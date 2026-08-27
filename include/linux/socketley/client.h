@@ -21,6 +21,18 @@ public:
         inst->set_event_loop(&m_loop);
     }
 
+    // The `-t` spelling, verbatim: `host:port`, or `unix:/path/to.sock` — the
+    // connect side of a server's `--listen unix:`.  This is the only way to
+    // dial a unix socket from the SDK; the two-argument constructor always
+    // builds `host:port`.
+    explicit client(std::string_view target) : m_name("_sdk_client") {
+        m_mgr.create(runtime_client, m_name);
+        auto* inst = raw();
+        inst->set_target(target);
+        inst->set_runtime_manager(&m_mgr);
+        inst->set_event_loop(&m_loop);
+    }
+
     // ── Chainable config ────────────────────────────────────────────────
     // Dial over TLS.  Complete on its own for this role: a client has no
     // listener to present a certificate on, the host from the constructor is
@@ -49,6 +61,10 @@ public:
     client& write_file(std::string_view p) { raw()->set_write_file(p); return *this; }
     client& lua(std::string_view path)     { raw()->load_lua_script(path); return *this; }
     client& tick_interval(uint32_t ms)     { raw()->set_tick_interval(ms); return *this; }
+    client& group(std::string_view g)      { raw()->set_group(g); return *this; }
+    // See server::cpus / server::sqpoll — same contract, this wrapper's loop.
+    client& cpus(std::string_view spec)    { detail::apply_cpus(m_loop, spec); return *this; }
+    client& sqpoll(bool on = true)         { m_loop.set_sqpoll(on); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
     client& on_start(std::function<void()> cb)                   { raw()->set_on_start(std::move(cb)); return *this; }
@@ -96,6 +112,7 @@ public:
     // ── Lifecycle ───────────────────────────────────────────────────────
     void start() {
         if (!m_loop.init()) return;
+        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
         m_loop.run();

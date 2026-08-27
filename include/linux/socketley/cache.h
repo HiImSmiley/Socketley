@@ -20,24 +20,40 @@ public:
         inst->set_event_loop(&m_loop);
     }
 
+    // Listen on an AF_UNIX socket instead of a TCP port — see the same
+    // constructor on server for why this is a constructor and why tls() does
+    // not combine with it.  Accepts the path with or without `unix:`.
+    explicit cache(std::string_view unix_path) : m_name("_sdk_cache") {
+        m_mgr.create(runtime_cache, m_name);
+        auto* inst = raw();
+        if (unix_path.rfind("unix:", 0) == 0)
+            unix_path.remove_prefix(5);
+        inst->set_listen_path(unix_path);
+        inst->set_runtime_manager(&m_mgr);
+        inst->set_event_loop(&m_loop);
+    }
+
     // ── Chainable config ────────────────────────────────────────────────
     cache& persistent(std::string_view path) { cch()->set_persistent(path); return *this; }
     cache& max_memory(size_t bytes)          { cch()->set_max_memory(bytes); return *this; }
     cache& eviction(eviction_policy p)       { cch()->set_eviction(p); return *this; }
     cache& resp()                            { cch()->set_resp_forced(true); return *this; }
     cache& mode(cache_mode m)                { cch()->set_mode(m); return *this; }
-    // Refused at start(), on every build.  A cache's listener has no handshake
-    // behind it — nothing drives a record layer on this runtime — so a cache
-    // "configured with TLS" would accept in the clear while inspect reported it
-    // encrypted, and tls_config_refusal fails it closed instead.
-    //
-    // Kept, and kept failing, rather than deleted: it is published, and a call
-    // that stops compiling teaches an embedder less than one that says why on
-    // the first run.  When a cache listener terminates TLS this becomes real
-    // with no change here.  See shared/tls_context.h.
+    // Terminate TLS on this cache's own listener.  Real since the TLS work
+    // landed a record layer on all four runtime types — an earlier revision of
+    // this header documented the call as "refused at start(), on every build",
+    // which was true then and is not now.  What tls_config_refusal still
+    // refuses, with the reason: half a key pair, and tls() combined with
+    // replicate() — the replication link dials its leader in cleartext, so the
+    // pair would stream the whole dataset off a port the flags call encrypted.
     cache& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
     }
+    // The CA that certificates presented *by clients* must be signed by —
+    // mutual TLS on this cache's listener, so it needs tls(cert, key) as well.
+    // A cache's --ca is the client CA for its own listener, exactly as a
+    // server's is; the name matches server::client_ca and proxy::client_ca.
+    cache& client_ca(std::string_view ca)    { raw()->set_ca_path(ca); return *this; }
     cache& max_connections(uint32_t n)       { raw()->set_max_connections(n); return *this; }
     cache& rate_limit(double r)              { raw()->set_rate_limit(r); return *this; }
     cache& global_rate_limit(double r)       { raw()->set_global_rate_limit(r); return *this; }
@@ -45,6 +61,11 @@ public:
     cache& replicate(std::string_view target){ cch()->set_replicate_target(target); return *this; }
     cache& lua(std::string_view path)        { raw()->load_lua_script(path); return *this; }
     cache& group(std::string_view g)         { raw()->set_group(g); return *this; }
+    cache& log_file(std::string_view p)      { raw()->set_log_file(p); return *this; }
+    cache& drain()                           { raw()->set_drain(true); return *this; }
+    // See server::cpus / server::sqpoll — same contract, this wrapper's loop.
+    cache& cpus(std::string_view spec)       { detail::apply_cpus(m_loop, spec); return *this; }
+    cache& sqpoll(bool on = true)            { m_loop.set_sqpoll(on); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
     cache& on_start(std::function<void()> cb)      { raw()->set_on_start(std::move(cb)); return *this; }
@@ -95,6 +116,7 @@ public:
     std::string_view get_cert_path()         { return raw()->get_cert_path(); }
     std::string_view get_key_path()          { return raw()->get_key_path(); }
     std::string_view get_ca_path()           { return raw()->get_ca_path(); }
+    std::string_view get_listen_path()       { return raw()->get_listen_path(); }
     std::string_view get_log_file()          { return raw()->get_log_file(); }
     uint32_t         get_max_connections()   { return raw()->get_max_connections(); }
     uint32_t         get_idle_timeout()      { return raw()->get_idle_timeout(); }
@@ -125,6 +147,7 @@ public:
     // ── Lifecycle ───────────────────────────────────────────────────────
     void start() {
         if (!m_loop.init()) return;
+        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         m_mgr.start(m_name, m_loop);
         m_loop.run();

@@ -1030,6 +1030,48 @@ project "test_sdk_engine"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: SDK wrappers, functionally (links libsocketley_sdk.a) ───
+-- test_sdk_engine is a compile test by design; this one starts the wrappers'
+-- event loops and talks to them over real sockets.
+
+project "test_sdk_runtime"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "include/linux",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+
+    files { "test/unit/test_sdk_runtime.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: SDK ws_client.h (header-only, no libs) ───
 
 project "test_sdk_ws_client"
