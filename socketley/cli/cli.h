@@ -1,8 +1,6 @@
 #pragma once
 
-#ifndef SOCKETLEY_VERSION
-#define SOCKETLEY_VERSION "1.0.9"
-#endif
+#include "../shared/version.h"
 
 int cli_dispatch(int argc, char** argv);
 int cli_forward(int argc, char** argv);

@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] - 2026-08-27
 
 Six months of work since v1.0.9, across 581 commits. The headline is that a
 runtime is no longer confined to the daemon's process or to one core.

@@ -2404,7 +2404,7 @@ int daemon_handler::cmd_ping(ipc_connection* conn)
     // And which executable this daemon is, exactly.
     //
     // The version cannot answer that.  Nothing in premake5.lua defines
-    // SOCKETLEY_VERSION, so it is one literal in cli.h that every build of a
+    // SOCKETLEY_VERSION, so it is one literal in shared/version.h that every build of a
     // release carries: a daemon started before a rebuild and a CLI built after
     // it report the same string, which is the one case an operator actually
     // hits — "I rebuilt and my new flag is rejected" is a same-version rebuild

@@ -27,7 +27,7 @@
 // daemon.
 //
 // Decided on the inode, because the version cannot decide it.  Nothing in
-// premake5.lua defines SOCKETLEY_VERSION, so it is a single literal in cli.h
+// SOCKETLEY_VERSION is a single literal in shared/version.h
 // and every build of a release carries it; two builds a minute apart compare
 // equal, and the whole case worth reporting is a same-version rebuild.
 //

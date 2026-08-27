@@ -3,6 +3,7 @@
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/blocking_write.h"
+#include "../shared/version.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -520,7 +521,7 @@ std::string metrics_endpoint::build_json_overview() const
 
     std::string j;
     j.reserve(512);
-    j += "{\"version\":\"1.0.9\",\"uptime_seconds\":";
+    j += "{\"version\":\"" SOCKETLEY_VERSION "\",\"uptime_seconds\":";
     json_append_uint(j, static_cast<uint64_t>(uptime));
     j += ",\"runtimes_total\":";
     json_append_uint(j, runtimes_total);

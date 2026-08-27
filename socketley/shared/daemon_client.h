@@ -71,7 +71,7 @@ struct daemon_ident
     // flag, and the device and inode that link resolves to.
     //
     // The version alone cannot answer "is this daemon my build".  Nothing in
-    // premake5.lua defines SOCKETLEY_VERSION, so it is one literal in cli.h and
+    // SOCKETLEY_VERSION is one literal in shared/version.h, and
     // every build of a release carries it — two builds a minute apart compare
     // equal.  The inode does not: a rebuild produces a different file, and the
     // daemon goes on executing the one it started with.
