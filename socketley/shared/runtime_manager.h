@@ -252,6 +252,26 @@ public:
         std::function<bool(std::string_view name, std::string_view message)> sink);
     bool deliver_out_of_process(std::string_view name, std::string_view message) const;
 
+    // ── The four calls that CHANGE the map, asked of whoever holds it ───────
+    //
+    // The fifth sink of the same shape, and the first that waits for an answer.
+    // socketley.create/.start/.stop/.remove alter the map; a worker holds a
+    // replica and altering that would build a runtime the daemon never hears
+    // about.  So a worker installs this and the call travels; the daemon
+    // installs nothing and the call is served locally, which is why the
+    // presence of the sink -- not a process flag -- is what decides.
+    //
+    // It blocks for the round trip, unlike every other sink here, because the
+    // script is mid-expression: `if socketley.create(...) then` needs the
+    // answer, not the acceptance.  What that costs and why it is affordable on
+    // this path is set out at encode_map_request in worker_protocol.h.
+    void set_map_sink(
+        std::function<bool(std::string_view op, std::string_view name,
+                           std::string_view config, std::string& err)> sink);
+    bool has_map_sink() const { return static_cast<bool>(m_map_sink); }
+    bool map_mutate(std::string_view op, std::string_view name,
+                    std::string_view config, std::string& err) const;
+
     // "The map has changed; let go of anything that names a runtime leaving
     // it."  The fourth of the same shape, and the one with no payload: what
     // crosses here is a moment, not an answer.
@@ -316,6 +336,8 @@ private:
     std::function<void(request_channel&)> m_shard_sink_publisher;
     std::function<void(std::string_view, std::string_view, std::string_view)> m_publish_sink;
     std::function<bool(std::string_view, std::string_view)> m_deliver_sink;
+    std::function<bool(std::string_view, std::string_view,
+                       std::string_view, std::string&)> m_map_sink;
     std::function<void()> m_worker_release_sink;
 
     // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER

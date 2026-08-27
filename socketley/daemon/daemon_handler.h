@@ -485,4 +485,91 @@ private:
 
     // Set only while a worker's publish is being fanned out; see above.
     proxy_supervisor* m_publish_origin{nullptr};
+
+    // ── socketley.create/.start/.stop/.remove, asked by a worker's script ───
+    //
+    // The daemon holds the map, so these four can only be answered here.  What
+    // arrives is the verb, the runtime's name and — for `create` — the whole
+    // configuration as JSON, which is the same text a config frame carries in
+    // the other direction; see proxy_supervisor::set_map_handler for the wire.
+    //
+    // ─── WHY THEY ARE QUEUED AND NOT SERVED WHERE THEY ARRIVE ──────────────
+    //
+    // They arrive inside proxy_supervisor::on_cqe, on that supervisor's own
+    // completion.  Three of the four can destroy that supervisor —
+    // `socketley.stop`/`remove` of the worker's own runtime go through
+    // reconcile_proxy_workers(), and `create` can too — and destroying it there
+    // frees the io_request the loop is holding while it dispatches it.  That is
+    // the same free-under-the-ring this file already defers a supervisor's
+    // teardown for; see the graveyard note above.
+    //
+    // So the arrival records the request and returns, and a nop brings the loop
+    // back once every handler on the stack has unwound.  request_channel uses
+    // submit_nop() for exactly this, and for exactly this reason.
+    struct pending_map_request
+    {
+        uint64_t    ticket{0};
+
+        // A dup of the supervisor's map socket, made where the request arrived
+        // and owned from here.  It is what makes the deferral safe: the
+        // supervisor may be gone by the time this is answered, and this
+        // descriptor does not care.
+        int         reply_fd{-1};
+
+        std::string op;
+        std::string name;
+        std::string config;
+    };
+
+    std::vector<pending_map_request> m_map_queue;
+    io_request                       m_map_defer_req{};
+    bool                             m_map_defer_armed{false};
+
+    // ── Above zero while this daemon is blocked waiting on a worker ─────────
+    //
+    // await_worker_startup() and the reload's await_routes() both sit in a
+    // ::poll inside a command handler, so the loop is not going to dispatch
+    // anything — including the nop that serves the queue above.  And what they
+    // are waiting for is the child's SCRIPT, which is where these four calls
+    // are made: a worker blocked on an answer, a daemon blocked on the worker.
+    //
+    // So inside a wait the requests are served where they arrive.  That is safe
+    // for one reason and it is worth naming: reconcile_proxy_workers() does not
+    // DESTROY a supervisor, it retires one — see retire_one() — so a stop or a
+    // remove served from inside proxy_supervisor::await_startup leaves the
+    // frame that called it standing on memory that is still there, with its
+    // descriptors closed and its loop pointer cleared.  The publish path has
+    // reached back into this map the same way for as long as a cache in a
+    // worker could reach a subscriber in the daemon.
+    //
+    // A counter rather than a flag: serving a `start` waits for that runtime's
+    // own child, so these nest.
+    int                              m_worker_wait_depth{0};
+
+    // Raises the count for a scope.  Nothing else may set it.
+    struct worker_wait_scope
+    {
+        int& d;
+        explicit worker_wait_scope(int& depth) : d(depth) { ++d; }
+        ~worker_wait_scope() { --d; }
+        worker_wait_scope(const worker_wait_scope&)            = delete;
+        worker_wait_scope& operator=(const worker_wait_scope&) = delete;
+    };
+
+    // Take one in.  Answers immediately and only when the loop will not come
+    // back — a daemon on its way down has nothing left to serve it with, and a
+    // worker waiting on the answer would otherwise sit until its own deadline.
+    void queue_map_request(uint64_t ticket, int reply_fd, std::string op,
+                           std::string name, std::string config);
+
+    // Serve everything queued, answer each one, close each descriptor.  Called
+    // from the nop's completion, so nothing on the stack belongs to a
+    // supervisor any more.
+    void serve_map_requests();
+
+    // One of the four, against this daemon's map.  False with `err` filled in;
+    // the text is what the script is handed, so it names the runtime and the
+    // reason rather than reporting a bare failure.
+    bool serve_map_request(const std::string& op, const std::string& name,
+                           const std::string& config, std::string& err);
 };

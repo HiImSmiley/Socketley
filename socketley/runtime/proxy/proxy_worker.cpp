@@ -57,6 +57,28 @@ constexpr int worker_shard_fd = 4;
 // it is named on both sides rather than shared through a header.
 constexpr int worker_clients_fd = 5;
 
+// The control plane, at the number proxy_supervisor::spawn dup2'd it onto.
+// socketley.create/.start/.stop/.remove travel here and their answers come
+// back; nothing else uses this descriptor and nothing arms it on the ring.
+//
+// ─── WHY THIS IS A SECOND SOCKET AND NOT THE CONTROL ONE ────────────────────
+//
+// Because this process has to BLOCK on the answer, and the control socket is
+// the one descriptor here it cannot block on.  Its writes are queued and
+// submitted by the ring at the end of a turn — see frame_writer::use_ring — so
+// a blocking wait mid-turn waits for an answer to a request still sitting in a
+// buffer, for ever.  Its reads are a standing ring recv into m_ctl_buf, so a
+// direct ::read racing that recv splits one frame between two consumers and the
+// halves reach take_frame() in whichever order the completions are dispatched.
+//
+// A descriptor nothing has armed has neither problem.
+//
+// Absent is not an error: an older daemon forks a worker without it, and the
+// four calls keep the refusal they have always had rather than hanging.  Tested
+// with fcntl rather than announced in a frame, for the reason worker_shard_fd
+// gives — the number IS the contract.
+constexpr int worker_map_fd = 6;
+
 // And the mesh block, which must agree with proxy_supervisor's
 // child_mesh_base: slot j is this shard's link to shard j, and the slot at its
 // own index is never placed.  Absent is the ordinary case — an unsharded
@@ -93,6 +115,25 @@ constexpr int idle_wait_ms = 30000;
 // wait used to use unconditionally; keeping it here rather than inlining it is
 // so the fallback and the thing it replaces are visibly the same number.
 constexpr int ctl_fallback_ms = 20;
+
+// ─── How long a map call may hold this worker's event loop ──────────────────
+//
+// socketley.create/.start/.stop/.remove block until the daemon answers.  What
+// bounds the answer is the daemon's own work, and the longest of it is known:
+// a `start` forks a child and waits for it to report that it is serving, under
+// worker_startup_bound — 2000 ms in daemon_handler.cpp.  This is that, with
+// room for the daemon to reach the request and for the reply to come back.
+//
+// It is a ceiling on a wrong answer, not on the daemon's work.  Timing out does
+// not cancel anything: the create still happens, and the script is told `false`
+// for something that succeeded a moment later.  That is the failure mode to
+// keep in mind if this number is ever tuned down — which is why it is above the
+// daemon's bound rather than level with it.
+//
+// The whole cost of a call that does NOT wait on a child is 9.95 / 10.20 /
+// 10.52 us over three runs of 20000; see encode_map_request in
+// worker_protocol.h for what that was measured against.
+constexpr int map_wait_ms = 5000;
 
 // SIGTERM asked for, and not yet acted on.
 //
@@ -279,6 +320,33 @@ public:
         // it here would build a runtime that exists in this process and nowhere
         // else.  See runtime_manager::mark_replica().
         m_manager.mark_replica();
+
+        // ── And the one way a write to that map can still happen ────────────
+        //
+        // Not here — over there.  The four calls that alter the map are asked
+        // of the daemon, which is the process that holds it, and this is the
+        // sink they travel through; see runtime_manager::set_map_sink.
+        //
+        // Installed in the constructor, before anything is read, because
+        // lua_context decides at BINDING TIME whether the four are refused —
+        // it asks has_map_sink() while it is building the table — and the
+        // script's table is built during the config frame's load_lua_script().
+        // Installing this beside the other sinks in on_config() would be a few
+        // lines too late for a script that calls socketley.create at its top
+        // level, which is the commonest place to call it.
+        //
+        // Absent descriptor, no sink, and the refusals stay: an old daemon
+        // forks a worker with nothing on 6, and the honest answer to
+        // socketley.create there is the refusal that names itself rather than a
+        // wait that ends in a timeout.
+        if (::fcntl(worker_map_fd, F_GETFD, 0) >= 0)
+        {
+            m_map_fd = worker_map_fd;
+            m_manager.set_map_sink(
+                [this](std::string_view op, std::string_view name,
+                       std::string_view config, std::string& err) -> bool
+                { return map_request(op, name, config, err); });
+        }
     }
 
     // ── The two things this worker has on the ring for itself ───────────────
@@ -1688,6 +1756,184 @@ private:
             p.ticket, static_cast<request_status>(p.status), p.payload);
     }
 
+    // ── socketley.create/.start/.stop/.remove, asked and waited for ─────────
+    //
+    // The only place in this process that blocks its own event loop, and the
+    // note at worker_protocol.h's encode_map_request is where the case for that
+    // is made and measured.  In short: these four are not on the data path —
+    // they run in on_start or on a rare control message, never per message —
+    // and `if socketley.create(...) then` cannot be answered with an
+    // acceptance.
+    //
+    // Everything this worker is serving stops for the duration.  That is the
+    // cost, it is bounded by map_wait_ms, and it is the same cost
+    // socketley.http() already imposes on the same loop for a network round
+    // trip three orders of magnitude longer.
+    bool map_request(std::string_view op, std::string_view name,
+                     std::string_view config, std::string& err)
+    {
+        if (m_map_fd < 0)
+        {
+            err = "this daemon does not serve map calls from a worker";
+            return false;
+        }
+
+        // Ticketed because frames interleave in one direction too: a reply to a
+        // call that already gave up is still in the socket, and reading it as
+        // the answer to this one would report another call's verdict.
+        const uint64_t ticket = ++m_map_ticket;
+
+        const std::string out = worker_proto::frame(
+            worker_proto::frame_type::map_req,
+            worker_proto::encode_map_request(ticket, op, name, config));
+
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(map_wait_ms);
+
+        if (!map_write(out, deadline))
+        {
+            err = "the daemon could not be reached";
+            return false;
+        }
+
+        for (;;)
+        {
+            // Whatever is already buffered, before deciding anything — the same
+            // shape proxy_supervisor::await_startup uses, for the same reason:
+            // the answer may already be here.
+            worker_proto::frame_type type{};
+            uint16_t                 ver   = 0;
+            std::string              payload;
+            bool                     fatal = false;
+
+            while (worker_proto::take_frame(m_map_in, type, ver, payload, fatal))
+            {
+                if (type != worker_proto::frame_type::map_rep)
+                    continue;
+
+                uint64_t    t  = 0;
+                bool        ok = false;
+                std::string reason;
+                if (!worker_proto::decode_map_reply(payload, t, ok, reason))
+                    continue;
+                if (t != ticket)
+                    continue;   // an answer to a call that has already given up
+
+                err = std::move(reason);
+                return ok;
+            }
+
+            if (fatal)
+            {
+                LOG_ERROR("proxy worker: malformed map reply; closing the "
+                          "control plane");
+                close_map();
+                err = "the daemon sent an answer this build cannot read";
+                return false;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+            {
+                // Said as what it is.  The daemon has not necessarily refused
+                // anything — it may still be doing the work — and a script told
+                // "it failed" would be told something this side cannot know.
+                err = "the daemon did not answer within "
+                    + std::to_string(map_wait_ms) + " ms";
+                return false;
+            }
+
+            struct pollfd pfd{m_map_fd, POLLIN, 0};
+            const int slice = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now).count());
+            const int r = ::poll(&pfd, 1, slice);
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                close_map();
+                err = "the control plane could not be waited on";
+                return false;
+            }
+            if (r == 0)
+                continue;       // the deadline is tested at the top
+
+            char          buf[4096];
+            const ssize_t n = ::recv(m_map_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n > 0)
+            {
+                m_map_in.append(buf, static_cast<size_t>(n));
+                continue;
+            }
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+
+            // Zero is the daemon letting go, and anything else is the socket.
+            // Either way this worker has no control plane left, and every
+            // later call says so at once rather than waiting five seconds for
+            // a descriptor that is not coming back.
+            close_map();
+            err = "the daemon closed the control plane";
+            return false;
+        }
+    }
+
+    // The request, out.  Bounded by the same deadline the wait is: a socketpair
+    // whose buffer is full has a daemon at the other end that has stopped
+    // reading, and blocking there without a limit would hold this worker's loop
+    // on a promise nobody made.
+    bool map_write(const std::string& frame,
+                   std::chrono::steady_clock::time_point deadline)
+    {
+        size_t off = 0;
+        while (off < frame.size())
+        {
+            const ssize_t n = ::send(m_map_fd, frame.data() + off,
+                                     frame.size() - off,
+                                     MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n > 0)
+            {
+                off += static_cast<size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                    return false;
+
+                struct pollfd pfd{m_map_fd, POLLOUT, 0};
+                const int slice = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - now).count());
+                if (::poll(&pfd, 1, slice) < 0 && errno != EINTR)
+                    return false;
+                continue;
+            }
+
+            close_map();
+            return false;
+        }
+        return true;
+    }
+
+    // The control plane is gone.  The sink stays installed and every later call
+    // is refused by the m_map_fd test at the top of map_request(), which is the
+    // truthful answer: a worker whose daemon has let go cannot alter the map,
+    // and it is about to be told to exit anyway.
+    void close_map()
+    {
+        if (m_map_fd >= 0)
+        {
+            ::close(m_map_fd);
+            m_map_fd = -1;
+        }
+        m_map_in.clear();
+    }
+
     // `socketley send` reaching the process that holds the connections.
     //
     // The same two calls cmd_send() makes on an in-process runtime, and the same
@@ -1940,6 +2186,16 @@ private:
     bool                                   m_ctl_eof{false};
     bool                                   m_done{false};
     int                                    m_exit_code{0};
+
+    // ── The control plane ───────────────────────────────────────────────────
+    //
+    // -1 when this daemon does not serve map calls, which is how the four Lua
+    // bindings decide to refuse rather than to travel.  Never armed on the ring
+    // and never touched from on_cqe: the whole point of it is a descriptor the
+    // loop does not own, so that map_request() may block on it.
+    int                                    m_map_fd{-1};
+    std::string                            m_map_in;
+    uint64_t                               m_map_ticket{0};
 };
 
 } // namespace

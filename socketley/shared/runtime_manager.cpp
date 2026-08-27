@@ -1298,6 +1298,24 @@ bool runtime_manager::deliver_out_of_process(std::string_view name,
     return m_deliver_sink ? m_deliver_sink(name, message) : false;
 }
 
+void runtime_manager::set_map_sink(
+    std::function<bool(std::string_view, std::string_view,
+                       std::string_view, std::string&)> sink)
+{
+    m_map_sink = std::move(sink);
+}
+
+bool runtime_manager::map_mutate(std::string_view op, std::string_view name,
+                                 std::string_view config, std::string& err) const
+{
+    if (!m_map_sink)
+    {
+        err = "no map sink installed";
+        return false;
+    }
+    return m_map_sink(op, name, config, err);
+}
+
 void runtime_manager::set_worker_release_sink(std::function<void()> sink)
 {
     m_worker_release_sink = std::move(sink);

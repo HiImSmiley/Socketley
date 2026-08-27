@@ -237,6 +237,56 @@ public:
     using stats_handler = std::function<void()>;
     void set_stats_handler(stats_handler h) { m_on_stats = std::move(h); }
 
+    // ── The four map calls, which are the only thing a worker WAITS for ─────
+    //
+    // socketley.create/.start/.stop/.remove from a script running out there.
+    // Everything else on this class's socket is one-way — a publish, a deliver,
+    // a stats push — and is answered by nothing.  These four are answered,
+    // because `if socketley.create(...) then` is how they are written and an
+    // acceptance dressed as a result is a lie the script cannot see through.
+    //
+    // ─── AND WHY THEY ARE NOT ON THE CONTROL SOCKET ─────────────────────────
+    //
+    // They travel on a SECOND socketpair, at child_map_fd, and that is not
+    // tidiness.  The worker has to block for the answer, and on the control
+    // socket it cannot:
+    //
+    //   * its writes queue and are submitted by the ring at the end of a turn
+    //     (frame_writer::use_ring), so a worker that blocks mid-turn never gets
+    //     its own request onto the wire — it waits for an answer to a question
+    //     still sitting in a buffer;
+    //   * its reads are a standing ring recv into a private buffer, so a direct
+    //     ::read racing that recv splits one frame across two consumers and the
+    //     two halves reach the parser in whichever order the completions are
+    //     dispatched.
+    //
+    // A descriptor nothing has armed has neither problem, and the separation
+    // buys a second property worth having on its own: a map request cannot
+    // queue behind a megabyte of data-plane frames.
+    //
+    // ─── WHAT THE HANDLER OWES ──────────────────────────────────────────────
+    //
+    // `reply_fd` is a DUP made here and owned by the handler, which must close
+    // it.  A dup rather than this object's own descriptor because the handler
+    // answers later and may not answer at all in this process's lifetime as
+    // this supervisor knows it: `socketley.remove(own_name)` destroys the very
+    // supervisor the request came through, and a reply written through a member
+    // afterwards is a read of freed memory.  The dup outlives that.
+    using map_handler = std::function<void(uint64_t ticket, int reply_fd,
+                                           std::string op, std::string name,
+                                           std::string config)>;
+    void set_map_handler(map_handler h) { m_on_map = std::move(h); }
+
+    // One answer, on the descriptor the request arrived on.  Static, and takes
+    // the descriptor rather than reading a member, for the reason directly
+    // above: by the time this is called the supervisor may be gone.
+    //
+    // A blocking write, and deliberately: the frame is tens of bytes against a
+    // socketpair buffer of a hundred kilobytes, and the peer is a worker that
+    // is at this moment doing nothing but waiting for it.
+    static void answer_map_request(int reply_fd, uint64_t ticket, bool ok,
+                                   std::string_view err);
+
     // What to do when the child dies without being asked to.
     enum class death_policy
     {
@@ -461,6 +511,17 @@ private:
     // fd is dropped by the loop for a deregistered owner, and this is what makes
     // sure the owner is deregistered.
     void   disarm_control_poll();
+
+    // The same three for the map socket.  Separate rather than parameterised:
+    // the two descriptors differ in every property that matters — one carries a
+    // backlog and the other never queues, one is drained by the health tick and
+    // the other only by its own arm — and a shared body would have to branch on
+    // which it was in all three.
+    void   arm_map_poll();
+    void   disarm_map_poll();
+    void   poll_map();
+    void   close_map();
+
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
 
@@ -510,10 +571,19 @@ private:
     unsigned     m_poll_mask{0};
     bool         m_poll_armed{false};
 
+    // The map socket, and its own arm.  A second io_request because the loop
+    // tells two submissions of the same shape apart by the address of the
+    // request and by nothing else — see proxy_worker's on_cqe for the same
+    // rule stated from the other side.
+    io_request   m_map_poll_req{};
+    bool         m_map_armed{false};
+    std::string  m_map_in;            // partial map frames from the child
+
     publish_handler  m_on_publish;
     deliver_handler  m_on_deliver;
     send_ref_handler m_on_send_ref;
     stats_handler   m_on_stats;
+    map_handler      m_on_map;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};
@@ -554,6 +624,7 @@ private:
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};
+    int          m_map_fd{-1};
     death_policy m_policy{death_policy::restart};
     unsigned     m_restarts{0};
     std::chrono::steady_clock::time_point m_last_restart{};

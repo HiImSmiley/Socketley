@@ -100,10 +100,12 @@ enum class frame_type : uint16_t
     start_err  = 7,  // payload: why `start`'s on_start raised; see below
     deliver_to = 8,  // payload: see encode_deliver_to
     send_ref   = 9,  // payload: see encode_send_ref
+    map_req    = 10, // payload: see encode_map_request
 
     // daemon → worker, again
     deliver_ref = 27,  // payload: see encode_send_ref — the same frame coming
                        // back down, which is why it is one codec and two names
+    map_rep     = 28,  // payload: see encode_map_reply
 };
 
 // ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
@@ -560,6 +562,89 @@ inline bool decode_deliver_to(std::string_view payload, std::string& name,
     reader r(payload.data(), payload.size());
     name    = std::string(r.str());
     message = std::string(r.str());
+    return r.ok;
+}
+
+// ── map_req / map_rep: the four calls that CHANGE the runtime map ───────────
+//
+// socketley.create, .start, .stop and .remove from a script running in a
+// worker.  Every one of them alters the map, and the map lives in the daemon:
+// answering them against the worker's own copy would build a runtime the daemon
+// never hears about, or flip a placeholder that binds nothing.  So they are not
+// answered here — they are asked.
+//
+// ─── WHY THIS ONE WAITS, WHEN deliver_to DOES NOT ───────────────────────────
+//
+// deliver_to is fire-and-forget because `self.send` has nothing to tell the
+// script afterwards.  These four do: `if socketley.create(...) then` is how
+// they are written, and a value that says "accepted" rather than "done" is a
+// lie the script cannot see through.
+//
+// The objection to waiting was stated one file over: a runtime does not make a
+// synchronous request of another process, because it blocks the loop serving
+// every connection this worker holds.  That is right about the DATA path, which
+// is what it was written about -- socketley.get() runs per message, and a
+// worker answering ~131k requests a second spends ~7.6 us on each.
+//
+// These four are not on it.  They run in on_start, or on a rare control
+// message, and never per message.  Measured on this box, AF_UNIX socketpair,
+// a 128-byte frame there and back: 9.95 / 10.20 / 10.52 us over three runs of
+// 20000.  That is the cost of one or two requests, once, on a path a script
+// reaches deliberately -- against socketley.http(), which this same file ships
+// and which blocks the identical loop for a network round trip, three orders of
+// magnitude longer.
+//
+// So the wait is bounded and it is the script's own callback deadline that
+// bounds it: a map request cannot outlive the callback that made it.
+//
+// `ticket` correlates, because frames interleave.  A worker waiting on a reply
+// still receives publishes, deliveries and stats requests, and a reply left
+// over from a call that already timed out must not be read as the answer to
+// this one.
+inline std::string encode_map_request(uint64_t ticket, std::string_view op,
+                                      std::string_view name, std::string_view config)
+{
+    std::string out;
+    out.reserve(20 + op.size() + name.size() + config.size());
+    put_u64(out, ticket);
+    put_str(out, op);       // "create" | "start" | "stop" | "remove"
+    put_str(out, name);
+    put_str(out, config);   // create only; empty for the other three
+    return out;
+}
+
+inline bool decode_map_request(std::string_view payload, uint64_t& ticket,
+                               std::string& op, std::string& name,
+                               std::string& config)
+{
+    reader r(payload.data(), payload.size());
+    ticket = r.u64();
+    op     = std::string(r.str());
+    name   = std::string(r.str());
+    config = std::string(r.str());
+    return r.ok;
+}
+
+// The answer carries the reason, not only the verdict.  A script that gets
+// `false` and nothing else has to guess between "a runtime by that name exists"
+// and "the port is taken", and the daemon is the only side that knows.
+inline std::string encode_map_reply(uint64_t ticket, bool ok, std::string_view err)
+{
+    std::string out;
+    out.reserve(13 + err.size());
+    put_u64(out, ticket);
+    out.push_back(ok ? '\1' : '\0');
+    put_str(out, err);
+    return out;
+}
+
+inline bool decode_map_reply(std::string_view payload, uint64_t& ticket,
+                             bool& ok, std::string& err)
+{
+    reader r(payload.data(), payload.size());
+    ticket = r.u64();
+    ok     = r.u8() != 0;
+    err    = std::string(r.str());
     return r.ok;
 }
 

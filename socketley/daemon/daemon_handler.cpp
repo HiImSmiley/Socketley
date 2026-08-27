@@ -17,6 +17,7 @@
 #include "../shared/tls_context.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
+#include "../shared/runtime_config_apply.h"
 #include "../shared/ipc_framing.h"
 #include "../shared/shard_target.h"
 #include <sys/resource.h>
@@ -800,6 +801,23 @@ void daemon_handler::teardown()
     }
     m_torn_down = true;
 
+    // ── Anything a worker was still waiting on ──────────────────────────────
+    //
+    // Refused rather than dropped, and the descriptors closed.  A dropped
+    // request is not a smaller failure than a refused one: the worker's script
+    // is blocked on the answer, so silence costs it its whole deadline and then
+    // tells it nothing about why.  The nop that would have served these is not
+    // coming — m_torn_down is set above and the ring is ending — so this is the
+    // last chance anything has to say so.
+    for (auto& q : m_map_queue)
+    {
+        proxy_supervisor::answer_map_request(q.reply_fd, q.ticket, false,
+                                             "the daemon is shutting down");
+        if (q.reply_fd >= 0)
+            ::close(q.reply_fd);
+    }
+    m_map_queue.clear();
+
     // Stop cluster discovery before closing IPC.  This is the graceful path the
     // man page's stale-detection table calls "file deleted, peers drop it at
     // once", so it has to reach unpublish().
@@ -873,6 +891,18 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             break;
         case op_write:
             handle_write(cqe, req);
+            break;
+        case op_nop:
+            // The loop coming back once every handler on the stack has unwound.
+            // Nothing else in this class submits one, and the address is checked
+            // anyway: a nop is the one submission whose type says nothing about
+            // who asked for it.
+            if (req == &m_map_defer_req)
+            {
+                m_map_defer_armed = false;
+                if (!m_torn_down)
+                    serve_map_requests();
+            }
             break;
         case op_timeout:
             if (req == &m_health_req)
@@ -4297,6 +4327,12 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     // the one `create` uses, for the reason given there: one timescale in this
     // file rather than two.  A worker that never answers leaves the declaration
     // it had in force, and the publish below carries that.
+    // The same ::poll-inside-a-command-handler as await_worker_startup(), and
+    // the same consequence: a reloaded script runs its top level again, so it
+    // reaches the same four map calls, and the nop that would serve them is not
+    // going to be dispatched until this returns.  See m_worker_wait_depth.
+    const worker_wait_scope reload_waiting{m_worker_wait_depth};
+
     for (auto& [sup, prev, name] : pending)
     {
         if (!sup->await_routes(prev, worker_startup_bound))
@@ -4923,6 +4959,328 @@ void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
     }
 }
 
+// ─── socketley.create/.start/.stop/.remove, asked by a script in a worker ───
+//
+// See the note on m_map_queue in the header for why these are recorded here and
+// served a turn later rather than where they arrive.
+void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
+                                       std::string op, std::string name,
+                                       std::string config)
+{
+    // A daemon on its way down will not come back round, so a request parked
+    // here would be answered by nothing and the worker would wait out its whole
+    // deadline for silence.  Refused with a reason instead, on the spot.
+    if (m_torn_down)
+    {
+        proxy_supervisor::answer_map_request(reply_fd, ticket, false,
+                                             "the daemon is shutting down");
+        if (reply_fd >= 0) ::close(reply_fd);
+        return;
+    }
+
+    m_map_queue.push_back({ticket, reply_fd, std::move(op), std::move(name),
+                           std::move(config)});
+
+    // Inside a wait for a worker, served here rather than deferred.  The loop
+    // is not coming back — this daemon is in a ::poll inside a command handler
+    // — and what it is waiting for is the script that is blocked on this very
+    // answer.  See m_worker_wait_depth for why serving from there is safe.
+    if (m_worker_wait_depth > 0)
+    {
+        serve_map_requests();
+        return;
+    }
+
+    // One nop for the whole queue, not one per request: the completion serves
+    // everything waiting, and a second arm would come back to an empty list.
+    if (m_map_defer_armed)
+        return;
+
+    m_map_defer_req   = { this, nullptr, -1, 0, op_nop };
+    m_map_defer_armed = m_loop.submit_nop(&m_map_defer_req);
+
+    if (!m_map_defer_armed)
+    {
+        // The ring would not take it, so nothing is going to bring the loop
+        // back for these.  Answering here is a re-entrancy this function exists
+        // to avoid — the caller is a supervisor's own completion — so the
+        // requests are refused rather than served: a `false` with a reason is
+        // recoverable, a freed supervisor is not.
+        LOG_ERROR("daemon: could not defer a worker's map request; refusing it");
+        for (auto& q : m_map_queue)
+        {
+            proxy_supervisor::answer_map_request(
+                q.reply_fd, q.ticket, false,
+                "the daemon could not schedule the request");
+            if (q.reply_fd >= 0) ::close(q.reply_fd);
+        }
+        m_map_queue.clear();
+    }
+}
+
+void daemon_handler::serve_map_requests()
+{
+    // Taken by value first.  Serving one of these can create a runtime whose
+    // script calls straight back — socketley.create in a top level runs inside
+    // load_lua_script — and a second request appended while this loop held an
+    // iterator into the vector would be a reallocation under it.  What arrives
+    // during the loop lands in the fresh m_map_queue and gets its own nop.
+    std::vector<pending_map_request> batch;
+    batch.swap(m_map_queue);
+
+    for (auto& q : batch)
+    {
+        std::string err;
+        const bool ok = serve_map_request(q.op, q.name, q.config, err);
+
+        proxy_supervisor::answer_map_request(q.reply_fd, q.ticket, ok, err);
+        if (q.reply_fd >= 0)
+            ::close(q.reply_fd);
+    }
+}
+
+// One of the four, against the map this process holds.
+//
+// ─── WHAT THIS IS AND IS NOT A COPY OF ──────────────────────────────────────
+//
+// It is the in-daemon socketley.create/.start/.stop/.remove, reached from a
+// different direction.  The parsing is NOT here: the script's config table was
+// read by the interpreter that has it — in the worker — and what crosses is a
+// runtime_config, the same struct a config frame carries the other way and the
+// same one a state file holds.  So there is one table parser, in lua_context,
+// and one field-by-field application, in runtime_config_apply.h, and this is
+// neither.
+//
+// What it does duplicate, deliberately and in three lines each, is the ORDER
+// cmd_start uses: refuse, start, persist, fork, wait for the child's verdict.
+// Sharing that with cmd_start would mean handing it an ipc_connection to write
+// into and a parsed_args to read, and inventing both here is a larger lie than
+// the repetition.
+bool daemon_handler::serve_map_request(const std::string& op,
+                                       const std::string& name,
+                                       const std::string& config,
+                                       std::string& err)
+{
+    const uint32_t h = fnv1a(op.c_str());
+
+    // ── create ─────────────────────────────────────────────────────────────
+    if (h == fnv1a("create"))
+    {
+        runtime_config    cfg;
+        state_persistence parser{std::filesystem::path{}};   // parser only
+        if (!parser.parse_json_string(config, cfg))
+        {
+            err = "the configuration could not be read by the daemon";
+            return false;
+        }
+
+        // The name on the wire wins over the one in the config.  They are
+        // written from the same string one line apart in lua_context, so they
+        // cannot differ today; saying which is authoritative is what stops a
+        // future field from deciding it by accident.
+        cfg.name = name;
+
+        switch (m_manager.try_create(cfg.type, name))
+        {
+            case runtime_manager::create_result::ok:
+                break;
+            case runtime_manager::create_result::invalid_name:
+                err = "\"" + name + "\" is not a usable runtime name";
+                return false;
+            case runtime_manager::create_result::name_taken:
+                err = "a runtime called \"" + name + "\" already exists";
+                return false;
+            case runtime_manager::create_result::internal:
+                err = "the runtime could not be built";
+                return false;
+        }
+
+        auto* inst = m_manager.get(name);
+        if (!inst)
+        {
+            err = "the runtime could not be built";
+            return false;
+        }
+
+        inst->set_runtime_manager(&m_manager);
+        inst->set_event_loop(&m_loop);
+        inst->set_owner(cfg.owner);
+
+        // ─── The runtime this builds runs IN THE DAEMON, as it always has ───
+        //
+        // A CLI `create` marks its runtime out-of-process; this does not, and
+        // the divergence is deliberate rather than an omission.
+        //
+        // socketley.create has produced an in-daemon runtime since it existed,
+        // and what this change is about is WHERE THE CALL IS SERVED — a script
+        // in a worker could not make one at all before, and now it can. Making
+        // it also produce a different kind of runtime would put a second change
+        // inside the first, and the script cannot see either: the same three
+        // lines of Lua would build a different thing depending on which process
+        // ran them, which is the exact property the worker/daemon parity work
+        // exists to remove.
+        //
+        // So both sides of the boundary answer this call the same way. Whether
+        // socketley.create should follow the CLI's default is a separate
+        // question about the API, to be asked once and answered for both.
+        inst->set_lua_created(true);
+        inst->set_child_policy(
+            cfg.child_policy == 1 ? runtime_instance::child_policy::remove
+                                  : runtime_instance::child_policy::stop);
+
+        apply_common_config(*inst, cfg);
+        apply_typed_config(*inst, cfg);
+
+        // The script, and the same unwind the in-daemon path takes: a child
+        // whose script will not load is removed rather than left standing with
+        // no callbacks on it, which is indistinguishable from a working one
+        // until traffic arrives.  The reason is in the log, written by the load
+        // under the CHILD's name.
+        if (!cfg.lua_script.empty() && !inst->load_lua_script(cfg.lua_script))
+        {
+            m_manager.remove(name);
+            err = "could not load " + cfg.lua_script;
+            return false;
+        }
+
+        // was_running is how the config carries the table's `start = true`;
+        // see the encode side in lua_context.
+        if (cfg.was_running && !m_manager.start(name, m_loop))
+        {
+            m_manager.remove(name);
+            err = "start = true, and it could not be started";
+            return false;
+        }
+
+        return true;
+    }
+
+    // ── The other three, and where their wording comes from ────────────────
+    //
+    // Word for word what socketley.start/.stop/.remove answer in the daemon —
+    // see the four bindings in lua_context.cpp — because a script must not be
+    // able to tell which side of the boundary it is running on from the text of
+    // a refusal.  The bindings ask this side FIRST for exactly that reason: a
+    // worker's map is a replica on a coalescing push, so a check made out there
+    // can be a snapshot behind, and these are made against the map itself.
+    auto* inst = m_manager.get(name);
+    if (!inst)
+    {
+        err = "there is no runtime called \"" + name + "\"";
+        return false;
+    }
+
+    // ── start ──────────────────────────────────────────────────────────────
+    if (h == fnv1a("start"))
+    {
+        if (inst->get_state() == runtime_running)
+        {
+            err = "\"" + name + "\" is already running";
+            return false;
+        }
+        if (inst->get_state() == runtime_failed)
+        {
+            err = "\"" + name + "\" is failed, and a failed runtime cannot be "
+                  "started again — remove it and create it anew";
+            return false;
+        }
+
+        if (std::string msg = instance_tls_refusal(inst); !msg.empty())
+        {
+            err = msg;
+            return false;
+        }
+        if (std::string msg = instance_shards_refusal(inst); !msg.empty())
+        {
+            err = msg;
+            return false;
+        }
+
+        if (!m_manager.start(name, m_loop))
+        {
+            err = "\"" + name + "\" could not be started";
+            return false;
+        }
+        if (m_persistence)
+            m_persistence->set_was_running(name, true);
+
+        // A runtime that lives in a worker is not serving until its child is,
+        // and this is the whole reason the call waits at all: reporting the
+        // fork rather than the listener is the defect cmd_start was fixed for.
+        reconcile_proxy_workers();
+        if (inst->is_out_of_process())
+        {
+            std::string wmsg;
+            const auto  deadline =
+                std::chrono::steady_clock::now() + worker_startup_bound;
+            if (await_worker_startup(name, wmsg, deadline) != 0)
+            {
+                err = wmsg.empty() ? "the worker did not come up" : wmsg;
+                return false;
+            }
+        }
+
+        // The runtime is up; its script's set-up may not be.  Reported as a
+        // failure with the reason, exactly as cmd_start reports it, and
+        // was_running is left set for the reason written there.
+        if (std::string why = on_start_error(name); !why.empty())
+        {
+            err = why;
+            return false;
+        }
+        return true;
+    }
+
+    // ── stop ───────────────────────────────────────────────────────────────
+    if (h == fnv1a("stop"))
+    {
+        if (inst->get_state() != runtime_running)
+        {
+            err = "\"" + name + "\" is "
+                + std::string(state_json(inst->get_state()))
+                + ", not running";
+            return false;
+        }
+
+        if (!m_manager.stop(name, m_loop))
+        {
+            err = "\"" + name + "\" could not be stopped";
+            return false;
+        }
+        if (m_persistence)
+            m_persistence->set_was_running(name, false);
+
+        // Before returning, for the reason cmd_stop gives: `stop` has to mean
+        // the port is free by the time the caller sees the answer.
+        reconcile_proxy_workers();
+        return true;
+    }
+
+    // ── remove ─────────────────────────────────────────────────────────────
+    if (h == fnv1a("remove"))
+    {
+        if (inst->get_state() == runtime_running)
+            m_manager.stop(name, m_loop);
+
+        // Before the instance leaves the map, for the reason cmd_remove gives:
+        // the supervisor holds a pointer to the placeholder, and that pointer
+        // has to be dropped while the object it names is still there.
+        reconcile_proxy_workers();
+
+        if (!m_manager.remove(name))
+        {
+            err = "\"" + name + "\" could not be removed";
+            return false;
+        }
+        if (m_persistence)
+            m_persistence->remove_runtime(name);
+        return true;
+    }
+
+    err = "the daemon does not know the map call \"" + op + "\"";
+    return false;
+}
+
 void daemon_handler::on_worker_publish(proxy_supervisor* from,
                                        std::string_view cache_name,
                                        std::string_view channel,
@@ -5423,6 +5781,15 @@ void daemon_handler::reconcile_proxy_workers()
                                   { on_worker_send_ref(f, r, m); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
 
+        // The four map calls, recorded here and served a turn later; see
+        // queue_map_request().  `this` outlives every supervisor it installs
+        // this on — they are all in m_proxy_workers, which is a member.
+        sup->set_map_handler([this](uint64_t ticket, int reply_fd,
+                                    std::string op, std::string n,
+                                    std::string cfg)
+                             { queue_map_request(ticket, reply_fd, std::move(op),
+                                                 std::move(n), std::move(cfg)); });
+
         // ─── Only the first shard is the request sink ───────────────────────
         //
         // A cross-runtime request names a runtime and expects ONE answer.  The
@@ -5606,6 +5973,12 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     // budget on the ones ahead.
     auto verdict = proxy_supervisor::startup::serving;
     {
+        // Everything below is a ::poll inside a command handler, so nothing the
+        // ring owes gets dispatched while it runs — including the nop that
+        // serves a worker's map requests.  This is what tells queue_map_request
+        // to serve them where they arrive instead; see m_worker_wait_depth.
+        const worker_wait_scope waiting{m_worker_wait_depth};
+
         const size_t n = it->second.size();
         for (size_t k = 0; k < n; ++k)
         {

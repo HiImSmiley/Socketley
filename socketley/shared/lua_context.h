@@ -564,7 +564,8 @@ private:
 
     // Overwrite the cross-runtime calls with a refusal that names them.  Only
     // called when in_worker_process().
-    void refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl);
+    void refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl,
+                                  runtime_instance* owner);
     void register_server_table(runtime_instance* owner, sol::table& self);
     void register_client_table(runtime_instance* owner, sol::table& self);
     void register_cache_table(runtime_instance* owner, sol::table& self);

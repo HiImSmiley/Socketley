@@ -40,6 +40,7 @@ namespace lua_diag
 #include "runtime_instance.h"
 #include "runtime_definitions.h"
 #include "runtime_manager.h"
+#include "state_persistence.h"
 #include "logging.h"
 #include "cluster_discovery.h"
 #include "event_loop.h"
@@ -2156,29 +2157,39 @@ std::string worker_refusal(const std::string& call,
 //   stop     the mirror of it — stores `stopped`, returns true, does nothing.
 //   remove   drops the local copy.  The daemon still has the runtime.
 //
-// And it ends by promising --daemon-process as though the map were the thing
-// in the way.  The map is coming; these still will not work when it arrives,
-// because being told what the map holds is not permission to alter it.  Doing
-// that from here needs a synchronous round trip to the daemon inside a Lua
-// callback, and this project settled that question the other way: a runtime
-// does not make a synchronous request of another process, because the only way
-// to implement one is to block the loop that is serving every connection this
-// worker holds.  See shared/request_channel.h, which is the asynchronous shape
-// that decision produced.
+// ─── AND WHY THIS IS NOW THE RARE PATH RATHER THAN THE ONLY ONE ─────────────
 //
-// So the message says the true reason and does not promise a delivery.  The
-// way out is real and unchanged: the call works in the daemon.
+// What stood here said these four could never work, and gave a reason: doing
+// them from a worker needs a synchronous round trip inside a Lua callback, and
+// this project had settled that question the other way — a runtime does not
+// make a synchronous request of another process, because the only way to
+// implement one is to block the loop serving every connection this worker
+// holds.
+//
+// That decision was right about the DATA path, which is what it was written
+// about: socketley.get() runs per message, and a worker answering ~131k
+// requests a second cannot spend ~7.6 us of loop time on each.  These four are
+// not on it.  They run in on_start, or on a rare control message, never per
+// message, and the round trip was measured rather than assumed: 9.95 / 10.20 /
+// 10.52 us over three runs of 20000, against socketley.http() — shipping, on
+// this same table — which blocks the identical loop for a network round trip
+// three orders of magnitude longer.
+//
+// So they travel now, and this message is reached only by a worker that has
+// nowhere to send them: a daemon that predates the control plane, or one whose
+// socketpair could not be created.  It says that, rather than the old text's
+// "this will never work", because the two send an operator to different places.
 std::string worker_mutation_refusal(const std::string& call)
 {
     return call +
-           "() is refused in a worker process: this call CHANGES the runtime "
-           "map, and the map lives in the daemon. A worker can be told what "
-           "the map holds and still not be allowed to alter it, so this one is "
-           "not waiting on the map arriving — answering it here would act on "
-           "this process's own copy: a runtime built inside this worker that "
-           "the daemon never hears about, or a start and a stop that flip a "
-           "placeholder and bind nothing. Create this runtime with "
-           "--daemon-process, or move the call to one that has it.";
+           "() is refused by this worker: the call CHANGES the runtime map, "
+           "the map lives in the daemon, and this worker was forked without a "
+           "control plane to ask over — an older daemon, or one that could not "
+           "create the socket. Answering it here would act on this process's "
+           "own copy of the map: a runtime built inside this worker that the "
+           "daemon never hears about, or a start and a stop that flip a "
+           "placeholder and bind nothing. Restart the daemon, or move the call "
+           "to a runtime that runs in it.";
 }
 
 // ── The two whose missing piece is not the map at all ───────────────────────
@@ -2326,7 +2337,8 @@ cluster_view_ptr lua_context::s_cluster_view;
 //
 // and a refusal at the top level fails the script load, which the worker treats
 // as a configuration it cannot serve.
-void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl)
+void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl,
+                                           runtime_instance* owner)
 {
     sol::function make = refusal_factory(m_lua);
     if (!make.valid())
@@ -2367,14 +2379,32 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     //   send   the map for the pre-checks, plus a deliver sink out of this
     //          process — see below.
 
-    // MUTATE.  These do not come back with it: being told what the map holds is
-    // not permission to alter it.  See worker_mutation_refusal() for what each
-    // of the four would actually do if it were answered here, which is worse
-    // than returning nothing.
-    for (const char* call : {"create", "start", "stop", "remove"})
+    // MUTATE.  Refused only while this process has no way to ASK for them.
+    //
+    // Being told what the map holds is still not permission to alter it, and
+    // that has not changed — what changed is that these four no longer try.
+    // They travel: the request goes to the daemon over the control plane at
+    // worker_map_fd, the daemon acts on the map it holds, and the answer comes
+    // back before the call returns.  See runtime_manager::set_map_sink and the
+    // note at encode_map_request in worker_protocol.h.
+    //
+    // So the question here is not "is this a worker" but "is there a sink", and
+    // the two differ in exactly one case: a worker forked by a daemon that does
+    // not serve map calls — an older build, or one whose socketpair could not
+    // be created. That worker keeps the refusal, and the refusal says so.
+    //
+    // Asked once, while the bindings are being built, which is safe for the
+    // reason the cluster view's identical test is safe: proxy_worker installs
+    // the sink in its CONSTRUCTOR, before a single frame is read, precisely so
+    // that it is in place before the config frame loads this script.
+    const runtime_manager* mgr = owner ? owner->get_runtime_manager() : nullptr;
+    if (!mgr || !mgr->has_map_sink())
     {
-        sol::function f = make(worker_mutation_refusal(std::string("socketley.") + call));
-        sk[call] = f;
+        for (const char* call : {"create", "start", "stop", "remove"})
+        {
+            sol::function f = make(worker_mutation_refusal(std::string("socketley.") + call));
+            sk[call] = f;
+        }
     }
 
     // CARRY A CONNECTION.  Not a map problem at all.  See
@@ -2712,6 +2742,56 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
 
+        // ── In a worker, the same call goes to the process holding the map ──
+        //
+        // Everything above this line is the TABLE, read by the interpreter that
+        // has it and refused here where the mistake was made — a script gets
+        // `port must be a number` at its own call site whichever process it is
+        // running in.  Everything below is the MAP, and a worker holds a copy.
+        //
+        // So the seam is exactly here, and what crosses is a runtime_config:
+        // the same struct a config frame carries in the other direction and the
+        // same one a state file holds, so there is one JSON codec and no second
+        // description of a runtime anywhere.  The daemon applies it with
+        // apply_common_config/apply_typed_config, which is the list both sides
+        // of the boundary already share.
+        //
+        // Only the fields this table can set are filled.  A default-constructed
+        // runtime_config is what `create` starts from in the daemon too, so an
+        // unset field carries the same meaning on both sides by construction
+        // rather than by agreement.
+        if (mgr->has_map_sink())
+        {
+            runtime_config c;
+            c.name        = name;
+            c.type        = type;
+            c.owner       = owner->get_name();
+            c.child_policy = cfg_remove_with_parent ? 1 : 0;
+
+            // `start = true` travels as was_running, which is the field that
+            // already means "this runtime is meant to be up" everywhere else.
+            c.was_running = cfg_start;
+
+            if (have_port)          c.port       = cfg_port;
+            if (have_target)        c.target     = cfg_target;
+            if (!cfg_group.empty()) c.group      = cfg_group;
+            if (!cfg_script.empty())c.lua_script = cfg_script;
+            if (type == runtime_server)
+            {
+                if (have_mode)           c.mode       = static_cast<uint8_t>(cfg_mode);
+                if (!cfg_http.empty())   c.http_dir   = cfg_http;
+                if (cfg_http_cache)      c.http_cache = true;
+            }
+
+            state_persistence codec{std::filesystem::path{}};   // codec only
+            std::string       err;
+            if (!mgr->map_mutate("create", name, codec.format_json_pretty(c), err))
+                return refuse(err.empty() ? std::string("the daemon refused the "
+                                                        "create and said nothing")
+                                          : err);
+            return api_yes();
+        }
+
         // Nothing above this line built anything, so nothing above it has to
         // undo anything.
         if (!mgr->create(type, name))
@@ -2831,6 +2911,35 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
 
+        // ── In a worker, asked of the daemon — and asked FIRST ──────────────
+        //
+        // Above every check below it, and that placement is the whole lesson of
+        // the first draft, which put it after them.
+        //
+        // A worker's map is a REPLICA and the daemon pushes it on a coalescing
+        // timer, so a runtime created a millisecond ago is not in it yet.  The
+        // lookup below then answered `there is no runtime called "kid2"` for a
+        // runtime the same script had just created and the daemon had already
+        // built — measured, three calls in a row, immediately after a create
+        // that returned true.  Every one of those checks reads the replica, so
+        // every one of them can be a snapshot behind.
+        //
+        // The daemon makes them all against the map it holds, and its wording
+        // is the wording here; see daemon_handler::serve_map_request.  One
+        // source of truth, and the answers a script sees do not depend on how
+        // recently a push happened to land.
+        //
+        // `loop` is a second reason: it is this WORKER'S ring, and the runtime
+        // being started is in the daemon, so ring_policy_refusal() below would
+        // be asking the wrong process's ring about somebody else's runtime.
+        if (mgr->has_map_sink())
+        {
+            std::string err;
+            if (mgr->map_mutate("start", name, {}, err))
+                return api_yes();
+            return api_why(err.empty() ? q(name) + " could not be started" : err);
+        }
+
         auto* inst = mgr->get(name);
         if (!inst)
             return api_why("there is no runtime called " + q(name));
@@ -2864,6 +2973,21 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
 
+        // In a worker, asked of the daemon, and asked before the replica is
+        // consulted; see socketley.start above for why that order is the point.
+        //
+        // stop is also the one of the four where waiting is load-bearing beyond
+        // the return value: the daemon takes the runtime's workers down before
+        // it answers, so a script that stops a runtime and then binds its port
+        // finds it free — the same guarantee `stop` gives at the CLI.
+        if (mgr->has_map_sink())
+        {
+            std::string err;
+            if (mgr->map_mutate("stop", name, {}, err))
+                return api_yes();
+            return api_why(err.empty() ? q(name) + " could not be stopped" : err);
+        }
+
         auto* inst = mgr->get(name);
         if (!inst)
             return api_why("there is no runtime called " + q(name));
@@ -2883,9 +3007,22 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
+        // In a worker, asked of the daemon, before the replica is consulted;
+        // see socketley.start above.  The stop below would be a write to that
+        // replica, which is the one thing a worker must not do — the daemon
+        // stops the runtime itself, on its own loop, as part of serving this.
+        if (mgr->has_map_sink())
+        {
+            std::string err;
+            if (mgr->map_mutate("remove", name, {}, err))
+                return api_yes();
+            return api_why(err.empty() ? q(name) + " could not be removed" : err);
+        }
+
         auto* inst = mgr->get(name);
         if (!inst)
             return api_why("there is no runtime called " + q(name));
+
         if (inst->get_state() == runtime_running)
             mgr->stop(name, *loop);
         // Before the instance leaves the map, and for the reason cmd_remove()
@@ -3621,7 +3758,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // Done here rather than by not binding them at all, so the two builds differ
     // in one place and the list of what is refused is readable in one place.
     if (in_worker_process())
-        refuse_cross_runtime_api(sk, cluster_tbl);
+        refuse_cross_runtime_api(sk, cluster_tbl, owner);
 
     sk["cluster"] = cluster_tbl;
 

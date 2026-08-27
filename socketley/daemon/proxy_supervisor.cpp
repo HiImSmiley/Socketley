@@ -43,6 +43,18 @@ constexpr int child_shard_fd = 4;
 // four.
 constexpr int child_clients_fd = 5;
 
+// The map socket: the child's half of the control plane, where
+// socketley.create/.start/.stop/.remove go and where their answers come back.
+// Six for the reason five is five, and separate from the control socket at 3
+// for the reason set out at proxy_supervisor::set_map_handler — a worker has to
+// BLOCK for these answers, and the control socket is the one descriptor in that
+// process it cannot block on.
+//
+// A child that finds nothing here keeps the refusals it always had: the worker
+// tests the descriptor rather than being told about it, so a new worker under
+// an old daemon degrades to the previous behaviour instead of hanging.
+constexpr int child_map_fd = 6;
+
 // And the shard mesh: one descriptor per SIBLING, at a fixed slot per sibling
 // index.  Eight rather than six so there is room between the single-purpose
 // descriptors above and a block whose width is the shard count.
@@ -231,8 +243,27 @@ void proxy_supervisor::disarm_control_poll()
     }
 }
 
-void proxy_supervisor::on_cqe(struct io_uring_cqe* /*cqe*/)
+void proxy_supervisor::on_cqe(struct io_uring_cqe* cqe)
 {
+    // ── Which of the two descriptors reported ───────────────────────────────
+    //
+    // By the address of the request and not by the op type, which is the rule
+    // proxy_worker states from the other side: both of these are op_poll, so a
+    // type tells them apart exactly as well as a coin would.  This used to
+    // ignore the completion entirely, which was correct while there was one
+    // thing to ignore it for.
+    if (static_cast<io_request*>(io_uring_cqe_get_data(cqe)) == &m_map_poll_req)
+    {
+        m_map_armed = false;
+        poll_map();
+
+        // Only if poll_map() did not close it.  A worker that has gone leaves
+        // its end at EOF, and re-arming there is a poll that reports readable
+        // for ever on a descriptor with nothing behind it.
+        arm_map_poll();
+        return;
+    }
+
     // Whatever the result, this arm is spent.  Cleared before the drain so a
     // frame that causes a write back into this socket can re-arm rather than
     // queue behind an arm that has already reported.
@@ -293,6 +324,18 @@ void proxy_supervisor::on_cqe(struct io_uring_cqe* /*cqe*/)
 // is nothing to protect against then.
 void proxy_supervisor::close_control()
 {
+    // Here rather than at the call sites, and the note below says why that
+    // matters: this is reached from 8 places, and an invariant every one of
+    // them has to remember is one the ninth will not.  The two descriptors have
+    // exactly one lifetime between them — they are two halves of the link to
+    // ONE child — so a child whose control socket is gone has no map socket
+    // worth keeping either.
+    //
+    // Not the converse: poll_map() closes the map socket on its own EOF and
+    // leaves the control socket standing, because that EOF is how an ordinary
+    // worker exit is first seen and the control socket is what reports it.
+    close_map();
+
     if (m_control_fd >= 0)
     {
         disarm_control_poll();
@@ -319,6 +362,191 @@ void proxy_supervisor::close_control()
         // frame) or the child has been reaped for good.
         m_out.clear();
         m_out_off = 0;
+    }
+}
+
+// The same rule for the map socket, and a shorter body because this descriptor
+// carries no backlog: nothing is ever queued for it — answer_map_request()
+// writes straight through — so there is nothing here that could survive into a
+// restarted child's socket.
+//
+// m_map_in goes with it, unlike m_in above.  A partial map REQUEST from a child
+// that has gone is not a frame anybody is still owed: the only thing on the
+// other end of one is a worker blocked on the answer, and that worker is the
+// process that just died.
+void proxy_supervisor::close_map()
+{
+    if (m_map_fd >= 0)
+    {
+        disarm_map_poll();
+        if (m_loop)
+            m_loop->close_fd(m_map_fd);
+        else
+            ::close(m_map_fd);
+        m_map_fd = -1;
+        m_map_in.clear();
+    }
+}
+
+void proxy_supervisor::arm_map_poll()
+{
+    if (!m_loop || m_map_fd < 0 || m_map_armed)
+        return;
+
+    m_map_poll_req = { this, nullptr, m_map_fd, 0, op_poll };
+    m_map_armed    = m_loop->submit_poll_add(m_map_fd, POLLIN, &m_map_poll_req);
+
+    // Louder than the control socket's equivalent, because there is no health
+    // tick behind this one: nothing else drains this descriptor, so a refused
+    // arm is not latency, it is a worker blocked until its own deadline.
+    if (!m_map_armed)
+        LOG_WARN("proxy supervisor: could not arm the map socket; this "
+                 "worker's socketley.create/start/stop/remove will time out");
+}
+
+void proxy_supervisor::disarm_map_poll()
+{
+    if (!m_loop)
+        return;
+
+    if (m_map_armed)
+    {
+        if (!m_loop->submit_poll_remove(&m_map_poll_req)) {}
+        m_map_armed = false;
+    }
+}
+
+// Whatever the child has asked for, handed on to be answered LATER.
+//
+// Nothing here decides anything: the handler is daemon_handler's, it queues the
+// request and returns, and the answer is written on a later turn of the loop.
+// That deferral is not a nicety — `socketley.remove` of this worker's own
+// runtime destroys THIS OBJECT, and doing that inside its own completion is a
+// free of the io_request the loop is still holding.  See set_map_handler().
+void proxy_supervisor::poll_map()
+{
+    if (m_map_fd < 0)
+        return;
+
+    // MSG_DONTWAIT rather than O_NONBLOCK on the descriptor, and the write below
+    // names its own mode too.  The two ends of this pair are used in opposite
+    // ways — the worker blocks on it, this side must never — and a flag on the
+    // file description is shared by every dup of it, including the ones
+    // answer_map_request() is handed.  Naming the mode per call is the only way
+    // the two cannot be made to disagree by a change to either.
+    char buf[4096];
+    for (;;)
+    {
+        const ssize_t n = ::recv(m_map_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0)
+        {
+            m_map_in.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0)
+        {
+            // The child let go of its end.  Ordinary: it happens on every
+            // worker exit, and the control socket's own EOF is what reports it.
+            close_map();
+            return;
+        }
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        close_map();
+        return;
+    }
+
+    worker_proto::frame_type type{};
+    uint16_t                 ver   = 0;
+    std::string              payload;
+    bool                     fatal = false;
+
+    while (worker_proto::take_frame(m_map_in, type, ver, payload, fatal))
+    {
+        if (type != worker_proto::frame_type::map_req || !m_on_map)
+            continue;   // a frame this build cannot serve is skipped, not fatal
+
+        uint64_t    ticket = 0;
+        std::string op, name, config;
+        if (!worker_proto::decode_map_request(payload, ticket, op, name, config))
+            continue;
+
+        // The dup the handler owns and closes.  Taken here, while the
+        // descriptor is certainly still open, rather than by the handler on a
+        // later turn when this object may be gone.
+        const int reply_fd = ::fcntl(m_map_fd, F_DUPFD_CLOEXEC, 3);
+        if (reply_fd < 0)
+        {
+            // Out of descriptors.  Answering on m_map_fd directly is the one
+            // thing that is still safe from here — nothing has been deferred
+            // yet, so this object is not going anywhere on this line.
+            answer_map_request(m_map_fd, ticket, false,
+                               "the daemon is out of file descriptors");
+            continue;
+        }
+
+        m_on_map(ticket, reply_fd, std::move(op), std::move(name),
+                 std::move(config));
+    }
+
+    if (fatal)
+    {
+        LOG_ERROR("proxy supervisor: malformed map frame from a worker");
+        m_map_in.clear();
+        close_map();
+    }
+}
+
+void proxy_supervisor::answer_map_request(int reply_fd, uint64_t ticket,
+                                          bool ok, std::string_view err)
+{
+    if (reply_fd < 0)
+        return;
+
+    const std::string frame = worker_proto::frame(
+        worker_proto::frame_type::map_rep,
+        worker_proto::encode_map_reply(ticket, ok, err));
+
+    // ─── The one place in the daemon that waits on a worker, and its bound ──
+    //
+    // A socketpair buffer is over a hundred kilobytes and this frame is tens of
+    // bytes, so the send below completes on its first attempt for any worker
+    // that is behaving as workers behave: one request outstanding, and the
+    // process blocked reading for exactly this.
+    //
+    // The wait exists for the one that is not.  A child that writes requests and
+    // never reads answers would eventually fill the buffer, and an unbounded
+    // blocking write there would stop the daemon's event loop on behalf of a
+    // process it supervises — every other runtime in the daemon stalled by one
+    // bad script.  So this gives up instead, and the worker's own deadline
+    // reports it.
+    static constexpr int reply_wait_ms = 250;
+
+    size_t off = 0;
+    while (off < frame.size())
+    {
+        const ssize_t n = ::send(reply_fd, frame.data() + off, frame.size() - off,
+                                 MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0)
+        {
+            off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            struct pollfd pfd{reply_fd, POLLOUT, 0};
+            if (::poll(&pfd, 1, reply_wait_ms) > 0 && (pfd.revents & POLLOUT))
+                continue;
+            LOG_WARN("proxy supervisor: a worker would not take its map reply");
+            break;
+        }
+
+        // The worker is gone.  There is nobody left to tell.
+        break;
     }
 }
 
@@ -404,11 +632,30 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
+    // The control plane's own pair; see child_map_fd.  A failure to build it is
+    // NOT a failure to spawn: the worker treats an absent descriptor as "this
+    // daemon does not serve map calls" and keeps the refusals, which is a
+    // working proxy with four fewer script calls rather than none at all.
+    int mv[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, mv) < 0)
+    {
+        LOG_WARN("proxy supervisor: no map socket for this worker; its "
+                 "socketley.create/start/stop/remove will be refused");
+        mv[0] = mv[1] = -1;
+    }
+
+    // Whatever this class was still holding from a previous child.  spawn() is
+    // reached again on restart with THIS object reused, and a map descriptor
+    // left over would be armed on the ring under a new child's number.
+    close_map();
+
     const pid_t child = ::fork();
     if (child < 0)
     {
         ::close(sv[0]);
         ::close(sv[1]);
+        if (mv[0] >= 0) ::close(mv[0]);
+        if (mv[1] >= 0) ::close(mv[1]);
         LOG_ERROR("proxy supervisor: fork failed");
         return false;
     }
@@ -458,6 +705,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         // held at fork time.  dup2 clears FD_CLOEXEC on the copy, which is what
         // lets the control socket survive the exec.
         ::close(sv[0]);
+        if (mv[0] >= 0)
+            ::close(mv[0]);
 
         // ─── Two fixed numbers, and the case where one is already taken ─────
         //
@@ -474,7 +723,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         // then the region, then the control socket, so no placement can undo
         // one that has already happened.
         if ((m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
-            || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd))
+            || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd)
+            || (mv[1] >= 0 && sv[1] == child_map_fd))
         {
             const int moved = ::fcntl(sv[1], F_DUPFD, 16);
             if (moved < 0)
@@ -551,6 +801,27 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         for (size_t j = 0; j < m_mesh_fds.size(); ++j)
             place(m_mesh_fds[j], child_mesh_base + static_cast<int>(j));
 
+        // ─── And the map socket, placed after everything except the control ─
+        //
+        // Last but one, deliberately.  Its destination sits between the shard
+        // pair and the mesh block, so a source already living on 6 belongs to a
+        // placement that has already happened — the dup2 that put it where it
+        // was going leaves the original readable at whatever number it had, and
+        // destroying that copy costs nothing.  Placing this FIRST would instead
+        // destroy a source before it had been placed.
+        //
+        // The control socket stays last for the same reason it always was: it
+        // is the descriptor whose loss cannot be recovered from, so nothing is
+        // allowed to be placed after it.
+        int map_src = mv[1];
+        if (map_src >= 0 && map_src <= child_mesh_base + static_cast<int>(m_mesh_fds.size()))
+        {
+            map_src = ::fcntl(map_src, F_DUPFD, 128);
+            if (map_src < 0)
+                _exit(127);
+        }
+        place(map_src, child_map_fd);
+
         if (sv[1] != child_control_fd)
         {
             if (::dup2(sv[1], child_control_fd) < 0)
@@ -583,8 +854,11 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
 
     // ── parent ──────────────────────────────────────────────────────────────
     ::close(sv[1]);
+    if (mv[1] >= 0)
+        ::close(mv[1]);
     m_pid        = child;
     m_control_fd = sv[0];
+    m_map_fd     = mv[0];
 
     // A new child has said nothing yet.  Without this a restart would inherit
     // the previous one's report, and await_startup() would answer for a process
@@ -665,6 +939,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // a failed spawn is about to close is the completion-outliving-its-fd case
     // this file goes to some length to avoid.
     arm_control_poll();
+    arm_map_poll();
     return true;
 }
 
@@ -980,6 +1255,21 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         // called, so the frames and the EOF are both sitting in the socket.
         poll();
 
+        // ── And the map socket, which is what stops this being a deadlock ───
+        //
+        // The child's script runs its on_start INSIDE the start this is waiting
+        // for, and on_start is where socketley.create/.start/.stop/.remove are
+        // written.  So the ordinary case is a worker blocked on an answer from
+        // a daemon blocked in this loop, and neither moves until a timeout ends
+        // one of them: measured, `create -s` reporting "did not report back
+        // within 2s" for a script whose create had in fact reached the daemon
+        // and would be served two seconds later.
+        //
+        // Draining here is only half of it; daemon_handler serves what this
+        // hands it rather than deferring, for the same reason.  See
+        // queue_map_request().
+        poll_map();
+
         if (m_placeholder && m_placeholder->get_state() == runtime_failed)
             return startup::refused;
 
@@ -1008,10 +1298,18 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         if (slice < 0)
             slice = 0;
 
-        if (m_control_fd >= 0)
+        if (m_control_fd >= 0 || m_map_fd >= 0)
         {
-            struct pollfd pfd{m_control_fd, POLLIN, 0};
-            if (::poll(&pfd, 1, slice) < 0) {}
+            // Both descriptors, because either can end this wait: the control
+            // socket carries the child's verdict, and the map socket carries a
+            // request whose answer the child is waiting on before it can give
+            // one.  Waiting on only the first is what made the deadlock above
+            // cost the full slice on every turn.
+            struct pollfd pfds[2];
+            nfds_t        n = 0;
+            if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
+            if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
+            if (::poll(pfds, n, slice) < 0) {}
         }
         else
         {
@@ -1048,6 +1346,10 @@ bool proxy_supervisor::await_routes(const void* previous,
     {
         poll();
 
+        // The reload path reaches the script's top level again, so it reaches
+        // the same four calls; see the note in await_startup().
+        poll_map();
+
         if (m_placeholder && m_placeholder->worker_routes().get() != previous)
             return true;
 
@@ -1070,8 +1372,11 @@ bool proxy_supervisor::await_routes(const void* previous,
         if (slice < 0)
             slice = 0;
 
-        struct pollfd pfd{m_control_fd, POLLIN, 0};
-        if (::poll(&pfd, 1, slice) < 0) {}
+        struct pollfd pfds[2];
+        nfds_t        n = 0;
+        if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
+        if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
+        if (n && ::poll(pfds, n, slice) < 0) {}
     }
 }
 
