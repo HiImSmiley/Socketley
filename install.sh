@@ -2,6 +2,18 @@
 set -e
 
 REPO="HiImSmiley/Socketley"
+
+# Said here rather than by dpkg halfway through.  The README documents
+# `curl ... | sudo sh`, so the usual way to arrive without privileges is to have
+# dropped the sudo -- and without this the script gets as far as apt-get before
+# failing, having already changed the package lists of a machine whose owner
+# thought nothing had happened yet.
+if [ "$(id -u)" -ne 0 ]; then
+  echo "error: this installer must run as root" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo sh" >&2
+  exit 1
+fi
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
