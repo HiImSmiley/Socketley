@@ -15,7 +15,8 @@ examples/
 ├── cluster/            # Several daemons discovering each other
 ├── managed/            # Binaries the daemon supervises, via `socketley add`
 ├── udp/                # UDP server/client examples
-└── advanced/           # Complex multi-runtime setups
+├── advanced/           # Complex multi-runtime setups
+└── projects/           # Complete systems you can run, not single features
 ```
 
 ## Quick Start
@@ -113,6 +114,15 @@ sockets — only the two marked below reach for the SDK wrapper.
 
 ### UDP
 - `udp-echo.sh` - Fire-and-forget UDP messaging
+
+### Projects
+Complete little systems rather than one flag each. Every one of these runs on its
+own daemon, on its own socket, and removes what it made on the way out.
+
+- `link-shortener/` - a TLS gateway in front of an HTTP API. Exercises
+  `on_http_request`, TLS termination, health checks, a circuit breaker and
+  retries, and states plainly what it cannot do: the links live in a Lua table,
+  so they do not survive a restart and would not survive `--shards` either
 
 ### Cluster
 - `docker-compose.yml` - three daemons in three containers sharing a volume;
