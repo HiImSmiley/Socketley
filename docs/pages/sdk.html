@@ -859,6 +859,8 @@ The sol2/LuaJIT include paths and <code>-lluajit</code> are not optional extras:
 </tbody>
 </table>
 
+<div class="info-box"><strong>No <code>daemon_process()</code> either, and for the neighbouring reason.</strong> <code>--daemon-process</code> asks the daemon to keep a runtime inside its own process instead of forking a worker for it. An embedded runtime is already inside a process &mdash; yours &mdash; and there is no daemon in the picture to decide otherwise, so the flag has nothing to select between. Both flags <em>do</em> work through Tier 1, which passes its flag string to the daemon verbatim: <code>ctl::create("server", "web", "-p 8080 --shards 4 -s")</code>.</div>
+
 <div class="info-box"><strong>No <code>shards()</code>, deliberately.</strong> A shard is a worker <em>process</em> forked by the daemon; an embedded wrapper is in-process by construction, and <code>shards_config_refusal</code> refuses any in-process runtime claiming more than one. Sharding an SDK service means running N processes of your binary; on a TCP port they can share it via <code>SO_REUSEPORT</code>.</div>
 
 <div class="method-card" id="sdk-wrap-server">
