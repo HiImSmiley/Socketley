@@ -16,6 +16,11 @@ int main()
 {
     socketley::server srv(9000);
 
+    // mode_in: without it the server is a hub -- every inbound line is also
+    // relayed raw to every other client, on top of what on_message sends.
+    // A server whose on_message IS the protocol wants the relay off.
+    srv.mode(mode_in);
+
     srv.on_connect([](int fd) {
         printf("client %d connected\n", fd);
     });
