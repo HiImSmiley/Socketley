@@ -2,41 +2,18 @@
 # Integration test: a script cannot schedule work for a runtime it has stopped.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
-#
-# `stop` severs the timers and the subscriptions a script has armed, and that
-# is what makes "a stopped runtime executes no script" true.  Both severances
-# happen inside stop(), and stop() returns — to a script, if socketley.stop is
-# what called it.  Whatever that handler does next runs on a runtime that is
-# already down, and set_interval and socketley.subscribe were happy to arm it:
-#
-#     socketley.subscribe(cache, "go", function()
-#         socketley.stop(self.name)          -- severs everything
-#         socketley.set_interval(120, ...)   -- and this arms a new one
-#     end)
-#
-# Measured on the parent commit, one publish and two seconds:
-#
-#     zombie ticks: 41   zombie subs: 1
-#
-# — the exact defect 23e5181 fixed, at full rate, on a runtime `ls` reports as
-# Stopped, reachable again through a door the severance does not close.  Forty
-# one is not a leak; it is a script running.
-#
+# stop() severs a script's timers and subscriptions and then returns -- to the
+# script, if socketley.stop is what called it -- so whatever the handler does
+# next arms a runtime that is already down, at full rate, on a runtime `ls`
+# reports as Stopped.
 # ─── ONE LATCH, BOTH APIS ───────────────────────────────────────────────────
-#
-# The timers and the subscriptions are asserted together on purpose.  They are
-# severed by the same call for the same sentence, and a fix applied to the one
-# it was found through would leave the other half of a single rule behind — and
-# leave it in the API whose bill 23e5181 already measured once.  So the test
-# arms both from the same handler and reads both answers.
-#
+# Timers and subscriptions are asserted together because they are severed by
+# the same call for the same sentence, and a fix applied only to the half it
+# was found through would leave the other behind.
 # ─── AND IT LIFTS ───────────────────────────────────────────────────────────
-#
-# A latch that never opened would be a way to make `stop; start` produce a
-# runtime that is up and can no longer schedule anything — green on every
-# assertion above and a worse defect than the one being fixed.  So the last
-# section starts the runtime again and asserts that on_start's own subscribe
-# and set_interval both work.
+# A latch that never opened would leave a restarted runtime up and unable to
+# schedule anything, green on every assertion above and worse than the defect
+# being fixed, so the last section starts it again.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -141,14 +118,10 @@ count()   { grep -ac "$1" "$SOCKETLEY_DLOG" 2>/dev/null || true; }
 
 said "READY starts=1" 10 || true
 
-# ── Controls: both APIs answer with a live id, and both work ───────────────
-#
-# Without these the whole file passes against a build where set_interval and
-# subscribe answer 0 always and nothing is ever armed at all.
-# "Not 0" rather than a particular id.  0 is the refusal this whole file is
-# about and is the only value with a meaning; which number a live registration
-# happens to get depends on what else the script armed first, and pinning it
-# makes adding a timer to the script a red assertion somewhere unrelated.
+# Controls, without which this file passes against a build where both APIs
+# answer 0 always -- and "not 0" rather than a particular id, because 0 is the
+# refusal this file is about while pinning a live id makes adding a timer a red
+# assertion somewhere unrelated.
 READY1=$(grep -a "READY starts=1" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
 case "$READY1" in
     ""|*" sub=0"*|*" interval=0"*)
@@ -163,9 +136,8 @@ if [ "$(count HEARTBEAT)" -ge 1 ]; then pass; else
     fail "control: the interval armed while running actually fires" \
          "no HEARTBEAT line"
 fi
-# And the top-level one, which the last assertion in this file is about.  It has
-# to be proved running here or "it did not come back" is satisfied by a timer
-# that was never armed in the first place.
+# The top-level timer has to be proved running here, or "it did not come back"
+# is satisfied by one that was never armed.
 said "TOPTICK" 6 || true
 if [ "$(count TOPTICK)" -ge 1 ]; then pass; else
     fail "control: the interval armed at the script's top level fires" \
@@ -194,13 +166,9 @@ if [ "$STATUS" = "Stopped" ]; then pass; else
          "ls says '${STATUS:-<nothing>}', wanted 'Stopped'"
 fi
 
-# The three answers, read directly rather than inferred from what fired.  A
-# refusal is 0 for all three: set_timeout and set_interval already document 0 as
-# "armed nothing", and subscribe's ids start at 1 so 0 is never a registration.
-# Matched on the values, not on the whole line.  The daemon's log prefix is not
-# this test's to pin — it has already gained a timestamp and the runtime's name
-# since this file was written — and an exact compare against it turns somebody
-# else's improvement into a red assertion here.
+# The three answers read directly rather than inferred from what fired, matched
+# on the values and not the whole line -- the daemon's log prefix is not this
+# test's to pin.
 REARM=$(grep -a "REARM " "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
 case "$REARM" in
     *"REARM interval=0 sub=0 timeout=0") REARM_OK=1 ;;
@@ -216,9 +184,8 @@ if [ "$REARM_OK" = "1" ]; then pass; else
 fi
 
 # ── And nothing it armed ever runs ─────────────────────────────────────────
-#
-# The observable half, and the one that does not depend on any return value.
-# Sampled entirely after the stop, over a window a 120 ms interval would fill.
+# The observable half, which depends on no return value, sampled entirely after
+# the stop over a window a 120 ms interval would fill.
 TICKS_BEFORE=$(count "ZOMBIE TICK")
 sleep 2
 TICKS_AFTER=$(count "ZOMBIE TICK")
@@ -231,15 +198,10 @@ if [ "$(count 'ZOMBIE TIMEOUT')" = "0" ]; then pass; else
     fail "no timeout armed after the stop ever fires" \
          "a ZOMBIE TIMEOUT line is in the log"
 fi
-# This one is already green on the parent, and it is worth saying why rather
-# than letting it look like coverage it is not: delivery to a stopped runtime is
-# refused by dispatch_publish's state test, so the subscription being refused
-# here changes nothing observable.  What it catches is the build where BOTH go —
-# a latch that covered only the timers together with a dispatch_publish that
-# stopped asking about state.  The direct reading of `sub=` above is what this
-# half of the latch is actually asserted by.
-# Read after the two-second window above, by which time the severance has long
-# settled: this is the number the restart must not move.
+# Already green on the parent, because delivery to a stopped runtime is refused
+# by dispatch_publish's state test -- what it catches is the build where both
+# go, and it is read after the two-second window as the number the restart must
+# not move.
 TOP_FROZEN=$(count TOPTICK)
 
 publish after zombie
@@ -254,11 +216,9 @@ fi
 # ── The latch lifts when the runtime starts again ──────────────────────────
 "$BIN" start rearm_srv >/dev/null 2>&1 || true
 ready_tcp 127.0.0.1 "$SRV_PORT" 10 || echo "  NOTE: the server never re-accepted"
-# Counted rather than matched on `starts=2`.  The counter is an upvalue in the
-# worker's interpreter and a start forks a NEW worker, so the second on_start
-# reports starts=1 -- the same number as the first, from a Lua state that has
-# never seen the first.  What has to be true is that there are now TWO READY
-# lines and that the second one armed live ids.
+# Counted rather than matched on `starts=2`, because the counter is an upvalue
+# in the worker's interpreter and a start forks a new worker that has never
+# seen the first.
 for _ in $(seq 1 80); do
     [ "$(count 'READY starts=')" -ge 2 ] && break
     sleep 0.1
@@ -296,24 +256,10 @@ if [ "$LIVE_AFTER" -gt "$LIVE_BEFORE" ]; then pass; else
          "no new 'LIVE SUB' line after the restart"
 fi
 
-# ── ...and the top-level timer DOES come back ──────────────────────────────
-#
-# This assertion is inverted, and the asymmetry it was written about is gone.
-#
-# It read: `start` re-runs on_start, so what on_start armed returns, and a timer
-# armed at the script's TOP LEVEL has nothing to replay it, because the top
-# level ran once, at load.  True while the script and the runtime shared a
-# process and an interpreter -- which is what --daemon-process was providing.
-#
-# A script runs where its runtime runs.  A stop retires the worker and a start
-# forks a NEW one, which loads the script from the file and runs its top level
-# like any other first run.  So there is no asymmetry left to pin: on_start's
-# registrations come back because on_start runs again, and the top level's come
-# back because the top level runs again.
-#
-# `starts` says the same thing from the other direction and is why the READY
-# assertion above stopped looking for `starts=2`: the counter is a Lua upvalue
-# in an interpreter that no longer exists, so the second start reports 1.
+# The asymmetry this assertion was written about is gone: a stop retires the
+# worker and a start forks a new one that loads the script and runs its top
+# level like any other first run, so both on_start's registrations and the top
+# level's come back.
 TOP_AFTER=$(count TOPTICK)
 if [ "$TOP_AFTER" -gt "$TOP_FROZEN" ]; then pass; else
     fail "a timer armed at the top level comes back on start" \

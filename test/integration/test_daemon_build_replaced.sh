@@ -1,50 +1,20 @@
 #!/usr/bin/env bash
-# Integration test: a daemon still running an executable that has since been
-# rebuilt says so.
-#
-# 62e6bb1 made `socketley version` report a daemon on the socket whose version
-# differs from the CLI's.  It compares
-#
-#     dver != SOCKETLEY_VERSION
-#
-# and SOCKETLEY_VERSION is a literal in cli/cli.h behind an #ifndef that nothing
-# in premake5.lua defines.  CLI and daemon are therefore compiled from the same
-# literal, and the comparison is false for every build of a given release — so
-# the arm fires only across a version bump, and the case it was written for
-# does not involve one.  "I rebuilt and my new flag is rejected" is a
-# same-version rebuild against a daemon that is still holding its runtimes, and
-# it was reported nowhere.
-#
+# `socketley version` compares a literal that CLI and daemon are both compiled
+# from, so its arm fires only across a version bump -- while the case it was
+# written for, a same-version rebuild against a daemon still holding its
+# runtimes, was reported nowhere.
 # ─── WHAT MAKES THIS DECIDABLE ──────────────────────────────────────────────
-#
-# The daemon can name its own executable exactly: readlink("/proc/self/exe")
-# for the path, and st_dev/st_ino from stat() on the same magic link for the
-# file, which stays readable after the file is unlinked.  The CLI can do the
-# same for itself.  The comparison is only sound when both name the same path:
-#
-#   same path, different inode    the file at that path was replaced since the
-#                                 daemon started.  Certain.  Report it.
-#   same path, daemon's deleted   the rebuild unlinked it.  Certain.  Report it.
-#   different paths               SAY NOTHING.
-#
-# The last is not a nicety.  81dcf4a exists because a binary copied under
-# another name was being misidentified, and comparing inodes across different
-# paths would reintroduce exactly that: every agent in this tree runs the CLI
-# from a copy while a daemon runs from the original, and a build report on each
-# of those is noise that trains people to ignore the message.
-#
+# Both sides can name their own executable exactly through /proc/self/exe, and
+# the comparison is only sound when both name the same path -- a different path
+# says nothing, because every agent in this tree runs the CLI from a copy and a
+# build report on each of those is noise that trains people to ignore the
+# message.
 # ─── WHY THE PAIR ───────────────────────────────────────────────────────────
-#
-# "Running the CLI from a different path says nothing" is green on a build
-# where the whole feature is missing — it is green right now.  On its own it
-# proves nothing whatever.  It is stated here only next to "a genuine
-# replacement at the same path IS reported", which is red right now, and the
-# two have to hold together or the feature is either absent or noisy.
-#
-# The replacement is a real one: a new file renamed over the path the daemon is
-# executing.  Not a simulation, and not `cp` over the top, which the kernel
-# refuses with ETXTBSY for a running executable — rename is what a linker
-# falls back to for the same reason, so it is also what a rebuild does.
+# "A different path says nothing" is green on a build with no feature at all,
+# so it is stated only next to "a genuine replacement at the same path is
+# reported" -- and the replacement is a real one, renamed over the path,
+# because the kernel refuses `cp` over a running executable with ETXTBSY and
+# rename is what a linker falls back to for the same reason.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -62,14 +32,8 @@ bad() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
-# Does HAYSTACK contain NEEDLE.
-#
-# NOT `printf '%s' "$x" | grep -q "$n"`.  This file runs under `set -o
-# pipefail` and `grep -q` exits at its first match, which hands the writer a
-# SIGPIPE; the pipeline then reports 141 and the `if` takes the "no match"
-# branch precisely when it matched.  lib_daemon.sh carries the same warning
-# over daemon_starting_pids; test_ps_failed_visible.sh carries the account of
-# it actually happening.  A case statement has no pipeline and cannot do it.
+# A case statement rather than `grep -q`, which exits at its first match and
+# under pipefail takes the no-match branch precisely when it matched.
 has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 IMP_PID=""
@@ -94,8 +58,6 @@ cp "$BIN" "$ALTDIR/socketley"
 
 daemon_start "$RUNDIR/socketley"
 
-# ─── 1. CONTROL: the same file is not news ───────────────────────────────────
-#
 # First, because if this is not silent then every assertion below is measuring
 # a message that is always printed.
 ERR=$("$RUNDIR/socketley" version 2>&1 >/dev/null || true)
@@ -112,16 +74,14 @@ if [ "$OUT_BEFORE" = "$("$BIN" version 2>/dev/null)" ]; then ok; else
 fi
 
 # ─── 2. the rebuild ──────────────────────────────────────────────────────────
-#
-# A new file, renamed over the path the daemon is executing.  The daemon keeps
-# the inode it started from — /proc/<pid>/exe now reads "... (deleted)" — and
-# the path holds a different file, which is what the CLI will be run from.
+# A new file renamed over the path the daemon is executing, so the daemon keeps
+# the inode it started from and the path holds the file the CLI will be run
+# from.
 cp "$BIN" "$SOCKETLEY_TMPD/staged"
 mv "$SOCKETLEY_TMPD/staged" "$RUNDIR/socketley"
 
-# The premise: the daemon must have survived being rebuilt under, and the two
-# files must actually be different inodes.  Without both, nothing below is
-# about a replaced executable.
+# The premise: the daemon survived being rebuilt under, and the two files
+# really are different inodes.
 if daemon_alive "$SOCKETLEY_SOCKET"; then ok; else
     bad "the daemon survives its executable being replaced" \
         "no process is serving $SOCKETLEY_SOCKET after the rename"
@@ -149,11 +109,9 @@ if [ "$OUT_AFTER" = "$OUT_BEFORE" ]; then ok; else
         "before [$OUT_BEFORE] after [$OUT_AFTER]"
 fi
 
-# ─── 3. PAIRED: a CLI at a different path says nothing ───────────────────────
-#
-# The half that is green today and has to stay green.  $ALTDIR/socketley is a
-# byte-identical copy at another path — the arrangement every agent in this
-# tree works in — and it is not evidence about anybody's build.
+# The half that is green today and has to stay green: a byte-identical copy at
+# another path is the arrangement every agent works in and is not evidence
+# about anybody's build.
 ERR=$("$ALTDIR/socketley" version 2>&1 >/dev/null || true)
 if [ -z "$ERR" ]; then ok; else
     bad "a CLI run from a different path than the daemon's says nothing" \
@@ -166,16 +124,9 @@ fi
 daemon_stop
 daemon_isolate buildswap2
 
-# ─── 4. a daemon too terse to answer is not accused ──────────────────────────
-#
-# A daemon built between 62e6bb1 and this change answers `ping` with the prefix,
-# a version and a pid, and nothing after it.  That is a real thing that can be
-# running on somebody's machine, and being terse is not the same as being a
-# different build.  The stand-in is a listener replying exactly that frame.
-#
-# Not red on any build — it is a guard against the obvious wrong
-# implementation, which is to treat "the daemon did not say" as "the daemon
-# said no".  Its control is directly below it.
+# A daemon too terse to answer is not accused, which is a guard against
+# treating "the daemon did not say" as "the daemon said no" -- stood in for by
+# a listener replying exactly that frame, with its control directly below.
 TERSE_PY=$SOCKETLEY_TMPD/terse.py
 cat > "$TERSE_PY" <<'PY'
 import os, socket, sys
@@ -227,9 +178,8 @@ if [ -z "$ERR" ]; then ok; else
 fi
 stop_terse
 
-# The control for the assertion above.  Without it, "the terse daemon is not
-# accused" is also green on a build where `version` never probes the socket at
-# all, and the assertion above would be measuring nothing.
+# The control, without which "the terse daemon is not accused" is also green on
+# a build where `version` never probes the socket at all.
 start_terse "socketley-daemon 0.0.1 424242"
 ERR=$("$BIN" version 2>&1 >/dev/null || true)
 if has "$ERR" "0.0.1"; then ok; else
