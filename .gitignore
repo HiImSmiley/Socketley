@@ -92,9 +92,21 @@ test/benchmark/bench_client
 # Packages
 *.deb
 *.rpm
-# Local-only project file.  Not CONTRIBUTING.md, which used to be ignored
-# beside it and is the one file a public repository is expected to carry.
-CLAUDE.md
+# every .md is local unless it is named below.
+# ai-assist notes, handoffs and memory dumps are markdown and kept arriving;
+# ignoring the extension and listing the public docs errs closed instead.
+# already-tracked files stay tracked -- the negations are what keeps them
+# obvious rather than what keeps them working.
+*.md
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!SECURITY.md
+!THIRD_PARTY_NOTICES.md
+!examples/**/README.md
+!man/README.md
+!.github/**/*.md
 
 # IDE and editor
 .vscode/
