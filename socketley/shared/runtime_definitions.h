@@ -30,10 +30,8 @@ inline bool g_worker_process = false;
 inline void set_worker_process(bool on) { g_worker_process = on; }
 inline bool in_worker_process()         { return g_worker_process; }
 
-// The whole --shards rule, returning the refusal text or an empty string; a
-// command line is not the only way a shard count arrives, so every route asks.
-// --listen is refused above one shard: N processes would unlink each other's
-// socket node and only the last to bind would be reachable.
+// The whole --shards rule; every route asks, because a command line is not the
+// only way a shard count arrives.
 inline std::string shards_config_refusal(runtime_type type,
                                          uint32_t    shards,
                                          std::string_view listen_path)

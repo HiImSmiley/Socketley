@@ -1,18 +1,6 @@
 #pragma once
-// Frames on their way out of a process, and what happens when the far side is
-// not reading.
-//
-// Queued and flushed as the socket takes them, with a cap so a peer that has
-// stopped reading cannot grow this process without limit.  Beyond the cap
-// write() refuses, and a refusal is a fact the caller must act on -- on the
-// mesh it is what makes a crossing fall back to the relay instead of vanishing.
-//
-// use_ring() puts the send on the ring; everything above is unchanged, and a
-// writer with no ring behaves exactly as before.
-//
-// Two buffers, not one: an SQE holds a pointer the kernel reads later, so
-// `m_wire` is never touched while a send is armed and `m_out` is what write()
-// appends to.
+// Frames out of a process, queued behind a cap so a peer that stopped reading
+// cannot grow it; past the cap write() refuses and the caller must act on that.
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
@@ -30,11 +18,7 @@ class frame_writer
 public:
     static constexpr size_t MAX_BACKLOG = 4u << 20;
 
-    // The largest single send this will submit.  A cap at all because the
-    // length field of an SQE is 32 bits and the backlog is not, and this one
-    // because it is far above any frame this socket carries — it bounds nothing
-    // in practice and is here so the cast below cannot be the thing that is
-    // wrong.
+    // Caps the 32-bit SQE length against an unbounded backlog.
     static constexpr size_t MAX_SEND = 1u << 20;
 
     explicit frame_writer(int fd) : m_fd(fd) {}
@@ -42,13 +26,8 @@ public:
     void set_fd(int fd) { m_fd = fd; }
     int  fd() const     { return m_fd; }
 
-    // Put the send on the ring.  Only after register_owner(), or the completion
-    // is dropped rather than delivered.
-    //
-    // AFTERWARDS THE OWNER MUST CALL flush() ONCE PER TURN of its loop: from
-    // here write() queues and does not submit.  Forgetting leaves the frame
-    // until the next flush, which on a control socket is a reply someone waits
-    // for.
+    // Only after register_owner().  AFTERWARDS THE OWNER MUST flush() ONCE PER
+    // TURN: from here write() queues and does not submit.
     void use_ring(event_loop* loop, io_handler* owner)
     {
         if (!loop || !owner || m_loop)
@@ -58,10 +37,8 @@ public:
         flush();
     }
 
-    // Take the send off the ring on the way down.  A send already in flight is
-    // abandoned rather than rewritten: how much the kernel took is unknowable
-    // until its completion lands, and a duplicated prefix is a malformed frame.
-    // Queued-but-unsubmitted bytes go back to the front of m_out.
+    // An in-flight send is abandoned, not rewritten -- a duplicated prefix is a
+    // malformed frame.  Unsubmitted bytes go back to the front of m_out.
     void leave_ring()
     {
         if (!m_loop)
@@ -84,19 +61,12 @@ public:
     // of its own and they must not be confused for a send that finished.
     bool owns_request(const io_request* r) const { return r == &m_send_req; }
 
-    // ── A send that finished ────────────────────────────────────────────────
-    //
-    // Short sends are ordinary on a stream socket, so `res` is a count and not
-    // a verdict: what it did not take stays at the front of m_wire and the next
-    // submission continues from there.
+    // `res` is a count, not a verdict: short sends are ordinary here.
     void on_send_cqe(int res)
     {
         m_send_armed = false;
 
-        // The completion of a send this writer has already given up on, in the
-        // window between leave_ring() and the ring closing.  m_wire is gone and
-        // the verdict was taken there; advancing an offset into a cleared
-        // buffer here would take pending() below zero.
+        // A completion for a send abandoned by leave_ring(); m_wire is gone.
         if (!m_loop)
             return;
 
@@ -133,10 +103,8 @@ public:
         m_full = false;
         m_out.append(framed);
 
-        // A ring writer queues and does not submit: submitting per frame ends
-        // the ring's wait for a completion nobody needed, so the loop stops
-        // batching.  flush() sends one turn's frames in one send; see
-        // use_ring() for the contract that makes it safe.
+        // Queue only: submitting per frame ends the ring's wait for a
+        // completion nobody needed, and the loop stops batching.
         if (!m_loop)
             blocking_flush();
         return true;
@@ -158,10 +126,8 @@ public:
         return (m_out.size() - m_off) + (m_wire.size() - m_wire_off);
     }
 
-    // Queued, and nothing in the ring will move it on its own.  This is what a
-    // loop clamps its wait on: an in-flight send ends with a completion, so it
-    // needs no timeout, and a submission that get_sqe() refused needs exactly
-    // one.
+    // Queued with nothing in the ring to move it; what a loop clamps its wait
+    // on, because a refused submission is the only case needing a timeout.
     bool needs_retry() const
     {
         return m_loop && !m_send_armed && !m_dead && pending() > 0;

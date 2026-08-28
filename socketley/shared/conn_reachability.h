@@ -1,8 +1,6 @@
 #pragma once
-// May a teardown be deferred to an operation still in flight?
-//
-// Only if something is obliged to report it. An armed read on a closing
-// connection is not: it ends when the peer sends, and the peer is already gone.
+// A teardown may only be deferred to an operation something is obliged to
+// report; an armed read on a closing connection is not one.
 #include <cstdint>
 
 namespace socketley::reach

@@ -1,20 +1,6 @@
 #pragma once
-// What names a connection when the thing naming it is somewhere else.
-//
-// A descriptor is an index into one process's table: not unique across
-// processes, reissued after close, and a licence to name any of them.  A
-// conn_ref is minted once by the owner, never reused, and a stale one resolves
-// to nothing.
-//
-// `owner` says which runtime minted it, so a serial need only be unique within
-// one.  `serial` says which connection, seeded from the clock so a restart
-// cannot hand back a name the previous lifetime used.
-//
-// The top six bits of the serial are the minting SHARD, because every shard of
-// a runtime shares its owner key and mints from an independent counter -- so
-// without them two shards eventually hand out the same serial.  It also lets a
-// holder route to one shard instead of offering the ref to all N.  The
-// remaining 58 bits are 9.1 years of uptime before the counter wraps.
+// Names a connection across processes, where a reissued descriptor cannot.
+// `owner` is the minting runtime, `serial` the connection, top six bits its shard.
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -123,10 +109,7 @@ inline uint32_t conn_ref_shard(const conn_ref& r)
     return static_cast<uint32_t>(r.serial >> conn_serial_shard_shift);
 }
 
-// ── Wire form ───────────────────────────────────────────────────────────────
-// Sixteen bytes, little-endian, fixed width.  Fixed rather than varint because
-// every framing this travels in is length-prefixed already and the saving would
-// be four bytes on a message that carries a payload.
+// Sixteen bytes, little-endian, fixed width.
 
 inline constexpr size_t conn_ref_wire_size = 16;
 

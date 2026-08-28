@@ -1,15 +1,7 @@
 #pragma once
 
-// The AF_UNIX rules, stated once: path_refusal(), fill_addr(), bind_listener().
-//
-// The connect side is fill_addr() plus connect(2) and is in this same header,
-// because what the two sides share is how a path becomes an address and how
-// many bytes of it the kernel reads -- a second copy is how the server and the
-// proxy came to disagree.  A dialler gets none of the stale-node machinery.
-//
-// The abstract namespace is refused by the absolute-path rule: it is bounded by
-// the network namespace, so any uid in it may connect, and the 0600 chmod this
-// file relies on does not exist there.
+// The AF_UNIX rules, stated once; the connect side is fill_addr() plus
+// connect(2) and is here so it cannot disagree about the address.
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -24,15 +16,8 @@
 namespace socketley::unix_sock
 {
 
-// Why `path` may not name a unix socket, or empty if it may.  Configuration
-// time on purpose: the kernel truncates an over-long sun_path silently, and a
-// trimmed path names a different socket that something else may be serving.
-//
-// Asked from the flag parser AND from every runtime's setup(), and the second
-// asking is not redundancy: setup() is the one function every route to a
-// socket passes through — create, the daemon's restore of a persisted runtime,
-// a worker rebuilding from its config frame, `import`, and a restart after
-// `edit` — and the flag parser is on exactly one of those routes.
+// Why `path` may not name a unix socket, or empty if it may; asked again from
+// setup(), which is the one function every route to a socket passes through.
 inline std::string path_refusal(std::string_view path)
 {
     if (path.empty())
@@ -70,27 +55,16 @@ inline socklen_t fill_addr(std::string_view path, struct sockaddr_un& out)
                                   path.size() + 1);
 }
 
-// What bind_listener has to say for itself.  fd >= 0 is a listening socket the
-// caller now owns (and must remember it bound `path`, so its teardown removes
-// exactly that node); fd < 0 comes with the reason, which the caller prefixes
-// with its runtime type and logs — the shared code does not know who it is
-// speaking for.
+// fd >= 0 is a listening socket the caller owns and must unlink on teardown;
+// fd < 0 carries the reason for the caller to prefix and log.
 struct bind_result
 {
     int fd = -1;
     std::string error;
 };
 
-// The AF_UNIX listener, for `--listen unix:/path/to.sock`.
-//
-// A node outlives the process that made it, so bind() fails EADDRINUSE whether
-// or not anyone is serving.  Unlinking unconditionally would also let a second
-// copy take the path from a live one, so the node is probed by connecting: a
-// refusal means stale and it is removed, a success means this start is refused.
-//
-// chmod 0600 rather than the umask, because connecting needs write permission
-// on the node and `umask 0` would otherwise publish it to the whole machine.
-// There is no flag to widen it; use a parent directory the operator controls.
+// A stale node is probed by connecting rather than unlinked blind, so a second
+// copy cannot take the path from a live one.  chmod 0600, not the umask.
 inline bind_result bind_listener(const std::string& path)
 {
     bind_result r;
@@ -115,19 +89,14 @@ inline bind_result bind_listener(const std::string& path)
                           "than taking the path away from it";
                 return r;
             }
-            // ENOENT is nothing to remove; anything else -- ECONNREFUSED above
-            // all, which is what a node with nobody behind it answers -- is a
-            // leftover.  unlink's own failure is left to bind() to report, which
-            // says which path and why in one message rather than two.
+            // ECONNREFUSED means a leftover; unlink's own failure is left to
+            // bind() so the operator gets one message, not two.
             if (err != ENOENT)
                 if (unlink(path.c_str()) < 0) {}
         }
     }
 
-    // Plain close() on every failure path below: none of these descriptors has
-    // been given to a ring yet, and handing a ring a close for something it
-    // does not know about is how a teardown starts owing a completion nobody
-    // will deliver.  The caller tracks the fd it is returned.
+    // Plain close(): none of these has been given to a ring yet.
     const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
     {
@@ -135,10 +104,7 @@ inline bind_result bind_listener(const std::string& path)
         return r;
     }
 
-    // Deliberately no SO_REUSEADDR, no SO_REUSEPORT, no TCP_NODELAY and no
-    // TCP_DEFER_ACCEPT.  The first two mean nothing for a path the bind below
-    // has just made exclusive, and the last two are TCP-level options that
-    // would fail on this socket and buy nothing if they did not.
+    // No SO_REUSE*, no TCP_*: the first mean nothing here, the second are TCP.
     if (bind(fd, reinterpret_cast<const struct sockaddr*>(&addr), addr_len) < 0)
     {
         r.error = "--listen " + path + " could not be bound: " + std::strerror(errno);
