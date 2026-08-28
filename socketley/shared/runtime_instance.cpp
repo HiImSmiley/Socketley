@@ -36,19 +36,9 @@ void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
     rt->fire_tick(cqe->res);
 }
 
-// ─── NOTHING RE-ARMS THIS CHAIN BUT ITS OWN COMPLETION ──────────────────────
-//
-// So a submission that never reached the ring ends on_tick for this runtime for
-// the rest of the daemon's life, and it used to end it in silence: the answer
-// was discarded here and again in fire_tick().
-//
-// It also leaked.  tick_handler is a raw `new` whose `delete this` lives in its
-// own on_cqe — the completion is what frees it — so a timer that was never
-// queued has no completion coming and the object is never released.
-//
-// daemon_handler::start_health_timer() has the same shape and says both things
-// out loud when its submission is refused.  This is the same chain one layer
-// down, and it now does too.
+// Nothing re-arms this chain but its own completion, so a refused submission
+// ends on_tick for this runtime for good and leaks the handler, and both are
+// now said out loud.
 void runtime_instance::start_tick_timer()
 {
     uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms
@@ -65,15 +55,9 @@ void runtime_instance::start_tick_timer()
     {
         LOG_ERROR("runtime tick timer refused: on_tick will not run again for "
                   "this runtime");
-        // Nothing will complete for it, so this is the only place that can free
-        // it.  Cleared first: the handler's own on_cqe is the other owner, and
-        // it reaches this object through m_tick.
-        //
-        // Deregistered exactly as on_cqe's own teardown does it.  A refused
-        // submission may still have registered the owner — arm() claims the
-        // slot before it prepares the SQE — and deregister_owner() returns at
-        // once for a handler that never got a token, so the call is right
-        // either way.
+        // Nothing will complete for it, so this is the only place that can
+        // free it, deregistering exactly as on_cqe's own teardown does because
+        // arm() claims the slot before it prepares the SQE.
         tick_handler* dead = m_tick;
         m_tick = nullptr;
         m_event_loop->deregister_owner(dead);
@@ -106,10 +90,8 @@ void runtime_instance::fire_tick(int res)
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
 
-    // The re-arm, and the same reasoning as the first one: this completion is
-    // the last thing that will ever name this handler unless the submission
-    // takes.  Freed here rather than leaked, and said out loud rather than
-    // found later as a runtime whose on_tick stopped for no visible reason.
+    // The re-arm, on the same reasoning as the first: this completion is the
+    // last thing that will name this handler unless the submission takes.
     if (!m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req))
     {
         LOG_ERROR("runtime tick timer could not be re-armed: on_tick will not "
@@ -127,23 +109,10 @@ bool runtime_instance::start(event_loop& loop)
     if (current != runtime_created && current != runtime_stopped)
         return false;
 
-    // Before every early return below, and deliberately so.  `create` checks
-    // this for every runtime whatever process it will end up in, and this is the
-    // same check on the path `create` does not cover: the daemon's own restore.
-    //
-    // The state file carries the request; the ring was created before the file
-    // was read, from the environment the daemon was launched with.  So a daemon
-    // restarted without the setting that satisfied a runtime's --cpus brings
-    // that runtime up on a ring that does not meet it, and until this gate
-    // existed it did so in silence — `stats` reported the ring it actually got
-    // and nothing reported that it was not the one asked for.  Refusing to start
-    // is the same answer `create` gives, arrived at one restart later.
-    //
-    // An out-of-process runtime is checked against the daemon's ring too, which
-    // is not its own: its worker builds one from the environment it inherited
-    // from this daemon, so this ring is what that one will look like.  Comparing
-    // against it is closer than not comparing at all, and it keeps `create` and
-    // restore giving the same answer to the same configuration.
+    // Before every early return below, because the ring was created before the
+    // state file was read, so a daemon restarted without the setting a
+    // runtime's --cpus needed must refuse rather than come up silently on a
+    // ring that does not meet it.
     if (const std::string msg = ring_policy_refusal(loop); !msg.empty())
     {
         LOG_ERROR(msg.c_str());
@@ -151,19 +120,9 @@ bool runtime_instance::start(event_loop& loop)
         return false;
     }
 
-    // The shard count, on the same terms and for the same reason, and BEFORE
-    // the out-of-process return below: the count is acted on by the daemon —
-    // reconcile_proxy_workers() forks this many children — so the placeholder is
-    // the object that has to refuse, and it has to refuse before a single child
-    // is forked.  A shard itself never asks this question; it is one process
-    // serving one socket and does not know which of N it is.
-    //
-    // `create`, `edit` and `import` all ask shards_config_refusal already, and
-    // they are where the operator gets the message on their terminal.  This is
-    // the path none of them is on: a state file carrying `"shards": 4` on a
-    // cache — written by hand, or by a build whose rules differed — is restored
-    // at boot and auto-started without passing a parser.  Without this line it
-    // would come up sharded and answer a miss for 1/N of the data it holds.
+    // The shard count on the same terms and before the out-of-process return,
+    // because the daemon forks this many children and a state file carrying
+    // `"shards": 4` on a cache passes no parser on the restore path.
     if (const std::string msg = shards_config_refusal(
             get_type(), m_shards, get_listen_path());
         !msg.empty())
@@ -173,24 +132,14 @@ bool runtime_instance::start(event_loop& loop)
         return false;
     }
 
-    // A placeholder for a worker process arms nothing and binds nothing: the
-    // supervisor forks the child that does both.  Returning before
-    // register_owner() is what keeps has_armed_io() false for it, so removal
-    // can free it on the spot instead of retiring it to the graveyard — there
-    // is no completion the kernel could still deliver into this object.
+    // A placeholder arms nothing and binds nothing, and returning before
+    // register_owner() keeps has_armed_io() false so removal can free it on
+    // the spot.
     if (m_out_of_process)
     {
-        // "Binds nothing" is the whole sentence above, and it is what this flag
-        // has to say out loud.  The line below stores `running` because that is
-        // the daemon's record of what was asked for — but nothing is listening
-        // on this port yet and, at this point, no child has even been forked to
-        // do it.  publish_endpoints() adds a member to its group on `running`,
-        // so without this the address is announced to every gateway here, in
-        // runtime_manager::start()'s publish, before the supervisor exists.
-        //
-        // Set before the state and not after: the two are read by another call
-        // in the same statement sequence, and a reader that saw `running` with
-        // the old flag would be reading exactly the state this prevents.
+        // Set before the state and not after, because `running` is the
+        // daemon's record of what was asked for while nothing is listening
+        // yet, and publish_endpoints() adds a member to its group on it.
         m_endpoint_live = false;
 
         m_state.store(runtime_running, std::memory_order_release);
@@ -233,34 +182,9 @@ bool runtime_instance::start(event_loop& loop)
         return true;  // skip setup(), on_start, tick timer
     }
 
-    // From here on the kernel may be holding addresses that point inside this
-    // object, so it can no longer be freed on demand — see runtime_manager's
-    // graveyard.  A setup() that fails counts too: it can have armed an accept
-    // or a timer before it gave up on a later step, and it has no way to tell
-    // us which.  Erring towards "armed" costs a retired object; erring the
-    // other way costs the daemon.
-    // Last gate before anything is armed, and the only one the daemon's own
-    // restore path also passes through: the flag handlers refuse the TLS
-    // options they cannot honour at create time, but a state file written
-    // before that gate existed carries was_running and is auto-started at boot
-    // without going near them.  Serving cleartext on a port the operator asked
-    // to encrypt — and which inspect still reports as encrypted — is worse than
-    // refusing to come up.
-    //
-    // Every runtime type performs a handshake somewhere now — a server's and a
-    // cache's own listener, a client's outbound socket, a proxy's two legs —
-    // so a complete configuration for any of them passes here and is honoured
-    // by that runtime's setup().  What is still refused is a configuration
-    // that would leave part of the traffic in the clear; see tls_context.h.
-    //
-    // "Complete" is all this gate can judge.  Refusals it cannot reach are
-    // made by the runtime itself, because they depend on configuration this
-    // signature does not carry or on something that happens later: --tls on a
-    // UDP socket would need DTLS, a server's upstream leg has no handshake
-    // behind it, and a TLS cache is only asked to become a replication leader
-    // once a client sends REPLICATE.  The first two return false from setup()
-    // and land in the same `failed` state as a refusal here; the third is
-    // answered at the command.
+    // From here the kernel may hold addresses inside this object, so it can no
+    // longer be freed on demand, and a failed setup() counts because it cannot
+    // say what it armed before giving up.
     std::string_view mesh_ca, mesh_cert, mesh_key;
     get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
     if (const std::string msg = tls_config_refusal(get_type(),
@@ -290,24 +214,17 @@ bool runtime_instance::start(event_loop& loop)
     m_state.store(runtime_running, std::memory_order_release);
     m_start_time = std::chrono::system_clock::now();
 
-    // The latch stop() raised comes down here, and here rather than anywhere
-    // later: on_start is where a script arms its timers and makes its
-    // subscriptions, so a latch still up at that line would make `stop; start`
-    // produce a runtime that is up, serving, and unable to schedule anything —
-    // green from every angle an operator has, and a worse defect than the one
-    // the latch exists for.  After the state store, so a callback that reads
-    // self.state during on_start sees the same answer this line acted on.
+    // The latch stop() raised comes down here, before on_start arms its timers
+    // and after the state store, so `stop; start` cannot produce a runtime
+    // that serves and can schedule nothing.
 #ifndef SOCKETLEY_NO_LUA
     if (m_lua)
         m_lua->allow_registrations();
 #endif
 
-    // The answer is deliberately not acted on here.  A raise in on_start has
-    // never failed a start: the runtime is already listening by this line, the
-    // state is already running, and turning a script's error into "the runtime
-    // is failed" would take down a listener over a callback the tree reports
-    // and carries on from everywhere else.  reload_lua_script() reads it
-    // because it has a command in flight that asked for exactly this to happen.
+    // Deliberately not acted on, because the runtime is already listening by
+    // this line and reload_lua_script() is the one caller with a command in
+    // flight that asked for it.
     if (!invoke_on_start()) {}
     if ((m_cb_on_tick || (m_lua && m_lua->has_on_tick())) && m_event_loop)
         start_tick_timer();
@@ -319,10 +236,8 @@ bool runtime_instance::stop(event_loop& loop)
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
 
-    // The child is not signalled here.  The supervisor owns it and takes it
-    // down through the control socket first, so that the worker stops its proxy
-    // while it still has a ring to cancel into; a SIGTERM from this side would
-    // race that and cost the connections a clean close.
+    // The child is not signalled here, because the supervisor takes it down
+    // through the control socket while it still has a ring to cancel into.
     if (m_out_of_process)
     {
         m_state.store(runtime_stopped, std::memory_order_release);
@@ -344,37 +259,10 @@ bool runtime_instance::stop(event_loop& loop)
     if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
     invoke_on_stop();
 
-    // The script's own timers, after on_stop and not before it.
-    //
-    // m_tick above is the on_tick machinery and was already severed here; the
-    // timers a script arms with set_timeout and set_interval were not, and
-    // nothing else does it until the context is destroyed — which only `remove`
-    // does.  So a stopped runtime went on running its script: measured, a 60 ms
-    // interval still firing at full rate minutes after `stop`, flat only after
-    // `remove`.  A script that calls self.send from such a timer is delivering
-    // to clients of a runtime the operator has taken down.
-    //
-    // After on_stop so that a timer armed inside on_stop is severed too: on_stop
-    // is the last thing this runtime is entitled to execute, and scheduling work
-    // to run after it is scheduling work for a runtime that is not there.
-    //
-    // Not restored by a later start().  The registrations are made at the
-    // script's top level, which runs when the script is loaded and not when the
-    // runtime starts, so there is nothing for start() to replay — stated in the
-    // man page beside set_interval rather than left for someone to discover.
-    //
-    // And the script's subscriptions, for the same sentence and at the same
-    // point.  A socketley.subscribe registration lives in the lua_context too,
-    // and nothing between `stop` and `remove` touched it: a PUBLISH on the
-    // linked cache was delivered to a runtime `ls` reported as Stopped, whose
-    // handler read self.state as "stopped" and ran anyway.  self.send from
-    // there reaches clients of a runtime the operator has taken down — the
-    // timers' bill, one API along.
-    //
-    // Unlike the timers, these DO come back on a later start(), and the
-    // difference is not an inconsistency: a subscription is registered from
-    // on_start, which start() runs, where a timer is armed at the script's top
-    // level, which only a load runs.  Both are stated in the man page.
+    // The script's own timers and subscriptions, severed after on_stop so one
+    // armed inside on_stop goes too, and not replayed by a later start() for
+    // the timers, which are armed at the script's top level, unlike the
+    // subscriptions on_start makes.
 #ifndef SOCKETLEY_NO_LUA
     if (m_lua)
     {
@@ -574,34 +462,10 @@ void runtime_instance::print_bash_message(std::string_view msg) const
     std::cout << std::endl;
 }
 
-// ─── Whose process does a script belong to? ─────────────────────────────────
-//
-// An out-of-process runtime exists twice: the worker that owns the listening
-// socket and serves every byte, and a placeholder in the daemon that holds its
-// name, port, group and state so `ls`, `stats` and the endpoint table have
-// something to answer with.  The script belongs to the worker.
-//
-// The placeholder used to load it too, so every top-level line ran twice -- and
-// the two copies did not even do the same thing, because the daemon's holds the
-// runtime manager and the worker's does not.  A top-level socketley.create()
-// therefore created a runtime FROM THE PLACEHOLDER while the identical line in
-// the worker was refused, which is the inverse of the asymmetry that was
-// intended: the refusal is there because a worker is not where the inventory
-// is, and the daemon quietly obliging is the same mistake read backwards.
-//
-// The placeholder now compiles the file and discards it.  That keeps the one
-// report `create` could always make -- a script that does not parse is refused
-// on the spot rather than becoming "the worker exited and the runtime is
-// failed" -- without executing a line of it.
-//
-// What the daemon gives up by not running it: a script's `routes` declaration
-// is read from the placeholder's context by publish_endpoints, so an
-// out-of-process runtime no longer publishes one.  Stated in LIMITATIONS.  The
-// feature is a handler's, not a proxy's -- the example says so in its own first
-// paragraph -- and only a proxy can be out-of-process today, so nothing in the
-// tree declared routes from a process that this affects.  The two other
-// readers of the placeholder's context already skipped out-of-process
-// runtimes before this change.
+// The script belongs to the worker, so the placeholder compiles the file and
+// discards it -- which keeps a parse error a `create` refusal rather than a
+// failed runtime -- at the cost of an out-of-process runtime publishing no
+// routes declaration.
 bool runtime_instance::load_lua_script(std::string_view path)
 {
     if (m_out_of_process)
@@ -637,11 +501,8 @@ bool runtime_instance::reload_lua_script()
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
 
-    // Same rule as load_lua_script: the placeholder does not run the script, so
-    // it has nothing to reload.  Re-checking that the file still parses is
-    // worth doing anyway -- `reload-lua` on a broken file should say so here
-    // rather than in the worker's exit status -- but the reload that matters
-    // is the worker's, and this daemon-side object has no callbacks to replace.
+    // Same rule as load_lua_script: the placeholder has nothing to reload,
+    // though re-checking that the file parses is still worth doing here.
     if (m_out_of_process)
     {
         std::string err;
@@ -654,24 +515,9 @@ bool runtime_instance::reload_lua_script()
         return true;
     }
 
-    // ─── The replacement is built before the old one is given up ────────────
-    //
-    // This used to reset m_lua and then load into the empty slot, so a script
-    // that no longer compiled left the runtime with NO interpreter: every
-    // callback stopped firing and nothing said so.  Both halves of the tree
-    // claim otherwise -- proxy_worker's reload warns that "the previous one is
-    // still in force", and cmd_reload_lua relies on the same promise when it
-    // reads the declaration back afterwards -- so the contract was written down
-    // twice and kept nowhere.
-    //
-    // Measured before this change, on a server whose script logs every message:
-    // one edit that dropped a closing paren, one reload-lua reporting success,
-    // and then total_messages 1 -> 3 with no further callback line.  The traffic
-    // arrived; the script it was supposed to reach was gone.
-    //
-    // Swapping on success is the whole fix.  The two contexts overlap only for
-    // the duration of the load: bindings are per-state, and the C++ callbacks
-    // this instance holds are not the Lua ones.
+    // The replacement is built before the old one is given up, so a script
+    // that no longer compiles leaves the runtime with the interpreter it had
+    // rather than with none.
     auto next = std::make_unique<lua_context>();
 
     if (!next->load_script(m_lua_script_path, this))
@@ -691,45 +537,11 @@ bool runtime_instance::reload_lua_script()
         m_tick = nullptr;
     }
 
-    // ─── The new script's set-up runs, or the reload only half happened ─────
-    //
-    // Everything a script establishes at runtime lives in its lua_context, and
-    // the assignment above destroyed the outgoing one: every
-    // socketley.subscribe registration went with it, and ~lua_context severs
-    // every set_timeout and set_interval timer by name.  Both are ordinarily
-    // made from on_start — it is the shape the man page documents and every
-    // example uses — and on_start was called from start() and from nowhere
-    // else.
-    //
-    // So the ordinary script came back from `reload-lua` with no subscriptions
-    // and no timers, went on serving, and the command reported success.  The
-    // runtime looked healthy from every angle an operator has: `ls` running,
-    // `stats` counting connections, the new callbacks firing on traffic.  Only
-    // the periodic half of it was gone.
-    //
-    // Re-running on_start is what makes reload-lua mean what it reads as, and
-    // it makes on_start's contract one sentence instead of two: it runs
-    // whenever this runtime begins executing a script.  That is a promise a
-    // script author has to be able to rely on in both directions, so the man
-    // page states the obligation it creates — anything on_start does must be
-    // safe to do twice.  socketley.create from on_start is the case that costs
-    // something, and it refuses a name that already exists rather than
-    // duplicating it.
-    //
-    // on_stop is NOT run for the outgoing script, and that asymmetry is the
-    // point rather than an omission.  The runtime is not stopping: it keeps its
-    // listener, its clients and its state right through this, and on_stop is
-    // where a script says goodbye to exactly those.  A reload that fired it
-    // would have every edit to a file publish a farewell and close what it had
-    // opened, for a runtime that never went away.
-    //
-    // A raise here is reported to whoever asked for the reload.  The script IS
-    // in force — this is past the swap — but it is in force with whatever
-    // on_start managed to do before it failed, which is not the thing the
-    // operator asked for, and this tree's rule is that a command does not
-    // report success for something that did not happen.  invoke_on_start()
-    // writes the reason into lua_diag; cmd_reload_lua and proxy_worker both
-    // read it from there.
+    // The new script's set-up runs, because the assignment above destroyed
+    // every subscription and timer the outgoing context held; on_stop is
+    // deliberately not run, since the runtime keeps its listener and clients
+    // throughout, and a raise here is reported to whoever asked for the
+    // reload.
     if (!invoke_on_start())
         return false;
 
@@ -744,9 +556,7 @@ std::string_view runtime_instance::get_lua_script_path() const
 bool runtime_instance::invoke_on_start()
 {
     // Every attempt starts with nothing to report, including the ones that
-    // return early: a runtime whose script no longer declares on_start, or that
-    // was handed a C++ callback instead, must not still be carrying the reason
-    // an earlier attempt raised.
+    // return early.
     m_on_start_error.clear();
 
     if (m_cb_on_start) { m_cb_on_start(); return true; }
@@ -762,25 +572,9 @@ bool runtime_instance::invoke_on_start()
         sol::error e = r;
         std::cerr << lua_diag::tag(get_name()) << " on_start error: " << e.what() << std::endl;
 
-        // Recorded as well as printed, for the reason lua_context.h gives for
-        // the load-time diagnostics: this is a tee, not a redirect.  The
-        // restriction stated there — "load time only, because a callback's
-        // error happens on traffic with no command in flight to carry it
-        // anywhere" — does not describe on_start.  on_start runs synchronously
-        // inside `start`, `create -s` and `reload-lua`, so there IS a caller to
-        // carry it to, and reload_lua_script() is the one that does.  The
-        // buffer is per-thread and cleared by whoever is about to read it, so
-        // writing here costs the callers that do not nothing at all.
-        //
-        // And on the instance as well, which is what `start` and `create -s`
-        // read.  Those two go through runtime_manager::start(), whose answer is
-        // start()'s — and start() ignores this one deliberately, so by the time
-        // either command can look, the only thing that would have told it is a
-        // bool that was thrown away three frames down.  A thread-local is no
-        // good to them either: `start srv1 srv2 srv3` runs three on_starts
-        // before it reports anything, and each script may create runtimes of its
-        // own, whose loads clear that buffer.  The reason belongs to the runtime
-        // it happened in.
+        // Recorded on the instance as well as printed, because `start srv1
+        // srv2 srv3` runs three on_starts before it reports and each script's
+        // own loads clear the thread-local buffer.
         m_on_start_error = std::string("on_start error: ") + e.what();
         lua_diag::record(m_on_start_error);
         return false;
@@ -861,19 +655,9 @@ bool runtime_instance::invoke_on_auth(int client_id)
 #ifndef SOCKETLEY_NO_LUA
     if (!m_lua || !m_lua->has_on_auth()) return true;  // no hook = allow
 
-    // A PROTECTED call.  Written as a try/catch on sol::error — which is what
-    // stood here, and what every callback in this file did at the time — the
-    // rejection happened and the message did not: the catch depends on sol2's
-    // panic handler throwing and on that throw unwinding out of the
-    // interpreter, and in this repository's Sanitize build it does neither.
-    // Measured with a script that logs a marker and then raises: the marker
-    // reached the daemon log, the client was rejected, and no `on_auth error`
-    // line was ever written.
-    //
-    // This is the callback that decides whether a client is served at all, so
-    // "it rejected everyone and would not say why" is the shape of outage an
-    // operator has to be able to diagnose from the log.  The error comes back
-    // as a value now, the way on_master_auth's and the filter chain's do.
+    // A protected call, because a try/catch on sol::error depends on the panic
+    // handler throwing and unwinding out of the interpreter, which in the
+    // Sanitize build it does not.
     sol::protected_function_result r = m_lua->on_auth()(client_id);
 
     if (!r.valid()) {
@@ -938,11 +722,9 @@ std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }
 void runtime_instance::mark_out_of_process() { m_out_of_process = true; }
 bool runtime_instance::is_out_of_process() const { return m_out_of_process; }
 
-// Clamped here rather than trusted, because this is reached from two places
-// that validate differently: the flag parser, which refuses a bad value with a
-// message, and the state file, which is read at startup from a document that
-// may have been written by another build or edited by hand.  A zero would mean
-// a runtime that is `running` and has no process serving it.
+// Clamped here rather than trusted, because the state file is read at startup
+// from a document another build may have written, and a zero would mean a
+// runtime that is running with no process serving it.
 void runtime_instance::set_shards(uint32_t n)
 {
     m_shards = n < 1 ? 1 : (n > max_shards ? max_shards : n);
@@ -950,11 +732,8 @@ void runtime_instance::set_shards(uint32_t n)
 uint32_t runtime_instance::get_shards() const { return m_shards; }
 void runtime_instance::set_shard_index(uint32_t i)
 {
-    // Clamped rather than refused: this arrives in a config frame, and a frame
-    // naming a slot outside the table would otherwise be a write past the end
-    // of the shared mapping.  shard_table::adopt() refuses the same value
-    // again on its own account, which is the check that decides whether this
-    // process publishes at all.
+    // Clamped rather than refused, because a frame naming a slot outside the
+    // table would be a write past the end of the shared mapping.
     m_shard_index = i < max_shards ? i : 0;
 }
 uint32_t runtime_instance::get_shard_index() const { return m_shard_index; }
@@ -967,28 +746,15 @@ void runtime_instance::set_sqpoll(bool on) { m_sqpoll = on; m_sqpoll_set = true;
 bool runtime_instance::get_sqpoll() const { return m_sqpoll; }
 bool runtime_instance::has_sqpoll_request() const { return m_sqpoll_set; }
 
-// A ring is a queue between one thread and the kernel, and io_uring fixes its
-// flags — SQPOLL among them — when the ring is created.  The ring a runtime uses
-// is created by the *process* it lives in, before that process has read any
-// runtime configuration at all: the daemon's in daemon_start(), a worker's
-// before its config frame arrives.  So neither `create` nor `start` can make a
-// ring; either can only be told to run a runtime on one that already exists.
-//
-// That leaves two honest answers to a request the existing ring does not
-// satisfy, and this is the one that is not a lie.  Accepting it and doing
-// nothing would put a figure in the state file that `stats` contradicts, and
-// leave an operator measuring a poller that was never started.
-//
-// Nothing changes here when the split lands: a runtime that owns its process
-// owns its ring, the request becomes that ring's parameters, and this check has
-// nothing left to refuse.
+// io_uring fixes a ring's flags at creation and the ring belongs to the
+// process, not the runtime, so a request the existing ring does not satisfy is
+// refused rather than accepted and quietly ignored.
 std::string runtime_instance::ring_policy_refusal(const event_loop& loop) const
 {
     std::string msg;
 
-    // Only what was actually asked for is checked.  A runtime created without
-    // either flag takes the ring it is given and is told nothing about it —
-    // there is no request to disappoint.
+    // Only what was actually asked for is checked, because a runtime created
+    // without either flag has no request to disappoint.
     const bool want_sqpoll = get_sqpoll();
     if (has_sqpoll_request() && want_sqpoll != loop.sqpoll_enabled())
     {
@@ -1099,37 +865,20 @@ std::string_view runtime_instance::get_ca_path() const { return m_ca_path; }
 
 // ─── Stats ───
 
-// ─── What `stats` prints, in the three pieces it is made of ─────────────────
-//
-// See the note above stats_prefix() in the header for why this is split.  The
-// order below is the order it has always printed in; each piece appends and
-// none of them knows what comes after it.
+// What `stats` prints, in the order it has always printed, each piece
+// appending and none knowing what comes after it.
 
 std::string runtime_instance::get_stats() const
 {
-    // Out of process: the two halves come from two processes.  The prefix is
-    // this daemon's, computed now out of the shared table; the rest was built
-    // by the worker on its own event-loop thread — walking the connection
-    // tables that only that thread may walk — and pushed the last time it
-    // changed.  Rebuilding the second half here reads this placeholder's own
-    // empty containers, which is a confident wrong answer: it printed keys:0
-    // for a cache that had just served five SETs.
+    // Out of process the two halves come from two processes, and rebuilding
+    // the second here reads this placeholder's empty containers, which printed
+    // keys:0 for a cache that had just served five SETs.
     if (worker_backed())
         return stats_prefix() + stat_detail_snapshot();
 
-    // Out of process, running, and not one report has ever landed.  This is the
-    // placeholder between the fork and the worker's first stats frame — or
-    // beyond it, for a worker that wedged before publishing or whose frames are
-    // being lost.  Falling through to the branch below walks THIS instance's
-    // own empty containers and prints their zeros as though the worker had
-    // answered: keys:0 from a store no command has ever reached, unlabelled and
-    // indistinguishable from a running cache with no traffic.  Say what is
-    // actually known instead — the daemon-side counters, and the fact that no
-    // report exists.
-    //
-    // Not in a worker process: there this object may be a replica — the record
-    // of a runtime living elsewhere, out of process by definition — and its
-    // callers already treat the base text as the answer for "not mine".
+    // Out of process, running, and no report has ever landed, so say what is
+    // known rather than print this instance's zeros as though the worker had
+    // answered.
     if (is_out_of_process() && !in_worker_process()
         && get_state() == runtime_running)
         return stats_prefix() + "worker_report:none\n";
@@ -1137,12 +886,8 @@ std::string runtime_instance::get_stats() const
     return stats_prefix() + stats_ring() + stats_extra();
 }
 
-// The counters, and nothing that needs a connection table walked.
-//
-// Every figure here is either configuration this process already holds or a
-// number worker_figures() can sum out of shared memory, which is what lets the
-// daemon print it for a runtime living somewhere else — at the instant it
-// prints, with no age to declare.
+// The counters, and nothing that needs a connection table walked, which is
+// what lets the daemon print them for a runtime living somewhere else.
 std::string runtime_instance::stats_prefix() const
 {
     std::string out;
@@ -1183,16 +928,9 @@ std::string runtime_instance::stats_prefix() const
 }
 
 // ── How this runtime's I/O is running ───────────────────────────────────────
-// Read from the loop, not from what was asked for.  A runtime whose polling
-// mode or CPU set can only be inferred from the command line that created it
-// is one nobody can debug: the kernel refuses an SQPOLL ring on some
-// configurations and a cpuset can refuse the pinning, and in both cases the
-// request and the result differ with nothing on screen to say so.
-//
-// The three fields are the ring's, so an out-of-process runtime reports its
-// worker's ring here — this piece is built inside the worker and pushed, which
-// is exactly the figure that is wanted, and is why it is NOT in the prefix the
-// daemon writes.
+// Read from the loop and not from what was asked for, because the kernel can
+// refuse an SQPOLL ring or a pinning, and these three fields are the ring's --
+// which is why a worker pushes them rather than the daemon writing them.
 std::string runtime_instance::stats_ring() const
 {
     std::string out;
@@ -1212,8 +950,8 @@ std::string runtime_instance::stats_ring() const
     }
     else
     {
-        // No loop yet — a runtime created and not started.  Saying so beats
-        // printing the defaults as if they had been chosen.
+        // No loop yet, which beats printing the defaults as if they had been
+        // chosen.
         out += "unknown\ncpus:unknown\nsq_thread_cpu:-";
     }
     out += '\n';
@@ -1239,11 +977,9 @@ namespace
 
 enum class notify_result { sent, skipped, broken };
 
-// Which of the two ways a write failed decides what to do about it.
-//
-// Nothing written means the message can be dropped and the stream stays intact.
-// A partial write has already put a fragment on the wire, and the reader will
-// splice it onto whatever comes next — that connection is finished.
+// Nothing written means the message can be dropped and the stream stays
+// intact, while a partial write has already put a fragment on the wire and
+// finishes that connection.
 notify_result notify_write(int fd, const char* data, size_t len)
 {
     size_t written = 0;

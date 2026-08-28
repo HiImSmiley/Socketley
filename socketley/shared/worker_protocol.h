@@ -1,48 +1,9 @@
 #pragma once
-// The wire between the daemon and a runtime worker process.
-//
-// ─── WHY THIS EXISTS ────────────────────────────────────────────────────────
-//
-// endpoint_table.h removed the last pointer a proxy held into another runtime,
-// which is what made moving one into its own process possible at all.  This is
-// the other half: once the proxy is a separate process, everything the daemon
-// used to do by calling a method has to become a message.  Configuration,
-// membership changes, start/stop, and the figures `stats` and `inspect` print
-// all cross here.
-//
-// ─── WHY A LENGTH-PREFIXED FRAME WITH A VERSION IN EVERY ONE ────────────────
-//
-// The daemon and the worker are the same binary today, but they are two
-// processes with independent lifetimes, and an upgrade replaces the binary on
-// disk while a worker forked from the old one is still running.  A receiver
-// must therefore be able to make sense of a frame it does not understand, and
-// the only way to do that is to know how long it is without knowing what is in
-// it.  So the header is fixed width and carries the length: an unknown type is
-// skipped by its length rather than desynchronising the stream, and a newer
-// version's extra trailing bytes are ignored the same way.
-//
-// The version travels in every frame rather than only in the handshake because
-// the handshake is exactly what is missing when a supervisor re-attaches to a
-// worker it did not fork.
-//
-// ─── WHAT DOES NOT CROSS ────────────────────────────────────────────────────
-//
-// No descriptors.  A worker opens its own listening socket from the port in its
-// config; nothing is passed with SCM_RIGHTS on THIS socket.  That is deliberate
-// and it is not only about simplicity: an SQE carries a descriptor NUMBER that
-// the kernel resolves later, on another thread under SQPOLL, so a descriptor
-// sent across a boundary and closed on one side does not cancel the submissions
-// naming it — it redirects them to whatever inherits the number.  This project
-// has paid for that lesson more than once.  Ports are values; descriptors are
-// not.
-//
-// A connection being handed from one runtime to another does cross, and it does
-// so on its own channel with its own rule: see shared/conn_transfer.h, where
-// the hazard above is what the two-call relinquish protocol exists to answer.
-// It is a separate channel on purpose.  This one carries control frames whose
-// delivery is best-effort — push_stats drops a frame the daemon is not draining
-// — and a descriptor cannot be dropped, because dropping it is losing a
-// connection that neither side is serving any more.
+// Everything the daemon used to do to a proxy by calling a method, once that
+// proxy is its own process: a length-prefixed frame carrying its version in
+// every one, so an unknown type is skipped rather than desynchronising the
+// stream, and carrying no descriptors, because ports are values and
+// descriptors are not.
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -50,10 +11,8 @@
 #include <utility>
 #include "conn_identity.h"
 #include "route_table.h"
-// The cluster snapshot travels whole, in the structs the daemon already has it
-// in — see the note above encode_cluster_view.  This is the same reason
-// route_table.h is included above rather than a flat copy of a declaration
-// being made here.
+// The cluster snapshot travels whole, in the structs the daemon already holds
+// it in.
 #include "cluster_view.h"
 #include <string_view>
 #include <vector>
@@ -61,16 +20,15 @@
 namespace worker_proto
 {
 
-// Bumped when the meaning of an existing frame type changes.  Adding a new type
-// does not need a bump: an old receiver skips what it does not know.
+// Bumped when the meaning of an existing frame type changes, not when one is
+// added, since an old receiver skips what it does not know.
 inline constexpr uint16_t version = 1;
 
 // The header is 8 bytes: [u32 payload_len][u16 version][u16 type].
 inline constexpr size_t header_size = 8;
 
-// A frame big enough to be nonsense is refused rather than allocated.  The
-// largest legitimate payload is an endpoint table or a config blob; both are
-// far below this.
+// A frame big enough to be nonsense is refused rather than allocated, well
+// above the largest legitimate payload.
 inline constexpr uint32_t max_payload = 8u * 1024u * 1024u;
 
 enum class frame_type : uint16_t
@@ -114,79 +72,25 @@ enum class frame_type : uint16_t
                        // reason send_ref/deliver_ref are one codec
 };
 
-// ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
-//
-// A worker's reload either loads the file or leaves the previous script in
-// force, and until this frame existed the only record of the second outcome was
-// a WARN in the daemon's log.  cmd_reload_lua waited for the `routes` frame,
-// got one either way — the declaration in force is still the right answer — and
-// returned 0 with an empty reply.  The operator was told their edit had taken
-// effect by a command that knew it had not.
-//
-// The payload is the diagnostic, verbatim, and the frame is only sent when the
-// reload failed: a worker that reloaded cleanly sends nothing, so success costs
-// no frame and the daemon's "did anything go wrong" is "did one arrive".  It is
-// written before the `routes` frame that ends the daemon's wait, so by the time
-// cmd_reload_lua stops waiting it has already been read.
+// reload_err carries the diagnostic verbatim and is sent only when the reload
+// failed, before the `routes` frame that ends the daemon's wait, so success
+// costs no frame.
 
-// ── start_err: the same answer, for the command that started the runtime ────
-//
-// on_start runs inside `create -s` as well as inside `reload-lua`, and for a
-// runtime in a worker it runs out here.  The child's start() does not fail on a
-// raise — see runtime_instance::start(), the listener is up and the state is
-// `running` several lines before on_start is called — so the `state` frame that
-// follows says `running`, await_startup() answers `serving`, and until this
-// frame existed the daemon had no way to learn that the script's set-up had not
-// happened.  `create -s` therefore exited 0 in silence for a runtime with none
-// of its subscriptions, timers or connections established.
-//
-// A separate frame from reload_err rather than a reuse of it.  The two are read
-// by different commands at different moments and cleared on different asks —
-// reload_err is cleared by send_reload() so that "nothing since the ask" is what
-// success looks like — and one member serving both would report a startup
-// failure as the answer to the first reload that came along.
-//
-// Same three rules as reload_err: the payload is the diagnostic verbatim, it is
-// sent only when on_start raised, and it is written before the `state` frame
-// that ends await_startup(), so it has been read by the time the daemon stops
-// waiting.
+// start_err is the same answer for `create -s`, a separate frame from
+// reload_err because the two are read by different commands at different
+// moments and cleared on different asks.
 
-// ── routes: what a runtime in a worker says it will answer ──────────────────
-//
-// A script's `routes` declaration is produced by running the script, and a
-// worker's script runs in the worker.  The placeholder only checks that the
-// file parses — it builds no interpreter, so it has no declaration and
-// publish_endpoints() published none.  A gateway in front of such a runtime
-// then forwarded every method to it instead of refusing the undeclared ones at
-// the edge with a 405: the enforcement quietly stopped existing, which is the
-// worst way for a gate to fail.
-//
-// So the worker sends its declaration up once, after the script has loaded, and
-// the daemon puts it where publish_endpoints() looks.  The alternative — having
-// the placeholder run the script too — is the thing the whole split exists to
-// avoid: every top-level side effect would happen twice, in two processes.
+// routes carries what a runtime in a worker says it will answer, sent up once
+// after the script loads, because the placeholder has no interpreter and a
+// gateway with no declaration forwards every method.
 
-// ── deliver: `socketley send <name> <message>` for a runtime in a worker ────
-//
-// The message a server broadcasts to its connections, or a client writes to its
-// peer.  It needs no encoder: the payload IS the message, and the frame header
-// already carries the length, so nothing has to be escaped, quoted or parsed.
-//
-// It exists because `send` acts on connections, and the connections are in the
-// worker.  cmd_send() reached the placeholder — which has the name, the port and
-// the state but not one connection — called lua_broadcast() on it and returned
-// 0.  The CLI said nothing, the exit status said success, and the message went
-// nowhere.  A `send` that reports success and delivers nothing is the shape of
-// wrong this tree is least willing to ship.
+// deliver is `socketley send` for a runtime in a worker, needing no encoder
+// because the payload is the message and the header carries the length.
 
 // ── What a worker's exit status means ───────────────────────────────────────
-//
-// A child that dies is restarted by default, which is right for a crash and
-// wrong for a configuration it can never accept: forking it five more times
-// produces five more copies of the same refusal.  So the one case the worker
-// can recognise about itself says so on the way out, and the supervisor leaves
-// the runtime `failed` instead of retrying.  Everything else keeps the old
-// policy, because everything else might work on the next try.
+// A child that dies is restarted by default, except for the one case it can
+// recognise about itself, where forking again would only produce the same
+// refusal.
 inline constexpr int exit_config_refused = 3;
 
 // ── Frame encoding ──────────────────────────────────────────────────────────
@@ -239,8 +143,8 @@ struct reader
 
     reader(const char* data, size_t len) : p(data), end(data + len) {}
 
-    // Nothing left to read.  Used to make a field optional: a frame from a
-    // build that did not write it ends here, and the reader stops rather than
+    // Nothing left to read, which makes a field optional: a frame from a build
+    // that did not write it ends here and the reader stops rather than
     // failing.
     bool done() const { return p >= end; }
 
@@ -279,10 +183,9 @@ struct reader
         return static_cast<uint8_t>(*p++);
     }
 
-    // How much of the payload is still unread.  For the one thing the header
-    // above promises and no decoder could otherwise honour: a field appended by
-    // a newer sender is skipped by an older receiver, and a field absent from
-    // an older sender must not be read as a truncation by a newer one.
+    // How much of the payload is still unread, so a newer sender's extra field
+    // is skipped and an older sender's missing one is not read as a
+    // truncation.
     size_t left() const { return ok ? static_cast<size_t>(end - p) : 0; }
 
     // Bounds-checked against the buffer, not just against the declared length:
@@ -298,11 +201,9 @@ struct reader
     }
 };
 
-// Pulls one whole frame off the front of `buf`.  Returns false when there is
-// not a complete frame yet and leaves `buf` untouched; the caller keeps reading.
-//
-// `frame_version` is reported rather than enforced here so the caller can
-// decide per type whether it can still act on it.
+// Pulls one whole frame off the front of `buf`, leaving it untouched when
+// there is not a complete one, and reporting `frame_version` rather than
+// enforcing it.
 inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_version,
                        std::string& payload, bool& fatal)
 {
@@ -332,11 +233,9 @@ inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_versi
 }
 
 // ── Endpoint table payload ──────────────────────────────────────────────────
-//
 // The table is rebuilt on the far side rather than shared, because a
-// shared_ptr to an immutable snapshot is exactly the thing that does not
-// survive a process boundary.  What survives is what endpoint_table.h says is
-// the whole of the answer: a host and a port, per name and per group.
+// shared_ptr to an immutable snapshot does not survive a process boundary and
+// a host and a port do.
 
 struct endpoint_wire
 {
@@ -348,10 +247,9 @@ struct endpoint_wire
 using route_decl_wire = std::vector<
     std::pair<std::string, std::shared_ptr<const route_table>>>;
 
-// Declared here, defined below the frame that uses it.  encode_endpoints
-// appends the route declarations after the two endpoint blocks, so it calls
-// this before the file has read it; the definition stays where it is because
-// it belongs beside decode_routes, which is the half that has to agree with it.
+// Declared here and defined below the frame that uses it, because the
+// definition belongs beside decode_routes, which is the half that has to agree
+// with it.
 inline std::string encode_routes(const route_table& rt);
 
 inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
@@ -375,18 +273,9 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
         put_u16(out, e.port);
     }
 
-    // The declarations, by name and by group.
-    //
-    // Left out for a long time, and the gap was invisible because it only shows
-    // where the PROXY is in a worker: the daemon builds an endpoint_table with
-    // set_name_routes() and a proxy in this process reads the same object.  One
-    // in a worker gets this frame instead, and this frame carried a host and a
-    // port and nothing else — so its gate had nothing to enforce and forwarded
-    // every method, while `stats` reported declared_routes:0.
-    //
-    // Appended after the two blocks above rather than folded into them, so a
-    // worker built before this field reads the endpoints it understands and
-    // stops at the end of them.
+    // The declarations by name and by group, appended after the two blocks
+    // above so a worker built before this field reads the endpoints it
+    // understands and stops.
     put_u32(out, static_cast<uint32_t>(name_routes.size()));
     for (const auto& [n, rt] : name_routes)
     {
@@ -402,10 +291,8 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     return out;
 }
 
-// A route declaration on the wire.  Flat and self-describing: a count, then
-// per route a path, a prefix flag and its methods.  Nothing here validates —
-// the table's own add() does that on the way in, and it is the same code on
-// both sides.
+// A route declaration on the wire, flat and self-describing, validating
+// nothing because the table's own add() does that on both sides.
 inline std::string encode_routes(const route_table& rt)
 {
     std::string out;
@@ -466,9 +353,8 @@ inline bool decode_endpoints(std::string_view payload,
 
     const uint32_t n_names = r.u32();
     if (!r.ok) return false;
-    // A count is not a reservation: it arrives from another process and
-    // reserving on it would let a corrupt frame ask for an arbitrary
-    // allocation.  Growth is bounded by the bytes actually present instead.
+    // A count is not a reservation, because it arrives from another process,
+    // so growth is bounded by the bytes actually present.
     for (uint32_t i = 0; i < n_names && r.ok; ++i)
     {
         endpoint_wire e;
@@ -491,9 +377,8 @@ inline bool decode_endpoints(std::string_view payload,
         groups.push_back(std::move(e));
     }
 
-    // The declarations, if this frame carries them.  A frame from a build that
-    // predates the field simply ends here, and the two maps stay empty — which
-    // is the behaviour that build had.
+    // The declarations, if this frame carries them, since a frame from a build
+    // that predates the field simply ends here.
     if (!r.done())
     {
         const uint32_t n_nr = r.u32();
@@ -528,30 +413,9 @@ inline bool decode_endpoints(std::string_view payload,
     return r.ok;
 }
 
-// ── deliver_to: the same verb, going the other way ──────────────────────────
-//
-// `deliver` above is the daemon telling one worker to write a message to its
-// connections, and the payload IS the message because the socket says which
-// runtime is meant.  Going up, it does not: a script in a worker names the
-// runtime it is sending to, and that runtime is any of them.
-//
-// So the name travels, and the frame is a separate type rather than the same
-// one with a second reading.  One type meaning two things depending on which
-// end read it is the sort of economy that survives until somebody loops a
-// socket back on itself.
-//
-// Fire and forget, like `deliver` and like every other message frame here.  The
-// caller's error cases — no such runtime, not running, not a kind of runtime
-// that has connections — are answered on the asking side out of the replica the
-// map frame installs, so what crosses is only the cases that cannot be:
-// delivery to a runtime in a THIRD process, and delivery to one in the daemon.
-//
-// What `true` means degrades by exactly one hop, and it is worth saying which.
-// In the daemon it means "handed to the process that holds the connections";
-// out here it means "handed to the daemon, which knows which process that is".
-// Neither is an acknowledgement — the daemon's own send has never waited for
-// one — and the alternative to the extra hop is a round trip on the data path,
-// which is the thing this design says no to everywhere else.
+// deliver_to is the same verb going up, a separate type because the name has
+// to travel, and fire-and-forget like every other message frame -- so `true`
+// means handed to the daemon, which knows which process holds the connections.
 
 inline std::string encode_deliver_to(std::string_view name, std::string_view message)
 {
@@ -571,62 +435,10 @@ inline bool decode_deliver_to(std::string_view payload, std::string& name,
     return r.ok;
 }
 
-// ── map_req / map_rep: the four calls that CHANGE the runtime map ───────────
-//
-// socketley.create, .start, .stop and .remove from a script running in a
-// worker.  Every one of them alters the map, and the map lives in the daemon:
-// answering them against the worker's own copy would build a runtime the daemon
-// never hears about, or flip a placeholder that binds nothing.  So they are not
-// answered here — they are asked.
-//
-// ─── WHY THIS ONE WAITS, WHEN deliver_to DOES NOT ───────────────────────────
-//
-// deliver_to is fire-and-forget because `self.send` has nothing to tell the
-// script afterwards.  These four do: `if socketley.create(...) then` is how
-// they are written, and a value that says "accepted" rather than "done" is a
-// lie the script cannot see through.
-//
-// The objection to waiting was stated one file over: a runtime does not make a
-// synchronous request of another process, because it blocks the loop serving
-// every connection this worker holds.  That is right about the DATA path, which
-// is what it was written about -- socketley.get() runs per message, and a
-// worker answering ~131k requests a second spends ~7.6 us on each.
-//
-// These four are not on it.  They run in on_start, or on a rare control
-// message, and never per message.  Measured on this box, AF_UNIX socketpair,
-// a 128-byte frame there and back: 9.95 / 10.20 / 10.52 us over three runs of
-// 20000.  That is the cost of one or two requests, once, on a path a script
-// reaches deliberately -- against socketley.http(), which this same file ships
-// and which blocks the identical loop for a network round trip, three orders of
-// magnitude longer.
-//
-// So the wait is bounded and it is the script's own callback deadline that
-// bounds it: a map request cannot outlive the callback that made it.
-//
-// ─── THE FIFTH OP, AND WHY IT IS ON THIS SOCKET ─────────────────────────────
-//
-// `route` joined the four in 2026-08.  It is not a map mutation, and the names
-// here (`map_req`, map_mutate, m_map_sink) were chosen when it was only the
-// four -- so what this socket actually is, is the worker's SYNCHRONOUS
-// ask-the-daemon channel, and the map calls were its first four users.
-//
-// It belongs here rather than on a channel of its own for the same reason the
-// four do not travel the control socket: a worker cannot block on that
-// descriptor at all, its writes being queued for the ring and its reads being a
-// standing recv that a direct read would race. That reasoning is about the
-// descriptor, not about what is asked over it, so a second socket with the
-// identical property would be a second thing to create, place at fork, drain in
-// both startup waits, and tear down -- four places to forget, for no
-// difference. `route` gets an op, and `config` carries its argument blob.
-//
-// What it must NOT be used for is the per-message path. `data`, `write`,
-// `close` and `drop` are route_up/route_down frames on the control socket
-// precisely because they are frequent and answer nothing; see route_op.
-//
-// `ticket` correlates, because frames interleave.  A worker waiting on a reply
-// still receives publishes, deliveries and stats requests, and a reply left
-// over from a call that already timed out must not be read as the answer to
-// this one.
+// The worker's synchronous ask-the-daemon channel, whose first four users were
+// the map mutations and whose fifth is `route`: it waits because a script is
+// mid-expression, it costs about 10 us on a path no message travels, and
+// `ticket` correlates because frames interleave.
 inline std::string encode_map_request(uint64_t ticket, std::string_view op,
                                       std::string_view name, std::string_view config)
 {
@@ -653,9 +465,8 @@ inline bool decode_map_request(std::string_view payload, uint64_t& ticket,
     return r.ok;
 }
 
-// The answer carries the reason, not only the verdict.  A script that gets
-// `false` and nothing else has to guess between "a runtime by that name exists"
-// and "the port is taken", and the daemon is the only side that knows.
+// The answer carries the reason and not only the verdict, because the daemon
+// is the only side that knows which refusal it was.
 inline std::string encode_map_reply(uint64_t ticket, bool ok, std::string_view err)
 {
     std::string out;
@@ -676,26 +487,9 @@ inline bool decode_map_reply(std::string_view payload, uint64_t& ticket,
     return r.ok;
 }
 
-// ── send_ref / deliver_ref: a message for a connection in another shard ─────
-//
-// `self.send(id, msg)` where `id` names a client of a SIBLING shard.  The two
-// names are one codec because they are one message travelling in two legs: up
-// from the shard that was asked, and down to the shard that owns the socket.
-//
-// The daemon does not have to search for the owner.  A conn_ref's serial
-// carries the minting shard in its top six bits — see conn_identity.h — so the
-// second leg goes to exactly one worker.  That is the whole reason the shard
-// index went into the serial rather than into a table somewhere.
-//
-// Nothing is answered, and that is a decision rather than an omission.  A
-// `send` on this tree's own in-process path returns "queued", not "delivered":
-// send_to() can still drop the connection for exceeding its write-queue bound,
-// and the caller learns that from the connection going away.  Answering across
-// a process boundary would therefore have to answer a question the local path
-// does not answer either — and it would cost a Lua callback a round trip,
-// which is the thing this design has spent two steps avoiding.  What the
-// caller IS told is whether the ref named a connection this runtime has at
-// all, and that is decided locally against the published client list.
+// send_ref / deliver_ref are one message in two legs, routed to exactly one
+// worker by the shard in the conn_ref's serial, answering nothing because the
+// in-process path answers "queued" rather than "delivered" either.
 inline std::string encode_send_ref(const conn_ref& ref, std::string_view message)
 {
     std::string out;
@@ -717,68 +511,18 @@ inline bool decode_send_ref(std::string_view payload, conn_ref& ref,
     return r.ok;
 }
 
-// ── config_err: the reason a worker would not serve its configuration ───────
-//
-// The third of the same shape, after reload_err and start_err, and the one that
-// was missing for the longest because a --daemon-process control arm hid it.
-//
-// A worker whose script will not load exits with exit_config_refused rather
-// than serving a proxy with none of the filters, routes or callbacks the
-// operator wrote.  The daemon then tells the CLI "the worker did not accept its
-// configuration (the reason is in the daemon log)" -- which is true, and is
-// what a `create` is answered with while the child has already written
-// `'path' must start with '/'` somewhere the operator is not looking.
-//
-// In the daemon the same failure came back on the terminal, so the gap was only
-// reachable with the flag off and every control arm had the flag on.  With the
-// flag gone it is the only path there is.
-//
-// Written BEFORE the exit, and that is the ordering that makes it work: the
-// bytes are in the socket once the write has been submitted, and a socket
-// outlives the process that wrote into it until the peer reads it.  The
-// supervisor is polling that descriptor and takes the frame on the same turn it
-// notices the child is gone.
-// ── route_up / route_down: a connection served by one runtime, answered by
+// config_err is the reason a worker would not serve its configuration, written
+// before the exit because a socket outlives the process that wrote into it
+// until the peer reads it.
 //    another ───────────────────────────────────────────────────────────────
-//
-// `self.route(client_id, "other")`.  The origin keeps the socket and stays in
-// the data path; the target gets a handle, its on_connect, and every message
-// that arrives.  That is conn_transfer.h's RELAY shape, and the choice between
-// relay and handover is made there rather than here -- read it before adding a
-// sixth op to this list.
-//
-// ─── FIVE OPS BECAUSE THERE ARE FIVE METHODS ────────────────────────────────
-//
-// server_instance declares exactly five cross-runtime methods, every one of
-// them already taking a conn_ref rather than a descriptor, and this enum is one
-// op per method with nothing left over:
-//
-//     open  -> accept_routed(ref, from)      on the TARGET
-//     data  -> deliver_routed(ref, payload)  on the TARGET
-//     close -> release_routed(ref)           on the TARGET
-//     write -> write_to_ref(ref, payload)    on the ORIGIN
-//     drop  -> drop_route(ref)               on the ORIGIN
-//
-// The direction is carried, not inferred.  Inferring it from `ref.owner ==
-// my_owner_key()` reads correctly and is wrong for one case that already
-// exists in process: a runtime routing a connection to ITSELF, where both
-// halves of that test are true at once.  A byte costs less than the paragraph
-// explaining why the inference is safe, and the inference would not have been.
-//
+// route_up / route_down carry one op per cross-runtime method server_instance
+// declares, with the direction carried rather than inferred, because a runtime
+// routing a connection to itself makes `ref.owner == my_owner_key()` true on
+// both halves.
 // ─── WHY `open` IS NOT HERE ─────────────────────────────────────────────────
-//
-// It is, as an op -- but the ASK that produces it travels the map socket as a
-// synchronous request, not as one of these frames.  These five are all
-// fire-and-forget, and `route()` is the one call in the set that owes its
-// script a true answer: it is written `if self.route(fd, "other") then`.
-//
-// The other four owe nothing.  `unroute()` decides from this runtime's own
-// table whether there was a route to remove, and is right about that without
-// asking anyone; `drop` and `close` are teardown, where there is no caller left
-// to answer; and `data` is the per-message path, where a round trip would cost
-// what this whole design has spent three steps avoiding -- see the note on
-// send_ref, which declines to answer for the same reason and says so at more
-// length.
+// `route` is an op, but the ask travels the map socket as a synchronous
+// request, because it is the one call in the set that owes its script a true
+// answer.
 enum class route_op : uint8_t
 {
     open  = 1,
@@ -787,51 +531,20 @@ enum class route_op : uint8_t
     write = 4,
     drop  = 5,
 
-    // ── The sixth, which is not about one connection ────────────────────────
-    //
-    // `from` has stopped or been removed; `to` must let go of every routing
-    // relationship it has with it, in both directions.  `ref` is unused and the
-    // payload is empty.
-    //
-    // It exists because the origin cannot be the one to tell.  Measured: a
-    // stopped worker's teardown posts its `close` frames through the writer,
-    // which submits at the end of a loop turn -- and the daemon does not wait,
-    // so reconcile_proxy_workers() has already retired the supervisor and
-    // closed the socket by the time they are written.  The frames go into a
-    // descriptor nobody reads.
-    //
-    // Fixing the race would not have been enough, and that is the part worth
-    // keeping: a worker that is KILLED never runs teardown at all.  Any design
-    // where the departing runtime does the telling is wrong for that case, and
-    // the in-process version never had to face it because one process losing
-    // its memory takes both ends of the route with it.  So the daemon tells
-    // everyone, from what it knows rather than from what the departing runtime
-    // manages to say on its way out.
+    // The sixth op is not about one connection: `from` has stopped and `to`
+    // must let go, told by the daemon because a killed worker runs no teardown
+    // at all and a stopped one writes into a descriptor nobody reads.
     forget = 6,
 
-    // ── The seventh, which addresses a RUNTIME and carries no ref ───────────
-    //
-    // self.owner_broadcast(): a sub-server reaching every client of the runtime
-    // that routed one to it.  `to` is that owner, `from` is the sub-server, the
-    // ref is unused and the payload is the message.
-    //
-    // It is here rather than on the deliver sink, and that distinction cost a
-    // measurement to find.  Sent as a `deliver` -- the socketley.send(name,msg)
-    // channel -- it arrives and is DROPPED for an owner created `--mode in`,
-    // because deliver honours that flag and must.  The in-process call never
-    // did: it went straight to lua_broadcast(), and `--mode in` is about
-    // whether socketley.send reaches a runtime, not about whether its own
-    // sub-server may answer its clients.  Routing it through deliver silently
-    // narrowed the verb.
+    // The seventh addresses a runtime and carries no ref, and it is here
+    // rather than on the deliver sink because deliver honours `--mode in` and
+    // would silently narrow self.owner_broadcast().
     broadcast = 7,
 };
 
-// `to` is the runtime the op is performed on, `from` the one that asked.  Both
-// are names rather than shard indices, because the two ends are different
-// RUNTIMES here and not two shards of one -- send_ref's trick of reading the
-// owning shard out of the ref's top six bits answers a question this frame is
-// not asking.  The daemon resolves `to` through the map it is the authority
-// for, which is also what stops a worker addressing a runtime that has gone.
+// `to` is the runtime the op is performed on and `from` the one that asked,
+// both names because the two ends are different runtimes and the daemon
+// resolves `to` through the map it is the authority for.
 inline std::string encode_route_frame(std::string_view to, std::string_view from,
                                       route_op op, const conn_ref& ref,
                                       std::string_view payload)
@@ -857,11 +570,8 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     if (!r.ok)
         return false;
     // Refuse an op this build does not know rather than defaulting to one it
-    // does.  The two ends are separate processes with independent lifetimes and
-    // an upgrade can replace the binary under one of them -- the same rule
-    // conn_transfer.h states for its own framing, and the reason both carry a
-    // length prefix.  Defaulting would turn a newer peer's sixth op into a
-    // `data` delivery of the wrong bytes.
+    // does, or a newer peer's sixth op becomes a `data` delivery of the wrong
+    // bytes.
     if (raw < static_cast<uint8_t>(route_op::open) ||
         raw > static_cast<uint8_t>(route_op::broadcast))
         return false;
@@ -876,14 +586,9 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     return r2.ok;
 }
 
-// The argument to the `route` op above: which connection, and who owns it.
-// Rides in the map request's `config` field, which is a string and is therefore
-// allowed to be bytes -- the four map ops put JSON there and this one does not,
-// so the field is opaque to the transport and read by whoever handles the op.
-//
-// The target runtime is NOT in here: it is the request's `name`, which is where
-// every other op puts the runtime it is about, and duplicating it would create
-// two answers to one question.
+// The argument to the `route` op, riding in the map request's `config` field,
+// with the target runtime left in the request's `name` where every other op
+// puts it.
 inline std::string encode_route_ask(const conn_ref& ref, std::string_view origin)
 {
     std::string out;
@@ -905,36 +610,9 @@ inline bool decode_route_ask(std::string_view payload, conn_ref& ref,
     return r.ok;
 }
 
-// ── cluster_ev: a daemon joined, left, or a group changed size ──────────────
-//
-// on_cluster_join, on_cluster_leave and on_group_change.  The daemon is the
-// only process that can observe any of them -- cluster_discovery scans the
-// shared directory, and a worker must not run one, because publishing there
-// claims the node name and a worker doing that would be a second daemon as far
-// as every other member is concerned (see cluster_view.h).
-//
-// So the OBSERVATION travels.  runtime_manager::dispatch_cluster_events walks
-// the daemon's map and reaches for each runtime's lua_context; for a runtime in
-// a worker that is a placeholder, which has none.  All three callbacks
-// therefore fired nowhere at all, and the only way to reach them was
-// --daemon-process -- which is to say, for as long as that flag existed this
-// was a capability it bought back and nobody had counted.
-//
-// ─── THE MEMBERS ARE RESOLVED HERE, NOT AT THE FAR END ──────────────────────
-//
-// on_group_change is handed (group_name, members), and members is built from
-// the local map plus every remote daemon's runtimes.  A worker could rebuild it
-// from its cluster view and its replica map, and that is the version not
-// written: two derivations of one list is two things to keep level, and the
-// worker's inputs are each a push interval old in a different way.
-//
-// The daemon resolves it once and sends the answer.  What a script in a worker
-// is handed is then the same table a script in the daemon is handed, by
-// construction rather than by agreement.
-// The struct itself lives in cluster_view.h, which lua_context.h already
-// includes: the daemon runs these callbacks against a resolved event too, for
-// the runtimes it holds, and one struct is what makes the two paths the same
-// code rather than the same intention.
+// cluster_ev carries an observation only the daemon can make, with
+// on_group_change's members resolved here so a script in a worker is handed
+// the same table a script in the daemon is.
 using cluster_ev_member = ::cluster_ev_member;
 using cluster_ev_wire   = ::cluster_ev_wire;
 
@@ -965,9 +643,8 @@ inline bool decode_cluster_event(std::string_view payload, cluster_ev_wire& e)
     const uint32_t n = r.u32();
     if (!r.ok)
         return false;
-    // Bounded before it is reserved.  A count is four bytes and a member is
-    // more than four, so a corrupt frame cannot ask for more members than the
-    // payload could hold -- the same rule every other decoder here follows.
+    // Bounded before it is reserved, so a corrupt frame cannot ask for more
+    // members than the payload could hold.
     if (n > payload.size() / 6)
         return false;
     e.members.clear();
@@ -986,50 +663,10 @@ inline bool decode_cluster_event(std::string_view payload, cluster_ev_wire& e)
 }
 
 // ── The runtime map, replicated ─────────────────────────────────────────────
-//
-// The endpoint table above says where a runtime can be REACHED.  This says what
-// runtimes there are, which is a different question and the one the management
-// half of the Lua API asks: socketley.list() and socketley.get() read the map,
-// and a worker had none — so both were refused out here, along with everything
-// else that reaches for it.
-//
-// Six of the seven fields are a transcription rather than a design: they are
-// exactly what socketley.get() returns, read off lua_context.cpp.  The seventh
-// is the group, which socketley.get() does not report and the cluster calls
-// cannot be answered without — a group is the only thing `socketley.cluster.
-// group(name)` is about, and it is a property of the runtime rather than of the
-// cluster, so it belongs in this frame and not in whatever carries the cluster
-// view later.
-//
-// Nothing else crosses, because nothing else is answered from the map: a
-// runtime's stats text, its flags and its script are answered by `stats` and
-// `inspect`, which are commands the daemon serves and not calls a script makes.
-//
-// ─── WHY A REPLICA AND NOT A LOOKUP ─────────────────────────────────────────
-//
-// The other shape available was a request/reply per call, on the chan_req wire
-// that already exists.  It was not taken.  socketley.get() returns a value to a
-// script that is mid-expression, so a lookup would have to block the worker's
-// event loop on the daemon for the length of a round trip — on the DATA path, in
-// a callback, which is the synchronous cross-runtime call this design has said
-// no to everywhere else.  A pushed table costs the worker nothing at the moment
-// of the call and costs the daemon one frame per worker when the map moves.
-//
-// ─── WHAT IT COSTS IN TRUTH ─────────────────────────────────────────────────
-//
-// The replica is as old as the last push.  That is not a new compromise: the
-// daemon's own answer for a runtime in a worker is already a pushed figure —
-// reported_connection_count() reads what the stats frame last carried, up to a
-// publish interval old — so a script in the daemon and a script in a worker are
-// reading the same kind of number, one hop further apart.  Membership changes
-// are pushed as they happen; the counts ride the same frame on the health tick.
-// Nothing here invalidates and nothing refreshes on demand: see the note on
-// runtime_manager::install_replica for what that buys.
-//
-// The state and type travel as u8 for the same reason the `state` frame's do:
-// this header knows nothing about runtime_definitions.h, and both enums are
-// append-only, so a value from a newer sender reads as a number this build has
-// no name for rather than as a different runtime.
+// What runtimes there are, which the endpoint table does not answer, pushed as
+// a whole map rather than asked per call so socketley.get() never blocks a
+// worker's loop on a round trip -- at the price of a replica as old as the
+// last push, with state and type as u8 because both enums are append-only.
 
 struct runtime_wire
 {
@@ -1086,48 +723,10 @@ inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wir
     return r.ok;
 }
 
-// ── The cluster, as a worker is allowed to see it ───────────────────────────
-//
-// The runtime map above answers what this daemon holds.  This answers what the
-// CLUSTER holds, and it is a separate frame because it is a separate fact with
-// a separate clock: a remote daemon joining or leaving moves nothing in the
-// local map, and a worker holding a map that is perfectly current can still be
-// describing a cluster that no longer exists.
-//
-// Three fields, and none of them is derivable from anything a worker already
-// has: this daemon's cluster NAME, the address it advertises — which is the
-// `host` of every LOCAL member, so a worker guessing 127.0.0.1 would hand a
-// script an address no other node can reach — and get_all_daemons() verbatim.
-// See shared/cluster_view.h, which is where the reasoning for the shape lives
-// and which the daemon and the worker both build against.
-//
-// ─── WHY NOT A cluster_discovery IN THE WORKER ──────────────────────────────
-//
-// Because it publishes.  A cluster_discovery claims this node's name in the
-// shared directory, and claim_is_ours() is what tells "me, restarted" from
-// "somebody else with my name" — so a worker running one would read as a second
-// daemon to every other member of the cluster.  A worker is a reader and gets a
-// reader's object.
-//
-// ─── WHAT TRAVELS AND WHAT DOES NOT ─────────────────────────────────────────
-//
-// The structs are cluster_discovery's own, not a flat copy: the daemon builds
-// this straight out of get_all_daemons(), and a second pair of structs with the
-// same fields is a conversion nobody would keep correct.  Every field of them
-// crosses, heartbeat included — it is read by nothing in the Lua surface today,
-// and leaving it at zero would be a field that is silently wrong rather than
-// merely absent, which is the trade this tree makes the other way round.
-//
-// The cost of carrying it is that the payload changes on every scan even when
-// the cluster has not, so the per-child dedupe cannot suppress this frame the
-// way it suppresses an unchanged runtime map.  That is one frame per worker per
-// scan interval on a CLUSTERED daemon and none at all on the ordinary one,
-// which is the shape worth paying: a daemon that is not in a cluster never
-// sends this frame at all.
-//
-// An EMPTY view — no daemon name — is how "this daemon is not in a cluster any
-// more" crosses.  The worker takes it as a withdrawal rather than as a cluster
-// of one with no name, and its four cluster calls go back to refusing.
+// The cluster as a worker is allowed to see it: a separate frame because a
+// remote daemon joining moves nothing in the local map, carrying
+// cluster_discovery's own structs verbatim, because a worker running a
+// discovery of its own would claim the node name and read as a second daemon.
 
 inline std::string encode_cluster_view(const cluster_view& v)
 {
