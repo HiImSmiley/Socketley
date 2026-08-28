@@ -7,7 +7,8 @@
 #   1. The cache never counted bytes at all.  Three runtimes fed
 #      m_stat_bytes_in/out from their completion handlers and the fourth
 #      forgot, so `stats` printed bytes_in:0 for a cache that had just served
-#      hundreds of commands — in every mode, worker or --daemon-process.
+#      hundreds of commands.  It was every mode: worker, and the in-daemon
+#      one that --daemon-process used to select and that no longer exists.
 #      Watched red against HEAD before the fix: the two byte assertions below
 #      failed while keys/total_messages passed.
 #

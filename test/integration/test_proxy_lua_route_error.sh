@@ -13,8 +13,11 @@
 #       what():  lua: error: route.lua:2: attempt to get length of local 'path' (a nil value)
 #     Aborted (core dumped)
 #
-# One request.  With --daemon-process that is the whole daemon and every runtime
-# in it — measured here at three: two backends and the proxy, all gone together.
+# One request.  Measured when a runtime could be kept in the daemon, that was
+# the whole daemon and every runtime in it -- three here: two backends and the
+# proxy, all gone together.  It is one worker now, which is what the split is
+# for; the refusal below is still the point, because a proxy restarted into the
+# same request is a crash loop rather than an answer.
 #
 # It needed no unusual script to reach.  on_route(method, path) receives its two
 # arguments only on `--protocol http`; on a TCP proxy it is called with none, so

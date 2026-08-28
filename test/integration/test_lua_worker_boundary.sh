@@ -3,8 +3,9 @@
 #
 # ─── WHAT THIS PINS ─────────────────────────────────────────────────────────
 #
-# Since 8399bee a runtime lives in a process of its own unless it was created
-# with --daemon-process.  The daemon keeps a *placeholder* for it: an object
+# Since 8399bee a runtime lives in a process of its own, and since the removal
+# of --daemon-process there is nowhere else it can live.  The daemon keeps a
+# *placeholder* for it: an object
 # with the name, the port and the state, and not one connection, not one client
 # fd.  Three of the Lua management calls read that placeholder as though it were
 # the runtime, and each of them was wrong in a way a script could not see.
@@ -145,10 +146,15 @@ PYEOF
 
 # ── The script under test ───────────────────────────────────────────────────
 #
-# It runs in the daemon (--daemon-process): the calls it makes are the
+# It runs in a worker, like everything else, and that sentence used to read
+# "it runs in the daemon (--daemon-process): the calls it makes are the
 # cross-runtime ones, which a worker refuses outright, so the only place they
-# can be measured is where they are allowed.  Its targets are the ones in
-# workers, which is the boundary this file is about.
+# can be measured is where they are allowed."
+#
+# Every one of those calls is answered in a worker now, so the controller has no
+# reason to be anywhere special -- and the file measures something stronger for
+# it: the boundary is crossed in BOTH directions rather than only outward from a
+# privileged caller.
 CTL_LUA="$SOCKETLEY_TMPD/ctl.lua"
 cat > "$CTL_LUA" <<'LUAEOF'
 local function say(s) socketley.log("CTL " .. s) end

@@ -8,8 +8,8 @@
 # parse_proxy_flags, so a cache was answered "unknown flag" rather than given
 # one.  The supervisor never needed either: it forks, hands over a config frame,
 # restarts and reads stats back, and it held a proxy_instance* it never
-# dereferenced.  A worker is now what every runtime gets unless it asks for
-# --daemon-process.
+# dereferenced.  A worker is now what every runtime gets, with nothing
+# to ask for and no alternative to ask it against.
 #
 # What this file holds down is that the CLI cannot tell the difference — the
 # same assertions would pass against an in-process cache, which is the point —

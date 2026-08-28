@@ -11,6 +11,7 @@
 # depending on which command reached it:
 #
 #     $ socketley create server c1 -p ... --lua boom.lua --daemon-process -s
+#                                                        ^ the flag is gone now
 #     $ echo $?
 #     0                                   <- and not one character of output
 #     $ socketley reload-lua c1
@@ -146,12 +147,14 @@ if [ "$RC" = "0" ] && [ -z "$OUT" ]; then pass; else
          "exit $RC, output: ${OUT:-<nothing>}"
 fi
 
-# ── The same create with no --daemon-process, which is the ordinary one ─────
+# ── The same create again, which is now the only one there is ──────────────
 #
-# Since a runtime lives in a worker unless it says otherwise, the command above
-# is the exception and this is what an operator actually types.  The script runs
-# in the child, so the reason has to cross the control socket to get here; a fix
-# that only covered the in-daemon leg would have covered the flag nobody passes.
+# This was "the same create with no --daemon-process, which is the ordinary
+# one": the command above was the exception and this was what an operator
+# actually typed.  There is no exception left, so the two are the same command
+# and this arm is the one that still has a reason to exist -- the script runs in
+# the child, so the reason has to cross the control socket to get here, and a
+# fix that only covered an in-daemon leg would now cover nothing at all.
 set +e
 OUT=$("$BIN" create server os_wboom -p $((PB + 5)) --lua "$BOOM" -s 2>&1)
 RC=$?

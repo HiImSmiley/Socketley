@@ -77,9 +77,10 @@ LUA="$SOCKETLEY_TMPD/rearm.lua"
 cat > "$LUA" <<'LUAEOF'
 local starts = 0
 
--- Armed at the script's TOP LEVEL, which runs when the script is loaded and
--- never again.  It is here to pin the asymmetry: a `start` re-runs on_start, so
--- what on_start armed comes back, and there is nothing to replay for this one.
+-- Armed at the script's TOP LEVEL.  It is here because the top level and
+-- on_start are severed by the same stop and restored by the same start: a stop
+-- retires this worker and a start forks a new one, which runs the file from the
+-- top.  Both come back, and the assertion at the end of this file says so.
 local top_id = socketley.set_interval(150, function()
     socketley.log("TOPTICK")
 end)
@@ -253,18 +254,32 @@ fi
 # ── The latch lifts when the runtime starts again ──────────────────────────
 "$BIN" start rearm_srv >/dev/null 2>&1 || true
 ready_tcp 127.0.0.1 "$SRV_PORT" 10 || echo "  NOTE: the server never re-accepted"
-said "READY starts=2" 8 || true
-REREADY=$(grep -a "READY starts=2" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
-case "$REREADY" in
-    *" sub=0"*|*" interval=0"*|"")
-        fail "a restarted runtime can arm timers and subscriptions again" \
-             "got: ${REREADY:-<no second READY line>}" \
-             "a latch that never opened would make 'stop; start' a way to get a" \
-             "runtime that is up and can schedule nothing, which is worse than" \
-             "the defect being fixed"
-        ;;
-    *) pass ;;
-esac
+# Counted rather than matched on `starts=2`.  The counter is an upvalue in the
+# worker's interpreter and a start forks a NEW worker, so the second on_start
+# reports starts=1 -- the same number as the first, from a Lua state that has
+# never seen the first.  What has to be true is that there are now TWO READY
+# lines and that the second one armed live ids.
+for _ in $(seq 1 80); do
+    [ "$(count 'READY starts=')" -ge 2 ] && break
+    sleep 0.1
+done
+REREADY=$(grep -a "READY starts=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+if [ "$(count 'READY starts=')" -lt 2 ]; then
+    fail "a restarted runtime can arm timers and subscriptions again" \
+         "only $(count 'READY starts=') READY line(s); the second worker's" \
+         "on_start never ran" \
+         "a latch that never opened would make 'stop; start' a way to get a" \
+         "runtime that is up and can schedule nothing, which is worse than" \
+         "the defect being fixed"
+else
+    case "$REREADY" in
+        *" sub=0"*|*" interval=0"*)
+            fail "a restarted runtime can arm timers and subscriptions again" \
+                 "got: $REREADY" \
+                 "0 is the refusal; the latch lowered by the stop never lifted" ;;
+        *) pass ;;
+    esac
+fi
 HB_BEFORE=$(count HEARTBEAT)
 sleep 1
 HB_AFTER=$(count HEARTBEAT)
@@ -281,20 +296,30 @@ if [ "$LIVE_AFTER" -gt "$LIVE_BEFORE" ]; then pass; else
          "no new 'LIVE SUB' line after the restart"
 fi
 
-# ── ...and the top-level timer does NOT come back ──────────────────────────
+# ── ...and the top-level timer DOES come back ──────────────────────────────
 #
-# The other side of the same asymmetry, and the reason it is asserted rather
-# than described: `start` re-runs on_start, so what on_start armed returns, and
-# a timer armed at the script's top level has nothing to replay it — the top
-# level ran once, at load.  The man page says so beside set_interval.  A latch
-# lowered in the wrong place, or a `start` that replayed the top level to make
-# the two symmetrical, would move that line without anything noticing.
+# This assertion is inverted, and the asymmetry it was written about is gone.
+#
+# It read: `start` re-runs on_start, so what on_start armed returns, and a timer
+# armed at the script's TOP LEVEL has nothing to replay it, because the top
+# level ran once, at load.  True while the script and the runtime shared a
+# process and an interpreter -- which is what --daemon-process was providing.
+#
+# A script runs where its runtime runs.  A stop retires the worker and a start
+# forks a NEW one, which loads the script from the file and runs its top level
+# like any other first run.  So there is no asymmetry left to pin: on_start's
+# registrations come back because on_start runs again, and the top level's come
+# back because the top level runs again.
+#
+# `starts` says the same thing from the other direction and is why the READY
+# assertion above stopped looking for `starts=2`: the counter is a Lua upvalue
+# in an interpreter that no longer exists, so the second start reports 1.
 TOP_AFTER=$(count TOPTICK)
-if [ "$TOP_AFTER" = "$TOP_FROZEN" ]; then pass; else
-    fail "a timer armed at the top level does not come back on start" \
+if [ "$TOP_AFTER" -gt "$TOP_FROZEN" ]; then pass; else
+    fail "a timer armed at the top level comes back on start" \
          "TOPTICK went $TOP_FROZEN -> $TOP_AFTER across the restart" \
-         "the registration is made when the script is LOADED, so a start has" \
-         "nothing to replay; reload-lua is what arms it again"
+         "a start forks a new worker, which runs the script from the top; a" \
+         "frozen count means the second worker never loaded it"
 fi
 
 # ── The daemon survived all of that ────────────────────────────────────────

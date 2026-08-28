@@ -346,7 +346,37 @@ public:
             m_manager.set_map_sink(
                 [this](std::string_view op, std::string_view name,
                        std::string_view config, std::string& err) -> bool
-                { return map_request(op, name, config, err); });
+                {
+                    if (!map_request(op, name, config, err))
+                        return false;
+
+                    // ─── A script that stops ITS OWN runtime ────────────────
+                    //
+                    // The daemon has stopped it, and this process does not know
+                    // yet: the placeholder moved, the worker's own object did
+                    // not.  So the very next line of the same handler armed a
+                    // timer and was answered with a live id --
+                    // `REARM interval=3 sub=2 timeout=4` -- for a timer that
+                    // can never fire, because this process is being retired.
+                    //
+                    // In the daemon socketley.stop() ran the stop on the way
+                    // through and the arming latch refused everything after it;
+                    // measured there as `interval=0 sub=0 timeout=0`.  A return
+                    // value that says "armed" for something that is not is the
+                    // accepted-but-not-applied shape, and it is the one this
+                    // whole boundary is written against.
+                    //
+                    // on_stop()'s body rather than a state flag, because the
+                    // script is entitled to the rest of what a stop does: its
+                    // on_stop runs, its timers are severed, its listener closes.
+                    // Same call the `stop` frame makes, and it guards on the
+                    // state, so the frame arriving afterwards is a no-op.
+                    if (m_rt && name == m_rt->get_name() &&
+                        (op == "stop" || op == "remove"))
+                        on_stop();
+
+                    return true;
+                });
 
             // ── And routing, which needs BOTH descriptors ───────────────────
             //
@@ -1500,8 +1530,14 @@ private:
             std::string why = lua_diag::text();
             if (why.empty())
                 why = "the script did not load";
-            LOG_ERROR(("proxy worker: lua script did not load; refusing to "
-                       "serve without it: " + why).c_str());
+            // The reason is deliberately NOT repeated here.  It is already in
+            // this worker's stderr -- the script's own error, printed by the
+            // loader -- and it now travels up the control socket as well, so
+            // putting it in a third place made it appear twice in the daemon's
+            // log.  Measured: test_worker_lua_refusal counts that text to tell
+            // one fork from a fork loop, and read 2 for a single fork.
+            LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
+                      "without it (the script's own error is above)");
 
             // Up the control socket as well as into the log, which is the
             // whole of the difference to an operator: the daemon answers a

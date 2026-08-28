@@ -57,10 +57,14 @@ mkdir -p "$SCRIPTS"
 
 # run_script NAME PORT FILE
 #
-# Load a script as a runtime's on_start and let it run.  --daemon-process on
-# purpose: out of process the crash would kill only the worker, which the
-# supervisor then restarts, and the assertion would be measuring the restart
-# policy rather than the interpreter.  In the daemon, a crash is unambiguous.
+# Load a script as a runtime's on_start and let it run.
+#
+# This used to pass --daemon-process on purpose, so that a crash took the daemon
+# and was unambiguous: out of process it kills only the worker, the supervisor
+# restarts it, and an assertion on "did it crash" would be measuring the restart
+# policy.  There is no in-daemon runtime now, so the assertions below are the
+# ones that survive the difference -- they read what the interpreter REFUSED,
+# out of the log, rather than inferring it from something dying.
 run_script() {
     local name=$1 port=$2 file=$3
     # Every case starts against a daemon of our own that is answering, so a
